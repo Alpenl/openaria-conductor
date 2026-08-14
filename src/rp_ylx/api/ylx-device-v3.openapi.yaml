@@ -922,7 +922,10 @@ components:
           required: [volume_id, total_bytes, available_bytes, writable]
           properties:
             volume_id:
-              $ref: "#/components/schemas/UuidV4"
+              description: 当前没有已准入录制卷时为 null。
+              oneOf:
+                - $ref: "#/components/schemas/UuidV4"
+                - type: "null"
             total_bytes:
               type: integer
               minimum: 0

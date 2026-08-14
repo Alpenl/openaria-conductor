@@ -190,13 +190,6 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
         self.assertEqual(marker.exception.code, "volume_not_admitted")
 
-        with self.assertRaises(DeviceRecordingError) as mount:
-            CaptureCoordinator(
-                CoordinatorConfig(self.mountpoint, self.state_root, self.session_config),
-                mount_checker=lambda path: False,
-            )
-        self.assertEqual(mount.exception.code, "volume_not_mounted")
-
         with (
             patch(
                 "rp_ylx.recording.coordinator._stat_capacity",
@@ -223,6 +216,58 @@ class CaptureCoordinatorTest(unittest.TestCase):
         ):
             self.coordinator()
         self.assertEqual(read_only.exception.code, "volume_read_only")
+
+    def test_unmounted_volume_keeps_control_plane_and_recovers_without_restart(self) -> None:
+        mounted = False
+        coordinator = CaptureCoordinator(
+            CoordinatorConfig(
+                self.mountpoint,
+                self.state_root,
+                self.session_config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            ),
+            mount_checker=lambda path: mounted and path == self.mountpoint.resolve(),
+        )
+        try:
+            validate_capture_status(coordinator.capture_status())
+            descriptor = coordinator.device_descriptor("v3", "customer")
+            validate_device_descriptor(
+                descriptor,
+                api_version="v3",
+                security_profile="customer",
+            )
+            self.assertFalse(descriptor["capabilities"]["capture"])
+            self.assertEqual(
+                descriptor["storage"],
+                {
+                    "volume_id": None,
+                    "total_bytes": 0,
+                    "available_bytes": 0,
+                    "writable": False,
+                },
+            )
+
+            with self.assertRaises(ProviderError) as unavailable:
+                coordinator.start_capture(start_command("volume-missing"))
+            self.assertEqual(unavailable.exception.code, "volume_not_mounted")
+            self.assertEqual(unavailable.exception.status, 409)
+
+            mounted = True
+            validate_capture_status(coordinator.capture_status())
+            automatically_restored = coordinator.device_descriptor("v3", "customer")
+            self.assertTrue(automatically_restored["capabilities"]["capture"])
+            self.assertEqual(automatically_restored["storage"]["volume_id"], self.volume_id)
+            result = coordinator.start_capture(start_command("volume-restored"))
+            self.assertEqual(result.status, 202)
+            self.assertEqual(result.body["snapshot"]["device_state"], "recording")
+            self.assertEqual(coordinator.volume_id, self.volume_id)
+            restored = coordinator.device_descriptor("v3", "customer")
+            self.assertTrue(restored["capabilities"]["capture"])
+            self.assertEqual(restored["storage"]["volume_id"], self.volume_id)
+            self.assertTrue(restored["storage"]["writable"])
+        finally:
+            coordinator.close()
 
     def test_start_rechecks_thresholds_and_rejects_wrong_volume(self) -> None:
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)

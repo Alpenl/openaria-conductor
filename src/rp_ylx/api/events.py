@@ -598,13 +598,15 @@ def _validate_device_storage(value: object) -> None:
         raise InvalidSourceEvent("device storage 必须是闭合对象")
     total_bytes = value["total_bytes"]
     available_bytes = value["available_bytes"]
+    volume_id = value["volume_id"]
     if (
-        not _uuid(value["volume_id"], UUID_V4)
+        (volume_id is not None and not _uuid(volume_id, UUID_V4))
         or type(total_bytes) is not int
         or total_bytes < 0
         or type(available_bytes) is not int
         or available_bytes < 0
         or type(value["writable"]) is not bool
+        or (volume_id is None and (total_bytes != 0 or available_bytes != 0 or value["writable"]))
     ):
         raise InvalidSourceEvent("device storage 无效")
 
