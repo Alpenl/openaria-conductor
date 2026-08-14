@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Alpenl/openaria-conductor/raw/main/src/rp_ylx/contracts/recording-session-v0.schema.json",
+  "title": "YLX 录制会话清单 v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "state", "session_id", "time", "device", "capture", "counts", "artifacts"],
+  "properties": {
+    "format": {"const": "ylx.recording-session.v0"},
+    "state": {"const": "sealed"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "software_version"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "software_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["video", "imu", "clock"],
+      "properties": {
+        "video": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "fps", "encoding", "coordinate_frame"],
+          "properties": {
+            "width": {"type": "integer", "minimum": 1},
+            "height": {"type": "integer", "minimum": 1},
+            "fps": {"type": "number", "exclusiveMinimum": 0},
+            "encoding": {"type": "string", "minLength": 1},
+            "coordinate_frame": {"const": "opencv_optical"}
+          }
+        },
+        "imu": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coordinate_frame", "device_tick_hz", "ranges"],
+          "properties": {
+            "coordinate_frame": {"const": "opencv_optical"},
+            "device_tick_hz": {"type": ["number", "null"], "exclusiveMinimum": 0},
+            "ranges": {
+              "oneOf": [
+                {"type": "null"},
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["accelerometer", "gyroscope"],
+                  "properties": {
+                    "accelerometer": {"$ref": "#/$defs/accelerometerRange"},
+                    "gyroscope": {"$ref": "#/$defs/gyroscopeRange"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "clock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["domain", "unit"],
+          "properties": {
+            "domain": {"const": "host_monotonic"},
+            "unit": {"const": "nanosecond"}
+          }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frames", "imu_samples", "diagnostics", "dropped_frames", "dropped_imu_samples"],
+      "properties": {
+        "frames": {"type": "integer", "minimum": 0},
+        "imu_samples": {"type": "integer", "minimum": 0},
+        "diagnostics": {"type": "integer", "minimum": 0},
+        "dropped_frames": {"type": "integer", "minimum": 0},
+        "dropped_imu_samples": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {"$ref": "#/$defs/artifact"}
+    }
+  },
+  "$defs": {
+    "accelerometerRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["full_scale", "unit"],
+      "properties": {
+        "full_scale": {"type": "number", "exclusiveMinimum": 0},
+        "unit": {"const": "g"}
+      }
+    },
+    "gyroscopeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["full_scale", "unit"],
+      "properties": {
+        "full_scale": {"type": "number", "exclusiveMinimum": 0},
+        "unit": {"const": "degree_per_second"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "path", "media_type", "bytes", "sha256", "records"],
+      "properties": {
+        "role": {
+          "enum": ["session.metadata", "video.left", "video.right", "frames.timeline", "imu.samples", "diagnostics.events"]
+        },
+        "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"},
+        "media_type": {
+          "enum": ["application/json", "application/vnd.ylx.frame-stream", "application/x-ndjson"]
+        },
+        "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "records": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

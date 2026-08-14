@@ -1,0 +1,3 @@
+include docs/networking.md
+include docs/rdk-x5-install.md
+recursive-include src/rp_ylx/deploy *.service *.sysusers *.tmpfiles

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rp-ylx"
+version = "0.1.0"
+description = "RDK X5 + YLX 2UQ2 双目视频与 IMU 录制服务"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["jsonschema>=4.23,<5", "pillow>=10,<13", "typing-extensions>=4.4,<5"]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.12,<1"]
+
+[project.scripts]
+rp-ylx = "rp_ylx.cli:main"
+rp-ylx-deploy = "rp_ylx.deployment:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rp_ylx = ["contracts/*.json", "api/*.json", "api/*.yaml", "schemas/*.json"]
+"rp_ylx.deploy" = ["*.service", "*.sysusers", "*.tmpfiles"]
+"rp_ylx.web" = ["*.html", "*.css", "*.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

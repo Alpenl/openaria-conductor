@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Alpenl/openaria-conductor/raw/main/src/rp_ylx/contracts/imu-sample-v0.schema.json",
+  "title": "YLX IMU 样本 v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "session_id",
+    "sequence",
+    "packet_sequence",
+    "sample_index",
+    "device_timestamp_raw",
+    "device_ticks",
+    "host_read_start_ns",
+    "host_read_end_ns",
+    "host_monotonic_ns",
+    "raw",
+    "sync"
+  ],
+  "properties": {
+    "format": {"const": "ylx.imu.v0"},
+    "session_id": {"type": "string", "format": "uuid"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "packet_sequence": {"type": "integer", "minimum": 0},
+    "sample_index": {"enum": [0, 1]},
+    "device_timestamp_raw": {"type": "integer", "minimum": 0, "maximum": 16777215},
+    "device_ticks": {"type": "integer", "minimum": 0},
+    "host_read_start_ns": {"type": "integer", "minimum": 0},
+    "host_read_end_ns": {"type": "integer", "minimum": 0},
+    "host_monotonic_ns": {"type": "integer", "minimum": 0},
+    "raw": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accelerometer", "gyroscope"],
+      "properties": {
+        "accelerometer": {"$ref": "#/$defs/rawVector"},
+        "gyroscope": {"$ref": "#/$defs/rawVector"}
+      }
+    },
+    "sync": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["offset_ns", "residual_ns", "quality"],
+          "properties": {
+            "offset_ns": {"type": "null"},
+            "residual_ns": {"type": "null"},
+            "quality": {"const": "insufficient"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["offset_ns", "residual_ns", "quality"],
+          "properties": {
+            "offset_ns": {"type": "integer"},
+            "residual_ns": {"type": "integer", "minimum": 0},
+            "quality": {"enum": ["good", "degraded"]}
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "rawVector": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": -32768, "maximum": 32767},
+        {"type": "integer", "minimum": -32768, "maximum": 32767},
+        {"type": "integer", "minimum": -32768, "maximum": 32767}
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    }
+  }
+}

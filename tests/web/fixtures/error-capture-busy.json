@@ -1,0 +1,14 @@
+{
+  "schema": "ylx.api-error.v2",
+  "error": {
+    "code": "capture_busy",
+    "message": "Artifact transfer is paused until the device returns to idle.",
+    "request_id": "99f1cd07-f04b-4617-a70e-d99d31d6447a",
+    "retryable": true,
+    "details": {
+      "wait_for": "idle",
+      "retry_after_seconds": 3,
+      "current_state": "recording"
+    }
+  }
+}

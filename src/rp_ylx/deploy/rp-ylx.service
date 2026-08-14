@@ -1,0 +1,27 @@
+[Unit]
+Description=RP-YLX RDK X5 capture service
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rp-ylx
+Group=rp-ylx
+SupplementaryGroups=video
+ExecStartPre=+/usr/local/sbin/rp-ylx-deploy recover
+ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve --config /etc/rp-ylx/device.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

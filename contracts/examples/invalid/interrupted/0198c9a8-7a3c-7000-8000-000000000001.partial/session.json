@@ -1,0 +1,11 @@
+{
+  "failure": {
+    "code": "process_interrupted",
+    "message": "进程中断"
+  },
+  "format": "ylx.recording-session-state.v0",
+  "session_id": "0198c9a8-7a3c-7000-8000-000000000001",
+  "started_at": "2026-08-10T01:00:00Z",
+  "state": "interrupted",
+  "updated_at": "2026-08-10T01:00:01Z"
+}
