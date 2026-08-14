@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import http.client
 import json
+import socket
 import tempfile
+import threading
 import time
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -126,6 +130,98 @@ class ProductionDaemonTest(unittest.TestCase):
             event_buffer = gateway.call_args.kwargs["event_buffer"]
             event_pump.assert_called_once_with(coordinator, event_buffer)
             self.assertIs(service.event_pump, event_pump.return_value)
+
+    def test_unmounted_volume_keeps_production_http_control_plane_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            config = replace(self.config(root), port=port)
+            source = Mock(open_handle_count=0)
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.stable_id_for_device", return_value="camera-stable"),
+                patch("rp_ylx.daemon.ThreadedCaptureSources", return_value=source),
+            ):
+                service = build_production_service(
+                    config,
+                    camera_backend_factory=Mock(return_value=Mock()),
+                    imu_source_factory=Mock(),
+                    mount_checker=lambda path: False,
+                )
+            thread = threading.Thread(target=service.server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read()
+
+                connection.request("GET", "/api/v3/device")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                device = json.loads(response.read())
+                self.assertFalse(device["capabilities"]["capture"])
+                self.assertEqual(device["storage"]["volume_id"], None)
+
+                connection.request("GET", "/api/v3/capture/status")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["snapshot"]["device_state"], "idle")
+
+                connection.request("GET", "/api/v3/sessions")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 409)
+                self.assertEqual(json.loads(response.read())["error"]["code"], "volume_not_mounted")
+
+                body = json.dumps(
+                    {
+                        "schema": "ylx.capture-start.v2",
+                        "mode": "production",
+                        "take": {"kind": "new"},
+                    }
+                )
+                connection.request(
+                    "POST",
+                    "/api/v3/capture/start",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": "missing-volume-start",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 409)
+                problem = json.loads(response.read())
+                self.assertEqual(problem["error"]["code"], "volume_not_mounted")
+                self.assertTrue(problem["error"]["retryable"])
+
+                stop_body = json.dumps({"schema": "ylx.capture-stop.v2", "reason": "user"})
+                connection.request(
+                    "POST",
+                    "/api/v3/capture/stop",
+                    body=stop_body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": "missing-volume-stop",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 409)
+                self.assertEqual(json.loads(response.read())["error"]["code"], "volume_not_mounted")
+
+                session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
+                connection.request("GET", f"/api/v3/sessions/{session_id}")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 409)
+                self.assertEqual(json.loads(response.read())["error"]["code"], "volume_not_mounted")
+            finally:
+                connection.close()
+                service.server.shutdown()
+                thread.join(timeout=2)
+                service.close()
 
     def test_event_pump_publishes_each_observed_revision_once_and_closes(self) -> None:
         source = {"authority_epoch": str(uuid.uuid4()), "source_revision": 1}

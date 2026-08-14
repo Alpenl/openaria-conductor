@@ -763,6 +763,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except InvalidSourceEvent:
             self._invalid_source_state("daemon session list 无效")
             return
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
         except Exception:
             self._provider_failure()
             return

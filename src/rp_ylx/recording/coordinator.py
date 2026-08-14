@@ -291,19 +291,27 @@ class CaptureCoordinator:
         persisted = self._read_local_state()
         self._authority_epoch = str(persisted.get("authority_epoch") or uuid.uuid4())
         self._revision = int(persisted.get("source_revision", 0))
-        self._admission = self._admit(persisted)
+        binding = persisted.get("volume_binding")
+        self._last_volume_binding = copy.deepcopy(binding) if isinstance(binding, Mapping) else None
+        self._admission: VolumeAdmission | None = None
+        try:
+            self._admission = self._admit(persisted)
+        except DeviceRecordingError as error:
+            if error.code != "volume_not_mounted":
+                raise
         self._restore_local_state(persisted)
-        self._recover_sessions()
-        self._catalog_sessions()
+        if self._admission is not None:
+            self._recover_sessions()
+            self._catalog_sessions()
         self._persist_local_state()
 
     @property
     def volume_id(self) -> str:
-        return self._admission.volume_id
+        return self._require_admission().volume_id
 
     @property
     def generation_id(self) -> str:
-        return self._admission.generation_id
+        return self._require_admission().generation_id
 
     @property
     def open_handle_count(self) -> int:
@@ -320,6 +328,24 @@ class CaptureCoordinator:
             return value if isinstance(value, dict) else {}
         except (OSError, ValueError, json.JSONDecodeError):
             return {}
+
+    def _require_admission(self) -> VolumeAdmission:
+        admission = self._admission
+        if admission is not None:
+            return admission
+        with self._lock:
+            if self._admission is not None:
+                return self._admission
+            persisted = self._read_local_state()
+            admission = self._admit(persisted)
+            self._admission = admission
+            self._media_lost = False
+            self._restore_local_state(persisted)
+            self._recover_sessions()
+            self._catalog_sessions()
+            self._next_revision()
+            self._persist_local_state()
+            return admission
 
     def _admit(self, persisted: Mapping[str, object]) -> VolumeAdmission:
         mountpoint = self._config.mountpoint.resolve()
@@ -381,6 +407,7 @@ class CaptureCoordinator:
         )
 
     def _restore_local_state(self, persisted: Mapping[str, object]) -> None:
+        admission = self._admission
         retained = persisted.get("retained")
         if isinstance(retained, Mapping):
             self._retained = {
@@ -392,17 +419,19 @@ class CaptureCoordinator:
         if isinstance(safe_swap, dict):
             receipt = safe_swap.get("receipt")
             if (
-                isinstance(receipt, Mapping)
-                and receipt.get("volume_id") == self._admission.volume_id
-                and receipt.get("generation_id") == self._admission.generation_id
+                admission is not None
+                and isinstance(receipt, Mapping)
+                and receipt.get("volume_id") == admission.volume_id
+                and receipt.get("generation_id") == admission.generation_id
             ):
                 self._safe_swap_resource = copy.deepcopy(safe_swap)
                 self._released = True
         pending = persisted.get("pending_safe_swap")
         if (
-            isinstance(pending, dict)
-            and pending.get("volume_id") == self._admission.volume_id
-            and pending.get("generation_id") == self._admission.generation_id
+            admission is not None
+            and isinstance(pending, dict)
+            and pending.get("volume_id") == admission.volume_id
+            and pending.get("generation_id") == admission.generation_id
         ):
             self._pending_safe_swap = copy.deepcopy(pending)
         commands = persisted.get("commands")
@@ -428,16 +457,19 @@ class CaptureCoordinator:
                     )
 
     def _persist_local_state(self) -> None:
+        admission = self._admission
+        if admission is not None:
+            self._last_volume_binding = {
+                "volume_id": admission.volume_id,
+                "generation_id": admission.generation_id,
+                "device": admission.device,
+                "mount_identity": admission.mount_identity,
+            }
         value = {
             "schema": "ylx.capture-coordinator-state.v1",
             "authority_epoch": self._authority_epoch,
             "source_revision": self._revision,
-            "volume_binding": {
-                "volume_id": self._admission.volume_id,
-                "generation_id": self._admission.generation_id,
-                "device": self._admission.device,
-                "mount_identity": self._admission.mount_identity,
-            },
+            "volume_binding": copy.deepcopy(self._last_volume_binding),
             "retained": self._retained,
             "pending_safe_swap": self._pending_safe_swap,
             "safe_swap_resource": self._safe_swap_resource,
@@ -470,18 +502,16 @@ class CaptureCoordinator:
         *,
         force: bool = False,
     ) -> StorageStatus:
-        if generation_id is not None and generation_id != self._admission.generation_id:
+        admission = self._require_admission()
+        if generation_id is not None and generation_id != admission.generation_id:
             raise DeviceRecordingError("stale_generation", "录制命令来自过期挂载代次")
         if self._released:
             raise DeviceRecordingError("volume_released", "录制卷已经进入安全移除状态")
         if self._media_lost:
             raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-        mountpoint = self._admission.mountpoint
+        mountpoint = admission.mountpoint
         try:
-            if (
-                not self._mount_checker(mountpoint)
-                or mountpoint.stat().st_dev != self._admission.device
-            ):
+            if not self._mount_checker(mountpoint) or mountpoint.stat().st_dev != admission.device:
                 self._media_lost = True
                 raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
         except DeviceRecordingError:
@@ -498,8 +528,8 @@ class CaptureCoordinator:
                 return self._storage_cache
         try:
             if (
-                self._mount_identity(mountpoint) != self._admission.mount_identity
-                or _read_volume_id(mountpoint) != self._admission.volume_id
+                self._mount_identity(mountpoint) != admission.mount_identity
+                or _read_volume_id(mountpoint) != admission.volume_id
             ):
                 self._media_lost = True
                 raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
@@ -518,7 +548,8 @@ class CaptureCoordinator:
             raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
 
     def _recover_sessions(self) -> None:
-        for partial in sorted(self._admission.sessions_root.glob("*.partial")):
+        admission = self._require_admission()
+        for partial in sorted(admission.sessions_root.glob("*.partial")):
             if not partial.is_dir():
                 continue
             session_id = partial.name.removesuffix(".partial")
@@ -534,7 +565,7 @@ class CaptureCoordinator:
                 and not (partial / "capture.json").exists()
             )
             if manifest.is_file() and controls_absent:
-                final = self._admission.sessions_root / session_id
+                final = admission.sessions_root / session_id
                 try:
                     validate_device_session_directory(
                         partial,
@@ -543,7 +574,7 @@ class CaptureCoordinator:
                     if final.exists():
                         raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
                     os.rename(partial, final)
-                    fsync_directory(self._admission.sessions_root)
+                    fsync_directory(admission.sessions_root)
                     payload = (final / "manifest.json").read_bytes()
                     self._verified[session_id] = hashlib.sha256(payload).hexdigest()
                     continue
@@ -553,6 +584,7 @@ class CaptureCoordinator:
             self._settle_partial(partial, session_id)
 
     def _settle_partial(self, partial: Path, session_id: str) -> None:
+        admission = self._require_admission()
         with suppress(OSError):
             (partial / "manifest.json").unlink(missing_ok=True)
         try:
@@ -568,7 +600,7 @@ class CaptureCoordinator:
             self._revision = max(self._revision, int(current["state_revision"]))
         if current.get("state") in {"recoverable", "failed", "abandoned"}:
             self._retained[session_id] = {
-                "generation_id": self._admission.generation_id,
+                "generation_id": admission.generation_id,
                 "recording_state": current,
             }
             return
@@ -591,12 +623,13 @@ class CaptureCoordinator:
             (partial / "manifest.json").unlink(missing_ok=True)
             write_json_atomic(partial / "recording.json", settled)
         self._retained[session_id] = {
-            "generation_id": self._admission.generation_id,
+            "generation_id": admission.generation_id,
             "recording_state": settled,
         }
 
     def _catalog_sessions(self) -> None:
-        for candidate in self._admission.sessions_root.iterdir():
+        admission = self._require_admission()
+        for candidate in admission.sessions_root.iterdir():
             if not candidate.is_dir() or candidate.name.endswith(".partial"):
                 continue
             try:
@@ -642,6 +675,9 @@ class CaptureCoordinator:
 
     def capture_status(self) -> Mapping[str, object]:
         with self._lock:
+            if self._admission is None:
+                with suppress(DeviceRecordingError):
+                    self._require_admission()
             snapshot = self._snapshot()
             source_revision = self._revision
             recording = snapshot["active_recording"] or snapshot["retained_unsuccessful"]
@@ -676,12 +712,14 @@ class CaptureCoordinator:
         }
 
     def device_descriptor(self, api_version: str, security_profile: str) -> Mapping[str, object]:
+        admission = self._admission
         try:
+            admission = self._require_admission()
             status = self._check_generation(force=True)
-            total_bytes, available_bytes, _ = _stat_capacity(self._admission.mountpoint)
+            total_bytes, available_bytes, _ = _stat_capacity(admission.mountpoint)
             writable = status.writable
         except DeviceRecordingError:
-            total_bytes = self._admission.total_bytes
+            total_bytes = 0 if admission is None else admission.total_bytes
             available_bytes = 0
             writable = False
         commit = self._config.session.commit
@@ -700,13 +738,13 @@ class CaptureCoordinator:
             },
             "security_profile": security_profile,
             "capabilities": {
-                "capture": not self._released,
+                "capture": admission is not None and writable and not self._released,
                 "preview": True,
                 "range_download": True,
                 "network_mutation": False,
             },
             "storage": {
-                "volume_id": self._admission.volume_id,
+                "volume_id": None if admission is None else admission.volume_id,
                 "total_bytes": total_bytes,
                 "available_bytes": available_bytes,
                 "writable": writable,
@@ -745,12 +783,21 @@ class CaptureCoordinator:
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
+        try:
+            admission = self._require_admission()
+        except DeviceRecordingError as error:
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=HTTPStatus.CONFLICT,
+                retryable=True,
+            ) from error
         requested_volume = body.get("volume_id")
-        if requested_volume is not None and requested_volume != self._admission.volume_id:
+        if requested_volume is not None and requested_volume != admission.volume_id:
             raise ProviderError("volume_mismatch", "请求的录制卷未准入", status=HTTPStatus.CONFLICT)
         try:
             self._check_generation(force=True)
-            _, available_bytes, available_inodes = _stat_capacity(self._admission.mountpoint)
+            _, available_bytes, available_inodes = _stat_capacity(admission.mountpoint)
             if available_bytes < self._config.minimum_available_bytes:
                 raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
             if available_inodes < self._config.minimum_available_inodes:
@@ -789,8 +836,8 @@ class CaptureCoordinator:
             display_name = datetime.now().astimezone().strftime("录制 %Y-%m-%d %H:%M:%S")
         plan = SessionPlan(
             session_id=session_id,
-            volume_id=self._admission.volume_id,
-            generation_id=self._admission.generation_id,
+            volume_id=admission.volume_id,
+            generation_id=admission.generation_id,
             capture_mode=str(body.get("mode")),
             display_name=display_name,
             take_id=take_id,
@@ -798,7 +845,7 @@ class CaptureCoordinator:
             continuation_of=None if continuation_of is None else str(continuation_of),
         )
         recorder = DeviceSessionRecorder(
-            self._admission.sessions_root,
+            admission.sessions_root,
             self._config.session,
             plan,
             authority_epoch=self._authority_epoch,
@@ -897,6 +944,16 @@ class CaptureCoordinator:
             return self._idempotent("stop", command, lambda: self._stop_capture(command.body))
 
     def _stop_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
+        if self._admission is None:
+            try:
+                self._require_admission()
+            except DeviceRecordingError as error:
+                raise ProviderError(
+                    error.code,
+                    error.message,
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                ) from error
         reason = body.get("reason")
         if self._active is None:
             if reason == "safe_swap" and self._pending_safe_swap is not None:
@@ -1092,7 +1149,8 @@ class CaptureCoordinator:
 
     def report_media_loss(self, *, generation_id: str) -> None:
         with self._lock:
-            if generation_id != self._admission.generation_id:
+            admission = self._require_admission()
+            if generation_id != admission.generation_id:
                 raise DeviceRecordingError("stale_generation", "介质事件来自过期挂载代次")
             if self._active is None:
                 return
@@ -1170,7 +1228,15 @@ class CaptureCoordinator:
                     status=HTTPStatus.LOCKED,
                     retryable=True,
                 )
-            self._check_generation()
+            try:
+                self._check_generation()
+            except DeviceRecordingError as error:
+                raise ProviderError(
+                    error.code,
+                    error.message,
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                ) from error
             self._open_representations += 1
         released = False
 
@@ -1184,8 +1250,9 @@ class CaptureCoordinator:
         return release
 
     def _open_store(self) -> DirectorySessionStore:
+        admission = self._require_admission()
         return DirectorySessionStore(
-            self._admission.sessions_root,
+            admission.sessions_root,
             verified_manifests=self._verified,
         )
 
@@ -1214,7 +1281,7 @@ class CaptureCoordinator:
             store.close()
 
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
-        path = self._admission.sessions_root / session_id
+        path = self._require_admission().sessions_root / session_id
         manifest, _ = inspect_device_session_directory(path)
         return manifest
 
@@ -1247,11 +1314,10 @@ class CaptureCoordinator:
                 status=HTTPStatus.CONFLICT,
                 retryable=True,
             ) from error
+        admission = self._require_admission()
         items: list[dict[str, object]] = []
         diagnostics: list[dict[str, object]] = []
-        for candidate in sorted(
-            self._admission.sessions_root.iterdir(), key=lambda path: path.name
-        ):
+        for candidate in sorted(admission.sessions_root.iterdir(), key=lambda path: path.name):
             if not candidate.is_dir() or candidate.name.endswith(".partial"):
                 continue
             if candidate.name in self._retained and candidate.name not in self._verified:

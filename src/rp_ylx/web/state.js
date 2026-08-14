@@ -48,7 +48,7 @@
  * @typedef {object} DeviceDescriptor
  * @property {{device_id: string, device_label: string}} device
  * @property {{capture: boolean, preview: boolean, range_download: boolean, network_mutation: boolean}} capabilities
- * @property {{volume_id: string, total_bytes: number, available_bytes: number, writable: boolean}} storage
+ * @property {{volume_id: string | null, total_bytes: number, available_bytes: number, writable: boolean}} storage
  */
 /**
  * @typedef {object} AppState
