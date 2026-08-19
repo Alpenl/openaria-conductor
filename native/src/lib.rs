@@ -8,6 +8,7 @@ mod native_camera;
 mod preview;
 mod recording;
 mod session_io;
+mod stereo_encoder;
 mod turbojpeg;
 mod v4l2;
 
@@ -30,6 +31,7 @@ const RECORDING_CODEC: &str = "recording_codec";
 const RECORDING_SINK: &str = "recording_sink";
 const RECORDING_FRAME_GATE: &str = "recording_frame_gate";
 const RECORDING_EVENT_QUEUE: &str = "recording_event_queue";
+const STEREO_ENCODER_EVENTS: &str = "stereo_encoder_events";
 const SESSION_IO: &str = "session_io";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
@@ -55,6 +57,10 @@ fn recording_error(error: recording::RecordingError) -> PyErr {
 }
 
 fn session_io_error(error: session_io::SessionIoError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn stereo_encoder_event_error(error: stereo_encoder::EncoderEventError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
 
@@ -683,6 +689,25 @@ impl NativeRecordingEventQueue {
 }
 
 #[pyclass]
+struct NativeStereoEncoderEvents;
+
+#[pymethods]
+impl NativeStereoEncoderEvents {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn parse(&self, py: Python<'_>, line: &[u8]) -> PyResult<Option<Py<PyDict>>> {
+        let event = stereo_encoder::parse_event(line).map_err(stereo_encoder_event_error)?;
+        let Some(event) = event else {
+            return Ok(None);
+        };
+        Ok(Some(stereo_encoder_event_dict(py, &event)?))
+    }
+}
+
+#[pyclass]
 struct NativeSessionIo;
 
 #[pymethods]
@@ -982,6 +1007,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     features.push(RECORDING_SINK);
     features.push(RECORDING_FRAME_GATE);
     features.push(RECORDING_EVENT_QUEUE);
+    features.push(STEREO_ENCODER_EVENTS);
     features.push(SESSION_IO);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
@@ -1107,6 +1133,44 @@ fn recording_event_queue_stats_dict(
     Ok(value.unbind())
 }
 
+fn stereo_encoder_event_dict(
+    py: Python<'_>,
+    event: &stereo_encoder::EncoderEvent,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    match event {
+        stereo_encoder::EncoderEvent::Ready => {
+            value.set_item("event", "ready")?;
+        }
+        stereo_encoder::EncoderEvent::Segment(segment) => {
+            value.set_item("event", "segment")?;
+            value.set_item("index", segment.index)?;
+            value.set_item("start_frame", segment.start_frame)?;
+            value.set_item("end_frame", segment.end_frame)?;
+            let left = PyDict::new(py);
+            left.set_item("path", &segment.left_path)?;
+            left.set_item("bytes", segment.left_bytes)?;
+            value.set_item("left", left)?;
+            let right = PyDict::new(py);
+            right.set_item("path", &segment.right_path)?;
+            right.set_item("bytes", segment.right_bytes)?;
+            value.set_item("right", right)?;
+        }
+        stereo_encoder::EncoderEvent::Done(stats) => {
+            value.set_item("event", "done")?;
+            for (key, number) in stats {
+                value.set_item(key, number)?;
+            }
+        }
+        stereo_encoder::EncoderEvent::Error { code, message } => {
+            value.set_item("event", "error")?;
+            value.set_item("code", code)?;
+            value.set_item("message", message)?;
+        }
+    }
+    Ok(value.unbind())
+}
+
 fn imu_observation_dict(py: Python<'_>, result: &imu::ImuObservation) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("dropped_samples", result.dropped_samples)?;
@@ -1185,6 +1249,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeRecordingSink>()?;
     module.add_class::<NativeRecordingFrameGate>()?;
     module.add_class::<NativeRecordingEventQueue>()?;
+    module.add_class::<NativeStereoEncoderEvents>()?;
     module.add_class::<NativeSessionIo>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;
@@ -1197,7 +1262,8 @@ mod tests {
     use super::{
         CAPABILITY_PROBE, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
         NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_EVENT_QUEUE,
-        RECORDING_FRAME_GATE, RECORDING_SINK, SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        RECORDING_FRAME_GATE, RECORDING_SINK, SESSION_IO, STEREO_ENCODER_EVENTS, TURBOJPEG_SPLIT,
+        V4L2_CAPTURE,
     };
 
     #[test]
@@ -1215,6 +1281,7 @@ mod tests {
         assert_eq!(RECORDING_SINK, "recording_sink");
         assert_eq!(RECORDING_FRAME_GATE, "recording_frame_gate");
         assert_eq!(RECORDING_EVENT_QUEUE, "recording_event_queue");
+        assert_eq!(STEREO_ENCODER_EVENTS, "stereo_encoder_events");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");

@@ -350,6 +350,11 @@ def build_production_service(
                 "正式录制缺少 Rust 录制事件队列能力",
                 code="native_recording_event_queue_unavailable",
             )
+        if "stereo_encoder_events" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 编码助手事件解析能力",
+                code="native_stereo_encoder_events_unavailable",
+            )
         if "session_io" not in capabilities.features:
             raise ProductionConfigError(
                 "正式录制缺少 Rust 会话 I/O 校验能力",

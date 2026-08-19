@@ -237,6 +237,10 @@ class NativeRecordingEventQueue(Protocol):
     def close_and_clear(self) -> None: ...
 
 
+class NativeStereoEncoderEvents(Protocol):
+    def parse(self, line: bytes) -> dict[str, object] | None: ...
+
+
 class NativeSessionIo(Protocol):
     def hash_file(self, path: str) -> dict[str, object]: ...
 
@@ -522,6 +526,32 @@ def create_native_recording_event_queue(capacity: int) -> NativeRecordingEventQu
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_recording_event_queue_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_stereo_encoder_events() -> NativeStereoEncoderEvents:
+    """Create the Rust stereo encoder stdout event parser or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_stereo_encoder_events_unavailable",
+            f"无法加载原生编码助手事件解析模块：{exc}",
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "stereo_encoder_events" not in capabilities.features:
+        raise NativeModuleError(
+            "native_stereo_encoder_events_unavailable",
+            "原生模块缺少编码助手事件解析能力",
+        )
+    try:
+        return module.NativeStereoEncoderEvents()
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_stereo_encoder_events_init_failed", raw
         raise NativeModuleError(code, message) from exc
 
 

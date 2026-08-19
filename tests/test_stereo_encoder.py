@@ -8,7 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from rp_ylx.recording.stereo_encoder import StereoEncoderProcess, _writev_all, resolve_executable
+from rp_ylx.recording.stereo_encoder import (
+    StereoEncoderError,
+    StereoEncoderProcess,
+    _parse_event,
+    _writev_all,
+    resolve_executable,
+)
 
 
 class StereoEncoderResolutionTest(unittest.TestCase):
@@ -77,6 +83,48 @@ class StereoEncoderResolutionTest(unittest.TestCase):
         native.write_encoder_frame.assert_called_once_with(7, b"abc")
         fallback.assert_not_called()
         self.assertEqual(encoder.submitted_frames, 1)
+
+    def test_parse_event_uses_native_parser_when_available(self) -> None:
+        parsed = {"event": "done", "frames": 3}
+        native = SimpleNamespace(parse=Mock(return_value=parsed))
+
+        with patch("rp_ylx.recording.stereo_encoder._encoder_events_or_none", return_value=native):
+            self.assertEqual(_parse_event(b"ignored by fake native"), parsed)
+
+        native.parse.assert_called_once_with(b"ignored by fake native")
+
+    def test_handle_event_records_native_segment_and_failure(self) -> None:
+        encoder = object.__new__(StereoEncoderProcess)
+        encoder._lock = threading.Lock()
+        encoder._segments = []
+        encoder._stats = {}
+        encoder._failure = None
+        native = SimpleNamespace(
+            parse=Mock(
+                return_value={
+                    "event": "segment",
+                    "index": 1,
+                    "start_frame": 2,
+                    "end_frame": 3,
+                    "left": {"path": "video/left_00001.mp4", "bytes": 10},
+                    "right": {"path": "video/right_00001.mp4", "bytes": 11},
+                }
+            )
+        )
+
+        with patch("rp_ylx.recording.stereo_encoder._encoder_events_or_none", return_value=native):
+            encoder._handle_event(b"segment")
+
+        self.assertEqual(len(encoder.segments), 1)
+        self.assertEqual(encoder.segments[0].left_path, "video/left_00001.mp4")
+
+        native.parse.side_effect = RuntimeError("encoder_failed: malformed event")
+        with patch("rp_ylx.recording.stereo_encoder._encoder_events_or_none", return_value=native):
+            encoder._handle_event(b"bad")
+
+        self.assertIsInstance(encoder._failure, StereoEncoderError)
+        self.assertEqual(encoder._failure.code, "encoder_failed")
+        self.assertEqual(encoder._failure.message, "malformed event")
 
 
 if __name__ == "__main__":

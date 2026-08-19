@@ -18,7 +18,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from rp_ylx.native import NativeModuleError, NativeSessionIo, create_native_session_io
+from rp_ylx.native import (
+    NativeModuleError,
+    NativeSessionIo,
+    NativeStereoEncoderEvents,
+    create_native_session_io,
+    create_native_stereo_encoder_events,
+)
 
 _FRAME_MAGIC = b"YLXF"
 _HEADER = struct.Struct("<4sI")
@@ -27,6 +33,9 @@ _DEFAULT_EXECUTABLE = "ylx-stereo-encoder"
 _SESSION_IO_LOCK = threading.Lock()
 _SESSION_IO: NativeSessionIo | None = None
 _SESSION_IO_UNAVAILABLE = False
+_ENCODER_EVENTS_LOCK = threading.Lock()
+_ENCODER_EVENTS: NativeStereoEncoderEvents | None = None
+_ENCODER_EVENTS_UNAVAILABLE = False
 
 
 class StereoEncoderError(RuntimeError):
@@ -259,16 +268,13 @@ class StereoEncoderProcess:
             self._done.set()
 
     def _handle_event(self, line: bytes) -> None:
-        text = line.strip()
-        if not text:
-            return
         try:
-            event = json.loads(text)
-        except ValueError:
+            event = _parse_event(line)
+        except StereoEncoderError as error:
             with self._lock:
-                self._failure = self._failure or StereoEncoderError(
-                    "encoder_failed", "助手输出不是 JSON"
-                )
+                self._failure = self._failure or error
+            return
+        if event is None:
             return
         kind = event.get("event")
         if kind == "ready":
@@ -343,3 +349,49 @@ def _session_io_or_none() -> NativeSessionIo | None:
             _SESSION_IO_UNAVAILABLE = True
             return None
         return _SESSION_IO
+
+
+def _encoder_events_or_none() -> NativeStereoEncoderEvents | None:
+    global _ENCODER_EVENTS, _ENCODER_EVENTS_UNAVAILABLE
+    if _ENCODER_EVENTS_UNAVAILABLE:
+        return None
+    if _ENCODER_EVENTS is not None:
+        return _ENCODER_EVENTS
+    with _ENCODER_EVENTS_LOCK:
+        if _ENCODER_EVENTS_UNAVAILABLE:
+            return None
+        if _ENCODER_EVENTS is not None:
+            return _ENCODER_EVENTS
+        try:
+            _ENCODER_EVENTS = create_native_stereo_encoder_events()
+        except NativeModuleError:
+            _ENCODER_EVENTS_UNAVAILABLE = True
+            return None
+        return _ENCODER_EVENTS
+
+
+def _parse_event(line: bytes) -> dict[str, object] | None:
+    native = _encoder_events_or_none()
+    if native is not None:
+        try:
+            return native.parse(line)
+        except RuntimeError as error:
+            raise _native_encoder_event_error(error) from error
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        event = json.loads(text)
+    except ValueError as error:
+        raise StereoEncoderError("encoder_failed", "助手输出不是 JSON") from error
+    if not isinstance(event, dict):
+        raise StereoEncoderError("encoder_failed", "助手输出 JSON 不是对象")
+    return event
+
+
+def _native_encoder_event_error(error: RuntimeError) -> StereoEncoderError:
+    raw = str(error)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = "encoder_failed", raw
+    return StereoEncoderError(code, message)
