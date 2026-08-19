@@ -1,0 +1,22 @@
+{
+  "schema": "ylx.capture-event.v3",
+  "sse_delivery_id": "1043",
+  "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "source_revision": 43,
+  "type": "diagnostic",
+  "occurred_at": "2026-08-08T13:01:02+08:00",
+  "session_id": "0198a100-0001-7001-8000-000000000001",
+  "data": {
+    "schema": "ylx.capture-diagnostic-event.v2",
+    "diagnostic": {
+      "code": "media_lost",
+      "severity": "error",
+      "message": "The selected recording volume disappeared before finalization.",
+      "at": "2026-08-08T13:01:02+08:00",
+      "recoverable": true,
+      "details": {
+        "action": "reinsert_same_volume"
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Python dependencies
+        run: uv sync --frozen --extra dev
+      - name: Install web test dependencies
+        run: npm ci
+      - name: Run hardware-free checks
+        run: uv run python scripts/check.py
+      - name: Type-check embedded web
+        run: npm run typecheck:web
+      - name: Lint embedded web
+        run: npm run lint:web
+      - name: Test embedded web
+        run: npm run test:web
+      - name: Build distribution
+        run: |
+          uv build
+          uv venv --no-project /tmp/rp-ylx-wheel-venv
+          uv pip install --python /tmp/rp-ylx-wheel-venv/bin/python dist/*.whl
+          build_info="$(cd /tmp && /tmp/rp-ylx-wheel-venv/bin/rp-ylx --version)"
+          test "$build_info" = "rp-ylx 0.1.0 ($GITHUB_SHA)"
+          printf '%s\n' "$build_info" > dist/build-info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp-ylx-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

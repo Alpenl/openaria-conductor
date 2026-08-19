@@ -1,0 +1,310 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RP-YLX 设备 API",
+    "version": "v0",
+    "description": "设备状态、录制控制、事件和有界实时预览接口。"
+  },
+  "servers": [{"url": "http://127.0.0.1:8080/api/v0"}],
+  "paths": {
+    "/device": {
+      "get": {
+        "operationId": "getDevice",
+        "responses": {
+          "200": {
+            "description": "稳定设备身份",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DeviceResponse"}}}
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "responses": {
+          "200": {
+            "description": "当前完整状态快照",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Status"}}}
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "responses": {
+          "200": {
+            "description": "设备上可见的会话摘要",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SessionList"}}}
+          }
+        }
+      }
+    },
+    "/recordings/start": {
+      "post": {
+        "operationId": "startRecording",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StartCommand"}}}
+        },
+        "responses": {
+          "202": {
+            "description": "命令已接受；相同 request_id 重放相同响应",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CommandResponse"}}}
+          },
+          "400": {"$ref": "#/components/responses/ErrorResponse"},
+          "409": {"$ref": "#/components/responses/ErrorResponse"},
+          "503": {"$ref": "#/components/responses/ErrorResponse"},
+          "507": {"$ref": "#/components/responses/ErrorResponse"}
+        }
+      }
+    },
+    "/recordings/stop": {
+      "post": {
+        "operationId": "stopRecording",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StopCommand"}}}
+        },
+        "responses": {
+          "202": {
+            "description": "命令已接受；相同 request_id 重放相同响应",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CommandResponse"}}}
+          },
+          "400": {"$ref": "#/components/responses/ErrorResponse"},
+          "409": {"$ref": "#/components/responses/ErrorResponse"}
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "operationId": "streamEvents",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {"type": "integer", "minimum": 0}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE；每个 snapshot、status 或 diagnostic 的 data 都是完整 Status",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "id 是 revision；event 是 snapshot/status/diagnostic；data 符合 Status"
+                }
+              }
+            },
+            "x-sse-events": {
+              "snapshot": {"data": {"$ref": "#/components/schemas/Status"}},
+              "status": {"data": {"$ref": "#/components/schemas/Status"}},
+              "diagnostic": {"data": {"$ref": "#/components/schemas/Status"}}
+            }
+          }
+        }
+      }
+    },
+    "/preview/frame": {
+      "get": {
+        "operationId": "getPreviewFrame",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "eye",
+            "required": true,
+            "schema": {"enum": ["left", "right"]}
+          },
+          {
+            "in": "query",
+            "name": "sequence",
+            "required": false,
+            "description": "省略时读取最新双目帧；提供时固定读取缓存中的该 pair_sequence",
+            "schema": {"type": "integer", "minimum": 0}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "最新双目源帧的指定眼 JPEG；同一双目帧的左右眼共享序号和时间",
+            "headers": {
+              "X-YLX-Sequence": {
+                "required": true,
+                "description": "十进制无符号双目源帧序号；同一对左右眼取值相同",
+                "schema": {"type": "string", "pattern": "^[0-9]+$"}
+              },
+              "X-YLX-Monotonic-Ns": {
+                "required": true,
+                "description": "十进制双目源帧主机单调时钟纳秒；同一对左右眼取值相同",
+                "schema": {"type": "string", "pattern": "^[0-9]+$"}
+              }
+            },
+            "content": {"image/jpeg": {"schema": {"type": "string", "contentEncoding": "binary"}}}
+          },
+          "400": {"$ref": "#/components/responses/ErrorResponse"},
+          "410": {"$ref": "#/components/responses/ErrorResponse"},
+          "503": {"$ref": "#/components/responses/ErrorResponse"}
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+    "DeviceResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "device"],
+      "properties": {
+        "api_version": {"const": "v0"},
+        "device": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "label", "model", "software_version"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "label": {"type": "string", "minLength": 1},
+            "model": {"type": "string", "minLength": 1},
+            "software_version": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "Recording": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "session_id", "started_at", "frames", "imu_samples"],
+      "properties": {
+        "state": {"enum": ["idle", "starting", "recording", "stopping", "failed"]},
+        "session_id": {"type": ["string", "null"]},
+        "started_at": {"type": ["string", "null"], "format": "date-time"},
+        "frames": {"type": "integer", "minimum": 0},
+        "imu_samples": {"type": "integer", "minimum": 0}
+      }
+    },
+    "Status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "observed_at", "health", "recording", "storage", "issues"],
+      "properties": {
+        "revision": {"type": "integer", "minimum": 0},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "health": {"enum": ["ok", "degraded", "error"]},
+        "recording": {"$ref": "#/components/schemas/Recording"},
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["free_bytes"],
+          "properties": {"free_bytes": {"type": "integer", "minimum": 0}}
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": {
+              "code": {"type": "string", "minLength": 1},
+              "message": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "SessionList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "sessions"],
+      "properties": {
+        "revision": {"type": "integer", "minimum": 0},
+        "sessions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id", "state", "started_at", "ended_at", "bytes"],
+            "properties": {
+              "session_id": {"type": "string"},
+              "state": {"enum": ["sealed", "interrupted", "failed"]},
+              "started_at": {"type": "string", "format": "date-time"},
+              "ended_at": {"type": ["string", "null"], "format": "date-time"},
+              "bytes": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "StartCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id"],
+      "properties": {
+        "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "expected_revision": {"type": "integer", "minimum": 0}
+      }
+    },
+    "StopCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "reason"],
+      "properties": {
+        "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "expected_revision": {"type": "integer", "minimum": 0},
+        "reason": {"enum": ["user", "device_shutdown"]}
+      }
+    },
+    "CommandResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "accepted", "revision", "recording"],
+      "properties": {
+        "request_id": {"type": "string"},
+        "accepted": {"const": true},
+        "revision": {"type": "integer", "minimum": 0},
+        "recording": {"$ref": "#/components/schemas/Recording"}
+      }
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "not_found",
+            "capture_busy",
+            "invalid_state",
+            "stale_revision",
+            "hardware_unavailable",
+            "storage_unavailable",
+            "preview_unavailable",
+            "preview_frame_expired",
+            "internal_error"
+          ]
+        },
+        "message": {"type": "string", "minLength": 1},
+        "retryable": {"type": "boolean"}
+      }
+    }
+    },
+    "responses": {
+    "ErrorResponse": {
+      "description": "设备 API 错误",
+      "content": {
+        "application/json": {
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["error", "revision"],
+            "properties": {
+              "error": {"$ref": "#/components/schemas/Error"},
+              "revision": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    }
+    }
+  }
+}

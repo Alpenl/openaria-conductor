@@ -1,0 +1,13 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">RP-YLX on %h</name>
+  <service>
+    <type>_ylx-capture._tcp</type>
+    <port>8080</port>
+  </service>
+  <service>
+    <type>_http._tcp</type>
+    <port>8080</port>
+  </service>
+</service-group>

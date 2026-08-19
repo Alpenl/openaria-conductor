@@ -1,0 +1,73 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "rp-ylx"
+version = "0.1.0"
+description = "RDK X5 + YLX 2UQ2 双目视频与 IMU 录制服务"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "jsonschema>=4.23,<5",
+  "pillow>=10,<13",
+  "typing-extensions>=4.4,<5",
+  "zeroconf>=0.150,<1",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.12,<1"]
+
+[project.scripts]
+rp-ylx = "rp_ylx.cli:main"
+rp-ylx-deploy = "rp_ylx.deployment:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rp_ylx = [
+  "contracts/*.json",
+  "api/*.json",
+  "api/*.yaml",
+  "schemas/*.json",
+  "hobot/*.c",
+  "hobot/*.h",
+  "hobot/Makefile",
+]
+"rp_ylx.deploy" = [
+  "*.avahi",
+  "*.service",
+  "*.timer",
+  "*.sysusers",
+  "*.tmpfiles",
+  "*.conf",
+  "*.default",
+  "rp-ylx-data-volume",
+  "rp-ylx-wifi-watchdog",
+]
+"rp_ylx.web" = ["*.html", "*.css", "*.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.maturin]
+manifest-path = "native/Cargo.toml"
+python-source = "src"
+module-name = "rp_ylx._native"
+features = ["extension-module"]
+include = [
+  { path = "build_backend.py", format = "sdist" },
+  { path = "Cargo.lock", format = "sdist" },
+  { path = "Cargo.toml", format = "sdist" },
+  { path = "contracts/golden/*.json", format = "sdist" },
+]

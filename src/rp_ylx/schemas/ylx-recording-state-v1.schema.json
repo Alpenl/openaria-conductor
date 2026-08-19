@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:recording-state:v1",
+  "title": "YLX 录制状态 v1",
+  "description": "进行中或未成功会话的运行状态。recoverable、failed 和 abandoned 是不可变的终止结果，绝不会成为完成标记。此 schema 不定义抢救转换或恢复来源；未来的任何抢救流程都需要独立的版本化恢复契约、尝试标识和输出命名空间。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "state",
+    "authority_epoch",
+    "state_revision",
+    "updated_at",
+    "session_id",
+    "take_id",
+    "display_name",
+    "device",
+    "storage",
+    "progress",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ylx.recording-state.v1"
+    },
+    "state": {
+      "enum": [
+        "recording",
+        "finalizing",
+        "verifying",
+        "recoverable",
+        "failed",
+        "abandoned"
+      ]
+    },
+    "authority_epoch": {
+      "$ref": "#/$defs/uuidV4",
+      "description": "提交这些精确 Recording State 字节的 daemon 权威生命周期。普通重启会保留该值；新获授权的权威生命周期使用新值。"
+    },
+    "state_revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "在 authority_epoch 内提交这些精确 Recording State 字节的 daemon source_revision。它不是 SSE 投递 ID，绝不会与 Last-Event-ID 一起使用。"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "session_id": {
+      "$ref": "#/$defs/uuidV7"
+    },
+    "take_id": {
+      "$ref": "#/$defs/uuidV7"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "device": {
+      "$ref": "#/$defs/deviceIdentity"
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["volume_id", "status", "writable", "remaining_bytes"],
+      "properties": {
+        "volume_id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "status": {
+          "enum": ["mounted", "sealing", "media_lost"],
+          "description": "任务处于活动或未成功状态时的存储状况。成功释放不是 Recording State 值，只由版本化 safe-swap 交接回执表示。media_lost 表示在有序交接前检测到介质被移除。"
+        },
+        "writable": {
+          "type": "boolean"
+        },
+        "remaining_bytes": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "const": "media_lost"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "writable": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["elapsed_seconds", "captured_frames", "bytes_written"],
+      "properties": {
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "captured_frames": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_written": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verification": {
+          "$ref": "#/$defs/counter"
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "abandonment": {
+      "$ref": "#/$defs/abandonment"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "const": "recoverable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "diagnostics": {
+            "contains": {
+              "type": "object",
+              "required": ["recoverable"],
+              "properties": {
+                "recoverable": {
+                  "const": true
+                }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "const": "failed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "diagnostics": {
+            "minItems": 1,
+            "contains": {
+              "type": "object",
+              "required": ["severity", "recoverable"],
+              "properties": {
+                "severity": {
+                  "const": "error"
+                },
+                "recoverable": {
+                  "const": false
+                }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "const": "abandoned"
+          }
+        }
+      },
+      "then": {
+        "required": ["abandonment"],
+        "properties": {
+          "diagnostics": {
+            "minItems": 1,
+            "contains": {
+              "type": "object",
+              "required": ["severity", "recoverable"],
+              "properties": {
+                "severity": {
+                  "const": "error"
+                },
+                "recoverable": {
+                  "const": false
+                }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      },
+      "else": {
+        "not": {
+          "required": ["abandonment"]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "const": "verifying"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "progress": {
+            "required": ["verification"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["storage"],
+        "properties": {
+          "storage": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "const": "media_lost"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "state": {
+            "enum": ["recoverable", "failed", "abandoned"]
+          },
+          "diagnostics": {
+            "contains": {
+              "type": "object",
+              "required": ["code"],
+              "properties": {
+                "code": {
+                  "const": "media_lost"
+                }
+              }
+            },
+            "minContains": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "规范的小写 UUIDv7。"
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "规范的小写随机 UUIDv4。"
+    },
+    "deviceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "device_label"],
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "device_label": {
+          "type": "string",
+          "pattern": "^YLX-[0-9A-F]{8}$",
+          "description": "仅用于显示的标签。"
+        }
+      }
+    },
+    "counter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completed", "total"],
+      "properties": {
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message", "at", "recoverable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "maxLength": 96
+        },
+        "severity": {
+          "enum": ["info", "warning", "error"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object",
+          "description": "用于诊断专属机器数据的显式扩展容器。消费者必须且只能在此容器内忽略未知键。",
+          "additionalProperties": true
+        }
+      }
+    },
+    "abandonment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason_code",
+        "reason",
+        "authorized_at",
+        "authorization"
+      ],
+      "properties": {
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "maxLength": 96
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "authorized_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "authorization": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "operator_id"],
+              "properties": {
+                "kind": {
+                  "const": "OPERATOR"
+                },
+                "operator_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+                  "maxLength": 128
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "policy_id",
+                "policy_revision",
+                "policy_sha256"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "POLICY"
+                },
+                "policy_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+                  "maxLength": 128
+                },
+                "policy_revision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "policy_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,3 @@
+u rp-ylx - "RP-YLX capture service" /var/lib/rp-ylx
+m rp-ylx video
+m rp-ylx misc

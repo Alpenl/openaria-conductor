@@ -1,0 +1,736 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:device-session:v1",
+  "title": "YLX 已密封设备会话 Manifest v1",
+  "description": "在最终化、任何由放置位置要求的转换以及设备端验证完成后，最后写入的不可变采集端成功 manifest。它的存在标识会话已密封；每个消费者在使用前仍须独立验证 schema、完整性、不变量及 artifact 字节。转换的执行位置由已部署的媒体契约定义。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "manifest_id",
+    "sealed",
+    "sealed_at",
+    "session_id",
+    "volume_id",
+    "capture_mode",
+    "display_name",
+    "device",
+    "time",
+    "take",
+    "camera",
+    "video",
+    "imu",
+    "frames",
+    "logs",
+    "integrity"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ylx.device-session.v1"
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/uuidV7",
+      "description": "这些精确 manifest 语义的不可变标识；发布还通过 SHA-256 绑定精确的序列化字节。"
+    },
+    "sealed": {
+      "const": true,
+      "description": "会话 manifest 仅表示成功密封的输出。"
+    },
+    "sealed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "session_id": {
+      "$ref": "#/$defs/uuidV7"
+    },
+    "volume_id": {
+      "$ref": "#/$defs/uuidV4"
+    },
+    "capture_mode": {
+      "enum": ["production", "calibration"],
+      "description": "采集意图。已部署的媒体契约决定生产采集写入哪一种受支持的视频布局。"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "仅用于显示的人类可读标签；绝不能将其用作目录键、对象键或会话标识。"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "device_label",
+        "hardware_fingerprint",
+        "platform",
+        "software_version",
+        "commit"
+      ],
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/uuidV4",
+          "description": "规范的随机机器标识。"
+        },
+        "device_label": {
+          "type": "string",
+          "pattern": "^YLX-[0-9A-F]{8}$",
+          "description": "仅用于显示的标签。"
+        },
+        "hardware_fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "software_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        }
+      }
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "timezone", "duration_seconds"],
+      "properties": {
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "timezone": {
+          "type": "string",
+          "pattern": "^[A-Za-z_]+(?:/[A-Za-z0-9_+.-]+)+$",
+          "description": "用于派生 display_name 的 IANA 时区。"
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "duration_clock": {
+          "const": "host_monotonic"
+        }
+      }
+    },
+    "take": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["take_id", "sequence", "continuation_of"],
+      "oneOf": [
+        {
+          "properties": {
+            "sequence": {
+              "const": 1
+            },
+            "continuation_of": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "sequence": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "continuation_of": {
+              "$ref": "#/$defs/uuidV7"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "take_id": {
+          "$ref": "#/$defs/uuidV7",
+          "description": "同一个逻辑 take 中所有会话共享的 UUIDv7。"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "continuation_of": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/uuidV7"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "width",
+        "height",
+        "eye_width",
+        "sensor_fps",
+        "frame_decimation",
+        "effective_fps",
+        "coordinate_frame"
+      ],
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "eye_width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sensor_fps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "frame_decimation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nominal_fps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "effective_fps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "coordinate_frame": {
+          "const": "opencv_optical"
+        }
+      }
+    },
+    "video": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/splitEyesVideo"
+        },
+        {
+          "$ref": "#/$defs/rawSideBySideVideo"
+        }
+      ]
+    },
+    "audio": {
+      "$ref": "#/$defs/audio"
+    },
+    "imu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "sample_count", "units", "coordinate_frame"],
+      "properties": {
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "imu.samples"
+                },
+                "media_type": {
+                  "const": "application/x-ndjson"
+                }
+              }
+            }
+          ]
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "units": {
+          "const": "raw_int16"
+        },
+        "coordinate_frame": {
+          "const": "opencv_optical"
+        }
+      }
+    },
+    "frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "count"],
+      "properties": {
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "frames.index"
+                },
+                "media_type": {
+                  "const": "application/x-ndjson"
+                }
+              }
+            }
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "logs": {
+      "type": "array",
+      "description": "设备端源日志。log.transform 等源角色仍属于普通源清单，与仅用于发布的 publication.transform-log 证据角色不同。",
+      "items": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/artifact"
+          },
+          {
+            "properties": {
+              "role": {
+                "pattern": "^log(?:[._-][a-z0-9]+)+$"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verified_at",
+        "dropped_frames",
+        "drop_events",
+        "fatal_errors"
+      ],
+      "properties": {
+        "verified_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "dropped_frames": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality_policy": {
+          "$ref": "#/$defs/qualityPolicy"
+        },
+        "drop_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dropEvent"
+          }
+        },
+        "media_write_throughput_bytes_per_second": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fatal_errors": {
+          "const": [],
+          "description": "已密封的成功 manifest 不能包含致命错误；失败诊断应写入 ylx.recording-state.v1。"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "qualityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "max_contiguous_dropped_frames",
+        "max_total_dropped_frames",
+        "max_drop_fraction",
+        "window_seconds",
+        "max_dropped_frames_per_window"
+      ],
+      "properties": {
+        "policy_id": {"const": "rdk-x5-lossless-v1"},
+        "max_contiguous_dropped_frames": {"const": 0},
+        "max_total_dropped_frames": {"const": 0},
+        "max_drop_fraction": {"const": 0},
+        "window_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_dropped_frames_per_window": {"const": 0}
+      }
+    },
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "规范的小写 UUIDv7。"
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "规范的小写随机 UUIDv4。"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^(?:manifest\\.json|recording\\.json)(?:/|$)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)[^/]*\\.tmp(?:[._-][^/]*)?(?:/|$)"
+          }
+        }
+      ],
+      "description": "规范化的会话相对 POSIX artifact 路径。根级控制文件和常规 .tmp 名称为密封/状态协议保留。"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "role", "path", "media_type", "bytes", "sha256"],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/sha256",
+          "description": "内容标识；必须等于 sha256。"
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+          "maxLength": 96
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "stereoSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "start_frame",
+        "end_frame",
+        "start_time_seconds",
+        "end_time_seconds",
+        "artifacts"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "从零开始的立体视频分段组索引；组索引必须连续且有序。"
+        },
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "抽帧后、丢帧前域中的闭区间起始帧记录序号。"
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "抽帧后、丢帧前域中的开区间结束帧记录序号。"
+        },
+        "start_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_time_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["left", "right"],
+          "properties": {
+            "left": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/artifact"
+                },
+                {
+                  "properties": {
+                    "role": {
+                      "const": "video.left"
+                    },
+                    "media_type": {
+                      "const": "video/mp4"
+                    }
+                  }
+                }
+              ]
+            },
+            "right": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/artifact"
+                },
+                {
+                  "properties": {
+                    "role": {
+                      "const": "video.right"
+                    },
+                    "media_type": {
+                      "const": "video/mp4"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "splitEyesVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout", "codec", "container", "segments"],
+      "properties": {
+        "layout": {
+          "const": "split-eyes"
+        },
+        "codec": {
+          "const": "h264"
+        },
+        "container": {
+          "const": "mp4"
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stereoSegment"
+          }
+        }
+      }
+    },
+    "rawSideBySideVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout", "codec", "continuous", "artifact"],
+      "properties": {
+        "layout": {
+          "const": "raw-side-by-side"
+        },
+        "codec": {
+          "const": "mjpeg"
+        },
+        "continuous": {
+          "const": true
+        },
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "video.raw-side-by-side"
+                },
+                "media_type": {
+                  "const": "video/x-motion-jpeg"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "codec",
+        "container",
+        "sample_rate_hz",
+        "channels",
+        "sample_format",
+        "sample_count",
+        "sync",
+        "segments"
+      ],
+      "properties": {
+        "device": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "codec": {
+          "const": "pcm_s16le"
+        },
+        "container": {
+          "const": "wav"
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_format": {
+          "const": "S16_LE"
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sync": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "clock",
+            "started_monotonic_ns",
+            "stopped_monotonic_ns",
+            "session_start_offset_seconds",
+            "session_stop_offset_seconds"
+          ],
+          "properties": {
+            "clock": {
+              "const": "host_monotonic"
+            },
+            "started_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stopped_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "session_start_offset_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "session_stop_offset_seconds": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/audioSegment"
+          }
+        }
+      }
+    },
+    "audioSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "start_sample",
+        "end_sample",
+        "start_time_seconds",
+        "end_time_seconds",
+        "artifact"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_sample": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_sample": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_time_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "audio.wav"
+                },
+                "media_type": {
+                  "const": "audio/wav"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "dropEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_frame", "end_frame", "at_time_seconds", "reason", "dropped"],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "抽帧后、丢帧前域中首个被省略的帧记录序号，作为闭区间起点。"
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "抽帧后、丢帧前域中间隙之后的帧记录序号，作为开区间终点。"
+        },
+        "at_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reason": {
+          "const": "write_backpressure"
+        },
+        "dropped": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "必须等于 end_frame 减去 start_frame。"
+        }
+      }
+    }
+  }
+}

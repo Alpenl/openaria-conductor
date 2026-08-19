@@ -1,0 +1,88 @@
+{
+  "artifacts": [
+    {
+      "bytes": 225,
+      "media_type": "application/json",
+      "path": "session.json",
+      "records": 1,
+      "role": "session.metadata",
+      "sha256": "506d42b274547d1df922ae7efb94491693d5510261fbd983f70017004031aed3"
+    },
+    {
+      "bytes": 40,
+      "media_type": "application/vnd.ylx.frame-stream",
+      "path": "video/left.bin",
+      "records": 2,
+      "role": "video.left",
+      "sha256": "2366709724b37d4757dd66174ea8bbc191c383cd57e0028824c8c1c878656f90"
+    },
+    {
+      "bytes": 42,
+      "media_type": "application/vnd.ylx.frame-stream",
+      "path": "video/right.bin",
+      "records": 2,
+      "role": "video.right",
+      "sha256": "145b1731530accfa0bf5e0ddfa487e55546ff7b4a50f5a8ea638e01679f9deff"
+    },
+    {
+      "bytes": 304,
+      "media_type": "application/x-ndjson",
+      "path": "frames.ndjson",
+      "records": 2,
+      "role": "frames.timeline",
+      "sha256": "eedd5d55073fe166436e2c08da385c43beb86d00b736f8d8feb7ed50d0ee9ed4"
+    },
+    {
+      "bytes": 1736,
+      "media_type": "application/x-ndjson",
+      "path": "imu.ndjson",
+      "records": 4,
+      "role": "imu.samples",
+      "sha256": "a702da42e71b65364ed75410fcbebfec2d150547511a8327c1c287b7e95dcd0c"
+    },
+    {
+      "bytes": 209,
+      "media_type": "application/x-ndjson",
+      "path": "diagnostics.ndjson",
+      "records": 1,
+      "role": "diagnostics.events",
+      "sha256": "50e2f5b798433b4f0e492db032fd5a845091e6d8edc1d73fa565a6cd29c40b21"
+    }
+  ],
+  "capture": {
+    "clock": {
+      "domain": "host_monotonic",
+      "unit": "nanosecond"
+    },
+    "imu": {
+      "coordinate_frame": "opencv_optical",
+      "device_tick_hz": 1000000,
+      "ranges": null
+    },
+    "video": {
+      "coordinate_frame": "opencv_optical",
+      "encoding": "fixture-bytes",
+      "fps": 30,
+      "height": 480,
+      "width": 640
+    }
+  },
+  "counts": {
+    "diagnostics": 1,
+    "dropped_frames": 0,
+    "dropped_imu_samples": 0,
+    "frames": 2,
+    "imu_samples": 4
+  },
+  "device": {
+    "id": "rp-ylx-test",
+    "software_version": "0.1.0"
+  },
+  "format": "ylx.recording-session.v0",
+  "session_id": "0198c9a8-7a3c-7000-8000-000000000001",
+  "state": "sealed",
+  "time": {
+    "ended_at": "2026-08-10T01:00:01Z",
+    "started_at": "2026-08-10T01:00:00Z"
+  }
+}

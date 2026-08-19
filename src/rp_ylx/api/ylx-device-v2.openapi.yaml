@@ -1,0 +1,1867 @@
+openapi: 3.1.0
+info:
+  title: YLX Device API
+  version: 2.0.0
+  summary: Target HTTP contract for YLX 0.5 device control and completed-session transfer
+  description: |
+    This is a target contract, not a statement that an implementation exists.
+
+    The capture daemon remains the authoritative state machine. Start and stop are
+    idempotent commands, completed sessions are immutable, and artifact bytes are
+    served with byte-range and HEAD support.
+servers:
+  - url: https://{device_host}/api/v2
+    description: A device reached through AP, Ethernet, or an explicitly configured LAN
+    variables:
+      device_host:
+        default: 10.42.0.1
+        description: IP address or mDNS hostname of the device
+tags:
+  - name: Device
+  - name: Capture
+  - name: Sessions
+x-ylx-security-profiles:
+  customer:
+    authentication: bearer
+    standard_openapi_security: bearer-only-authority
+    description: Every operation requires a customer-issued bearer token.
+    destructive_mutation: target-disabled-pending-STORE-DELETE-01
+    network_mutation: target-disabled-pending-M1-machine-contract
+  lab:
+    authentication: none
+    standard_openapi_resolution: explicit-lab-profile-artifact-required
+    deployment_constraint: isolated-device-only
+    description: |
+      The listed operations are unauthenticated only on an explicitly selected,
+      physically isolated lab deployment. The standard OpenAPI security clauses remain
+      bearer-only and authoritative for Customer; a Lab deployment requires a separately
+      resolved, immutable profile artifact plus runtime verification for exactly the
+      allowed operation IDs below. Destructive and network mutations are not routed in
+      this profile; any implementation-private matching route MUST reject with 403 before
+      reaching its handler.
+    allowed_operation_ids:
+      - getDevice
+      - getCaptureStatus
+      - startCapture
+      - stopCapture
+      - streamCaptureEvents
+      - getCurrentSafeSwapReceipt
+      - getPreview
+      - listSessions
+      - getSession
+      - getRetainedUnsuccessfulSessionOutcome
+      - getSessionArtifact
+      - headSessionArtifact
+    destructive_mutation: unreachable-or-403
+    network_mutation: unreachable-or-403
+x-ylx-external-authority-boundaries:
+  schema: ylx.external-authority-boundaries.v1
+  legacy_v1:
+    status: BLOCKED
+    profile_binding: same-explicit-deployment-profile-as-v2
+    lab_destructive_mutation: unreachable-or-rejected-before-handler
+    lab_network_mutation: unreachable-or-rejected-before-handler
+    customer_destructive_mutation: target-disabled-pending-STORE-DELETE-01
+    deployed_contract_authority:
+      immutable_ref: null
+      contract_sha256: null
+      fixture_set_sha256: null
+      status: BLOCKED
+      blocked_on:
+        - immutable-deployed-contract-ref
+        - deployed-v1-fixture-digest
+  tls_pin:
+    status: BLOCKED
+    authority_requirement: m1-versioned-machine-contract
+    expected_pin_owner: ylx-transfer
+    server_credential_owner: device-gateway
+    configuration:
+      target: null
+      algorithm: null
+      encoding: null
+      provisioning: null
+      rotation: null
+    blocked_on:
+      - target
+      - algorithm
+      - encoding
+      - provisioning
+      - rotation
+paths:
+  /device:
+    get:
+      tags: [Device]
+      operationId: getDevice
+      summary: Read device identity, software, storage, and advertised capabilities
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Device descriptor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceDescriptor"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /capture/status:
+    get:
+      tags: [Capture]
+      operationId: getCaptureStatus
+      summary: Read the current daemon-authoritative capture snapshot
+      description: |
+        Returns the current daemon authority identity and the same closed snapshot
+        payload used by a snapshot CaptureEvent. source_revision is the daemon journal
+        revision of this snapshot; it is never an SSE delivery ID. An idle snapshot may
+        retain the most recent unsuccessful terminal outcome even after later successful
+        sessions; historical outcomes remain queryable per session. Ordinary idle with no
+        retained outcome is still a 200 snapshot with active_recording and
+        retained_unsuccessful both null; runtime remains present.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current authority-bearing capture snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureStatusSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /capture/start:
+    post:
+      tags: [Capture]
+      operationId: startCapture
+      summary: Idempotently start or join the current capture command
+      description: |
+        The daemon allocates identifiers before accepting capture. Repeating the same
+        request converges on the same active recording. Replaying an Idempotency-Key
+        with the same request returns the original response; reusing it with different
+        request data returns 409.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureStartRequest"
+      responses:
+        "202":
+          description: Capture command accepted; response is the current authority-bearing daemon snapshot
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureStatusSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /capture/stop:
+    post:
+      tags: [Capture]
+      operationId: stopCapture
+      summary: Idempotently request capture finalization
+      description: |
+        Repeating stop cannot create a second finalization. Clients may follow
+        finalizing, encoding, or verifying through status/SSE toward a sealed session.
+        When no session is active, stop is an idempotent no-op and returns 204.
+        recoverable, failed, and abandoned are terminal outcomes: they never enter the
+        completed-session list, and clients surface diagnostics. This API version defines
+        no salvage action; any future recovery flow requires a separate versioned recovery
+        contract and API operation. reason=safe_swap is request intent; only a
+        later typed safe_swap receipt, delivered by SSE or recovered field-for-field from
+        /capture/safe-swap, proves durable seal and volume release.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureStopRequest"
+      responses:
+        "202":
+          description: Stop/finalize command accepted; response is the current authority-bearing daemon snapshot
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureStatusSnapshot"
+        "204":
+          description: No session is active; the idempotent stop is a successful no-op
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /capture/events:
+    get:
+      tags: [Capture]
+      operationId: streamCaptureEvents
+      summary: Stream daemon state changes through Server-Sent Events
+      description: |
+        SSE id values and CaptureEvent.sse_delivery_id are the same decimal transport
+        delivery sequence. Clients reconnect with Last-Event-ID; the server first emits
+        a snapshot when the requested delivery ID is no longer in its bounded replay
+        buffer. Every non-heartbeat event separately preserves the daemon-authoritative
+        authority_epoch and source_revision; the gateway never replaces, renumbers,
+        sorts, or deduplicates those source fields. Event names are snapshot, state,
+        progress, diagnostic, safe_swap, and heartbeat. Each non-heartbeat data field is
+        one compact JSON CaptureEvent. safe_swap data is the closed handoff receipt. If a
+        safe_swap event has already fallen out of the bounded replay buffer, the client
+        recovers that identical typed receipt through GET /capture/safe-swap. Heartbeats are
+        SSE comments and do not advance either delivery or source revision.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      x-sse-data-schema:
+        $ref: "#/components/schemas/CaptureEvent"
+      parameters:
+        - $ref: "#/components/parameters/LastEventId"
+      responses:
+        "200":
+          description: Open SSE stream; reconnect using the most recently processed id field
+          headers:
+            Cache-Control:
+              description: SSE responses are never cached
+              schema:
+                type: string
+                const: no-cache
+            X-Accel-Buffering:
+              description: Reverse proxies must not buffer the stream
+              schema:
+                type: string
+                const: "no"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                id: 1042
+                event: state
+                data: {"schema":"ylx.capture-event.v2","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-08-08T02:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"ylx.capture-state-event.v2","state":"encoding","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
+
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /capture/safe-swap:
+    get:
+      tags: [Capture]
+      operationId: getCurrentSafeSwapReceipt
+      summary: Recover the current successful safe-swap handoff receipt
+      description: |
+        Returns the identical typed receipt previously emitted in a successful safe_swap
+        CaptureEvent. This resource is independent of Recording State and survives SSE
+        replay-buffer eviction. The daemon retains it across restart only while it still
+        describes the same released mount generation and session. It MUST atomically
+        invalidate the resource before admitting a different volume, mount generation,
+        or session; remounting the same volume creates a new generation_id. GET never
+        manufactures a receipt from status, list visibility, or absence of open files.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current handoff receipt recovered from the durable receipt store
+          headers:
+            Cache-Control:
+              required: true
+              description: A receipt must never survive server-side generation invalidation in a cache
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SafeSwapReceiptResource"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            No current successful handoff receipt exists, or the retained receipt was
+            invalidated by a volume, mount-generation, or session change.
+          headers:
+            Cache-Control:
+              required: true
+              description: Absence is generation-sensitive and must not be cached
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /preview:
+    get:
+      tags: [Capture]
+      operationId: getPreview
+      summary: Read a non-authoritative low-rate JPEG preview
+      description: |
+        Preview delivery must never backpressure capture. multipart/x-mixed-replace is
+        a live stream; image/jpeg returns the newest available frame and closes.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: fps
+          in: query
+          required: false
+          description: |
+            Requested upper bound; the device may deliver fewer frames and clamps the
+            request to its M4c-qualified deployed profile. Five fps is a measurement
+            candidate, not a protocol maximum or default.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Latest preview image or multipart stream selected by Accept
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                contentEncoding: binary
+            multipart/x-mixed-replace:
+              schema:
+                type: string
+                contentEncoding: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Preview is unavailable in the current device state
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No preview frame is currently available
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /sessions:
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List sealed session candidates and their independent gateway verdicts
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+        - name: limit
+          in: query
+          required: false
+          description: Maximum combined number of normal items and quarantine diagnostics returned
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: take_id
+          in: query
+          required: false
+          description: Filters schema-valid items only; diagnostics remain visible because their take identity is untrusted
+          schema:
+            $ref: "#/components/schemas/UuidV7"
+      responses:
+        "200":
+          description: |
+            Cursor page of discovered candidates. Every schema-valid
+            ylx.device-session.v1 sealed candidate is projected once as SessionSummary,
+            ordered newest first by manifest started_at then session_id. A malformed, unreadable,
+            unsealed, unknown-schema, schema-invalid, or manifest-local-semantics-invalid
+            manifest is projected once only as a closed
+            SessionDiscoveryDiagnostic and MUST NOT be promoted into items by inventing
+            summary fields. The opaque cursor advances across both collections, and the
+            limit counts items plus diagnostics, so a quarantined candidate cannot cause
+            an empty-page loop. verification is null when no current verdict exists;
+            listing a candidate never grants artifact download or export.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /sessions/{session_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Read a sealed session manifest
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: |
+            Exact stored manifest.json bytes, byte-for-byte as sealed on disk. The
+            server MUST NOT parse and reserialize this response. ETag is the quoted
+            SHA-256 of these exact bytes. A current consumer-local usable verdict is
+            not required to inspect the manifest, but remains required for artifact
+            GET/HEAD, Range, export, and publication.
+          x-ylx-byte-preservation: exact-stored-bytes
+          headers:
+            Content-Length:
+              $ref: "#/components/headers/ContentLength"
+            ETag:
+              $ref: "#/components/headers/ETag"
+            YLX-Manifest-SHA256:
+              $ref: "#/components/headers/ManifestSha256"
+          content:
+            application/json:
+              schema:
+                $ref: "../schemas/ylx-device-session-v1.schema.json"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /sessions/{session_id}/unsuccessful-outcome:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: getRetainedUnsuccessfulSessionOutcome
+      summary: Read one retained unsuccessful producer terminal outcome
+      description: |
+        Returns the immutable recoverable, failed, or abandoned Recording State for
+        this session together with the exact daemon authority epoch and source revision
+        that committed it. A later session, daemon restart, current-status replacement,
+        or SSE replay-buffer eviction MUST NOT evict this resource. While the underlying
+        session directory is retained, 404 means no unsuccessful terminal outcome was
+        ever committed for this session; it cannot be inferred from list omission.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Retained unsuccessful outcome for the requested session
+          headers:
+            Cache-Control:
+              required: true
+              description: Authorization and retention changes must not be hidden by an intermediary cache
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetainedUnsuccessfulSessionResource"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No retained unsuccessful outcome exists for this session
+          headers:
+            Cache-Control:
+              required: true
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /sessions/{session_id}/artifacts/{artifact_id}:
+    x-ylx-representation-contract:
+      enforcement: procedural-custom-validator
+      descriptor_source: verified-device-session-manifest.descriptor-by-artifact-id
+      content_type_equals: descriptor.media_type
+      etag_equals: quoted-descriptor.sha256
+      complete_content_length_equals: descriptor.bytes
+      partial_content_length_equals: selected-inclusive-range.bytes
+      applies_to: [GET-200, GET-206, HEAD-200]
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/ArtifactId"
+    get:
+      tags: [Sessions]
+      operationId: getSessionArtifact
+      summary: Download immutable artifact bytes with single-range support
+      description: |
+        The server supports one RFC 9110 bytes range. Multiple ranges are rejected
+        with 416. ETag is the quoted lowercase SHA-256 artifact_id and never changes.
+        Content-Type is the manifest descriptor media_type for 200, 206, and HEAD. A
+        request made while capture, finalization, encoding, or producer verification is
+        active is rejected first with 423 capture_busy and an explicit idle wait state.
+        When the device is idle, a current usable gateway verdict over the exact current
+        manifest bytes is an admission requirement. The server evaluates both gates
+        before Range parsing or representation metadata lookup. An absent, unusable, or
+        stale verdict returns the stable 409 session_not_verified response rather than
+        hiding the artifact as 404 or leaking artifact length through 416.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Range"
+        - $ref: "#/components/parameters/IfRange"
+      responses:
+        "200":
+          description: Complete artifact
+          headers:
+            Accept-Ranges:
+              $ref: "#/components/headers/AcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/ContentLength"
+            Content-Type:
+              $ref: "#/components/headers/ArtifactContentType"
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            "*/*":
+              schema:
+                type: string
+                contentEncoding: binary
+        "206":
+          description: Requested inclusive byte range
+          headers:
+            Accept-Ranges:
+              $ref: "#/components/headers/AcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/ContentLength"
+            Content-Range:
+              $ref: "#/components/headers/ContentRange"
+            Content-Type:
+              $ref: "#/components/headers/ArtifactContentType"
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            "*/*":
+              schema:
+                type: string
+                contentEncoding: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/SessionNotVerified"
+        "423":
+          $ref: "#/components/responses/CaptureBusy"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "416":
+          description: Unsatisfiable or multiple byte ranges; Content-Range reports the full length
+          headers:
+            Content-Range:
+              description: Unsatisfied range form, for example bytes */12345
+              required: true
+              schema:
+                type: string
+                pattern: '^bytes \*/[0-9]+$'
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    head:
+      tags: [Sessions]
+      operationId: headSessionArtifact
+      summary: Read immutable artifact metadata without a response body
+      description: |
+        Uses the same capture-busy and current-verdict admission order as GET. Busy
+        device state returns 423 capture_busy with Retry-After and YLX-Wait-State;
+        an absent, unusable, or stale verdict returns 409 session_not_verified. As
+        required by HEAD semantics, no response body is sent for any status.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Artifact exists; headers match a complete GET
+          headers:
+            Accept-Ranges:
+              $ref: "#/components/headers/AcceptRanges"
+            Content-Length:
+              $ref: "#/components/headers/ContentLength"
+            Content-Type:
+              $ref: "#/components/headers/ArtifactContentType"
+            ETag:
+              $ref: "#/components/headers/ETag"
+        "401":
+          $ref: "#/components/responses/UnauthorizedHead"
+        "403":
+          $ref: "#/components/responses/ForbiddenHead"
+        "409":
+          $ref: "#/components/responses/SessionNotVerifiedHead"
+        "423":
+          $ref: "#/components/responses/CaptureBusyHead"
+        "404":
+          $ref: "#/components/responses/NotFoundHead"
+        "500":
+          $ref: "#/components/responses/InternalErrorHead"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Customer-profile bearer token. Tokens are never accepted in query parameters.
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UuidV7"
+    ArtifactId:
+      name: artifact_id
+      in: path
+      required: true
+      description: Lowercase SHA-256 content identity from the session manifest
+      schema:
+        $ref: "#/components/schemas/Sha256"
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Opaque key scoped to the authenticated customer principal or isolated lab device.
+        Retained for at least 24 hours; 1-128 visible ASCII characters excluding spaces.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[!#-~]+$'
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: Last completely processed decimal SSE delivery ID; not a daemon source revision
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    Range:
+      name: Range
+      in: header
+      required: false
+      description: One RFC 9110 bytes range; multipart ranges are not supported
+      schema:
+        type: string
+        pattern: '^bytes=(?:[0-9]+-[0-9]*|-[0-9]+)$'
+    IfRange:
+      name: If-Range
+      in: header
+      required: false
+      description: Quoted SHA-256 ETag previously returned by GET or HEAD
+      schema:
+        type: string
+        pattern: '^"[0-9a-f]{64}"$'
+  headers:
+    AcceptRanges:
+      description: Supported range unit
+      required: true
+      schema:
+        type: string
+        const: bytes
+    ContentLength:
+      description: Decimal representation length; on HEAD this is the complete GET body length
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+    ContentRange:
+      description: Inclusive returned byte interval and complete artifact size
+      required: true
+      schema:
+        type: string
+        pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$'
+    ETag:
+      description: Strong quoted lowercase SHA-256 content identity
+      required: true
+      schema:
+        type: string
+        pattern: '^"[0-9a-f]{64}"$'
+    ArtifactContentType:
+      description: Exact media_type declared by the matching sealed manifest artifact descriptor
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$'
+    ManifestSha256:
+      description: Lowercase SHA-256 of the exact stored manifest response bytes; equals the unquoted ETag
+      required: true
+      schema:
+        $ref: "#/components/schemas/Sha256"
+    IdempotencyReplayed:
+      description: true when this response was replayed from the idempotency store
+      required: false
+      schema:
+        type: boolean
+  responses:
+    BadRequest:
+      description: Malformed request or unsupported parameter
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Customer-profile bearer credential is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Customer-profile bearer challenge
+          schema:
+            type: string
+            pattern: '^Bearer(?: .*)?$'
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnauthorizedHead:
+      description: Customer-profile bearer credential is missing or invalid; HEAD sends no response body
+      headers:
+        WWW-Authenticate:
+          description: Customer-profile bearer challenge
+          required: true
+          schema:
+            type: string
+            pattern: '^Bearer(?: .*)?$'
+    Forbidden:
+      description: The authenticated Customer principal is not authorized for this operation or resource
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ForbiddenHead:
+      description: The authenticated Customer principal is not authorized; HEAD sends no response body
+    NotFound:
+      description: Resource does not exist or is not sealed
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFoundHead:
+      description: Resource does not exist or is not sealed; HEAD sends no response body
+    Conflict:
+      description: Command conflicts with daemon state or an Idempotency-Key was reused with different input
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    SessionNotVerified:
+      description: |
+        The sealed session or artifact exists, but the gateway has no current usable
+        verdict over the exact current manifest bytes. This includes absent, unusable,
+        and stale/digest-mismatched verdicts. GET returns the problem body.
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: session_not_verified
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/SessionNotVerifiedError"
+    SessionNotVerifiedHead:
+      description: |
+        The sealed session or artifact exists, but the gateway has no current usable
+        verdict over the exact current manifest bytes. HEAD sends no response body.
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: session_not_verified
+    CaptureBusy:
+      description: |
+        Artifact IO is paused while capture, finalization, encoding, or producer
+        verification owns device resources. The client waits for the daemon-authoritative
+        idle state before retrying. GET returns the typed problem body.
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: capture_busy
+        YLX-Wait-State:
+          required: true
+          schema:
+            type: string
+            const: idle
+        Retry-After:
+          required: true
+          description: Conservative whole seconds before polling state again; clients still require an idle snapshot
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/CaptureBusyError"
+    CaptureBusyHead:
+      description: |
+        Artifact IO is paused while capture resources are active. HEAD sends no response
+        body and carries the same stable retry and wait-state headers as GET.
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: capture_busy
+        YLX-Wait-State:
+          required: true
+          schema:
+            type: string
+            const: idle
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+    UnprocessableEntity:
+      description: Request is well formed but fails admission checks
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Unexpected device error
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalErrorHead:
+      description: Unexpected device error; HEAD sends no response body
+  schemas:
+    UuidV7:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      description: Canonical lowercase UUIDv7
+    UuidV4:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      description: Canonical lowercase random UUIDv4
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+    DeviceIdentity:
+      type: object
+      additionalProperties: false
+      required: [device_id, device_label]
+      properties:
+        device_id:
+          $ref: "#/components/schemas/UuidV4"
+        device_label:
+          type: string
+          pattern: '^YLX-[0-9A-F]{8}$'
+          description: Display-only label
+    DeviceDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - device
+        - hardware_fingerprint
+        - api_version
+        - build
+        - security_profile
+        - capabilities
+        - storage
+        - runtime
+      properties:
+        schema:
+          const: ylx.device.v2
+        device:
+          $ref: "#/components/schemas/DeviceIdentity"
+        hardware_fingerprint:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Diagnostic hardware binding; never a device identity or authorization key
+        api_version:
+          const: "2.0"
+        build:
+          type: object
+          additionalProperties: false
+          required: [package_version, commit, build_id]
+          properties:
+            package_version:
+              type: string
+              minLength: 1
+              maxLength: 64
+              description: Monotonic package version, independent of project milestone names
+            commit:
+              type: string
+              pattern: '^[0-9a-f]{40,64}$'
+            build_id:
+              type: string
+              minLength: 1
+              maxLength: 128
+        security_profile:
+          enum: [customer, lab]
+        capabilities:
+          type: object
+          additionalProperties: false
+          required: [capture, preview, range_download, network_mutation]
+          properties:
+            capture:
+              type: boolean
+            preview:
+              type: boolean
+            range_download:
+              const: true
+            network_mutation:
+              const: false
+              description: |
+                Target-disabled for every profile until M1 publishes a separately
+                versioned machine-configuration contract and authorization model.
+                This closed 2.0 descriptor cannot flip the const to true compatibly;
+                enabling it requires a new explicit Device API/schema version and route.
+        storage:
+          type: object
+          additionalProperties: false
+          required: [volume_id, total_bytes, available_bytes, writable]
+          properties:
+            volume_id:
+              description: Null when no recording volume is currently admitted.
+              oneOf:
+                - $ref: "#/components/schemas/UuidV4"
+                - type: "null"
+            total_bytes:
+              type: integer
+              minimum: 0
+            available_bytes:
+              type: integer
+              minimum: 0
+            writable:
+              type: boolean
+        runtime:
+          $ref: "#/components/schemas/DeviceRuntimeStatus"
+      allOf:
+        - if:
+            required: [security_profile]
+            properties:
+              security_profile:
+                const: lab
+          then:
+            properties:
+              capabilities:
+                type: object
+                required: [network_mutation]
+                properties:
+                  network_mutation:
+                    const: false
+    DeviceRuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [observed_at, connection_method, temperature_celsius, network, live_imu]
+      properties:
+        observed_at:
+          type: string
+          format: date-time
+          description: Timestamp at which all fields in this runtime observation were reconciled
+        connection_method:
+          enum: [wifi_ap, wifi_client, ethernet_direct, ethernet_lan, offline]
+          description: Current browser-to-device reachability mode, not an inferred preferred mode
+        temperature_celsius:
+          type: number
+          minimum: -40
+          maximum: 125
+          description: Current SoC thermal reading in degrees Celsius
+        network:
+          $ref: "#/components/schemas/NetworkRuntimeStatus"
+        live_imu:
+          oneOf:
+            - $ref: "#/components/schemas/LiveImuObservation"
+            - type: "null"
+          description: Latest non-stale live sample, or null when no active session sample is available
+    NetworkRuntimeStatus:
+      type: object
+      additionalProperties: false
+      required: [ap, wifi_client, wired, default_route]
+      properties:
+        ap:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        wifi_client:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        wired:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        default_route:
+          enum: [wifi_client, wired, none]
+          description: Interface class currently owning the default route
+    NetworkInterfaceStatus:
+      type: object
+      additionalProperties: false
+      required: [state, interface, addresses, peer_or_ssid]
+      properties:
+        state:
+          enum: [disabled, disconnected, starting, connecting, connected, active, degraded, failed, unavailable]
+        interface:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 64
+              pattern: '^[A-Za-z0-9_.:-]+$'
+            - type: "null"
+        addresses:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+        peer_or_ssid:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 128
+            - type: "null"
+          default: null
+      allOf:
+        - if:
+            required: [state]
+            properties:
+              state:
+                enum: [connected, active, degraded]
+          then:
+            properties:
+              interface:
+                type: string
+                minLength: 1
+                maxLength: 64
+              addresses:
+                minItems: 1
+    LiveImuObservation:
+      type: object
+      additionalProperties: false
+      required: [session_id, clock, acceleration_m_s2, angular_velocity_rad_s, orientation_quaternion]
+      properties:
+        session_id:
+          $ref: "#/components/schemas/UuidV7"
+        clock:
+          type: object
+          additionalProperties: false
+          required: [time_base, epoch_id, timestamp_ns]
+          properties:
+            time_base:
+              const: session_monotonic
+            epoch_id:
+              $ref: "#/components/schemas/UuidV7"
+              description: Must equal the enclosing live IMU session_id
+            timestamp_ns:
+              type: integer
+              minimum: 0
+        acceleration_m_s2:
+          $ref: "#/components/schemas/Vector3"
+        angular_velocity_rad_s:
+          $ref: "#/components/schemas/Vector3"
+        orientation_quaternion:
+          type: object
+          additionalProperties: false
+          required: [w, x, y, z]
+          properties:
+            w: {type: number}
+            x: {type: number}
+            y: {type: number}
+            z: {type: number}
+    Vector3:
+      type: object
+      additionalProperties: false
+      required: [x, y, z]
+      properties:
+        x: {type: number}
+        y: {type: number}
+        z: {type: number}
+    CaptureStartRequest:
+      type: object
+      additionalProperties: false
+      required: [schema, mode, take]
+      properties:
+        schema:
+          const: ylx.capture-start.v2
+        mode:
+          enum: [production, calibration]
+        volume_id:
+          $ref: "#/components/schemas/UuidV4"
+          description: Omit to use the daemon-admitted current volume
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 160
+          description: Optional human override; never becomes an identity
+        take:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [kind]
+              properties:
+                kind:
+                  const: new
+            - type: object
+              additionalProperties: false
+              required: [kind, continuation_of]
+              properties:
+                kind:
+                  const: continue
+                continuation_of:
+                  $ref: "#/components/schemas/UuidV7"
+          description: |
+            For new, the daemon allocates take_id and sequence 1. For continue, the
+            daemon verifies a sealed same-device predecessor, derives the predecessor's
+            take_id and next sequence, and rejects branches or mismatches with 422.
+    CaptureStopRequest:
+      type: object
+      additionalProperties: false
+      required: [schema, reason]
+      properties:
+        schema:
+          const: ylx.capture-stop.v2
+        reason:
+          enum: [user, safe_swap]
+    CaptureStatusSnapshot:
+      type: object
+      additionalProperties: false
+      required: [schema, authority_epoch, source_revision, snapshot]
+      properties:
+        schema:
+          const: ylx.capture-status.v2
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+          description: Current daemon authority lifetime, copied without gateway substitution
+        source_revision:
+          type: integer
+          minimum: 0
+          description: Current daemon journal revision for snapshot; never an SSE delivery ID
+        snapshot:
+          $ref: "#/components/schemas/CaptureSnapshotEventData"
+      description: |
+        HTTP wrapper for the exact snapshot payload also carried by SSE. When the
+        payload contains an active or retained Recording State, its authority_epoch and
+        state_revision equal this wrapper's authority_epoch and source_revision.
+    CaptureEvent:
+      type: object
+      additionalProperties: false
+      required: [schema, sse_delivery_id, authority_epoch, source_revision, type, occurred_at, session_id, data]
+      properties:
+        schema:
+          const: ylx.capture-event.v2
+        sse_delivery_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Transport replay identity; equal to the SSE id field, never a replacement for source_revision
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+          description: Stable daemon authority lifetime copied unchanged through IPC and the gateway
+        source_revision:
+          type: integer
+          minimum: 0
+          description: Durable daemon-authoritative revision copied unchanged through IPC and the gateway
+        type:
+          enum: [snapshot, state, progress, diagnostic, safe_swap]
+        occurred_at:
+          type: string
+          format: date-time
+        session_id:
+          oneOf:
+            - $ref: "#/components/schemas/UuidV7"
+            - type: "null"
+          description: Subject session identity; null is allowed only for a sessionless idle or blocked snapshot, or a device-wide diagnostic
+        data:
+          type: object
+          description: Closed payload selected by type; consumers never infer fields from an extension bag
+      allOf:
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: safe_swap
+          then:
+            properties:
+              session_id:
+                $ref: "#/components/schemas/UuidV7"
+              data:
+                $ref: "#/components/schemas/SafeSwapReceipt"
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: snapshot
+          then:
+            properties:
+              data:
+                $ref: "#/components/schemas/CaptureSnapshotEventData"
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: state
+          then:
+            properties:
+              session_id:
+                $ref: "#/components/schemas/UuidV7"
+              data:
+                $ref: "#/components/schemas/CaptureStateEventData"
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: progress
+          then:
+            properties:
+              session_id:
+                $ref: "#/components/schemas/UuidV7"
+              data:
+                $ref: "#/components/schemas/CaptureProgressEventData"
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: diagnostic
+          then:
+            properties:
+              data:
+                $ref: "#/components/schemas/CaptureDiagnosticEventData"
+    CaptureSnapshotEventData:
+      type: object
+      additionalProperties: false
+      required: [schema, device_state, active_recording, retained_unsuccessful, runtime]
+      properties:
+        schema:
+          const: ylx.capture-snapshot-event.v2
+        device_state:
+          enum: [idle, recording, finalizing, encoding, verifying, blocked]
+        active_recording:
+          oneOf:
+            - $ref: "#/components/schemas/CaptureActiveRecording"
+            - type: "null"
+          description: Current active producer state; non-null exactly in an active device state
+        retained_unsuccessful:
+          oneOf:
+            - $ref: "#/components/schemas/CaptureRetainedUnsuccessfulRecording"
+            - type: "null"
+          description: Most recent unsuccessful terminal outcome while idle; historical outcomes remain queryable per session
+        runtime:
+          $ref: "#/components/schemas/DeviceRuntimeStatus"
+      allOf:
+        - if:
+            required: [device_state]
+            properties:
+              device_state:
+                enum: [recording, finalizing, encoding, verifying]
+          then:
+            properties:
+              active_recording:
+                $ref: "#/components/schemas/CaptureActiveRecording"
+              retained_unsuccessful:
+                type: "null"
+          else:
+            properties:
+              active_recording:
+                type: "null"
+        - if:
+            required: [device_state]
+            properties:
+              device_state:
+                const: blocked
+          then:
+            properties:
+              retained_unsuccessful:
+                type: "null"
+    CaptureSnapshotRecording:
+      type: object
+      additionalProperties: false
+      required: [generation_id, recording_state]
+      properties:
+        generation_id:
+          $ref: "#/components/schemas/UuidV4"
+        recording_state:
+          $ref: "../schemas/ylx-recording-state-v1.schema.json"
+      description: Mount generation plus the complete, lossless persisted Recording State
+    CaptureActiveRecording:
+      allOf:
+        - $ref: "#/components/schemas/CaptureSnapshotRecording"
+        - type: object
+          properties:
+            recording_state:
+              type: object
+              required: [state]
+              properties:
+                state:
+                  enum: [recording, finalizing, encoding, verifying]
+    CaptureRetainedUnsuccessfulRecording:
+      allOf:
+        - $ref: "#/components/schemas/CaptureSnapshotRecording"
+        - type: object
+          properties:
+            recording_state:
+              type: object
+              required: [state]
+              properties:
+                state:
+                  enum: [recoverable, failed, abandoned]
+    CaptureStateEventData:
+      type: object
+      additionalProperties: false
+      required: [schema, state, volume_id, generation_id]
+      properties:
+        schema:
+          const: ylx.capture-state-event.v2
+        state:
+          enum: [recording, finalizing, encoding, verifying, recoverable, failed, abandoned]
+        volume_id:
+          $ref: "#/components/schemas/UuidV4"
+        generation_id:
+          $ref: "#/components/schemas/UuidV4"
+    CaptureProgressEventData:
+      type: object
+      additionalProperties: false
+      required: [schema, phase, elapsed_seconds, completed_units, total_units, unit]
+      properties:
+        schema:
+          const: ylx.capture-progress-event.v2
+        phase:
+          enum: [recording, finalizing, encoding, verifying]
+        elapsed_seconds:
+          type: number
+          minimum: 0
+        completed_units:
+          type: integer
+          minimum: 0
+        total_units:
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: "null"
+        unit:
+          enum: [frames, bytes, artifacts, checks]
+      allOf:
+        - if:
+            required: [total_units]
+            properties:
+              total_units:
+                type: integer
+          then:
+            properties:
+              completed_units:
+                type: integer
+                minimum: 0
+    CaptureDiagnosticEventData:
+      type: object
+      additionalProperties: false
+      required: [schema, diagnostic]
+      properties:
+        schema:
+          const: ylx.capture-diagnostic-event.v2
+        diagnostic:
+          $ref: "#/components/schemas/CaptureDiagnostic"
+    CaptureDiagnostic:
+      $ref: "../schemas/ylx-recording-state-v1.schema.json#/$defs/diagnostic"
+      description: Exact Recording State diagnostic; no timestamp, detail field, or message bytes are dropped
+    RetainedUnsuccessfulSessionResource:
+      type: object
+      additionalProperties: false
+      required: [schema, authority_epoch, source_revision, outcome]
+      properties:
+        schema:
+          const: ylx.retained-unsuccessful-session-resource.v2
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+        source_revision:
+          type: integer
+          minimum: 0
+        outcome:
+          $ref: "#/components/schemas/CaptureRetainedUnsuccessfulRecording"
+      description: |
+        Per-session retained terminal resource. authority_epoch and source_revision
+        exactly equal outcome.recording_state authority_epoch and state_revision.
+    SafeSwapReceipt:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - session_id
+        - volume_id
+        - generation_id
+        - manifest_id
+        - manifest_sha256
+        - sealed_at
+        - released_at
+        - release_state
+        - open_handle_count
+        - handle_audit
+      properties:
+        schema:
+          const: ylx.safe-swap-receipt.v2
+        session_id:
+          $ref: "#/components/schemas/UuidV7"
+        volume_id:
+          $ref: "#/components/schemas/UuidV4"
+        generation_id:
+          $ref: "#/components/schemas/UuidV4"
+          description: |
+            Durable identity of the admitted mount epoch. The daemon allocates and
+            persists it before recording, never reuses it, and allocates a new value
+            whenever any volume, including the same volume_id, is mounted again.
+        manifest_id:
+          $ref: "#/components/schemas/UuidV7"
+        manifest_sha256:
+          $ref: "#/components/schemas/Sha256"
+          description: SHA-256 of the exact durably sealed manifest bytes
+        sealed_at:
+          type: string
+          format: date-time
+          description: Time after artifact/manifest sync, atomic rename, and required directory fsync completed
+        released_at:
+          type: string
+          format: date-time
+          description: Time after every coordinator-observed system-owned volume handle was closed and the removable volume was released
+        release_state:
+          enum: [unmounted, device-released]
+        open_handle_count:
+          const: 0
+          description: |
+            Aggregate of the per-participant counts in handle_audit. This scalar is
+            never sufficient by itself: the closed expected participant set, required
+            access-path coverage, generation/fence binding, and every acknowledgement
+            must also validate. Release uses a non-lazy unmount/device release only
+            after the complete integrated audit reaches zero.
+        handle_audit:
+          $ref: "#/components/schemas/SafeSwapHandleAudit"
+      description: |
+        This HTTP/SSE receipt is the M4 integrated handoff authority. It is not the M3
+        daemon/core IPC receipt: an implementation may project the latter only after
+        the qualified deployment's complete participant inventory has been fenced,
+        drained, audited, and bound here.
+    SafeSwapHandleAudit:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - scope
+        - participant_set_authority
+        - binding_context_sha256
+        - deployment_record_sha256
+        - participant_authority_sha256
+        - expected_participant_set_sha256
+        - expected_participant_ids
+        - admission_fence
+        - acknowledgements
+      properties:
+        schema:
+          const: ylx.safe-swap-handle-audit.v1
+        scope:
+          const: integrated-m4
+          description: Distinguishes whole-system M4 ownership from the narrower M3 daemon/core receipt.
+        participant_set_authority:
+          const: m4-qualified-deployment-record
+          description: The runtime receipt cannot self-author or shrink the expected participant inventory.
+        binding_context_sha256:
+          $ref: "#/components/schemas/Sha256"
+          description: Exact M4 binding-context digest also carried by the independent participant authority.
+        deployment_record_sha256:
+          $ref: "#/components/schemas/Sha256"
+          description: Exact qualified deployment-record digest also carried by the independent participant authority.
+        participant_authority_sha256:
+          $ref: "#/components/schemas/Sha256"
+          description: |
+            SHA-256 of the exact immutable ylx.safe-swap-participant-authority.v1
+            bytes. The authority contains the closed participant-to-access-path map;
+            the receipt cannot select or rewrite that map.
+        expected_participant_set_sha256:
+          $ref: "#/components/schemas/Sha256"
+          description: |
+            SHA-256 of the ASCII participant IDs in bytewise order, each followed by
+            LF. It must equal the participant-set digest frozen by the qualified
+            deployment record; a receipt cannot choose a smaller set at runtime.
+        expected_participant_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Exact bytewise-sorted participant IDs from the qualified deployment inventory.
+          items:
+            type: string
+            pattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+        admission_fence:
+          $ref: "#/components/schemas/SafeSwapAdmissionFence"
+        acknowledgements:
+          type: array
+          minItems: 1
+          description: Exactly one generation-bound acknowledgement for every expected participant ID.
+          items:
+            $ref: "#/components/schemas/SafeSwapParticipantAcknowledgement"
+    SafeSwapAdmissionFence:
+      type: object
+      additionalProperties: false
+      required: [schema, fence_id, generation_id, state, held_until]
+      properties:
+        schema:
+          const: ylx.safe-swap-admission-fence.v1
+        fence_id:
+          $ref: "#/components/schemas/UuidV4"
+        generation_id:
+          $ref: "#/components/schemas/UuidV4"
+        state:
+          const: held
+        held_until:
+          const: receipt-durable-publish
+          description: New volume opens remain fail-closed through durable publication of this receipt.
+    SafeSwapParticipantAcknowledgement:
+      type: object
+      additionalProperties: false
+      required:
+        - participant_id
+        - access_paths
+        - generation_id
+        - fence_id
+        - open_handle_count
+        - release_state
+        - acknowledged_at
+      properties:
+        participant_id:
+          type: string
+          pattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+        access_paths:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Qualified ways this participant can acquire or retain access to the volume.
+          items:
+            enum:
+              - capture-seal
+              - gateway-validation
+              - artifact-get-head-range
+              - preview
+              - lan-transfer
+              - media-adapter
+              - worker
+        generation_id:
+          $ref: "#/components/schemas/UuidV4"
+        fence_id:
+          $ref: "#/components/schemas/UuidV4"
+        open_handle_count:
+          const: 0
+        release_state:
+          enum: [drained, no-handle-opened]
+        acknowledged_at:
+          type: string
+          format: date-time
+    SafeSwapReceiptResource:
+      type: object
+      additionalProperties: false
+      required: [schema, receipt]
+      properties:
+        schema:
+          const: ylx.safe-swap-receipt-resource.v2
+        receipt:
+          $ref: "#/components/schemas/SafeSwapReceipt"
+      description: |
+        Query wrapper for the exact current receipt already emitted in a typed
+        safe_swap event. The wrapper is not Recording State and cannot be synthesized
+        from any state snapshot.
+    SessionSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - session_id
+        - producer_outcome
+        - take_id
+        - take_sequence
+        - continuation_of
+        - display_name
+        - device
+        - started_at
+        - ended_at
+        - duration_seconds
+        - total_bytes
+        - verification
+      properties:
+        session_id:
+          $ref: "#/components/schemas/UuidV7"
+        producer_outcome:
+          const: sealed
+          description: Producer terminal outcome represented by the immutable manifest
+        take_id:
+          $ref: "#/components/schemas/UuidV7"
+        take_sequence:
+          type: integer
+          minimum: 1
+          description: Exact copy of manifest take.sequence
+        continuation_of:
+          oneOf:
+            - $ref: "#/components/schemas/UuidV7"
+            - type: "null"
+          description: Exact copy of manifest take.continuation_of
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 160
+          description: Historical display-only value copied from the sealed manifest
+        device:
+          $ref: "#/components/schemas/DeviceIdentity"
+          description: Historical device identity and label copied from the sealed manifest, never current mutable presentation data
+        started_at:
+          type: string
+          format: date-time
+          description: Exact projection of manifest time.started_at
+        ended_at:
+          type: string
+          format: date-time
+          description: Exact projection of manifest time.ended_at
+        duration_seconds:
+          type: number
+          minimum: 0
+          description: Exact projection of manifest time.duration_seconds
+        total_bytes:
+          type: integer
+          minimum: 0
+          description: Sum of unique downloadable manifest artifact descriptor bytes; excludes manifest.json, recording state, and temporary files
+        verification:
+          oneOf:
+            - $ref: "#/components/schemas/GatewayVerification"
+            - type: "null"
+          description: Current gateway-local verdict for these exact manifest bytes, or null when absent/stale
+    GatewayVerification:
+      type: object
+      additionalProperties: false
+      required: [actor, validator, manifest_sha256, verified_at, verdict, diagnostics]
+      properties:
+        actor:
+          const: gateway
+        validator:
+          type: object
+          additionalProperties: false
+          required: [name, version, build_sha256]
+          properties:
+            name:
+              type: string
+              minLength: 1
+              maxLength: 128
+            version:
+              type: string
+              minLength: 1
+              maxLength: 64
+            build_sha256:
+              $ref: "#/components/schemas/Sha256"
+        manifest_sha256:
+          $ref: "#/components/schemas/Sha256"
+        verified_at:
+          type: string
+          format: date-time
+        verdict:
+          enum: [usable, unusable]
+        diagnostics:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+      allOf:
+        - if:
+            required: [verdict]
+            properties:
+              verdict:
+                const: unusable
+          then:
+            properties:
+              diagnostics:
+                minItems: 1
+    SessionList:
+      type: object
+      additionalProperties: false
+      required: [schema, items, diagnostics, next_cursor]
+      properties:
+        schema:
+          const: ylx.session-list.v2
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        diagnostics:
+          type: array
+          description: Quarantined discovery records that cannot satisfy SessionSummary
+          items:
+            $ref: "#/components/schemas/SessionDiscoveryDiagnostic"
+        next_cursor:
+          oneOf:
+            - type: string
+              minLength: 1
+            - type: "null"
+    SessionDiscoveryDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [quarantine_id, code, observed_at, message]
+      properties:
+        quarantine_id:
+          $ref: "#/components/schemas/UuidV4"
+          description: Stable opaque correlation identity; never a filesystem path or session identity
+        code:
+          enum: [manifest_unreadable, unsupported_schema, manifest_invalid, manifest_not_sealed]
+          description: |
+            manifest_unreadable covers malformed bytes and read failures;
+            unsupported_schema covers an unknown discriminator; manifest_invalid covers
+            closed-schema or manifest-local identity/take/path/seal-semantics failures;
+            manifest_not_sealed covers a readable supported object that is not sealed.
+        observed_at:
+          type: string
+          format: date-time
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable]
+          properties:
+            code:
+              type: string
+              pattern: '^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$'
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              type: boolean
+            details:
+              type: object
+              description: Explicit error-code extension bag. Consumers ignore unknown keys only here.
+              additionalProperties: true
+    SessionNotVerifiedError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: session_not_verified
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              type: boolean
+            details:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason:
+                  enum: [absent, unusable, stale]
+    CaptureBusyError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: capture_busy
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: true
+            details:
+              type: object
+              additionalProperties: false
+              required: [wait_for, retry_after_seconds, current_state]
+              properties:
+                wait_for:
+                  const: idle
+                retry_after_seconds:
+                  type: integer
+                  minimum: 1
+                current_state:
+                  enum: [recording, finalizing, encoding, verifying]
