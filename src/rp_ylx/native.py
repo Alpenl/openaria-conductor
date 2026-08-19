@@ -225,6 +225,18 @@ class NativeRecordingFrameGate(Protocol):
     def snapshot(self) -> dict[str, object]: ...
 
 
+class NativeRecordingEventQueue(Protocol):
+    def put(self, item: object, timeout_seconds: float = 0.0) -> bool: ...
+
+    def get(self) -> object: ...
+
+    def qsize(self) -> int: ...
+
+    def stats(self) -> dict[str, object]: ...
+
+    def close_and_clear(self) -> None: ...
+
+
 class NativeSessionIo(Protocol):
     def hash_file(self, path: str) -> dict[str, object]: ...
 
@@ -484,6 +496,32 @@ def create_native_recording_frame_gate(frame_decimation: int) -> NativeRecording
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_recording_frame_gate_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_recording_event_queue(capacity: int) -> NativeRecordingEventQueue:
+    """Create the Rust recording event queue or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_recording_event_queue_unavailable",
+            f"无法加载原生录制事件队列模块：{exc}",
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "recording_event_queue" not in capabilities.features:
+        raise NativeModuleError(
+            "native_recording_event_queue_unavailable",
+            "原生模块缺少录制事件队列热路径能力",
+        )
+    try:
+        return module.NativeRecordingEventQueue(capacity)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_recording_event_queue_init_failed", raw
         raise NativeModuleError(code, message) from exc
 
 

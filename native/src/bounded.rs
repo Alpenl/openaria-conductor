@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueueStats {
@@ -26,6 +26,7 @@ struct Shared<T> {
     capacity: usize,
     state: Mutex<State<T>>,
     readable: Condvar,
+    writable: Condvar,
 }
 
 impl<T> Shared<T> {
@@ -56,12 +57,39 @@ impl<T> Clone for Producer<T> {
 
 impl<T> Producer<T> {
     pub(crate) fn try_push(&self, value: T) -> Result<(), T> {
+        self.push_timeout(value, Duration::ZERO)
+    }
+
+    pub(crate) fn push_timeout(&self, value: T, timeout: Duration) -> Result<(), T> {
         let mut state = self.shared.state.lock().unwrap();
-        if state.closed {
-            return Err(value);
+        if timeout.is_zero() {
+            if state.closed {
+                return Err(value);
+            }
+            if state.queue.len() == self.shared.capacity {
+                state.rejected += 1;
+                return Err(value);
+            }
+            state.queue.push_back(value);
+            state.peak_depth = state.peak_depth.max(state.queue.len());
+            state.enqueued += 1;
+            self.shared.readable.notify_one();
+            return Ok(());
         }
-        if state.queue.len() == self.shared.capacity {
-            state.rejected += 1;
+        let started = Instant::now();
+        while !state.closed && state.queue.len() == self.shared.capacity {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                state.rejected += 1;
+                return Err(value);
+            };
+            let (next, wait) = self.shared.writable.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.queue.len() == self.shared.capacity {
+                state.rejected += 1;
+                return Err(value);
+            }
+        }
+        if state.closed {
             return Err(value);
         }
         state.queue.push_back(value);
@@ -81,7 +109,34 @@ pub(crate) struct Consumer<T> {
     shared: Arc<Shared<T>>,
 }
 
+impl<T> Clone for Consumer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
 impl<T> Consumer<T> {
+    pub(crate) fn receive_blocking(&self) -> Result<T, RecvTimeoutError> {
+        let state = self.shared.state.lock().unwrap();
+        let mut state = self
+            .shared
+            .readable
+            .wait_while(state, |state| state.queue.is_empty() && !state.closed)
+            .unwrap();
+        if state.closed && state.queue.is_empty() {
+            return Err(RecvTimeoutError::Disconnected);
+        }
+        let value = state
+            .queue
+            .pop_front()
+            .expect("readable bounded queue must contain one value");
+        state.delivered += 1;
+        self.shared.writable.notify_one();
+        Ok(value)
+    }
+
     pub(crate) fn receive(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         let state = self.shared.state.lock().unwrap();
         let (mut state, result) = self
@@ -102,6 +157,7 @@ impl<T> Consumer<T> {
             .pop_front()
             .expect("readable bounded queue must contain one value");
         state.delivered += 1;
+        self.shared.writable.notify_one();
         Ok(value)
     }
 
@@ -114,6 +170,7 @@ impl<T> Consumer<T> {
         state.closed = true;
         state.queue.clear();
         self.shared.readable.notify_all();
+        self.shared.writable.notify_all();
     }
 
     pub(crate) fn reopen(&self) {
@@ -136,6 +193,7 @@ pub(crate) fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
             rejected: 0,
         }),
         readable: Condvar::new(),
+        writable: Condvar::new(),
     });
     (
         Producer {
@@ -174,6 +232,31 @@ mod tests {
         );
         assert_eq!(consumer.stats().depth, 0);
         assert_eq!(consumer.stats().delivered, 2);
+    }
+
+    #[test]
+    fn timed_push_waits_for_consumer_capacity() {
+        let (producer, consumer) = channel(1);
+        assert_eq!(producer.try_push(10), Ok(()));
+        let producer_thread = producer.clone();
+        let handle =
+            std::thread::spawn(move || producer_thread.push_timeout(11, Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(consumer.receive(Duration::from_secs(1)), Ok(10));
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        assert_eq!(consumer.receive(Duration::from_secs(1)), Ok(11));
+        let stats = consumer.stats();
+        assert_eq!(stats.rejected, 0);
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(stats.delivered, 2);
+    }
+
+    #[test]
+    fn timed_push_reports_rejection_after_timeout() {
+        let (producer, _consumer) = channel(1);
+        assert_eq!(producer.try_push(10), Ok(()));
+        assert_eq!(producer.push_timeout(11, Duration::from_millis(1)), Err(11));
+        assert_eq!(producer.stats().rejected, 1);
     }
 
     #[test]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import tempfile
 import threading
 import time
@@ -186,6 +187,46 @@ class FakeAudioRecorder:
         self.aborted = True
 
 
+class FakeNativeEventQueue:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.put_calls = 0
+        self.get_calls = 0
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
+
+    def put(self, item: object, timeout_seconds: float = 0.0) -> bool:
+        self.put_calls += 1
+        try:
+            self._queue.put(item, timeout=timeout_seconds)
+            return True
+        except queue.Full:
+            return False
+
+    def get(self) -> object:
+        self.get_calls += 1
+        return self._queue.get()
+
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+    def stats(self) -> dict[str, object]:
+        return {
+            "capacity": self.capacity,
+            "depth": self._queue.qsize(),
+            "peak_depth": self.capacity,
+            "enqueued": self.put_calls,
+            "delivered": self.get_calls,
+            "rejected": 0,
+        }
+
+    def close_and_clear(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+
 class SplitEyeRecordingTest(unittest.TestCase):
     segment_seconds = 0.1  # 30fps * 0.1s = 3 frames per segment
 
@@ -306,6 +347,35 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 "raw-sbs.mjpeg", {item.name for item in (sealed.path / "video").iterdir()}
             )
             validate_device_session_manifest(manifest)
+
+    def test_recorder_uses_native_event_queue_when_available(self) -> None:
+        queues: list[FakeNativeEventQueue] = []
+
+        def factory(capacity: int) -> FakeNativeEventQueue:
+            native_queue = FakeNativeEventQueue(capacity)
+            queues.append(native_queue)
+            return native_queue
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch(
+                "rp_ylx.recording.device_session.create_native_recording_event_queue",
+                side_effect=factory,
+            ):
+                recorder, _, _ = self.build(
+                    root,
+                    before_write=lambda role, payload: None,
+                )
+            recorder.start()
+            self.feed(recorder, 3)
+            sealed = recorder.stop()
+
+            validate_device_session_manifest(sealed.manifest)
+
+        self.assertEqual(len(queues), 1)
+        self.assertEqual(queues[0].capacity, 128)
+        self.assertGreaterEqual(queues[0].put_calls, 4)
+        self.assertGreaterEqual(queues[0].get_calls, 4)
 
     def test_take_ending_on_a_segment_boundary_seals_without_an_empty_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

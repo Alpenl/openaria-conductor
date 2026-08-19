@@ -27,10 +27,12 @@ from rp_ylx.native import (
     NativeAudioRecorder,
     NativeModuleError,
     NativeRecordingCodec,
+    NativeRecordingEventQueue,
     NativeRecordingSink,
     NativeSessionIo,
     create_native_audio_recorder,
     create_native_recording_codec,
+    create_native_recording_event_queue,
     create_native_recording_sink,
     create_native_session_io,
 )
@@ -418,7 +420,12 @@ class DeviceSessionRecorder:
         )
         self._before_write = before_write or (lambda role, payload: None)
         self._metrics = metrics
-        self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_capacity)
+        self._native_event_queue: NativeRecordingEventQueue | None = None
+        with suppress(NativeModuleError):
+            self._native_event_queue = create_native_recording_event_queue(queue_capacity)
+        self._queue: queue.Queue[object] | None = (
+            None if self._native_event_queue is not None else queue.Queue(maxsize=queue_capacity)
+        )
         self._queue_capacity = queue_capacity
         self._enqueue_timeout = enqueue_timeout
         self._checkpoint_interval = checkpoint_interval
@@ -671,7 +678,7 @@ class DeviceSessionRecorder:
 
     def _writer_loop(self) -> None:
         while True:
-            item = self._queue.get()
+            item = self._queue_get()
             try:
                 if item is _STOP:
                     return
@@ -689,7 +696,37 @@ class DeviceSessionRecorder:
             finally:
                 if isinstance(item, _FrameEvent) and item.payload_lease is not None:
                     item.payload_lease.release()
-                self._queue.task_done()
+                self._queue_task_done()
+
+    def _queue_put(self, item: object, timeout: float) -> bool:
+        native_queue = self._native_event_queue
+        if native_queue is not None:
+            return native_queue.put(item, timeout)
+        assert self._queue is not None
+        try:
+            self._queue.put(item, timeout=timeout)
+            return True
+        except queue.Full:
+            return False
+
+    def _queue_get(self) -> object:
+        native_queue = self._native_event_queue
+        if native_queue is not None:
+            return native_queue.get()
+        assert self._queue is not None
+        return self._queue.get()
+
+    def _queue_depth(self) -> int:
+        native_queue = self._native_event_queue
+        if native_queue is not None:
+            return native_queue.qsize()
+        assert self._queue is not None
+        return self._queue.qsize()
+
+    def _queue_task_done(self) -> None:
+        if self._native_event_queue is None:
+            assert self._queue is not None
+            self._queue.task_done()
 
     def _persist_frame(self, event: _FrameEvent) -> None:
         started = self._metrics.start() if self._metrics is not None else 0
@@ -1017,43 +1054,39 @@ class DeviceSessionRecorder:
                 if self._metrics is not None
                 else None
             )
-            try:
-                self._queue.put(
-                    _FrameEvent(observation, record_sequence, lease), timeout=self._enqueue_timeout
-                )
+            if self._queue_put(
+                _FrameEvent(observation, record_sequence, lease), self._enqueue_timeout
+            ):
                 if self._metrics is not None:
                     self._metrics.observe_queue(
-                        depth=self._queue.qsize(), capacity=self._queue_capacity
+                        depth=self._queue_depth(), capacity=self._queue_capacity
                     )
                 return True
-            except queue.Full:
-                with self._counter_lock:
-                    self._record_drop(record_sequence, record_sequence + 1)
-                if lease is not None:
-                    lease.release()
-                if self._metrics is not None:
-                    self._metrics.observe_queue(
-                        depth=self._queue.qsize(), capacity=self._queue_capacity, rejected=1
-                    )
-                    self._metrics.record_loss("queue_rejected")
-                return False
+            with self._counter_lock:
+                self._record_drop(record_sequence, record_sequence + 1)
+            if lease is not None:
+                lease.release()
+            if self._metrics is not None:
+                self._metrics.observe_queue(
+                    depth=self._queue_depth(), capacity=self._queue_capacity, rejected=1
+                )
+                self._metrics.record_loss("queue_rejected")
+            return False
 
     def submit_imu(self, observation: ImuObservation) -> bool:
         with self._lock:
             self._raise_if_unavailable()
             self._storage_status()
-            try:
-                self._queue.put(_ImuEvent(observation), timeout=self._enqueue_timeout)
+            if self._queue_put(_ImuEvent(observation), self._enqueue_timeout):
                 return True
-            except queue.Full as error:
-                if self._metrics is not None:
-                    self._metrics.observe_queue(
-                        depth=self._queue.qsize(), capacity=self._queue_capacity, rejected=1
-                    )
-                    self._metrics.record_loss("queue_rejected")
-                failure = DeviceRecordingError("imu_backpressure", "IMU 样本未能进入有界队列")
-                self._writer_error = self._writer_error or failure
-                raise failure from error
+            if self._metrics is not None:
+                self._metrics.observe_queue(
+                    depth=self._queue_depth(), capacity=self._queue_capacity, rejected=1
+                )
+                self._metrics.record_loss("queue_rejected")
+            failure = DeviceRecordingError("imu_backpressure", "IMU 样本未能进入有界队列")
+            self._writer_error = self._writer_error or failure
+            raise failure
 
     def _checkpoint_if_due(self) -> None:
         now = time.monotonic()
@@ -1074,11 +1107,8 @@ class DeviceSessionRecorder:
         if writer is None:
             return
         while writer.is_alive():
-            try:
-                self._queue.put(_STOP, timeout=0.1)
+            if self._queue_put(_STOP, 0.1):
                 break
-            except queue.Full:
-                continue
         writer.join(timeout=10)
         if writer.is_alive() and self._writer_error is None:
             self._writer_error = TimeoutError("v1 writer 未在期限内停止")

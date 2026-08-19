@@ -12,6 +12,7 @@ from rp_ylx.native import (
     create_native_performance_metrics,
     create_native_preview_buffer,
     create_native_recording_codec,
+    create_native_recording_event_queue,
     create_native_recording_frame_gate,
     create_native_recording_sink,
     create_native_session_io,
@@ -349,6 +350,36 @@ class NativeCapabilitiesTest(unittest.TestCase):
         with patch("rp_ylx.native.importlib.import_module", return_value=module):
             self.assertIs(create_native_recording_frame_gate(3), owner)
         constructor.assert_called_once_with(3)
+
+    def test_explicit_recording_event_queue_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_recording_event_queue(128)
+        self.assertEqual(raised.exception.code, "native_recording_event_queue_unavailable")
+
+    def test_explicit_recording_event_queue_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "recording_event_queue"],
+            },
+            NativeRecordingEventQueue=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_recording_event_queue(256), owner)
+        constructor.assert_called_once_with(256)
 
     def test_explicit_session_io_requires_native_capability(self) -> None:
         module = SimpleNamespace(

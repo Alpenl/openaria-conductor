@@ -345,6 +345,11 @@ def build_production_service(
                 "正式录制缺少 Rust 录制帧门控能力",
                 code="native_recording_frame_gate_unavailable",
             )
+        if "recording_event_queue" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 录制事件队列能力",
+                code="native_recording_event_queue_unavailable",
+            )
         if "session_io" not in capabilities.features:
             raise ProductionConfigError(
                 "正式录制缺少 Rust 会话 I/O 校验能力",

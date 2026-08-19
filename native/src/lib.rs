@@ -29,6 +29,7 @@ const NATIVE_IMU: &str = "native_imu";
 const RECORDING_CODEC: &str = "recording_codec";
 const RECORDING_SINK: &str = "recording_sink";
 const RECORDING_FRAME_GATE: &str = "recording_frame_gate";
+const RECORDING_EVENT_QUEUE: &str = "recording_event_queue";
 const SESSION_IO: &str = "session_io";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
@@ -618,6 +619,70 @@ impl NativeRecordingFrameGate {
 }
 
 #[pyclass]
+struct NativeRecordingEventQueue {
+    producer: bounded::Producer<Py<PyAny>>,
+    consumer: bounded::Consumer<Py<PyAny>>,
+}
+
+#[pymethods]
+impl NativeRecordingEventQueue {
+    #[new]
+    fn new(capacity: usize) -> PyResult<Self> {
+        if capacity == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: recording event queue capacity must be positive",
+            ));
+        }
+        let (producer, consumer) = bounded::channel(capacity);
+        Ok(Self { producer, consumer })
+    }
+
+    #[pyo3(signature = (item, timeout_seconds=0.0))]
+    fn put(&self, py: Python<'_>, item: Py<PyAny>, timeout_seconds: f64) -> PyResult<bool> {
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: recording event queue timeout must be finite and non-negative",
+            ));
+        }
+        let producer = self.producer.clone();
+        let timeout = Duration::from_secs_f64(timeout_seconds);
+        match py.allow_threads(move || producer.push_timeout(item, timeout)) {
+            Ok(()) => Ok(true),
+            Err(_item) => Ok(false),
+        }
+    }
+
+    fn get(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let consumer = self.consumer.clone();
+        match py.allow_threads(move || consumer.receive_blocking()) {
+            Ok(item) => Ok(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "recording_event_queue_closed: recording event queue is closed",
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "recording_event_queue_timeout: blocking receive unexpectedly timed out",
+                ))
+            }
+        }
+    }
+
+    fn qsize(&self) -> PyResult<usize> {
+        Ok(self.consumer.stats().depth)
+    }
+
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        recording_event_queue_stats_dict(py, &self.consumer.stats())
+    }
+
+    fn close_and_clear(&self) {
+        self.consumer.close_and_clear();
+    }
+}
+
+#[pyclass]
 struct NativeSessionIo;
 
 #[pymethods]
@@ -916,6 +981,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     features.push(RECORDING_CODEC);
     features.push(RECORDING_SINK);
     features.push(RECORDING_FRAME_GATE);
+    features.push(RECORDING_EVENT_QUEUE);
     features.push(SESSION_IO);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
@@ -1027,6 +1093,20 @@ fn recording_frame_gate_snapshot_dict(
     Ok(value.unbind())
 }
 
+fn recording_event_queue_stats_dict(
+    py: Python<'_>,
+    stats: &bounded::QueueStats,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("capacity", stats.capacity)?;
+    value.set_item("depth", stats.depth)?;
+    value.set_item("peak_depth", stats.peak_depth)?;
+    value.set_item("enqueued", stats.enqueued)?;
+    value.set_item("delivered", stats.delivered)?;
+    value.set_item("rejected", stats.rejected)?;
+    Ok(value.unbind())
+}
+
 fn imu_observation_dict(py: Python<'_>, result: &imu::ImuObservation) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("dropped_samples", result.dropped_samples)?;
@@ -1104,6 +1184,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeRecordingCodec>()?;
     module.add_class::<NativeRecordingSink>()?;
     module.add_class::<NativeRecordingFrameGate>()?;
+    module.add_class::<NativeRecordingEventQueue>()?;
     module.add_class::<NativeSessionIo>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;
@@ -1115,8 +1196,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         CAPABILITY_PROBE, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
-        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_FRAME_GATE,
-        RECORDING_SINK, SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_EVENT_QUEUE,
+        RECORDING_FRAME_GATE, RECORDING_SINK, SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
     };
 
     #[test]
@@ -1133,6 +1214,7 @@ mod tests {
         assert_eq!(RECORDING_CODEC, "recording_codec");
         assert_eq!(RECORDING_SINK, "recording_sink");
         assert_eq!(RECORDING_FRAME_GATE, "recording_frame_gate");
+        assert_eq!(RECORDING_EVENT_QUEUE, "recording_event_queue");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");
