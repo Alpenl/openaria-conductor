@@ -175,6 +175,67 @@ class NativeRecordingCodec(Protocol):
     ) -> bytes: ...
 
 
+class NativeSessionIo(Protocol):
+    def hash_file(self, path: str) -> dict[str, object]: ...
+
+    def verify_fd(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> dict[str, object]: ...
+
+    def sendfile(
+        self,
+        output_descriptor: int,
+        input_descriptor: int,
+        offset: int,
+        length: int,
+    ) -> int: ...
+
+    def write_encoder_frame(self, descriptor: int, jpeg: bytes) -> int: ...
+
+
+class NativeMultipartPreview(Protocol):
+    def __iter__(self) -> NativeMultipartPreview: ...
+
+    def __next__(self) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+class NativePreviewBuffer(Protocol):
+    def publish(self, jpeg: bytes) -> int: ...
+
+    def clear(self) -> None: ...
+
+    def jpeg(self) -> tuple[int, bytes]: ...
+
+    def multipart_stream(self, fps: int | None = None) -> NativeMultipartPreview: ...
+
+    def wake_streams(self) -> None: ...
+
+
+class NativePerformanceMetrics(Protocol):
+    def record_stage(self, name: str, elapsed_ns: int) -> None: ...
+
+    def record_copy(self, name: str, size: int, count: int = 1) -> None: ...
+
+    def change_payload(self, name: str, count_delta: int, bytes_delta: int) -> None: ...
+
+    def observe_queue(
+        self,
+        depth: int,
+        capacity: int,
+        rejected: int = 0,
+        peak_depth: int | None = None,
+    ) -> None: ...
+
+    def record_loss(self, kind: str, count: int = 1) -> None: ...
+
+    def snapshot(self) -> dict[str, object]: ...
+
+
 def create_native_splitter() -> NativeSplitter:
     """Create the explicit Rust/TurboJPEG splitter or fail without fallback."""
 
@@ -319,4 +380,70 @@ def create_native_recording_codec() -> NativeRecordingCodec:
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_recording_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_session_io() -> NativeSessionIo:
+    """Create the Rust session file I/O helper or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_session_io_unavailable", f"无法加载原生会话 I/O 模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "session_io" not in capabilities.features:
+        raise NativeModuleError("native_session_io_unavailable", "原生模块缺少会话 I/O 能力")
+    try:
+        return module.NativeSessionIo()
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_session_io_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_preview_buffer(stream_fps: int) -> NativePreviewBuffer:
+    """Create the Rust latest-only preview buffer or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_preview_buffer_unavailable", f"无法加载原生预览缓冲模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "preview_buffer" not in capabilities.features:
+        raise NativeModuleError("native_preview_buffer_unavailable", "原生模块缺少预览缓冲能力")
+    try:
+        return module.NativePreviewBuffer(stream_fps)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_preview_buffer_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_performance_metrics() -> NativePerformanceMetrics:
+    """Create the Rust performance metrics accumulator or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_metrics_unavailable", f"无法加载原生性能指标模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "performance_metrics" not in capabilities.features:
+        raise NativeModuleError("native_metrics_unavailable", "原生模块缺少性能指标能力")
+    try:
+        return module.NativePerformanceMetrics()
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_metrics_init_failed", raw
         raise NativeModuleError(code, message) from exc

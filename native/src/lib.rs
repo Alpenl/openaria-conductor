@@ -3,15 +3,19 @@ mod bounded;
 mod frame_stream;
 mod imu;
 mod jpeg;
+mod metrics;
 mod native_camera;
+mod preview;
 mod recording;
+mod session_io;
 mod turbojpeg;
 mod v4l2;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const NATIVE_ABI: u32 = 4;
 const CAPABILITY_PROBE: &str = "capability_probe";
@@ -23,6 +27,9 @@ const NATIVE_CAMERA: &str = "native_camera";
 const NATIVE_AUDIO: &str = "native_audio";
 const NATIVE_IMU: &str = "native_imu";
 const RECORDING_CODEC: &str = "recording_codec";
+const SESSION_IO: &str = "session_io";
+const PREVIEW_BUFFER: &str = "preview_buffer";
+const PERFORMANCE_METRICS: &str = "performance_metrics";
 
 fn native_error(error: turbojpeg::TurboJpegError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
@@ -42,6 +49,23 @@ fn imu_error(error: imu::ImuError) -> PyErr {
 
 fn recording_error(error: recording::RecordingError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn session_io_error(error: session_io::SessionIoError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn preview_error(error: preview::PreviewError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn metrics_error(error: metrics::MetricsError) -> PyErr {
+    let message = format!("{}: {}", error.code, error.message);
+    if error.code == "invalid_argument" {
+        pyo3::exceptions::PyValueError::new_err(message)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(message)
+    }
 }
 
 type PythonCameraFrame<'py> = (
@@ -397,6 +421,249 @@ impl NativeRecordingCodec {
 }
 
 #[pyclass]
+struct NativeSessionIo;
+
+#[pymethods]
+impl NativeSessionIo {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn hash_file(&self, py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
+        let path = std::path::PathBuf::from(path);
+        let digest = py
+            .allow_threads(move || session_io::hash_file(&path))
+            .map_err(session_io_error)?;
+        file_digest_dict(py, &digest)
+    }
+
+    fn verify_fd(
+        &self,
+        py: Python<'_>,
+        descriptor: i32,
+        expected_bytes: u64,
+        expected_sha256: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let expected_sha256 = expected_sha256.to_owned();
+        let identity = py
+            .allow_threads(move || {
+                session_io::verify_fd(descriptor, expected_bytes, &expected_sha256)
+            })
+            .map_err(session_io_error)?;
+        file_identity_dict(py, &identity)
+    }
+
+    fn sendfile(
+        &self,
+        py: Python<'_>,
+        output_descriptor: i32,
+        input_descriptor: i32,
+        offset: u64,
+        length: u64,
+    ) -> PyResult<u64> {
+        py.allow_threads(move || {
+            session_io::sendfile_all(output_descriptor, input_descriptor, offset, length)
+        })
+        .map_err(session_io_error)
+    }
+
+    fn write_encoder_frame(&self, py: Python<'_>, descriptor: i32, jpeg: &[u8]) -> PyResult<u64> {
+        py.allow_threads(move || session_io::write_encoder_frame(descriptor, jpeg))
+            .map_err(session_io_error)
+    }
+}
+
+#[pyclass]
+struct NativePreviewBuffer {
+    buffer: Arc<preview::LatestBuffer>,
+}
+
+#[pymethods]
+impl NativePreviewBuffer {
+    #[new]
+    fn new(stream_fps: u32) -> PyResult<Self> {
+        Ok(Self {
+            buffer: Arc::new(preview::LatestBuffer::new(stream_fps).map_err(preview_error)?),
+        })
+    }
+
+    fn publish(&self, py: Python<'_>, jpeg: Py<PyBytes>) -> PyResult<u64> {
+        self.buffer.publish(py, jpeg).map_err(preview_error)
+    }
+
+    fn clear(&self) -> PyResult<()> {
+        self.buffer.clear().map_err(preview_error)
+    }
+
+    fn jpeg(&self, py: Python<'_>) -> PyResult<(u64, Py<PyBytes>)> {
+        let snapshot = self.buffer.snapshot(py).map_err(preview_error)?;
+        Ok((snapshot.sequence, snapshot.jpeg))
+    }
+
+    #[pyo3(signature = (fps=None))]
+    fn multipart_stream(&self, fps: Option<u32>) -> PyResult<NativeMultipartPreview> {
+        let requested_fps = fps.unwrap_or_else(|| self.buffer.stream_fps());
+        if requested_fps < 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: fps must be at least 1",
+            ));
+        }
+        let effective_fps = requested_fps.min(self.buffer.stream_fps());
+        Ok(NativeMultipartPreview {
+            buffer: Arc::clone(&self.buffer),
+            stop: Arc::new(AtomicBool::new(false)),
+            period: Duration::from_secs_f64(1.0 / f64::from(effective_fps)),
+            state: Mutex::new(MultipartPreviewState {
+                last_sequence: 0,
+                next_delivery: Instant::now(),
+            }),
+        })
+    }
+
+    fn wake_streams(&self) {
+        self.buffer.wake_streams();
+    }
+}
+
+#[pyclass(frozen)]
+struct NativeMultipartPreview {
+    buffer: Arc<preview::LatestBuffer>,
+    stop: Arc<AtomicBool>,
+    period: Duration,
+    state: Mutex<MultipartPreviewState>,
+}
+
+struct MultipartPreviewState {
+    last_sequence: u64,
+    next_delivery: Instant,
+}
+
+#[pymethods]
+impl NativeMultipartPreview {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        while !self.stop.load(Ordering::Acquire) {
+            let now = Instant::now();
+            let (delay, last_sequence) = {
+                let state = self.state.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "preview_stream_poisoned: preview stream mutex is poisoned",
+                    )
+                })?;
+                (
+                    (now < state.next_delivery).then(|| state.next_delivery.duration_since(now)),
+                    state.last_sequence,
+                )
+            };
+            if let Some(delay) = delay {
+                let buffer = Arc::clone(&self.buffer);
+                let stop = Arc::clone(&self.stop);
+                py.allow_threads(move || buffer.wait_until_stop(&stop, delay))
+                    .map_err(preview_error)?;
+                continue;
+            }
+
+            let buffer = Arc::clone(&self.buffer);
+            let stop = Arc::clone(&self.stop);
+            py.allow_threads(move || {
+                buffer.wait_after(last_sequence, &stop, Duration::from_millis(250))
+            })
+            .map_err(preview_error)?;
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            let snapshot = self.buffer.snapshot(py).map_err(preview_error)?;
+            {
+                let mut state = self.state.lock().map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "preview_stream_poisoned: preview stream mutex is poisoned",
+                    )
+                })?;
+                if snapshot.sequence == state.last_sequence {
+                    continue;
+                }
+                state.last_sequence = snapshot.sequence;
+                state.next_delivery = Instant::now() + self.period;
+            }
+            return Ok(Some(preview::multipart_part(py, &snapshot.jpeg)?));
+        }
+        Ok(None)
+    }
+
+    fn close(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.buffer.wake_streams();
+    }
+}
+
+impl Drop for NativeMultipartPreview {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.buffer.wake_streams();
+    }
+}
+
+#[pyclass]
+struct NativePerformanceMetrics {
+    metrics: Arc<metrics::Metrics>,
+}
+
+#[pymethods]
+impl NativePerformanceMetrics {
+    #[new]
+    fn new() -> Self {
+        Self {
+            metrics: Arc::new(metrics::Metrics::new()),
+        }
+    }
+
+    fn record_stage(&self, name: &str, elapsed_ns: u64) -> PyResult<()> {
+        self.metrics
+            .record_stage(name, elapsed_ns)
+            .map_err(metrics_error)
+    }
+
+    #[pyo3(signature = (name, size, count=1))]
+    fn record_copy(&self, name: &str, size: u64, count: u64) -> PyResult<()> {
+        self.metrics
+            .record_copy(name, size, count)
+            .map_err(metrics_error)
+    }
+
+    fn change_payload(&self, name: &str, count_delta: i64, bytes_delta: i64) -> PyResult<()> {
+        self.metrics
+            .change_payload(name, count_delta, bytes_delta)
+            .map_err(metrics_error)
+    }
+
+    #[pyo3(signature = (depth, capacity, rejected=0, peak_depth=None))]
+    fn observe_queue(
+        &self,
+        depth: u64,
+        capacity: u64,
+        rejected: u64,
+        peak_depth: Option<u64>,
+    ) -> PyResult<()> {
+        self.metrics
+            .observe_queue(depth, capacity, rejected, peak_depth)
+            .map_err(metrics_error)
+    }
+
+    #[pyo3(signature = (kind, count=1))]
+    fn record_loss(&self, kind: &str, count: u64) -> PyResult<()> {
+        self.metrics.record_loss(kind, count).map_err(metrics_error)
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.metrics.snapshot(py).map_err(metrics_error)
+    }
+}
+
+#[pyclass]
 struct NativeSplitter {
     handle: Arc<Mutex<turbojpeg::TransformHandle>>,
 }
@@ -450,6 +717,9 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     result.set_item("abi", NATIVE_ABI)?;
     let mut features = vec![CAPABILITY_PROBE, JPEG_CONTRACT, FRAME_STREAM];
     features.push(RECORDING_CODEC);
+    features.push(SESSION_IO);
+    features.push(PREVIEW_BUFFER);
+    features.push(PERFORMANCE_METRICS);
     features.push(V4L2_CAPTURE);
     if turbojpeg::available() {
         features.push(TURBOJPEG_SPLIT);
@@ -548,6 +818,23 @@ fn imu_observation_dict(py: Python<'_>, result: &imu::ImuObservation) -> PyResul
     Ok(value.unbind())
 }
 
+fn file_identity_dict(py: Python<'_>, identity: &session_io::FileIdentity) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("device", identity.device)?;
+    value.set_item("inode", identity.inode)?;
+    value.set_item("size", identity.size)?;
+    value.set_item("modified_ns", identity.modified_ns)?;
+    value.set_item("nlink", identity.nlink)?;
+    Ok(value.unbind())
+}
+
+fn file_digest_dict(py: Python<'_>, digest: &session_io::FileDigest) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("sha256", &digest.sha256)?;
+    value.set_item("identity", file_identity_dict(py, &digest.identity)?)?;
+    Ok(value.unbind())
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("NATIVE_ABI", NATIVE_ABI)?;
@@ -564,6 +851,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAudioRecorder>()?;
     module.add_class::<NativeImuCollector>()?;
     module.add_class::<NativeRecordingCodec>()?;
+    module.add_class::<NativeSessionIo>()?;
+    module.add_class::<NativePreviewBuffer>()?;
+    module.add_class::<NativeMultipartPreview>()?;
+    module.add_class::<NativePerformanceMetrics>()?;
     Ok(())
 }
 
@@ -571,7 +862,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         CAPABILITY_PROBE, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
-        NATIVE_IMU, RECORDING_CODEC, TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, SESSION_IO,
+        TURBOJPEG_SPLIT, V4L2_CAPTURE,
     };
 
     #[test]
@@ -586,5 +878,8 @@ mod tests {
         assert_eq!(NATIVE_AUDIO, "native_audio");
         assert_eq!(NATIVE_IMU, "native_imu");
         assert_eq!(RECORDING_CODEC, "recording_codec");
+        assert_eq!(SESSION_IO, "session_io");
+        assert_eq!(PREVIEW_BUFFER, "preview_buffer");
+        assert_eq!(PERFORMANCE_METRICS, "performance_metrics");
     }
 }

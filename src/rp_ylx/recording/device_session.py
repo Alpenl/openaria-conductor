@@ -27,8 +27,10 @@ from rp_ylx.native import (
     NativeAudioRecorder,
     NativeModuleError,
     NativeRecordingCodec,
+    NativeSessionIo,
     create_native_audio_recorder,
     create_native_recording_codec,
+    create_native_session_io,
 )
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 from rp_ylx.recording.stereo_encoder import (
@@ -188,6 +190,9 @@ _STOP = object()
 _UUID7_LOCK = threading.Lock()
 _UUID7_MILLISECOND = 0
 _UUID7_COUNTER = 0
+_SESSION_IO_LOCK = threading.Lock()
+_SESSION_IO: NativeSessionIo | None = None
+_SESSION_IO_UNAVAILABLE = False
 
 
 def uuid7() -> str:
@@ -253,6 +258,20 @@ def write_json_atomic(path: Path, value: object) -> None:
 
 
 def _digest(path: Path) -> str:
+    native = _session_io_or_none()
+    if native is not None:
+        try:
+            result = native.hash_file(os.fspath(path))
+        except BaseException as error:
+            raise _session_io_error(error) from error
+        digest = result.get("sha256") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise DeviceRecordingError("native_session_io_failed", "原生会话 I/O 返回无效摘要")
+        return digest
     result = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -299,6 +318,35 @@ def _recording_codec_error(error: BaseException) -> DeviceRecordingError:
     if not separator or not code.replace("_", "").isalnum():
         code, message = "native_recording_failed", raw
     return DeviceRecordingError(code, message)
+
+
+def _session_io_error(error: BaseException) -> DeviceRecordingError:
+    if isinstance(error, DeviceRecordingError):
+        return error
+    raw = str(error)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = "native_session_io_failed", raw
+    return DeviceRecordingError(code, message)
+
+
+def _session_io_or_none() -> NativeSessionIo | None:
+    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
+    if _SESSION_IO_UNAVAILABLE:
+        return None
+    if _SESSION_IO is not None:
+        return _SESSION_IO
+    with _SESSION_IO_LOCK:
+        if _SESSION_IO_UNAVAILABLE:
+            return None
+        if _SESSION_IO is not None:
+            return _SESSION_IO
+        try:
+            _SESSION_IO = create_native_session_io()
+        except NativeModuleError:
+            _SESSION_IO_UNAVAILABLE = True
+            return None
+        return _SESSION_IO
 
 
 def _strict_int(value: object, field: str) -> int:
@@ -1571,6 +1619,13 @@ def _read_bounded_fd(descriptor: int, maximum_bytes: int, *, code: str) -> bytes
 
 
 def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: str) -> None:
+    native = _session_io_or_none()
+    if native is not None:
+        try:
+            native.verify_fd(descriptor, expected_bytes, expected_sha256)
+            return
+        except BaseException as error:
+            raise _session_io_error(error) from error
     before = os.fstat(descriptor)
     if before.st_size != expected_bytes:
         raise DeviceRecordingError("artifact_invalid", "artifact 大小不匹配")

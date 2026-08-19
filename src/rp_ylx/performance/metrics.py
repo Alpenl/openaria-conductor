@@ -7,7 +7,14 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+from rp_ylx.native import (
+    NativeModuleError,
+    NativePerformanceMetrics,
+    create_native_performance_metrics,
+)
+
 LossKind = Literal["source_gap", "queue_rejected", "write_failure", "unknown_gap"]
+_LOSS_KINDS = {"source_gap", "queue_rejected", "write_failure", "unknown_gap"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +58,10 @@ class PerformanceMetrics:
     """Thread-safe metrics backed by fixed-size logarithmic histograms."""
 
     def __init__(self) -> None:
+        try:
+            self._native: NativePerformanceMetrics | None = create_native_performance_metrics()
+        except NativeModuleError:
+            self._native = None
         self._lock = threading.Lock()
         self._stages: dict[str, list[int]] = {}
         self._copies: dict[str, list[int]] = {}
@@ -75,6 +86,9 @@ class PerformanceMetrics:
     def record_stage(self, name: str, elapsed_ns: int) -> None:
         if elapsed_ns < 0:
             raise ValueError("stage elapsed_ns cannot be negative")
+        if self._native is not None:
+            self._native.record_stage(name, elapsed_ns)
+            return
         bucket = min(63, elapsed_ns.bit_length())
         with self._lock:
             value = self._stages.setdefault(name, [0] * 66)
@@ -87,6 +101,9 @@ class PerformanceMetrics:
             raise ValueError("copy size and count cannot be negative")
         if count == 0:
             return
+        if self._native is not None:
+            self._native.record_copy(name, size, count)
+            return
         with self._lock:
             copied = self._copies.setdefault(name, [0, 0])
             copied[0] += count
@@ -98,6 +115,9 @@ class PerformanceMetrics:
         return PayloadLease(self, name, size)
 
     def _change_payload(self, name: str, count_delta: int, bytes_delta: int) -> None:
+        if self._native is not None:
+            self._native.change_payload(name, count_delta, bytes_delta)
+            return
         with self._lock:
             payload = self._payloads.setdefault(name, [0, 0, 0, 0, 0])
             payload[0] += count_delta
@@ -127,14 +147,20 @@ class PerformanceMetrics:
             or rejected < 0
         ):
             raise ValueError("invalid bounded queue observation")
+        if self._native is not None:
+            self._native.observe_queue(depth, capacity, rejected, peak)
+            return
         with self._lock:
             self._queue_capacity = max(self._queue_capacity, capacity)
             self._queue_peak = max(self._queue_peak, peak)
             self._queue_rejected += rejected
 
     def record_loss(self, kind: LossKind, count: int = 1) -> None:
-        if kind not in self._loss or count < 0:
+        if kind not in _LOSS_KINDS or count < 0:
             raise ValueError("invalid loss observation")
+        if self._native is not None:
+            self._native.record_loss(kind, count)
+            return
         with self._lock:
             self._loss[kind] += count
 
@@ -149,6 +175,15 @@ class PerformanceMetrics:
         return 0
 
     def snapshot(self) -> MetricsSnapshot:
+        if self._native is not None:
+            raw = self._native.snapshot()
+            return MetricsSnapshot(
+                tuple(raw["stages"]),  # type: ignore[arg-type]
+                tuple(raw["copies"]),  # type: ignore[arg-type]
+                tuple(raw["payloads"]),  # type: ignore[arg-type]
+                dict(raw["queue"]),  # type: ignore[arg-type]
+                dict(raw["loss"]),  # type: ignore[arg-type]
+            )
         with self._lock:
             stages = []
             for name, raw in sorted(self._stages.items()):

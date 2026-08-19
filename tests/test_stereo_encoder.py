@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from rp_ylx.recording.stereo_encoder import _writev_all, resolve_executable
+from rp_ylx.recording.stereo_encoder import StereoEncoderProcess, _writev_all, resolve_executable
 
 
 class StereoEncoderResolutionTest(unittest.TestCase):
@@ -57,6 +59,24 @@ class StereoEncoderResolutionTest(unittest.TestCase):
         with patch("rp_ylx.recording.stereo_encoder.os.writev", side_effect=fake_writev):
             _writev_all(7, (b"abcd", b"efgh"))
         self.assertEqual(b"".join(writes), b"abcdefgh")
+
+    def test_submit_uses_native_encoder_write_when_available(self) -> None:
+        encoder = object.__new__(StereoEncoderProcess)
+        encoder._process = SimpleNamespace(stdin=SimpleNamespace(fileno=lambda: 7))
+        encoder._lock = threading.Lock()
+        encoder._failure = None
+        encoder._submitted = 0
+        native = SimpleNamespace(write_encoder_frame=Mock(return_value=11))
+
+        with (
+            patch("rp_ylx.recording.stereo_encoder._session_io_or_none", return_value=native),
+            patch("rp_ylx.recording.stereo_encoder._writev_all") as fallback,
+        ):
+            encoder.submit(b"abc")
+
+        native.write_encoder_frame.assert_called_once_with(7, b"abc")
+        fallback.assert_not_called()
+        self.assertEqual(encoder.submitted_frames, 1)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,10 @@ from rp_ylx.native import (
     create_native_audio_recorder,
     create_native_camera,
     create_native_imu_collector,
+    create_native_performance_metrics,
+    create_native_preview_buffer,
     create_native_recording_codec,
+    create_native_session_io,
     create_native_splitter,
     native_capabilities,
 )
@@ -280,6 +283,96 @@ class NativeCapabilitiesTest(unittest.TestCase):
         )
         with patch("rp_ylx.native.importlib.import_module", return_value=module):
             self.assertIs(create_native_recording_codec(), owner)
+        constructor.assert_called_once_with()
+
+    def test_explicit_session_io_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_session_io()
+        self.assertEqual(raised.exception.code, "native_session_io_unavailable")
+
+    def test_explicit_session_io_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "session_io"],
+            },
+            NativeSessionIo=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_session_io(), owner)
+        constructor.assert_called_once_with()
+
+    def test_explicit_preview_buffer_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_preview_buffer(15)
+        self.assertEqual(raised.exception.code, "native_preview_buffer_unavailable")
+
+    def test_explicit_preview_buffer_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "preview_buffer"],
+            },
+            NativePreviewBuffer=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_preview_buffer(15), owner)
+        constructor.assert_called_once_with(15)
+
+    def test_explicit_performance_metrics_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_performance_metrics()
+        self.assertEqual(raised.exception.code, "native_metrics_unavailable")
+
+    def test_explicit_performance_metrics_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "performance_metrics"],
+            },
+            NativePerformanceMetrics=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_performance_metrics(), owner)
         constructor.assert_called_once_with()
 
 

@@ -20,6 +20,8 @@ from typing import Literal
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
+from rp_ylx.native import NativeModuleError, NativeSessionIo, create_native_session_io
+
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _SESSION_ID = re.compile(
@@ -45,6 +47,9 @@ _RECORDING_SESSION_VALIDATOR = Draft202012Validator(
     _RECORDING_SESSION_SCHEMA,
     format_checker=FormatChecker(),
 )
+_SESSION_IO_LOCK = threading.Lock()
+_SESSION_IO: NativeSessionIo | None = None
+_SESSION_IO_UNAVAILABLE = False
 
 
 class ArtifactAccessError(RuntimeError):
@@ -166,6 +171,31 @@ class LockedBytes:
         self._assert_unchanged()
         return b"".join(chunks)
 
+    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
+        if output_descriptor < 0 or offset < 0 or (length is not None and length < 0):
+            raise ValueError("output_descriptor、offset 或 length 无效")
+        self._assert_unchanged()
+        available = max(0, self.size - offset)
+        selected = available if length is None else min(length, available)
+        native = _session_io_or_none()
+        if native is not None:
+            sent = native.sendfile(output_descriptor, self._descriptor, offset, selected)
+            if not isinstance(sent, int) or sent != selected:
+                raise ArtifactAccessError("not_verified", "artifact native sendfile 发生短写")
+            self._assert_unchanged()
+            return sent
+        sent = 0
+        for chunk in self.iter_chunks(offset, selected):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_descriptor, view)
+                if written <= 0:
+                    raise BrokenPipeError("artifact socket wrote zero bytes")
+                sent += written
+                view = view[written:]
+        self._assert_unchanged()
+        return sent
+
     def iter_chunks(
         self,
         offset: int = 0,
@@ -239,6 +269,22 @@ class LockedManifest(LockedBytes):
             cursor += selected
             remaining -= selected
 
+    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
+        if output_descriptor < 0 or offset < 0 or (length is not None and length < 0):
+            raise ValueError("output_descriptor、offset 或 length 无效")
+        available = max(0, self.size - offset)
+        selected = available if length is None else min(length, available)
+        sent = 0
+        for chunk in self.iter_chunks(offset, selected):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_descriptor, view)
+                if written <= 0:
+                    raise BrokenPipeError("manifest socket wrote zero bytes")
+                sent += written
+                view = view[written:]
+        return sent
+
 
 class LockedArtifact(LockedBytes):
     """已由 exact manifest 固定身份并通过打开的 fd 读取的 artifact。"""
@@ -297,6 +343,25 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
     if last < first:
         raise UnsatisfiableRange(complete_size)
     return first, min(last, complete_size - 1)
+
+
+def _session_io_or_none() -> NativeSessionIo | None:
+    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
+    if _SESSION_IO_UNAVAILABLE:
+        return None
+    if _SESSION_IO is not None:
+        return _SESSION_IO
+    with _SESSION_IO_LOCK:
+        if _SESSION_IO_UNAVAILABLE:
+            return None
+        if _SESSION_IO is not None:
+            return _SESSION_IO
+        try:
+            _SESSION_IO = create_native_session_io()
+        except NativeModuleError:
+            _SESSION_IO_UNAVAILABLE = True
+            return None
+        return _SESSION_IO
 
 
 class DirectorySessionStore:

@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from rp_ylx.api import Principal, SecurityPolicy, create_gateway_server
-from rp_ylx.api.downloads import ArtifactAccessError, DirectorySessionStore
+from rp_ylx.api.downloads import ArtifactAccessError, DirectorySessionStore, LockedBytes
 from rp_ylx.recording import RecordingConfig, SessionRecorder
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
@@ -633,25 +633,30 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
 
     def test_head_and_single_byte_range_read_only_requested_artifact_bytes(self) -> None:
         artifact_url = f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-        real_pread = os.pread
-        artifact_reads: list[int] = []
+        real_send_to = LockedBytes.send_to
+        artifact_sends: list[int] = []
 
-        def measured_pread(descriptor: int, length: int, offset: int) -> bytes:
-            if os.fstat(descriptor).st_size == len(ARTIFACT_BYTES):
-                artifact_reads.append(length)
-            return real_pread(descriptor, length, offset)
+        def measured_send_to(
+            locked: LockedBytes,
+            output_descriptor: int,
+            offset: int = 0,
+            length: int | None = None,
+        ) -> int:
+            if locked.size == len(ARTIFACT_BYTES):
+                artifact_sends.append(locked.size - offset if length is None else length)
+            return real_send_to(locked, output_descriptor, offset, length)
 
-        with patch("rp_ylx.api.downloads.os.pread", side_effect=measured_pread):
+        with patch("rp_ylx.api.downloads.LockedBytes.send_to", measured_send_to):
             status, payload, _ = self.request(artifact_url, method="HEAD")
-        self.assertEqual((status, payload, artifact_reads), (200, b"", []))
+        self.assertEqual((status, payload, artifact_sends), (200, b"", []))
 
-        artifact_reads.clear()
-        with patch("rp_ylx.api.downloads.os.pread", side_effect=measured_pread):
+        artifact_sends.clear()
+        with patch("rp_ylx.api.downloads.LockedBytes.send_to", measured_send_to):
             status, payload, _ = self.request(
                 artifact_url,
                 headers={"Range": "bytes=0-0"},
             )
-        self.assertEqual((status, payload, artifact_reads), (206, ARTIFACT_BYTES[:1], [1]))
+        self.assertEqual((status, payload, artifact_sends), (206, ARTIFACT_BYTES[:1], [1]))
 
     def test_manifest_path_replacement_after_open_sends_exact_locked_bytes(self) -> None:
         manifest_path = self.session_root / "manifest.json"

@@ -18,10 +18,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from rp_ylx.native import NativeModuleError, NativeSessionIo, create_native_session_io
+
 _FRAME_MAGIC = b"YLXF"
 _HEADER = struct.Struct("<4sI")
 _READY_TIMEOUT_SECONDS = 15.0
 _DEFAULT_EXECUTABLE = "ylx-stereo-encoder"
+_SESSION_IO_LOCK = threading.Lock()
+_SESSION_IO: NativeSessionIo | None = None
+_SESSION_IO_UNAVAILABLE = False
 
 
 class StereoEncoderError(RuntimeError):
@@ -177,8 +182,14 @@ class StereoEncoderProcess:
             raise StereoEncoderError("invalid_state", "助手进程未启动")
         self._raise_if_failed()
         try:
-            _writev_all(process.stdin.fileno(), (_HEADER.pack(_FRAME_MAGIC, len(jpeg)), jpeg))
-        except (BrokenPipeError, OSError) as error:
+            native = _session_io_or_none()
+            if native is None:
+                _writev_all(process.stdin.fileno(), (_HEADER.pack(_FRAME_MAGIC, len(jpeg)), jpeg))
+            else:
+                written = native.write_encoder_frame(process.stdin.fileno(), jpeg)
+                if written != _HEADER.size + len(jpeg):
+                    raise BrokenPipeError("encoder pipe native write was short")
+        except (BrokenPipeError, OSError, RuntimeError) as error:
             self._raise_if_failed()
             raise StereoEncoderError("encoder_failed", f"助手写入失败：{error}") from error
         self._submitted += 1
@@ -313,3 +324,22 @@ def _writev_all(descriptor: int, chunks: Sequence[bytes]) -> None:
             offset = 0
         if written:
             offset += written
+
+
+def _session_io_or_none() -> NativeSessionIo | None:
+    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
+    if _SESSION_IO_UNAVAILABLE:
+        return None
+    if _SESSION_IO is not None:
+        return _SESSION_IO
+    with _SESSION_IO_LOCK:
+        if _SESSION_IO_UNAVAILABLE:
+            return None
+        if _SESSION_IO is not None:
+            return _SESSION_IO
+        try:
+            _SESSION_IO = create_native_session_io()
+        except NativeModuleError:
+            _SESSION_IO_UNAVAILABLE = True
+            return None
+        return _SESSION_IO

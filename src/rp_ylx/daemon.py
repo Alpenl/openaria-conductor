@@ -335,6 +335,21 @@ def build_production_service(
                 "正式录制缺少 Rust 热路径编码能力",
                 code="native_recording_unavailable",
             )
+        if "session_io" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 会话 I/O 校验能力",
+                code="native_session_io_unavailable",
+            )
+        if "preview_buffer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式预览缺少 Rust latest-only 缓冲能力",
+                code="native_preview_buffer_unavailable",
+            )
+        if "performance_metrics" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust 性能指标累计能力",
+                code="native_metrics_unavailable",
+            )
     mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
     if camera_backend_factory is None:
 

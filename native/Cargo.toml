@@ -16,3 +16,4 @@ extension-module = ["pyo3/extension-module"]
 libloading = "0.8.9"
 libc = "0.2.189"
 pyo3 = { version = "0.25.1", features = ["abi3-py311"] }
+sha2 = "0.10.9"

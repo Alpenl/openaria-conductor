@@ -356,7 +356,13 @@ class ProductionDaemonTest(unittest.TestCase):
                 True,
                 "0.1.0",
                 4,
-                ("capability_probe", "native_camera", "native_imu", "recording_codec"),
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_imu",
+                    "recording_codec",
+                    "session_io",
+                ),
             )
             with (
                 patch("rp_ylx.daemon.__commit__", "a" * 40),
@@ -380,7 +386,13 @@ class ProductionDaemonTest(unittest.TestCase):
                 True,
                 "0.1.0",
                 4,
-                ("capability_probe", "native_camera", "native_audio", "recording_codec"),
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_audio",
+                    "recording_codec",
+                    "session_io",
+                ),
             )
             with (
                 patch("rp_ylx.daemon.__commit__", "a" * 40),
@@ -416,6 +428,99 @@ class ProductionDaemonTest(unittest.TestCase):
             ):
                 build_production_service(config)
             self.assertEqual(raised.exception.code, "native_recording_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
+    def test_missing_native_session_io_fails_before_production_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_audio",
+                    "native_imu",
+                    "recording_codec",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_session_io_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
+    def test_missing_native_preview_buffer_fails_before_production_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_audio",
+                    "native_imu",
+                    "recording_codec",
+                    "session_io",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_preview_buffer_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
+    def test_missing_native_metrics_fails_before_production_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_audio",
+                    "native_imu",
+                    "recording_codec",
+                    "session_io",
+                    "preview_buffer",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_metrics_unavailable")
             backend.assert_not_called()
             coordinator.assert_not_called()
             gateway.assert_not_called()
