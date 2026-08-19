@@ -9,6 +9,7 @@ from typing import Protocol
 
 from rp_ylx.api.mock_device import MockDevice
 from rp_ylx.camera.models import CameraMode, FrameObservation
+from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 
 
 class PreviewController(Protocol):
@@ -47,6 +48,7 @@ class CameraPreviewPump:
         on_error: Callable[[BaseException], None] | None = None,
         logger: logging.Logger | None = None,
         thread_name: str = "rp-ylx-camera-preview",
+        metrics: PerformanceMetrics | None = None,
     ) -> None:
         if read_timeout <= 0:
             raise ValueError("read_timeout 必须大于零")
@@ -66,6 +68,8 @@ class CameraPreviewPump:
         self._state = "new"
         self._error: BaseException | None = None
         self._frames_published = 0
+        self._metrics = metrics
+        self._preview_lease: PayloadLease | None = None
 
     @property
     def state(self) -> str:
@@ -192,12 +196,21 @@ class CameraPreviewPump:
                 if self._stop_event.is_set():
                     break
                 frame = observation.frame
+                started = self._metrics.start() if self._metrics is not None else 0
                 self._device.publish_preview_pair(
                     frame.left,
                     frame.right,
                     source_sequence=frame.source_sequence,
                     capture_monotonic_ns=frame.host_monotonic_ns,
                 )
+                if self._metrics is not None:
+                    self._metrics.finish("preview_publish", started)
+                    lease = self._metrics.retain_payload(
+                        "preview_reference", len(frame.left) + len(frame.right)
+                    )
+                    previous, self._preview_lease = self._preview_lease, lease
+                    if previous is not None:
+                        previous.release()
                 with self._lock:
                     self._frames_published += 1
         except BaseException as exc:
@@ -205,6 +218,9 @@ class CameraPreviewPump:
                 self._record_error(exc)
         finally:
             self._release_controller()
+            lease, self._preview_lease = self._preview_lease, None
+            if lease is not None:
+                lease.release()
             with self._lock:
                 if self._state == "running":
                     self._state = "stopped" if self._error is None else "failed"

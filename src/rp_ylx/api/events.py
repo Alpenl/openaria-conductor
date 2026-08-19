@@ -328,7 +328,7 @@ def validate_session_list(
     if len({item["session_id"] for item in items}) != len(items):
         raise InvalidSourceEvent("session list 不得重复会话")
     order = [(_date_time_value(item["started_at"]), item["session_id"]) for item in items]
-    if order != sorted(order):
+    if order != sorted(order, reverse=True):
         raise InvalidSourceEvent("session list 排序无效")
     for diagnostic in diagnostics:
         _validate_session_discovery_diagnostic(diagnostic)
@@ -468,13 +468,13 @@ def _validate_snapshot_data(
     device_state = data["device_state"]
     if not _is_enum(
         device_state,
-        {"idle", "recording", "finalizing", "encoding", "verifying", "blocked"},
+        {"idle", "recording", "finalizing", "verifying", "blocked"},
     ):
         raise InvalidSourceEvent("snapshot device_state 无效")
 
     active = data["active_recording"]
     retained = data["retained_unsuccessful"]
-    if device_state in {"recording", "finalizing", "encoding", "verifying"}:
+    if device_state in {"recording", "finalizing", "verifying"}:
         _require_session_id(source_session_id, "active snapshot")
         _validate_snapshot_recording(
             active,
@@ -814,7 +814,6 @@ def _validate_state_data(data: Mapping[str, object]) -> None:
         {
             "recording",
             "finalizing",
-            "encoding",
             "verifying",
             "recoverable",
             "failed",
@@ -831,7 +830,7 @@ def _validate_state_data(data: Mapping[str, object]) -> None:
 def _validate_progress_data(data: Mapping[str, object]) -> None:
     if set(data) != PROGRESS_KEYS or data["schema"] != "ylx.capture-progress-event.v2":
         raise InvalidSourceEvent("progress data 字段或 schema 无效")
-    if not _is_enum(data["phase"], {"recording", "finalizing", "encoding", "verifying"}):
+    if not _is_enum(data["phase"], {"recording", "finalizing", "verifying"}):
         raise InvalidSourceEvent("progress phase 无效")
     if not _is_enum(data["unit"], {"frames", "bytes", "artifacts", "checks"}):
         raise InvalidSourceEvent("progress unit 无效")

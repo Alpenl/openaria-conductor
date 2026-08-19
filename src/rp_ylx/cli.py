@@ -14,6 +14,7 @@ from rp_ylx.api import CameraPreviewPump, MockDevice, create_server
 from rp_ylx.camera import CameraController, CameraError, CameraMode, V4L2DiscoveryBackend
 from rp_ylx.cli_helpers import stable_id_for_device
 from rp_ylx.hardware import HardwareSmokeError, collect_hardware_facts, record_hardware_smoke
+from rp_ylx.native import NativeModuleError, native_capabilities
 from rp_ylx.network import (
     NetworkError,
     apply_network,
@@ -102,6 +103,21 @@ def build_parser() -> argparse.ArgumentParser:
     network_apply.add_argument("--config", required=True, help="JSON 配置文件或 - 表示标准输入")
     network_subcommands.add_parser("rescue", help="激活已登记的本机救援热点")
     network_subcommands.add_parser("reconcile", help="恢复提交前中断的网络事务")
+    benchmark = subcommands.add_parser("benchmark", help="运行统一数据面性能工作负载")
+    benchmark.add_argument("kind", choices=["fixed_trace", "preview", "recording", "concurrent"])
+    benchmark.add_argument("--duration", type=float, default=30.0, help="测量秒数")
+    benchmark.add_argument("--round", type=int, default=1, help="从 1 开始的轮次")
+    benchmark.add_argument("--wheel-sha256", required=True, help="当前安装 wheel 的 SHA-256")
+    benchmark.add_argument(
+        "--adapter",
+        choices=["python", "rust"],
+        required=True,
+        help="显式选择 Python 基线或 Rust 候选数据面",
+    )
+    benchmark.add_argument("--device", default="/dev/video0", help="目标采集节点")
+    benchmark.add_argument("--trace", help="仅 fixed_trace 使用的显式 MJPEG 输入")
+    benchmark.add_argument("--recording-root", help="recording/concurrent 的空闲输出根")
+    benchmark.add_argument("--output", required=True, help="新建或覆盖的严格 JSON 报告")
     return parser
 
 
@@ -112,6 +128,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rp-ylx {__version__} ({__commit__})")
         return 0
     if args.command == "status":
+        try:
+            native = native_capabilities().as_dict()
+        except NativeModuleError as exc:
+            native = {
+                "adapter": "python",
+                "module_available": False,
+                "module_version": None,
+                "abi": None,
+                "features": [],
+                "error": {"code": exc.code, "message": exc.message},
+            }
         print(
             json.dumps(
                 {
@@ -120,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "commit": __commit__,
                     "hardware": "not-probed",
                     "recording": "idle",
+                    "native": native,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -133,6 +161,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.output).write_text(rendered, encoding="utf-8")
         else:
             print(rendered, end="")
+        return 0
+    if args.command == "benchmark":
+        from rp_ylx.performance import BenchmarkConfig, BenchmarkError, run_benchmark
+
+        try:
+            report = run_benchmark(
+                BenchmarkConfig(
+                    kind=args.kind,
+                    duration_seconds=args.duration,
+                    round=args.round,
+                    wheel_sha256=args.wheel_sha256,
+                    device=Path(args.device),
+                    trace=None if args.trace is None else Path(args.trace),
+                    recording_root=(
+                        None if args.recording_root is None else Path(args.recording_root)
+                    ),
+                    adapter=args.adapter,
+                )
+            )
+            Path(args.output).write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except (BenchmarkError, OSError, RuntimeError, ValueError) as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": str(getattr(exc, "code", "benchmark_failed")),
+                            "message": str(getattr(exc, "message", exc)),
+                        },
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        print(json.dumps({"ok": True, "output": args.output}, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "hardware-smoke":
         if args.frames <= 0 or args.imu_packets <= 0:

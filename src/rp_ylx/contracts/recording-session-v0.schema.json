@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Alpenl/openaria-conductor/raw/main/src/rp_ylx/contracts/recording-session-v0.schema.json",
+  "$id": "https://github.com/mirrorbloom/RP-YLX/raw/rewrite/src/rp_ylx/contracts/recording-session-v0.schema.json",
   "title": "YLX 录制会话清单 v0",
   "type": "object",
   "additionalProperties": false,

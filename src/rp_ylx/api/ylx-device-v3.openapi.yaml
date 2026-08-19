@@ -81,9 +81,9 @@ paths:
       description: |
         返回当前 daemon 权威标识，以及与 snapshot 类型 CaptureEvent 使用的相同闭合快照
         payload。source_revision 是该快照的 daemon journal 修订号，绝不是 SSE 投递 ID。
-        空闲快照可以保留最近一次未成功的终止结果。启动新会话会从当前状态中移除该结果，
-        但绝不会删除按会话保留的资源。没有保留结果的普通空闲状态仍返回 200 快照，其中
-        active_recording 和 retained_unsuccessful 均为 null，runtime 仍然存在。
+        空闲快照可以保留最近一次未成功的终止结果，即使之后已有新的成功会话；历史结果仍可
+        按会话查询。没有保留结果的普通空闲状态仍返回 200 快照，其中 active_recording 和
+        retained_unsuccessful 均为 null，runtime 仍然存在。
       x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
@@ -147,8 +147,8 @@ paths:
       operationId: stopCapture
       summary: 幂等地请求最终化采集
       description: |
-        重复停止不会产生第二次最终化。客户端可以通过 status/SSE 跟踪 finalizing、encoding
-        或 verifying，直至形成已密封会话。没有活动会话时，停止是幂等的空操作并返回 204。
+        重复停止不会产生第二次最终化。客户端可以通过 status/SSE 跟踪 finalizing
+        或 verifying，直至形成已密封会话。设备不存在后台编码态：成片在录制期间边录边出。没有活动会话时，停止是幂等的空操作并返回 204。
         recoverable、failed 和 abandoned 是终止结果：它们绝不会进入已完成会话列表，
         客户端会呈现诊断信息。此 API 版本不定义抢救操作；未来的任何恢复流程都需要独立的
         版本化恢复契约和 API 操作。reason=safe_swap 是请求意图；只有随后通过 SSE 投递，
@@ -232,7 +232,7 @@ paths:
               example: |
                 id: 1042
                 event: state
-                data: {"schema":"ylx.capture-event.v3","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-08-08T02:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"ylx.capture-state-event.v2","state":"encoding","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
+                data: {"schema":"ylx.capture-event.v3","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-08-08T02:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"ylx.capture-state-event.v2","state":"finalizing","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
 
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -377,7 +377,7 @@ paths:
         "200":
           description: |
             已发现候选项的游标分页。每个 schema 有效的已密封 ylx.device-session.v1 候选项
-            都恰好投影一次为 SessionSummary，并先按 manifest started_at、再按 session_id 排序。
+        都恰好投影一次为 SessionSummary，并先按 manifest started_at、再按 session_id 最新优先排序。
             对于格式错误、不可读、未密封、schema 未知、schema 无效或 manifest 局部语义无效的
             manifest，只能恰好投影一次为闭合的 SessionDiscoveryDiagnostic，且不得通过虚构
             summary 字段将其提升至 items。不透明游标跨两个集合推进，limit 统计 items 与
@@ -1227,7 +1227,7 @@ components:
         schema:
           const: ylx.capture-snapshot-event.v2
         device_state:
-          enum: [idle, recording, finalizing, encoding, verifying, blocked]
+          enum: [idle, recording, finalizing, verifying, blocked]
         active_recording:
           oneOf:
             - $ref: "#/components/schemas/CaptureActiveRecording"
@@ -1245,7 +1245,7 @@ components:
             required: [device_state]
             properties:
               device_state:
-                enum: [recording, finalizing, encoding, verifying]
+                enum: [recording, finalizing, verifying]
           then:
             properties:
               active_recording:
@@ -1285,7 +1285,7 @@ components:
               required: [state]
               properties:
                 state:
-                  enum: [recording, finalizing, encoding, verifying]
+                  enum: [recording, finalizing, verifying]
     CaptureRetainedUnsuccessfulRecording:
       allOf:
         - $ref: "#/components/schemas/CaptureSnapshotRecording"
@@ -1305,7 +1305,7 @@ components:
         schema:
           const: ylx.capture-state-event.v2
         state:
-          enum: [recording, finalizing, encoding, verifying, recoverable, failed, abandoned]
+          enum: [recording, finalizing, verifying, recoverable, failed, abandoned]
         volume_id:
           $ref: "#/components/schemas/UuidV4"
         generation_id:
@@ -1318,7 +1318,7 @@ components:
         schema:
           const: ylx.capture-progress-event.v2
         phase:
-          enum: [recording, finalizing, encoding, verifying]
+          enum: [recording, finalizing, verifying]
         elapsed_seconds:
           type: number
           minimum: 0
@@ -1665,4 +1665,4 @@ components:
                   type: integer
                   minimum: 1
                 current_state:
-                  enum: [recording, finalizing, encoding, verifying]
+                  enum: [recording, finalizing, verifying]

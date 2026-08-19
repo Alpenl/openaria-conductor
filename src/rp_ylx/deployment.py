@@ -36,6 +36,35 @@ MAX_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_FILES = 100_000
 ACTIVATION_HEALTH_TIMEOUT_SECONDS = 300.0
+DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "rp-ylx.service": ("usr/lib/systemd/system/rp-ylx.service", 0o644),
+    # avahi only scans /etc/avahi/services, so the mDNS service definition is
+    # installed under /etc rather than /usr/lib.
+    "rp-ylx.avahi": ("etc/avahi/services/rp-ylx.service", 0o644),
+    "rp-ylx-data-volume": ("usr/local/sbin/rp-ylx-data-volume", 0o755),
+    "rp-ylx-data-volume.service": (
+        "usr/lib/systemd/system/rp-ylx-data-volume.service",
+        0o644,
+    ),
+    "rp-ylx.sysusers": ("usr/lib/sysusers.d/rp-ylx.conf", 0o644),
+    "rp-ylx.tmpfiles": ("usr/lib/tmpfiles.d/rp-ylx.conf", 0o644),
+    "rp-ylx-wifi-watchdog": ("usr/local/sbin/rp-ylx-wifi-watchdog", 0o755),
+    "rp-ylx-wifi-watchdog.service": (
+        "usr/lib/systemd/system/rp-ylx-wifi-watchdog.service",
+        0o644,
+    ),
+    "rp-ylx-wifi-watchdog.timer": (
+        "usr/lib/systemd/system/rp-ylx-wifi-watchdog.timer",
+        0o644,
+    ),
+    "rp-ylx-wifi-watchdog.default": ("etc/default/rp-ylx-wifi-watchdog", 0o644),
+    "aic8800-rp-ylx.conf": ("etc/modprobe.d/aic8800-rp-ylx.conf", 0o644),
+    "90-rp-ylx-wifi-powersave.conf": (
+        "etc/NetworkManager/conf.d/90-rp-ylx-wifi-powersave.conf",
+        0o644,
+    ),
+}
+PRESERVED_DEPLOYMENT_ASSETS = {"rp-ylx-wifi-watchdog.default"}
 
 
 class DeploymentError(RuntimeError):
@@ -308,8 +337,23 @@ def _wheel_identity(wheel: Path) -> tuple[str, str]:
             if len(metadata_names) != 1:
                 raise DeploymentError("bundle_invalid", "application wheel 缺少唯一 METADATA")
             metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
+            native_names = [name for name in archive.namelist() if name == "rp_ylx/_native.abi3.so"]
+            if len(native_names) != 1:
+                raise DeploymentError(
+                    "bundle_invalid", "application wheel 缺少唯一 rp_ylx/_native.abi3.so"
+                )
+            native = archive.read(native_names[0])
     except (OSError, UnicodeError, zipfile.BadZipFile) as error:
         raise DeploymentError("bundle_invalid", f"无法读取 application wheel：{error}") from error
+    if (
+        len(native) < 20
+        or native[:4] != b"\x7fELF"
+        or native[4:6] != b"\x02\x01"
+        or int.from_bytes(native[18:20], "little") != 183
+    ):
+        raise DeploymentError(
+            "bundle_platform_mismatch", "application wheel 原生扩展不是 AArch64 ELF64"
+        )
     marker = '__commit__ = "'
     lines = [
         line for line in content.splitlines() if line.startswith(marker) and line.endswith('"')
@@ -642,6 +686,37 @@ def _install_stage(bundle: Bundle, stage: Path) -> None:
         launcher.chmod(0o755)
 
 
+def _build_stereo_encoder(stage: Path) -> None:
+    """编译边录边出左右眼 H.264 的助手。
+
+    助手链接板上的 hobot-multimedia，只能在目标机上编译；没有它就没有生产成片，
+    因此编译失败必须让安装失败，而不是留下一个不能录制的发行版。
+    """
+
+    source = stage / "site-packages/rp_ylx/hobot"
+    bin_directory = stage / "bin"
+    if not (source / "Makefile").is_file():
+        raise DeploymentError("bundle_invalid", "wheel 缺少 ylx-stereo-encoder 源码")
+    try:
+        subprocess.run(  # noqa: S603 - 固定参数，无 shell
+            ["make", "--silent", "install", f"DESTDIR={bin_directory.resolve()}"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = getattr(error, "stderr", b"") or b""
+        raise DeploymentError(
+            "runtime_dependency_missing",
+            f"无法编译 ylx-stereo-encoder：{error}；{detail[:512].decode(errors='replace')}",
+        ) from error
+    built = bin_directory / "ylx-stereo-encoder"
+    if not built.is_file():
+        raise DeploymentError("runtime_dependency_missing", "ylx-stereo-encoder 未生成")
+    built.chmod(0o755)
+
+
 class ReleaseManager:
     def __init__(
         self,
@@ -658,6 +733,7 @@ class ReleaseManager:
         executable_finder: Callable[[str], str | None] = shutil.which,
         runner: Runner = _run,
         stage_installer: StageInstaller = _install_stage,
+        encoder_builder: Callable[[Path], None] = _build_stereo_encoder,
         health_checker: Callable[[], None] | None = None,
     ) -> None:
         self.install_root = install_root
@@ -674,16 +750,23 @@ class ReleaseManager:
         self.executable_finder = executable_finder
         self.runner = runner
         self.stage_installer = stage_installer
+        self.encoder_builder = encoder_builder
         self.health_checker = health_checker or self._wait_for_health
 
     def _require_target(self) -> None:
         self._require_platform()
         if self.library_finder("turbojpeg") is None:
             raise DeploymentError("runtime_dependency_missing", "正式 60 FPS 路径要求 libturbojpeg")
+        if self.library_finder("multimedia") is None:
+            raise DeploymentError(
+                "runtime_dependency_missing", "边录边出 H.264 要求 hobot-multimedia"
+            )
         required_commands = (
             "systemctl",
             "systemd-sysusers",
             "systemd-tmpfiles",
+            "make",
+            "cc",
         )
         missing = [
             command for command in required_commands if self.executable_finder(command) is None
@@ -826,6 +909,7 @@ class ReleaseManager:
         stage.mkdir(mode=0o755)
         try:
             self.stage_installer(bundle, stage)
+            self.encoder_builder(stage)
             _write_atomic(
                 stage / "release.json",
                 {
@@ -846,15 +930,16 @@ class ReleaseManager:
 
     def _install_assets(self) -> None:
         targets = {
-            "rp-ylx.service": self.system_root / "usr/lib/systemd/system/rp-ylx.service",
-            "rp-ylx.sysusers": self.system_root / "usr/lib/sysusers.d/rp-ylx.conf",
-            "rp-ylx.tmpfiles": self.system_root / "usr/lib/tmpfiles.d/rp-ylx.conf",
+            name: (self.system_root / relative, mode)
+            for name, (relative, mode) in DEPLOYMENT_ASSETS.items()
         }
-        for name, target in targets.items():
+        for name, (target, mode) in targets.items():
+            if name in PRESERVED_DEPLOYMENT_ASSETS and target.exists():
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             temporary.write_bytes(_asset_bytes(name))
-            temporary.chmod(0o644)
+            temporary.chmod(mode)
             os.replace(temporary, target)
             _fsync_directory(target.parent)
         bootstrap = self.system_root / "usr/local/sbin/rp-ylx-deploy"
@@ -873,13 +958,13 @@ class ReleaseManager:
         temporary_module.write_bytes(_module_bytes())
         temporary_module.chmod(0o644)
         os.replace(temporary_module, bootstrap_module)
-        for name in targets:
+        for name, (_, mode) in targets.items():
             bootstrap_asset = bootstrap_root / name
             temporary_asset = bootstrap_asset.with_name(
                 f".{bootstrap_asset.name}.{uuid.uuid4().hex}.tmp"
             )
             temporary_asset.write_bytes(_asset_bytes(name))
-            temporary_asset.chmod(0o644)
+            temporary_asset.chmod(mode)
             os.replace(temporary_asset, bootstrap_asset)
         _fsync_directory(bootstrap_root)
         if not (self.config_root / "device.json").exists():
@@ -891,9 +976,17 @@ class ReleaseManager:
                     "width": 3840,
                     "height": 1080,
                     "fps": 60,
+                    "data_plane": "rust",
+                },
+                "audio": {
+                    "enabled": True,
+                    "device": "hw:0,0",
+                    "sample_rate_hz": 48000,
+                    "channels": 2,
+                    "sample_format": "S16_LE",
                 },
                 "storage": {
-                    "mountpoint": "/mnt/ylx-recording",
+                    "mountpoint": "/data",
                     "minimum_available_bytes": 2 * 1024 * 1024 * 1024,
                     "minimum_available_inodes": 1024,
                 },
@@ -945,6 +1038,8 @@ class ReleaseManager:
     def _activate(self, old_current: str | None, new_current: str) -> None:
         release_changed = old_current != new_current
         try:
+            self.runner(["systemctl", "enable", "--now", "rp-ylx-data-volume.service"])
+            self.runner(["systemctl", "enable", "--now", "rp-ylx-wifi-watchdog.timer"])
             self.runner(["systemctl", "enable", "--now", "rp-ylx.service"])
             if old_current is not None and release_changed:
                 self.runner(["systemctl", "restart", "rp-ylx.service"])
@@ -1002,17 +1097,16 @@ class ReleaseManager:
     def uninstall(self) -> Mapping[str, object]:
         self._require_platform()
         with suppress(DeploymentError):
+            self.runner(["systemctl", "disable", "--now", "rp-ylx-wifi-watchdog.timer"])
+        with suppress(DeploymentError):
             self.runner(["systemctl", "disable", "--now", "rp-ylx.service"])
         if self.install_root.exists() and not self.install_root.is_symlink():
             shutil.rmtree(self.install_root)
         self.transaction.unlink(missing_ok=True)
-        for target in (
-            self.system_root / "usr/lib/systemd/system/rp-ylx.service",
-            self.system_root / "usr/lib/sysusers.d/rp-ylx.conf",
-            self.system_root / "usr/lib/tmpfiles.d/rp-ylx.conf",
-            self.system_root / "usr/local/sbin/rp-ylx-deploy",
-        ):
+        for relative, _ in DEPLOYMENT_ASSETS.values():
+            target = self.system_root / relative
             target.unlink(missing_ok=True)
+        (self.system_root / "usr/local/sbin/rp-ylx-deploy").unlink(missing_ok=True)
         bootstrap_root = self.system_root / "usr/local/lib/rp-ylx"
         if bootstrap_root.exists() and not bootstrap_root.is_symlink():
             shutil.rmtree(bootstrap_root)

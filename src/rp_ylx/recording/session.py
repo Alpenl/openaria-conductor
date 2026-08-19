@@ -20,6 +20,7 @@ from rp_ylx.camera import FrameObservation
 from rp_ylx.contracts import validate_session
 from rp_ylx.contracts.frame_stream import MAGIC, encode_frame
 from rp_ylx.imu import ImuObservation
+from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 
 
 class RecordingError(RuntimeError):
@@ -58,6 +59,7 @@ class RecordingConfig:
 @dataclass(frozen=True, slots=True)
 class _FrameEvent:
     observation: FrameObservation
+    payload_lease: PayloadLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +119,7 @@ class SessionRecorder:
         queue_capacity: int = 128,
         enqueue_timeout: float = 0.05,
         before_write: Callable[[str, bytes], None] | None = None,
+        metrics: PerformanceMetrics | None = None,
     ) -> None:
         if queue_capacity <= 0 or enqueue_timeout < 0:
             raise ValueError("队列容量必须大于零，入队超时不能为负")
@@ -125,6 +128,8 @@ class SessionRecorder:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_capacity)
         self._enqueue_timeout = enqueue_timeout
         self._before_write = before_write or (lambda role, payload: None)
+        self._metrics = metrics
+        self._queue_capacity = queue_capacity
         self._state_lock = threading.RLock()
         self._counter_lock = threading.Lock()
         self._state = "new"
@@ -139,6 +144,8 @@ class SessionRecorder:
         self._imu_written = 0
         self._diagnostics_written = 0
         self._dropped_frames = 0
+        self._source_gaps = 0
+        self._queue_rejected_frames = 0
         self._dropped_imu = 0
 
     @property
@@ -224,10 +231,18 @@ class SessionRecorder:
             return self._partial_path
 
     def _write(self, role: str, payload: bytes) -> None:
-        self._before_write(role, payload)
-        written = self._files[role].write(payload)
-        if written != len(payload):
-            raise OSError(f"{role} 发生短写：{written}/{len(payload)}")
+        started = self._metrics.start() if self._metrics is not None else 0
+        try:
+            self._before_write(role, payload)
+            written = self._files[role].write(payload)
+            if written != len(payload):
+                raise OSError(f"{role} 发生短写：{written}/{len(payload)}")
+        except BaseException:
+            if self._metrics is not None:
+                self._metrics.record_loss("write_failure")
+            raise
+        if self._metrics is not None:
+            self._metrics.finish("recording_write", started)
 
     def _write_diagnostic(self, severity: str, code: str, message: str, count: int) -> None:
         record = {
@@ -259,10 +274,13 @@ class SessionRecorder:
             except Exception as exc:
                 self._writer_error = exc
             finally:
+                if isinstance(item, _FrameEvent) and item.payload_lease is not None:
+                    item.payload_lease.release()
                 self._queue.task_done()
 
     def _persist_frame(self, observation: FrameObservation) -> None:
         frame = observation.frame
+        started = self._metrics.start() if self._metrics is not None else 0
         self._write("video.left", encode_frame(frame.left))
         self._write("video.right", encode_frame(frame.right))
         record = {
@@ -274,6 +292,8 @@ class SessionRecorder:
         }
         self._write("frames.timeline", _json_bytes(record))
         self._frames_written += 1
+        if self._metrics is not None:
+            self._metrics.finish("recording_frame", started)
 
     def _persist_imu(self, observation: ImuObservation) -> None:
         session_id = self._require_session_id()
@@ -292,12 +312,33 @@ class SessionRecorder:
             self._raise_if_unavailable()
             with self._counter_lock:
                 self._dropped_frames += observation.dropped_before
+                self._source_gaps += observation.dropped_before
+            lease = (
+                self._metrics.retain_payload(
+                    "recorder_reference",
+                    len(observation.frame.left) + len(observation.frame.right),
+                )
+                if self._metrics is not None
+                else None
+            )
             try:
-                self._queue.put(_FrameEvent(observation), timeout=self._enqueue_timeout)
+                self._queue.put(_FrameEvent(observation, lease), timeout=self._enqueue_timeout)
+                if self._metrics is not None:
+                    self._metrics.observe_queue(
+                        depth=self._queue.qsize(), capacity=self._queue_capacity
+                    )
                 return True
             except queue.Full:
                 with self._counter_lock:
                     self._dropped_frames += 1
+                    self._queue_rejected_frames += 1
+                if lease is not None:
+                    lease.release()
+                if self._metrics is not None:
+                    self._metrics.observe_queue(
+                        depth=self._queue.qsize(), capacity=self._queue_capacity, rejected=1
+                    )
+                    self._metrics.record_loss("queue_rejected")
                 return False
 
     def submit_imu(self, observation: ImuObservation) -> bool:
@@ -462,6 +503,17 @@ class SessionRecorder:
             if self._dropped_frames:
                 self._write_diagnostic(
                     "warning", "frame_dropped", "相机或有界队列发生丢帧", self._dropped_frames
+                )
+            if self._source_gaps:
+                self._write_diagnostic(
+                    "warning", "source_frame_gap", "相机来源帧序列存在缺口", self._source_gaps
+                )
+            if self._queue_rejected_frames:
+                self._write_diagnostic(
+                    "warning",
+                    "frame_queue_rejected",
+                    "录制有界队列拒绝帧",
+                    self._queue_rejected_frames,
                 )
             if self._dropped_imu:
                 self._write_diagnostic(

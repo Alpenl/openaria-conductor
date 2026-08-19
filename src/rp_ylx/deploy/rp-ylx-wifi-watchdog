@@ -1,0 +1,306 @@
+#!/bin/sh
+set -eu
+
+TAG=rp-ylx-wifi-watchdog
+INTERFACE=${WIFI_INTERFACE:-wlan0}
+CONNECTION_UUID=${WIFI_CONNECTION_UUID:-}
+GATEWAY=${WIFI_GATEWAY:-}
+FAILURE_THRESHOLD=${WIFI_FAILURE_THRESHOLD:-3}
+RECONNECT_TIMEOUT=${WIFI_RECONNECT_TIMEOUT_SECONDS:-30}
+RELOAD_TIMEOUT=${WIFI_RELOAD_TIMEOUT_SECONDS:-60}
+NMCLI_TIMEOUT=${WIFI_NMCLI_TIMEOUT_SECONDS:-10}
+RECOVERY_COOLDOWN=${WIFI_RECOVERY_COOLDOWN_SECONDS:-900}
+DRIVER_MODULE=${WIFI_DRIVER_MODULE:-aic8800_fdrv}
+REBOOT_ON_FAILURE=${WIFI_REBOOT_ON_RECOVERY_FAILURE:-1}
+REBOOT_COOLDOWN=${WIFI_REBOOT_COOLDOWN_SECONDS:-21600}
+STATE_DIRECTORY=${STATE_DIRECTORY:-/var/lib/rp-ylx-wifi-watchdog}
+RUNTIME_DIRECTORY=${RUNTIME_DIRECTORY:-/run/rp-ylx-wifi-watchdog}
+SYS_CLASS_NET=${WIFI_SYS_CLASS_NET:-/sys/class/net}
+
+FAILURE_FILE=$RUNTIME_DIRECTORY/failures
+LOCK_FILE=$RUNTIME_DIRECTORY/lock
+LAST_RECOVERY_FILE=$STATE_DIRECTORY/last-recovery-epoch
+LAST_REBOOT_FILE=$STATE_DIRECTORY/last-automatic-reboot-epoch
+
+log()
+{
+    logger -t "$TAG" -- "$*"
+    printf '%s: %s\n' "$TAG" "$*"
+}
+
+require_unsigned_integer()
+{
+    name=$1
+    value=$2
+    case "$value" in
+        ''|*[!0-9]*)
+            log "invalid $name: $value"
+            exit 2
+            ;;
+    esac
+}
+
+require_unsigned_integer WIFI_FAILURE_THRESHOLD "$FAILURE_THRESHOLD"
+require_unsigned_integer WIFI_RECONNECT_TIMEOUT_SECONDS "$RECONNECT_TIMEOUT"
+require_unsigned_integer WIFI_RELOAD_TIMEOUT_SECONDS "$RELOAD_TIMEOUT"
+require_unsigned_integer WIFI_NMCLI_TIMEOUT_SECONDS "$NMCLI_TIMEOUT"
+require_unsigned_integer WIFI_RECOVERY_COOLDOWN_SECONDS "$RECOVERY_COOLDOWN"
+require_unsigned_integer WIFI_REBOOT_COOLDOWN_SECONDS "$REBOOT_COOLDOWN"
+
+mkdir -p "$STATE_DIRECTORY" "$RUNTIME_DIRECTORY"
+chmod 0700 "$STATE_DIRECTORY" "$RUNTIME_DIRECTORY"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    exit 0
+fi
+
+read_failure_count()
+{
+    if [ ! -r "$FAILURE_FILE" ]; then
+        printf '0\n'
+        return
+    fi
+    count=$(cat "$FAILURE_FILE" 2>/dev/null || printf '0')
+    case "$count" in
+        ''|*[!0-9]*) printf '0\n' ;;
+        *) printf '%s\n' "$count" ;;
+    esac
+}
+
+write_failure_count()
+{
+    temporary=$FAILURE_FILE.$$
+    printf '%s\n' "$1" >"$temporary"
+    mv "$temporary" "$FAILURE_FILE"
+}
+
+resolve_gateway()
+{
+    if [ -n "$GATEWAY" ]; then
+        printf '%s\n' "$GATEWAY"
+        return
+    fi
+    ip -4 route show default dev "$INTERFACE" 2>/dev/null \
+        | awk '/^default / {print $3; exit}'
+}
+
+resolve_connection_uuid()
+{
+    if [ -n "$CONNECTION_UUID" ]; then
+        printf '%s\n' "$CONNECTION_UUID"
+        return
+    fi
+    timeout "$NMCLI_TIMEOUT" nmcli -g GENERAL.CON-UUID device show "$INTERFACE" 2>/dev/null \
+        | awk 'NF {print; exit}'
+}
+
+is_healthy()
+{
+    [ -e "$SYS_CLASS_NET/$INTERFACE" ] || return 1
+    target=$(resolve_gateway)
+    [ -n "$target" ] || return 1
+    ping -n -q -I "$INTERFACE" -c 2 -W 2 "$target" >/dev/null 2>&1
+}
+
+wait_until_healthy()
+{
+    timeout=$1
+    elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if is_healthy; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+record_diagnostics()
+{
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    output=$STATE_DIRECTORY/diagnostic-$timestamp.log
+    {
+        date -u
+        uname -a
+        ip -brief address
+        ip route
+        iw dev "$INTERFACE" link 2>&1 || true
+        iw dev "$INTERFACE" get power_save 2>&1 || true
+        timeout "$NMCLI_TIMEOUT" nmcli -f GENERAL,IP4 device show "$INTERFACE" 2>&1 || true
+        journalctl -k --since=-15min --no-pager 2>&1 || true
+        journalctl -u NetworkManager.service --since=-15min --no-pager 2>&1 || true
+        journalctl -u wpa_supplicant.service --since=-15min --no-pager 2>&1 || true
+    } >"$output"
+    chmod 0600 "$output"
+    log "saved diagnostics to $output"
+}
+
+recovery_is_in_cooldown()
+{
+    [ -r "$LAST_RECOVERY_FILE" ] || return 1
+    last=$(cat "$LAST_RECOVERY_FILE" 2>/dev/null || printf '0')
+    case "$last" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    now=$(date +%s)
+    [ "$now" -ge "$last" ] || return 1
+    [ $((now - last)) -lt "$RECOVERY_COOLDOWN" ]
+}
+
+mark_recovery()
+{
+    date +%s >"$LAST_RECOVERY_FILE"
+    chmod 0600 "$LAST_RECOVERY_FILE"
+}
+
+reconnect_network_manager()
+{
+    uuid=$(resolve_connection_uuid)
+    if [ -z "$uuid" ]; then
+        log "cannot resolve the NetworkManager connection UUID for $INTERFACE"
+        return 1
+    fi
+    log "asking NetworkManager to reconnect $INTERFACE"
+    timeout "$NMCLI_TIMEOUT" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+    sleep 2
+    timeout "$NMCLI_TIMEOUT" nmcli radio wifi on >/dev/null 2>&1 || true
+    timeout "$NMCLI_TIMEOUT" nmcli connection up uuid "$uuid" ifname "$INTERFACE" \
+        >/dev/null 2>&1 || true
+    iw dev "$INTERFACE" set power_save off >/dev/null 2>&1 || true
+    wait_until_healthy "$RECONNECT_TIMEOUT"
+}
+
+reload_driver()
+{
+    uuid=$(resolve_connection_uuid)
+    log "reloading kernel module $DRIVER_MODULE for $INTERFACE"
+    timeout "$NMCLI_TIMEOUT" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+    sleep 2
+    if ! timeout 20 modprobe -r "$DRIVER_MODULE"; then
+        log "failed to unload $DRIVER_MODULE"
+        return 1
+    fi
+    sleep 2
+    if ! timeout 20 modprobe "$DRIVER_MODULE"; then
+        log "failed to load $DRIVER_MODULE"
+        return 1
+    fi
+
+    elapsed=0
+    while [ "$elapsed" -lt 30 ] && [ ! -e "$SYS_CLASS_NET/$INTERFACE" ]; do
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    if [ ! -e "$SYS_CLASS_NET/$INTERFACE" ]; then
+        log "$INTERFACE did not reappear after reloading $DRIVER_MODULE"
+        return 1
+    fi
+
+    timeout "$NMCLI_TIMEOUT" nmcli radio wifi on >/dev/null 2>&1 || true
+    if [ -n "$uuid" ]; then
+        timeout "$NMCLI_TIMEOUT" nmcli connection up uuid "$uuid" ifname "$INTERFACE" \
+            >/dev/null 2>&1 || true
+    fi
+    iw dev "$INTERFACE" set power_save off >/dev/null 2>&1 || true
+    return 0
+}
+
+automatic_reboot_is_in_cooldown()
+{
+    [ -r "$LAST_REBOOT_FILE" ] || return 1
+    last=$(cat "$LAST_REBOOT_FILE" 2>/dev/null || printf '0')
+    case "$last" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    now=$(date +%s)
+    if [ "$now" -lt "$last" ]; then
+        return 0
+    fi
+    [ $((now - last)) -lt "$REBOOT_COOLDOWN" ]
+}
+
+maybe_reboot_after_recovery_failure()
+{
+    [ "$REBOOT_ON_FAILURE" = 1 ] || return 0
+    if automatic_reboot_is_in_cooldown; then
+        log "automatic reboot is in cooldown"
+        return 0
+    fi
+    date +%s >"$LAST_REBOOT_FILE"
+    chmod 0600 "$LAST_REBOOT_FILE"
+    log "$INTERFACE is still unhealthy after driver recovery; rebooting the device"
+    sync
+    systemctl reboot
+}
+
+force_recovery()
+{
+    record_diagnostics
+    mark_recovery
+    if ! reload_driver; then
+        maybe_reboot_after_recovery_failure
+        return 1
+    fi
+    if wait_until_healthy "$RELOAD_TIMEOUT"; then
+        write_failure_count 0
+        log "$INTERFACE recovered after reloading $DRIVER_MODULE"
+        return 0
+    fi
+    write_failure_count 0
+    log "$INTERFACE reappeared, but the gateway is still unreachable"
+    maybe_reboot_after_recovery_failure
+    return 1
+}
+
+check_health()
+{
+    if is_healthy; then
+        if [ "$(read_failure_count)" -ne 0 ]; then
+            log "$INTERFACE connectivity recovered"
+        fi
+        write_failure_count 0
+        exit 0
+    fi
+
+    failures=$(( $(read_failure_count) + 1 ))
+    write_failure_count "$failures"
+    log "$INTERFACE gateway probe failed ($failures/$FAILURE_THRESHOLD)"
+    if [ "$failures" -lt "$FAILURE_THRESHOLD" ]; then
+        exit 0
+    fi
+    if recovery_is_in_cooldown; then
+        log "recovery is in cooldown"
+        exit 0
+    fi
+
+    record_diagnostics
+    mark_recovery
+    if reconnect_network_manager; then
+        write_failure_count 0
+        log "$INTERFACE recovered after the NetworkManager reconnect"
+        exit 0
+    fi
+    if ! reload_driver; then
+        maybe_reboot_after_recovery_failure
+        exit 0
+    fi
+    if wait_until_healthy "$RELOAD_TIMEOUT"; then
+        write_failure_count 0
+        log "$INTERFACE recovered after reloading $DRIVER_MODULE"
+        exit 0
+    fi
+
+    write_failure_count 0
+    log "$INTERFACE reappeared, but the gateway is still unreachable"
+    maybe_reboot_after_recovery_failure
+}
+
+case "${1:-check}" in
+    check) check_health ;;
+    recover) force_recovery ;;
+    *)
+        printf 'usage: %s [check|recover]\n' "$0" >&2
+        exit 2
+        ;;
+esac

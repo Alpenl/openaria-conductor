@@ -12,10 +12,13 @@ from rp_ylx.camera.models import (
     CameraStream,
     FrameObservation,
 )
+from rp_ylx.performance.metrics import PerformanceMetrics
 
 
 class CameraController:
-    def __init__(self, backend: CameraBackend) -> None:
+    def __init__(
+        self, backend: CameraBackend, *, metrics: PerformanceMetrics | None = None
+    ) -> None:
         self._backend = backend
         self._stream: CameraStream | None = None
         self._descriptor: CameraDescriptor | None = None
@@ -23,6 +26,7 @@ class CameraController:
         self._state = "closed"
         self._last_source_sequence: int | None = None
         self._last_host_time: int | None = None
+        self._metrics = metrics
 
     @property
     def state(self) -> str:
@@ -102,10 +106,26 @@ class CameraController:
             ):
                 raise CameraError("bad_frame", "相机返回不完整或无效双目帧")
             dropped = 0
+            application_dropped = frame._application_dropped_before
             if self._last_source_sequence is not None:
                 if frame.source_sequence <= self._last_source_sequence:
                     raise CameraError("sequence_regression", "相机帧序号重复或回退")
                 dropped = frame.source_sequence - self._last_source_sequence - 1
+                if application_dropped > dropped:
+                    raise CameraError(
+                        "invalid_drop_accounting",
+                        "应用丢帧计数超过相机源序列缺口",
+                    )
+                if self._metrics is not None:
+                    if application_dropped:
+                        self._metrics.record_loss("queue_rejected", application_dropped)
+                    source_dropped = dropped - application_dropped
+                    if source_dropped:
+                        self._metrics.record_loss("source_gap", source_dropped)
+            elif application_dropped:
+                dropped = application_dropped
+                if self._metrics is not None:
+                    self._metrics.record_loss("queue_rejected", application_dropped)
             if self._last_host_time is not None and frame.host_monotonic_ns <= self._last_host_time:
                 raise CameraError("timestamp_regression", "相机主机时间戳重复或回退")
             self._last_source_sequence = frame.source_sequence

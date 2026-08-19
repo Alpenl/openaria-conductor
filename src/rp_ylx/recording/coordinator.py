@@ -17,7 +17,11 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Protocol
 
-from rp_ylx.api.downloads import ArtifactAccessError, DirectorySessionStore
+from rp_ylx.api.downloads import (
+    ArtifactAccessError,
+    DirectorySessionStore,
+    iter_device_session_v1_artifacts,
+)
 from rp_ylx.api.events import validate_safe_swap_v3_receipt
 from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderError
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
@@ -38,7 +42,8 @@ from rp_ylx.recording.device_session import (
 from rp_ylx.runtime import collect_linux_runtime
 
 VOLUME_MARKER = ".ylx-volume.json"
-SESSIONS_DIRECTORY = "sessions"
+SESSIONS_DIRECTORY = "recordings"
+LEGACY_SESSIONS_DIRECTORY = "sessions"
 
 
 class _Representation(Protocol):
@@ -80,6 +85,7 @@ class CaptureSources(Protocol):
 class VolumeAdmission:
     mountpoint: Path
     sessions_root: Path
+    catalog_roots: tuple[Path, ...]
     volume_id: str
     generation_id: str
     device: int
@@ -251,6 +257,53 @@ class _TrackedRepresentation:
         return self._representation.iter_chunks(offset, length, chunk_size=chunk_size)
 
 
+class _MultiRootSessionStore:
+    """Read sealed sessions from the current recordings root and legacy roots."""
+
+    def __init__(
+        self,
+        roots: tuple[Path, ...],
+        *,
+        verified_manifests: Mapping[str, str],
+    ) -> None:
+        self._stores = [
+            DirectorySessionStore(root, verified_manifests=verified_manifests) for root in roots
+        ]
+
+    def close(self) -> None:
+        for store in self._stores:
+            store.close()
+
+    def open_manifest(self, session_id: str, api_version: str) -> object:
+        not_found: ArtifactAccessError | None = None
+        for store in self._stores:
+            try:
+                return store.open_manifest(session_id, api_version)
+            except ArtifactAccessError as error:
+                if error.code != "not_found":
+                    raise
+                not_found = error
+        if not_found is not None:
+            raise not_found
+        raise ArtifactAccessError("not_found", "会话不存在")
+
+    def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
+        last_retryable: ArtifactAccessError | None = None
+        for store in self._stores:
+            try:
+                return store.open_verified_artifact(session_id, artifact_id, api_version)
+            except ArtifactAccessError as error:
+                if error.code == "not_found" or (
+                    error.code == "not_verified" and error.reason == "stale"
+                ):
+                    last_retryable = error
+                    continue
+                raise
+        if last_retryable is not None:
+            raise last_retryable
+        raise ArtifactAccessError("not_found", "artifact 不存在")
+
+
 class CaptureCoordinator:
     """单卷单活动会话的生产 DeviceProvider。"""
 
@@ -273,6 +326,7 @@ class CaptureCoordinator:
         self._sources = sources
         self._before_write = before_write
         self._lock = threading.RLock()
+        self._stop_condition = threading.Condition(self._lock)
         self._storage_lock = threading.Lock()
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
@@ -285,6 +339,7 @@ class CaptureCoordinator:
         self._media_lost = False
         self._pending_safe_swap: dict[str, object] | None = None
         self._safe_swap_resource: dict[str, object] | None = None
+        self._stop_inflight: tuple[str, str, str] | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
         self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         self._state_path = self._config.state_root / "capture-coordinator.json"
@@ -296,9 +351,8 @@ class CaptureCoordinator:
         self._admission: VolumeAdmission | None = None
         try:
             self._admission = self._admit(persisted)
-        except DeviceRecordingError as error:
-            if error.code != "volume_not_mounted":
-                raise
+        except DeviceRecordingError:
+            self._admission = None
         self._restore_local_state(persisted)
         if self._admission is not None:
             self._recover_sessions()
@@ -319,6 +373,9 @@ class CaptureCoordinator:
             recorder_handles = 0 if self._active is None else self._active.open_handle_count
             source_handles = 0 if self._sources is None else self._sources.open_handle_count
             return recorder_handles + source_handles + self._open_representations
+
+    def _sources_keep_preview(self) -> bool:
+        return bool(getattr(self._sources, "keeps_preview_after_stop", False))
 
     def _read_local_state(self) -> Mapping[str, object]:
         if not self._state_path.exists():
@@ -392,11 +449,23 @@ class CaptureCoordinator:
             raise DeviceRecordingError("unsafe_sessions_root", "会话目录不能是符号链接")
         if sessions_root.stat().st_dev != mount_stat.st_dev:
             raise DeviceRecordingError("cross_device_sessions", "会话目录不在录制卷文件系统内")
+        catalog_roots = [sessions_root]
+        legacy_sessions_root = mountpoint / LEGACY_SESSIONS_DIRECTORY
+        if legacy_sessions_root != sessions_root and legacy_sessions_root.exists():
+            if legacy_sessions_root.is_symlink() or not legacy_sessions_root.is_dir():
+                raise DeviceRecordingError("unsafe_sessions_root", "旧会话目录不能是符号链接或文件")
+            if legacy_sessions_root.stat().st_dev != mount_stat.st_dev:
+                raise DeviceRecordingError(
+                    "cross_device_sessions",
+                    "旧会话目录不在录制卷文件系统内",
+                )
+            catalog_roots.append(legacy_sessions_root)
         if not sessions_root_existed:
             fsync_directory(mountpoint)
         return VolumeAdmission(
             mountpoint,
             sessions_root,
+            tuple(catalog_roots),
             volume_id,
             generation_id,
             mount_stat.st_dev,
@@ -549,39 +618,40 @@ class CaptureCoordinator:
 
     def _recover_sessions(self) -> None:
         admission = self._require_admission()
-        for partial in sorted(admission.sessions_root.glob("*.partial")):
-            if not partial.is_dir():
-                continue
-            session_id = partial.name.removesuffix(".partial")
-            try:
-                parsed = uuid.UUID(session_id)
-            except ValueError:
-                continue
-            if parsed.version != 7 or str(parsed) != session_id:
-                continue
-            manifest = partial / "manifest.json"
-            controls_absent = (
-                not (partial / "recording.json").exists()
-                and not (partial / "capture.json").exists()
-            )
-            if manifest.is_file() and controls_absent:
-                final = admission.sessions_root / session_id
-                try:
-                    validate_device_session_directory(
-                        partial,
-                        expected_session_id=session_id,
-                    )
-                    if final.exists():
-                        raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
-                    os.rename(partial, final)
-                    fsync_directory(admission.sessions_root)
-                    payload = (final / "manifest.json").read_bytes()
-                    self._verified[session_id] = hashlib.sha256(payload).hexdigest()
+        for sessions_root in admission.catalog_roots:
+            for partial in sorted(sessions_root.glob("*.partial")):
+                if not partial.is_dir():
                     continue
-                except (OSError, DeviceRecordingError):
-                    with suppress(OSError):
-                        manifest.unlink(missing_ok=True)
-            self._settle_partial(partial, session_id)
+                session_id = partial.name.removesuffix(".partial")
+                try:
+                    parsed = uuid.UUID(session_id)
+                except ValueError:
+                    continue
+                if parsed.version != 7 or str(parsed) != session_id:
+                    continue
+                manifest = partial / "manifest.json"
+                controls_absent = (
+                    not (partial / "recording.json").exists()
+                    and not (partial / "capture.json").exists()
+                )
+                if manifest.is_file() and controls_absent:
+                    final = sessions_root / session_id
+                    try:
+                        validate_device_session_directory(
+                            partial,
+                            expected_session_id=session_id,
+                        )
+                        if final.exists():
+                            raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
+                        os.rename(partial, final)
+                        fsync_directory(sessions_root)
+                        payload = (final / "manifest.json").read_bytes()
+                        self._verified[session_id] = hashlib.sha256(payload).hexdigest()
+                        continue
+                    except (OSError, DeviceRecordingError):
+                        with suppress(OSError):
+                            manifest.unlink(missing_ok=True)
+                self._settle_partial(partial, session_id)
 
     def _settle_partial(self, partial: Path, session_id: str) -> None:
         admission = self._require_admission()
@@ -629,17 +699,22 @@ class CaptureCoordinator:
 
     def _catalog_sessions(self) -> None:
         admission = self._require_admission()
-        for candidate in admission.sessions_root.iterdir():
-            if not candidate.is_dir() or candidate.name.endswith(".partial"):
-                continue
-            try:
-                parsed = uuid.UUID(candidate.name)
-                if parsed.version != 7 or str(parsed) != candidate.name:
+        for sessions_root in admission.catalog_roots:
+            for candidate in sessions_root.iterdir():
+                if (
+                    not candidate.is_dir()
+                    or candidate.name.endswith(".partial")
+                    or candidate.name in self._verified
+                ):
                     continue
-                _, payload = inspect_device_session_directory(candidate)
-                self._verified[candidate.name] = hashlib.sha256(payload).hexdigest()
-            except (OSError, ValueError, DeviceRecordingError):
-                continue
+                try:
+                    parsed = uuid.UUID(candidate.name)
+                    if parsed.version != 7 or str(parsed) != candidate.name:
+                        continue
+                    _, payload = inspect_device_session_directory(candidate)
+                    self._verified[candidate.name] = hashlib.sha256(payload).hexdigest()
+                except (OSError, ValueError, DeviceRecordingError):
+                    continue
 
     def _recording_snapshot(self) -> tuple[str, object | None, object | None]:
         if self._active is not None:
@@ -861,7 +936,8 @@ class CaptureCoordinator:
         self._active_plan = plan
         self._safe_swap_resource = None
         self._pending_safe_swap = None
-        self._preview.clear()
+        if not self._sources_keep_preview():
+            self._preview.clear()
         try:
             recorder.start()
             if self._sources is not None:
@@ -919,86 +995,137 @@ class CaptureCoordinator:
 
     def stop_capture(self, command: CaptureCommand) -> CaptureCommandResult:
         scope = (command.principal_id, "stop", command.idempotency_key)
-        with self._lock:
-            previous = self._commands.get(scope)
-            should_stop_sources = previous is None and self._active is not None
-        if should_stop_sources and self._sources is not None:
-            try:
-                self._sources.stop()
-            except BaseException as error:
-                with self._lock:
-                    if self._active is not None:
-                        failure = DeviceRecordingError(
-                            "source_stop_failed",
-                            f"采集来源未能释放：{error}",
+        reason = command.body.get("reason")
+        with self._stop_condition:
+            while True:
+                previous = self._commands.get(scope)
+                if previous is not None:
+                    previous_body, result = previous
+                    if previous_body != command.canonical_body:
+                        raise ProviderError(
+                            "idempotency_conflict",
+                            "幂等键已经用于不同请求",
+                            status=HTTPStatus.CONFLICT,
                         )
-                        self._retain_active_failure(failure)
-                raise ProviderError(
-                    "source_stop_failed",
-                    f"采集来源未能释放：{error}",
-                    status=HTTPStatus.CONFLICT,
-                ) from error
-        if should_stop_sources:
-            self._preview.clear()
-        with self._lock:
-            return self._idempotent("stop", command, lambda: self._stop_capture(command.body))
+                    return CaptureCommandResult(
+                        result.status, copy.deepcopy(result.body), replayed=True
+                    )
+                if self._stop_inflight is None:
+                    break
+                self._stop_condition.wait()
+            if self._admission is None:
+                try:
+                    self._require_admission()
+                except DeviceRecordingError as error:
+                    raise ProviderError(
+                        error.code,
+                        error.message,
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    ) from error
+            if self._active is None:
+                if reason == "safe_swap" and self._pending_safe_swap is not None:
+                    result = self._publish_safe_swap_command()
+                else:
+                    result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                self._remember_command(scope, command, result)
+                return result
+            recorder = self._active
+            plan = self._active_plan
+            assert plan is not None
+            self._stop_inflight = scope
 
-    def _stop_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
-        if self._admission is None:
-            try:
-                self._require_admission()
-            except DeviceRecordingError as error:
-                raise ProviderError(
-                    error.code,
-                    error.message,
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                ) from error
-        reason = body.get("reason")
-        if self._active is None:
-            if reason == "safe_swap" and self._pending_safe_swap is not None:
-                self._publish_safe_swap()
-                return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-            return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-        recorder = self._active
-        plan = self._active_plan
-        assert plan is not None
         try:
-            sealed = recorder.stop(
-                before_publish=lambda: self._check_generation(
-                    plan.generation_id,
-                    force=True,
+            if self._sources is not None:
+                try:
+                    self._sources.stop()
+                except BaseException as error:
+                    with self._lock:
+                        if self._active is recorder:
+                            failure = DeviceRecordingError(
+                                "source_stop_failed",
+                                f"采集来源未能释放：{error}",
+                            )
+                            self._retain_active_failure(failure)
+                    raise ProviderError(
+                        "source_stop_failed",
+                        f"采集来源未能释放：{error}",
+                        status=HTTPStatus.CONFLICT,
+                    ) from error
+            if not self._sources_keep_preview():
+                self._preview.clear()
+
+            try:
+                sealed = recorder.stop(
+                    before_publish=lambda: self._check_generation(
+                        plan.generation_id,
+                        force=True,
+                    )
                 )
-            )
-        except DeviceRecordingError as error:
-            self._retain_active_failure(error)
-            raise ProviderError(error.code, error.message, status=HTTPStatus.CONFLICT) from error
-        self._verified[plan.session_id] = sealed.manifest_sha256
-        self._active = None
-        self._active_plan = None
-        self._next_revision()
-        if reason == "safe_swap":
-            self._pending_safe_swap = {
-                "session_id": plan.session_id,
-                "volume_id": plan.volume_id,
-                "generation_id": plan.generation_id,
-                "manifest_id": sealed.manifest["manifest_id"],
-                "manifest_sha256": sealed.manifest_sha256,
-                "sealed_at": sealed.manifest["sealed_at"],
-            }
-            self._persist_local_state()
-            self._publish_safe_swap()
+            except DeviceRecordingError as error:
+                with self._lock:
+                    if self._active is recorder:
+                        self._retain_active_failure(error)
+                raise ProviderError(
+                    error.code, error.message, status=HTTPStatus.CONFLICT
+                ) from error
+
+            with self._lock:
+                if self._active is not recorder:
+                    raise ProviderError(
+                        "capture_state_changed",
+                        "录制停止期间状态已变化",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    )
+                self._verified[plan.session_id] = sealed.manifest_sha256
+                self._active = None
+                self._active_plan = None
+                self._next_revision()
+                if reason == "safe_swap":
+                    self._pending_safe_swap = {
+                        "session_id": plan.session_id,
+                        "volume_id": plan.volume_id,
+                        "generation_id": plan.generation_id,
+                        "manifest_id": sealed.manifest["manifest_id"],
+                        "manifest_sha256": sealed.manifest_sha256,
+                        "sealed_at": sealed.manifest["sealed_at"],
+                    }
+                    self._persist_local_state()
+                    result = self._publish_safe_swap_command()
+                else:
+                    self._persist_local_state()
+                    result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+                self._remember_command(scope, command, result)
+                return result
+        finally:
+            with self._stop_condition:
+                if self._stop_inflight == scope:
+                    self._stop_inflight = None
+                self._stop_condition.notify_all()
+
+    def _publish_safe_swap_command(self) -> CaptureCommandResult:
+        self._publish_safe_swap()
+        return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+
+    def _remember_command(
+        self,
+        scope: tuple[str, str, str],
+        command: CaptureCommand,
+        result: CaptureCommandResult,
+    ) -> None:
+        self._commands[scope] = (command.canonical_body, copy.deepcopy(result))
+        while len(self._commands) > 1024:
+            self._commands.pop(next(iter(self._commands)))
         self._persist_local_state()
-        if reason == "safe_swap":
-            return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-        return CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
 
     def _retain_active_failure(self, error: DeviceRecordingError) -> None:
         recorder = self._active
         plan = self._active_plan
         if recorder is None or plan is None:
             return
-        self._preview.clear()
+        if not self._sources_keep_preview():
+            self._preview.clear()
         media_lost = error.code == "media_lost"
         recorder.fail(
             error.code,
@@ -1249,10 +1376,10 @@ class CaptureCoordinator:
 
         return release
 
-    def _open_store(self) -> DirectorySessionStore:
+    def _open_store(self) -> _MultiRootSessionStore:
         admission = self._require_admission()
-        return DirectorySessionStore(
-            admission.sessions_root,
+        return _MultiRootSessionStore(
+            admission.catalog_roots,
             verified_manifests=self._verified,
         )
 
@@ -1281,9 +1408,15 @@ class CaptureCoordinator:
             store.close()
 
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
-        path = self._require_admission().sessions_root / session_id
-        manifest, _ = inspect_device_session_directory(path)
-        return manifest
+        admission = self._require_admission()
+        for sessions_root in admission.catalog_roots:
+            path = sessions_root / session_id
+            try:
+                manifest, _ = inspect_device_session_directory(path)
+                return manifest
+            except (OSError, DeviceRecordingError):
+                continue
+        raise ArtifactAccessError("not_found", "会话不存在")
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
         with self._lock:
@@ -1317,80 +1450,86 @@ class CaptureCoordinator:
         admission = self._require_admission()
         items: list[dict[str, object]] = []
         diagnostics: list[dict[str, object]] = []
-        for candidate in sorted(admission.sessions_root.iterdir(), key=lambda path: path.name):
-            if not candidate.is_dir() or candidate.name.endswith(".partial"):
-                continue
-            if candidate.name in self._retained and candidate.name not in self._verified:
-                diagnostics.append(
-                    {
-                        "quarantine_id": str(uuid.uuid4()),
-                        "code": "manifest_invalid",
-                        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                        "message": "会话发布失败，未进入可下载 catalog",
-                    }
-                )
-                continue
-            try:
-                manifest, manifest_payload = inspect_device_session_directory(candidate)
-                take = manifest["take"]
-                timing = manifest["time"]
-                device = manifest["device"]
-                if not all(isinstance(value, Mapping) for value in (take, timing, device)):
-                    raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
-                if take_id is not None and take["take_id"] != take_id:
+        seen_sessions: set[str] = set()
+        for sessions_root in admission.catalog_roots:
+            for candidate in sorted(sessions_root.iterdir(), key=lambda path: path.name):
+                if (
+                    not candidate.is_dir()
+                    or candidate.name.endswith(".partial")
+                    or candidate.name in seen_sessions
+                ):
                     continue
-                total_bytes = sum(
-                    int(artifact["bytes"])
-                    for artifact in (
-                        manifest["video"]["artifact"],
-                        manifest["imu"]["artifact"],
-                        manifest["frames"]["artifact"],
+                seen_sessions.add(candidate.name)
+                if candidate.name in self._retained and candidate.name not in self._verified:
+                    diagnostics.append(
+                        {
+                            "quarantine_id": str(uuid.uuid4()),
+                            "code": "manifest_invalid",
+                            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                            "message": "会话发布失败，未进入可下载 catalog",
+                        }
                     )
-                )
-                manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-                self._verified[candidate.name] = manifest_sha256
-                items.append(
-                    {
-                        "session_id": manifest["session_id"],
-                        "producer_outcome": "sealed",
-                        "take_id": take["take_id"],
-                        "take_sequence": take["sequence"],
-                        "continuation_of": take["continuation_of"],
-                        "display_name": manifest["display_name"],
-                        "device": {
-                            "device_id": device["device_id"],
-                            "device_label": device["device_label"],
-                        },
-                        "started_at": timing["started_at"],
-                        "ended_at": timing["ended_at"],
-                        "duration_seconds": timing["duration_seconds"],
-                        "total_bytes": total_bytes,
-                        "verification": {
-                            "actor": "gateway",
-                            "validator": {
-                                "name": "rp-ylx-device-session-v1",
-                                "version": "1",
-                                "build_sha256": hashlib.sha256(
-                                    b"rp-ylx-device-session-v1"
-                                ).hexdigest(),
+                    continue
+                try:
+                    manifest, manifest_payload = inspect_device_session_directory(candidate)
+                    take = manifest["take"]
+                    timing = manifest["time"]
+                    device = manifest["device"]
+                    if not all(isinstance(value, Mapping) for value in (take, timing, device)):
+                        raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
+                    if take_id is not None and take["take_id"] != take_id:
+                        continue
+                    total_bytes = sum(
+                        int(artifact["bytes"])
+                        for artifact in iter_device_session_v1_artifacts(manifest)
+                    )
+                    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+                    self._verified[candidate.name] = manifest_sha256
+                    items.append(
+                        {
+                            "session_id": manifest["session_id"],
+                            "producer_outcome": "sealed",
+                            "take_id": take["take_id"],
+                            "take_sequence": take["sequence"],
+                            "continuation_of": take["continuation_of"],
+                            "display_name": manifest["display_name"],
+                            "device": {
+                                "device_id": device["device_id"],
+                                "device_label": device["device_label"],
                             },
-                            "manifest_sha256": manifest_sha256,
-                            "verified_at": manifest["integrity"]["verified_at"],
-                            "verdict": "usable",
-                            "diagnostics": [],
-                        },
-                    }
-                )
-            except (OSError, DeviceRecordingError, KeyError, TypeError, ValueError) as error:
-                diagnostics.append(
-                    {
-                        "quarantine_id": str(uuid.uuid4()),
-                        "code": "manifest_invalid",
-                        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                        "message": str(error)[:512],
-                    }
-                )
-        items.sort(key=lambda item: (str(item["started_at"]), str(item["session_id"])))
+                            "started_at": timing["started_at"],
+                            "ended_at": timing["ended_at"],
+                            "duration_seconds": timing["duration_seconds"],
+                            "total_bytes": total_bytes,
+                            "verification": {
+                                "actor": "gateway",
+                                "validator": {
+                                    "name": "rp-ylx-device-session-v1",
+                                    "version": "1",
+                                    "build_sha256": hashlib.sha256(
+                                        b"rp-ylx-device-session-v1"
+                                    ).hexdigest(),
+                                },
+                                "manifest_sha256": manifest_sha256,
+                                "verified_at": manifest["integrity"]["verified_at"],
+                                "verdict": "usable",
+                                "diagnostics": [],
+                            },
+                        }
+                    )
+                except (OSError, DeviceRecordingError, KeyError, TypeError, ValueError) as error:
+                    diagnostics.append(
+                        {
+                            "quarantine_id": str(uuid.uuid4()),
+                            "code": "manifest_invalid",
+                            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                            "message": str(error)[:512],
+                        }
+                    )
+        items.sort(
+            key=lambda item: (str(item["started_at"]), str(item["session_id"])),
+            reverse=True,
+        )
         combined: list[tuple[str, dict[str, object]]] = [
             (str(item["session_id"]), item) for item in items
         ]
@@ -1415,12 +1554,21 @@ class CaptureCoordinator:
         }
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
+        start_preview = getattr(self._sources, "start_preview", None)
+        if callable(start_preview):
+            with suppress(BaseException):
+                start_preview()
         return self._preview.latest_preview(fps=fps, accept=accept)
 
     def close(self) -> None:
         if self._sources is not None:
-            with suppress(BaseException):
-                self._sources.stop()
+            close_sources = getattr(self._sources, "close", None)
+            if callable(close_sources):
+                with suppress(BaseException):
+                    close_sources()
+            else:
+                with suppress(BaseException):
+                    self._sources.stop()
         self._preview.clear()
         with self._lock:
             if self._active is not None:

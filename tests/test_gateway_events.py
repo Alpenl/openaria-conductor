@@ -8,7 +8,7 @@ from copy import deepcopy
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from rp_ylx.api.events import EventReplayBuffer, InvalidSourceEvent
+from rp_ylx.api.events import EventReplayBuffer, InvalidSourceEvent, validate_session_list
 from rp_ylx.api.gateway import (
     CaptureCommand,
     CaptureCommandResult,
@@ -515,6 +515,62 @@ class GatewayEventHttpTest(unittest.TestCase):
                         "handle_audit": {},
                     },
                 }
+            )
+
+    def test_session_list_validator_accepts_newest_first_order(self) -> None:
+        def item(session_id: str, started_at: str) -> dict[str, object]:
+            return {
+                "session_id": session_id,
+                "producer_outcome": "sealed",
+                "take_id": session_id,
+                "take_sequence": 1,
+                "continuation_of": None,
+                "display_name": "ordered session",
+                "device": {
+                    "device_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "device_label": "YLX-30D5872D",
+                },
+                "started_at": started_at,
+                "ended_at": started_at,
+                "duration_seconds": 1.0,
+                "total_bytes": 1,
+                "verification": {
+                    "actor": "gateway",
+                    "validator": {
+                        "name": "rp-ylx-device-session-v1",
+                        "version": "1",
+                        "build_sha256": "a" * 64,
+                    },
+                    "manifest_sha256": "b" * 64,
+                    "verified_at": started_at,
+                    "verdict": "usable",
+                    "diagnostics": [],
+                },
+            }
+
+        newer = item("01989f6b-2c00-7a1b-8c2d-3e4f50617283", "2026-08-08T02:26:00Z")
+        older = item("01989f6a-2c00-7a1b-8c2d-3e4f50617283", "2026-08-08T02:25:00Z")
+        validate_session_list(
+            {
+                "schema": "ylx.session-list.v2",
+                "items": [newer, older],
+                "diagnostics": [],
+                "next_cursor": None,
+            },
+            limit=2,
+            take_id=None,
+        )
+
+        with self.assertRaises(InvalidSourceEvent):
+            validate_session_list(
+                {
+                    "schema": "ylx.session-list.v2",
+                    "items": [older, newer],
+                    "diagnostics": [],
+                    "next_cursor": None,
+                },
+                limit=2,
+                take_id=None,
             )
 
     def test_every_source_event_data_is_closed_before_delivery_id_assignment(self) -> None:
