@@ -215,6 +215,16 @@ class NativeRecordingSink(Protocol):
     def close(self) -> None: ...
 
 
+class NativeRecordingFrameGate(Protocol):
+    def begin_frame(self, dropped_before: int) -> dict[str, object]: ...
+
+    def finish_frame(self) -> int: ...
+
+    def start_stopping(self) -> int: ...
+
+    def snapshot(self) -> dict[str, object]: ...
+
+
 class NativeSessionIo(Protocol):
     def hash_file(self, path: str) -> dict[str, object]: ...
 
@@ -449,6 +459,31 @@ def create_native_recording_sink(
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_recording_sink_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_recording_frame_gate(frame_decimation: int) -> NativeRecordingFrameGate:
+    """Create the Rust recording frame fanout/decimation gate or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_recording_frame_gate_unavailable",
+            f"无法加载原生录制帧门控模块：{exc}",
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "recording_frame_gate" not in capabilities.features:
+        raise NativeModuleError(
+            "native_recording_frame_gate_unavailable", "原生模块缺少录制帧门控热路径能力"
+        )
+    try:
+        return module.NativeRecordingFrameGate(frame_decimation)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_recording_frame_gate_init_failed", raw
         raise NativeModuleError(code, message) from exc
 
 

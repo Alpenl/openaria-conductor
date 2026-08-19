@@ -8,6 +8,7 @@ import unittest
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from rp_ylx.api import CaptureCommand
 from rp_ylx.api.events import EventReplayBuffer
@@ -261,6 +262,59 @@ class StreamingImu:
         self.closed.set()
 
 
+class FakeNativeFrameGate:
+    def __init__(self, frame_decimation: int) -> None:
+        self.frame_decimation = frame_decimation
+        self.first_frame = True
+        self.observed_frames = 0
+        self.inflight_frames = 0
+        self.stopping = False
+        self.begin_drops: list[int] = []
+        self.finished = 0
+
+    def begin_frame(self, dropped_before: int) -> dict[str, object]:
+        self.begin_drops.append(dropped_before)
+        if self.stopping:
+            return self._decision(False, dropped_before)
+        if self.first_frame:
+            self.first_frame = False
+            self.observed_frames = 1
+            self.inflight_frames += 1
+            return self._decision(True, 0)
+        observed_index = self.observed_frames
+        self.observed_frames += dropped_before + 1
+        if dropped_before or observed_index % self.frame_decimation == 0:
+            self.inflight_frames += 1
+            return self._decision(True, dropped_before)
+        return self._decision(False, dropped_before)
+
+    def finish_frame(self) -> int:
+        self.finished += 1
+        self.inflight_frames -= 1
+        return self.inflight_frames
+
+    def start_stopping(self) -> int:
+        self.stopping = True
+        return self.inflight_frames
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "frame_decimation": self.frame_decimation,
+            "first_frame": self.first_frame,
+            "observed_frames": self.observed_frames,
+            "inflight_frames": self.inflight_frames,
+            "stopping": self.stopping,
+        }
+
+    def _decision(self, record: bool, dropped_before: int) -> dict[str, object]:
+        return {
+            "record": record,
+            "dropped_before": dropped_before,
+            "observed_frames": self.observed_frames,
+            "inflight_frames": self.inflight_frames,
+        }
+
+
 def capture_command(key: str, body: dict[str, object]) -> CaptureCommand:
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     return CaptureCommand("operator", key, body, canonical)
@@ -457,6 +511,7 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         preview_payloads: list[bytes] = []
         submitted: list[FrameObservation] = []
         failures: list[tuple[str, str]] = []
+        gate = FakeNativeFrameGate(2)
         sources = ContinuousCaptureSources(
             lambda: camera,
             lambda: imu,
@@ -466,13 +521,18 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
             frame_decimation=2,
         )
         try:
-            sources.start(
-                mode="production",
-                generation_id=str(uuid.uuid4()),
-                submit_frame=lambda observation: submitted.append(observation) or True,
-                submit_imu=lambda observation: True,
-                on_failure=lambda code, message: failures.append((code, message)),
-            )
+            with patch(
+                "rp_ylx.recording.sources.create_native_recording_frame_gate",
+                return_value=gate,
+            ) as create_gate:
+                sources.start(
+                    mode="production",
+                    generation_id=str(uuid.uuid4()),
+                    submit_frame=lambda observation: submitted.append(observation) or True,
+                    submit_imu=lambda observation: True,
+                    on_failure=lambda code, message: failures.append((code, message)),
+                )
+            create_gate.assert_called_once_with(2)
             camera.release(6)
             deadline = time.monotonic() + 1
             while len(preview_payloads) < 6 and time.monotonic() < deadline:
@@ -486,6 +546,8 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
             [0, 2, 4],
         )
         self.assertEqual(preview_payloads, [f"left-{index}".encode() for index in range(6)])
+        self.assertEqual(gate.begin_drops, [0, 0, 0, 0, 0, 0])
+        self.assertEqual(gate.finished, 3)
 
     def test_continuous_sources_source_gap_on_decimated_frame_fails_closed(self) -> None:
         camera = GatedSequenceCamera(

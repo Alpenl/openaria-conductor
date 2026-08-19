@@ -340,6 +340,11 @@ def build_production_service(
                 "正式录制缺少 Rust 热路径写入能力",
                 code="native_recording_sink_unavailable",
             )
+        if "recording_frame_gate" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 录制帧门控能力",
+                code="native_recording_frame_gate_unavailable",
+            )
         if "session_io" not in capabilities.features:
             raise ProductionConfigError(
                 "正式录制缺少 Rust 会话 I/O 校验能力",

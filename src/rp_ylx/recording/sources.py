@@ -10,6 +10,11 @@ from typing import Protocol
 
 from rp_ylx.camera import CameraMode, FrameObservation
 from rp_ylx.imu import ImuObservation
+from rp_ylx.native import (
+    NativeModuleError,
+    NativeRecordingFrameGate,
+    create_native_recording_frame_gate,
+)
 
 
 class CaptureCamera(Protocol):
@@ -28,6 +33,12 @@ class CaptureImu(Protocol):
     def read(self, *, timeout: float) -> ImuObservation: ...
 
     def close(self) -> None: ...
+
+
+def _native_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"{name} 必须是非负整数")
+    return value
 
 
 class ThreadedCaptureSources:
@@ -289,6 +300,7 @@ class _RecordingTap:
     observed_frames: int = 0
     stopping: bool = False
     inflight_frames: int = 0
+    native_frame_gate: NativeRecordingFrameGate | None = None
 
 
 class ContinuousCaptureSources:
@@ -400,6 +412,11 @@ class ContinuousCaptureSources:
         del mode
         self.start_preview()
         imu = self._imu_factory()
+        native_frame_gate = None
+        try:
+            native_frame_gate = create_native_recording_frame_gate(self._frame_decimation)
+        except NativeModuleError:
+            native_frame_gate = None
         tap = _RecordingTap(
             generation_id,
             submit_frame,
@@ -407,6 +424,7 @@ class ContinuousCaptureSources:
             on_failure,
             self._frame_decimation,
             imu=imu,
+            native_frame_gate=native_frame_gate,
         )
         thread = threading.Thread(
             target=self._imu_loop,
@@ -488,6 +506,19 @@ class ContinuousCaptureSources:
         with self._condition:
             if self._recording is not tap or tap.stopping:
                 return None
+            if tap.native_frame_gate is not None:
+                decision = tap.native_frame_gate.begin_frame(observation.dropped_before)
+                tap.inflight_frames = _native_int(
+                    decision.get("inflight_frames"), "recording_frame_gate.inflight_frames"
+                )
+                if not decision.get("record"):
+                    return None
+                dropped_before = _native_int(
+                    decision.get("dropped_before"), "recording_frame_gate.dropped_before"
+                )
+                if dropped_before != observation.dropped_before:
+                    return FrameObservation(observation.frame, dropped_before=dropped_before)
+                return observation
             if tap.first_frame:
                 tap.first_frame = False
                 tap.observed_frames = 1
@@ -507,7 +538,10 @@ class ContinuousCaptureSources:
 
     def _finish_recording_frame(self, tap: _RecordingTap) -> None:
         with self._condition:
-            tap.inflight_frames -= 1
+            if tap.native_frame_gate is not None:
+                tap.inflight_frames = tap.native_frame_gate.finish_frame()
+            else:
+                tap.inflight_frames -= 1
             self._condition.notify_all()
 
     def _recording_snapshot(self) -> _RecordingTap | None:
@@ -574,6 +608,8 @@ class ContinuousCaptureSources:
             tap = self._recording
             if tap is not None:
                 tap.stopping = True
+                if tap.native_frame_gate is not None:
+                    tap.inflight_frames = tap.native_frame_gate.start_stopping()
                 self._recording = None
                 self._condition.wait_for(
                     lambda: tap.inflight_frames == 0,

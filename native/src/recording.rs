@@ -44,6 +44,125 @@ pub(crate) struct RecordingSinkSnapshot {
     pub(crate) imu_samples_written: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameGateDecision {
+    pub(crate) record: bool,
+    pub(crate) dropped_before: u64,
+    pub(crate) observed_frames: u64,
+    pub(crate) inflight_frames: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameGateSnapshot {
+    pub(crate) frame_decimation: u64,
+    pub(crate) first_frame: bool,
+    pub(crate) observed_frames: u64,
+    pub(crate) inflight_frames: u64,
+    pub(crate) stopping: bool,
+}
+
+pub(crate) struct RecordingFrameGate {
+    frame_decimation: u64,
+    first_frame: bool,
+    observed_frames: u64,
+    inflight_frames: u64,
+    stopping: bool,
+}
+
+impl RecordingFrameGate {
+    pub(crate) fn new(frame_decimation: u64) -> Result<Self, RecordingError> {
+        if frame_decimation == 0 {
+            return Err(RecordingError::new(
+                "invalid_argument",
+                "frame_decimation must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            frame_decimation,
+            first_frame: true,
+            observed_frames: 0,
+            inflight_frames: 0,
+            stopping: false,
+        })
+    }
+
+    pub(crate) fn begin_frame(
+        &mut self,
+        dropped_before: u64,
+    ) -> Result<FrameGateDecision, RecordingError> {
+        if self.stopping {
+            return Ok(self.decision(false, dropped_before));
+        }
+        if self.first_frame {
+            self.first_frame = false;
+            self.observed_frames = 1;
+            self.inflight_frames = self.inflight_frames.checked_add(1).ok_or_else(|| {
+                RecordingError::new("counter_overflow", "recording frame gate inflight overflow")
+            })?;
+            // A source gap before the first recorded frame belongs to pre-recording
+            // warmup/preview and must not poison the new take.
+            return Ok(self.decision(true, 0));
+        }
+
+        let observed_index = self.observed_frames;
+        self.observed_frames = self
+            .observed_frames
+            .checked_add(dropped_before)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                RecordingError::new("counter_overflow", "recording frame gate observed overflow")
+            })?;
+        if dropped_before != 0 {
+            self.inflight_frames = self.inflight_frames.checked_add(1).ok_or_else(|| {
+                RecordingError::new("counter_overflow", "recording frame gate inflight overflow")
+            })?;
+            return Ok(self.decision(true, dropped_before));
+        }
+        if observed_index % self.frame_decimation != 0 {
+            return Ok(self.decision(false, dropped_before));
+        }
+        self.inflight_frames = self.inflight_frames.checked_add(1).ok_or_else(|| {
+            RecordingError::new("counter_overflow", "recording frame gate inflight overflow")
+        })?;
+        Ok(self.decision(true, dropped_before))
+    }
+
+    pub(crate) fn finish_frame(&mut self) -> Result<u64, RecordingError> {
+        if self.inflight_frames == 0 {
+            return Err(RecordingError::new(
+                "invalid_state",
+                "recording frame gate has no inflight frame to finish",
+            ));
+        }
+        self.inflight_frames -= 1;
+        Ok(self.inflight_frames)
+    }
+
+    pub(crate) fn start_stopping(&mut self) -> u64 {
+        self.stopping = true;
+        self.inflight_frames
+    }
+
+    pub(crate) fn snapshot(&self) -> FrameGateSnapshot {
+        FrameGateSnapshot {
+            frame_decimation: self.frame_decimation,
+            first_frame: self.first_frame,
+            observed_frames: self.observed_frames,
+            inflight_frames: self.inflight_frames,
+            stopping: self.stopping,
+        }
+    }
+
+    fn decision(&self, record: bool, dropped_before: u64) -> FrameGateDecision {
+        FrameGateDecision {
+            record,
+            dropped_before,
+            observed_frames: self.observed_frames,
+            inflight_frames: self.inflight_frames,
+        }
+    }
+}
+
 pub(crate) struct RecordingSink {
     session_id: String,
     split_eyes: bool,
@@ -528,7 +647,7 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordingSink, imu_sample_record, jpeg_payload, raw_frame_index_record,
+        RecordingFrameGate, RecordingSink, imu_sample_record, jpeg_payload, raw_frame_index_record,
         split_frame_index_record,
     };
     use std::fs;
@@ -597,6 +716,61 @@ mod tests {
               \"sample_index\":1,\"sync\":{\"offset_ns\":null,\"quality\":\"good\",\
               \"residual_ns\":100}}\n"
         );
+    }
+
+    #[test]
+    fn recording_frame_gate_matches_continuous_source_decimation() {
+        let mut gate = RecordingFrameGate::new(3).unwrap();
+
+        let first = gate.begin_frame(2).unwrap();
+        assert!(first.record);
+        assert_eq!(first.dropped_before, 0);
+        assert_eq!(first.observed_frames, 1);
+        assert_eq!(first.inflight_frames, 1);
+        assert_eq!(gate.finish_frame().unwrap(), 0);
+
+        let skipped = gate.begin_frame(0).unwrap();
+        assert!(!skipped.record);
+        assert_eq!(skipped.observed_frames, 2);
+        assert_eq!(skipped.inflight_frames, 0);
+
+        let skipped_again = gate.begin_frame(0).unwrap();
+        assert!(!skipped_again.record);
+        assert_eq!(skipped_again.observed_frames, 3);
+
+        let recorded = gate.begin_frame(0).unwrap();
+        assert!(recorded.record);
+        assert_eq!(recorded.observed_frames, 4);
+        assert_eq!(recorded.inflight_frames, 1);
+        assert_eq!(gate.finish_frame().unwrap(), 0);
+
+        let gap = gate.begin_frame(2).unwrap();
+        assert!(gap.record);
+        assert_eq!(gap.dropped_before, 2);
+        assert_eq!(gap.observed_frames, 7);
+        assert_eq!(gap.inflight_frames, 1);
+        assert_eq!(gate.finish_frame().unwrap(), 0);
+    }
+
+    #[test]
+    fn recording_frame_gate_stopping_rejects_new_frames_but_tracks_inflight() {
+        let mut gate = RecordingFrameGate::new(1).unwrap();
+        assert!(RecordingFrameGate::new(0).is_err());
+
+        let decision = gate.begin_frame(0).unwrap();
+        assert!(decision.record);
+        assert_eq!(decision.inflight_frames, 1);
+        assert_eq!(gate.start_stopping(), 1);
+
+        let stopped = gate.begin_frame(0).unwrap();
+        assert!(!stopped.record);
+        assert_eq!(stopped.inflight_frames, 1);
+
+        assert_eq!(gate.finish_frame().unwrap(), 0);
+        assert!(gate.finish_frame().is_err());
+        let snapshot = gate.snapshot();
+        assert!(snapshot.stopping);
+        assert_eq!(snapshot.inflight_frames, 0);
     }
 
     #[test]

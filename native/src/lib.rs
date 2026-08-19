@@ -28,6 +28,7 @@ const NATIVE_AUDIO: &str = "native_audio";
 const NATIVE_IMU: &str = "native_imu";
 const RECORDING_CODEC: &str = "recording_codec";
 const RECORDING_SINK: &str = "recording_sink";
+const RECORDING_FRAME_GATE: &str = "recording_frame_gate";
 const SESSION_IO: &str = "session_io";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
@@ -558,6 +559,65 @@ impl Drop for NativeRecordingSink {
 }
 
 #[pyclass]
+struct NativeRecordingFrameGate {
+    gate: Mutex<recording::RecordingFrameGate>,
+}
+
+#[pymethods]
+impl NativeRecordingFrameGate {
+    #[new]
+    fn new(frame_decimation: u64) -> PyResult<Self> {
+        Ok(Self {
+            gate: Mutex::new(
+                recording::RecordingFrameGate::new(frame_decimation).map_err(recording_error)?,
+            ),
+        })
+    }
+
+    fn begin_frame(&self, py: Python<'_>, dropped_before: u64) -> PyResult<Py<PyDict>> {
+        let decision = {
+            let mut gate = self.gate.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
+                )
+            })?;
+            gate.begin_frame(dropped_before).map_err(recording_error)?
+        };
+        recording_frame_gate_decision_dict(py, &decision)
+    }
+
+    fn finish_frame(&self) -> PyResult<u64> {
+        let mut gate = self.gate.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
+            )
+        })?;
+        gate.finish_frame().map_err(recording_error)
+    }
+
+    fn start_stopping(&self) -> PyResult<u64> {
+        let mut gate = self.gate.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
+            )
+        })?;
+        Ok(gate.start_stopping())
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let snapshot = {
+            let gate = self.gate.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
+                )
+            })?;
+            gate.snapshot()
+        };
+        recording_frame_gate_snapshot_dict(py, &snapshot)
+    }
+}
+
+#[pyclass]
 struct NativeSessionIo;
 
 #[pymethods]
@@ -855,6 +915,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let mut features = vec![CAPABILITY_PROBE, JPEG_CONTRACT, FRAME_STREAM];
     features.push(RECORDING_CODEC);
     features.push(RECORDING_SINK);
+    features.push(RECORDING_FRAME_GATE);
     features.push(SESSION_IO);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
@@ -941,6 +1002,31 @@ fn recording_sink_snapshot_dict(
     Ok(value.unbind())
 }
 
+fn recording_frame_gate_decision_dict(
+    py: Python<'_>,
+    decision: &recording::FrameGateDecision,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("record", decision.record)?;
+    value.set_item("dropped_before", decision.dropped_before)?;
+    value.set_item("observed_frames", decision.observed_frames)?;
+    value.set_item("inflight_frames", decision.inflight_frames)?;
+    Ok(value.unbind())
+}
+
+fn recording_frame_gate_snapshot_dict(
+    py: Python<'_>,
+    snapshot: &recording::FrameGateSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("frame_decimation", snapshot.frame_decimation)?;
+    value.set_item("first_frame", snapshot.first_frame)?;
+    value.set_item("observed_frames", snapshot.observed_frames)?;
+    value.set_item("inflight_frames", snapshot.inflight_frames)?;
+    value.set_item("stopping", snapshot.stopping)?;
+    Ok(value.unbind())
+}
+
 fn imu_observation_dict(py: Python<'_>, result: &imu::ImuObservation) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("dropped_samples", result.dropped_samples)?;
@@ -1017,6 +1103,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeImuCollector>()?;
     module.add_class::<NativeRecordingCodec>()?;
     module.add_class::<NativeRecordingSink>()?;
+    module.add_class::<NativeRecordingFrameGate>()?;
     module.add_class::<NativeSessionIo>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;
@@ -1028,8 +1115,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         CAPABILITY_PROBE, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
-        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_SINK,
-        SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_FRAME_GATE,
+        RECORDING_SINK, SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
     };
 
     #[test]
@@ -1045,6 +1132,7 @@ mod tests {
         assert_eq!(NATIVE_IMU, "native_imu");
         assert_eq!(RECORDING_CODEC, "recording_codec");
         assert_eq!(RECORDING_SINK, "recording_sink");
+        assert_eq!(RECORDING_FRAME_GATE, "recording_frame_gate");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");
