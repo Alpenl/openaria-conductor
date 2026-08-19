@@ -175,6 +175,46 @@ class NativeRecordingCodec(Protocol):
     ) -> bytes: ...
 
 
+class NativeRecordingSink(Protocol):
+    def write_split_frame_index(
+        self,
+        frame: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        segment_index: int,
+        segment_frame: int,
+    ) -> int: ...
+
+    def write_raw_frame(
+        self,
+        frame: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        raw_side_by_side: bytes,
+    ) -> dict[str, int]: ...
+
+    def write_imu_sample(
+        self,
+        sequence: int,
+        packet_sequence: int,
+        sample_index: int,
+        device_timestamp_raw: int,
+        device_ticks: int,
+        host_read_start_ns: int,
+        host_read_end_ns: int,
+        host_monotonic_ns: int,
+        accelerometer: tuple[int, int, int],
+        gyroscope: tuple[int, int, int],
+        sync_offset_ns: int | None,
+        sync_residual_ns: int | None,
+        sync_quality: str,
+    ) -> int: ...
+
+    def flush_and_close(self) -> dict[str, object]: ...
+
+    def close(self) -> None: ...
+
+
 class NativeSessionIo(Protocol):
     def hash_file(self, path: str) -> dict[str, object]: ...
 
@@ -380,6 +420,35 @@ def create_native_recording_codec() -> NativeRecordingCodec:
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_recording_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_recording_sink(
+    session_root: str,
+    session_id: str,
+    *,
+    split_eyes: bool,
+) -> NativeRecordingSink:
+    """Create the Rust recording event sink or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_recording_sink_unavailable", f"无法加载原生录制写入模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "recording_sink" not in capabilities.features:
+        raise NativeModuleError(
+            "native_recording_sink_unavailable", "原生模块缺少录制写入热路径能力"
+        )
+    try:
+        return module.NativeRecordingSink(session_root, session_id, split_eyes)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_recording_sink_init_failed", raw
         raise NativeModuleError(code, message) from exc
 
 

@@ -27,6 +27,7 @@ const NATIVE_CAMERA: &str = "native_camera";
 const NATIVE_AUDIO: &str = "native_audio";
 const NATIVE_IMU: &str = "native_imu";
 const RECORDING_CODEC: &str = "recording_codec";
+const RECORDING_SINK: &str = "recording_sink";
 const SESSION_IO: &str = "session_io";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
@@ -421,6 +422,142 @@ impl NativeRecordingCodec {
 }
 
 #[pyclass]
+struct NativeRecordingSink {
+    sink: Mutex<recording::RecordingSink>,
+}
+
+#[pymethods]
+impl NativeRecordingSink {
+    #[new]
+    fn new(session_root: &str, session_id: &str, split_eyes: bool) -> PyResult<Self> {
+        Ok(Self {
+            sink: Mutex::new(
+                recording::RecordingSink::create(
+                    std::path::Path::new(session_root),
+                    session_id,
+                    split_eyes,
+                )
+                .map_err(recording_error)?,
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_split_frame_index(
+        &self,
+        frame: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        segment_index: u64,
+        segment_frame: u64,
+    ) -> PyResult<u64> {
+        let mut sink = self.sink.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "native_recording_poisoned: recording sink mutex is poisoned",
+            )
+        })?;
+        sink.write_split_frame_index(
+            frame,
+            source_sequence,
+            host_monotonic_ns,
+            segment_index,
+            segment_frame,
+        )
+        .map_err(recording_error)
+    }
+
+    fn write_raw_frame(
+        &self,
+        py: Python<'_>,
+        frame: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        raw_side_by_side: &[u8],
+    ) -> PyResult<Py<PyDict>> {
+        let result = {
+            let mut sink = self.sink.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "native_recording_poisoned: recording sink mutex is poisoned",
+                )
+            })?;
+            sink.write_raw_frame(frame, source_sequence, host_monotonic_ns, raw_side_by_side)
+                .map_err(recording_error)?
+        };
+        let value = PyDict::new(py);
+        value.set_item("bytes_written", result.bytes_written)?;
+        value.set_item("video_offset", result.video_offset)?;
+        value.set_item("video_bytes", result.video_bytes)?;
+        Ok(value.unbind())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_imu_sample(
+        &self,
+        sequence: u64,
+        packet_sequence: u64,
+        sample_index: u8,
+        device_timestamp_raw: u32,
+        device_ticks: u64,
+        host_read_start_ns: u64,
+        host_read_end_ns: u64,
+        host_monotonic_ns: u64,
+        accelerometer: (i16, i16, i16),
+        gyroscope: (i16, i16, i16),
+        sync_offset_ns: Option<i64>,
+        sync_residual_ns: Option<u64>,
+        sync_quality: &str,
+    ) -> PyResult<u64> {
+        let mut sink = self.sink.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "native_recording_poisoned: recording sink mutex is poisoned",
+            )
+        })?;
+        sink.write_imu_sample(
+            sequence,
+            packet_sequence,
+            sample_index,
+            device_timestamp_raw,
+            device_ticks,
+            host_read_start_ns,
+            host_read_end_ns,
+            host_monotonic_ns,
+            accelerometer,
+            gyroscope,
+            sync_offset_ns,
+            sync_residual_ns,
+            sync_quality,
+        )
+        .map_err(recording_error)
+    }
+
+    fn flush_and_close(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let snapshot = {
+            let mut sink = self.sink.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "native_recording_poisoned: recording sink mutex is poisoned",
+                )
+            })?;
+            sink.flush_and_close().map_err(recording_error)?
+        };
+        recording_sink_snapshot_dict(py, &snapshot)
+    }
+
+    fn close(&self) {
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.close();
+        }
+    }
+}
+
+impl Drop for NativeRecordingSink {
+    fn drop(&mut self) {
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.close();
+        }
+    }
+}
+
+#[pyclass]
 struct NativeSessionIo;
 
 #[pymethods]
@@ -717,6 +854,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     result.set_item("abi", NATIVE_ABI)?;
     let mut features = vec![CAPABILITY_PROBE, JPEG_CONTRACT, FRAME_STREAM];
     features.push(RECORDING_CODEC);
+    features.push(RECORDING_SINK);
     features.push(SESSION_IO);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
@@ -773,6 +911,33 @@ fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> Py
         segments.append(item)?;
     }
     value.set_item("segments", segments)?;
+    Ok(value.unbind())
+}
+
+fn recording_sink_snapshot_dict(
+    py: Python<'_>,
+    snapshot: &recording::RecordingSinkSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("bytes_written", snapshot.bytes_written)?;
+    value.set_item("frames_written", snapshot.frames_written)?;
+    value.set_item("imu_samples_written", snapshot.imu_samples_written)?;
+    let artifacts = PyDict::new(py);
+    for artifact in &snapshot.artifacts {
+        let item = PyDict::new(py);
+        item.set_item("role", artifact.role)?;
+        item.set_item("path", artifact.relative_path)?;
+        item.set_item("bytes", artifact.bytes)?;
+        item.set_item("sha256", &artifact.sha256)?;
+        let identity = PyDict::new(py);
+        identity.set_item("device", artifact.identity.device)?;
+        identity.set_item("inode", artifact.identity.inode)?;
+        identity.set_item("size", artifact.identity.size)?;
+        identity.set_item("mtime_ns", artifact.identity.mtime_ns)?;
+        item.set_item("identity", identity)?;
+        artifacts.set_item(artifact.role, item)?;
+    }
+    value.set_item("artifacts", artifacts)?;
     Ok(value.unbind())
 }
 
@@ -851,6 +1016,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAudioRecorder>()?;
     module.add_class::<NativeImuCollector>()?;
     module.add_class::<NativeRecordingCodec>()?;
+    module.add_class::<NativeRecordingSink>()?;
     module.add_class::<NativeSessionIo>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;
@@ -862,8 +1028,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::{
         CAPABILITY_PROBE, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
-        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, SESSION_IO,
-        TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        NATIVE_IMU, PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_CODEC, RECORDING_SINK,
+        SESSION_IO, TURBOJPEG_SPLIT, V4L2_CAPTURE,
     };
 
     #[test]
@@ -878,6 +1044,7 @@ mod tests {
         assert_eq!(NATIVE_AUDIO, "native_audio");
         assert_eq!(NATIVE_IMU, "native_imu");
         assert_eq!(RECORDING_CODEC, "recording_codec");
+        assert_eq!(RECORDING_SINK, "recording_sink");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");

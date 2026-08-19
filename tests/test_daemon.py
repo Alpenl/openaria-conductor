@@ -446,6 +446,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_audio",
                     "native_imu",
                     "recording_codec",
+                    "recording_sink",
                 ),
             )
             with (
@@ -458,6 +459,36 @@ class ProductionDaemonTest(unittest.TestCase):
             ):
                 build_production_service(config)
             self.assertEqual(raised.exception.code, "native_session_io_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
+    def test_missing_native_recording_sink_fails_before_production_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "native_audio",
+                    "native_imu",
+                    "recording_codec",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_recording_sink_unavailable")
             backend.assert_not_called()
             coordinator.assert_not_called()
             gateway.assert_not_called()
@@ -476,6 +507,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_audio",
                     "native_imu",
                     "recording_codec",
+                    "recording_sink",
                     "session_io",
                 ),
             )
@@ -507,6 +539,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_audio",
                     "native_imu",
                     "recording_codec",
+                    "recording_sink",
                     "session_io",
                     "preview_buffer",
                 ),

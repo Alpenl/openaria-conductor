@@ -450,7 +450,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 "rp_ylx.recording.device_session.create_native_recording_codec",
                 return_value=codec,
             ):
-                recorder, _, _ = self.build(root)
+                recorder, _, _ = self.build(root, before_write=lambda _role, _payload: None)
             recorder.start()
             self.feed(recorder, 1)
             recorder.submit_imu(imu_observation())

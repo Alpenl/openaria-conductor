@@ -27,9 +27,11 @@ from rp_ylx.native import (
     NativeAudioRecorder,
     NativeModuleError,
     NativeRecordingCodec,
+    NativeRecordingSink,
     NativeSessionIo,
     create_native_audio_recorder,
     create_native_recording_codec,
+    create_native_recording_sink,
     create_native_session_io,
 )
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
@@ -193,6 +195,8 @@ _UUID7_COUNTER = 0
 _SESSION_IO_LOCK = threading.Lock()
 _SESSION_IO: NativeSessionIo | None = None
 _SESSION_IO_UNAVAILABLE = False
+_ORIGINAL_PATH_OPEN = Path.open
+_ORIGINAL_OS_FSYNC = os.fsync
 
 
 def uuid7() -> str:
@@ -320,6 +324,16 @@ def _recording_codec_error(error: BaseException) -> DeviceRecordingError:
     return DeviceRecordingError(code, message)
 
 
+def _recording_sink_error(error: BaseException) -> DeviceRecordingError:
+    if isinstance(error, DeviceRecordingError):
+        return error
+    raw = str(error)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = "native_recording_sink_failed", raw
+    return DeviceRecordingError(code, message)
+
+
 def _session_io_error(error: BaseException) -> DeviceRecordingError:
     if isinstance(error, DeviceRecordingError):
         return error
@@ -352,6 +366,12 @@ def _session_io_or_none() -> NativeSessionIo | None:
 def _strict_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise DeviceRecordingError("audio_invalid", f"{field} 必须是非负整数")
+    return value
+
+
+def _native_uint(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DeviceRecordingError("native_recording_sink_failed", f"{field} 必须是非负整数")
     return value
 
 
@@ -391,6 +411,11 @@ class DeviceSessionRecorder:
         self._allocate_revision = allocate_revision
         self._storage_status = storage_status
         self._state_sink = state_sink or (lambda state: None)
+        self._native_sink_allowed = (
+            before_write is None
+            and Path.open is _ORIGINAL_PATH_OPEN
+            and os.fsync is _ORIGINAL_OS_FSYNC
+        )
         self._before_write = before_write or (lambda role, payload: None)
         self._metrics = metrics
         self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_capacity)
@@ -414,6 +439,9 @@ class DeviceSessionRecorder:
         self._recording_codec: NativeRecordingCodec | None = None
         with suppress(NativeModuleError):
             self._recording_codec = create_native_recording_codec()
+        self._native_recording_sink: NativeRecordingSink | None = None
+        self._native_recording_sink_handles = 0
+        self._native_artifacts: dict[str, dict[str, object]] = {}
         self._audio_recorder: NativeAudioRecorder | None = None
         self._audio_result: Mapping[str, object] | None = None
         self._audio_segment_records: list[dict[str, object]] = []
@@ -469,6 +497,7 @@ class DeviceSessionRecorder:
                 len(self._files)
                 + int(self._writer is not None and self._writer.is_alive())
                 + int(self._encoder is not None)
+                + self._native_recording_sink_handles
                 + int(self._audio_recorder is not None)
                 + int(self._harvester is not None and self._harvester.is_alive())
             )
@@ -569,15 +598,26 @@ class DeviceSessionRecorder:
                         "started_at": self._timestamp(self._started_at),
                     },
                 )
-                self._files = {
-                    "frames.index": (self._partial / "frames.ndjson").open("xb"),
-                    "imu.samples": (self._partial / "imu.ndjson").open("xb"),
-                }
+                if self._native_sink_allowed:
+                    try:
+                        self._native_recording_sink = create_native_recording_sink(
+                            str(self._partial),
+                            self._plan.session_id,
+                            split_eyes=self._split_eyes,
+                        )
+                        self._native_recording_sink_handles = 2 + int(not self._split_eyes)
+                    except NativeModuleError as error:
+                        raise DeviceRecordingError(error.code, error.message) from error
+                else:
+                    self._files = {
+                        "frames.index": (self._partial / "frames.ndjson").open("xb"),
+                        "imu.samples": (self._partial / "imu.ndjson").open("xb"),
+                    }
                 if self._split_eyes:
                     encoder = self._encoder_factory(self._partial)
                     encoder.start()
                     self._encoder = encoder
-                else:
+                elif self._native_recording_sink is None:
                     self._files["video.raw-side-by-side"] = (
                         self._partial / "video/raw-sbs.mjpeg"
                     ).open("xb")
@@ -657,44 +697,70 @@ class DeviceSessionRecorder:
         frame = event.observation.frame
         if frame.raw_side_by_side is None:
             raise DeviceRecordingError("raw_frame_unavailable", "生产录制缺少相机原始 SBS MJPEG 帧")
-        codec = self._recording_codec
-        try:
-            payload = (
-                _jpeg_payload(frame.raw_side_by_side)
-                if codec is None
-                else codec.jpeg_payload(frame.raw_side_by_side)
-            )
-        except BaseException as error:
-            raise _recording_codec_error(error) from error
+        native_sink = self._native_recording_sink
         if self._encoder is None:
-            video_offset = self._files["video.raw-side-by-side"].tell()
-            video_bytes = len(payload)
-            self._write("video.raw-side-by-side", payload)
-            if codec is None:
-                index_record = json_bytes(
-                    {
-                        "schema": "ylx.frame-index.v1",
-                        "session_id": self._plan.session_id,
-                        "frame": event.record_sequence,
-                        "source_sequence": frame.source_sequence,
-                        "host_monotonic_ns": frame.host_monotonic_ns,
-                        "video_offset": video_offset,
-                        "video_bytes": video_bytes,
-                    }
-                )
-            else:
+            if native_sink is not None:
                 try:
-                    index_record = codec.encode_raw_frame_index(
-                        self._plan.session_id,
+                    result = native_sink.write_raw_frame(
                         event.record_sequence,
                         frame.source_sequence,
                         frame.host_monotonic_ns,
-                        video_offset,
-                        video_bytes,
+                        frame.raw_side_by_side,
+                    )
+                except BaseException as error:
+                    raise _recording_sink_error(error) from error
+                self._bytes_written += _native_uint(
+                    result.get("bytes_written") if isinstance(result, Mapping) else None,
+                    "recording_sink.bytes_written",
+                )
+            else:
+                codec = self._recording_codec
+                try:
+                    payload = (
+                        _jpeg_payload(frame.raw_side_by_side)
+                        if codec is None
+                        else codec.jpeg_payload(frame.raw_side_by_side)
                     )
                 except BaseException as error:
                     raise _recording_codec_error(error) from error
+                video_offset = self._files["video.raw-side-by-side"].tell()
+                video_bytes = len(payload)
+                self._write("video.raw-side-by-side", payload)
+                if codec is None:
+                    index_record = json_bytes(
+                        {
+                            "schema": "ylx.frame-index.v1",
+                            "session_id": self._plan.session_id,
+                            "frame": event.record_sequence,
+                            "source_sequence": frame.source_sequence,
+                            "host_monotonic_ns": frame.host_monotonic_ns,
+                            "video_offset": video_offset,
+                            "video_bytes": video_bytes,
+                        }
+                    )
+                else:
+                    try:
+                        index_record = codec.encode_raw_frame_index(
+                            self._plan.session_id,
+                            event.record_sequence,
+                            frame.source_sequence,
+                            frame.host_monotonic_ns,
+                            video_offset,
+                            video_bytes,
+                        )
+                    except BaseException as error:
+                        raise _recording_codec_error(error) from error
+                self._write("frames.index", index_record)
         else:
+            codec = self._recording_codec
+            try:
+                payload = (
+                    _jpeg_payload(frame.raw_side_by_side)
+                    if codec is None
+                    else codec.jpeg_payload(frame.raw_side_by_side)
+                )
+            except BaseException as error:
+                raise _recording_codec_error(error) from error
             ordinal = self._frames_written
             if ordinal % self._segment_frames == 0:
                 self._mark_segment_boundary(ordinal, event.record_sequence)
@@ -704,22 +770,9 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError(error.code, error.message) from error
             segment_index = ordinal // self._segment_frames
             segment_frame = ordinal % self._segment_frames
-            if codec is None:
-                index_record = json_bytes(
-                    {
-                        "schema": "ylx.frame-index.v1",
-                        "session_id": self._plan.session_id,
-                        "frame": event.record_sequence,
-                        "source_sequence": frame.source_sequence,
-                        "host_monotonic_ns": frame.host_monotonic_ns,
-                        "segment_index": segment_index,
-                        "segment_frame": segment_frame,
-                    }
-                )
-            else:
+            if native_sink is not None:
                 try:
-                    index_record = codec.encode_split_frame_index(
-                        self._plan.session_id,
+                    written = native_sink.write_split_frame_index(
                         event.record_sequence,
                         frame.source_sequence,
                         frame.host_monotonic_ns,
@@ -727,8 +780,34 @@ class DeviceSessionRecorder:
                         segment_frame,
                     )
                 except BaseException as error:
-                    raise _recording_codec_error(error) from error
-        self._write("frames.index", index_record)
+                    raise _recording_sink_error(error) from error
+                self._bytes_written += _native_uint(written, "recording_sink.bytes_written")
+            else:
+                if codec is None:
+                    index_record = json_bytes(
+                        {
+                            "schema": "ylx.frame-index.v1",
+                            "session_id": self._plan.session_id,
+                            "frame": event.record_sequence,
+                            "source_sequence": frame.source_sequence,
+                            "host_monotonic_ns": frame.host_monotonic_ns,
+                            "segment_index": segment_index,
+                            "segment_frame": segment_frame,
+                        }
+                    )
+                else:
+                    try:
+                        index_record = codec.encode_split_frame_index(
+                            self._plan.session_id,
+                            event.record_sequence,
+                            frame.source_sequence,
+                            frame.host_monotonic_ns,
+                            segment_index,
+                            segment_frame,
+                        )
+                    except BaseException as error:
+                        raise _recording_codec_error(error) from error
+                self._write("frames.index", index_record)
         self._frames_written += 1
         if self._metrics is not None:
             self._metrics.finish("recording_frame", started)
@@ -825,6 +904,38 @@ class DeviceSessionRecorder:
 
     def _persist_imu(self, observation: ImuObservation) -> None:
         self._storage_status()
+        native_sink = self._native_recording_sink
+        if native_sink is not None:
+            for sample in observation.samples:
+                try:
+                    written = native_sink.write_imu_sample(
+                        sample.sequence,
+                        sample.packet_sequence,
+                        sample.sample_index,
+                        sample.device_timestamp_raw,
+                        sample.device_ticks,
+                        sample.host_read_start_ns,
+                        sample.host_read_end_ns,
+                        sample.host_monotonic_ns,
+                        (
+                            sample.accelerometer.x,
+                            sample.accelerometer.y,
+                            sample.accelerometer.z,
+                        ),
+                        (
+                            sample.gyroscope.x,
+                            sample.gyroscope.y,
+                            sample.gyroscope.z,
+                        ),
+                        sample.sync_offset_ns,
+                        sample.sync_residual_ns,
+                        sample.sync_quality,
+                    )
+                except BaseException as error:
+                    raise _recording_sink_error(error) from error
+                self._bytes_written += _native_uint(written, "recording_sink.bytes_written")
+                self._imu_written += 1
+            return
         codec = self._recording_codec
         for sample in observation.samples:
             if codec is None:
@@ -980,6 +1091,17 @@ class DeviceSessionRecorder:
     }
 
     def _sync_and_close_files(self) -> None:
+        native_sink = self._native_recording_sink
+        if native_sink is not None:
+            try:
+                result = native_sink.flush_and_close()
+            except BaseException as error:
+                raise _recording_sink_error(error) from error
+            finally:
+                self._native_recording_sink = None
+                self._native_recording_sink_handles = 0
+            self._apply_native_sink_snapshot(result)
+            return
         first_error: BaseException | None = None
         for role, stream in self._files.items():
             try:
@@ -1008,10 +1130,67 @@ class DeviceSessionRecorder:
         if first_error is not None:
             raise first_error
 
+    def _apply_native_sink_snapshot(self, result: Mapping[str, object]) -> None:
+        if not isinstance(result, Mapping):
+            raise DeviceRecordingError("native_recording_sink_failed", "原生录制写入结果无效")
+        artifacts = result.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            raise DeviceRecordingError("native_recording_sink_failed", "原生录制 artifact 结果无效")
+        frames_written = _native_uint(result.get("frames_written"), "recording_sink.frames_written")
+        imu_written = _native_uint(
+            result.get("imu_samples_written"), "recording_sink.imu_samples_written"
+        )
+        bytes_written = _native_uint(result.get("bytes_written"), "recording_sink.bytes_written")
+        if frames_written != self._frames_written or imu_written != self._imu_written:
+            raise DeviceRecordingError("native_recording_sink_failed", "原生录制计数与控制面不一致")
+        if bytes_written != self._bytes_written:
+            raise DeviceRecordingError(
+                "native_recording_sink_failed", "原生录制字节数与控制面不一致"
+            )
+        for raw_role, raw_artifact in artifacts.items():
+            role = str(raw_role)
+            if not isinstance(raw_artifact, Mapping):
+                raise DeviceRecordingError("native_recording_sink_failed", "原生 artifact 字段无效")
+            relative = str(raw_artifact.get("path"))
+            digest = str(raw_artifact.get("sha256"))
+            size = _native_uint(raw_artifact.get("bytes"), f"{role}.bytes")
+            identity = raw_artifact.get("identity")
+            if (
+                role != raw_artifact.get("role")
+                or role not in self._digests
+                or not relative
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or not isinstance(identity, Mapping)
+            ):
+                raise DeviceRecordingError("native_recording_sink_failed", "原生 artifact 身份无效")
+            device = _native_uint(identity.get("device"), f"{role}.identity.device")
+            inode = _native_uint(identity.get("inode"), f"{role}.identity.inode")
+            identity_size = _native_uint(identity.get("size"), f"{role}.identity.size")
+            mtime_ns = _native_uint(identity.get("mtime_ns"), f"{role}.identity.mtime_ns")
+            if identity_size != size:
+                raise DeviceRecordingError(
+                    "native_recording_sink_failed", "原生 artifact 大小不一致"
+                )
+            self._artifact_bytes[role] = size
+            self._native_artifacts[role] = {
+                "artifact_id": digest,
+                "role": role,
+                "path": relative,
+                "bytes": size,
+                "sha256": digest,
+            }
+            self._artifact_identities[relative] = (device, inode, identity_size, mtime_ns)
+
     def _close_files(self, *, ignore_errors: bool) -> None:
         try:
             self._sync_and_close_files()
         except BaseException:
+            if self._native_recording_sink is not None:
+                with suppress(BaseException):
+                    self._native_recording_sink.close()
+                self._native_recording_sink = None
+                self._native_recording_sink_handles = 0
             if not ignore_errors:
                 raise
 
@@ -1083,6 +1262,15 @@ class DeviceSessionRecorder:
         return self._partial
 
     def _artifact(self, role: str, relative: str, media_type: str) -> dict[str, object]:
+        native = self._native_artifacts.get(role)
+        if native is not None:
+            if native["path"] != relative:
+                raise DeviceRecordingError(
+                    "native_recording_sink_failed", "原生 artifact 路径不一致"
+                )
+            artifact = dict(native)
+            artifact["media_type"] = media_type
+            return artifact
         digest = self._digests[role].hexdigest()
         return {
             "artifact_id": digest,
