@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import importlib
+import sys
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -697,6 +703,78 @@ class NativeCapabilitiesTest(unittest.TestCase):
             120,
             "v/",
         )
+
+    def test_native_encoder_process_read_methods_wait_during_submit(self) -> None:
+        try:
+            native = importlib.import_module("rp_ylx._native")
+        except ModuleNotFoundError as error:
+            raise unittest.SkipTest("native wheel is not installed") from error
+
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "blocking-encoder.py"
+            helper.write_text(
+                "\n".join(
+                    [
+                        f"#!{sys.executable}",
+                        "import struct",
+                        "import sys",
+                        "import time",
+                        "header = struct.Struct('<4sI')",
+                        'sys.stdout.write(\'{"event":"ready"}\\n\')',
+                        "sys.stdout.flush()",
+                        "time.sleep(0.3)",
+                        "while True:",
+                        "    data = sys.stdin.buffer.read(header.size)",
+                        "    if len(data) != header.size:",
+                        "        break",
+                        "    magic, size = header.unpack(data)",
+                        "    if size == 0:",
+                        "        break",
+                        "    remaining = size",
+                        "    while remaining:",
+                        "        chunk = sys.stdin.buffer.read(min(65536, remaining))",
+                        "        if not chunk:",
+                        "            break",
+                        "        remaining -= len(chunk)",
+                        'sys.stdout.write(\'{"event":"done","frames":1}\\n\')',
+                        "sys.stdout.flush()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+            process = native.NativeStereoEncoderProcess(
+                directory,
+                str(helper),
+                3840,
+                1080,
+                60,
+                8192,
+                900,
+                "video/",
+            )
+            process.start()
+            errors: list[BaseException] = []
+
+            def submit_frame() -> None:
+                try:
+                    process.submit(b"x" * (8 * 1024 * 1024))
+                except BaseException as error:  # pragma: no cover - reported below
+                    errors.append(error)
+
+            thread = threading.Thread(target=submit_frame)
+            thread.start()
+            time.sleep(0.05)
+
+            try:
+                self.assertEqual(process.submitted_frames(), 1)
+            finally:
+                process.abort()
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
 
     def test_explicit_session_io_requires_native_capability(self) -> None:
         module = SimpleNamespace(

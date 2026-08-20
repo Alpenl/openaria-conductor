@@ -15,6 +15,7 @@ mod v4l2;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +80,13 @@ fn stereo_encoder_event_error(error: stereo_encoder::EncoderEventError) -> PyErr
 
 fn stereo_encoder_process_error(error: stereo_encoder::EncoderProcessError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn stereo_encoder_process_mutex_error() -> stereo_encoder::EncoderProcessError {
+    stereo_encoder::EncoderProcessError {
+        code: "encoder_failed".to_owned(),
+        message: "encoder process mutex is poisoned".to_owned(),
+    }
 }
 
 fn preview_error(error: preview::PreviewError) -> PyErr {
@@ -1332,7 +1340,7 @@ impl NativeStereoEncoderPipe {
 
 #[pyclass]
 struct NativeStereoEncoderProcess {
-    process: Mutex<Option<stereo_encoder::EncoderProcess>>,
+    process: Mutex<stereo_encoder::EncoderProcess>,
 }
 
 #[pymethods]
@@ -1351,7 +1359,7 @@ impl NativeStereoEncoderProcess {
         path_prefix: &str,
     ) -> PyResult<Self> {
         Ok(Self {
-            process: Mutex::new(Some(
+            process: Mutex::new(
                 stereo_encoder::EncoderProcess::new(
                     std::path::Path::new(out_dir),
                     std::path::Path::new(executable),
@@ -1363,26 +1371,30 @@ impl NativeStereoEncoderProcess {
                     path_prefix,
                 )
                 .map_err(stereo_encoder_process_error)?,
-            )),
+            ),
         })
     }
 
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        let mut process = self.take_process()?;
-        let result = py
-            .allow_threads(|| process.start())
-            .map_err(stereo_encoder_process_error);
-        self.put_process(process)?;
-        result
+        py.allow_threads(|| {
+            let mut process = self
+                .process
+                .lock()
+                .map_err(|_| stereo_encoder_process_mutex_error())?;
+            process.start()
+        })
+        .map_err(stereo_encoder_process_error)
     }
 
     fn submit(&self, py: Python<'_>, jpeg: &[u8]) -> PyResult<u64> {
-        let mut process = self.take_process()?;
-        let result = py
-            .allow_threads(|| process.submit(jpeg))
-            .map_err(stereo_encoder_process_error);
-        self.put_process(process)?;
-        result
+        py.allow_threads(|| {
+            let mut process = self
+                .process
+                .lock()
+                .map_err(|_| stereo_encoder_process_mutex_error())?;
+            process.submit(jpeg)
+        })
+        .map_err(stereo_encoder_process_error)
     }
 
     #[pyo3(signature = (timeout_seconds=30.0))]
@@ -1393,98 +1405,79 @@ impl NativeStereoEncoderProcess {
             ));
         }
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        let mut process = self.take_process()?;
         let result = py
-            .allow_threads(|| process.finish(timeout))
+            .allow_threads(|| {
+                let mut process = self
+                    .process
+                    .lock()
+                    .map_err(|_| stereo_encoder_process_mutex_error())?;
+                process.finish(timeout)
+            })
             .map_err(stereo_encoder_process_error);
-        self.put_process(process)?;
         let segments = result?;
         stereo_encoder_segment_list(py, &segments)
     }
 
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
-        let mut process = self.take_process()?;
-        py.allow_threads(|| process.abort());
-        self.put_process(process)?;
-        Ok(())
+        py.allow_threads(|| {
+            let mut process = self
+                .process
+                .lock()
+                .map_err(|_| stereo_encoder_process_mutex_error())?;
+            process.abort();
+            Ok::<(), stereo_encoder::EncoderProcessError>(())
+        })
+        .map_err(stereo_encoder_process_error)
     }
 
     fn segments(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let process = self.process.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "encoder_failed: encoder process mutex is poisoned",
-            )
-        })?;
-        let Some(process) = process.as_ref() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "invalid_state: encoder process is busy",
-            ));
-        };
-        stereo_encoder_segment_list(py, &process.segments())
+        let segments = py
+            .allow_threads(|| {
+                let process = self
+                    .process
+                    .lock()
+                    .map_err(|_| stereo_encoder_process_mutex_error())?;
+                Ok::<Vec<stereo_encoder::SegmentEvent>, stereo_encoder::EncoderProcessError>(
+                    process.segments(),
+                )
+            })
+            .map_err(stereo_encoder_process_error)?;
+        stereo_encoder_segment_list(py, &segments)
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let process = self.process.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "encoder_failed: encoder process mutex is poisoned",
-            )
-        })?;
-        let Some(process) = process.as_ref() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "invalid_state: encoder process is busy",
-            ));
-        };
+        let stats = py
+            .allow_threads(|| {
+                let process = self
+                    .process
+                    .lock()
+                    .map_err(|_| stereo_encoder_process_mutex_error())?;
+                Ok::<BTreeMap<String, i64>, stereo_encoder::EncoderProcessError>(process.stats())
+            })
+            .map_err(stereo_encoder_process_error)?;
         let value = PyDict::new(py);
-        for (key, number) in process.stats() {
+        for (key, number) in stats {
             value.set_item(key, number)?;
         }
         Ok(value.unbind())
     }
 
-    fn submitted_frames(&self) -> PyResult<u64> {
-        let process = self.process.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "encoder_failed: encoder process mutex is poisoned",
-            )
-        })?;
-        let Some(process) = process.as_ref() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "invalid_state: encoder process is busy",
-            ));
-        };
-        Ok(process.submitted_frames())
-    }
-}
-
-impl NativeStereoEncoderProcess {
-    fn take_process(&self) -> PyResult<stereo_encoder::EncoderProcess> {
-        let mut process = self.process.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "encoder_failed: encoder process mutex is poisoned",
-            )
-        })?;
-        process.take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("invalid_state: encoder process is busy")
+    fn submitted_frames(&self, py: Python<'_>) -> PyResult<u64> {
+        py.allow_threads(|| {
+            let process = self
+                .process
+                .lock()
+                .map_err(|_| stereo_encoder_process_mutex_error())?;
+            Ok::<u64, stereo_encoder::EncoderProcessError>(process.submitted_frames())
         })
-    }
-
-    fn put_process(&self, value: stereo_encoder::EncoderProcess) -> PyResult<()> {
-        let mut process = self.process.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "encoder_failed: encoder process mutex is poisoned",
-            )
-        })?;
-        *process = Some(value);
-        Ok(())
+        .map_err(stereo_encoder_process_error)
     }
 }
 
 impl Drop for NativeStereoEncoderProcess {
     fn drop(&mut self) {
-        if let Ok(mut process) = self.process.lock() {
-            if let Some(process) = process.as_mut() {
-                process.abort();
-            }
+        if let Ok(process) = self.process.get_mut() {
+            process.abort();
         }
     }
 }
