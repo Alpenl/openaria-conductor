@@ -161,6 +161,15 @@ function receiptMatchesCapture(safeSwap, capture) {
   );
 }
 
+/** @param {CaptureStatus | null} current @param {CaptureStatus} incoming */
+function isStaleCaptureSnapshot(current, incoming) {
+  return (
+    current !== null &&
+    incoming.authority_epoch === current.authority_epoch &&
+    incoming.source_revision < current.source_revision
+  );
+}
+
 /** @param {AppState} state @param {Action} action @returns {AppState} */
 export function reduceState(state, action) {
   if (action.type === "device.loaded") {
@@ -171,6 +180,9 @@ export function reduceState(state, action) {
     return { ...state, device: action.payload, safeSwapReceipt };
   }
   if (action.type === "capture.snapshot") {
+    if (isStaleCaptureSnapshot(state.capture, action.payload)) {
+      return state;
+    }
     return {
       ...state,
       capture: action.payload,
