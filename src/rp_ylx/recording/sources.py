@@ -103,8 +103,9 @@ class ThreadedCaptureSources:
         submit_frame: Callable[[FrameObservation], bool],
         submit_imu: Callable[[ImuObservation], bool],
         on_failure: Callable[[str, str], None],
+        native_recorder: object | None = None,
     ) -> None:
-        del mode, generation_id
+        del mode, generation_id, native_recorder
         with self._lock:
             if self._threads or self._camera is not None or self._imu is not None:
                 raise RuntimeError("采集来源已经启动")
@@ -318,6 +319,7 @@ class NativeContinuousCaptureSources:
         frame_decimation: int = 1,
         buffer_count: int = 16,
         queue_capacity: int = 64,
+        require_native_imu: bool = True,
         metrics: PerformanceMetrics | None = None,
     ) -> None:
         if read_timeout <= 0:
@@ -337,6 +339,7 @@ class NativeContinuousCaptureSources:
         self._frame_decimation = frame_decimation
         self._buffer_count = buffer_count
         self._queue_capacity = queue_capacity
+        self._require_native_imu = require_native_imu
         self._metrics = metrics
         self._lock = threading.RLock()
         self._runtime: NativeContinuousCaptureRuntime | None = None
@@ -416,10 +419,16 @@ class NativeContinuousCaptureSources:
         submit_frame: Callable[[FrameObservation], bool],
         submit_imu: Callable[[ImuObservation], bool],
         on_failure: Callable[[str, str], None],
+        native_recorder: object | None = None,
     ) -> None:
         del mode
         self.start_preview()
         imu = self._imu_factory()
+        native_imu = getattr(imu, "native_owner", None)
+        if self._require_native_imu and native_imu is None:
+            with suppress(BaseException):
+                imu.close()
+            raise RuntimeError("正式连续采集需要 Rust IMU 采集器")
         tap = _RecordingTap(
             generation_id,
             submit_frame,
@@ -428,7 +437,6 @@ class NativeContinuousCaptureSources:
             self._frame_decimation,
             imu=imu,
         )
-        native_imu = getattr(imu, "native_owner", None)
         thread = (
             None
             if native_imu is not None
@@ -453,6 +461,54 @@ class NativeContinuousCaptureSources:
             self._recording = tap
             self._open_handles += 1
         try:
+            native_raw_targets = self._native_raw_sink_targets(native_recorder)
+            if native_raw_targets is not None:
+                active_take, sink = native_raw_targets
+                if native_imu is None:
+                    runtime.start_recording_raw_sink(
+                        active_take,
+                        sink,
+                        lambda code, message: self._runtime_failure(tap, code, message),
+                    )
+                    assert thread is not None
+                    thread.start()
+                else:
+                    runtime.start_recording_raw_sink(
+                        active_take,
+                        sink,
+                        lambda code, message: self._runtime_failure(tap, code, message),
+                        native_imu,
+                        self._read_timeout,
+                    )
+                return
+            native_split_targets = self._native_split_sink_targets(native_recorder)
+            if native_split_targets is not None:
+                active_take, sink, encoder, segment_planner, started_monotonic_ns = (
+                    native_split_targets
+                )
+                if native_imu is None:
+                    runtime.start_recording_split_sink(
+                        active_take,
+                        sink,
+                        encoder,
+                        segment_planner,
+                        started_monotonic_ns,
+                        lambda code, message: self._runtime_failure(tap, code, message),
+                    )
+                    assert thread is not None
+                    thread.start()
+                else:
+                    runtime.start_recording_split_sink(
+                        active_take,
+                        sink,
+                        encoder,
+                        segment_planner,
+                        started_monotonic_ns,
+                        lambda code, message: self._runtime_failure(tap, code, message),
+                        native_imu,
+                        self._read_timeout,
+                    )
+                return
 
             def submit_native_frame(
                 source_sequence: int,
@@ -501,6 +557,39 @@ class NativeContinuousCaptureSources:
             with suppress(BaseException):
                 imu.close()
             raise
+
+    def _native_raw_sink_targets(
+        self, native_recorder: object | None
+    ) -> tuple[object, object] | None:
+        if native_recorder is None:
+            return None
+        targets = getattr(native_recorder, "native_raw_sink_targets", None)
+        if not callable(targets):
+            return None
+        result = targets()
+        if result is None:
+            return None
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("原生 raw sink 目标无效")
+        return result
+
+    def _native_split_sink_targets(
+        self, native_recorder: object | None
+    ) -> tuple[object, object, object, object, int] | None:
+        if native_recorder is None:
+            return None
+        targets = getattr(native_recorder, "native_split_sink_targets", None)
+        if not callable(targets):
+            return None
+        result = targets()
+        if result is None:
+            return None
+        if not isinstance(result, tuple) or len(result) != 5:
+            raise RuntimeError("原生 split sink 目标无效")
+        started_monotonic_ns = result[4]
+        if not isinstance(started_monotonic_ns, int) or started_monotonic_ns <= 0:
+            raise RuntimeError("原生 split sink 起始时间无效")
+        return result
 
     def _submit_native_frame(
         self,
@@ -742,8 +831,9 @@ class ContinuousCaptureSources:
         submit_frame: Callable[[FrameObservation], bool],
         submit_imu: Callable[[ImuObservation], bool],
         on_failure: Callable[[str, str], None],
+        native_recorder: object | None = None,
     ) -> None:
-        del mode
+        del mode, native_recorder
         self.start_preview()
         imu = self._imu_factory()
         native_fanout = None

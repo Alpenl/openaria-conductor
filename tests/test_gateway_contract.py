@@ -36,7 +36,7 @@ CONTRACT_GOLDENS = {
 
 SCHEMA_GOLDENS = {
     "ylx-device-session-v1.schema.json": (
-        "efd8c6e7793fe004bc190034f9c92250ae8d35a2945a761dae2470e048710ea9"
+        "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
     ),
     "ylx-recording-state-v1.schema.json": (
         "e787e168ee508256628fd12067fdeb2305c35688730aa4dfe01c06f1c04d5f8c"

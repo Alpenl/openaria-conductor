@@ -140,6 +140,73 @@ class NativeAudioRecorder(Protocol):
     def close(self) -> None: ...
 
 
+class NativeTimeline(Protocol):
+    @staticmethod
+    def now_monotonic_ns() -> int: ...
+
+    def start_monotonic_ns(self) -> int: ...
+
+    def elapsed_ns(self) -> int: ...
+
+    def elapsed_seconds(self) -> float: ...
+
+    def offset_ns(self, monotonic_ns: int) -> int: ...
+
+    def offset_seconds(self, monotonic_ns: int) -> float: ...
+
+    def audio_sync(
+        self,
+        started_monotonic_ns: int,
+        stopped_monotonic_ns: int,
+        sample_rate_hz: int,
+    ) -> dict[str, object]: ...
+
+
+class NativeActiveTakeWriter(Protocol):
+    def reserve_frame(
+        self,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        source_gap: int,
+    ) -> dict[str, object]: ...
+
+    def raw_write_decision(
+        self,
+        record_sequence: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+    ) -> dict[str, object]: ...
+
+    def split_write_decision(
+        self,
+        record_sequence: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        segment_index: int,
+        segment_frame: int,
+    ) -> dict[str, object]: ...
+
+    def finish_frame(
+        self,
+        record_sequence: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        bytes_written: int,
+    ) -> dict[str, object]: ...
+
+    def reject_frame(
+        self,
+        record_sequence: int,
+        source_sequence: int,
+        host_monotonic_ns: int,
+        at_time_seconds: float,
+    ) -> dict[str, object]: ...
+
+    def snapshot(self) -> dict[str, object]: ...
+
+    def finish(self) -> dict[str, object]: ...
+
+
 class NativeImuCollector(Protocol):
     def read(self, timeout_seconds: float = 1.0) -> dict[str, object]: ...
 
@@ -280,6 +347,27 @@ class NativeContinuousCaptureRuntime(Protocol):
         imu_timeout_seconds: float = 1.0,
     ) -> dict[str, object]: ...
 
+    def start_recording_raw_sink(
+        self,
+        active_take: NativeActiveTakeWriter,
+        sink: NativeRecordingSink,
+        on_failure: object,
+        imu: object | None = None,
+        imu_timeout_seconds: float = 1.0,
+    ) -> dict[str, object]: ...
+
+    def start_recording_split_sink(
+        self,
+        active_take: NativeActiveTakeWriter,
+        sink: NativeRecordingSink,
+        encoder: NativeStereoEncoderProcess,
+        segment_planner: NativeRecordingSegmentPlanner,
+        recording_start_monotonic_ns: int,
+        on_failure: object,
+        imu: object | None = None,
+        imu_timeout_seconds: float = 1.0,
+    ) -> dict[str, object]: ...
+
     def stop_recording(self, timeout_seconds: float = 3.0) -> dict[str, object]: ...
 
     def close(self, timeout_seconds: float = 5.0) -> dict[str, object]: ...
@@ -394,6 +482,16 @@ class NativeSessionIo(Protocol):
         self,
         manifest: bytes,
         session_id: str,
+    ) -> dict[str, object]: ...
+
+    def seal_device_session_v1(
+        self,
+        partial_path: str,
+        final_path: str,
+        session_id: str,
+        manifest: bytes,
+        expected_identities: dict[str, tuple[int, int, int, int]],
+        control_names: list[str] | None = None,
     ) -> dict[str, object]: ...
 
 
@@ -559,6 +657,52 @@ def create_native_audio_recorder(
         code, separator, message = raw.partition(": ")
         if not separator or not code.replace("_", "").isalnum():
             code, message = "native_audio_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_timeline(start_monotonic_ns: int | None = None) -> NativeTimeline:
+    """Create the Rust take/session timeline owner or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_timeline_unavailable", f"无法加载原生时间线模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "native_timeline" not in capabilities.features:
+        raise NativeModuleError("native_timeline_unavailable", "原生模块缺少统一时间线能力")
+    try:
+        return module.NativeTimeline(start_monotonic_ns)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "native_timeline_init_failed", raw
+        raise NativeModuleError(code, message) from exc
+
+
+def create_native_active_take_writer(session_id: str) -> NativeActiveTakeWriter:
+    """Create the Rust active-take frame/domain/drop owner or fail explicitly."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "active_take_writer_unavailable", f"无法加载原生 active take 模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "active_take_writer" not in capabilities.features:
+        raise NativeModuleError(
+            "active_take_writer_unavailable", "原生模块缺少 active take 写入状态能力"
+        )
+    try:
+        return module.NativeActiveTakeWriter(session_id)
+    except Exception as exc:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            code, message = "active_take_writer_init_failed", raw
         raise NativeModuleError(code, message) from exc
 
 

@@ -391,6 +391,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "recording_codec",
                     "session_io",
                     "device_session_artifacts",
+                    "device_session_finalizer",
                 ),
             )
             with (
@@ -408,6 +409,40 @@ class ProductionDaemonTest(unittest.TestCase):
             gateway.assert_not_called()
             self.assertFalse(config.state_root.exists())
 
+    def test_missing_native_timeline_fails_before_production_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "camera_frame_validator",
+                    "native_audio",
+                    "native_imu",
+                    "recording_codec",
+                    "session_io",
+                    "device_session_artifacts",
+                    "device_session_finalizer",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_timeline_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
     def test_missing_native_imu_fails_before_production_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
@@ -420,9 +455,11 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "recording_codec",
                     "session_io",
                     "device_session_artifacts",
+                    "device_session_finalizer",
                 ),
             )
             with (
@@ -452,6 +489,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                 ),
             )
@@ -482,13 +520,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                     "stereo_encoder_events",
@@ -522,13 +564,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                     "stereo_encoder_events",
@@ -551,6 +597,52 @@ class ProductionDaemonTest(unittest.TestCase):
             gateway.assert_not_called()
             self.assertFalse(config.state_root.exists())
 
+    def test_missing_native_device_session_finalizer_fails_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "camera_frame_validator",
+                    "native_audio",
+                    "native_timeline",
+                    "native_imu",
+                    "recording_codec",
+                    "recording_sink",
+                    "recording_imu_batch",
+                    "active_take_writer",
+                    "recording_frame_gate",
+                    "capture_fanout",
+                    "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
+                    "recording_event_queue",
+                    "artifact_finalize",
+                    "stereo_encoder_events",
+                    "stereo_encoder_pipe",
+                    "session_io",
+                    "device_session_artifacts",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_device_session_finalizer_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
     def test_missing_native_recording_sink_fails_before_production_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
@@ -563,6 +655,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                 ),
@@ -596,6 +689,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
@@ -616,6 +710,42 @@ class ProductionDaemonTest(unittest.TestCase):
             gateway.assert_not_called()
             self.assertFalse(config.state_root.exists())
 
+    def test_missing_native_active_take_writer_fails_before_production_side_effects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "camera_frame_validator",
+                    "native_audio",
+                    "native_timeline",
+                    "native_imu",
+                    "recording_codec",
+                    "recording_sink",
+                    "recording_imu_batch",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(raised.exception.code, "native_active_take_writer_unavailable")
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
     def test_missing_native_recording_frame_gate_fails_before_production_side_effects(
         self,
     ) -> None:
@@ -630,10 +760,12 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                 ),
             )
             with (
@@ -665,10 +797,12 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                 ),
             )
@@ -701,10 +835,12 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                 ),
@@ -727,6 +863,93 @@ class ProductionDaemonTest(unittest.TestCase):
             gateway.assert_not_called()
             self.assertFalse(config.state_root.exists())
 
+    def test_missing_native_continuous_capture_raw_sink_fails_before_side_effects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "camera_frame_validator",
+                    "native_audio",
+                    "native_timeline",
+                    "native_imu",
+                    "recording_codec",
+                    "recording_sink",
+                    "recording_imu_batch",
+                    "active_take_writer",
+                    "recording_frame_gate",
+                    "capture_fanout",
+                    "continuous_capture_runtime",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(
+                raised.exception.code,
+                "native_continuous_capture_raw_sink_unavailable",
+            )
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
+    def test_missing_native_continuous_capture_split_sink_fails_before_side_effects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            capabilities = NativeCapabilities(
+                True,
+                "0.1.0",
+                4,
+                (
+                    "capability_probe",
+                    "native_camera",
+                    "camera_frame_validator",
+                    "native_audio",
+                    "native_timeline",
+                    "native_imu",
+                    "recording_codec",
+                    "recording_sink",
+                    "recording_imu_batch",
+                    "active_take_writer",
+                    "recording_frame_gate",
+                    "capture_fanout",
+                    "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                ),
+            )
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
+                patch("rp_ylx.daemon.create_gateway_server") as gateway,
+                self.assertRaises(ProductionConfigError) as raised,
+            ):
+                build_production_service(config)
+            self.assertEqual(
+                raised.exception.code,
+                "native_continuous_capture_split_sink_unavailable",
+            )
+            backend.assert_not_called()
+            coordinator.assert_not_called()
+            gateway.assert_not_called()
+            self.assertFalse(config.state_root.exists())
+
     def test_missing_native_recording_event_queue_fails_before_production_side_effects(
         self,
     ) -> None:
@@ -741,13 +964,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                 ),
             )
             with (
@@ -779,13 +1006,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                 ),
             )
@@ -818,13 +1049,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                 ),
@@ -858,13 +1093,17 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                     "stereo_encoder_events",
@@ -897,19 +1136,24 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                     "stereo_encoder_events",
                     "stereo_encoder_pipe",
                     "session_io",
                     "device_session_artifacts",
+                    "device_session_finalizer",
                 ),
             )
             with (
@@ -939,19 +1183,24 @@ class ProductionDaemonTest(unittest.TestCase):
                     "native_camera",
                     "camera_frame_validator",
                     "native_audio",
+                    "native_timeline",
                     "native_imu",
                     "recording_codec",
                     "recording_sink",
                     "recording_imu_batch",
+                    "active_take_writer",
                     "recording_frame_gate",
                     "capture_fanout",
                     "continuous_capture_runtime",
+                    "continuous_capture_raw_sink",
+                    "continuous_capture_split_sink",
                     "recording_event_queue",
                     "artifact_finalize",
                     "stereo_encoder_events",
                     "stereo_encoder_pipe",
                     "session_io",
                     "device_session_artifacts",
+                    "device_session_finalizer",
                     "preview_buffer",
                 ),
             )

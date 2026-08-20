@@ -1,8 +1,10 @@
+use crate::active_take;
 use crate::imu::{self, Collector, ImuError};
 use crate::metrics::Metrics;
 use crate::native_camera::{Frame, FrameValidator, Stream, StreamError};
 use crate::preview::{LatestBuffer, PreviewError};
-use crate::recording::{CaptureFanoutState, RecordingError};
+use crate::recording::{self, CaptureFanoutState, RecordingError};
+use crate::stereo_encoder;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +40,12 @@ impl From<PreviewError> for RuntimeError {
     }
 }
 
+impl From<active_take::ActiveTakeError> for RuntimeError {
+    fn from(error: active_take::ActiveTakeError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
 impl From<RecordingError> for RuntimeError {
     fn from(error: RecordingError) -> Self {
         Self::new(error.code, error.message)
@@ -68,10 +76,76 @@ struct RecordingCallbacks {
     imu: Option<Arc<Collector>>,
 }
 
+struct RawSinkRecording {
+    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+    sink: Arc<Mutex<recording::RecordingSink>>,
+    on_failure: Py<PyAny>,
+    imu: Option<Arc<Collector>>,
+}
+
+struct SplitSinkRecording {
+    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+    sink: Arc<Mutex<recording::RecordingSink>>,
+    encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
+    segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
+    recording_start_monotonic_ns: u64,
+    on_failure: Py<PyAny>,
+    imu: Option<Arc<Collector>>,
+}
+
+enum RecordingTarget {
+    Callbacks(RecordingCallbacks),
+    RawSink(RawSinkRecording),
+    SplitSink(SplitSinkRecording),
+}
+
+impl RecordingTarget {
+    fn imu(&self) -> Option<Arc<Collector>> {
+        match self {
+            Self::Callbacks(callbacks) => callbacks.imu.as_ref().map(Arc::clone),
+            Self::RawSink(recording) => recording.imu.as_ref().map(Arc::clone),
+            Self::SplitSink(recording) => recording.imu.as_ref().map(Arc::clone),
+        }
+    }
+
+    fn on_failure(&self, py: Python<'_>) -> Py<PyAny> {
+        match self {
+            Self::Callbacks(callbacks) => callbacks.on_failure.clone_ref(py),
+            Self::RawSink(recording) => recording.on_failure.clone_ref(py),
+            Self::SplitSink(recording) => recording.on_failure.clone_ref(py),
+        }
+    }
+}
+
+enum RecordingDispatch {
+    Callbacks {
+        submit_frame: Py<PyAny>,
+        on_failure: Py<PyAny>,
+    },
+    RawSink {
+        active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+        sink: Arc<Mutex<recording::RecordingSink>>,
+        on_failure: Py<PyAny>,
+    },
+    SplitSink {
+        active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+        sink: Arc<Mutex<recording::RecordingSink>>,
+        encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
+        segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
+        recording_start_monotonic_ns: u64,
+        on_failure: Py<PyAny>,
+    },
+}
+
+enum ImuSubmitTarget {
+    Callback(Py<PyAny>),
+    RawSink(Arc<Mutex<recording::RecordingSink>>),
+}
+
 struct State {
     fanout: CaptureFanoutState,
     validator: FrameValidator,
-    recording: Option<RecordingCallbacks>,
+    recording: Option<RecordingTarget>,
     running: bool,
     terminal_error: Option<RuntimeError>,
     last_preview_error: Option<RuntimeError>,
@@ -229,11 +303,11 @@ impl Runtime {
             ));
         }
         state.fanout.start_recording()?;
-        state.recording = Some(RecordingCallbacks {
+        state.recording = Some(RecordingTarget::Callbacks(RecordingCallbacks {
             submit_frame,
             on_failure,
             imu,
-        });
+        }));
         self.shared.changed.notify_all();
         let snapshot = snapshot_locked(&state);
         drop(state);
@@ -249,7 +323,192 @@ impl Runtime {
                 handle: thread::spawn(move || {
                     run_imu_loop(
                         collector,
-                        callback,
+                        ImuSubmitTarget::Callback(callback),
+                        on_failure,
+                        shared,
+                        stop,
+                        imu_timeout,
+                        metrics,
+                    );
+                    let _ = done_tx.send(());
+                }),
+                done: done_rx,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn start_recording_raw_sink(
+        &self,
+        active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+        sink: Arc<Mutex<recording::RecordingSink>>,
+        on_failure: Py<PyAny>,
+        imu: Option<Arc<Collector>>,
+        imu_timeout: Duration,
+    ) -> Result<RuntimeSnapshot, RuntimeError> {
+        if imu.is_some() && imu_timeout.is_zero() {
+            return Err(RuntimeError::new(
+                "invalid_argument",
+                "capture runtime IMU timeout must be positive",
+            ));
+        }
+        let mut imu_worker = self.imu_worker.lock().map_err(|_| {
+            RuntimeError::new(
+                "capture_runtime_poisoned",
+                "capture runtime IMU worker mutex is poisoned",
+            )
+        })?;
+        if imu_worker.is_some() {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime IMU worker is already running",
+            ));
+        }
+        let imu_for_worker = imu.clone();
+        let on_failure_for_imu = if imu_for_worker.is_some() {
+            Some(Python::with_gil(|py| on_failure.clone_ref(py)))
+        } else {
+            None
+        };
+        let sink_for_worker = Arc::clone(&sink);
+        let mut state = self.shared.state.lock().map_err(|_| {
+            RuntimeError::new(
+                "capture_runtime_poisoned",
+                "capture runtime state mutex is poisoned",
+            )
+        })?;
+        if !state.running {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime preview is not running",
+            ));
+        }
+        if state.recording.is_some() {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime is already recording",
+            ));
+        }
+        state.fanout.start_recording()?;
+        state.recording = Some(RecordingTarget::RawSink(RawSinkRecording {
+            active_take,
+            sink,
+            on_failure,
+            imu,
+        }));
+        self.shared.changed.notify_all();
+        let snapshot = snapshot_locked(&state);
+        drop(state);
+        if let (Some(collector), Some(on_failure)) = (imu_for_worker, on_failure_for_imu) {
+            self.imu_stop.store(false, Ordering::Release);
+            let shared = Arc::clone(&self.shared);
+            let stop = Arc::clone(&self.imu_stop);
+            let metrics = self.metrics.as_ref().map(Arc::clone);
+            let (done_tx, done_rx) = mpsc::channel();
+            *imu_worker = Some(WorkerHandle {
+                handle: thread::spawn(move || {
+                    run_imu_loop(
+                        collector,
+                        ImuSubmitTarget::RawSink(sink_for_worker),
+                        on_failure,
+                        shared,
+                        stop,
+                        imu_timeout,
+                        metrics,
+                    );
+                    let _ = done_tx.send(());
+                }),
+                done: done_rx,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_recording_split_sink(
+        &self,
+        active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+        sink: Arc<Mutex<recording::RecordingSink>>,
+        encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
+        segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
+        recording_start_monotonic_ns: u64,
+        on_failure: Py<PyAny>,
+        imu: Option<Arc<Collector>>,
+        imu_timeout: Duration,
+    ) -> Result<RuntimeSnapshot, RuntimeError> {
+        if recording_start_monotonic_ns == 0 {
+            return Err(RuntimeError::new(
+                "invalid_argument",
+                "recording start monotonic timestamp must be positive",
+            ));
+        }
+        if imu.is_some() && imu_timeout.is_zero() {
+            return Err(RuntimeError::new(
+                "invalid_argument",
+                "capture runtime IMU timeout must be positive",
+            ));
+        }
+        let mut imu_worker = self.imu_worker.lock().map_err(|_| {
+            RuntimeError::new(
+                "capture_runtime_poisoned",
+                "capture runtime IMU worker mutex is poisoned",
+            )
+        })?;
+        if imu_worker.is_some() {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime IMU worker is already running",
+            ));
+        }
+        let imu_for_worker = imu.clone();
+        let on_failure_for_imu = if imu_for_worker.is_some() {
+            Some(Python::with_gil(|py| on_failure.clone_ref(py)))
+        } else {
+            None
+        };
+        let sink_for_worker = Arc::clone(&sink);
+        let mut state = self.shared.state.lock().map_err(|_| {
+            RuntimeError::new(
+                "capture_runtime_poisoned",
+                "capture runtime state mutex is poisoned",
+            )
+        })?;
+        if !state.running {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime preview is not running",
+            ));
+        }
+        if state.recording.is_some() {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture runtime is already recording",
+            ));
+        }
+        state.fanout.start_recording()?;
+        state.recording = Some(RecordingTarget::SplitSink(SplitSinkRecording {
+            active_take,
+            sink,
+            encoder,
+            segment_planner,
+            recording_start_monotonic_ns,
+            on_failure,
+            imu,
+        }));
+        self.shared.changed.notify_all();
+        let snapshot = snapshot_locked(&state);
+        drop(state);
+        if let (Some(collector), Some(on_failure)) = (imu_for_worker, on_failure_for_imu) {
+            self.imu_stop.store(false, Ordering::Release);
+            let shared = Arc::clone(&self.shared);
+            let stop = Arc::clone(&self.imu_stop);
+            let metrics = self.metrics.as_ref().map(Arc::clone);
+            let (done_tx, done_rx) = mpsc::channel();
+            *imu_worker = Some(WorkerHandle {
+                handle: thread::spawn(move || {
+                    run_imu_loop(
+                        collector,
+                        ImuSubmitTarget::RawSink(sink_for_worker),
                         on_failure,
                         shared,
                         stop,
@@ -368,10 +627,7 @@ impl Runtime {
                     "capture runtime state mutex is poisoned",
                 )
             })?;
-            state
-                .recording
-                .as_ref()
-                .and_then(|callbacks| callbacks.imu.as_ref().map(Arc::clone))
+            state.recording.as_ref().and_then(RecordingTarget::imu)
         };
         if let Some(imu) = imu {
             imu.close();
@@ -504,7 +760,7 @@ fn process_frame(
                     "application dropped frame count is out of range",
                 )
             })?;
-        let (record, dropped_before, submit_frame, on_failure) = {
+        let (dropped_before, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
                     "capture_runtime_poisoned",
@@ -536,49 +792,117 @@ fn process_frame(
                     finish_stage(metrics, "native_preview_publish", publish_started);
                 }
             }
-            let callbacks = if decision.record {
-                state.recording.as_ref().map(|callbacks| {
-                    (
-                        callbacks.submit_frame.clone_ref(py),
-                        callbacks.on_failure.clone_ref(py),
-                    )
+            let dispatch = if decision.record {
+                state.recording.as_ref().map(|target| match target {
+                    RecordingTarget::Callbacks(callbacks) => RecordingDispatch::Callbacks {
+                        submit_frame: callbacks.submit_frame.clone_ref(py),
+                        on_failure: callbacks.on_failure.clone_ref(py),
+                    },
+                    RecordingTarget::RawSink(recording) => RecordingDispatch::RawSink {
+                        active_take: Arc::clone(&recording.active_take),
+                        sink: Arc::clone(&recording.sink),
+                        on_failure: recording.on_failure.clone_ref(py),
+                    },
+                    RecordingTarget::SplitSink(recording) => RecordingDispatch::SplitSink {
+                        active_take: Arc::clone(&recording.active_take),
+                        sink: Arc::clone(&recording.sink),
+                        encoder: Arc::clone(&recording.encoder),
+                        segment_planner: Arc::clone(&recording.segment_planner),
+                        recording_start_monotonic_ns: recording.recording_start_monotonic_ns,
+                        on_failure: recording.on_failure.clone_ref(py),
+                    },
                 })
             } else {
                 None
             };
-            (
-                decision.record && callbacks.is_some(),
-                decision.dropped_before,
-                callbacks
-                    .as_ref()
-                    .map(|callbacks| callbacks.0.clone_ref(py)),
-                callbacks.map(|callbacks| callbacks.1),
-            )
+            (decision.dropped_before, dispatch)
         };
-        if record {
-            if let Some(callback) = submit_frame {
-                let callback_started = start_stage(metrics);
-                let result = callback.call1(
-                    py,
-                    (
-                        frame.source_sequence,
-                        frame.host_monotonic_ns,
-                        dropped_before,
-                        frame.left.clone_ref(py),
-                        frame.right.clone_ref(py),
-                        frame.raw_side_by_side.clone_ref(py),
-                    ),
-                );
-                finish_stage(metrics, "native_recording_callback", callback_started);
-                if let Err(error) = result {
-                    submit_failure = Some(RuntimeError::new(
-                        "camera_failed",
-                        format!("recording frame callback failed: {error}"),
-                    ));
+        if let Some(dispatch) = dispatch {
+            let on_failure = match dispatch {
+                RecordingDispatch::Callbacks {
+                    submit_frame,
+                    on_failure,
+                } => {
+                    let callback_started = start_stage(metrics);
+                    let result = submit_frame.call1(
+                        py,
+                        (
+                            frame.source_sequence,
+                            frame.host_monotonic_ns,
+                            dropped_before,
+                            frame.left.clone_ref(py),
+                            frame.right.clone_ref(py),
+                            frame.raw_side_by_side.clone_ref(py),
+                        ),
+                    );
+                    finish_stage(metrics, "native_recording_callback", callback_started);
+                    if let Err(error) = result {
+                        submit_failure = Some(RuntimeError::new(
+                            "camera_failed",
+                            format!("recording frame callback failed: {error}"),
+                        ));
+                    }
+                    on_failure
                 }
-            }
+                RecordingDispatch::RawSink {
+                    active_take,
+                    sink,
+                    on_failure,
+                } => {
+                    let raw = frame.raw_side_by_side.as_bytes(py).to_vec();
+                    let source_sequence = frame.source_sequence;
+                    let host_monotonic_ns = frame.host_monotonic_ns;
+                    let write_started = start_stage(metrics);
+                    let result = py.allow_threads(move || {
+                        write_raw_sink_frame(
+                            active_take,
+                            sink,
+                            source_sequence,
+                            host_monotonic_ns,
+                            dropped_before,
+                            raw,
+                        )
+                    });
+                    finish_stage(metrics, "native_recording_raw_sink", write_started);
+                    if let Err(error) = result {
+                        submit_failure = Some(error);
+                    }
+                    on_failure
+                }
+                RecordingDispatch::SplitSink {
+                    active_take,
+                    sink,
+                    encoder,
+                    segment_planner,
+                    recording_start_monotonic_ns,
+                    on_failure,
+                } => {
+                    let raw = frame.raw_side_by_side.as_bytes(py).to_vec();
+                    let source_sequence = frame.source_sequence;
+                    let host_monotonic_ns = frame.host_monotonic_ns;
+                    let write_started = start_stage(metrics);
+                    let result = py.allow_threads(move || {
+                        write_split_sink_frame(
+                            active_take,
+                            sink,
+                            encoder,
+                            segment_planner,
+                            recording_start_monotonic_ns,
+                            source_sequence,
+                            host_monotonic_ns,
+                            dropped_before,
+                            raw,
+                        )
+                    });
+                    finish_stage(metrics, "native_recording_split_sink", write_started);
+                    if let Err(error) = result {
+                        submit_failure = Some(error);
+                    }
+                    on_failure
+                }
+            };
             finish_recording_frame(shared)?;
-            if let (Some(error), Some(on_failure)) = (submit_failure.clone(), on_failure) {
+            if let Some(error) = submit_failure.clone() {
                 report_recording_failure(shared, py, error, Some(on_failure));
             }
         }
@@ -586,6 +910,151 @@ fn process_frame(
     });
     finish_stage(metrics, "native_capture_frame", frame_started);
     result
+}
+
+fn write_raw_sink_frame(
+    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+    sink: Arc<Mutex<recording::RecordingSink>>,
+    source_sequence: u64,
+    host_monotonic_ns: u64,
+    dropped_before: u64,
+    raw_side_by_side: Vec<u8>,
+) -> Result<(), RuntimeError> {
+    if raw_side_by_side.is_empty() {
+        return Err(RuntimeError::new(
+            "raw_frame_unavailable",
+            "production recording is missing raw side-by-side MJPEG frame",
+        ));
+    }
+    let reserved = {
+        let mut writer = active_take.lock().map_err(|_| {
+            RuntimeError::new(
+                "active_take_writer_poisoned",
+                "active take writer mutex is poisoned",
+            )
+        })?;
+        writer.reserve_frame(active_take::ActiveSourceFrame {
+            source_sequence,
+            host_monotonic_ns,
+            source_gap: dropped_before,
+        })?
+    };
+    let written = {
+        let mut sink = sink.lock().map_err(|_| {
+            RuntimeError::new(
+                "native_recording_poisoned",
+                "recording sink mutex is poisoned",
+            )
+        })?;
+        sink.write_raw_frame(
+            reserved.record_sequence,
+            reserved.source_sequence,
+            reserved.host_monotonic_ns,
+            &raw_side_by_side,
+        )?
+    };
+    {
+        let mut writer = active_take.lock().map_err(|_| {
+            RuntimeError::new(
+                "active_take_writer_poisoned",
+                "active take writer mutex is poisoned",
+            )
+        })?;
+        writer.finish_frame(reserved, written.bytes_written)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_split_sink_frame(
+    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+    sink: Arc<Mutex<recording::RecordingSink>>,
+    encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
+    segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
+    recording_start_monotonic_ns: u64,
+    source_sequence: u64,
+    host_monotonic_ns: u64,
+    dropped_before: u64,
+    raw_side_by_side: Vec<u8>,
+) -> Result<(), RuntimeError> {
+    if raw_side_by_side.is_empty() {
+        return Err(RuntimeError::new(
+            "raw_frame_unavailable",
+            "production split-eye recording is missing raw side-by-side MJPEG frame",
+        ));
+    }
+    let payload = recording::jpeg_payload(&raw_side_by_side)?;
+    let reserved = {
+        let mut writer = active_take.lock().map_err(|_| {
+            RuntimeError::new(
+                "active_take_writer_poisoned",
+                "active take writer mutex is poisoned",
+            )
+        })?;
+        writer.reserve_frame(active_take::ActiveSourceFrame {
+            source_sequence,
+            host_monotonic_ns,
+            source_gap: dropped_before,
+        })?
+    };
+    let elapsed_seconds = if host_monotonic_ns >= recording_start_monotonic_ns {
+        (host_monotonic_ns - recording_start_monotonic_ns) as f64 / 1_000_000_000.0
+    } else {
+        0.0
+    };
+    let plan = {
+        let mut planner = segment_planner.lock().map_err(|_| {
+            RuntimeError::new(
+                "native_recording_segment_planner_poisoned",
+                "recording segment planner mutex is poisoned",
+            )
+        })?;
+        planner.next_frame(reserved.record_sequence, elapsed_seconds)?
+    };
+    {
+        let mut encoder = encoder.lock().map_err(|_| {
+            RuntimeError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        encoder.submit(payload).map_err(encoder_runtime_error)?;
+    }
+    let written = {
+        let mut sink = sink.lock().map_err(|_| {
+            RuntimeError::new(
+                "native_recording_poisoned",
+                "recording sink mutex is poisoned",
+            )
+        })?;
+        sink.write_split_frame_index(
+            reserved.record_sequence,
+            reserved.source_sequence,
+            reserved.host_monotonic_ns,
+            plan.segment_index,
+            plan.segment_frame,
+        )?
+    };
+    {
+        let mut writer = active_take.lock().map_err(|_| {
+            RuntimeError::new(
+                "active_take_writer_poisoned",
+                "active take writer mutex is poisoned",
+            )
+        })?;
+        writer.finish_frame(reserved, written)?;
+    }
+    Ok(())
+}
+
+fn encoder_runtime_error(error: stereo_encoder::EncoderProcessError) -> RuntimeError {
+    let code = match error.code.as_str() {
+        "invalid_argument" => "invalid_argument",
+        "invalid_state" => "invalid_state",
+        "encoder_unavailable" => "encoder_unavailable",
+        "encoder_failed" => "encoder_failed",
+        "counter_overflow" => "counter_overflow",
+        "send_failed" => "send_failed",
+        _ => "encoder_failed",
+    };
+    RuntimeError::new(code, error.message)
 }
 
 fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
@@ -605,7 +1074,7 @@ fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
 
 fn run_imu_loop(
     collector: Arc<Collector>,
-    submit_imu: Py<PyAny>,
+    target: ImuSubmitTarget,
     on_failure: Py<PyAny>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
@@ -625,25 +1094,53 @@ fn run_imu_loop(
                     break;
                 }
                 let mut failure: Option<RuntimeError> = None;
-                Python::with_gil(|py| match imu::observation_dict(py, &observation) {
-                    Ok(payload) => {
-                        let callback_started = start_stage(metrics.as_ref());
-                        let result = submit_imu.call1(py, (payload,));
-                        finish_stage(metrics.as_ref(), "native_imu_callback", callback_started);
+                match &target {
+                    ImuSubmitTarget::Callback(submit_imu) => {
+                        Python::with_gil(|py| match imu::observation_dict(py, &observation) {
+                            Ok(payload) => {
+                                let callback_started = start_stage(metrics.as_ref());
+                                let result = submit_imu.call1(py, (payload,));
+                                finish_stage(
+                                    metrics.as_ref(),
+                                    "native_imu_callback",
+                                    callback_started,
+                                );
+                                if let Err(error) = result {
+                                    failure = Some(RuntimeError::new(
+                                        "imu_failed",
+                                        format!("recording IMU callback failed: {error}"),
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                failure = Some(RuntimeError::new(
+                                    "imu_failed",
+                                    format!("recording IMU payload conversion failed: {error}"),
+                                ));
+                            }
+                        });
+                    }
+                    ImuSubmitTarget::RawSink(sink) => {
+                        let write_started = start_stage(metrics.as_ref());
+                        let result = sink
+                            .lock()
+                            .map_err(|_| {
+                                RuntimeError::new(
+                                    "native_recording_poisoned",
+                                    "recording sink mutex is poisoned",
+                                )
+                            })
+                            .and_then(|mut sink| {
+                                sink.write_imu_observation(&observation)
+                                    .map(|_| ())
+                                    .map_err(RuntimeError::from)
+                            });
+                        finish_stage(metrics.as_ref(), "native_imu_raw_sink", write_started);
                         if let Err(error) = result {
-                            failure = Some(RuntimeError::new(
-                                "imu_failed",
-                                format!("recording IMU callback failed: {error}"),
-                            ));
+                            failure = Some(error);
                         }
                     }
-                    Err(error) => {
-                        failure = Some(RuntimeError::new(
-                            "imu_failed",
-                            format!("recording IMU payload conversion failed: {error}"),
-                        ));
-                    }
-                });
+                }
                 if let Some(error) = failure {
                     if !stop.load(Ordering::Acquire) && recording_present(&shared) {
                         Python::with_gil(|py| {
@@ -736,12 +1233,8 @@ fn report_recording_failure(
         }
         shared.changed.notify_all();
         if should_report {
-            preferred_callback.or_else(|| {
-                state
-                    .recording
-                    .as_ref()
-                    .map(|callbacks| callbacks.on_failure.clone_ref(py))
-            })
+            preferred_callback
+                .or_else(|| state.recording.as_ref().map(|target| target.on_failure(py)))
         } else {
             None
         }
@@ -762,10 +1255,7 @@ fn set_terminal_error(shared: &Shared, error: RuntimeError) {
             state.running = false;
             let (should_report, _inflight) = state.fanout.mark_failure();
             let callback = if should_report {
-                state
-                    .recording
-                    .as_ref()
-                    .map(|callbacks| callbacks.on_failure.clone_ref(py))
+                state.recording.as_ref().map(|target| target.on_failure(py))
             } else {
                 None
             };
@@ -790,5 +1280,94 @@ fn snapshot_locked(state: &State) -> RuntimeSnapshot {
         failure_reported: fanout.failure_reported,
         terminal_error: state.terminal_error.clone(),
         last_preview_error: state.last_preview_error.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rp-ylx-{name}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn split_sink_frame_writes_index_and_finishes_active_take() {
+        let root = temp_root("split-sink");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = root.join("encoder-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions).unwrap();
+
+        {
+            let active_take = Arc::new(Mutex::new(
+                active_take::ActiveTakeWriter::new("session").unwrap(),
+            ));
+            let sink = Arc::new(Mutex::new(
+                recording::RecordingSink::create(&root, "session", true).unwrap(),
+            ));
+            let mut encoder = stereo_encoder::EncoderProcess::new(
+                &root.join("video"),
+                &helper,
+                3840,
+                1080,
+                60,
+                8192,
+                3,
+                "video/",
+            )
+            .unwrap();
+            encoder.start().unwrap();
+            let encoder = Arc::new(Mutex::new(encoder));
+            let segment_planner = Arc::new(Mutex::new(
+                recording::RecordingSegmentPlanner::new(3).unwrap(),
+            ));
+
+            write_split_sink_frame(
+                Arc::clone(&active_take),
+                Arc::clone(&sink),
+                Arc::clone(&encoder),
+                Arc::clone(&segment_planner),
+                1_000_000,
+                9,
+                34_000_000,
+                0,
+                b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
+            )
+            .unwrap();
+
+            let summary = active_take.lock().unwrap().finish().unwrap();
+            assert_eq!(summary.frames_written, 1);
+            assert_eq!(summary.frame_domain, 1);
+            assert_eq!(summary.pending_frames, 0);
+            let snapshot = sink.lock().unwrap().flush_and_close().unwrap();
+            assert_eq!(snapshot.frames_written, 1);
+            assert_eq!(snapshot.imu_samples_written, 0);
+            assert!(snapshot.bytes_written > 0);
+            assert!(
+                snapshot
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.relative_path == "frames.ndjson")
+            );
+            assert_eq!(encoder.lock().unwrap().submitted_frames(), 1);
+            assert_eq!(segment_planner.lock().unwrap().snapshot().frames_written, 1);
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 }

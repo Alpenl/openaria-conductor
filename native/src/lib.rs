@@ -1,3 +1,4 @@
+mod active_take;
 mod audio;
 mod bounded;
 mod capture_runtime;
@@ -10,11 +11,12 @@ mod preview;
 mod recording;
 mod session_io;
 mod stereo_encoder;
+mod timeline;
 mod turbojpeg;
 mod v4l2;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,8 @@ const V4L2_CAPTURE: &str = "v4l2_capture";
 const NATIVE_CAMERA: &str = "native_camera";
 const CAMERA_FRAME_VALIDATOR: &str = "camera_frame_validator";
 const NATIVE_AUDIO: &str = "native_audio";
+const NATIVE_TIMELINE: &str = "native_timeline";
+const ACTIVE_TAKE_WRITER: &str = "active_take_writer";
 const NATIVE_IMU: &str = "native_imu";
 const RECORDING_CODEC: &str = "recording_codec";
 const RECORDING_SINK: &str = "recording_sink";
@@ -37,6 +41,8 @@ const RECORDING_FRAME_GATE: &str = "recording_frame_gate";
 const RECORDING_TAP_STATE: &str = "recording_tap_state";
 const CAPTURE_FANOUT: &str = "capture_fanout";
 const CONTINUOUS_CAPTURE_RUNTIME: &str = "continuous_capture_runtime";
+const CONTINUOUS_CAPTURE_RAW_SINK: &str = "continuous_capture_raw_sink";
+const CONTINUOUS_CAPTURE_SPLIT_SINK: &str = "continuous_capture_split_sink";
 const RECORDING_SEGMENT_PLANNER: &str = "recording_segment_planner";
 const RECORDING_EVENT_QUEUE: &str = "recording_event_queue";
 const ARTIFACT_FINALIZE: &str = "artifact_finalize";
@@ -46,6 +52,7 @@ const STEREO_ENCODER_PIPE: &str = "stereo_encoder_pipe";
 const STEREO_ENCODER_PROCESS: &str = "stereo_encoder_process";
 const SESSION_IO: &str = "session_io";
 const DEVICE_SESSION_ARTIFACTS: &str = "device_session_artifacts";
+const DEVICE_SESSION_FINALIZER: &str = "device_session_finalizer";
 const DROP_QUALITY_POLICY: &str = "drop_quality_policy";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
@@ -59,6 +66,14 @@ fn camera_error(error: native_camera::StreamError) -> PyErr {
 }
 
 fn audio_error(error: audio::AudioError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn timeline_error(error: timeline::TimelineError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn active_take_error(error: active_take::ActiveTakeError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
 
@@ -351,6 +366,248 @@ impl Drop for NativeAudioRecorder {
 }
 
 #[pyclass]
+struct NativeTimeline {
+    timeline: timeline::Timeline,
+}
+
+#[pymethods]
+impl NativeTimeline {
+    #[new]
+    #[pyo3(signature = (start_monotonic_ns=None))]
+    fn new(start_monotonic_ns: Option<u64>) -> PyResult<Self> {
+        let timeline = match start_monotonic_ns {
+            Some(value) => timeline::Timeline::new(value),
+            None => timeline::Timeline::start_now(),
+        }
+        .map_err(timeline_error)?;
+        Ok(Self { timeline })
+    }
+
+    #[staticmethod]
+    fn now_monotonic_ns(py: Python<'_>) -> PyResult<u64> {
+        py.allow_threads(timeline::monotonic_ns)
+            .map_err(timeline_error)
+    }
+
+    fn start_monotonic_ns(&self) -> u64 {
+        self.timeline.start_monotonic_ns()
+    }
+
+    fn elapsed_ns(&self, py: Python<'_>) -> PyResult<u64> {
+        let timeline = self.timeline.clone();
+        py.allow_threads(move || timeline.elapsed_ns())
+            .map_err(timeline_error)
+    }
+
+    fn elapsed_seconds(&self, py: Python<'_>) -> PyResult<f64> {
+        let timeline = self.timeline.clone();
+        py.allow_threads(move || timeline.elapsed_seconds())
+            .map_err(timeline_error)
+    }
+
+    fn offset_ns(&self, monotonic_ns: u64) -> i128 {
+        self.timeline.offset_ns(monotonic_ns)
+    }
+
+    fn offset_seconds(&self, monotonic_ns: u64) -> f64 {
+        self.timeline.offset_seconds(monotonic_ns)
+    }
+
+    fn audio_sync(
+        &self,
+        py: Python<'_>,
+        started_monotonic_ns: u64,
+        stopped_monotonic_ns: u64,
+        sample_rate_hz: u32,
+    ) -> PyResult<Py<PyDict>> {
+        let timeline = self.timeline.clone();
+        let sync = py
+            .allow_threads(move || {
+                timeline.audio_sync(started_monotonic_ns, stopped_monotonic_ns, sample_rate_hz)
+            })
+            .map_err(timeline_error)?;
+        timeline_audio_sync_dict(py, &sync)
+    }
+}
+
+#[pyclass]
+struct NativeActiveTakeWriter {
+    session_id: String,
+    writer: Arc<Mutex<active_take::ActiveTakeWriter>>,
+}
+
+#[pymethods]
+impl NativeActiveTakeWriter {
+    #[new]
+    fn new(session_id: &str) -> PyResult<Self> {
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            writer: Arc::new(Mutex::new(
+                active_take::ActiveTakeWriter::new(session_id).map_err(active_take_error)?,
+            )),
+        })
+    }
+
+    fn reserve_frame(
+        &self,
+        py: Python<'_>,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        source_gap: u64,
+    ) -> PyResult<Py<PyDict>> {
+        let frame = {
+            let mut writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer
+                .reserve_frame(active_take::ActiveSourceFrame {
+                    source_sequence,
+                    host_monotonic_ns,
+                    source_gap,
+                })
+                .map_err(active_take_error)?
+        };
+        active_take_reserved_frame_dict(py, &frame)
+    }
+
+    fn raw_write_decision(
+        &self,
+        py: Python<'_>,
+        record_sequence: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+    ) -> PyResult<Py<PyDict>> {
+        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
+        let decision = {
+            let writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer
+                .raw_write_decision(&frame)
+                .map_err(active_take_error)?
+        };
+        active_take_write_decision_dict(py, &decision)
+    }
+
+    fn split_write_decision(
+        &self,
+        py: Python<'_>,
+        record_sequence: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        segment_index: u64,
+        segment_frame: u64,
+    ) -> PyResult<Py<PyDict>> {
+        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
+        let decision = {
+            let writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer
+                .split_write_decision(
+                    &frame,
+                    active_take::SplitFrameLocation {
+                        segment_index,
+                        segment_frame,
+                    },
+                )
+                .map_err(active_take_error)?
+        };
+        active_take_write_decision_dict(py, &decision)
+    }
+
+    fn finish_frame(
+        &self,
+        py: Python<'_>,
+        record_sequence: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        bytes_written: u64,
+    ) -> PyResult<Py<PyDict>> {
+        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
+        let snapshot = {
+            let mut writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer
+                .finish_frame(frame, bytes_written)
+                .map_err(active_take_error)?
+        };
+        active_take_snapshot_dict(py, &snapshot)
+    }
+
+    fn reject_frame(
+        &self,
+        py: Python<'_>,
+        record_sequence: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        at_time_seconds: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
+        let snapshot = {
+            let mut writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer
+                .reject_frame(frame, at_time_seconds)
+                .map_err(active_take_error)?
+        };
+        active_take_snapshot_dict(py, &snapshot)
+    }
+
+    fn finish(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let summary = {
+            let mut writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer.finish().map_err(active_take_error)?
+        };
+        active_take_snapshot_dict(py, &summary)
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let snapshot = {
+            let writer = self.writer.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "active_take_writer_poisoned: active take writer mutex is poisoned",
+                )
+            })?;
+            writer.snapshot()
+        };
+        active_take_snapshot_dict(py, &snapshot)
+    }
+}
+
+impl NativeActiveTakeWriter {
+    fn reserved_frame(
+        &self,
+        record_sequence: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+    ) -> active_take::ReservedFrame {
+        active_take::ReservedFrame {
+            session_id: self.session_id.clone(),
+            record_sequence,
+            source_sequence,
+            host_monotonic_ns,
+        }
+    }
+}
+
+#[pyclass]
 struct NativeImuCollector {
     collector: Arc<imu::Collector>,
 }
@@ -563,7 +820,7 @@ fn py_imu_sample(value: &Bound<'_, PyAny>) -> PyResult<PyImuSampleRecord> {
 
 #[pyclass]
 struct NativeRecordingSink {
-    sink: Mutex<recording::RecordingSink>,
+    sink: Arc<Mutex<recording::RecordingSink>>,
 }
 
 #[pymethods]
@@ -571,14 +828,14 @@ impl NativeRecordingSink {
     #[new]
     fn new(session_root: &str, session_id: &str, split_eyes: bool) -> PyResult<Self> {
         Ok(Self {
-            sink: Mutex::new(
+            sink: Arc::new(Mutex::new(
                 recording::RecordingSink::create(
                     std::path::Path::new(session_root),
                     session_id,
                     split_eyes,
                 )
                 .map_err(recording_error)?,
-            ),
+            )),
         })
     }
 
@@ -1060,6 +1317,87 @@ impl NativeContinuousCaptureRuntime {
         capture_runtime_snapshot_dict(py, &snapshot)
     }
 
+    #[pyo3(signature = (active_take, sink, on_failure, imu=None, imu_timeout_seconds=1.0))]
+    fn start_recording_raw_sink(
+        &self,
+        py: Python<'_>,
+        active_take: PyRef<'_, NativeActiveTakeWriter>,
+        sink: PyRef<'_, NativeRecordingSink>,
+        on_failure: Py<PyAny>,
+        imu: Option<PyRef<'_, NativeImuCollector>>,
+        imu_timeout_seconds: f64,
+    ) -> PyResult<Py<PyDict>> {
+        if !imu_timeout_seconds.is_finite() || imu_timeout_seconds <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: imu_timeout_seconds must be finite and positive",
+            ));
+        }
+        let imu_collector = imu
+            .as_ref()
+            .map(|collector| Arc::clone(&collector.collector));
+        let runtime = Arc::clone(&self.runtime);
+        let active_take = Arc::clone(&active_take.writer);
+        let sink = Arc::clone(&sink.sink);
+        let timeout = Duration::from_secs_f64(imu_timeout_seconds);
+        let snapshot = py
+            .allow_threads(move || {
+                runtime.start_recording_raw_sink(
+                    active_take,
+                    sink,
+                    on_failure,
+                    imu_collector,
+                    timeout,
+                )
+            })
+            .map_err(capture_runtime_error)?;
+        capture_runtime_snapshot_dict(py, &snapshot)
+    }
+
+    #[pyo3(signature = (active_take, sink, encoder, segment_planner, recording_start_monotonic_ns, on_failure, imu=None, imu_timeout_seconds=1.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn start_recording_split_sink(
+        &self,
+        py: Python<'_>,
+        active_take: PyRef<'_, NativeActiveTakeWriter>,
+        sink: PyRef<'_, NativeRecordingSink>,
+        encoder: PyRef<'_, NativeStereoEncoderProcess>,
+        segment_planner: PyRef<'_, NativeRecordingSegmentPlanner>,
+        recording_start_monotonic_ns: u64,
+        on_failure: Py<PyAny>,
+        imu: Option<PyRef<'_, NativeImuCollector>>,
+        imu_timeout_seconds: f64,
+    ) -> PyResult<Py<PyDict>> {
+        if !imu_timeout_seconds.is_finite() || imu_timeout_seconds <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: imu_timeout_seconds must be finite and positive",
+            ));
+        }
+        let imu_collector = imu
+            .as_ref()
+            .map(|collector| Arc::clone(&collector.collector));
+        let runtime = Arc::clone(&self.runtime);
+        let active_take = Arc::clone(&active_take.writer);
+        let sink = Arc::clone(&sink.sink);
+        let encoder = Arc::clone(&encoder.process);
+        let segment_planner = Arc::clone(&segment_planner.planner);
+        let timeout = Duration::from_secs_f64(imu_timeout_seconds);
+        let snapshot = py
+            .allow_threads(move || {
+                runtime.start_recording_split_sink(
+                    active_take,
+                    sink,
+                    encoder,
+                    segment_planner,
+                    recording_start_monotonic_ns,
+                    on_failure,
+                    imu_collector,
+                    timeout,
+                )
+            })
+            .map_err(capture_runtime_error)?;
+        capture_runtime_snapshot_dict(py, &snapshot)
+    }
+
     #[pyo3(signature = (timeout_seconds=3.0))]
     fn stop_recording(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<Py<PyDict>> {
         if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
@@ -1107,7 +1445,7 @@ impl Drop for NativeContinuousCaptureRuntime {
 
 #[pyclass]
 struct NativeRecordingSegmentPlanner {
-    planner: Mutex<recording::RecordingSegmentPlanner>,
+    planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
 }
 
 #[pymethods]
@@ -1115,9 +1453,9 @@ impl NativeRecordingSegmentPlanner {
     #[new]
     fn new(segment_frames: u64) -> PyResult<Self> {
         Ok(Self {
-            planner: Mutex::new(
+            planner: Arc::new(Mutex::new(
                 recording::RecordingSegmentPlanner::new(segment_frames).map_err(recording_error)?,
-            ),
+            )),
         })
     }
 
@@ -1340,7 +1678,7 @@ impl NativeStereoEncoderPipe {
 
 #[pyclass]
 struct NativeStereoEncoderProcess {
-    process: Mutex<stereo_encoder::EncoderProcess>,
+    process: Arc<Mutex<stereo_encoder::EncoderProcess>>,
 }
 
 #[pymethods]
@@ -1359,7 +1697,7 @@ impl NativeStereoEncoderProcess {
         path_prefix: &str,
     ) -> PyResult<Self> {
         Ok(Self {
-            process: Mutex::new(
+            process: Arc::new(Mutex::new(
                 stereo_encoder::EncoderProcess::new(
                     std::path::Path::new(out_dir),
                     std::path::Path::new(executable),
@@ -1371,7 +1709,7 @@ impl NativeStereoEncoderProcess {
                     path_prefix,
                 )
                 .map_err(stereo_encoder_process_error)?,
-            ),
+            )),
         })
     }
 
@@ -1476,7 +1814,7 @@ impl NativeStereoEncoderProcess {
 
 impl Drop for NativeStereoEncoderProcess {
     fn drop(&mut self) {
-        if let Ok(process) = self.process.get_mut() {
+        if let Ok(mut process) = self.process.lock() {
             process.abort();
         }
     }
@@ -1619,6 +1957,40 @@ impl NativeSessionIo {
             .allow_threads(move || session_io::device_session_v1_summary(&manifest, &session_id))
             .map_err(session_io_error)?;
         device_session_v1_summary_dict(py, &summary)
+    }
+
+    #[pyo3(signature = (partial_path, final_path, session_id, manifest, expected_identities, control_names=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn seal_device_session_v1(
+        &self,
+        py: Python<'_>,
+        partial_path: &str,
+        final_path: &str,
+        session_id: &str,
+        manifest: &[u8],
+        expected_identities: &Bound<'_, PyDict>,
+        control_names: Option<Vec<String>>,
+    ) -> PyResult<Py<PyDict>> {
+        let partial_path = std::path::PathBuf::from(partial_path);
+        let final_path = std::path::PathBuf::from(final_path);
+        let session_id = session_id.to_owned();
+        let manifest = manifest.to_vec();
+        let expected_identities = expected_artifact_identities(expected_identities)?;
+        let control_names = control_names
+            .unwrap_or_else(|| vec!["recording.json".to_owned(), "capture.json".to_owned()]);
+        let result = py
+            .allow_threads(move || {
+                session_io::seal_device_session(
+                    &partial_path,
+                    &final_path,
+                    &manifest,
+                    &session_id,
+                    &expected_identities,
+                    &control_names,
+                )
+            })
+            .map_err(session_io_error)?;
+        device_session_seal_result_dict(py, &result)
     }
 }
 
@@ -1995,10 +2367,15 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     features.push(STEREO_ENCODER_PROCESS);
     features.push(SESSION_IO);
     features.push(DEVICE_SESSION_ARTIFACTS);
+    features.push(DEVICE_SESSION_FINALIZER);
     features.push(DROP_QUALITY_POLICY);
     features.push(CAMERA_FRAME_VALIDATOR);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
+    features.push(NATIVE_TIMELINE);
+    features.push(ACTIVE_TAKE_WRITER);
+    features.push(CONTINUOUS_CAPTURE_RAW_SINK);
+    features.push(CONTINUOUS_CAPTURE_SPLIT_SINK);
     features.push(V4L2_CAPTURE);
     if turbojpeg::available() {
         features.push(TURBOJPEG_SPLIT);
@@ -2064,6 +2441,103 @@ fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> Py
         segments.append(item)?;
     }
     value.set_item("segments", segments)?;
+    Ok(value.unbind())
+}
+
+fn timeline_audio_sync_dict(py: Python<'_>, sync: &timeline::AudioSync) -> PyResult<Py<PyDict>> {
+    let session_start_offset_ns = i64::try_from(sync.session_start_offset_ns).map_err(|_| {
+        pyo3::exceptions::PyOverflowError::new_err(
+            "timeline_overflow: audio start offset does not fit in signed 64-bit nanoseconds",
+        )
+    })?;
+    let session_stop_offset_ns = i64::try_from(sync.session_stop_offset_ns).map_err(|_| {
+        pyo3::exceptions::PyOverflowError::new_err(
+            "timeline_overflow: audio stop offset does not fit in signed 64-bit nanoseconds",
+        )
+    })?;
+    let value = PyDict::new(py);
+    value.set_item("clock", "host_monotonic")?;
+    value.set_item("timebase", "monotonic_ns")?;
+    value.set_item(
+        "session_start_monotonic_ns",
+        sync.session_start_monotonic_ns,
+    )?;
+    value.set_item("started_monotonic_ns", sync.started_monotonic_ns)?;
+    value.set_item("stopped_monotonic_ns", sync.stopped_monotonic_ns)?;
+    value.set_item("session_start_offset_ns", session_start_offset_ns)?;
+    value.set_item("session_stop_offset_ns", session_stop_offset_ns)?;
+    value.set_item(
+        "session_start_offset_seconds",
+        sync.session_start_offset_seconds,
+    )?;
+    value.set_item(
+        "session_stop_offset_seconds",
+        sync.session_stop_offset_seconds,
+    )?;
+    value.set_item("sample_duration_ns", sync.sample_duration_ns)?;
+    Ok(value.unbind())
+}
+
+fn active_take_reserved_frame_dict(
+    py: Python<'_>,
+    frame: &active_take::ReservedFrame,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("session_id", &frame.session_id)?;
+    value.set_item("record_sequence", frame.record_sequence)?;
+    value.set_item("source_sequence", frame.source_sequence)?;
+    value.set_item("host_monotonic_ns", frame.host_monotonic_ns)?;
+    Ok(value.unbind())
+}
+
+fn active_take_write_decision_dict(
+    py: Python<'_>,
+    decision: &active_take::FrameWriteDecision,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    match decision {
+        active_take::FrameWriteDecision::RawSideBySide(raw) => {
+            value.set_item("layout", "raw-side-by-side")?;
+            value.set_item("session_id", &raw.session_id)?;
+            value.set_item("record_sequence", raw.record_sequence)?;
+            value.set_item("source_sequence", raw.source_sequence)?;
+            value.set_item("host_monotonic_ns", raw.host_monotonic_ns)?;
+        }
+        active_take::FrameWriteDecision::SplitEyes(split) => {
+            value.set_item("layout", "split-eyes")?;
+            value.set_item("session_id", &split.session_id)?;
+            value.set_item("record_sequence", split.record_sequence)?;
+            value.set_item("source_sequence", split.source_sequence)?;
+            value.set_item("host_monotonic_ns", split.host_monotonic_ns)?;
+            value.set_item("segment_index", split.segment_index)?;
+            value.set_item("segment_frame", split.segment_frame)?;
+        }
+    }
+    Ok(value.unbind())
+}
+
+fn active_take_snapshot_dict(
+    py: Python<'_>,
+    snapshot: &active_take::ActiveTakeSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("session_id", &snapshot.session_id)?;
+    value.set_item("frame_domain", snapshot.frame_domain)?;
+    value.set_item("frames_written", snapshot.frames_written)?;
+    value.set_item("bytes_written", snapshot.bytes_written)?;
+    value.set_item("dropped_frames", snapshot.dropped_frames)?;
+    value.set_item("pending_frames", snapshot.pending_frames)?;
+    let drop_events = PyList::empty(py);
+    for event in &snapshot.drop_events {
+        let item = PyDict::new(py);
+        item.set_item("start_frame", event.start_frame)?;
+        item.set_item("end_frame", event.end_frame)?;
+        item.set_item("at_time_seconds", event.at_time_seconds)?;
+        item.set_item("reason", event.reason)?;
+        item.set_item("dropped", event.dropped)?;
+        drop_events.append(item)?;
+    }
+    value.set_item("drop_events", drop_events)?;
     Ok(value.unbind())
 }
 
@@ -2329,6 +2803,62 @@ fn file_identity_dict(py: Python<'_>, identity: &session_io::FileIdentity) -> Py
     Ok(value.unbind())
 }
 
+fn expected_artifact_identities(
+    raw: &Bound<'_, PyDict>,
+) -> PyResult<Vec<session_io::ExpectedArtifactIdentity>> {
+    let mut identities = Vec::with_capacity(raw.len());
+    for (path, identity) in raw.iter() {
+        let path = path.extract::<String>()?;
+        let identity = identity.downcast::<PySequence>()?;
+        if identity.len()? != 4 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "artifact_invalid: artifact identity must be a 4-item tuple",
+            ));
+        }
+        let device = strict_u64_identity_field(&identity.get_item(0)?, "device")?;
+        let inode = strict_u64_identity_field(&identity.get_item(1)?, "inode")?;
+        let size = strict_u64_identity_field(&identity.get_item(2)?, "size")?;
+        let modified_ns = strict_i64_identity_field(&identity.get_item(3)?, "modified_ns")?;
+        identities.push(session_io::ExpectedArtifactIdentity {
+            path,
+            identity: session_io::FileIdentity {
+                device,
+                inode,
+                size,
+                modified_ns,
+                nlink: 1,
+            },
+        });
+    }
+    Ok(identities)
+}
+
+fn strict_u64_identity_field(value: &Bound<'_, PyAny>, field: &str) -> PyResult<u64> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "artifact_invalid: artifact identity {field} must be an integer"
+        )));
+    }
+    value.extract::<u64>().map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "artifact_invalid: artifact identity {field} must be a non-negative integer: {error}"
+        ))
+    })
+}
+
+fn strict_i64_identity_field(value: &Bound<'_, PyAny>, field: &str) -> PyResult<i64> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "artifact_invalid: artifact identity {field} must be an integer"
+        )));
+    }
+    value.extract::<i64>().map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "artifact_invalid: artifact identity {field} must be an integer: {error}"
+        ))
+    })
+}
+
 fn file_digest_dict(py: Python<'_>, digest: &session_io::FileDigest) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("sha256", &digest.sha256)?;
@@ -2359,6 +2889,17 @@ fn artifact_descriptor_dict(
     item.set_item("bytes", artifact.bytes)?;
     item.set_item("sha256", &artifact.sha256)?;
     Ok(item.unbind())
+}
+
+fn device_session_seal_result_dict(
+    py: Python<'_>,
+    result: &session_io::DeviceSessionSealResult,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("manifest_sha256", &result.manifest_sha256)?;
+    value.set_item("artifact_count", result.artifact_count)?;
+    value.set_item("manifest_bytes", result.manifest_bytes)?;
+    Ok(value.unbind())
 }
 
 fn device_session_v1_summary_dict(
@@ -2402,6 +2943,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeCameraStream>()?;
     module.add_class::<NativeCameraFrameValidator>()?;
     module.add_class::<NativeAudioRecorder>()?;
+    module.add_class::<NativeTimeline>()?;
+    module.add_class::<NativeActiveTakeWriter>()?;
     module.add_class::<NativeImuCollector>()?;
     module.add_class::<NativeRecordingCodec>()?;
     module.add_class::<NativeRecordingSink>()?;
@@ -2424,13 +2967,15 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARTIFACT_FINALIZE, CAMERA_FRAME_VALIDATOR, CAPABILITY_PROBE, CAPTURE_FANOUT,
-        CONTINUOUS_CAPTURE_RUNTIME, DEVICE_SESSION_ARTIFACTS, DROP_QUALITY_POLICY, FRAME_STREAM,
-        JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA, NATIVE_IMU, PERFORMANCE_METRICS,
-        PREVIEW_BUFFER, RANGE_PARSER, RECORDING_CODEC, RECORDING_EVENT_QUEUE, RECORDING_FRAME_GATE,
-        RECORDING_IMU_BATCH, RECORDING_SEGMENT_PLANNER, RECORDING_SINK, RECORDING_TAP_STATE,
-        SESSION_IO, STEREO_ENCODER_EVENTS, STEREO_ENCODER_PIPE, STEREO_ENCODER_PROCESS,
-        TURBOJPEG_SPLIT, V4L2_CAPTURE, parse_single_http_range,
+        ACTIVE_TAKE_WRITER, ARTIFACT_FINALIZE, CAMERA_FRAME_VALIDATOR, CAPABILITY_PROBE,
+        CAPTURE_FANOUT, CONTINUOUS_CAPTURE_RAW_SINK, CONTINUOUS_CAPTURE_RUNTIME,
+        CONTINUOUS_CAPTURE_SPLIT_SINK, DEVICE_SESSION_ARTIFACTS, DEVICE_SESSION_FINALIZER,
+        DROP_QUALITY_POLICY, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
+        NATIVE_IMU, NATIVE_TIMELINE, PERFORMANCE_METRICS, PREVIEW_BUFFER, RANGE_PARSER,
+        RECORDING_CODEC, RECORDING_EVENT_QUEUE, RECORDING_FRAME_GATE, RECORDING_IMU_BATCH,
+        RECORDING_SEGMENT_PLANNER, RECORDING_SINK, RECORDING_TAP_STATE, SESSION_IO,
+        STEREO_ENCODER_EVENTS, STEREO_ENCODER_PIPE, STEREO_ENCODER_PROCESS, TURBOJPEG_SPLIT,
+        V4L2_CAPTURE, parse_single_http_range,
     };
 
     #[test]
@@ -2444,6 +2989,8 @@ mod tests {
         assert_eq!(NATIVE_CAMERA, "native_camera");
         assert_eq!(CAMERA_FRAME_VALIDATOR, "camera_frame_validator");
         assert_eq!(NATIVE_AUDIO, "native_audio");
+        assert_eq!(NATIVE_TIMELINE, "native_timeline");
+        assert_eq!(ACTIVE_TAKE_WRITER, "active_take_writer");
         assert_eq!(NATIVE_IMU, "native_imu");
         assert_eq!(RECORDING_CODEC, "recording_codec");
         assert_eq!(RECORDING_SINK, "recording_sink");
@@ -2452,6 +2999,11 @@ mod tests {
         assert_eq!(RECORDING_TAP_STATE, "recording_tap_state");
         assert_eq!(CAPTURE_FANOUT, "capture_fanout");
         assert_eq!(CONTINUOUS_CAPTURE_RUNTIME, "continuous_capture_runtime");
+        assert_eq!(CONTINUOUS_CAPTURE_RAW_SINK, "continuous_capture_raw_sink");
+        assert_eq!(
+            CONTINUOUS_CAPTURE_SPLIT_SINK,
+            "continuous_capture_split_sink"
+        );
         assert_eq!(RECORDING_SEGMENT_PLANNER, "recording_segment_planner");
         assert_eq!(RECORDING_EVENT_QUEUE, "recording_event_queue");
         assert_eq!(ARTIFACT_FINALIZE, "artifact_finalize");
@@ -2461,6 +3013,7 @@ mod tests {
         assert_eq!(STEREO_ENCODER_PROCESS, "stereo_encoder_process");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(DEVICE_SESSION_ARTIFACTS, "device_session_artifacts");
+        assert_eq!(DEVICE_SESSION_FINALIZER, "device_session_finalizer");
         assert_eq!(DROP_QUALITY_POLICY, "drop_quality_policy");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");

@@ -2,8 +2,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::fs::OpenOptions;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -103,6 +103,19 @@ impl FileIdentity {
 pub struct FileDigest {
     pub identity: FileIdentity,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedArtifactIdentity {
+    pub path: String,
+    pub identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSessionSealResult {
+    pub manifest_sha256: String,
+    pub artifact_count: u64,
+    pub manifest_bytes: u64,
 }
 
 pub fn hash_file(path: &Path) -> Result<FileDigest, SessionIoError> {
@@ -508,6 +521,101 @@ pub fn device_session_v1_artifact(
     Ok(device_session_v1_artifacts(payload, expected_session_id)?
         .into_iter()
         .find(|artifact| artifact.artifact_id == artifact_id))
+}
+
+pub fn verify_device_session_artifacts(
+    session_root: &Path,
+    manifest_payload: &[u8],
+    expected_session_id: &str,
+    expected_identities: &[ExpectedArtifactIdentity],
+) -> Result<u64, SessionIoError> {
+    let artifacts = device_session_v1_artifacts(manifest_payload, expected_session_id)?;
+    let expected = expected_identity_map(expected_identities)?;
+    if expected.len() != artifacts.len() {
+        return Err(SessionIoError::new(
+            "artifact_invalid",
+            "artifact 封存身份与 manifest 不一致",
+        ));
+    }
+    let root = open_directory(session_root, "artifact_invalid", "无法安全打开会话目录")?;
+    for artifact in &artifacts {
+        let expected_identity = expected.get(artifact.path.as_str()).ok_or_else(|| {
+            SessionIoError::new("artifact_invalid", "artifact 缺少封存身份")
+        })?;
+        if expected_identity.size != artifact.bytes {
+            return Err(SessionIoError::new(
+                "artifact_invalid",
+                "artifact 大小与 manifest 不一致",
+            ));
+        }
+        let descriptor = open_relative_regular(root.as_raw_fd(), &artifact.path)?;
+        let actual = FileIdentity::from_fd(descriptor);
+        close_fd(descriptor);
+        let actual = actual?;
+        if actual != **expected_identity {
+            return Err(SessionIoError::new(
+                "digest_mismatch",
+                "artifact 在封存前发生变化",
+            ));
+        }
+    }
+    u64::try_from(artifacts.len())
+        .map_err(|_| SessionIoError::new("artifact_invalid", "artifact 数量超出可表示范围"))
+}
+
+pub fn seal_device_session(
+    partial_root: &Path,
+    final_root: &Path,
+    manifest_payload: &[u8],
+    expected_session_id: &str,
+    expected_identities: &[ExpectedArtifactIdentity],
+    control_names: &[String],
+) -> Result<DeviceSessionSealResult, SessionIoError> {
+    if final_root.exists() {
+        return Err(SessionIoError::new("session_exists", "最终会话目录已经存在"));
+    }
+    let artifact_count = verify_device_session_artifacts(
+        partial_root,
+        manifest_payload,
+        expected_session_id,
+        expected_identities,
+    )?;
+    let manifest_path = partial_root.join("manifest.json");
+    write_manifest(&manifest_path, manifest_payload)?;
+    fsync_directory(partial_root, "write_failed", "同步会话目录失败")?;
+    for control_name in control_names {
+        validate_control_name(control_name)?;
+        match std::fs::remove_file(partial_root.join(control_name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SessionIoError::os(
+                    "write_failed",
+                    "删除录制控制文件失败",
+                    error,
+                ));
+            }
+        }
+    }
+    fsync_directory(partial_root, "write_failed", "同步会话目录失败")?;
+    std::fs::rename(partial_root, final_root)
+        .map_err(|error| SessionIoError::os("write_failed", "发布会话目录失败", error))?;
+    if let Some(parent) = final_root.parent() {
+        fsync_directory(parent, "write_failed", "同步 generation 根目录失败")?;
+    }
+    verify_device_session_artifacts(
+        final_root,
+        manifest_payload,
+        expected_session_id,
+        expected_identities,
+    )?;
+    Ok(DeviceSessionSealResult {
+        manifest_sha256: hex_digest(Sha256::digest(manifest_payload).as_slice()),
+        artifact_count,
+        manifest_bytes: u64::try_from(manifest_payload.len()).map_err(|_| {
+            SessionIoError::new("write_failed", "manifest 大小超出可表示范围")
+        })?,
+    })
 }
 
 #[derive(Default)]
@@ -982,12 +1090,81 @@ fn hex_digest(payload: &[u8]) -> String {
     out
 }
 
+fn expected_identity_map(
+    identities: &[ExpectedArtifactIdentity],
+) -> Result<HashMap<&str, &FileIdentity>, SessionIoError> {
+    let mut by_path = HashMap::with_capacity(identities.len());
+    for item in identities {
+        validate_relative_artifact_path(&item.path)?;
+        if by_path.insert(item.path.as_str(), &item.identity).is_some() {
+            return Err(SessionIoError::new(
+                "artifact_invalid",
+                "artifact 封存身份路径重复",
+            ));
+        }
+    }
+    Ok(by_path)
+}
+
+fn open_directory(
+    path: &Path,
+    code: &'static str,
+    context: &str,
+) -> Result<File, SessionIoError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| SessionIoError::os(code, context, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| SessionIoError::os(code, "读取目录元数据失败", error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(SessionIoError::new(code, "路径不是目录"));
+    }
+    Ok(file)
+}
+
+fn write_manifest(path: &Path, payload: &[u8]) -> Result<(), SessionIoError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o640)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| SessionIoError::os("write_failed", "创建 manifest 失败", error))?;
+    file.write_all(payload)
+        .map_err(|error| SessionIoError::os("write_failed", "写入 manifest 失败", error))?;
+    file.sync_all()
+        .map_err(|error| SessionIoError::os("write_failed", "同步 manifest 失败", error))
+}
+
+fn fsync_directory(path: &Path, code: &'static str, context: &str) -> Result<(), SessionIoError> {
+    let directory = open_directory(path, code, context)?;
+    directory
+        .sync_all()
+        .map_err(|error| SessionIoError::os(code, context, error))
+}
+
+fn validate_control_name(name: &str) -> Result<(), SessionIoError> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || invalid_path_component(name)
+        || name == "manifest.json"
+    {
+        return Err(SessionIoError::new("write_failed", "录制控制文件名无效"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         device_session_v1_artifact, device_session_v1_artifacts, device_session_v1_summary,
-        finalize_artifact, hash_file, open_relative_regular, read_fd_bounded, sendfile_all,
-        verify_fd, write_encoder_frame,
+        finalize_artifact, hash_file, open_relative_regular, read_fd_bounded, seal_device_session,
+        sendfile_all, verify_device_session_artifacts, verify_fd, write_encoder_frame,
+        ExpectedArtifactIdentity,
     };
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -1242,6 +1419,139 @@ mod tests {
                 "audio/000000.wav"
             ]
         );
+    }
+
+    #[test]
+    fn native_finalizer_seals_manifest_and_verifies_artifact_identities() {
+        let root = tempfile_dir();
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = root.join(format!("{session_id}.partial"));
+        let final_root = root.join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        fs::write(partial.join("recording.json"), b"recording").unwrap();
+        fs::write(partial.join("capture.json"), b"capture").unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"frame").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"frame-index\n").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"imu\n").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(5)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(12)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(4)).unwrap();
+        let manifest = format!(
+            r#"{{
+              "schema":"ylx.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{video_sha}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":5,"sha256":"{video_sha}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{frames_sha}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"{frames_sha}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{imu_sha}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":4,"sha256":"{imu_sha}"}}}}
+            }}"#,
+            video_sha = video.sha256,
+            frames_sha = frames.sha256,
+            imu_sha = imu.sha256,
+        );
+        let manifest = manifest.into_bytes();
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+        ];
+
+        assert_eq!(
+            verify_device_session_artifacts(&partial, &manifest, session_id, &expected).unwrap(),
+            3
+        );
+        let sealed = seal_device_session(
+            &partial,
+            &final_root,
+            &manifest,
+            session_id,
+            &expected,
+            &["recording.json".to_owned(), "capture.json".to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(sealed.artifact_count, 3);
+        assert_eq!(sealed.manifest_bytes, manifest.len() as u64);
+        assert!(!partial.exists());
+        assert!(final_root.join("manifest.json").is_file());
+        assert!(!final_root.join("recording.json").exists());
+        assert!(!final_root.join("capture.json").exists());
+        assert_eq!(fs::read(final_root.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(
+            verify_device_session_artifacts(&final_root, &manifest, session_id, &expected)
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn native_finalizer_rejects_artifact_identity_changes_before_publish() {
+        let root = tempfile_dir();
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = root.join(format!("{session_id}.partial"));
+        let final_root = root.join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"frame").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"frame-index\n").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"imu\n").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(5)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(12)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(4)).unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"changed").unwrap();
+        let manifest = format!(
+            r#"{{
+              "schema":"ylx.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{video_sha}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":5,"sha256":"{video_sha}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{frames_sha}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"{frames_sha}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{imu_sha}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":4,"sha256":"{imu_sha}"}}}}
+            }}"#,
+            video_sha = video.sha256,
+            frames_sha = frames.sha256,
+            imu_sha = imu.sha256,
+        );
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+        ];
+        let error = seal_device_session(
+            &partial,
+            &final_root,
+            manifest.as_bytes(),
+            session_id,
+            &expected,
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "digest_mismatch");
+        assert!(partial.exists());
+        assert!(!partial.join("manifest.json").exists());
+        assert!(!final_root.exists());
     }
 
     #[test]

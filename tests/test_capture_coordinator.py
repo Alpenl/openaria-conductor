@@ -124,7 +124,9 @@ class FakeSources:
         submit_frame: object,
         submit_imu: object,
         on_failure: object,
+        native_recorder: object | None = None,
     ) -> None:
+        del native_recorder
         self.mode = mode
         self.generation_id = generation_id
         self.submit_frame = submit_frame

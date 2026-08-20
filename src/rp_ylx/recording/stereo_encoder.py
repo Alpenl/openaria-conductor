@@ -169,6 +169,10 @@ class StereoEncoderProcess:
             return self._native_pipe.submitted_frames()
         return self._submitted
 
+    @property
+    def native_owner(self) -> NativeStereoEncoderProcess | None:
+        return self._native_process
+
     def start(self) -> None:
         if self._process is not None or self._native_process is not None:
             raise StereoEncoderError("invalid_state", "助手进程只能启动一次")
@@ -475,9 +479,11 @@ def _encoder_process_or_none(
                 segment_frames=segment_frames,
                 path_prefix=path_prefix,
             )
-        except NativeModuleError:
-            _ENCODER_PROCESS_UNAVAILABLE = True
-            return None
+        except NativeModuleError as error:
+            if error.code == "native_stereo_encoder_process_unavailable":
+                _ENCODER_PROCESS_UNAVAILABLE = True
+                return None
+            raise _native_encoder_process_error(error) from error
 
 
 def _encoder_events_or_none() -> NativeStereoEncoderEvents | None:

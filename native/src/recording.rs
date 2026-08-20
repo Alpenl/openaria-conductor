@@ -1,3 +1,4 @@
+use crate::imu;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -845,6 +846,38 @@ impl RecordingSink {
             .checked_add(1)
             .ok_or_else(|| RecordingError::new("write_failed", "IMU sample count overflow"))?;
         Ok(written)
+    }
+
+    pub(crate) fn write_imu_observation(
+        &mut self,
+        observation: &imu::ImuObservation,
+    ) -> Result<u64, RecordingError> {
+        let mut bytes_written = 0_u64;
+        for sample in &observation.samples {
+            let written = self.write_imu_sample(
+                sample.sequence,
+                sample.packet_sequence,
+                sample.sample_index,
+                sample.device_timestamp_raw,
+                sample.device_ticks,
+                sample.host_read_start_ns,
+                sample.host_read_end_ns,
+                sample.host_monotonic_ns,
+                (
+                    sample.accelerometer.x,
+                    sample.accelerometer.y,
+                    sample.accelerometer.z,
+                ),
+                (sample.gyroscope.x, sample.gyroscope.y, sample.gyroscope.z),
+                sample.sync_offset_ns,
+                sample.sync_residual_ns,
+                sample.sync_quality,
+            )?;
+            bytes_written = bytes_written.checked_add(written).ok_or_else(|| {
+                RecordingError::new("write_failed", "IMU observation byte count overflow")
+            })?;
+        }
+        Ok(bytes_written)
     }
 
     pub(crate) fn flush_and_close(&mut self) -> Result<RecordingSinkSnapshot, RecordingError> {

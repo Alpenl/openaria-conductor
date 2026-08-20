@@ -22,6 +22,7 @@ from rp_ylx.api.downloads import (
 )
 from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.native import NativeModuleError
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -82,11 +83,13 @@ class FakeStereoEncoder:
         segment_frames: int,
         fail_after: int | None = None,
         drop_tail_segment: bool = False,
+        native_owner: object | None = None,
     ) -> None:
         self._out_dir = out_dir
         self._segment_frames = segment_frames
         self._fail_after = fail_after
         self._drop_tail_segment = drop_tail_segment
+        self.native_owner = native_owner
         self._segments: list[ClosedSegment] = []
         self._submitted = 0
         self._started = False
@@ -304,6 +307,7 @@ class FakeNativeSessionIo:
         self.open_calls: list[tuple[int, str]] = []
         self.read_calls: list[tuple[int, int]] = []
         self.verify_calls: list[tuple[int, int, str]] = []
+        self.seal_calls: list[tuple[str, str, str, list[str]]] = []
 
     def device_session_v1_artifacts(
         self,
@@ -335,6 +339,44 @@ class FakeNativeSessionIo:
     ) -> dict[str, object]:
         self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
         return {}
+
+    def seal_device_session_v1(
+        self,
+        partial_path: str,
+        final_path: str,
+        session_id: str,
+        manifest: bytes,
+        expected_identities: dict[str, tuple[int, int, int, int]],
+        control_names: list[str] | None = None,
+    ) -> dict[str, object]:
+        artifacts = self.device_session_v1_artifacts(manifest, session_id)
+        paths = [str(item["path"]) for item in artifacts]
+        self.seal_calls.append((partial_path, final_path, session_id, paths))
+        partial = Path(partial_path)
+        final = Path(final_path)
+        if final.exists():
+            raise RuntimeError("session_exists: final exists")
+        for artifact in artifacts:
+            relative = str(artifact["path"])
+            expected = expected_identities[relative]
+            metadata = (partial / relative).stat(follow_symlinks=False)
+            actual = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+            if actual != expected or metadata.st_size != int(artifact["bytes"]):
+                raise RuntimeError("digest_mismatch: artifact changed")
+        (partial / "manifest.json").write_bytes(manifest)
+        for control_name in control_names or ["recording.json", "capture.json"]:
+            (partial / control_name).unlink(missing_ok=True)
+        os.rename(partial, final)
+        return {
+            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "artifact_count": len(artifacts),
+            "manifest_bytes": len(manifest),
+        }
 
 
 class SplitEyeRecordingTest(unittest.TestCase):
@@ -523,6 +565,108 @@ class SplitEyeRecordingTest(unittest.TestCase):
             )
             validate_device_session_manifest(manifest)
 
+    def test_stop_uses_native_device_session_finalizer_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            native = FakeNativeSessionIo()
+            with patch(
+                "rp_ylx.recording.device_session._session_io_or_none",
+                return_value=native,
+            ):
+                recorder, _, _ = self.build(root)
+                recorder.start()
+                self.feed(recorder, 4)
+                sealed = recorder.stop()
+
+            self.assertEqual(len(native.seal_calls), 1)
+            partial_path, final_path, session_id, paths = native.seal_calls[0]
+            self.assertEqual(Path(final_path), sealed.path)
+            self.assertFalse(Path(partial_path).exists())
+            self.assertTrue(Path(final_path).is_dir())
+            self.assertEqual(session_id, sealed.manifest["session_id"])
+            self.assertEqual(
+                paths,
+                [
+                    "video/left_00000.mp4",
+                    "video/right_00000.mp4",
+                    "video/left_00001.mp4",
+                    "video/right_00001.mp4",
+                    "frames.ndjson",
+                    "imu.ndjson",
+                ],
+            )
+            self.assertTrue((sealed.path / "manifest.json").is_file())
+            self.assertFalse((sealed.path / "recording.json").exists())
+            self.assertFalse((sealed.path / "capture.json").exists())
+            validate_device_session_manifest(sealed.manifest)
+
+    def test_raw_sbs_direct_native_sink_can_be_sealed_without_python_frame_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = 0
+
+            def allocate_revision() -> int:
+                nonlocal revision
+                revision += 1
+                return revision
+
+            config = DeviceSessionConfig(
+                device_id=str(uuid.uuid4()),
+                device_label="YLX-12AB34CD",
+                hardware_fingerprint="sha256:" + "a" * 64,
+                platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+                software_version="0.5.0",
+                commit="b" * 40,
+                width=3840,
+                height=1080,
+                sensor_fps=60.0,
+                frame_decimation=1,
+                video_layout="raw-side-by-side",
+                segment_seconds=self.segment_seconds,
+            )
+            recorder = DeviceSessionRecorder(
+                root,
+                config,
+                SessionPlan(
+                    session_id=uuid7(),
+                    volume_id=str(uuid.uuid4()),
+                    generation_id=str(uuid.uuid4()),
+                    capture_mode="production",
+                    display_name="raw direct fixture",
+                    take_id=uuid7(),
+                    take_sequence=1,
+                    continuation_of=None,
+                ),
+                authority_epoch=str(uuid.uuid4()),
+                allocate_revision=allocate_revision,
+                storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
+                checkpoint_interval=0.0,
+            )
+            try:
+                recorder.start()
+            except DeviceRecordingError as error:
+                if error.code.startswith("native_"):
+                    self.skipTest(f"native recording sink unavailable: {error}")
+                raise
+            targets = recorder.native_raw_sink_targets()
+            if targets is None:
+                self.skipTest("native raw sink targets unavailable")
+            active_take, sink = targets
+            reserved = active_take.reserve_frame(0, 1_000_000, 0)
+            record_sequence = reserved["record_sequence"]
+            written = sink.write_raw_frame(record_sequence, 0, 1_000_000, FRAME)
+            active_take.finish_frame(record_sequence, 0, 1_000_000, written["bytes_written"])
+
+            sealed = recorder.stop()
+
+            manifest = sealed.manifest
+            self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
+            self.assertEqual(manifest["frames"]["count"], 1)
+            self.assertEqual(manifest["imu"]["sample_count"], 0)
+            self.assertEqual(manifest["integrity"]["dropped_frames"], 0)
+            validate_device_session_manifest(manifest)
+            validate_device_session_directory(sealed.path)
+
     def test_recorder_uses_native_event_queue_when_available(self) -> None:
         queues: list[FakeNativeEventQueue] = []
 
@@ -551,6 +695,56 @@ class SplitEyeRecordingTest(unittest.TestCase):
         self.assertEqual(queues[0].capacity, 128)
         self.assertGreaterEqual(queues[0].put_calls, 4)
         self.assertGreaterEqual(queues[0].get_calls, 4)
+
+    def test_split_eye_native_targets_expose_direct_sink_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active_take = object()
+            sink = SimpleNamespace(close=lambda: None)
+            native_encoder = object()
+            planner = FakeNativeSegmentPlanner(3)
+            with (
+                patch(
+                    "rp_ylx.recording.device_session.create_native_active_take_writer",
+                    return_value=active_take,
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_sink",
+                    return_value=sink,
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
+                    return_value=planner,
+                ),
+            ):
+                recorder, _, _ = self.build(root, native_owner=native_encoder)
+                recorder.start()
+                targets = recorder.native_split_sink_targets()
+                self.assertIsNotNone(targets)
+                assert targets is not None
+                self.assertIs(targets[0], active_take)
+                self.assertIs(targets[1], sink)
+                self.assertIs(targets[2], native_encoder)
+                self.assertIs(targets[3], planner)
+                self.assertIsInstance(targets[4], int)
+                self.assertGreater(targets[4], 0)
+                self.assertTrue(recorder._native_direct_recording)
+                recorder.fail("test_cleanup", "cleanup", recoverable=False)
+
+    def test_source_checkout_falls_back_to_python_files_when_native_sink_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch(
+                "rp_ylx.recording.device_session.create_native_recording_sink",
+                side_effect=NativeModuleError("native_recording_sink_unavailable", "missing"),
+            ):
+                recorder, _, _ = self.build(root)
+                recorder.start()
+                self.feed(recorder, 3)
+                sealed = recorder.stop()
+
+            self.assertEqual(sealed.manifest["frames"]["count"], 3)
+            validate_device_session_manifest(sealed.manifest)
 
     def test_take_ending_on_a_segment_boundary_seals_without_an_empty_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -824,7 +1018,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
         self.assertEqual(inspected["session_id"], sealed.manifest["session_id"])
         self.assertEqual(validated["session_id"], sealed.manifest["session_id"])
-        self.assertGreaterEqual(len(native.artifact_calls), 6)
+        self.assertGreaterEqual(len(native.artifact_calls), 3)
         self.assertTrue(
             all(
                 session_id == sealed.manifest["session_id"]
@@ -869,6 +1063,17 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertEqual(audio["sample_rate_hz"], 48_000)
             self.assertEqual(audio["sample_count"], 4_800)
             self.assertEqual(audio["sync"]["clock"], "host_monotonic")
+            self.assertEqual(audio["sync"]["timebase"], "monotonic_ns")
+            self.assertGreater(audio["sync"]["session_start_monotonic_ns"], 0)
+            self.assertEqual(
+                audio["sync"]["session_start_offset_ns"],
+                audio["sync"]["started_monotonic_ns"] - audio["sync"]["session_start_monotonic_ns"],
+            )
+            self.assertEqual(
+                audio["sync"]["session_stop_offset_ns"],
+                audio["sync"]["stopped_monotonic_ns"] - audio["sync"]["session_start_monotonic_ns"],
+            )
+            self.assertEqual(audio["sync"]["sample_duration_ns"], 20_833)
             artifact = audio["segments"][0]["artifact"]
             self.assertEqual(artifact["role"], "audio.wav")
             self.assertEqual(artifact["media_type"], "audio/wav")

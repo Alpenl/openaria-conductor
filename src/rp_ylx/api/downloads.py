@@ -1302,6 +1302,8 @@ def _validate_audio(audio: Mapping[str, object]) -> None:
         raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
     if sync["stopped_monotonic_ns"] < sync["started_monotonic_ns"]:
         raise ArtifactAccessError("not_verified", "manifest audio 单调时间无效")
+    if sync.get("timebase") is not None:
+        _validate_audio_timeline_sync(sync)
     previous_end = 0
     for expected_index, segment in enumerate(segments):
         if not isinstance(segment, Mapping):
@@ -1323,6 +1325,54 @@ def _validate_audio(audio: Mapping[str, object]) -> None:
         previous_end = segment["end_sample"]
     if previous_end != sample_count:
         raise ArtifactAccessError("not_verified", "manifest audio sample_count 不一致")
+
+
+def _validate_audio_timeline_sync(sync: Mapping[str, object]) -> None:
+    if sync.get("clock") != "host_monotonic" or sync.get("timebase") != "monotonic_ns":
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    required_ints = (
+        "session_start_monotonic_ns",
+        "started_monotonic_ns",
+        "stopped_monotonic_ns",
+        "session_start_offset_ns",
+        "session_stop_offset_ns",
+        "sample_duration_ns",
+    )
+    for field in required_ints:
+        value = sync.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    session_start = sync["session_start_monotonic_ns"]
+    started = sync["started_monotonic_ns"]
+    stopped = sync["stopped_monotonic_ns"]
+    start_offset = sync["session_start_offset_ns"]
+    stop_offset = sync["session_stop_offset_ns"]
+    sample_duration = sync["sample_duration_ns"]
+    if (
+        session_start <= 0
+        or started <= 0
+        or stopped <= 0
+        or stopped < started
+        or start_offset < 0
+        or sample_duration <= 0
+        or start_offset != started - session_start
+        or stop_offset != stopped - session_start
+        or stop_offset < start_offset
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    start_seconds = sync.get("session_start_offset_seconds")
+    stop_seconds = sync.get("session_stop_offset_seconds")
+    if (
+        isinstance(start_seconds, bool)
+        or not isinstance(start_seconds, (int, float))
+        or isinstance(stop_seconds, bool)
+        or not isinstance(stop_seconds, (int, float))
+        or not math.isfinite(float(start_seconds))
+        or not math.isfinite(float(stop_seconds))
+        or abs(float(start_seconds) - start_offset / 1e9) > 1e-9
+        or abs(float(stop_seconds) - stop_offset / 1e9) > 1e-9
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
 
 
 def _api_datetime(value: object) -> datetime:

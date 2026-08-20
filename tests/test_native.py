@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from rp_ylx.native import (
     NativeModuleError,
+    create_native_active_take_writer,
     create_native_audio_recorder,
     create_native_camera,
     create_native_camera_frame_validator,
@@ -31,6 +32,7 @@ from rp_ylx.native import (
     create_native_stereo_encoder_events,
     create_native_stereo_encoder_pipe,
     create_native_stereo_encoder_process,
+    create_native_timeline,
     evaluate_native_drop_quality_policy,
     native_capabilities,
     parse_native_single_range,
@@ -265,6 +267,66 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 owner,
             )
         constructor.assert_called_once_with("/tmp/session", "hw:0,0", 48_000, 2, 30.0)
+
+    def test_explicit_timeline_requires_native_timeline_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_timeline()
+        self.assertEqual(raised.exception.code, "native_timeline_unavailable")
+
+    def test_explicit_timeline_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "native_timeline"],
+            },
+            NativeTimeline=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_timeline(123), owner)
+        constructor.assert_called_once_with(123)
+
+    def test_explicit_active_take_writer_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            create_native_active_take_writer("session")
+        self.assertEqual(raised.exception.code, "active_take_writer_unavailable")
+
+    def test_explicit_active_take_writer_returns_native_owner(self) -> None:
+        owner = object()
+        constructor = unittest.mock.Mock(return_value=owner)
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "active_take_writer"],
+            },
+            NativeActiveTakeWriter=constructor,
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertIs(create_native_active_take_writer("session"), owner)
+        constructor.assert_called_once_with("session")
 
     def test_explicit_imu_requires_native_imu_capability(self) -> None:
         module = SimpleNamespace(

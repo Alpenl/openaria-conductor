@@ -625,11 +625,26 @@
             "clock": {
               "const": "host_monotonic"
             },
+            "timebase": {
+              "const": "monotonic_ns"
+            },
+            "session_start_monotonic_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
             "started_monotonic_ns": {
               "type": "integer",
               "minimum": 0
             },
             "stopped_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "session_start_offset_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "session_stop_offset_ns": {
               "type": "integer",
               "minimum": 0
             },
@@ -640,6 +655,10 @@
             "session_stop_offset_seconds": {
               "type": "number",
               "minimum": 0
+            },
+            "sample_duration_ns": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         },

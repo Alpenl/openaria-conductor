@@ -332,6 +332,11 @@ def build_production_service(
                 "正式采集缺少 Rust/ALSA 原生音频能力",
                 code="native_audio_unavailable",
             )
+        if "native_timeline" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust 统一录制时间线能力",
+                code="native_timeline_unavailable",
+            )
         if "native_imu" not in capabilities.features:
             raise ProductionConfigError(
                 "正式采集缺少 Rust/UVC XU 原生 IMU 能力",
@@ -352,6 +357,11 @@ def build_production_service(
                 "正式录制缺少 Rust IMU batch 写入能力",
                 code="native_recording_imu_batch_unavailable",
             )
+        if "active_take_writer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust active take 写入状态能力",
+                code="native_active_take_writer_unavailable",
+            )
         if "recording_frame_gate" not in capabilities.features:
             raise ProductionConfigError(
                 "正式录制缺少 Rust 录制帧门控能力",
@@ -366,6 +376,16 @@ def build_production_service(
             raise ProductionConfigError(
                 "正式持续采集缺少 Rust 连续采集 runtime 能力",
                 code="native_continuous_capture_runtime_unavailable",
+            )
+        if "continuous_capture_raw_sink" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust raw-SBS 直写能力",
+                code="native_continuous_capture_raw_sink_unavailable",
+            )
+        if "continuous_capture_split_sink" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust split-eyes 直写能力",
+                code="native_continuous_capture_split_sink_unavailable",
             )
         if "recording_event_queue" not in capabilities.features:
             raise ProductionConfigError(
@@ -396,6 +416,11 @@ def build_production_service(
             raise ProductionConfigError(
                 "正式下载缺少 Rust device-session artifact 清单能力",
                 code="native_device_session_artifacts_unavailable",
+            )
+        if "device_session_finalizer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust device-session 封存发布能力",
+                code="native_device_session_finalizer_unavailable",
             )
         if "preview_buffer" not in capabilities.features:
             raise ProductionConfigError(

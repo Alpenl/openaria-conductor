@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from rp_ylx.native import NativeModuleError
 from rp_ylx.recording.stereo_encoder import (
     StereoEncoderError,
     StereoEncoderProcess,
@@ -171,6 +172,34 @@ class StereoEncoderResolutionTest(unittest.TestCase):
         self.assertEqual(encoder.segments[0].right_bytes, 11)
         self.assertEqual(encoder.stats, {"frames": 3})
         self.assertEqual(encoder.submitted_frames, 1)
+
+    def test_native_encoder_process_init_failure_does_not_fallback_to_python_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "ylx-stereo-encoder"
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            encoder = StereoEncoderProcess(
+                directory,
+                executable=helper,
+                width=3840,
+                height=1080,
+                fps=60,
+            )
+            with (
+                patch("rp_ylx.recording.stereo_encoder._ENCODER_PROCESS_UNAVAILABLE", False),
+                patch(
+                    "rp_ylx.recording.stereo_encoder.create_native_stereo_encoder_process",
+                    side_effect=NativeModuleError(
+                        "native_stereo_encoder_process_init_failed",
+                        "bad native process",
+                    ),
+                ),
+                patch("rp_ylx.recording.stereo_encoder.subprocess.Popen") as popen,
+                self.assertRaises(StereoEncoderError) as raised,
+            ):
+                encoder.start()
+
+        self.assertEqual(raised.exception.code, "native_stereo_encoder_process_init_failed")
+        popen.assert_not_called()
 
     def test_parse_event_uses_native_parser_when_available(self) -> None:
         parsed = {"event": "done", "frames": 3}

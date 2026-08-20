@@ -77,6 +77,7 @@ class CaptureSources(Protocol):
         submit_frame: Callable[[FrameObservation], bool],
         submit_imu: Callable[[ImuObservation], bool],
         on_failure: Callable[[str, str], None],
+        native_recorder: object | None = None,
     ) -> None: ...
 
     def stop(self) -> None: ...
@@ -963,6 +964,7 @@ class CaptureCoordinator:
                         code,
                         message,
                     ),
+                    native_recorder=recorder,
                 )
         except BaseException as error:
             if recorder.state in {"recording", "finalizing"}:
