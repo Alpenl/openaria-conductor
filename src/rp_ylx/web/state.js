@@ -1,17 +1,26 @@
 // @ts-check
 
-/** @typedef {{x: number, y: number, z: number}} Vector3 */
-/** @typedef {{w: number, x: number, y: number, z: number}} Quaternion */
+/** @typedef {{x: number, y: number, z: number}} RawVector3 */
+/**
+ * @typedef {object} NetworkInterfaceStatus
+ * @property {string} state
+ * @property {string | null} interface
+ * @property {string[]} addresses
+ * @property {string | null} peer_or_ssid
+ */
 /**
  * @typedef {object} LiveImu
- * @property {Vector3} acceleration_m_s2
- * @property {Vector3} angular_velocity_rad_s
- * @property {Quaternion} orientation_quaternion
+ * @property {string} session_id
+ * @property {{time_base: "host_monotonic", timestamp_ns: number}} clock
+ * @property {{units: "raw_int16", accelerometer: RawVector3, gyroscope: RawVector3}} raw
+ * @property {{quality: "insufficient" | "good" | "degraded"}} sync
  */
 /**
  * @typedef {object} DeviceRuntime
+ * @property {string} observed_at
  * @property {string} connection_method
  * @property {number} temperature_celsius
+ * @property {{ap: NetworkInterfaceStatus, wifi_client: NetworkInterfaceStatus, wired: NetworkInterfaceStatus, default_route: string}} network
  * @property {LiveImu | null} live_imu
  */
 /**
@@ -152,6 +161,15 @@ function receiptMatchesCapture(safeSwap, capture) {
   );
 }
 
+/** @param {CaptureStatus | null} current @param {CaptureStatus} incoming */
+function isStaleCaptureSnapshot(current, incoming) {
+  return (
+    current !== null &&
+    incoming.authority_epoch === current.authority_epoch &&
+    incoming.source_revision < current.source_revision
+  );
+}
+
 /** @param {AppState} state @param {Action} action @returns {AppState} */
 export function reduceState(state, action) {
   if (action.type === "device.loaded") {
@@ -162,6 +180,9 @@ export function reduceState(state, action) {
     return { ...state, device: action.payload, safeSwapReceipt };
   }
   if (action.type === "capture.snapshot") {
+    if (isStaleCaptureSnapshot(state.capture, action.payload)) {
+      return state;
+    }
     return {
       ...state,
       capture: action.payload,

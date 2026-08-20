@@ -228,6 +228,70 @@ class NativeCollectorAdapterTest(unittest.TestCase):
         collector.close()
         self.assertTrue(owner.closed)
 
+    def test_native_latest_observation_decodes_without_reading_again(self) -> None:
+        class Owner:
+            def latest_observation(self) -> dict[str, object]:
+                return {
+                    "dropped_samples": 0,
+                    "samples": [
+                        {
+                            "sequence": 8,
+                            "packet_sequence": 4,
+                            "sample_index": 0,
+                            "device_timestamp_raw": 1000,
+                            "device_ticks": 1000,
+                            "host_read_start_ns": 10_000_000,
+                            "host_read_end_ns": 10_010_000,
+                            "host_monotonic_ns": 10_005_000,
+                            "raw": {
+                                "accelerometer": [1, 2, 3],
+                                "gyroscope": [4, 5, 6],
+                            },
+                            "sync": {
+                                "offset_ns": None,
+                                "residual_ns": None,
+                                "quality": "insufficient",
+                            },
+                        },
+                        {
+                            "sequence": 9,
+                            "packet_sequence": 4,
+                            "sample_index": 1,
+                            "device_timestamp_raw": 1000,
+                            "device_ticks": 1000,
+                            "host_read_start_ns": 10_000_000,
+                            "host_read_end_ns": 10_010_000,
+                            "host_monotonic_ns": 10_005_000,
+                            "raw": {
+                                "accelerometer": [-1, -2, -3],
+                                "gyroscope": [-4, -5, -6],
+                            },
+                            "sync": {
+                                "offset_ns": None,
+                                "residual_ns": None,
+                                "quality": "insufficient",
+                            },
+                        },
+                    ],
+                }
+
+            def close(self) -> None:
+                pass
+
+        collector = NativeImuCollector("/dev/video-test", owner=Owner())
+        latest = collector.latest_observation()
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertEqual(latest.samples[0].sequence, 8)
+        self.assertEqual(latest.samples[1].accelerometer.as_list(), [-1, -2, -3])
+
+    def test_native_latest_observation_is_optional_for_old_owner(self) -> None:
+        class Owner:
+            def close(self) -> None:
+                pass
+
+        self.assertIsNone(NativeImuCollector("/dev/video-test", owner=Owner()).latest_observation())
+
     def test_native_error_keeps_code_retryability_and_closes_owner(self) -> None:
         class Owner:
             def __init__(self) -> None:

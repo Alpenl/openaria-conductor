@@ -22,13 +22,13 @@ from rp_ylx.api import (
 CONTRACT_GOLDENS = {
     "v2": {
         "filename": "ylx-device-v2.openapi.yaml",
-        "sha256": "65fa008129213c6b7446711183ba09c9ed6d7b12d732c712670ac9114de239de",
+        "sha256": "b705823ae82a7fcd55385866dfd2f96464c2ed23e2c8ca65aa8933aa057e6933",
         "info_version": "2.0.0",
         "server_suffix": "/api/v2",
     },
     "v3": {
         "filename": "ylx-device-v3.openapi.yaml",
-        "sha256": "6ad17d43756b2de155d96cd1d1b60c4364d55b5e79b28ef5da91562a7b47822f",
+        "sha256": "a348c4d2527a60448525298a4518b97ce99333f7212f3ff5f3c9c4f7503a97ab",
         "info_version": "3.0.0",
         "server_suffix": "/api/v3",
     },

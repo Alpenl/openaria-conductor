@@ -25,7 +25,7 @@ from rp_ylx.api.events import validate_safe_swap_v3_receipt
 from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderError
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.camera import FrameObservation
-from rp_ylx.imu import ImuObservation
+from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -338,6 +338,7 @@ class CaptureCoordinator:
         self._active_plan: SessionPlan | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
+        self._latest_imu: tuple[str, ImuSample] | None = None
         self._open_representations = 0
         self._released = False
         self._media_lost = False
@@ -742,6 +743,61 @@ class CaptureCoordinator:
                 break
         return "idle", None, retained
 
+    @staticmethod
+    def _raw_imu_vector(vector: RawVector3) -> Mapping[str, object]:
+        return {"x": vector.x, "y": vector.y, "z": vector.z}
+
+    def _live_imu_from_sample(self, session_id: str, sample: ImuSample) -> Mapping[str, object]:
+        return {
+            "session_id": session_id,
+            "clock": {
+                "time_base": "host_monotonic",
+                "timestamp_ns": sample.host_monotonic_ns,
+            },
+            "raw": {
+                "units": "raw_int16",
+                "accelerometer": self._raw_imu_vector(sample.accelerometer),
+                "gyroscope": self._raw_imu_vector(sample.gyroscope),
+            },
+            "sync": {"quality": sample.sync_quality},
+        }
+
+    def _latest_imu_sample(self) -> tuple[str, ImuSample] | None:
+        with self._lock:
+            plan = self._active_plan
+            if self._active is None or plan is None:
+                return None
+            cached = self._latest_imu
+            if cached is not None and cached[0] == plan.session_id:
+                return cached
+            session_id = plan.session_id
+            sources = self._sources
+        latest = getattr(sources, "latest_imu_observation", None)
+        if not callable(latest):
+            return None
+        try:
+            observation = latest()
+        except BaseException:
+            return None
+        if observation is None:
+            return None
+        if not observation.samples:
+            return None
+        sample = observation.samples[-1]
+        with self._lock:
+            if self._active_plan is not None and self._active_plan.session_id == session_id:
+                self._latest_imu = (session_id, sample)
+                return self._latest_imu
+        return None
+
+    def _runtime_snapshot(self) -> Mapping[str, object]:
+        runtime = dict(copy.deepcopy(self._runtime()))
+        latest = self._latest_imu_sample()
+        runtime["live_imu"] = (
+            None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
+        )
+        return runtime
+
     def _snapshot(self) -> Mapping[str, object]:
         state, active, retained = self._recording_snapshot()
         return {
@@ -749,7 +805,7 @@ class CaptureCoordinator:
             "device_state": state,
             "active_recording": active,
             "retained_unsuccessful": retained,
-            "runtime": copy.deepcopy(self._runtime()),
+            "runtime": self._runtime_snapshot(),
         }
 
     def capture_status(self) -> Mapping[str, object]:
@@ -828,7 +884,7 @@ class CaptureCoordinator:
                 "available_bytes": available_bytes,
                 "writable": writable,
             },
-            "runtime": copy.deepcopy(self._runtime()),
+            "runtime": self._runtime_snapshot(),
         }
 
     def _idempotent(
@@ -939,6 +995,7 @@ class CaptureCoordinator:
         )
         self._active = recorder
         self._active_plan = plan
+        self._latest_imu = None
         self._safe_swap_resource = None
         self._pending_safe_swap = None
         if not self._sources_keep_preview():
@@ -981,6 +1038,7 @@ class CaptureCoordinator:
                 }
             self._active = None
             self._active_plan = None
+            self._latest_imu = None
             self._preview.clear()
             self._persist_local_state()
             code = getattr(error, "code", "source_start_failed")
@@ -1087,6 +1145,7 @@ class CaptureCoordinator:
                 self._verified[plan.session_id] = sealed.manifest_sha256
                 self._active = None
                 self._active_plan = None
+                self._latest_imu = None
                 self._next_revision()
                 if reason == "safe_swap":
                     self._pending_safe_swap = {
@@ -1148,6 +1207,7 @@ class CaptureCoordinator:
         }
         self._active = None
         self._active_plan = None
+        self._latest_imu = None
         self._persist_local_state()
 
     def _local_failure_state(
@@ -1265,7 +1325,10 @@ class CaptureCoordinator:
                 raise DeviceRecordingError("invalid_state", "当前没有活动录制")
             try:
                 self._check_generation(generation_id or self._active_plan.generation_id)
-                return self._active.submit_imu(observation)
+                accepted = self._active.submit_imu(observation)
+                if accepted:
+                    self._latest_imu = (self._active_plan.session_id, observation.samples[-1])
+                return accepted
             except DeviceRecordingError as error:
                 if error.code == "stale_generation" or not retain_failure:
                     raise
@@ -1589,6 +1652,7 @@ class CaptureCoordinator:
                     }
                 self._active = None
                 self._active_plan = None
+                self._latest_imu = None
             self._persist_local_state()
 
     def __enter__(self) -> CaptureCoordinator:

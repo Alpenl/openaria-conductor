@@ -663,6 +663,13 @@ impl NativeImuCollector {
     fn unit(&self) -> PyResult<u8> {
         self.collector.unit().map_err(imu_error)
     }
+
+    fn latest_observation(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        match self.collector.latest_observation().map_err(imu_error)? {
+            Some(observation) => imu::observation_dict(py, &observation).map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 impl Drop for NativeImuCollector {

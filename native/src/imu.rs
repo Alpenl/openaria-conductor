@@ -176,6 +176,7 @@ struct State {
     selector: u8,
     stale_poll_interval: Duration,
     last_device_timestamp: Option<u32>,
+    latest_observation: Option<ImuObservation>,
     unwrapper: TimestampUnwrapper,
     synchronizer: TimeSynchronizer,
     packet_sequence: u64,
@@ -212,6 +213,7 @@ impl Collector {
             selector,
             stale_poll_interval: stale_poll_interval.unwrap_or(DEFAULT_STALE_POLL),
             last_device_timestamp: None,
+            latest_observation: None,
             unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
             synchronizer: TimeSynchronizer::default(),
             packet_sequence: 0,
@@ -254,6 +256,13 @@ impl Collector {
         self.state
             .lock()
             .map(|state| state.unit)
+            .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))
+    }
+
+    pub(crate) fn latest_observation(&self) -> Result<Option<ImuObservation>, ImuError> {
+        self.state
+            .lock()
+            .map(|state| state.latest_observation.clone())
             .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))
     }
 }
@@ -319,10 +328,12 @@ impl State {
         });
         self.packet_sequence += 1;
         self.sample_sequence += SAMPLES_PER_PACKET as u64;
-        Ok(ImuObservation {
+        let observation = ImuObservation {
             samples,
             dropped_samples: 0,
-        })
+        };
+        self.latest_observation = Some(observation.clone());
+        Ok(observation)
     }
 
     fn read_fresh_packet(&mut self, timeout: Duration) -> Result<PacketRead, ImuError> {

@@ -1033,44 +1033,46 @@ components:
     LiveImuObservation:
       type: object
       additionalProperties: false
-      required: [session_id, clock, acceleration_m_s2, angular_velocity_rad_s, orientation_quaternion]
+      required: [session_id, clock, raw, sync]
       properties:
         session_id:
           $ref: "#/components/schemas/UuidV7"
         clock:
           type: object
           additionalProperties: false
-          required: [time_base, epoch_id, timestamp_ns]
+          required: [time_base, timestamp_ns]
           properties:
             time_base:
-              const: session_monotonic
-            epoch_id:
-              $ref: "#/components/schemas/UuidV7"
-              description: 必须等于外层 live IMU 的 session_id
+              const: host_monotonic
             timestamp_ns:
               type: integer
               minimum: 0
-        acceleration_m_s2:
-          $ref: "#/components/schemas/Vector3"
-        angular_velocity_rad_s:
-          $ref: "#/components/schemas/Vector3"
-        orientation_quaternion:
+        raw:
           type: object
           additionalProperties: false
-          required: [w, x, y, z]
+          required: [units, accelerometer, gyroscope]
           properties:
-            w: {type: number}
-            x: {type: number}
-            y: {type: number}
-            z: {type: number}
-    Vector3:
+            units:
+              const: raw_int16
+            accelerometer:
+              $ref: "#/components/schemas/RawImuVector3"
+            gyroscope:
+              $ref: "#/components/schemas/RawImuVector3"
+        sync:
+          type: object
+          additionalProperties: false
+          required: [quality]
+          properties:
+            quality:
+              enum: [insufficient, good, degraded]
+    RawImuVector3:
       type: object
       additionalProperties: false
       required: [x, y, z]
       properties:
-        x: {type: number}
-        y: {type: number}
-        z: {type: number}
+        x: {type: integer, minimum: -32768, maximum: 32767}
+        y: {type: integer, minimum: -32768, maximum: 32767}
+        z: {type: integer, minimum: -32768, maximum: 32767}
     CaptureStartRequest:
       type: object
       additionalProperties: false
