@@ -864,6 +864,28 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_calibration_active_blocks_production_recording(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            calibration = start_command("calibration-start", mode="calibration")
+            first = coordinator.start_capture(calibration)
+            replay = coordinator.start_capture(calibration)
+            self.assertEqual(first.body, replay.body)
+            self.assertTrue(replay.replayed)
+
+            changed = start_command("calibration-start", mode="production")
+            with self.assertRaises(ProviderError) as conflict:
+                coordinator.start_capture(changed)
+            self.assertEqual(conflict.exception.code, "idempotency_conflict")
+
+            with self.assertRaises(ProviderError) as busy:
+                coordinator.start_capture(start_command("production-start", mode="production"))
+            self.assertEqual(busy.exception.code, "capture_busy")
+            coordinator.submit_frame(frame())
+            coordinator.stop_capture(stop_command("calibration-stop"))
+        finally:
+            coordinator.close()
+
     def test_recording_progress_checkpoints_and_revision_survives_restart(self) -> None:
         coordinator = self.coordinator(checkpoint_interval=0)
         coordinator.start_capture(start_command("checkpoint-start"))
