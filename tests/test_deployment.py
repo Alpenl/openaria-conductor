@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -13,9 +14,11 @@ from unittest.mock import MagicMock, patch
 
 from rp_ylx.deployment import (
     BUNDLE_SCHEMA,
+    DEPLOYMENT_ASSETS,
     TARGET_PLATFORM,
     DeploymentError,
     ReleaseManager,
+    _asset_bytes,
     _extract_runtime,
     _extract_wheel,
     _launcher,
@@ -26,6 +29,7 @@ from rp_ylx.deployment import (
     normalize_runtime_archive,
     write_bundle_manifest,
 )
+from rp_ylx.network import MDNS_ASSET_NAME, MDNS_PORT, MDNS_SERVICE, _avahi_service
 from scripts import rdk_x5_install
 from scripts.rdk_x5_install import _prepare_runtime
 
@@ -69,13 +73,13 @@ class ReleaseManagerTest(unittest.TestCase):
         self,
         character: str,
         *,
-        platform_tag: str = "any",
+        platform_tag: str = "manylinux_2_28_aarch64",
         manifest_commit: str | None = None,
     ) -> Path:
         commit = self.commit(character)
         root = self.root / f"bundle-{character}-{platform_tag}"
         root.mkdir()
-        name = f"rp_ylx-0.1.0-py3-none-{platform_tag}.whl"
+        name = f"rp_ylx-0.1.0-cp311-abi3-{platform_tag}.whl"
         wheel = root / name
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr(
@@ -86,6 +90,10 @@ class ReleaseManagerTest(unittest.TestCase):
                 "rp_ylx-0.1.0.dist-info/METADATA",
                 "Metadata-Version: 2.1\nName: rp-ylx\nVersion: 0.1.0\n",
             )
+            elf = bytearray(64)
+            elf[:6] = b"\x7fELF\x02\x01"
+            elf[18:20] = (183).to_bytes(2, "little")
+            archive.writestr("rp_ylx/_native.abi3.so", elf)
         installer = root / "rdk_x5_install.py"
         installer.write_text("# bootstrap\n", encoding="utf-8")
         manifest = {
@@ -123,6 +131,7 @@ class ReleaseManagerTest(unittest.TestCase):
             executable_finder=lambda name: f"/usr/bin/{name}",
             runner=lambda command: self.commands.append(tuple(command)),
             stage_installer=self.stage_installer,
+            encoder_builder=lambda stage: None,
             health_checker=lambda: self.commands.append(("health-check",)),
         )
 
@@ -133,18 +142,106 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(first["current"], self.commit("a"))
         self.assertIsNone(first["previous"])
         config_path = self.config_root / "device.json"
-        identity = json.loads(config_path.read_bytes())["device"]
+        installed_config = json.loads(config_path.read_bytes())
+        identity = installed_config["device"]
+        self.assertEqual(installed_config["camera"]["data_plane"], "rust")
+        self.assertEqual(
+            installed_config["audio"],
+            {
+                "enabled": True,
+                "device": "hw:0,0",
+                "sample_rate_hz": 48000,
+                "channels": 2,
+                "sample_format": "S16_LE",
+            },
+        )
+        self.assertEqual(installed_config["storage"]["mountpoint"], "/data")
         (self.state_root / "business-state.json").write_text("keep", encoding="utf-8")
 
         repeated = manager.install(bundle)
         self.assertEqual(repeated, first)
         self.assertEqual(json.loads(config_path.read_bytes())["device"], identity)
         self.assertEqual((self.state_root / "business-state.json").read_text(), "keep")
+        self.assertIn(("systemctl", "enable", "--now", "rp-ylx-data-volume.service"), self.commands)
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx.service"), self.commands)
+        self.assertIn(("systemctl", "enable", "--now", "rp-ylx-wifi-watchdog.timer"), self.commands)
         self.assertIn(("health-check",), self.commands)
         self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx.service").is_file())
+        self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx-data-volume.service").is_file())
+        data_volume = self.root / "usr/local/sbin/rp-ylx-data-volume"
+        self.assertTrue(data_volume.stat().st_mode & 0o100)
+        watchdog = self.root / "usr/local/sbin/rp-ylx-wifi-watchdog"
+        self.assertTrue(watchdog.stat().st_mode & 0o100)
+        self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx-wifi-watchdog.timer").is_file())
+        self.assertTrue((self.root / "etc/modprobe.d/aic8800-rp-ylx.conf").is_file())
+        self.assertTrue(
+            (self.root / "etc/NetworkManager/conf.d/90-rp-ylx-wifi-powersave.conf").is_file()
+        )
         bootstrap = self.root / "usr/local/lib/rp-ylx/deployment.py"
         self.assertIn("import argparse", bootstrap.read_text(encoding="utf-8"))
+
+    def test_repeated_install_preserves_wifi_watchdog_device_configuration(self) -> None:
+        manager = self.manager()
+        bundle = self.bundle("a")
+        manager.install(bundle, activate=False)
+        configuration = self.root / "etc/default/rp-ylx-wifi-watchdog"
+        configuration.write_text("WIFI_GATEWAY=192.0.2.1\n", encoding="utf-8")
+
+        manager.install(bundle, activate=False)
+
+        self.assertEqual(configuration.read_text(encoding="utf-8"), "WIFI_GATEWAY=192.0.2.1\n")
+
+    def test_clean_install_advertises_mdns_without_a_network_apply(self) -> None:
+        # #118：默认安装必须在受支持设备网络上可被按名发现。此前 avahi service 文件只在
+        # network apply 事务中写入，因此从未改过网络模式的设备完全不广播。
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+
+        advertised = self.root / "etc/avahi/services/rp-ylx.service"
+        self.assertTrue(advertised.is_file(), "干净安装后 avahi service 文件必须存在")
+        self.assertEqual(advertised.stat().st_mode & 0o777, 0o644)
+
+        document = advertised.read_text(encoding="utf-8")
+        self.assertIn(f"<type>{MDNS_SERVICE}</type>", document)
+        self.assertIn(f"<port>{MDNS_PORT}</port>", document)
+        # %h 通配符让 avahi 自行解析主机与地址，因此设备换地址后无需重写该文件。
+        self.assertIn('replace-wildcards="yes"', document)
+
+    def test_installed_mdns_service_matches_the_network_apply_payload(self) -> None:
+        # 安装器与 network apply 必须写同一份字节，否则端口或服务类型会出现两份真相。
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+
+        advertised = self.root / "etc/avahi/services/rp-ylx.service"
+        self.assertEqual(advertised.read_bytes(), _avahi_service())
+        self.assertEqual(advertised.read_bytes(), _asset_bytes(MDNS_ASSET_NAME))
+
+    def test_bootstrap_root_carries_the_mdns_asset_for_standalone_deploys(self) -> None:
+        # deployment.py 会被单独复制到 /usr/local/lib/rp-ylx 运行，其资产也必须一并落地。
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+
+        standalone = self.root / "usr/local/lib/rp-ylx" / MDNS_ASSET_NAME
+        self.assertTrue(standalone.is_file())
+        self.assertEqual(standalone.read_bytes(), _avahi_service())
+
+    def test_every_system_asset_is_declared_for_packaging(self) -> None:
+        # 新增资产若没同时进打包声明，wheel 里就没有它，安装到真机才会暴露。
+        repository = Path(__file__).resolve().parents[1]
+        pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
+        manifest = (repository / "MANIFEST.in").read_text(encoding="utf-8")
+        for name in DEPLOYMENT_ASSETS:
+            with self.subTest(asset=name):
+                self.assertTrue((repository / "src/rp_ylx/deploy" / name).is_file())
+                self.assertTrue(_asset_bytes(name))
+                suffix = Path(name).suffix
+                if suffix:
+                    glob = f"*{suffix}"
+                    self.assertIn(glob, pyproject, f"pyproject.toml 未声明 {glob}")
+                    self.assertIn(glob, manifest, f"MANIFEST.in 未声明 {glob}")
+                else:
+                    self.assertIn(f'"{name}"', pyproject, f"pyproject.toml 未声明 {name}")
+                    self.assertIn(name, manifest, f"MANIFEST.in 未声明 {name}")
 
     def test_launchers_use_only_release_managed_runtime(self) -> None:
         application = _launcher("rp_ylx").decode()
@@ -467,12 +564,23 @@ class ReleaseManagerTest(unittest.TestCase):
         recording.parent.mkdir(parents=True)
         recording.write_bytes(b"keep")
 
+        advertised = self.root / "etc/avahi/services/rp-ylx.service"
+        self.assertTrue(advertised.is_file())
+
         result = manager.uninstall()
         self.assertFalse(result["installed"])
         self.assertFalse(self.install_root.exists())
         self.assertTrue(config.is_file())
         self.assertEqual(business.read_text(), "keep")
         self.assertEqual(recording.read_bytes(), b"keep")
+        self.assertIn(
+            ("systemctl", "disable", "--now", "rp-ylx-wifi-watchdog.timer"),
+            self.commands,
+        )
+        for relative, _ in DEPLOYMENT_ASSETS.values():
+            self.assertFalse((self.root / relative).exists())
+        # 卸载后设备不得继续广播一个已不存在的采集服务。
+        self.assertFalse(advertised.exists())
 
     def test_x86_install_fails_before_writing_layout(self) -> None:
         manager = ReleaseManager(
@@ -483,6 +591,7 @@ class ReleaseManagerTest(unittest.TestCase):
             target_machine="x86_64",
             runner=lambda command: None,
             stage_installer=self.stage_installer,
+            encoder_builder=lambda stage: None,
         )
         with self.assertRaises(DeploymentError) as rejected:
             manager.install(self.bundle("a"))
@@ -499,6 +608,7 @@ class ReleaseManagerTest(unittest.TestCase):
             target_model="Raspberry Pi 5 Model B Rev 1.0",
             runner=lambda command: None,
             stage_installer=self.stage_installer,
+            encoder_builder=lambda stage: None,
         )
         with self.assertRaises(DeploymentError) as rejected:
             manager.install(self.bundle("a"))
@@ -517,6 +627,7 @@ class ReleaseManagerTest(unittest.TestCase):
             executable_finder=lambda name: f"/usr/bin/{name}",
             runner=lambda command: None,
             stage_installer=self.stage_installer,
+            encoder_builder=lambda stage: None,
         )
         with self.assertRaises(DeploymentError) as rejected:
             manager.install(self.bundle("a"))
@@ -564,19 +675,23 @@ class ReleaseManagerTest(unittest.TestCase):
         commit = self.commit("a")
         bundle = self.root / "zip-bootstrap-bundle"
         bundle.mkdir()
-        wheel = bundle / "rp_ylx-0.1.0-py3-none-any.whl"
+        wheel = bundle / "rp_ylx-0.1.0-cp311-abi3-manylinux_2_28_aarch64.whl"
         repository = Path(__file__).resolve().parents[1]
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr("rp_ylx/__init__.py", "from ._build_info import __commit__\n")
             archive.writestr("rp_ylx/deploy/__init__.py", "")
             archive.write(repository / "src/rp_ylx/deployment.py", "rp_ylx/deployment.py")
             archive.writestr("rp_ylx/_build_info.py", f'__commit__ = "{commit}"\n')
-            for name in ("rp-ylx.service", "rp-ylx.sysusers", "rp-ylx.tmpfiles"):
+            for name in DEPLOYMENT_ASSETS:
                 archive.write(repository / "src/rp_ylx/deploy" / name, f"rp_ylx/deploy/{name}")
             archive.writestr(
                 "rp_ylx-0.1.0.dist-info/METADATA",
                 "Metadata-Version: 2.1\nName: rp-ylx\nVersion: 0.1.0\n",
             )
+            elf = bytearray(64)
+            elf[:6] = b"\x7fELF\x02\x01"
+            elf[18:20] = (183).to_bytes(2, "little")
+            archive.writestr("rp_ylx/_native.abi3.so", elf)
         installer = bundle / "rdk_x5_install.py"
         installer.write_text("# bootstrap\n", encoding="utf-8")
         manifest = {
@@ -613,6 +728,7 @@ class ReleaseManagerTest(unittest.TestCase):
                 "    target_model='D-Robotics RDK X5 V1.0',",
                 "    library_finder=lambda name: f'lib{name}.so',",
                 "    executable_finder=lambda name: f'/usr/bin/{name}',",
+                "    encoder_builder=lambda stage: None,",
                 "    runner=lambda command: None,",
                 "    health_checker=lambda: None,",
                 ")",
@@ -632,6 +748,11 @@ class ReleaseManagerTest(unittest.TestCase):
         source_module = repository / "src/rp_ylx/deployment.py"
         self.assertEqual(bootstrap.read_bytes(), source_module.read_bytes())
         self.assertTrue((isolated_root / "usr/lib/systemd/system/rp-ylx.service").is_file())
+        self.assertTrue(
+            (isolated_root / "usr/lib/systemd/system/rp-ylx-data-volume.service").is_file()
+        )
+        self.assertTrue((isolated_root / "usr/local/sbin/rp-ylx-data-volume").is_file())
+        self.assertTrue((isolated_root / "usr/local/sbin/rp-ylx-wifi-watchdog").is_file())
 
     def test_service_declares_boot_restart_and_privileged_recovery(self) -> None:
         unit = (Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy/rp-ylx.service").read_text(
@@ -639,9 +760,117 @@ class ReleaseManagerTest(unittest.TestCase):
         )
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertIn("Restart=on-failure", unit)
+        self.assertIn("Wants=rp-ylx-data-volume.service network-online.target", unit)
+        self.assertIn("After=rp-ylx-data-volume.service", unit)
         self.assertIn("ExecStartPre=+/usr/local/sbin/rp-ylx-deploy recover", unit)
         self.assertIn("ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve", unit)
+        self.assertIn("SupplementaryGroups=video vpu jpu vps misc", unit)
         self.assertNotIn("raspberry", unit.casefold())
+
+    def test_data_volume_asset_uses_data_mount_and_reserved_backing_file(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"
+        script = root / "rp-ylx-data-volume"
+        syntax = subprocess.run(
+            ["bash", "-n", str(script)], check=False, capture_output=True, text=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("/var/lib/rp-ylx-data-volume/data-volume.img", content)
+        self.assertIn("/data", content)
+        self.assertIn("mkfs.ext4 -F -E nodiscard", content)
+        self.assertIn("mountpoint -q", content)
+        service = (root / "rp-ylx-data-volume.service").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/usr/local/sbin/rp-ylx-data-volume ensure", service)
+        sysusers = (root / "rp-ylx.sysusers").read_text(encoding="utf-8")
+        self.assertIn("m rp-ylx misc", sysusers)
+        tmpfiles = (root / "rp-ylx.tmpfiles").read_text(encoding="utf-8")
+        self.assertIn("d /var/lib/rp-ylx-data-volume 0755 root root -", tmpfiles)
+
+    def test_wifi_watchdog_assets_are_syntactically_valid_and_safely_wired(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"
+        script = root / "rp-ylx-wifi-watchdog"
+        syntax = subprocess.run(
+            ["sh", "-n", str(script)], check=False, capture_output=True, text=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        service = (root / "rp-ylx-wifi-watchdog.service").read_text(encoding="utf-8")
+        timer = (root / "rp-ylx-wifi-watchdog.timer").read_text(encoding="utf-8")
+        watchdog = script.read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/usr/local/sbin/rp-ylx-wifi-watchdog check", service)
+        self.assertIn("OnUnitActiveSec=1min", timer)
+        self.assertIn("TimeoutStartSec=5min", service)
+        self.assertIn("RuntimeDirectoryPreserve=yes", service)
+        self.assertIn('modprobe -r "$DRIVER_MODULE"', watchdog)
+        self.assertIn('timeout "$NMCLI_TIMEOUT" nmcli connection up', watchdog)
+        self.assertIn("automatic reboot is in cooldown", watchdog)
+        self.assertIn("systemctl reboot", watchdog)
+
+    def test_wifi_watchdog_reboots_once_when_driver_reload_does_not_restore_gateway(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"
+        script = root / "rp-ylx-wifi-watchdog"
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        calls = self.root / "systemctl-calls"
+        for command in ("ip", "iw", "journalctl", "logger", "nmcli", "sleep"):
+            fake = fake_bin / command
+            fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake.chmod(0o755)
+        ping = fake_bin / "ping"
+        ping.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        ping.chmod(0o755)
+        modprobe = fake_bin / "modprobe"
+        modprobe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        modprobe.chmod(0o755)
+        systemctl = fake_bin / "systemctl"
+        systemctl.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n",
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        sys_class_net = self.root / "sys/class/net"
+        (sys_class_net / "wlan0").mkdir(parents=True)
+        environment = os.environ | {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "STATE_DIRECTORY": str(self.root / "state"),
+            "RUNTIME_DIRECTORY": str(self.root / "run"),
+            "WIFI_SYS_CLASS_NET": str(sys_class_net),
+            "WIFI_CONNECTION_UUID": "00000000-0000-0000-0000-000000000001",
+            "WIFI_GATEWAY": "192.0.2.1",
+            "WIFI_RELOAD_TIMEOUT_SECONDS": "2",
+            "WIFI_REBOOT_ON_RECOVERY_FAILURE": "1",
+            "WIFI_REBOOT_COOLDOWN_SECONDS": "21600",
+        }
+
+        first = subprocess.run(
+            [str(script), "recover"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        second = subprocess.run(
+            [str(script), "recover"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        last_reboot = self.root / "state/last-automatic-reboot-epoch"
+        last_reboot.write_text("4102444800\n", encoding="utf-8")
+        third = subprocess.run(
+            [str(script), "recover"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(first.returncode, 1, first.stderr)
+        self.assertEqual(second.returncode, 1, second.stderr)
+        self.assertEqual(third.returncode, 1, third.stderr)
+        self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["reboot"])
+        self.assertIn("automatic reboot is in cooldown", second.stdout)
+        self.assertIn("automatic reboot is in cooldown", third.stdout)
 
 
 if __name__ == "__main__":

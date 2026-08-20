@@ -23,6 +23,7 @@ class InstalledWheelTest(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.strip()
+        source_build_info = (REPOSITORY / "src/rp_ylx/_build_info.py").read_bytes()
 
         environment = os.environ.copy()
         for name in ("PYTHONPATH", "RP_YLX_COMMIT", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV"):
@@ -151,9 +152,18 @@ class InstalledWheelTest(unittest.TestCase):
 
                 self.assertEqual(version, f"rp-ylx 0.1.0 ({expected_commit})")
                 self.assertEqual(status["commit"], expected_commit)
+                self.assertEqual(status["native"]["adapter"], "rust")
+                self.assertTrue(status["native"]["module_available"])
+                self.assertEqual(status["native"]["abi"], 4)
+                self.assertIn("capability_probe", status["native"]["features"])
+                self.assertIn("jpeg_contract", status["native"]["features"])
+                self.assertIn("frame_stream", status["native"]["features"])
                 self.assertIn(virtual_environment, module_path.parents)
                 self.assertIn("site-packages", module_path.parts)
                 self.assertNotIn(REPOSITORY.resolve(), module_path.parents)
+            self.assertEqual(
+                (REPOSITORY / "src/rp_ylx/_build_info.py").read_bytes(), source_build_info
+            )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,11 @@ from rp_ylx.recording.device_session import (
     validate_device_session_directory,
 )
 from rp_ylx.recording.session import RecordingConfig, RecordingError, SessionRecorder
-from rp_ylx.recording.sources import ThreadedCaptureSources
+from rp_ylx.recording.sources import (
+    ContinuousCaptureSources,
+    NativeContinuousCaptureSources,
+    ThreadedCaptureSources,
+)
 
 __all__ = [
     "DeviceRecordingError",
@@ -33,6 +37,8 @@ __all__ = [
     "SessionPlan",
     "SessionRecorder",
     "StorageStatus",
+    "ContinuousCaptureSources",
+    "NativeContinuousCaptureSources",
     "ThreadedCaptureSources",
     "VolumeAdmission",
     "initialize_capture_volume",

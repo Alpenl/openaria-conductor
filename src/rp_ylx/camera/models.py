@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 
@@ -46,6 +46,8 @@ class StereoFrame:
     right: bytes
     valid: bool = True
     raw_side_by_side: bytes | None = None
+    _payload_lease: object | None = field(default=None, repr=False, compare=False)
+    _application_dropped_before: int = field(default=0, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

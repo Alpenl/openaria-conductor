@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the RP-YLX RDK X5 Wi-Fi watchdog
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Unit=rp-ylx-wifi-watchdog.service
+
+[Install]
+WantedBy=timers.target

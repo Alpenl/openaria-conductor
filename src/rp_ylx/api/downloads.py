@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -19,6 +20,13 @@ from typing import Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
+
+from rp_ylx.native import (
+    NativeModuleError,
+    NativeSessionIo,
+    create_native_session_io,
+    parse_native_single_range,
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
@@ -45,6 +53,12 @@ _RECORDING_SESSION_VALIDATOR = Draft202012Validator(
     _RECORDING_SESSION_SCHEMA,
     format_checker=FormatChecker(),
 )
+_SESSION_IO_LOCK = threading.Lock()
+_SESSION_IO: NativeSessionIo | None = None
+_SESSION_IO_UNAVAILABLE = False
+_RANGE_PARSER_UNAVAILABLE = False
+_DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
+_DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
 
 
 class ArtifactAccessError(RuntimeError):
@@ -76,6 +90,7 @@ class UnsatisfiableRange(ValueError):
 @dataclass(frozen=True, slots=True)
 class ArtifactDescriptor:
     artifact_id: str
+    role: str
     path: str
     media_type: str
     bytes: int
@@ -166,6 +181,31 @@ class LockedBytes:
         self._assert_unchanged()
         return b"".join(chunks)
 
+    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
+        if output_descriptor < 0 or offset < 0 or (length is not None and length < 0):
+            raise ValueError("output_descriptor、offset 或 length 无效")
+        self._assert_unchanged()
+        available = max(0, self.size - offset)
+        selected = available if length is None else min(length, available)
+        native = _session_io_or_none()
+        if native is not None:
+            sent = native.sendfile(output_descriptor, self._descriptor, offset, selected)
+            if not isinstance(sent, int) or sent != selected:
+                raise ArtifactAccessError("not_verified", "artifact native sendfile 发生短写")
+            self._assert_unchanged()
+            return sent
+        sent = 0
+        for chunk in self.iter_chunks(offset, selected):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_descriptor, view)
+                if written <= 0:
+                    raise BrokenPipeError("artifact socket wrote zero bytes")
+                sent += written
+                view = view[written:]
+        self._assert_unchanged()
+        return sent
+
     def iter_chunks(
         self,
         offset: int = 0,
@@ -239,6 +279,22 @@ class LockedManifest(LockedBytes):
             cursor += selected
             remaining -= selected
 
+    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
+        if output_descriptor < 0 or offset < 0 or (length is not None and length < 0):
+            raise ValueError("output_descriptor、offset 或 length 无效")
+        available = max(0, self.size - offset)
+        selected = available if length is None else min(length, available)
+        sent = 0
+        for chunk in self.iter_chunks(offset, selected):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_descriptor, view)
+                if written <= 0:
+                    raise BrokenPipeError("manifest socket wrote zero bytes")
+                sent += written
+                view = view[written:]
+        return sent
+
 
 class LockedArtifact(LockedBytes):
     """已由 exact manifest 固定身份并通过打开的 fd 读取的 artifact。"""
@@ -270,6 +326,14 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
         raise ValueError("complete_size 不能为负数")
     if value is None:
         return None
+    global _RANGE_PARSER_UNAVAILABLE
+    if not _RANGE_PARSER_UNAVAILABLE:
+        try:
+            return parse_native_single_range(value, complete_size)
+        except NativeModuleError:
+            _RANGE_PARSER_UNAVAILABLE = True
+        except ValueError as error:
+            raise UnsatisfiableRange(complete_size) from error
     if not value.startswith("bytes=") or "," in value:
         raise UnsatisfiableRange(complete_size)
     selected = value.removeprefix("bytes=")
@@ -297,6 +361,307 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
     if last < first:
         raise UnsatisfiableRange(complete_size)
     return first, min(last, complete_size - 1)
+
+
+def _session_io_or_none() -> NativeSessionIo | None:
+    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
+    if _SESSION_IO_UNAVAILABLE:
+        return None
+    if _SESSION_IO is not None:
+        return _SESSION_IO
+    with _SESSION_IO_LOCK:
+        if _SESSION_IO_UNAVAILABLE:
+            return None
+        if _SESSION_IO is not None:
+            return _SESSION_IO
+        try:
+            _SESSION_IO = create_native_session_io()
+        except NativeModuleError:
+            _SESSION_IO_UNAVAILABLE = True
+            return None
+        return _SESSION_IO
+
+
+def _native_device_session_v1_artifact_descriptors(
+    manifest_bytes: bytes,
+    session_id: str,
+    manifest: Mapping[str, object],
+) -> dict[str, ArtifactDescriptor] | None:
+    if manifest.get("schema") != "ylx.device-session.v1":
+        return None
+    summary = _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
+    if summary is not None:
+        raw_artifacts = summary["artifacts"]
+        if not isinstance(raw_artifacts, list):
+            raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+        return _artifact_descriptors_from_raw(raw_artifacts, legacy=False, path_validated=True)
+    global _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE
+    if _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE:
+        return None
+    native = _session_io_or_none()
+    if native is None:
+        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
+        return None
+    read_artifacts = getattr(native, "device_session_v1_artifacts", None)
+    if not callable(read_artifacts):
+        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
+        return None
+    try:
+        raw_descriptors = read_artifacts(manifest_bytes, session_id)
+    except AttributeError:
+        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效") from error
+    if not isinstance(raw_descriptors, list):
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+    return _artifact_descriptors_from_raw(raw_descriptors, legacy=False, path_validated=True)
+
+
+def device_session_v1_summary(
+    manifest_bytes: bytes,
+    session_id: str,
+    manifest: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the sealed Device Session v1 summary, preferring Rust's manifest fast path."""
+
+    native_summary = _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
+    if native_summary is not None:
+        return native_summary
+    if manifest is None:
+        manifest = _validated_manifest(manifest_bytes, session_id, "v3")
+    return _device_session_v1_summary_python(
+        manifest,
+        manifest_bytes=manifest_bytes,
+        session_id=session_id,
+    )
+
+
+def _native_device_session_v1_summary(
+    manifest_bytes: bytes,
+    session_id: str,
+    manifest: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if manifest is not None and manifest.get("schema") != "ylx.device-session.v1":
+        return None
+    global _DEVICE_SESSION_SUMMARY_UNAVAILABLE
+    if _DEVICE_SESSION_SUMMARY_UNAVAILABLE:
+        return None
+    native = _session_io_or_none()
+    if native is None:
+        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
+        return None
+    read_summary = getattr(native, "device_session_v1_summary", None)
+    if not callable(read_summary):
+        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
+        return None
+    try:
+        raw_summary = read_summary(manifest_bytes, session_id)
+    except AttributeError:
+        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError("not_verified", "manifest summary 无效") from error
+    return _coerce_device_session_v1_summary(raw_summary, session_id)
+
+
+def _device_session_v1_summary_python(
+    manifest: Mapping[str, object],
+    *,
+    manifest_bytes: bytes,
+    session_id: str,
+) -> dict[str, object]:
+    del manifest_bytes
+    try:
+        if (
+            manifest.get("schema") != "ylx.device-session.v1"
+            or manifest.get("sealed") is not True
+            or manifest.get("session_id") != session_id
+        ):
+            raise ArtifactAccessError("not_verified", "manifest 不是 sealed device-session v1")
+        time = manifest["time"]
+        frames = manifest["frames"]
+        imu = manifest["imu"]
+        if not all(isinstance(value, Mapping) for value in (time, frames, imu)):
+            raise ArtifactAccessError("not_verified", "manifest summary 结构无效")
+        audio = manifest.get("audio")
+        audio_sample_count = None
+        if audio is not None:
+            if not isinstance(audio, Mapping):
+                raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+            audio_sample_count = _non_negative_int(
+                audio.get("sample_count"),
+                "manifest audio sample_count 无效",
+            )
+        descriptors = _artifact_descriptors(manifest)
+        artifacts = _artifact_descriptor_payloads(descriptors)
+        return {
+            "session_id": _string_value(manifest.get("session_id"), "manifest session_id 无效"),
+            "display_name": _string_value(
+                manifest.get("display_name"),
+                "manifest display_name 无效",
+            ),
+            "started_at": _string_value(time.get("started_at"), "manifest started_at 无效"),
+            "ended_at": _string_value(time.get("ended_at"), "manifest ended_at 无效"),
+            "duration_seconds": _non_negative_number(
+                time.get("duration_seconds"),
+                "manifest duration_seconds 无效",
+            ),
+            "frames_count": _non_negative_int(
+                frames.get("count"),
+                "manifest frames count 无效",
+            ),
+            "imu_sample_count": _non_negative_int(
+                imu.get("sample_count"),
+                "manifest imu sample_count 无效",
+            ),
+            "audio_sample_count": audio_sample_count,
+            "total_bytes": sum(descriptor.bytes for descriptor in descriptors.values()),
+            "artifacts": artifacts,
+        }
+    except ArtifactAccessError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactAccessError("not_verified", "manifest summary 无效") from error
+
+
+def _coerce_device_session_v1_summary(
+    raw_summary: object,
+    session_id: str,
+) -> dict[str, object]:
+    if not isinstance(raw_summary, Mapping):
+        raise ArtifactAccessError("not_verified", "manifest summary 无效")
+    required = {
+        "session_id",
+        "display_name",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "frames_count",
+        "imu_sample_count",
+        "audio_sample_count",
+        "total_bytes",
+        "artifacts",
+    }
+    if not required.issubset(raw_summary):
+        raise ArtifactAccessError("not_verified", "manifest summary 字段缺失")
+    raw_artifacts = raw_summary["artifacts"]
+    if not isinstance(raw_artifacts, list):
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+    descriptors = _artifact_descriptors_from_raw(
+        raw_artifacts,
+        legacy=False,
+        path_validated=True,
+    )
+    artifacts = _artifact_descriptor_payloads(descriptors)
+    total_bytes = _non_negative_int(raw_summary["total_bytes"], "manifest total_bytes 无效")
+    computed_total = sum(descriptor.bytes for descriptor in descriptors.values())
+    if total_bytes != computed_total:
+        raise ArtifactAccessError("not_verified", "manifest total_bytes 与 artifact 不一致")
+    selected_session_id = _string_value(raw_summary["session_id"], "manifest session_id 无效")
+    if selected_session_id != session_id:
+        raise ArtifactAccessError("not_verified", "manifest 会话身份不匹配")
+    audio_sample_count = raw_summary["audio_sample_count"]
+    if audio_sample_count is not None:
+        audio_sample_count = _non_negative_int(
+            audio_sample_count,
+            "manifest audio sample_count 无效",
+        )
+    return {
+        "session_id": selected_session_id,
+        "display_name": _string_value(
+            raw_summary["display_name"],
+            "manifest display_name 无效",
+        ),
+        "started_at": _string_value(raw_summary["started_at"], "manifest started_at 无效"),
+        "ended_at": _string_value(raw_summary["ended_at"], "manifest ended_at 无效"),
+        "duration_seconds": _non_negative_number(
+            raw_summary["duration_seconds"],
+            "manifest duration_seconds 无效",
+        ),
+        "frames_count": _non_negative_int(
+            raw_summary["frames_count"],
+            "manifest frames count 无效",
+        ),
+        "imu_sample_count": _non_negative_int(
+            raw_summary["imu_sample_count"],
+            "manifest imu sample_count 无效",
+        ),
+        "audio_sample_count": audio_sample_count,
+        "total_bytes": total_bytes,
+        "artifacts": artifacts,
+    }
+
+
+def _native_device_session_v1_artifact_descriptor(
+    manifest_bytes: bytes,
+    session_id: str,
+    manifest: Mapping[str, object],
+    artifact_id: str,
+) -> ArtifactDescriptor | None:
+    if manifest.get("schema") != "ylx.device-session.v1":
+        return None
+    global _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE
+    if _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE:
+        return None
+    native = _session_io_or_none()
+    if native is None:
+        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
+        return None
+    read_artifact = getattr(native, "device_session_v1_artifact", None)
+    if not callable(read_artifact):
+        return None
+    try:
+        raw_descriptor = read_artifact(manifest_bytes, session_id, artifact_id)
+    except AttributeError:
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效") from error
+    if raw_descriptor is None:
+        return None
+    if not isinstance(raw_descriptor, Mapping):
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+    return _artifact_descriptor(raw_descriptor, legacy=False, path_validated=True)
+
+
+def _native_open_relative_regular(path: str, session_descriptor: int) -> int | None:
+    native = _session_io_or_none()
+    if native is None:
+        return None
+    opener = getattr(native, "open_relative_regular", None)
+    if not callable(opener):
+        return None
+    try:
+        descriptor = opener(session_descriptor, path)
+    except AttributeError:
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError(
+            "not_verified", "manifest 声明的 artifact 不存在或不安全"
+        ) from error
+    if not isinstance(descriptor, int) or descriptor < 0:
+        raise ArtifactAccessError("not_verified", "artifact native open 返回无效 fd")
+    return descriptor
+
+
+def _native_read_bounded_file(descriptor: int, maximum_bytes: int) -> bytes | None:
+    native = _session_io_or_none()
+    if native is None:
+        return None
+    reader = getattr(native, "read_bounded_fd", None)
+    if not callable(reader):
+        return None
+    try:
+        payload = reader(descriptor, maximum_bytes)
+    except AttributeError:
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError("not_verified", "会话对象在校验期间无法读取") from error
+    if not isinstance(payload, bytes):
+        raise ArtifactAccessError("not_verified", "artifact native read 返回无效 payload")
+    if len(payload) > maximum_bytes:
+        raise ArtifactAccessError("not_verified", "会话对象在校验期间超过允许大小")
+    return payload
 
 
 class DirectorySessionStore:
@@ -407,8 +772,21 @@ class DirectorySessionStore:
                 raise ArtifactAccessError(
                     "not_verified", "当前 manifest 无法作为 sealed 会话使用"
                 ) from error
-            descriptors = _artifact_descriptors(manifest)
-            selected = descriptors.get(artifact_id)
+            selected = _native_device_session_v1_artifact_descriptor(
+                manifest_bytes,
+                session_id,
+                manifest,
+                artifact_id,
+            )
+            if selected is None:
+                descriptors = _native_device_session_v1_artifact_descriptors(
+                    manifest_bytes,
+                    session_id,
+                    manifest,
+                )
+                if descriptors is None:
+                    descriptors = _artifact_descriptors(manifest)
+                selected = descriptors.get(artifact_id)
             if selected is None:
                 raise ArtifactAccessError("not_found", "artifact 不存在")
 
@@ -511,6 +889,9 @@ def _open_regular_component(component: str, parent_descriptor: int) -> int:
 
 
 def _open_relative_regular(path: str, session_descriptor: int) -> int:
+    native_descriptor = _native_open_relative_regular(path, session_descriptor)
+    if native_descriptor is not None:
+        return native_descriptor
     components = _safe_relative_components(path)
     current = os.dup(session_descriptor)
     try:
@@ -545,6 +926,14 @@ def _safe_relative_components(path: str) -> list[str]:
 
 
 def _read_exact_file(descriptor: int, identity: _FileIdentity) -> bytes:
+    native_payload = _native_read_bounded_file(descriptor, identity.size)
+    if native_payload is not None:
+        if len(native_payload) != identity.size:
+            raise ArtifactAccessError("not_verified", "会话对象在校验期间被截断")
+        if _FileIdentity.read(descriptor) != identity:
+            raise ArtifactAccessError("not_verified", "会话对象在校验期间发生变化")
+        return native_payload
+
     remaining = identity.size
     offset = 0
     blocks: list[bytes] = []
@@ -598,20 +987,29 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _artifact_descriptors(manifest: Mapping[str, object]) -> dict[str, ArtifactDescriptor]:
     raw_descriptors: list[object]
+    legacy = False
     if manifest.get("schema") == "ylx.device-session.v1":
-        raw_descriptors = []
-        _collect_v1_descriptors(manifest, raw_descriptors)
+        raw_descriptors = list(iter_device_session_v1_artifacts(manifest))
     else:
         artifacts = manifest.get("artifacts")
         if not isinstance(artifacts, list):
             raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
         raw_descriptors = artifacts
+        legacy = True
 
+    return _artifact_descriptors_from_raw(raw_descriptors, legacy=legacy)
+
+
+def _artifact_descriptors_from_raw(
+    raw_descriptors: list[object],
+    *,
+    legacy: bool,
+    path_validated: bool = False,
+) -> dict[str, ArtifactDescriptor]:
     descriptors: dict[str, ArtifactDescriptor] = {}
     paths: set[str] = set()
     for raw in raw_descriptors:
-        legacy = isinstance(raw, dict) and "artifact_id" not in raw
-        descriptor = _artifact_descriptor(raw, legacy=legacy)
+        descriptor = _artifact_descriptor(raw, legacy=legacy, path_validated=path_validated)
         existing = descriptors.get(descriptor.artifact_id)
         if descriptor.path in paths:
             raise ArtifactAccessError("not_verified", "manifest artifact 路径重复")
@@ -627,6 +1025,107 @@ def _artifact_descriptors(manifest: Mapping[str, object]) -> dict[str, ArtifactD
     if not descriptors:
         raise ArtifactAccessError("not_verified", "manifest 未声明 artifact")
     return descriptors
+
+
+def _artifact_descriptor_payloads(
+    descriptors: Mapping[str, ArtifactDescriptor],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "artifact_id": descriptor.artifact_id,
+            "role": descriptor.role,
+            "path": descriptor.path,
+            "media_type": descriptor.media_type,
+            "bytes": descriptor.bytes,
+            "sha256": descriptor.sha256,
+        }
+        for descriptor in descriptors.values()
+    ]
+
+
+def _string_value(value: object, message: str) -> str:
+    if not isinstance(value, str):
+        raise ArtifactAccessError("not_verified", message)
+    return value
+
+
+def _non_negative_int(value: object, message: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ArtifactAccessError("not_verified", message)
+    return value
+
+
+def _non_negative_number(value: object, message: str) -> int | float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ArtifactAccessError("not_verified", message)
+    return value
+
+
+def iter_device_session_v1_artifacts(
+    manifest: Mapping[str, object],
+) -> Iterator[Mapping[str, object]]:
+    """Yield every artifact descriptor declared by a Device Session v1 manifest."""
+
+    try:
+        video = manifest["video"]
+        frames = manifest["frames"]
+        imu = manifest["imu"]
+    except KeyError as error:
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效") from error
+    if not all(isinstance(value, Mapping) for value in (video, frames, imu)):
+        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+
+    layout = video.get("layout")
+    if layout == "raw-side-by-side":
+        artifact = video.get("artifact")
+        if not isinstance(artifact, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest video artifact 无效")
+        yield artifact
+    elif layout == "split-eyes":
+        segments = video.get("segments")
+        if not isinstance(segments, list):
+            raise ArtifactAccessError("not_verified", "manifest video segments 无效")
+        for segment in segments:
+            if not isinstance(segment, Mapping):
+                raise ArtifactAccessError("not_verified", "manifest video segment 无效")
+            artifacts = segment.get("artifacts")
+            if not isinstance(artifacts, Mapping):
+                raise ArtifactAccessError("not_verified", "manifest video segment artifact 无效")
+            for eye in ("left", "right"):
+                artifact = artifacts.get(eye)
+                if not isinstance(artifact, Mapping):
+                    raise ArtifactAccessError(
+                        "not_verified", "manifest video segment artifact 无效"
+                    )
+                yield artifact
+    else:
+        raise ArtifactAccessError("not_verified", "manifest video layout 无效")
+
+    for section in (frames, imu):
+        artifact = section.get("artifact")
+        if not isinstance(artifact, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
+        yield artifact
+
+    audio = manifest.get("audio")
+    if audio is not None:
+        if not isinstance(audio, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+        segments = audio.get("segments")
+        if not isinstance(segments, list):
+            raise ArtifactAccessError("not_verified", "manifest audio segments 无效")
+        for segment in segments:
+            if not isinstance(segment, Mapping):
+                raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+            artifact = segment.get("artifact")
+            if not isinstance(artifact, Mapping):
+                raise ArtifactAccessError("not_verified", "manifest audio artifact 无效")
+            yield artifact
 
 
 def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
@@ -725,6 +1224,11 @@ def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
     video = manifest["video"]
     if isinstance(video, Mapping) and video.get("layout") == "split-eyes":
         _validate_split_eye_segments(manifest, video, drops, dropped_sum)
+    audio = manifest.get("audio")
+    if audio is not None:
+        if not isinstance(audio, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+        _validate_audio(audio)
 
 
 def validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
@@ -782,6 +1286,95 @@ def _validate_split_eye_segments(
         raise ArtifactAccessError("not_verified", "frames count 与视频帧域不一致")
 
 
+def _validate_audio(audio: Mapping[str, object]) -> None:
+    sample_rate = audio["sample_rate_hz"]
+    sample_count = audio["sample_count"]
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 采样字段无效")
+    sync = audio["sync"]
+    segments = audio["segments"]
+    if not isinstance(sync, Mapping) or not isinstance(segments, list):
+        raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+    if sync["stopped_monotonic_ns"] < sync["started_monotonic_ns"]:
+        raise ArtifactAccessError("not_verified", "manifest audio 单调时间无效")
+    if sync.get("timebase") is not None:
+        _validate_audio_timeline_sync(sync)
+    previous_end = 0
+    for expected_index, segment in enumerate(segments):
+        if not isinstance(segment, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+        if (
+            segment["index"] != expected_index
+            or segment["start_sample"] != previous_end
+            or segment["end_sample"] <= segment["start_sample"]
+            or segment["start_time_seconds"] >= segment["end_time_seconds"]
+        ):
+            raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+        start_time = segment["start_sample"] / sample_rate
+        end_time = segment["end_sample"] / sample_rate
+        if (
+            abs(segment["start_time_seconds"] - start_time) > 1e-9
+            or abs(segment["end_time_seconds"] - end_time) > 1e-9
+        ):
+            raise ArtifactAccessError("not_verified", "manifest audio 时间域无效")
+        previous_end = segment["end_sample"]
+    if previous_end != sample_count:
+        raise ArtifactAccessError("not_verified", "manifest audio sample_count 不一致")
+
+
+def _validate_audio_timeline_sync(sync: Mapping[str, object]) -> None:
+    if sync.get("clock") != "host_monotonic" or sync.get("timebase") != "monotonic_ns":
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    required_ints = (
+        "session_start_monotonic_ns",
+        "started_monotonic_ns",
+        "stopped_monotonic_ns",
+        "session_start_offset_ns",
+        "session_stop_offset_ns",
+        "sample_duration_ns",
+    )
+    for field in required_ints:
+        value = sync.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    session_start = sync["session_start_monotonic_ns"]
+    started = sync["started_monotonic_ns"]
+    stopped = sync["stopped_monotonic_ns"]
+    start_offset = sync["session_start_offset_ns"]
+    stop_offset = sync["session_stop_offset_ns"]
+    sample_duration = sync["sample_duration_ns"]
+    if (
+        session_start <= 0
+        or started <= 0
+        or stopped <= 0
+        or stopped < started
+        or start_offset < 0
+        or sample_duration <= 0
+        or start_offset != started - session_start
+        or stop_offset != stopped - session_start
+        or stop_offset < start_offset
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    start_seconds = sync.get("session_start_offset_seconds")
+    stop_seconds = sync.get("session_stop_offset_seconds")
+    if (
+        isinstance(start_seconds, bool)
+        or not isinstance(start_seconds, (int, float))
+        or isinstance(stop_seconds, bool)
+        or not isinstance(stop_seconds, (int, float))
+        or not math.isfinite(float(start_seconds))
+        or not math.isfinite(float(stop_seconds))
+        or abs(float(start_seconds) - start_offset / 1e9) > 1e-9
+        or abs(float(stop_seconds) - stop_offset / 1e9) > 1e-9
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+
+
 def _api_datetime(value: object) -> datetime:
     if not isinstance(value, str):
         raise ArtifactAccessError("not_verified", "manifest 时间戳无效")
@@ -791,19 +1384,9 @@ def _api_datetime(value: object) -> datetime:
         raise ArtifactAccessError("not_verified", "manifest 时间戳无效") from error
 
 
-def _collect_v1_descriptors(value: object, output: list[object]) -> None:
-    if isinstance(value, dict):
-        if "artifact_id" in value:
-            output.append(value)
-            return
-        for child in value.values():
-            _collect_v1_descriptors(child, output)
-    elif isinstance(value, list):
-        for child in value:
-            _collect_v1_descriptors(child, output)
-
-
-def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
+def _artifact_descriptor(
+    raw: object, *, legacy: bool, path_validated: bool = False
+) -> ArtifactDescriptor:
     if not isinstance(raw, dict):
         raise ArtifactAccessError("not_verified", "manifest artifact 描述符无效")
     required = {"role", "path", "media_type", "bytes", "sha256"}
@@ -812,6 +1395,7 @@ def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
         raise ArtifactAccessError("not_verified", "manifest artifact 描述符字段无效")
     sha256 = raw.get("sha256")
     artifact_id = sha256 if legacy else raw.get("artifact_id")
+    role = raw.get("role")
     path = raw.get("path")
     media_type = raw.get("media_type")
     size = raw.get("bytes")
@@ -821,6 +1405,7 @@ def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
         or not isinstance(sha256, str)
         or not _SHA256.fullmatch(sha256)
         or artifact_id != sha256
+        or (not legacy and (not isinstance(role, str) or not role))
         or not isinstance(path, str)
         or not isinstance(media_type, str)
         or not _MEDIA_TYPE.fullmatch(media_type)
@@ -833,9 +1418,11 @@ def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
         records = raw.get("records")
         if isinstance(records, bool) or not isinstance(records, int) or records < 0:
             raise ArtifactAccessError("not_verified", "manifest artifact records 无效")
-    _safe_relative_components(path)
+    if not path_validated:
+        _safe_relative_components(path)
     return ArtifactDescriptor(
         artifact_id=artifact_id,
+        role=role if isinstance(role, str) else "",
         path=path,
         media_type=media_type,
         bytes=size,

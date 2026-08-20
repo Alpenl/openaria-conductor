@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SIZE="${RP_YLX_DATA_VOLUME_SIZE:-80G}"
+IMAGE="${RP_YLX_DATA_VOLUME_IMAGE:-/var/lib/rp-ylx-data-volume/data-volume.img}"
+MOUNT="${RP_YLX_DATA_VOLUME_MOUNT:-/data}"
+OWNER="${RP_YLX_DATA_VOLUME_OWNER:-rp-ylx:rp-ylx}"
+
+log() {
+    printf '[rp-ylx-data-volume] %s\n' "$*"
+}
+
+usage() {
+    echo "usage: $0 ensure" >&2
+}
+
+case "${1:-ensure}" in
+    ensure) ;;
+    *) usage; exit 2 ;;
+esac
+
+getent passwd rp-ylx >/dev/null || {
+    echo 'rp-ylx user is missing' >&2
+    exit 1
+}
+
+install -d -o root -g root -m 0755 "$(dirname "$IMAGE")"
+if [ ! -e "$IMAGE" ]; then
+    log "creating $SIZE ext4 image at $IMAGE"
+    fallocate -l "$SIZE" "$IMAGE"
+    chmod 0600 "$IMAGE"
+    # Do not discard the freshly allocated file: the backing root filesystem must
+    # reserve the data-volume blocks up front rather than overcommit system space.
+    mkfs.ext4 -F -E nodiscard -L RP-YLX-DATA "$IMAGE" >/dev/null
+elif [ ! -f "$IMAGE" ]; then
+    echo "$IMAGE exists but is not a regular file" >&2
+    exit 1
+fi
+
+install -d -o root -g root -m 0755 "$MOUNT"
+if ! mountpoint -q "$MOUNT"; then
+    log "mounting $IMAGE at $MOUNT"
+    mount -o loop,rw "$IMAGE" "$MOUNT"
+fi
+
+chown "$OWNER" "$MOUNT"
+chmod 0750 "$MOUNT"
+if [ ! -f "$MOUNT/.ylx-volume.json" ]; then
+    log 'initializing capture volume identity'
+    runuser -u rp-ylx -- /opt/rp-ylx/current/bin/rp-ylx volume init "$MOUNT"
+fi
+install -d -o rp-ylx -g rp-ylx -m 0750 "$MOUNT/recordings"
+# Keep the old generation root readable so upgraded devices can still list and
+# download sessions captured before the /data/recordings migration.
+install -d -o rp-ylx -g rp-ylx -m 0750 "$MOUNT/sessions"
+chown -R rp-ylx:rp-ylx "$MOUNT/.ylx-volume.json" "$MOUNT/sessions" "$MOUNT/recordings" 2>/dev/null || true
+log "ready: $(findmnt -rn --mountpoint "$MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS)"
+df -hT "$MOUNT"

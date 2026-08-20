@@ -118,10 +118,10 @@ paths:
         Returns the current daemon authority identity and the same closed snapshot
         payload used by a snapshot CaptureEvent. source_revision is the daemon journal
         revision of this snapshot; it is never an SSE delivery ID. An idle snapshot may
-        retain the most recent unsuccessful terminal outcome. Starting a new session
-        removes that outcome from current status but never deletes its per-session
-        retained resource. Ordinary idle with no retained outcome is still a 200 snapshot
-        with active_recording and retained_unsuccessful both null; runtime remains present.
+        retain the most recent unsuccessful terminal outcome even after later successful
+        sessions; historical outcomes remain queryable per session. Ordinary idle with no
+        retained outcome is still a 200 snapshot with active_recording and
+        retained_unsuccessful both null; runtime remains present.
       x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
@@ -426,7 +426,7 @@ paths:
           description: |
             Cursor page of discovered candidates. Every schema-valid
             ylx.device-session.v1 sealed candidate is projected once as SessionSummary,
-            ordered by manifest started_at then session_id. A malformed, unreadable,
+            ordered newest first by manifest started_at then session_id. A malformed, unreadable,
             unsealed, unknown-schema, schema-invalid, or manifest-local-semantics-invalid
             manifest is projected once only as a closed
             SessionDiscoveryDiagnostic and MUST NOT be promoted into items by inventing

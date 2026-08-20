@@ -114,7 +114,7 @@ function render() {
   const stopActions = /** @type {HTMLElement} */ (element(".stop-actions"));
   const stopCommand = /** @type {HTMLButtonElement} */ (element("#stop-command"));
   const safeSwapCommand = /** @type {HTMLButtonElement} */ (element("#safe-swap-command"));
-  const isActive = ["recording", "finalizing", "encoding", "verifying"].includes(
+  const isActive = ["recording", "finalizing", "verifying"].includes(
     snapshot.device_state,
   );
   stopActions.hidden = !isActive;
@@ -264,6 +264,22 @@ function visibleError(error) {
   };
 }
 
+/** @returns {Promise<import("./state.js").SessionList>} */
+async function loadSessions() {
+  try {
+    return await deviceApi.listSessions();
+  } catch (error) {
+    if (
+      error instanceof DeviceApiError &&
+      error.status === 409 &&
+      error.code === "volume_not_mounted"
+    ) {
+      return { items: [], diagnostics: [], next_cursor: null };
+    }
+    throw error;
+  }
+}
+
 /** @param {import("./state.js").Action} action */
 function dispatch(action) {
   state = reduceState(state, action);
@@ -290,7 +306,7 @@ async function loadInitialState() {
       deviceApi.getDevice(),
       deviceApi.getCaptureStatus(),
       deviceApi.getSafeSwap(),
-      deviceApi.listSessions(),
+      loadSessions(),
     ]);
     dispatch({ type: "device.loaded", payload: device });
     dispatch({ type: "capture.snapshot", payload: capture });
@@ -376,7 +392,7 @@ async function refreshRelatedResources() {
     relatedResourcesRefresh = Promise.all([
       deviceApi.getDevice(),
       deviceApi.getSafeSwap(),
-      deviceApi.listSessions(),
+      loadSessions(),
     ])
       .then(([device, safeSwap, sessions]) => {
         dispatch({ type: "device.loaded", payload: device });

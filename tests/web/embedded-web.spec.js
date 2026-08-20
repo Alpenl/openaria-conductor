@@ -34,6 +34,20 @@ test("权威快照呈现设备、容量和明确单位的 IMU", async ({ page })
   await expect(page.getByTestId("orientation")).toContainText("w 0.999");
 });
 
+test("无录制卷时设备保持在线并显示空会话列表", async ({ page, request }) => {
+  await request.post("/__fixture/config", { data: { sessionsVolumeUnavailable: true } });
+
+  await page.goto("/");
+
+  await expect(page.locator(".connection")).toHaveText("已连接");
+  await expect(page.getByTestId("capture-state")).toHaveText("待机");
+  await expect(page.getByTestId("storage-available")).toHaveText("0.0 GiB");
+  await expect(page.getByTestId("storage-writable")).toHaveText("不可写");
+  await expect(page.getByText("暂无会话", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "开始录制" })).toBeDisabled();
+});
+
 test("录制命令在权威快照到达前保持待机", async ({ page, request }) => {
   await request.post("/__fixture/config", { data: { commandDelayMs: 350 } });
   await page.goto("/");
@@ -46,6 +60,31 @@ test("录制命令在权威快照到达前保持待机", async ({ page, request 
   await expect(page.getByTestId("capture-state")).toHaveText("待机");
   await expect(page.getByTestId("capture-state")).toHaveText("录制中");
   await expect(page.getByText("走廊采集 01", { exact: true })).toBeVisible();
+});
+
+test("缺少 crypto.randomUUID 的 HTTP LAN 浏览器仍能发送录制命令", async ({ page, request }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis.crypto, "randomUUID", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  await page.goto("/");
+  await page.getByLabel("录制名称").fill("无 randomUUID 兼容");
+
+  await page.getByRole("button", { name: "开始录制" }).click();
+
+  await expect(page.getByTestId("capture-state")).toHaveText("录制中");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  const response = await request.get("/__fixture/requests");
+  const body = /** @type {{requests: Array<{path: string, idempotencyKey: string | null}>}} */ (
+    await response.json()
+  );
+  const starts = body.requests.filter((entry) => entry.path === "/api/v3/capture/start");
+  expect(starts).toHaveLength(1);
+  expect(starts[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
 });
 
 test("录制命令只在本次请求结束后解锁", async ({ page, request }) => {
@@ -284,6 +323,37 @@ test("预览循环不会累积中止监听器", async ({ page, request }) => {
     () => /** @type {any} */ (window).__rpYlxAbortMetrics.active,
   );
   expect(activeListeners).toBeLessThanOrEqual(1);
+});
+
+test("空闲预览不可用不会持续污染浏览器控制台", async ({ page }) => {
+  /** @type {string[]} */
+  const warnings = [];
+  page.on("console", (message) => {
+    if (message.type() === "warning") {
+      warnings.push(message.text());
+    }
+  });
+  await page.route("**/api/v3/preview", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        schema: "ylx.api-error.v2",
+        error: {
+          code: "preview_unavailable",
+          message: "当前没有可用的预览帧",
+          request_id: "12c175c7-a794-45f5-b6c7-348c3e73bc22",
+          retryable: true,
+        },
+      }),
+    });
+  });
+
+  await page.goto("/");
+
+  await expect(page.getByText("画面暂不可用", { exact: true })).toBeVisible();
+  await page.waitForTimeout(650);
+  expect(warnings).toEqual([]);
 });
 
 test("只有 typed safe-swap 回执允许移除存储设备且刷新可恢复", async ({ page, request }) => {

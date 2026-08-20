@@ -1,3 +1,5 @@
-include docs/networking.md
-include docs/rdk-x5-install.md
-recursive-include src/rp_ylx/deploy *.service *.sysusers *.tmpfiles
+include Cargo.lock
+include Cargo.toml
+recursive-include native *.rs *.toml
+recursive-include contracts/golden *.json
+recursive-include src/rp_ylx/deploy *.avahi *.conf *.default *.service *.sysusers *.timer *.tmpfiles rp-ylx-data-volume rp-ylx-wifi-watchdog

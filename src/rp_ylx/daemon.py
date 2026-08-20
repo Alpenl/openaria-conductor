@@ -17,6 +17,7 @@ from typing import Any
 from rp_ylx import __commit__, __version__
 from rp_ylx.api import AuditEvent, SecurityPolicy, create_gateway_server
 from rp_ylx.api.events import EventReplayBuffer
+from rp_ylx.api.preview import LatestPreviewBuffer
 from rp_ylx.camera import (
     CameraController,
     CameraMode,
@@ -24,12 +25,16 @@ from rp_ylx.camera import (
     v4l2_production_stream_factory,
 )
 from rp_ylx.cli_helpers import stable_id_for_device
-from rp_ylx.imu import ImuCollector, UvcXuImuSource
+from rp_ylx.imu import ImuCollector, NativeImuCollector
+from rp_ylx.mdns import MdnsPublisher
+from rp_ylx.native import NativeModuleError, native_capabilities
+from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import (
     CaptureCoordinator,
+    ContinuousCaptureSources,
     CoordinatorConfig,
     DeviceSessionConfig,
-    ThreadedCaptureSources,
+    NativeContinuousCaptureSources,
 )
 
 PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
@@ -52,7 +57,10 @@ LAB_OPERATIONS = frozenset(
 
 
 class ProductionConfigError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str = "invalid_production_config") -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +74,20 @@ class ProductionConfig:
     device_label: str
     hardware_fingerprint: str
     isolated_network: bool
+    data_plane: str = "rust"
     width: int = 3840
     height: int = 1080
     fps: int = 60
+    # 0.5 records 30fps split-eye H.264: dual 1080p60 leaves the VPU no headroom.
+    frame_decimation: int = 2
+    video_layout: str = "split-eyes"
+    video_bitrate_kbps: int = 8192
+    segment_seconds: float = 30.0
+    audio_enabled: bool = True
+    audio_device: str = "hw:0,0"
+    audio_sample_rate_hz: int = 48_000
+    audio_channels: int = 2
+    audio_sample_format: str = "S16_LE"
     minimum_available_bytes: int = 2 * 1024 * 1024 * 1024
     minimum_available_inodes: int = 1024
 
@@ -101,8 +120,18 @@ class ProductionConfig:
             or self.width % 2
             or self.height <= 0
             or self.fps <= 0
+            or self.frame_decimation <= 0
+            or self.video_layout not in {"split-eyes", "raw-side-by-side"}
+            or self.video_bitrate_kbps <= 0
+            or self.segment_seconds <= 0
+            or type(self.audio_enabled) is not bool
+            or (self.audio_enabled and not self.audio_device)
+            or self.audio_sample_rate_hz <= 0
+            or self.audio_channels <= 0
+            or self.audio_sample_format != "S16_LE"
             or self.minimum_available_bytes < 0
             or self.minimum_available_inodes < 0
+            or self.data_plane != "rust"
         ):
             raise ProductionConfigError("生产服务配置无效")
 
@@ -131,18 +160,33 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         "device",
         "security",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    optional = {"audio"}
+    if not isinstance(value, dict):
+        raise ProductionConfigError("生产配置顶层字段无效")
+    top_level = set(value)
+    if top_level != required and top_level != required | optional:
         raise ProductionConfigError("生产配置顶层字段无效")
     listen = value["listen"]
     camera = value["camera"]
     storage = value["storage"]
     device = value["device"]
     security = value["security"]
+    audio = value.get("audio")
     if (
         value["schema"] != PRODUCTION_CONFIG_SCHEMA
         or not all(isinstance(item, dict) for item in (listen, camera, storage, device, security))
+        or (audio is not None and not isinstance(audio, dict))
         or set(listen) != {"host", "port"}
-        or set(camera) != {"device", "width", "height", "fps"}
+        or set(camera)
+        not in (
+            {"device", "width", "height", "fps"},
+            {"device", "width", "height", "fps", "data_plane"},
+        )
+        or (
+            audio is not None
+            and set(audio) != {"enabled", "device", "sample_rate_hz", "channels", "sample_format"}
+        )
+        or (audio is not None and type(audio.get("enabled")) is not bool)
         or set(storage) != {"mountpoint", "minimum_available_bytes", "minimum_available_inodes"}
         or set(device) != {"device_id", "device_label", "hardware_fingerprint"}
         or set(security) != {"profile", "isolated_network"}
@@ -161,9 +205,19 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             device_label=str(device["device_label"]),
             hardware_fingerprint=str(device["hardware_fingerprint"]),
             isolated_network=security["isolated_network"],
+            data_plane=str(camera.get("data_plane", "rust")),
             width=_integer(camera["width"], "camera.width"),
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
+            audio_enabled=True if audio is None else audio["enabled"],
+            audio_device="hw:0,0" if audio is None else str(audio["device"]),
+            audio_sample_rate_hz=(
+                48_000
+                if audio is None
+                else _integer(audio["sample_rate_hz"], "audio.sample_rate_hz")
+            ),
+            audio_channels=2 if audio is None else _integer(audio["channels"], "audio.channels"),
+            audio_sample_format="S16_LE" if audio is None else str(audio["sample_format"]),
             minimum_available_bytes=_integer(
                 storage["minimum_available_bytes"], "storage.minimum_available_bytes"
             ),
@@ -198,9 +252,11 @@ class ProductionService:
     coordinator: CaptureCoordinator
     server: Any
     event_pump: CaptureEventPump
+    mdns_publisher: MdnsPublisher
 
     def close(self) -> None:
         self.server.server_close()
+        self.mdns_publisher.close()
         self.event_pump.close()
         self.coordinator.close()
 
@@ -250,12 +306,134 @@ def build_production_service(
     config: ProductionConfig,
     *,
     camera_backend_factory: Callable[[], object] | None = None,
-    imu_source_factory: Callable[[Path], object] = UvcXuImuSource,
+    imu_source_factory: Callable[[Path], object] | None = None,
     mount_checker: Callable[[Path], bool] | None = None,
+    mdns_publisher_factory: Callable[[int], MdnsPublisher] | None = None,
 ) -> ProductionService:
     if __commit__ == "unknown" or len(__commit__) != 40:
         raise ProductionConfigError("生产服务必须从带精确提交身份的安装包启动")
+    if camera_backend_factory is None:
+        try:
+            capabilities = native_capabilities()
+        except NativeModuleError as exc:
+            raise ProductionConfigError(exc.message, code=exc.code) from exc
+        if not capabilities.module_available or "native_camera" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式 Rust 数据面缺少完整 V4L2/TurboJPEG 原生相机能力",
+                code="native_camera_unavailable",
+            )
+        if "camera_frame_validator" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust 相机帧连续性校验能力",
+                code="native_camera_frame_validator_unavailable",
+            )
+        if config.audio_enabled and "native_audio" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust/ALSA 原生音频能力",
+                code="native_audio_unavailable",
+            )
+        if "native_timeline" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust 统一录制时间线能力",
+                code="native_timeline_unavailable",
+            )
+        if "native_imu" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust/UVC XU 原生 IMU 能力",
+                code="native_imu_unavailable",
+            )
+        if "recording_codec" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 热路径编码能力",
+                code="native_recording_unavailable",
+            )
+        if "recording_sink" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 热路径写入能力",
+                code="native_recording_sink_unavailable",
+            )
+        if "recording_imu_batch" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust IMU batch 写入能力",
+                code="native_recording_imu_batch_unavailable",
+            )
+        if "active_take_writer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust active take 写入状态能力",
+                code="native_active_take_writer_unavailable",
+            )
+        if "recording_frame_gate" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 录制帧门控能力",
+                code="native_recording_frame_gate_unavailable",
+            )
+        if "capture_fanout" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust fanout 热路径能力",
+                code="native_capture_fanout_unavailable",
+            )
+        if "continuous_capture_runtime" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust 连续采集 runtime 能力",
+                code="native_continuous_capture_runtime_unavailable",
+            )
+        if "continuous_capture_raw_sink" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust raw-SBS 直写能力",
+                code="native_continuous_capture_raw_sink_unavailable",
+            )
+        if "continuous_capture_split_sink" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式持续采集缺少 Rust split-eyes 直写能力",
+                code="native_continuous_capture_split_sink_unavailable",
+            )
+        if "recording_event_queue" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 录制事件队列能力",
+                code="native_recording_event_queue_unavailable",
+            )
+        if "artifact_finalize" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust artifact 封存能力",
+                code="native_artifact_finalize_unavailable",
+            )
+        if "stereo_encoder_events" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 编码助手事件解析能力",
+                code="native_stereo_encoder_events_unavailable",
+            )
+        if "stereo_encoder_pipe" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 编码助手写入能力",
+                code="native_stereo_encoder_pipe_unavailable",
+            )
+        if "session_io" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust 会话 I/O 校验能力",
+                code="native_session_io_unavailable",
+            )
+        if "device_session_artifacts" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式下载缺少 Rust device-session artifact 清单能力",
+                code="native_device_session_artifacts_unavailable",
+            )
+        if "device_session_finalizer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式录制缺少 Rust device-session 封存发布能力",
+                code="native_device_session_finalizer_unavailable",
+            )
+        if "preview_buffer" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式预览缺少 Rust latest-only 缓冲能力",
+                code="native_preview_buffer_unavailable",
+            )
+        if "performance_metrics" not in capabilities.features:
+            raise ProductionConfigError(
+                "正式采集缺少 Rust 性能指标累计能力",
+                code="native_metrics_unavailable",
+            )
     mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
+    use_native_continuous_sources = camera_backend_factory is None and imu_source_factory is None
     if camera_backend_factory is None:
 
         def production_backend() -> V4L2DiscoveryBackend:
@@ -264,39 +442,81 @@ def build_production_service(
         camera_backend_factory = production_backend
     selector = CameraController(camera_backend_factory())
     stable_id = stable_id_for_device(selector, config.camera_device)
-    sources = ThreadedCaptureSources(
-        lambda: CameraController(camera_backend_factory()),
-        lambda: ImuCollector(imu_source_factory(config.camera_device)),
-        mode,
-        stable_id=stable_id,
-    )
-    config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
-    session_config = DeviceSessionConfig(
-        device_id=config.device_id,
-        device_label=config.device_label,
-        hardware_fingerprint=config.hardware_fingerprint,
-        platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
-        software_version=__version__,
-        commit=__commit__,
-        width=config.width,
-        height=config.height,
-        sensor_fps=float(config.fps),
-    )
-    coordinator = CaptureCoordinator(
-        CoordinatorConfig(
-            config.mountpoint,
-            config.state_root,
-            session_config,
-            minimum_available_bytes=config.minimum_available_bytes,
-            minimum_available_inodes=config.minimum_available_inodes,
-            queue_capacity=1024,
-        ),
-        mount_checker=mount_checker,
-        sources=sources,
-    )
-    security = SecurityPolicy.lab(allowed_operations=LAB_OPERATIONS)
-    event_buffer = EventReplayBuffer()
+    preview = LatestPreviewBuffer(stream_fps=15)
+    metrics = PerformanceMetrics()
+    if imu_source_factory is None:
+
+        def imu_factory() -> NativeImuCollector:
+            return NativeImuCollector(config.camera_device)
+
+    else:
+
+        def imu_factory() -> ImuCollector:
+            return ImuCollector(imu_source_factory(config.camera_device))
+
+    if use_native_continuous_sources:
+        sources = NativeContinuousCaptureSources(
+            str(config.camera_device),
+            imu_factory,
+            mode,
+            preview=preview,
+            frame_decimation=config.frame_decimation,
+            metrics=metrics,
+        )
+    else:
+        sources = ContinuousCaptureSources(
+            lambda: CameraController(camera_backend_factory()),
+            imu_factory,
+            mode,
+            publish_preview=preview.publish,
+            stable_id=stable_id,
+            warmup_frames=max(1, config.fps),
+            frame_decimation=config.frame_decimation,
+        )
+    coordinator = None
+    server = None
+    event_pump = None
+    mdns_publisher = None
     try:
+        with suppress(BaseException):
+            sources.start_preview()
+        config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        session_config = DeviceSessionConfig(
+            device_id=config.device_id,
+            device_label=config.device_label,
+            hardware_fingerprint=config.hardware_fingerprint,
+            platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+            software_version=__version__,
+            commit=__commit__,
+            width=config.width,
+            height=config.height,
+            sensor_fps=float(config.fps),
+            frame_decimation=config.frame_decimation,
+            video_layout=config.video_layout,
+            video_bitrate_kbps=config.video_bitrate_kbps,
+            segment_seconds=config.segment_seconds,
+            audio_enabled=config.audio_enabled,
+            audio_device=config.audio_device,
+            audio_sample_rate_hz=config.audio_sample_rate_hz,
+            audio_channels=config.audio_channels,
+            audio_sample_format=config.audio_sample_format,
+        )
+        coordinator = CaptureCoordinator(
+            CoordinatorConfig(
+                config.mountpoint,
+                config.state_root,
+                session_config,
+                minimum_available_bytes=config.minimum_available_bytes,
+                minimum_available_inodes=config.minimum_available_inodes,
+                queue_capacity=1024,
+            ),
+            mount_checker=mount_checker,
+            preview=preview,
+            sources=sources,
+            metrics=metrics,
+        )
+        security = SecurityPolicy.lab(allowed_operations=LAB_OPERATIONS)
+        event_buffer = EventReplayBuffer()
         server = create_gateway_server(
             config.host,
             config.port,
@@ -306,10 +526,27 @@ def build_production_service(
             event_buffer=event_buffer,
         )
         event_pump = CaptureEventPump(coordinator, event_buffer)
+        publisher_factory = mdns_publisher_factory or MdnsPublisher
+        mdns_publisher = publisher_factory(config.port)
+        mdns_publisher.start()
     except BaseException:
-        coordinator.close()
+        if mdns_publisher is not None:
+            with suppress(BaseException):
+                mdns_publisher.close()
+        if event_pump is not None:
+            with suppress(BaseException):
+                event_pump.close()
+        if server is not None:
+            with suppress(BaseException):
+                server.server_close()
+        if coordinator is not None:
+            with suppress(BaseException):
+                coordinator.close()
+        else:
+            with suppress(BaseException):
+                sources.close()
         raise
-    return ProductionService(coordinator, server, event_pump)
+    return ProductionService(coordinator, server, event_pump, mdns_publisher)
 
 
 def run_production_service(config_path: str | Path) -> None:

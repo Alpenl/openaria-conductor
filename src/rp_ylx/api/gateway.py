@@ -145,6 +145,10 @@ class LockedRepresentation(Protocol):
         chunk_size: int = 1024 * 1024,
     ) -> Iterator[bytes]: ...
 
+    def send_to(
+        self, output_descriptor: int, offset: int = 0, length: int | None = None
+    ) -> int: ...
+
 
 class PreviewResponse(Protocol):
     content_type: str
@@ -308,8 +312,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         if not head:
-            for chunk in representation.iter_chunks(offset, selected_length):
-                self.wfile.write(chunk)
+            send_to = getattr(representation, "send_to", None)
+            if callable(send_to):
+                self.wfile.flush()
+                send_to(self.connection.fileno(), offset, selected_length)
+            else:
+                for chunk in representation.iter_chunks(offset, selected_length):
+                    self.wfile.write(chunk)
 
     def _problem(
         self,

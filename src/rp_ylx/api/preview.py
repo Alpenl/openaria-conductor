@@ -7,6 +7,8 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+from rp_ylx.native import NativeModuleError, NativePreviewBuffer, create_native_preview_buffer
+
 MULTIPART_BOUNDARY = "ylx-preview"
 
 
@@ -34,6 +36,10 @@ class LatestPreviewBuffer:
         if stream_fps < 1:
             raise ValueError("stream_fps must be at least 1")
         self._stream_fps = stream_fps
+        try:
+            self._native: NativePreviewBuffer | None = create_native_preview_buffer(stream_fps)
+        except NativeModuleError:
+            self._native = None
         self._condition = threading.Condition()
         self._latest: _Frame | None = None
         self._sequence = 0
@@ -41,6 +47,8 @@ class LatestPreviewBuffer:
     def publish(self, jpeg: bytes) -> int:
         if not isinstance(jpeg, bytes) or not jpeg:
             raise ValueError("preview JPEG must be non-empty bytes")
+        if self._native is not None:
+            return self._native.publish(jpeg)
         with self._condition:
             self._sequence += 1
             self._latest = _Frame(self._sequence, jpeg)
@@ -48,9 +56,16 @@ class LatestPreviewBuffer:
             return self._sequence
 
     def clear(self) -> None:
+        if self._native is not None:
+            self._native.clear()
+            return
         with self._condition:
             self._latest = None
             self._condition.notify_all()
+
+    @property
+    def native_owner(self) -> NativePreviewBuffer | None:
+        return self._native
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
         if accept == "multipart/x-mixed-replace":
@@ -66,7 +81,11 @@ class LatestPreviewBuffer:
             raise ValueError("fps must be at least 1")
         self._snapshot()
         fps = self._stream_fps if requested_fps is None else min(requested_fps, self._stream_fps)
-        body = MultipartPreview(self, fps=fps)
+        body: Iterator[bytes]
+        if self._native is None:
+            body = MultipartPreview(self, fps=fps)
+        else:
+            body = self._native.multipart_stream(fps)
         return PreviewResponse(
             f"multipart/x-mixed-replace; boundary={MULTIPART_BOUNDARY}",
             body,
@@ -74,6 +93,12 @@ class LatestPreviewBuffer:
         )
 
     def _snapshot(self) -> _Frame:
+        if self._native is not None:
+            try:
+                sequence, jpeg = self._native.jpeg()
+            except RuntimeError as exc:
+                _raise_native_preview_error(exc)
+            return _Frame(sequence, jpeg)
         with self._condition:
             if self._latest is None:
                 raise PreviewFrameUnavailable("no preview frame is currently available")
@@ -93,6 +118,9 @@ class LatestPreviewBuffer:
             return self._latest
 
     def _wake_streams(self) -> None:
+        if self._native is not None:
+            self._native.wake_streams()
+            return
         with self._condition:
             self._condition.notify_all()
 
@@ -138,3 +166,11 @@ def multipart_part(jpeg: bytes) -> bytes:
         f"--{MULTIPART_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n"
     ).encode("ascii")
     return header + jpeg + b"\r\n"
+
+
+def _raise_native_preview_error(error: RuntimeError) -> None:
+    raw = str(error)
+    code, separator, message = raw.partition(": ")
+    if separator and code == "preview_unavailable":
+        raise PreviewFrameUnavailable(message) from error
+    raise error

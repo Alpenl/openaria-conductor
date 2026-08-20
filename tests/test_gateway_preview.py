@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -251,6 +252,54 @@ class GatewayPreviewHttpTest(unittest.TestCase):
                 close()
             response.close()
             connection.close()
+
+    def test_preview_retains_the_original_owned_bytes_without_copying(self) -> None:
+        buffer = LatestPreviewBuffer(stream_fps=15)
+        payload = bytes(bytearray(STREAM_INITIAL))
+        buffer.publish(payload)
+        response = buffer.jpeg_response()
+        self.assertIs(response.body, payload)
+
+    def test_latest_preview_buffer_uses_native_owner_when_available(self) -> None:
+        class _NativePreview:
+            def __init__(self) -> None:
+                self.latest: tuple[int, bytes] | None = None
+                self.stream_fps: int | None = None
+                self.woken = False
+
+            def publish(self, jpeg: bytes) -> int:
+                self.latest = (7, jpeg)
+                return 7
+
+            def clear(self) -> None:
+                self.latest = None
+
+            def jpeg(self) -> tuple[int, bytes]:
+                if self.latest is None:
+                    raise RuntimeError("preview_unavailable: empty")
+                return self.latest
+
+            def multipart_stream(self, fps: int | None = None) -> object:
+                self.stream_fps = fps
+                return iter((b"native-stream",))
+
+            def wake_streams(self) -> None:
+                self.woken = True
+
+        native = _NativePreview()
+        with patch("rp_ylx.api.preview.create_native_preview_buffer", return_value=native):
+            buffer = LatestPreviewBuffer(stream_fps=15)
+        payload = bytes(bytearray(STREAM_LATEST))
+
+        self.assertEqual(buffer.publish(payload), 7)
+        jpeg = buffer.jpeg_response()
+        stream = buffer.multipart_response(30)
+        buffer._wake_streams()
+
+        self.assertIs(jpeg.body, payload)
+        self.assertEqual(list(stream.body), [b"native-stream"])
+        self.assertEqual(native.stream_fps, 15)
+        self.assertTrue(native.woken)
 
 
 if __name__ == "__main__":

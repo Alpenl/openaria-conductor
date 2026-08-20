@@ -1,13 +1,14 @@
 [Unit]
 Description=RP-YLX RDK X5 capture service
-After=network-online.target NetworkManager.service
-Wants=network-online.target
+After=rp-ylx-data-volume.service network-online.target NetworkManager.service
+Wants=rp-ylx-data-volume.service network-online.target
 
 [Service]
 Type=simple
 User=rp-ylx
 Group=rp-ylx
-SupplementaryGroups=video
+# vpu/jpu/vps carry codec nodes; misc carries the RDK X5 ION allocator.
+SupplementaryGroups=video vpu jpu vps misc
 ExecStartPre=+/usr/local/sbin/rp-ylx-deploy recover
 ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve --config /etc/rp-ylx/device.json
 Restart=on-failure

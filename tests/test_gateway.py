@@ -301,9 +301,9 @@ class GatewayHttpTest(unittest.TestCase):
         )
         denied = Principal("denied", permissions={})
         self.policy = SecurityPolicy.customer(
-            tokens={"reader-token": reader, "denied-token": denied},
+            tokens={"reader": reader, "denied": denied},
             allowed_origins={"http://127.0.0.1:4173"},
-            csrf_token="browser-csrf-token",
+            csrf_token="csrf",
         )
         self.server = create_gateway_server("127.0.0.1", 0, DeviceProvider(), security=self.policy)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -394,7 +394,7 @@ class GatewayHttpTest(unittest.TestCase):
     def test_embedded_web_same_origin_command_does_not_need_a_second_secret(self) -> None:
         status, payload, headers = self.request(
             "/api/v3/capture/start",
-            token="reader-token",
+            token="reader",
             headers={
                 "Origin": self.base,
                 "Idempotency-Key": "embedded-web-start",
@@ -413,7 +413,7 @@ class GatewayHttpTest(unittest.TestCase):
 
         status, payload, _ = self.request(
             "/api/v3/capture/stop",
-            token="reader-token",
+            token="reader",
             headers={
                 "Origin": self.base,
                 "Idempotency-Key": "embedded-web-stop",
@@ -437,25 +437,25 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(json.loads(payload)["error"]["code"], "unauthorized")
 
             with self.subTest(path=path, credential="forbidden"):
-                status, payload, _ = self.request(path, token="denied-token")
+                status, payload, _ = self.request(path, token="denied")
                 self.assertEqual(status, 403)
                 self.assertEqual(json.loads(payload)["error"]["code"], "forbidden")
 
             with self.subTest(path=path, credential="allowed"):
-                status, payload, headers = self.request(path, token="reader-token")
+                status, payload, headers = self.request(path, token="reader")
                 self.assertEqual(status, 200)
                 self.assertEqual(headers["Cache-Control"], "no-store")
                 version = path.split("/")[2]
                 self.assertEqual(json.loads(payload)["schema"], f"ylx.device.{version}")
 
-        status, payload, _ = self.request("/api/v4/device", token="reader-token")
+        status, payload, _ = self.request("/api/v4/device", token="reader")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
     def test_repeated_authorization_headers_fail_closed_regardless_of_order(self) -> None:
         for values in (
-            ("Bearer reader-token", "Bearer wrong-token"),
-            ("Bearer wrong-token", "Bearer reader-token"),
+            ("Bearer reader", "Bearer wrong-token"),
+            ("Bearer wrong-token", "Bearer reader"),
         ):
             with self.subTest(values=values):
                 connection = http.client.HTTPConnection(
@@ -480,7 +480,7 @@ class GatewayHttpTest(unittest.TestCase):
             "GET",
             "/api/v3/device",
             (
-                ("Authorization", "Bearer reader-token"),
+                ("Authorization", "Bearer reader"),
                 ("Origin", "http://127.0.0.1:4173"),
                 ("Origin", "http://127.0.0.1:4173"),
             ),
@@ -500,9 +500,9 @@ class GatewayHttpTest(unittest.TestCase):
             separators=(",", ":"),
         ).encode()
         common = (
-            ("Authorization", "Bearer reader-token"),
+            ("Authorization", "Bearer reader"),
             ("Origin", "http://127.0.0.1:4173"),
-            ("X-CSRF-Token", "browser-csrf-token"),
+            ("X-CSRF-Token", "csrf"),
             ("Idempotency-Key", "raw-header-test"),
             ("Content-Type", "application/json"),
             ("Content-Length", str(len(body))),
@@ -511,7 +511,7 @@ class GatewayHttpTest(unittest.TestCase):
             ("Content-Type", "application/json", 400, "invalid_request"),
             ("Content-Length", str(len(body)), 400, "invalid_request"),
             ("Idempotency-Key", "raw-header-test", 400, "invalid_request"),
-            ("X-CSRF-Token", "browser-csrf-token", 403, "csrf_forbidden"),
+            ("X-CSRF-Token", "csrf", 403, "csrf_forbidden"),
         )
         for name, value, expected_status, expected_code in cases:
             with self.subTest(header=name):
@@ -565,9 +565,7 @@ class GatewayHttpTest(unittest.TestCase):
 
     def test_status_is_exact_and_commands_are_principal_scoped_and_csrf_protected(self) -> None:
         for version in ("v2", "v3"):
-            status, payload, _ = self.request(
-                f"/api/{version}/capture/status", token="reader-token"
-            )
+            status, payload, _ = self.request(f"/api/{version}/capture/status", token="reader")
             self.assertEqual(status, 200)
             self.assertEqual(payload, json.dumps(CAPTURE_STATUS, separators=(",", ":")).encode())
 
@@ -578,12 +576,12 @@ class GatewayHttpTest(unittest.TestCase):
         }
         mutation_headers = {
             "Origin": "http://127.0.0.1:4173",
-            "X-CSRF-Token": "browser-csrf-token",
+            "X-CSRF-Token": "csrf",
             "Idempotency-Key": "same-visible-key",
         }
         status, first, headers = self.request(
             "/api/v3/capture/start",
-            token="reader-token",
+            token="reader",
             headers=mutation_headers,
             body=start,
         )
@@ -593,7 +591,7 @@ class GatewayHttpTest(unittest.TestCase):
 
         status, repeated, headers = self.request(
             "/api/v3/capture/start",
-            token="reader-token",
+            token="reader",
             headers=mutation_headers,
             body=start,
         )
@@ -604,7 +602,7 @@ class GatewayHttpTest(unittest.TestCase):
         changed = {**start, "display_name": "另一个请求"}
         status, payload, _ = self.request(
             "/api/v3/capture/start",
-            token="reader-token",
+            token="reader",
             headers=mutation_headers,
             body=changed,
         )
@@ -616,7 +614,7 @@ class GatewayHttpTest(unittest.TestCase):
         }
         status, payload, _ = self.request(
             "/api/v3/capture/stop",
-            token="reader-token",
+            token="reader",
             headers=missing_csrf,
             body={"schema": "ylx.capture-stop.v2", "reason": "user"},
         )
@@ -625,7 +623,7 @@ class GatewayHttpTest(unittest.TestCase):
 
         status, payload, _ = self.request(
             "/api/v3/capture/stop",
-            token="reader-token",
+            token="reader",
             headers={**mutation_headers, "Idempotency-Key": "stop-on-idle"},
             body={"schema": "ylx.capture-stop.v2", "reason": "user"},
         )
@@ -637,18 +635,18 @@ class GatewayHttpTest(unittest.TestCase):
 
         status, payload, _ = self.request(
             "/api/v3/capture/status",
-            token="reader-token",
+            token="reader",
         )
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
 
         headers = {
             "Origin": "http://127.0.0.1:4173",
-            "X-CSRF-Token": "browser-csrf-token",
+            "X-CSRF-Token": "csrf",
         }
         status, payload, _ = self.request(
             "/api/v3/capture/start",
-            token="reader-token",
+            token="reader",
             headers={**headers, "Idempotency-Key": "invalid-start-status"},
             body={
                 "schema": "ylx.capture-start.v2",
@@ -662,7 +660,7 @@ class GatewayHttpTest(unittest.TestCase):
         self.server.provider.stop_status = 202
         status, payload, _ = self.request(
             "/api/v3/capture/stop",
-            token="reader-token",
+            token="reader",
             headers={**headers, "Idempotency-Key": "invalid-stop-status"},
             body={"schema": "ylx.capture-stop.v2", "reason": "user"},
         )
@@ -673,7 +671,7 @@ class GatewayHttpTest(unittest.TestCase):
         take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
         status, payload, _ = self.request(
             f"/api/v3/sessions?cursor=next-page&limit=17&take_id={take_id}",
-            token="reader-token",
+            token="reader",
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), SESSION_LIST)
@@ -681,14 +679,12 @@ class GatewayHttpTest(unittest.TestCase):
 
         for query in ("limit=0", "limit=201", "limit=abc", "cursor=", "take_id=wrong"):
             with self.subTest(query=query):
-                status, payload, _ = self.request(f"/api/v3/sessions?{query}", token="reader-token")
+                status, payload, _ = self.request(f"/api/v3/sessions?{query}", token="reader")
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
 
     def test_manifest_outcome_and_safe_swap_are_exact_persisted_resources(self) -> None:
-        status, manifest, headers = self.request(
-            f"/api/v3/sessions/{SESSION_ID}", token="reader-token"
-        )
+        status, manifest, headers = self.request(f"/api/v3/sessions/{SESSION_ID}", token="reader")
         self.assertEqual(status, 200)
         self.assertEqual(manifest, MANIFEST_BYTES)
         self.assertEqual(headers["Content-Type"], "application/json")
@@ -696,12 +692,12 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(headers["YLX-Manifest-SHA256"], MANIFEST_DIGEST)
 
         status, payload, _ = self.request(
-            f"/api/v3/sessions/{SESSION_ID}/unsuccessful-outcome", token="reader-token"
+            f"/api/v3/sessions/{SESSION_ID}/unsuccessful-outcome", token="reader"
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), RETAINED_OUTCOME)
 
-        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader-token")
+        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), SAFE_SWAP_V3)
         self.assertNotIn("handle_audit", json.loads(payload)["receipt"])
@@ -716,21 +712,21 @@ class GatewayHttpTest(unittest.TestCase):
                 else:
                     malformed["receipt"]["open_handle_count"] = False
                 self.server.provider.safe_swap = malformed
-                status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader-token")
+                status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader")
                 self.assertEqual(status, 404)
                 self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
         self.server.provider.safe_swap = deepcopy(SAFE_SWAP_V2)
-        status, payload, _ = self.request("/api/v2/capture/safe-swap", token="reader-token")
+        status, payload, _ = self.request("/api/v2/capture/safe-swap", token="reader")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), SAFE_SWAP_V2)
 
-        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader-token")
+        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
         self.server.provider.safe_swap = deepcopy(SAFE_SWAP_V3)
-        status, payload, _ = self.request("/api/v2/capture/safe-swap", token="reader-token")
+        status, payload, _ = self.request("/api/v2/capture/safe-swap", token="reader")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
@@ -811,7 +807,7 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(json.loads(payload)["schema"], "ylx.api-error.v2")
 
         self.server.provider.safe_swap = None
-        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader-token")
+        status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 

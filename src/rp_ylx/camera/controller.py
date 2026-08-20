@@ -11,11 +11,20 @@ from rp_ylx.camera.models import (
     CameraMode,
     CameraStream,
     FrameObservation,
+    StereoFrame,
 )
+from rp_ylx.native import (
+    NativeCameraFrameValidator,
+    NativeModuleError,
+    create_native_camera_frame_validator,
+)
+from rp_ylx.performance.metrics import PerformanceMetrics
 
 
 class CameraController:
-    def __init__(self, backend: CameraBackend) -> None:
+    def __init__(
+        self, backend: CameraBackend, *, metrics: PerformanceMetrics | None = None
+    ) -> None:
         self._backend = backend
         self._stream: CameraStream | None = None
         self._descriptor: CameraDescriptor | None = None
@@ -23,6 +32,13 @@ class CameraController:
         self._state = "closed"
         self._last_source_sequence: int | None = None
         self._last_host_time: int | None = None
+        self._metrics = metrics
+        try:
+            self._native_frame_validator: NativeCameraFrameValidator | None = (
+                create_native_camera_frame_validator()
+            )
+        except NativeModuleError:
+            self._native_frame_validator = None
 
     @property
     def state(self) -> str:
@@ -72,8 +88,7 @@ class CameraController:
         self._descriptor = descriptor
         self._mode = mode
         self._state = "open"
-        self._last_source_sequence = None
-        self._last_host_time = None
+        self._reset_frame_validation()
         return descriptor
 
     def start(self) -> None:
@@ -94,23 +109,7 @@ class CameraController:
             raise CameraError("invalid_state", "相机尚未开始采集")
         try:
             frame = self._stream.read(timeout)
-            if (
-                not frame.valid
-                or frame.source_sequence < 0
-                or frame.host_monotonic_ns < 0
-                or not ((frame.left and frame.right) or frame.raw_side_by_side)
-            ):
-                raise CameraError("bad_frame", "相机返回不完整或无效双目帧")
-            dropped = 0
-            if self._last_source_sequence is not None:
-                if frame.source_sequence <= self._last_source_sequence:
-                    raise CameraError("sequence_regression", "相机帧序号重复或回退")
-                dropped = frame.source_sequence - self._last_source_sequence - 1
-            if self._last_host_time is not None and frame.host_monotonic_ns <= self._last_host_time:
-                raise CameraError("timestamp_regression", "相机主机时间戳重复或回退")
-            self._last_source_sequence = frame.source_sequence
-            self._last_host_time = frame.host_monotonic_ns
-            return FrameObservation(frame=frame, dropped_before=dropped)
+            return FrameObservation(frame=frame, dropped_before=self._validate_frame(frame))
         except CameraError:
             with suppress(Exception):
                 self.close()
@@ -141,13 +140,106 @@ class CameraController:
         self._descriptor = None
         self._mode = None
         self._state = "closed"
-        self._last_source_sequence = None
-        self._last_host_time = None
+        self._reset_frame_validation()
         if stream is not None:
             stream.close()
+
+    def _reset_frame_validation(self) -> None:
+        self._last_source_sequence = None
+        self._last_host_time = None
+        if self._native_frame_validator is not None:
+            try:
+                self._native_frame_validator.reset()
+            except Exception:
+                self._native_frame_validator = None
+
+    def _validate_frame(self, frame: StereoFrame) -> int:
+        if self._native_frame_validator is not None:
+            return self._validate_frame_native(frame)
+        return self._validate_frame_python(frame)
+
+    def _validate_frame_native(self, frame: StereoFrame) -> int:
+        raw = frame.raw_side_by_side
+        try:
+            result = self._native_frame_validator.validate_frame(
+                frame.source_sequence,
+                frame.host_monotonic_ns,
+                frame.valid,
+                bool(frame.left),
+                bool(frame.right),
+                raw is not None and bool(raw),
+                frame._application_dropped_before,
+            )
+            dropped = _native_non_negative_int(result.get("dropped_before"), "dropped_before")
+            queue_rejected = _native_non_negative_int(
+                result.get("queue_rejected"), "queue_rejected"
+            )
+            source_gap = _native_non_negative_int(result.get("source_gap"), "source_gap")
+        except CameraError:
+            raise
+        except Exception as exc:
+            raise _camera_error_from_native(exc, "native_camera_frame_validator_failed") from exc
+        if self._metrics is not None:
+            if queue_rejected:
+                self._metrics.record_loss("queue_rejected", queue_rejected)
+            if source_gap:
+                self._metrics.record_loss("source_gap", source_gap)
+        return dropped
+
+    def _validate_frame_python(self, frame: StereoFrame) -> int:
+        if (
+            not frame.valid
+            or frame.source_sequence < 0
+            or frame.host_monotonic_ns < 0
+            or not ((frame.left and frame.right) or frame.raw_side_by_side)
+        ):
+            raise CameraError("bad_frame", "相机返回不完整或无效双目帧")
+        dropped = 0
+        application_dropped = frame._application_dropped_before
+        if self._last_source_sequence is not None:
+            if frame.source_sequence <= self._last_source_sequence:
+                raise CameraError("sequence_regression", "相机帧序号重复或回退")
+            dropped = frame.source_sequence - self._last_source_sequence - 1
+            if application_dropped > dropped:
+                raise CameraError(
+                    "invalid_drop_accounting",
+                    "应用丢帧计数超过相机源序列缺口",
+                )
+            if self._metrics is not None:
+                if application_dropped:
+                    self._metrics.record_loss("queue_rejected", application_dropped)
+                source_dropped = dropped - application_dropped
+                if source_dropped:
+                    self._metrics.record_loss("source_gap", source_dropped)
+        elif application_dropped:
+            dropped = application_dropped
+            if self._metrics is not None:
+                self._metrics.record_loss("queue_rejected", application_dropped)
+        if self._last_host_time is not None and frame.host_monotonic_ns <= self._last_host_time:
+            raise CameraError("timestamp_regression", "相机主机时间戳重复或回退")
+        self._last_source_sequence = frame.source_sequence
+        self._last_host_time = frame.host_monotonic_ns
+        return dropped
 
     def __enter__(self) -> CameraController:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+def _native_non_negative_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise CameraError(
+            "native_camera_frame_validator_failed",
+            f"原生相机帧校验结果字段无效：{name}",
+        )
+    return value
+
+
+def _camera_error_from_native(error: BaseException, fallback_code: str) -> CameraError:
+    raw = str(error)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = fallback_code, raw or fallback_code
+    return CameraError(code, message)
