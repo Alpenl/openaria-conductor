@@ -545,7 +545,10 @@ impl Runtime {
         if inflight == 0 {
             state.recording = None;
             self.shared.changed.notify_all();
-            return Ok(snapshot_locked(&state));
+            let snapshot = snapshot_locked(&state);
+            drop(state);
+            self.stop_imu_worker(timeout)?;
+            return Ok(snapshot);
         }
         let (state, wait_result) = self
             .shared
@@ -1286,6 +1289,7 @@ fn snapshot_locked(state: &State) -> RuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::types::PyBytes;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1369,5 +1373,48 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_recording_clears_imu_worker_when_no_frames_are_inflight() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let runtime = Runtime::new(
+                Arc::new(Stream::test_idle(1)),
+                Arc::new(LatestBuffer::new(30).unwrap()),
+                1,
+                Duration::from_millis(10),
+                None,
+            )
+            .unwrap();
+            let submit_frame = PyBytes::new(py, b"submit-frame").into_any().unbind();
+            let on_failure = PyBytes::new(py, b"on-failure").into_any().unbind();
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                state.running = true;
+                state.fanout.start_recording().unwrap();
+                state.recording = Some(RecordingTarget::Callbacks(RecordingCallbacks {
+                    submit_frame,
+                    on_failure,
+                    imu: None,
+                }));
+            }
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let _ = done_tx.send(());
+            });
+            *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
+                handle,
+                done: done_rx,
+            });
+
+            let snapshot = runtime.stop_recording(Duration::from_secs(1)).unwrap();
+
+            assert!(!snapshot.recording_present);
+            assert!(
+                runtime.imu_worker.lock().unwrap().is_none(),
+                "stop_recording must clear a completed IMU worker even when no frames are inflight",
+            );
+        });
     }
 }

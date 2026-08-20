@@ -696,6 +696,27 @@ class SplitEyeRecordingTest(unittest.TestCase):
         self.assertGreaterEqual(queues[0].put_calls, 4)
         self.assertGreaterEqual(queues[0].get_calls, 4)
 
+    def test_active_take_pending_allows_writer_inflight_plus_queue_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder, _, _ = self.build(root, queue_capacity=2)
+
+            snapshot = {
+                "session_id": recorder._plan.session_id,
+                "frame_domain": 3,
+                "frames_written": 0,
+                "pending_frames": 3,
+                "drop_events": [],
+            }
+            recorder._apply_active_take_snapshot(snapshot, expected_frames_written=0)
+
+            self.assertEqual(recorder._frame_domain, 3)
+
+            snapshot["pending_frames"] = 4
+            with self.assertRaises(DeviceRecordingError) as raised:
+                recorder._apply_active_take_snapshot(snapshot, expected_frames_written=0)
+            self.assertEqual(raised.exception.code, "active_take_writer_failed")
+
     def test_split_eye_native_targets_expose_direct_sink_owners(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

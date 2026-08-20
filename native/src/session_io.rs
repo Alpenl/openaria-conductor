@@ -539,9 +539,9 @@ pub fn verify_device_session_artifacts(
     }
     let root = open_directory(session_root, "artifact_invalid", "无法安全打开会话目录")?;
     for artifact in &artifacts {
-        let expected_identity = expected.get(artifact.path.as_str()).ok_or_else(|| {
-            SessionIoError::new("artifact_invalid", "artifact 缺少封存身份")
-        })?;
+        let expected_identity = expected
+            .get(artifact.path.as_str())
+            .ok_or_else(|| SessionIoError::new("artifact_invalid", "artifact 缺少封存身份"))?;
         if expected_identity.size != artifact.bytes {
             return Err(SessionIoError::new(
                 "artifact_invalid",
@@ -572,7 +572,10 @@ pub fn seal_device_session(
     control_names: &[String],
 ) -> Result<DeviceSessionSealResult, SessionIoError> {
     if final_root.exists() {
-        return Err(SessionIoError::new("session_exists", "最终会话目录已经存在"));
+        return Err(SessionIoError::new(
+            "session_exists",
+            "最终会话目录已经存在",
+        ));
     }
     let artifact_count = verify_device_session_artifacts(
         partial_root,
@@ -612,9 +615,8 @@ pub fn seal_device_session(
     Ok(DeviceSessionSealResult {
         manifest_sha256: hex_digest(Sha256::digest(manifest_payload).as_slice()),
         artifact_count,
-        manifest_bytes: u64::try_from(manifest_payload.len()).map_err(|_| {
-            SessionIoError::new("write_failed", "manifest 大小超出可表示范围")
-        })?,
+        manifest_bytes: u64::try_from(manifest_payload.len())
+            .map_err(|_| SessionIoError::new("write_failed", "manifest 大小超出可表示范围"))?,
     })
 }
 
@@ -1106,11 +1108,7 @@ fn expected_identity_map(
     Ok(by_path)
 }
 
-fn open_directory(
-    path: &Path,
-    code: &'static str,
-    context: &str,
-) -> Result<File, SessionIoError> {
+fn open_directory(path: &Path, code: &'static str, context: &str) -> Result<File, SessionIoError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1161,10 +1159,10 @@ fn validate_control_name(name: &str) -> Result<(), SessionIoError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        device_session_v1_artifact, device_session_v1_artifacts, device_session_v1_summary,
-        finalize_artifact, hash_file, open_relative_regular, read_fd_bounded, seal_device_session,
-        sendfile_all, verify_device_session_artifacts, verify_fd, write_encoder_frame,
-        ExpectedArtifactIdentity,
+        ExpectedArtifactIdentity, device_session_v1_artifact, device_session_v1_artifacts,
+        device_session_v1_summary, finalize_artifact, hash_file, open_relative_regular,
+        read_fd_bounded, seal_device_session, sendfile_all, verify_device_session_artifacts,
+        verify_fd, write_encoder_frame,
     };
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -1487,10 +1485,12 @@ mod tests {
         assert!(final_root.join("manifest.json").is_file());
         assert!(!final_root.join("recording.json").exists());
         assert!(!final_root.join("capture.json").exists());
-        assert_eq!(fs::read(final_root.join("manifest.json")).unwrap(), manifest);
         assert_eq!(
-            verify_device_session_artifacts(&final_root, &manifest, session_id, &expected)
-                .unwrap(),
+            fs::read(final_root.join("manifest.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            verify_device_session_artifacts(&final_root, &manifest, session_id, &expected).unwrap(),
             3
         );
     }

@@ -1526,10 +1526,11 @@ class DeviceSessionRecorder:
         with self._counter_lock:
             self._frame_domain = frame_domain
             self._drop_events = drop_events
-            if expected_frames_written is not None and pending_frames > self._queue_depth():
+            max_pending_frames = self._queue_capacity + 1
+            if expected_frames_written is not None and pending_frames > max_pending_frames:
                 raise DeviceRecordingError(
                     "active_take_writer_failed",
-                    "active take pending 帧数超过录制队列深度",
+                    "active take pending 帧数超过录制队列容量",
                 )
 
     def _reserve_frame_sequence(self, observation: FrameObservation) -> int:

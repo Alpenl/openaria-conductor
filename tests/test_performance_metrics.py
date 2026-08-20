@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rp_ylx.camera import (
     CameraController,
@@ -13,12 +14,26 @@ from rp_ylx.camera import (
     StereoFrame,
     SyntheticCameraBackend,
 )
+from rp_ylx.native import NativeModuleError
 from rp_ylx.performance import PerformanceMetrics
 from rp_ylx.recording import RecordingConfig, SessionRecorder
 from tests.test_camera import MODE
 
 
 class PerformanceMetricsTest(unittest.TestCase):
+    def test_zero_byte_copies_are_not_reported(self) -> None:
+        with patch(
+            "rp_ylx.performance.metrics.create_native_performance_metrics",
+            side_effect=NativeModuleError("native_unavailable", "test fallback"),
+        ):
+            metrics = PerformanceMetrics()
+
+        metrics.record_copy("empty_left", 0)
+        metrics.record_copy("empty_right", 0, count=3)
+        metrics.record_copy("no_count", 512, count=0)
+
+        self.assertEqual(metrics.snapshot().copies, ())
+
     def test_queue_observation_accepts_real_peak_and_rejects_impossible_values(self) -> None:
         metrics = PerformanceMetrics()
         metrics.observe_queue(depth=2, peak_depth=4, capacity=4, rejected=1)

@@ -350,6 +350,22 @@ impl Stream {
     pub(crate) fn stats(&self) -> QueueStats {
         self.consumer.stats()
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_idle(queue_capacity: usize) -> Self {
+        let (producer, consumer) = bounded::channel(queue_capacity);
+        Self {
+            lifecycle: Mutex::new(Lifecycle {
+                state: State::Stopped,
+                resources: None,
+                worker: None,
+            }),
+            stop: Arc::new(AtomicBool::new(false)),
+            producer,
+            consumer,
+            terminal_error: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl Drop for Stream {

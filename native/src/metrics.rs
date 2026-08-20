@@ -125,7 +125,7 @@ impl Metrics {
         size: u64,
         count: u64,
     ) -> Result<(), MetricsError> {
-        if count == 0 {
+        if size == 0 || count == 0 {
             return Ok(());
         }
         let mut state = self.state.lock().map_err(|_| {
@@ -326,7 +326,7 @@ fn percentile(histogram: &[u64; 64], samples: u64, percentile: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{percentile, stage_bucket};
+    use super::{Metrics, percentile, stage_bucket};
 
     #[test]
     fn stage_bucket_matches_python_bit_length_shape() {
@@ -344,5 +344,15 @@ mod tests {
         histogram[3] = 2;
         assert_eq!(percentile(&histogram, 4, 0.50), 1);
         assert_eq!(percentile(&histogram, 4, 0.95), 4);
+    }
+
+    #[test]
+    fn zero_byte_copies_are_not_reported() {
+        let metrics = Metrics::new();
+        metrics.record_copy("empty_left", 0, 1).unwrap();
+        metrics.record_copy("empty_right", 0, 3).unwrap();
+        metrics.record_copy("no_count", 512, 0).unwrap();
+
+        assert!(metrics.state.lock().unwrap().copies.is_empty());
     }
 }

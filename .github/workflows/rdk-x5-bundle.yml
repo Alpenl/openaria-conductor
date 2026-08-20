@@ -1,0 +1,128 @@
+name: RDK X5 离线安装包
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "ci/**"
+      - "codex/**"
+      - "public-*"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/rdk-x5-bundle.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "build_backend.py"
+      - "native/**"
+      - "pyproject.toml"
+      - "scripts/build_rdk_x5_bundle.py"
+      - "scripts/rdk_x5_install.py"
+      - "src/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdk-x5-bundle-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建 RDK X5 bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RDK_RUNTIME_NAME: cpython-3.11.16+20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
+      RDK_RUNTIME_URL: https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.11.16%2B20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
+      RDK_RUNTIME_SHA256: 9142c12dd3559eaac58a18d8905b99a293979d5e5a1b4fb5cf4cebbf82ef6f33
+      RDK_WHEEL: dist-aarch64/rp_ylx-0.1.0-cp311-abi3-manylinux_2_28_aarch64.whl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: 安装 Rust aarch64 target
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-gnu
+          rustup default stable
+
+      - name: 暴露 zig linker
+        run: |
+          zig_dir="$(
+            uv run --with ziglang==0.16.0 python - <<'PY'
+          from pathlib import Path
+          import ziglang
+
+          print(Path(ziglang.__file__).resolve().parent)
+          PY
+          )"
+          test -x "$zig_dir/zig"
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          "$zig_dir/zig" version
+
+      - name: 构建 aarch64 manylinux wheel
+        run: |
+          uv run --python 3.11 --no-project --with 'build>=1,<2' python -m build \
+            --wheel \
+            --outdir dist-aarch64 \
+            -Cbuild-args="--target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 --zig"
+
+      - name: 校验 wheel 身份
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+          import zipfile
+
+          wheel = Path(os.environ["RDK_WHEEL"])
+          expected_sha = os.environ["GITHUB_SHA"]
+          if not wheel.is_file():
+              raise SystemExit(f"missing wheel: {wheel}")
+          with zipfile.ZipFile(wheel) as archive:
+              build_info = archive.read("rp_ylx/_build_info.py").decode()
+              wheel_metadata = archive.read("rp_ylx-0.1.0.dist-info/WHEEL").decode()
+          if expected_sha not in build_info:
+              sys.stderr.write(build_info)
+              raise SystemExit(f"wheel build_info does not contain {expected_sha}")
+          expected_tag = "Tag: cp311-abi3-manylinux_2_28_aarch64"
+          if expected_tag not in wheel_metadata:
+              sys.stderr.write(wheel_metadata)
+              raise SystemExit(f"wheel tag is not {expected_tag}")
+          PY
+
+      - name: 下载并校验 package-owned runtime
+        run: |
+          mkdir -p dist-runtime
+          curl -fL "$RDK_RUNTIME_URL" -o "dist-runtime/$RDK_RUNTIME_NAME"
+          printf '%s  %s\n' "$RDK_RUNTIME_SHA256" "dist-runtime/$RDK_RUNTIME_NAME" \
+            | sha256sum --check --strict
+
+      - name: 生成 RDK X5 离线 bundle
+        run: |
+          PYTHONPATH=src uv run --python 3.11 --no-project python scripts/build_rdk_x5_bundle.py \
+            --application-wheel "$RDK_WHEEL" \
+            --runtime "dist-runtime/$RDK_RUNTIME_NAME" \
+            --output dist-rdk-x5 \
+            --version 0.1.0
+          printf 'rp-ylx 0.1.0 (%s)\n' "$GITHUB_SHA" > dist-rdk-x5/build-info.txt
+
+      - name: 校验 bundle manifest
+        run: |
+          PYTHONPATH=src uv run --python 3.11 --no-project python - <<'PY'
+          from pathlib import Path
+          from rp_ylx.deployment import load_bundle
+
+          bundle = load_bundle(Path("dist-rdk-x5"))
+          print(bundle.version)
+          print(bundle.commit)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp-ylx-rdk-x5-${{ github.sha }}
+          path: dist-rdk-x5/
+          if-no-files-found: error

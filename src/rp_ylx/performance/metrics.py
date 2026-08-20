@@ -103,7 +103,7 @@ class PerformanceMetrics:
     def record_copy(self, name: str, size: int, *, count: int = 1) -> None:
         if size < 0 or count < 0:
             raise ValueError("copy size and count cannot be negative")
-        if count == 0:
+        if size == 0 or count == 0:
             return
         if self._native is not None:
             self._native.record_copy(name, size, count)
