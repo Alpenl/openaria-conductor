@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import threading
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -59,6 +60,9 @@ _SESSION_IO_UNAVAILABLE = False
 _RANGE_PARSER_UNAVAILABLE = False
 _DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
 _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
+_VALIDATED_MANIFEST_CACHE_LIMIT = 32
+_VALIDATED_MANIFEST_CACHE_LOCK = threading.Lock()
+_VALIDATED_MANIFEST_CACHE: OrderedDict[tuple[str, str, str], Mapping[str, object]] = OrderedDict()
 
 
 class ArtifactAccessError(RuntimeError):
@@ -950,6 +954,26 @@ def _read_exact_file(descriptor: int, identity: _FileIdentity) -> bytes:
 
 
 def _validated_manifest(payload: bytes, session_id: str, api_version: str) -> Mapping[str, object]:
+    if api_version not in {"v2", "v3"}:
+        raise ValueError("api_version 必须是 v2 或 v3")
+    manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    cache_key = (api_version, session_id, manifest_sha256)
+    with _VALIDATED_MANIFEST_CACHE_LOCK:
+        cached = _VALIDATED_MANIFEST_CACHE.get(cache_key)
+        if cached is not None:
+            _VALIDATED_MANIFEST_CACHE.move_to_end(cache_key)
+            return cached
+        manifest = _decode_and_validate_manifest(payload, session_id, api_version)
+        _VALIDATED_MANIFEST_CACHE[cache_key] = manifest
+        _VALIDATED_MANIFEST_CACHE.move_to_end(cache_key)
+        while len(_VALIDATED_MANIFEST_CACHE) > _VALIDATED_MANIFEST_CACHE_LIMIT:
+            _VALIDATED_MANIFEST_CACHE.popitem(last=False)
+        return manifest
+
+
+def _decode_and_validate_manifest(
+    payload: bytes, session_id: str, api_version: str
+) -> Mapping[str, object]:
     try:
         decoded = payload.decode("utf-8")
         manifest = json.loads(
@@ -965,8 +989,6 @@ def _validated_manifest(payload: bytes, session_id: str, api_version: str) -> Ma
     is_v0 = (
         manifest.get("format") == "ylx.recording-session.v0" and manifest.get("state") == "sealed"
     )
-    if api_version not in {"v2", "v3"}:
-        raise ValueError("api_version 必须是 v2 或 v3")
     if not is_v1 and not (api_version == "v2" and is_v0):
         raise ArtifactAccessError("not_found", "会话不存在或尚未封存")
     if is_v1:
@@ -974,6 +996,11 @@ def _validated_manifest(payload: bytes, session_id: str, api_version: str) -> Ma
     else:
         _validate_recording_session_v0(manifest)
     return manifest
+
+
+def _clear_validated_manifest_cache_for_tests() -> None:
+    with _VALIDATED_MANIFEST_CACHE_LOCK:
+        _VALIDATED_MANIFEST_CACHE.clear()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

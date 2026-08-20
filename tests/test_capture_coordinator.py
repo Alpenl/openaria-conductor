@@ -39,6 +39,7 @@ from rp_ylx.recording import (
     initialize_capture_volume,
     validate_device_session_directory,
 )
+from rp_ylx.recording.coordinator import _TrackedRepresentation
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 
 JPEG = b"\xff\xd8raw-side-by-side\xff\xd9"
@@ -298,6 +299,48 @@ def imu_observation(
 
 
 class CaptureCoordinatorTest(unittest.TestCase):
+    def test_tracked_representation_forwards_send_to_fast_path(self) -> None:
+        calls: list[tuple[int, int, int | None]] = []
+        releases: list[bool] = []
+
+        class _Representation:
+            etag = '"etag"'
+            size = 4
+            content_type = "application/octet-stream"
+
+            def close(self) -> None:
+                return None
+
+            def read(self, offset: int = 0, length: int | None = None) -> bytes:
+                del offset, length
+                return b""
+
+            def iter_chunks(
+                self,
+                offset: int = 0,
+                length: int | None = None,
+                *,
+                chunk_size: int = 1024 * 1024,
+            ) -> object:
+                del offset, length, chunk_size
+                raise AssertionError("send_to fast path was not used")
+
+            def send_to(
+                self,
+                output_descriptor: int,
+                offset: int = 0,
+                length: int | None = None,
+            ) -> int:
+                calls.append((output_descriptor, offset, length))
+                return 2
+
+        tracked = _TrackedRepresentation(_Representation(), lambda: releases.append(True))
+
+        self.assertEqual(tracked.send_to(7, 1, 2), 2)
+        self.assertEqual(calls, [(7, 1, 2)])
+        tracked.close()
+        self.assertEqual(releases, [True])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

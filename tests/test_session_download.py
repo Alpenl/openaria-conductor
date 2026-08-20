@@ -487,6 +487,7 @@ class SessionDownloadHttpTest(unittest.TestCase):
 
 class DirectorySessionDownloadHttpTest(unittest.TestCase):
     def setUp(self) -> None:
+        downloads._clear_validated_manifest_cache_for_tests()
         self.temporary = tempfile.TemporaryDirectory()
         self.generation_root = Path(self.temporary.name) / "generation"
         self.session_root = self.generation_root / SESSION_ID
@@ -649,6 +650,7 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         self.temporary.cleanup()
         downloads._DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
         downloads._DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
+        downloads._clear_validated_manifest_cache_for_tests()
 
     def request(
         self,
@@ -978,6 +980,26 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
                 headers={"Range": "bytes=0-0"},
             )
         self.assertEqual((status, payload, artifact_sends), (206, ARTIFACT_BYTES[:1], [1]))
+
+    def test_verified_v1_manifest_validation_is_reused_for_artifact_ranges(self) -> None:
+        artifact_url = f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
+
+        with patch(
+            "rp_ylx.api.downloads._validate_device_session_v1",
+            wraps=downloads._validate_device_session_v1,
+        ) as validate_v1:
+            status, payload, _ = self.request(f"/api/v3/sessions/{SESSION_ID}")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload, self.manifest_bytes)
+
+            for _ in range(3):
+                status, payload, _ = self.request(
+                    artifact_url,
+                    headers={"Range": "bytes=0-0"},
+                )
+                self.assertEqual((status, payload), (206, ARTIFACT_BYTES[:1]))
+
+        self.assertEqual(validate_v1.call_count, 1)
 
     def test_manifest_path_replacement_after_open_sends_exact_locked_bytes(self) -> None:
         manifest_path = self.session_root / "manifest.json"

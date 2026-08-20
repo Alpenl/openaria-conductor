@@ -258,6 +258,21 @@ class _TrackedRepresentation:
     ) -> object:
         return self._representation.iter_chunks(offset, length, chunk_size=chunk_size)
 
+    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
+        send_to = getattr(self._representation, "send_to", None)
+        if callable(send_to):
+            return int(send_to(output_descriptor, offset, length))
+        sent = 0
+        for chunk in self.iter_chunks(offset, length):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_descriptor, view)
+                if written <= 0:
+                    raise BrokenPipeError("representation socket wrote zero bytes")
+                sent += written
+                view = view[written:]
+        return sent
+
 
 class _MultiRootSessionStore:
     """Read sealed sessions from the current recordings root and legacy roots."""
