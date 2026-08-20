@@ -6,13 +6,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rp_ylx.camera import CameraMode
 from rp_ylx.camera.models import StereoFrame
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.performance import BenchmarkConfig, BenchmarkError, run_benchmark
-from rp_ylx.performance.benchmark import _ExactCameraBackend, _preview_pair_for_frame
+from rp_ylx.performance.benchmark import (
+    _ExactCameraBackend,
+    _preview_pair_for_frame,
+    _run_native_continuous_hardware,
+)
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.performance.report import validate_performance_report
 
@@ -141,6 +146,114 @@ class PerformanceBenchmarkTest(unittest.TestCase):
                 with patch(f"rp_ylx.performance.benchmark.{factory_name}") as factory:
                     self.assertIs(backend.open(descriptor, mode), factory.return_value)
                 self.assertIs(factory.call_args.kwargs["metrics"], metrics)
+
+    def test_rust_recording_benchmark_uses_native_continuous_direct_sink(self) -> None:
+        class Recorder:
+            state = "new"
+
+            def __init__(self) -> None:
+                self._plan = SimpleNamespace(generation_id="generation-1")
+                self.started = False
+                self.failed = False
+
+            def start(self) -> None:
+                self.started = True
+                self.state = "recording"
+
+            def stop(self) -> object:
+                self.state = "sealed"
+                artifact = {
+                    "role": "video.raw-side-by-side",
+                    "path": "video/raw-sbs.mjpeg",
+                    "media_type": "video/x-motion-jpeg",
+                    "bytes": 100,
+                    "sha256": "0" * 64,
+                }
+                manifest = {
+                    "video": {"layout": "raw-side-by-side", "artifact": artifact},
+                    "frames": {
+                        "count": 42,
+                        "artifact": {**artifact, "role": "frames.index", "bytes": 7},
+                    },
+                    "imu": {
+                        "artifact": {**artifact, "role": "imu.samples", "bytes": 3},
+                    },
+                    "integrity": {"dropped_frames": 0},
+                }
+                return SimpleNamespace(manifest=manifest)
+
+            def fail(self, code: str, message: str) -> None:
+                del code, message
+                self.failed = True
+                self.state = "failed"
+
+            def submit_frame(self, observation: object) -> bool:
+                del observation
+                raise AssertionError("direct sink benchmark must not use Python submit_frame")
+
+            def submit_imu(self, observation: object) -> bool:
+                del observation
+                raise AssertionError("direct sink benchmark must not use Python submit_imu")
+
+        class Sources:
+            instances: list[Sources] = []
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args
+                self.preview = kwargs["preview"]
+                self.native_recorder: object | None = None
+                self.stopped = False
+                self.closed = False
+                Sources.instances.append(self)
+
+            def start(
+                self,
+                *,
+                mode: str,
+                generation_id: str,
+                submit_frame: object,
+                submit_imu: object,
+                on_failure: object,
+                native_recorder: object | None = None,
+            ) -> None:
+                del submit_frame, submit_imu, on_failure
+                self.mode = mode
+                self.generation_id = generation_id
+                self.native_recorder = native_recorder
+                self.preview.publish(LEFT)
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        recorder = Recorder()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("rp_ylx.performance.benchmark._new_recorder", return_value=recorder),
+            patch("rp_ylx.performance.benchmark.NativeContinuousCaptureSources", Sources),
+        ):
+            frames_input, frames_output, bytes_written = _run_native_continuous_hardware(
+                BenchmarkConfig(
+                    "concurrent",
+                    0.001,
+                    1,
+                    WHEEL_SHA256,
+                    recording_root=Path(directory),
+                    adapter="rust",
+                ),
+                PerformanceMetrics(),
+            )
+
+        self.assertEqual((frames_input, frames_output, bytes_written), (42, 42, 110))
+        self.assertTrue(recorder.started)
+        self.assertFalse(recorder.failed)
+        self.assertEqual(len(Sources.instances), 1)
+        self.assertIs(Sources.instances[0].native_recorder, recorder)
+        self.assertEqual(Sources.instances[0].generation_id, "generation-1")
+        self.assertTrue(Sources.instances[0].stopped)
+        self.assertTrue(Sources.instances[0].closed)
 
     def test_concurrent_preview_uses_raw_sbs_when_native_stream_does_not_split_eyes(self) -> None:
         frame = StereoFrame(7, 11, b"", b"", raw_side_by_side=LEFT + RIGHT)

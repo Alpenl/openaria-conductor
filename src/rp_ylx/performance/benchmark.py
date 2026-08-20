@@ -8,6 +8,7 @@ import resource
 import sys
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Literal
 from rp_ylx import __commit__, __version__
 from rp_ylx.api.downloads import iter_device_session_v1_artifacts
 from rp_ylx.api.mock_device import MockDevice
+from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable
 from rp_ylx.camera import CameraController, CameraDescriptor, CameraMode
 from rp_ylx.camera.models import CameraBackend, CameraStream, StereoFrame
 from rp_ylx.camera.v4l2 import (
@@ -25,6 +27,7 @@ from rp_ylx.camera.v4l2 import (
 )
 from rp_ylx.hardware import collect_hardware_facts
 from rp_ylx.hardware.target import RDK_X5_BOARD_ID, YLX_2UQ2_CAMERA_ID
+from rp_ylx.imu import NativeImuCollector
 from rp_ylx.native import (
     NativeModuleError,
     create_native_splitter,
@@ -35,6 +38,7 @@ from rp_ylx.performance.report import validate_performance_report
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
+    NativeContinuousCaptureSources,
     SessionPlan,
     StorageStatus,
     uuid7,
@@ -189,6 +193,92 @@ def _preview_pair_for_frame(frame: StereoFrame) -> tuple[bytes, bytes]:
     return left, right
 
 
+def _manifest_frame_count(manifest: dict[str, object]) -> int:
+    frames = manifest.get("frames")
+    if not isinstance(frames, dict):
+        raise BenchmarkError("invalid_session_manifest", "sealed session is missing frame count")
+    count = frames.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise BenchmarkError("invalid_session_manifest", "sealed session frame count is invalid")
+    return count
+
+
+def _manifest_dropped_frames(manifest: dict[str, object]) -> int:
+    integrity = manifest.get("integrity")
+    if not isinstance(integrity, dict):
+        raise BenchmarkError("invalid_session_manifest", "sealed session is missing integrity")
+    dropped = integrity.get("dropped_frames")
+    if isinstance(dropped, bool) or not isinstance(dropped, int) or dropped < 0:
+        raise BenchmarkError("invalid_session_manifest", "sealed session drop count is invalid")
+    return dropped
+
+
+def _run_native_continuous_hardware(
+    config: BenchmarkConfig, metrics: PerformanceMetrics
+) -> tuple[int, int, int]:
+    """Run Rust recording workloads through the production continuous runtime."""
+
+    if config.kind not in {"recording", "concurrent"}:
+        raise BenchmarkError(
+            "unsupported_native_continuous_workload",
+            "native continuous benchmark only supports recording/concurrent",
+        )
+    assert config.recording_root is not None
+    preview = LatestPreviewBuffer(stream_fps=15)
+    sources = NativeContinuousCaptureSources(
+        str(config.device),
+        lambda: NativeImuCollector(config.device),
+        TARGET_MODE,
+        preview=preview,
+        metrics=metrics,
+    )
+    recorder = _new_recorder(config, metrics)
+    failures: list[tuple[str, str]] = []
+
+    def on_failure(code: str, message: str) -> None:
+        failures.append((code, message))
+
+    try:
+        recorder.start()
+        sources.start(
+            mode="production",
+            generation_id=recorder._plan.generation_id,
+            submit_frame=recorder.submit_frame,
+            submit_imu=recorder.submit_imu,
+            on_failure=on_failure,
+            native_recorder=recorder,
+        )
+        deadline = time.monotonic() + config.duration_seconds
+        while time.monotonic() < deadline:
+            if failures:
+                code, message = failures[0]
+                raise BenchmarkError(code, message)
+            if config.kind == "concurrent":
+                with suppress(PreviewFrameUnavailable):
+                    preview.jpeg_response()
+            time.sleep(1 / 15)
+        sources.stop()
+        if failures:
+            code, message = failures[0]
+            raise BenchmarkError(code, message)
+        sealed = recorder.stop()
+        frames_output = _manifest_frame_count(sealed.manifest)
+        dropped = _manifest_dropped_frames(sealed.manifest)
+        bytes_written = sum(
+            int(artifact["bytes"]) for artifact in iter_device_session_v1_artifacts(sealed.manifest)
+        )
+        return frames_output + dropped, frames_output, bytes_written
+    except BaseException:
+        with suppress(BaseException):
+            sources.stop()
+        if recorder.state in {"recording", "finalizing"}:
+            with suppress(BaseException):
+                recorder.fail("benchmark_failed", "性能测试未完成")
+        raise
+    finally:
+        sources.close()
+
+
 def _run_trace(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[int, int, int]:
     assert config.trace is not None
     payload = config.trace.read_bytes()
@@ -220,6 +310,9 @@ def _run_trace(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[in
 
 
 def _run_hardware(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[int, int, int]:
+    if config.adapter == "rust" and config.kind in {"recording", "concurrent"}:
+        return _run_native_continuous_hardware(config, metrics)
+
     controller = CameraController(
         _ExactCameraBackend(config.device, metrics, config.adapter),
         metrics=metrics,
