@@ -1505,6 +1505,79 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_remount_after_safe_swap_invalidates_receipt_and_allows_new_capture(self) -> None:
+        mount_identity = "swap-mount-a"
+        coordinator = CaptureCoordinator(
+            CoordinatorConfig(
+                self.mountpoint,
+                self.state_root,
+                self.session_config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            ),
+            mount_checker=lambda path: path == self.mountpoint.resolve(),
+            mount_identity=lambda path: mount_identity,
+        )
+        try:
+            released_session = self.seal_one(
+                coordinator,
+                prefix="release",
+                reason="safe_swap",
+            )
+            released_generation = coordinator.generation_id
+            receipt_resource = coordinator.current_safe_swap_receipt()
+            self.assertIsNotNone(receipt_resource)
+            self.assertEqual(
+                receipt_resource["receipt"]["session_id"],
+                released_session,
+            )
+            self.assertEqual(coordinator.artifact_io_state(), "device-released")
+        finally:
+            coordinator.close()
+
+        retained = CaptureCoordinator(
+            CoordinatorConfig(
+                self.mountpoint,
+                self.state_root,
+                self.session_config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            ),
+            mount_checker=lambda path: path == self.mountpoint.resolve(),
+            mount_identity=lambda path: mount_identity,
+        )
+        try:
+            self.assertEqual(retained.generation_id, released_generation)
+            self.assertIsNotNone(retained.current_safe_swap_receipt())
+            with self.assertRaises(ProviderError) as released:
+                retained.start_capture(start_command("released-start"))
+            self.assertEqual(released.exception.code, "volume_released")
+        finally:
+            retained.close()
+
+        mount_identity = "swap-mount-b"
+        reopened = CaptureCoordinator(
+            CoordinatorConfig(
+                self.mountpoint,
+                self.state_root,
+                self.session_config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            ),
+            mount_checker=lambda path: path == self.mountpoint.resolve(),
+            mount_identity=lambda path: mount_identity,
+        )
+        try:
+            self.assertNotEqual(reopened.generation_id, released_generation)
+            self.assertIsNone(reopened.current_safe_swap_receipt())
+            reopened_session = self.seal_one(reopened, prefix="after-release")
+            self.assertIsNone(reopened.current_safe_swap_receipt())
+            self.assertIsNone(reopened.artifact_io_state())
+            with reopened.open_manifest(reopened_session, "v3") as manifest:
+                self.assertGreater(manifest.size, 0)
+        finally:
+            reopened.close()
+
     def test_pending_safe_swap_survives_restart_and_requires_zero_handles(self) -> None:
         first = self.coordinator()
         previous_id = self.seal_one(first, prefix="pending-previous")
