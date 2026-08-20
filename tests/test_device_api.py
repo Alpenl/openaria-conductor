@@ -198,6 +198,43 @@ class HttpApiTest(unittest.TestCase):
         self.assertIn(b"event: snapshot", events)
         self.assertIn(b"data: {", events)
 
+    def test_idle_sse_emits_full_status_heartbeat_without_advancing_revision(self) -> None:
+        device = MockDevice()
+        server = create_server(
+            "127.0.0.1",
+            0,
+            device,
+            event_heartbeat_seconds=0.01,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/api/v0/events"
+            with urlopen(url, timeout=2) as response:
+                blocks: list[bytes] = []
+                block: list[bytes] = []
+                while len(blocks) < 2:
+                    line = response.readline()
+                    self.assertTrue(line)
+                    if line == b"\n":
+                        blocks.append(b"".join(block))
+                        block = []
+                    else:
+                        block.append(line)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertIn(b"event: snapshot\n", blocks[0])
+        self.assertIn(b"event: status\n", blocks[1])
+        payloads = [
+            json.loads(next(line for line in value.splitlines() if line.startswith(b"data: "))[6:])
+            for value in blocks
+        ]
+        self.assertEqual(payloads[0]["revision"], payloads[1]["revision"])
+        self.assertGreater(payloads[1]["observed_at"], payloads[0]["observed_at"])
+
     def test_invalid_preview_eye_has_stable_error(self) -> None:
         status, payload, _ = self.request("/preview/frame?eye=middle")
         self.assertEqual(status, 400)

@@ -13,6 +13,8 @@ from rp_ylx import __commit__, __version__
 from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
 from rp_ylx.cli import build_parser, main
 from rp_ylx.hardware import HardwareSmokeError
+from rp_ylx.native import NativeCapabilities
+from rp_ylx.performance import BenchmarkError
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -73,6 +75,36 @@ class CliTest(unittest.TestCase):
             )
         )
         return recorder.stop().path
+
+    def test_benchmark_failure_is_machine_readable_and_does_not_write_report(self) -> None:
+        error = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "rp_ylx.performance.benchmark.run_benchmark",
+                side_effect=BenchmarkError("unsupported_target", "not RDK X5"),
+            ) as run,
+            redirect_stderr(error),
+        ):
+            output = Path(directory) / "report.json"
+            result = main(
+                [
+                    "benchmark",
+                    "preview",
+                    "--duration",
+                    "0.1",
+                    "--wheel-sha256",
+                    "a" * 64,
+                    "--adapter",
+                    "rust",
+                    "--output",
+                    str(output),
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(json.loads(error.getvalue())["error"]["code"], "unsupported_target")
+        self.assertFalse(output.exists())
+        self.assertEqual(run.call_args.args[0].adapter, "rust")
 
     def test_production_service_failure_is_machine_readable(self) -> None:
         error = io.StringIO()
@@ -215,12 +247,20 @@ class CliTest(unittest.TestCase):
 
     def test_status_runs_without_hardware(self) -> None:
         output = io.StringIO()
-        with redirect_stdout(output):
+        with (
+            patch(
+                "rp_ylx.cli.native_capabilities",
+                return_value=NativeCapabilities(False, None, None, ()),
+            ),
+            redirect_stdout(output),
+        ):
             self.assertEqual(main(["status"]), 0)
         status = json.loads(output.getvalue())
         self.assertEqual(status["commit"], __commit__)
         self.assertEqual(status["hardware"], "not-probed")
         self.assertEqual(status["recording"], "idle")
+        self.assertEqual(status["native"]["adapter"], "python")
+        self.assertFalse(status["native"]["module_available"])
 
     def test_validate_valid_session(self) -> None:
         session_id = "0198c9a8-7a3c-7000-8000-000000000001"

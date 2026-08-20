@@ -9,6 +9,7 @@ from rp_ylx.imu import (
     ImuCollector,
     ImuError,
     ImuPacketRead,
+    NativeImuCollector,
     SyntheticImuSource,
     TimestampUnwrapper,
     TimeSynchronizer,
@@ -155,6 +156,98 @@ class CollectorTest(unittest.TestCase):
             duplicate.read()
         self.assertEqual(timestamp.exception.code, "timestamp_stalled")
         self.assertTrue(duplicate_source.closed)
+
+
+class NativeCollectorAdapterTest(unittest.TestCase):
+    def test_converts_native_observation_to_existing_model(self) -> None:
+        class Owner:
+            def __init__(self) -> None:
+                self.timeout: float | None = None
+                self.closed = False
+
+            def read(self, timeout_seconds: float) -> dict[str, object]:
+                self.timeout = timeout_seconds
+                return {
+                    "dropped_samples": 0,
+                    "samples": [
+                        {
+                            "sequence": 0,
+                            "packet_sequence": 0,
+                            "sample_index": 0,
+                            "device_timestamp_raw": 1000,
+                            "device_ticks": 1000,
+                            "host_read_start_ns": 10_999_900,
+                            "host_read_end_ns": 11_000_100,
+                            "host_monotonic_ns": 11_000_000,
+                            "raw": {
+                                "accelerometer": [1, 2, 3],
+                                "gyroscope": [4, 5, 6],
+                            },
+                            "sync": {
+                                "offset_ns": None,
+                                "residual_ns": None,
+                                "quality": "insufficient",
+                            },
+                        },
+                        {
+                            "sequence": 1,
+                            "packet_sequence": 0,
+                            "sample_index": 1,
+                            "device_timestamp_raw": 1000,
+                            "device_ticks": 1000,
+                            "host_read_start_ns": 10_999_900,
+                            "host_read_end_ns": 11_000_100,
+                            "host_monotonic_ns": 11_000_000,
+                            "raw": {
+                                "accelerometer": [-1, -2, -3],
+                                "gyroscope": [-4, -5, -6],
+                            },
+                            "sync": {
+                                "offset_ns": None,
+                                "residual_ns": None,
+                                "quality": "insufficient",
+                            },
+                        },
+                    ],
+                }
+
+            def unit(self) -> int:
+                return 7
+
+            def close(self) -> None:
+                self.closed = True
+
+        owner = Owner()
+        collector = NativeImuCollector("/dev/video-test", owner=owner)
+        observation = collector.read(timeout=0.25)
+        self.assertEqual(owner.timeout, 0.25)
+        self.assertEqual(collector.unit, 7)
+        self.assertEqual(observation.samples[0].accelerometer.as_list(), [1, 2, 3])
+        self.assertEqual(observation.samples[1].gyroscope.as_list(), [-4, -5, -6])
+        self.assertEqual(observation.samples[0].sync_quality, "insufficient")
+        collector.close()
+        self.assertTrue(owner.closed)
+
+    def test_native_error_keeps_code_retryability_and_closes_owner(self) -> None:
+        class Owner:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def read(self, timeout_seconds: float) -> dict[str, object]:
+                del timeout_seconds
+                raise RuntimeError("sensor_stalled: stale IMU packet")
+
+            def close(self) -> None:
+                self.closed = True
+
+        owner = Owner()
+        collector = NativeImuCollector("/dev/video-test", owner=owner)
+        with self.assertRaises(ImuError) as raised:
+            collector.read(timeout=0.25)
+        self.assertEqual(raised.exception.code, "sensor_stalled")
+        self.assertTrue(raised.exception.retryable)
+        self.assertTrue(owner.closed)
+        self.assertTrue(collector.closed)
 
 
 class UvcXuImuSourceTest(unittest.TestCase):

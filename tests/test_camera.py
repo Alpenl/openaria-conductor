@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import rp_ylx.camera.v4l2 as v4l2
 from rp_ylx.camera import (
@@ -108,6 +108,30 @@ class CameraControllerTest(unittest.TestCase):
         controller.close()
         self.assertTrue(backend.opened_streams[0].stopped)
         self.assertTrue(backend.opened_streams[0].closed)
+
+    def test_controller_uses_native_frame_validator_when_available(self) -> None:
+        device = descriptor("camera-native-validator")
+        backend = SyntheticCameraBackend(
+            (device,),
+            frames={device.stable_id: [frame(5, 100)]},
+        )
+        validator = Mock()
+        validator.validate_frame.return_value = {
+            "dropped_before": 7,
+            "queue_rejected": 0,
+            "source_gap": 7,
+        }
+        with patch(
+            "rp_ylx.camera.controller.create_native_camera_frame_validator",
+            return_value=validator,
+        ):
+            controller = CameraController(backend)
+        controller.open(MODE)
+        controller.start()
+        self.assertEqual(controller.read().dropped_before, 7)
+        controller.close()
+        validator.validate_frame.assert_called_once_with(5, 100, True, True, True, False, 0)
+        self.assertGreaterEqual(validator.reset.call_count, 2)
 
     def test_bad_frame_regression_and_hot_unplug_release_resources(self) -> None:
         cases = (
@@ -300,6 +324,152 @@ class V4L2StreamTest(unittest.TestCase):
     SBS = LEFT + RIGHT
     MODE = CameraMode(3840, 1080, 30.0, "mjpg")
 
+    def test_production_factory_uses_complete_native_camera(self) -> None:
+        owner = Mock()
+        owner.stats.return_value = {
+            "capacity": 4,
+            "depth": 0,
+            "peak_depth": 1,
+            "enqueued": 1,
+            "delivered": 1,
+            "rejected": 0,
+        }
+        owner.read.return_value = (10, 1_000_000, 0, self.LEFT, self.RIGHT, self.SBS)
+        with patch.object(v4l2, "create_native_camera", return_value=owner) as create:
+            stream = v4l2_production_stream_factory(Path("/dev/video0"), self.MODE)
+
+        create.assert_called_once_with(
+            "/dev/video0",
+            3840,
+            1080,
+            30,
+            "mjpg",
+            buffer_count=16,
+            queue_capacity=64,
+            split_eyes=False,
+        )
+        stream.start()
+        self.assertEqual(
+            stream.read(1.0),
+            StereoFrame(10, 1_000_000, self.LEFT, self.RIGHT, True, self.SBS),
+        )
+        stream.stop()
+        stream.close()
+        stream.close()
+        owner.start.assert_called_once_with()
+        owner.read.assert_called_once_with(1.0)
+        owner.stats.assert_not_called()
+        owner.stop.assert_called_once_with()
+        owner.close.assert_called_once_with()
+
+    def test_production_factory_does_not_fallback_when_native_is_unavailable(self) -> None:
+        from rp_ylx.native import NativeModuleError
+
+        with (
+            patch.object(
+                v4l2,
+                "create_native_camera",
+                side_effect=NativeModuleError("native_camera_unavailable", "missing"),
+            ),
+            patch.object(v4l2, "V4L2CameraStream") as stream,
+            self.assertRaises(CameraError) as raised,
+        ):
+            v4l2_production_stream_factory(Path("/dev/video0"), self.MODE)
+        self.assertEqual(raised.exception.code, "native_camera_unavailable")
+        stream.assert_not_called()
+
+    def test_native_adapter_translates_errors_and_closes_owner(self) -> None:
+        cases = [
+            (RuntimeError("frame_timeout: no frame"), TimeoutError, None),
+            (RuntimeError("bad_frame: damaged"), CameraError, "bad_frame"),
+            (RuntimeError("opaque"), CameraError, "native_camera_failed"),
+        ]
+        for error, exception_type, code in cases:
+            with self.subTest(error=str(error)):
+                owner = Mock()
+                owner.read.side_effect = error
+                stream = v4l2.NativeV4L2CameraStream(owner)
+                with self.assertRaises(exception_type) as raised:
+                    stream.read(1.0)
+                if code is not None:
+                    self.assertEqual(raised.exception.code, code)
+                self.assertTrue(stream.closed)
+                owner.close.assert_called_once_with()
+
+    def test_native_adapter_accepts_raw_sbs_without_split_eyes(self) -> None:
+        owner = Mock()
+        owner.stats.return_value = {
+            "capacity": 64,
+            "depth": 0,
+            "peak_depth": 1,
+            "enqueued": 1,
+            "delivered": 1,
+            "rejected": 0,
+        }
+        owner.read.return_value = (10, 1_000_000, 0, b"", b"", self.SBS)
+        stream = v4l2.NativeV4L2CameraStream(owner)
+        self.assertEqual(
+            stream.read(1.0),
+            StereoFrame(10, 1_000_000, b"", b"", True, self.SBS),
+        )
+
+    def test_native_adapter_rejects_invalid_frame_and_fractional_fps(self) -> None:
+        owner = Mock()
+        owner.read.return_value = (True, 1, 0, self.LEFT, self.RIGHT, self.SBS)
+        stream = v4l2.NativeV4L2CameraStream(owner)
+        with self.assertRaises(CameraError) as invalid:
+            stream.read(1.0)
+        self.assertEqual(invalid.exception.code, "invalid_native_frame")
+        owner.close.assert_called_once_with()
+
+        owner = Mock()
+        owner.read.return_value = (10, 1_000_000, 0, b"", b"", b"")
+        stream = v4l2.NativeV4L2CameraStream(owner)
+        with self.assertRaises(CameraError) as invalid:
+            stream.read(1.0)
+        self.assertEqual(invalid.exception.code, "invalid_native_frame")
+        owner.close.assert_called_once_with()
+
+        with self.assertRaises(CameraError) as unsupported:
+            v4l2_production_stream_factory(
+                Path("/dev/video0"), CameraMode(3840, 1080, 29.97, "mjpg")
+            )
+        self.assertEqual(unsupported.exception.code, "unsupported_mode")
+
+    def test_native_adapter_observes_bounded_queue_only_when_enabled(self) -> None:
+        from rp_ylx.performance.metrics import PerformanceMetrics
+
+        metrics = PerformanceMetrics()
+        owner = Mock()
+        owner.read.side_effect = [
+            (10, 1_000_000, 0, self.LEFT, self.RIGHT, self.SBS),
+            (12, 2_000_000, 1, self.LEFT, self.RIGHT, self.SBS),
+        ]
+        owner.stats.side_effect = [
+            {
+                "capacity": 4,
+                "depth": 3,
+                "peak_depth": 4,
+                "enqueued": 4,
+                "delivered": 1,
+                "rejected": 0,
+            },
+            {
+                "capacity": 4,
+                "depth": 2,
+                "peak_depth": 4,
+                "enqueued": 5,
+                "delivered": 2,
+                "rejected": 1,
+            },
+        ]
+        stream = v4l2.NativeV4L2CameraStream(owner, metrics=metrics)
+        stream.read(1.0)
+        second = stream.read(1.0)
+        self.assertEqual(second._application_dropped_before, 1)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot.queue, {"capacity": 4, "peak_depth": 4, "rejected": 1})
+
     def test_split_preserves_two_jpeg_payloads_without_reencoding(self) -> None:
         self.assertEqual(
             split_sbs_mjpeg(b"padding" + self.SBS + b"\x00", 3840, 1080),
@@ -443,18 +613,6 @@ class V4L2StreamTest(unittest.TestCase):
         self.assertEqual((captured.left, captured.right), (b"", b""))
         self.assertEqual(captured.raw_side_by_side, self.SBS)
         stream.close()
-
-    def test_production_factory_uses_raw_sbs_mode(self) -> None:
-        device = Path("/dev/video0")
-        with patch.object(v4l2, "V4L2CameraStream") as constructor:
-            v4l2_production_stream_factory(device, self.MODE)
-
-        constructor.assert_called_once_with(
-            device,
-            self.MODE,
-            buffer_count=16,
-            split_frame=None,
-        )
 
     def test_source_sequence_rollover_unwraps_without_a_gap(self) -> None:
         fake = _FakeV4L2Device(

@@ -61,6 +61,7 @@ const previewJpeg = Buffer.from(
  * @property {boolean} startProblem
  * @property {boolean} stopProblem
  * @property {boolean} eventsUnavailable
+ * @property {boolean} sessionsVolumeUnavailable
  * @property {number} eventSnapshotDelayMs
  * @property {number} previewDelayMs
  * @property {number} previewRequests
@@ -68,7 +69,7 @@ const previewJpeg = Buffer.from(
  * @property {Array<Record<string, unknown>>} previewTimeline
  * @property {number} previewMaxConcurrent
  * @property {boolean} requireBearer
- * @property {Array<{path: string, authorization: string | null, lastEventId: string | null}>} apiRequests
+ * @property {Array<{path: string, authorization: string | null, lastEventId: string | null, idempotencyKey: string | null}>} apiRequests
  * @property {{schema: "ylx.safe-swap-receipt-resource.v3", receipt: SafeSwapReceipt} | null} safeSwapResource
  * @property {ReturnType<typeof captureEvent> | null} staleSafeSwapEvent
  */
@@ -216,6 +217,7 @@ function makeFixture() {
     startProblem: false,
     stopProblem: false,
     eventsUnavailable: false,
+    sessionsVolumeUnavailable: false,
     eventSnapshotDelayMs: 0,
     previewDelayMs: 20,
     previewRequests: 0,
@@ -575,7 +577,7 @@ const server = createServer(async (request, response) => {
   }
 
   if (url.pathname === "/__fixture/config" && request.method === "POST") {
-    const config = /** @type {{commandDelayMs?: number, previewDelayMs?: number, requireBearer?: boolean, stopReturns204?: boolean, startProblem?: boolean, stopProblem?: boolean, eventsUnavailable?: boolean, eventSnapshotDelayMs?: number}} */ (
+    const config = /** @type {{commandDelayMs?: number, previewDelayMs?: number, requireBearer?: boolean, stopReturns204?: boolean, startProblem?: boolean, stopProblem?: boolean, eventsUnavailable?: boolean, sessionsVolumeUnavailable?: boolean, eventSnapshotDelayMs?: number}} */ (
       await readJson(request)
     );
     if (Number.isFinite(config.commandDelayMs)) {
@@ -599,6 +601,18 @@ const server = createServer(async (request, response) => {
     }
     if (typeof config.eventsUnavailable === "boolean") {
       fixture.eventsUnavailable = config.eventsUnavailable;
+    }
+    if (typeof config.sessionsVolumeUnavailable === "boolean") {
+      fixture.sessionsVolumeUnavailable = config.sessionsVolumeUnavailable;
+      if (config.sessionsVolumeUnavailable) {
+        fixture.device.capabilities.capture = false;
+        fixture.device.storage = {
+          volume_id: null,
+          total_bytes: 0,
+          available_bytes: 0,
+          writable: false,
+        };
+      }
     }
     if (Number.isFinite(config.eventSnapshotDelayMs)) {
       fixture.eventSnapshotDelayMs = Number(config.eventSnapshotDelayMs);
@@ -714,6 +728,10 @@ const server = createServer(async (request, response) => {
       lastEventId:
         typeof request.headers["last-event-id"] === "string"
           ? request.headers["last-event-id"]
+          : null,
+      idempotencyKey:
+        typeof request.headers["idempotency-key"] === "string"
+          ? request.headers["idempotency-key"]
           : null,
     });
     if (rejectMissingBearer(request, response)) {
@@ -846,6 +864,19 @@ const server = createServer(async (request, response) => {
   }
 
   if (url.pathname === "/api/v3/sessions") {
+    if (fixture.sessionsVolumeUnavailable) {
+      sendJson(response, 409, {
+        schema: "ylx.api-error.v2",
+        error: {
+          code: "volume_not_mounted",
+          message: "录制卷不是当前活动挂载点",
+          request_id: "962f25f5-c8f1-42cb-a598-4143a806d89f",
+          retryable: true,
+          details: {},
+        },
+      });
+      return;
+    }
     sendJson(response, 200, fixture.sessions);
     return;
   }

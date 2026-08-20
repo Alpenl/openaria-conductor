@@ -1,0 +1,29 @@
+{
+  "format": "ylx.data-plane-golden.v0",
+  "jpeg": {
+    "left_base64": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/wAALCAACAAIBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAABv/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8APv/Z",
+    "left_sha256": "373149372120ffa4c96de08d28d0e2f669fae010c74751b3cbc0eef0678879a2",
+    "right_base64": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/wAALCAACAAIBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAABv/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AQP/Z",
+    "right_sha256": "fac46602eb4860ba89711dff4f87344dddbfb8e1199de771816371c523471f6b",
+    "sbs_sha256": "00ff59783917445d89b58f4d582b541739af40d4a28edeb225195d75868350a9",
+    "dimensions": [2, 2]
+  },
+  "frame_stream": {
+    "encoded_left_sha256": "fd1bbd45420c8493e799e81c68f3a50ec0ace26a28e1126d3c0fe0a987b8e7d9",
+    "encoded_left_bytes": 171
+  },
+  "sequence": {
+    "wrap_input": [4294967294, 4294967295, 0, 1],
+    "wrap_output": [4294967294, 4294967295, 4294967296, 4294967297],
+    "regression_input": [10, 9],
+    "regression_error": "sequence_regression"
+  },
+  "timestamp": {
+    "regression_input_ns": [2000000000, 1000000000],
+    "regression_error": "timestamp_regression"
+  },
+  "lifecycle": {
+    "close_is_idempotent": true,
+    "stop_after_close_is_noop": true
+  }
+}

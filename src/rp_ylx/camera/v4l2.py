@@ -25,6 +25,8 @@ from rp_ylx.camera.models import (
     StereoFrame,
 )
 from rp_ylx.camera.turbojpeg import lossless_crop_sbs_jpeg
+from rp_ylx.native import NativeCamera, NativeModuleError, create_native_camera
+from rp_ylx.performance.metrics import PerformanceMetrics
 
 _FORMAT = re.compile(r"\[\d+\]:\s+'([^']+)'")
 _SIZE = re.compile(r"Size:\s+Discrete\s+(\d+)x(\d+)")
@@ -346,6 +348,8 @@ class V4L2CameraStream:
         mmap_factory: MmapFactory = _mmap_buffer,
         wait_readable: WaitReadable = _wait_readable,
         split_frame: Callable[[bytes, int, int], tuple[bytes, bytes]] | None = split_sbs_mjpeg,
+        metrics: PerformanceMetrics | None = None,
+        close_splitter: Callable[[], None] | None = None,
     ) -> None:
         if buffer_count < 2:
             raise ValueError("buffer_count must be at least two")
@@ -358,6 +362,8 @@ class V4L2CameraStream:
         self._mmap_factory = mmap_factory
         self._wait_readable = wait_readable
         self._split_frame = split_frame
+        self._metrics = metrics
+        self._close_splitter = close_splitter
         self._fd: int | None = None
         self._buffers: list[mmap.mmap] = []
         self._streaming = False
@@ -531,7 +537,10 @@ class V4L2CameraStream:
                     self.close()
                 raise TimeoutError("V4L2 frame did not arrive before timeout")
             try:
+                started = self._metrics.start() if self._metrics is not None else 0
                 ready = self._wait_readable(fd, remaining)
+                if self._metrics is not None:
+                    self._metrics.finish("v4l2_wait", started)
             except BaseException:
                 with suppress(BaseException):
                     self.close()
@@ -544,7 +553,10 @@ class V4L2CameraStream:
             struct.pack_into("<IIII", dequeue, 0, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE, 0, 0)
             struct.pack_into("<I", dequeue, _BUFFER_MEMORY_OFFSET, V4L2_MEMORY_MMAP)
             try:
+                started = self._metrics.start() if self._metrics is not None else 0
                 self._ioctl(fd, VIDIOC_DQBUF, dequeue)
+                if self._metrics is not None:
+                    self._metrics.finish("v4l2_dequeue", started)
             except OSError as exc:
                 if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
                     continue
@@ -566,13 +578,29 @@ class V4L2CameraStream:
                     raise CameraError("bad_frame", "V4L2 返回了无效图像长度")
                 source_sequence = self._source_sequence(raw_sequence)
                 host_timestamp = self._timestamp_from_buffer(dequeue, flags)
+                started = self._metrics.start() if self._metrics is not None else 0
                 raw_side_by_side = bytes(self._buffers[index][:bytes_used])
+                if self._metrics is not None:
+                    self._metrics.finish("sbs_copy", started)
+                    self._metrics.record_copy("sbs_input", bytes_used)
                 if self._split_frame is None:
                     left, right = b"", b""
                 else:
+                    started = self._metrics.start() if self._metrics is not None else 0
                     left, right = self._split_frame(
                         raw_side_by_side, self._mode.width, self._mode.height
                     )
+                    if self._metrics is not None:
+                        self._metrics.finish("jpeg_split", started)
+                        self._metrics.record_copy("left_output", len(left))
+                        self._metrics.record_copy("right_output", len(right))
+                lease = (
+                    self._metrics.retain_payload(
+                        "camera_frame", len(raw_side_by_side) + len(left) + len(right)
+                    )
+                    if self._metrics is not None
+                    else None
+                )
                 frame = StereoFrame(
                     source_sequence,
                     host_timestamp,
@@ -580,6 +608,7 @@ class V4L2CameraStream:
                     right,
                     True,
                     raw_side_by_side,
+                    lease,
                 )
             except BaseException as exc:
                 frame_error = exc
@@ -587,7 +616,10 @@ class V4L2CameraStream:
                 queue = bytearray(88)
                 struct.pack_into("<IIII", queue, 0, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, 0, 0)
                 struct.pack_into("<I", queue, _BUFFER_MEMORY_OFFSET, V4L2_MEMORY_MMAP)
+                started = self._metrics.start() if self._metrics is not None else 0
                 self._ioctl(fd, VIDIOC_QBUF, queue)
+                if self._metrics is not None:
+                    self._metrics.finish("v4l2_requeue", started)
             except BaseException:
                 self.close()
                 raise
@@ -634,6 +666,12 @@ class V4L2CameraStream:
             except BaseException as exc:
                 first_error = first_error or exc
             self._fd = None
+        if self._close_splitter is not None:
+            try:
+                self._close_splitter()
+            except BaseException as exc:
+                first_error = first_error or exc
+            self._close_splitter = None
         if first_error is not None:
             raise first_error
 
@@ -650,10 +688,200 @@ def v4l2_stream_factory(device: Path, mode: CameraMode) -> CameraStream:
     return V4L2CameraStream(device, mode)
 
 
-def v4l2_production_stream_factory(device: Path, mode: CameraMode) -> CameraStream:
-    """正式录制只复制原始 SBS，避免在 60 FPS 采集热路径裁剪 JPEG。"""
+class NativeV4L2CameraStream:
+    """Thin CameraStream adapter over the deep Rust capture module."""
 
-    return V4L2CameraStream(device, mode, buffer_count=16, split_frame=None)
+    def __init__(
+        self,
+        owner: NativeCamera,
+        *,
+        metrics: PerformanceMetrics | None = None,
+    ) -> None:
+        self._owner = owner
+        self._closed = False
+        self._metrics = metrics
+        self._queue_rejected = 0
+        self._accounted_application_drops = 0
+
+    def _observe_native_stats(self) -> None:
+        if self._metrics is None:
+            return
+        stats = self._owner.stats()
+        expected = {
+            "capacity",
+            "depth",
+            "peak_depth",
+            "enqueued",
+            "delivered",
+            "rejected",
+        }
+        if (
+            not isinstance(stats, dict)
+            or set(stats) != expected
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in stats.values()
+            )
+            or any(value < 0 for value in stats.values())
+            or stats["capacity"] <= 0
+            or stats["depth"] > stats["capacity"]
+            or stats["peak_depth"] > stats["capacity"]
+            or stats["rejected"] < self._queue_rejected
+        ):
+            raise CameraError("invalid_native_stats", "原生相机返回了无效有界队列统计")
+        rejected = stats["rejected"] - self._queue_rejected
+        self._queue_rejected = stats["rejected"]
+        self._metrics.observe_queue(
+            depth=stats["depth"],
+            capacity=stats["capacity"],
+            rejected=rejected,
+            peak_depth=stats["peak_depth"],
+        )
+
+    def _record_tail_rejections(self) -> None:
+        if self._metrics is None:
+            return
+        tail = self._queue_rejected - self._accounted_application_drops
+        if tail < 0:
+            raise CameraError("invalid_native_stats", "应用丢帧计数超过原生队列拒绝总数")
+        if tail:
+            self._metrics.record_loss("queue_rejected", tail)
+            self._accounted_application_drops += tail
+
+    @staticmethod
+    def _translate(exc: Exception) -> BaseException:
+        raw = str(exc)
+        code, separator, message = raw.partition(": ")
+        if not separator or not code.replace("_", "").isalnum():
+            return CameraError("native_camera_failed", raw)
+        if code == "frame_timeout":
+            return TimeoutError(message)
+        return CameraError(code, message)
+
+    def start(self) -> None:
+        if self._closed:
+            raise CameraError("invalid_state", "原生相机已关闭")
+        try:
+            self._owner.start()
+        except Exception as exc:
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise self._translate(exc) from exc
+
+    def read(self, timeout: float) -> StereoFrame:
+        if self._closed:
+            raise CameraError("invalid_state", "原生相机已关闭")
+        try:
+            result = self._owner.read(timeout)
+        except Exception as exc:
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise self._translate(exc) from exc
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 6
+            or isinstance(result[0], bool)
+            or not isinstance(result[0], int)
+            or isinstance(result[1], bool)
+            or not isinstance(result[1], int)
+            or isinstance(result[2], bool)
+            or not isinstance(result[2], int)
+            or any(not isinstance(payload, bytes) for payload in result[3:])
+        ):
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise CameraError("invalid_native_frame", "原生相机返回了无效帧结构")
+        sequence, timestamp, application_dropped, left, right, raw_side_by_side = result
+        if sequence < 0 or timestamp <= 0 or application_dropped < 0 or not raw_side_by_side:
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise CameraError("invalid_native_frame", "原生相机返回了无效帧内容")
+        try:
+            self._observe_native_stats()
+        except Exception:
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise
+        if self._metrics is not None:
+            self._metrics.record_copy("sbs_input", len(raw_side_by_side))
+            self._metrics.record_copy("left_output", len(left))
+            self._metrics.record_copy("right_output", len(right))
+            lease = self._metrics.retain_payload(
+                "camera_frame",
+                len(raw_side_by_side) + len(left) + len(right),
+            )
+        else:
+            lease = None
+        self._accounted_application_drops += application_dropped
+        return StereoFrame(
+            sequence,
+            timestamp,
+            left,
+            right,
+            True,
+            raw_side_by_side,
+            lease,
+            application_dropped,
+        )
+
+    def stop(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._owner.stop()
+            self._observe_native_stats()
+            self._record_tail_rejections()
+        except Exception as exc:
+            with suppress(Exception):
+                self._owner.close()
+            self._closed = True
+            raise self._translate(exc) from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._owner.close()
+            self._observe_native_stats()
+            self._record_tail_rejections()
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+
+def v4l2_production_stream_factory(
+    device: Path,
+    mode: CameraMode,
+    *,
+    metrics: PerformanceMetrics | None = None,
+) -> CameraStream:
+    """Production stream factory requiring the complete Rust data plane."""
+
+    rounded_fps = round(mode.fps)
+    if abs(mode.fps - rounded_fps) > max(0.01, mode.fps * 0.001):
+        raise CameraError("unsupported_mode", "原生相机只接受整数帧率")
+    try:
+        owner = create_native_camera(
+            str(device),
+            mode.width,
+            mode.height,
+            rounded_fps,
+            mode.encoding,
+            buffer_count=16,
+            queue_capacity=64,
+            split_eyes=False,
+        )
+    except NativeModuleError as exc:
+        raise CameraError(exc.code, exc.message) from exc
+    return NativeV4L2CameraStream(owner, metrics=metrics)
 
 
 class V4L2DiscoveryBackend:

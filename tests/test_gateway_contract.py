@@ -22,13 +22,13 @@ from rp_ylx.api import (
 CONTRACT_GOLDENS = {
     "v2": {
         "filename": "ylx-device-v2.openapi.yaml",
-        "sha256": "165e42f7bd2cd7b1f27360b4d7d04b9eee3b2c2cf89f7963565ad328f8d8cf26",
+        "sha256": "65fa008129213c6b7446711183ba09c9ed6d7b12d732c712670ac9114de239de",
         "info_version": "2.0.0",
         "server_suffix": "/api/v2",
     },
     "v3": {
         "filename": "ylx-device-v3.openapi.yaml",
-        "sha256": "3a1f68323e7b3a2460583e50ac48c9a3eec469597bb81de1d5ca98d7834708f4",
+        "sha256": "6ad17d43756b2de155d96cd1d1b60c4364d55b5e79b28ef5da91562a7b47822f",
         "info_version": "3.0.0",
         "server_suffix": "/api/v3",
     },
@@ -36,10 +36,10 @@ CONTRACT_GOLDENS = {
 
 SCHEMA_GOLDENS = {
     "ylx-device-session-v1.schema.json": (
-        "2d523dd3128fe637791cc4236bc53fa81b3d1578d9b691b7ef18066760491607"
+        "efd8c6e7793fe004bc190034f9c92250ae8d35a2945a761dae2470e048710ea9"
     ),
     "ylx-recording-state-v1.schema.json": (
-        "2a075aab15d592f570c4c1a2e811147ea773c80265c45bf2cec4290843709a19"
+        "e787e168ee508256628fd12067fdeb2305c35688730aa4dfe01c06f1c04d5f8c"
     ),
 }
 

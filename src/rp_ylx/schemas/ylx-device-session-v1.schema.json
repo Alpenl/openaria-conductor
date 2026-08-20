@@ -228,6 +228,9 @@
         }
       ]
     },
+    "audio": {
+      "$ref": "#/$defs/audio"
+    },
     "imu": {
       "type": "object",
       "additionalProperties": false,
@@ -560,6 +563,139 @@
                 },
                 "media_type": {
                   "const": "video/x-motion-jpeg"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "codec",
+        "container",
+        "sample_rate_hz",
+        "channels",
+        "sample_format",
+        "sample_count",
+        "sync",
+        "segments"
+      ],
+      "properties": {
+        "device": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "codec": {
+          "const": "pcm_s16le"
+        },
+        "container": {
+          "const": "wav"
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_format": {
+          "const": "S16_LE"
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sync": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "clock",
+            "started_monotonic_ns",
+            "stopped_monotonic_ns",
+            "session_start_offset_seconds",
+            "session_stop_offset_seconds"
+          ],
+          "properties": {
+            "clock": {
+              "const": "host_monotonic"
+            },
+            "started_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stopped_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "session_start_offset_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "session_stop_offset_seconds": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/audioSegment"
+          }
+        }
+      }
+    },
+    "audioSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "start_sample",
+        "end_sample",
+        "start_time_seconds",
+        "end_time_seconds",
+        "artifact"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_sample": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_sample": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_time_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "audio.wav"
+                },
+                "media_type": {
+                  "const": "audio/wav"
                 }
               }
             }

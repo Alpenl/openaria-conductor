@@ -27,7 +27,6 @@
       "enum": [
         "recording",
         "finalizing",
-        "encoding",
         "verifying",
         "recoverable",
         "failed",
@@ -124,9 +123,6 @@
         "bytes_written": {
           "type": "integer",
           "minimum": 0
-        },
-        "encoding": {
-          "$ref": "#/$defs/counter"
         },
         "verification": {
           "$ref": "#/$defs/counter"
@@ -233,23 +229,6 @@
       "else": {
         "not": {
           "required": ["abandonment"]
-        }
-      }
-    },
-    {
-      "if": {
-        "required": ["state"],
-        "properties": {
-          "state": {
-            "const": "encoding"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "progress": {
-            "required": ["encoding"]
-          }
         }
       }
     },

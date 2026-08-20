@@ -1,0 +1,21 @@
+[Unit]
+Description=RP-YLX RDK X5 Wi-Fi health and recovery check
+After=NetworkManager.service network.target
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rp-ylx-wifi-watchdog
+ExecStart=/usr/local/sbin/rp-ylx-wifi-watchdog check
+StateDirectory=rp-ylx-wifi-watchdog
+RuntimeDirectory=rp-ylx-wifi-watchdog
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictSUIDSGID=yes
+LockPersonality=yes

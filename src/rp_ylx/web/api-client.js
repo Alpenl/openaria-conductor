@@ -57,6 +57,34 @@ export function waitForAbortableDelay(milliseconds, signal) {
   });
 }
 
+/** @param {Uint8Array} bytes */
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function idempotencyKey() {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    cryptoApi.getRandomValues(bytes);
+  } else {
+    const seed = `${Date.now()}-${Math.random()}-${performance.now()}`;
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = seed.charCodeAt(index % seed.length) ^ Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytesToHex(bytes);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+    16,
+    20,
+  )}-${hex.slice(20)}`;
+}
+
 export function getAccessToken() {
   return sessionStorage.getItem(TOKEN_KEY)?.trim() || null;
 }
@@ -68,17 +96,17 @@ export function setAccessToken(token) {
 
 /** @returns {Record<string, string>} */
 export function authorizationHeaders() {
-  const token = getAccessToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
+  const credential = getAccessToken();
+  return credential ? { Authorization: `Bearer ${credential}` } : {};
 }
 
 /** @param {string} accept @param {HeadersInit | undefined} [initial] */
 export function requestHeaders(accept, initial) {
   const headers = new Headers(initial);
   headers.set("Accept", accept);
-  const token = getAccessToken();
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const credential = getAccessToken();
+  if (credential) {
+    headers.set("Authorization", `Bearer ${credential}`);
   }
   return headers;
 }
@@ -133,7 +161,7 @@ export const deviceApi = {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Idempotency-Key": crypto.randomUUID(),
+        "Idempotency-Key": idempotencyKey(),
       },
       body: JSON.stringify({
         schema: "ylx.capture-start.v2",
@@ -148,7 +176,7 @@ export const deviceApi = {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Idempotency-Key": crypto.randomUUID(),
+        "Idempotency-Key": idempotencyKey(),
       },
       body: JSON.stringify({ schema: "ylx.capture-stop.v2", reason }),
     }),
@@ -162,7 +190,7 @@ export async function getLatestPreview(signal) {
     signal,
   });
   if (!response.ok) {
-    throw new DeviceApiError(`设备预览返回 ${response.status}`, response.status);
+    throw await makeApiError(response);
   }
   const contentType = response.headers.get("Content-Type")?.split(";", 1)[0];
   if (contentType !== "image/jpeg") {

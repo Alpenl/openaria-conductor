@@ -16,6 +16,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from importlib.resources import files as resource_files
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -27,6 +28,8 @@ MDNS_HOSTNAME = "rp-ylx.local"
 MDNS_SERVICE = "_ylx-capture._tcp"
 MDNS_SERVICE_ALIASES = ["_http._tcp"]
 MDNS_PORT = 8080
+MDNS_ASSET_NAME = "rp-ylx.avahi"
+MDNS_SERVICE_FILENAME = "rp-ylx.service"
 MAX_CONFIG_BYTES = 64 * 1024
 JOURNAL_FORMAT = "ylx.network-journal.v0"
 RESULT_FORMAT = "ylx.network-result.v0"
@@ -407,20 +410,16 @@ def _network_manager_profile(name: str, config: Mapping[str, Any]) -> bytes:
 
 
 def _avahi_service() -> bytes:
-    return b"""<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">RP-YLX on %h</name>
-  <service>
-    <type>_ylx-capture._tcp</type>
-    <port>8080</port>
-  </service>
-  <service>
-    <type>_http._tcp</type>
-    <port>8080</port>
-  </service>
-</service-group>
-"""
+    """读取随包发布的 mDNS service 定义。
+
+    同一份资产由安装器在首次安装时铺到 `/etc/avahi/services/`，因此默认安装无需先执行一次
+    network apply 就已经广播；这里在每次 apply 时重写，用于自愈被删除或被改坏的文件。两条
+    路径共用 `deploy/rp-ylx.avahi`，避免端口或服务类型出现两份真相。
+    """
+    packaged = Path(__file__).parent / "deploy" / MDNS_ASSET_NAME
+    if packaged.is_file():
+        return packaged.read_bytes()
+    return resource_files("rp_ylx.deploy").joinpath(MDNS_ASSET_NAME).read_bytes()
 
 
 def _run_nmcli(arguments: list[str], *, timeout: float = 35) -> subprocess.CompletedProcess[str]:
@@ -1148,7 +1147,7 @@ def _apply_network_locked(
     try:
         _write_json(journal_path, current)
         _write_atomic(profile_path, _network_manager_profile(profile, config), 0o600)
-        _write_atomic(_avahi_dir() / "rp-ylx.service", _avahi_service(), 0o644)
+        _write_atomic(_avahi_dir() / MDNS_SERVICE_FILENAME, _avahi_service(), 0o644)
         current = _journal_record(phase="staging", **common)
         _write_json(journal_path, current)
         reload_result = _run_nmcli(["connection", "reload"], timeout=10)

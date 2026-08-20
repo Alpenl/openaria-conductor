@@ -1,0 +1,13 @@
+[Unit]
+Description=RP-YLX /data internal recording volume
+DefaultDependencies=no
+After=local-fs.target
+Before=rp-ylx.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/rp-ylx-data-volume ensure
+
+[Install]
+WantedBy=multi-user.target

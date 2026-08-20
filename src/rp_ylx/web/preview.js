@@ -1,6 +1,6 @@
 // @ts-check
 
-import { getLatestPreview, waitForAbortableDelay } from "./api-client.js";
+import { DeviceApiError, getLatestPreview, waitForAbortableDelay } from "./api-client.js";
 
 /**
  * @param {{
@@ -28,7 +28,13 @@ export async function followLatestPreview(options) {
           return;
         }
         options.status.textContent = "画面暂不可用";
-        console.warn(error);
+        const expectedIdle =
+          error instanceof DeviceApiError &&
+          error.status === 503 &&
+          error.code === "preview_unavailable";
+        if (!expectedIdle) {
+          console.warn(error);
+        }
         await waitForAbortableDelay(500, options.signal);
       }
     }

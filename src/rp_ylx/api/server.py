@@ -25,9 +25,13 @@ class DeviceApiServer(ThreadingHTTPServer):
         *,
         auto_transition: bool = True,
         allowed_origins: Iterable[str] = (),
+        event_heartbeat_seconds: float = 5.0,
     ) -> None:
+        if event_heartbeat_seconds <= 0:
+            raise ValueError("设备事件心跳间隔必须大于零")
         self.device = device
         self.auto_transition = auto_transition
+        self.event_heartbeat_seconds = event_heartbeat_seconds
         origins = frozenset(allowed_origins)
         if "*" in origins:
             raise ValueError("设备 API 禁止通配符 CORS origin")
@@ -225,10 +229,13 @@ class DeviceApiHandler(BaseHTTPRequestHandler):
             if once:
                 return
             while True:
-                events = self.server.device.wait_events(last_revision, 15)
+                events = self.server.device.wait_events(
+                    last_revision,
+                    self.server.event_heartbeat_seconds,
+                )
                 if not events:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
+                    heartbeat = self.server.device.status()
+                    self._write_event(heartbeat["revision"], "status", heartbeat)
                     continue
                 for revision, event, data in events:
                     self._write_event(revision, event, data)
@@ -244,10 +251,12 @@ def create_server(
     *,
     auto_transition: bool = True,
     allowed_origins: Iterable[str] = (),
+    event_heartbeat_seconds: float = 5.0,
 ) -> DeviceApiServer:
     return DeviceApiServer(
         (host, port),
         device or MockDevice(),
         auto_transition=auto_transition,
         allowed_origins=allowed_origins,
+        event_heartbeat_seconds=event_heartbeat_seconds,
     )
