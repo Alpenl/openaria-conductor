@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 /** @typedef {import("node:http").ServerResponse} ServerResponse */
 /** @typedef {import("../../src/rp_ylx/web/state.js").CaptureStatus} CaptureStatus */
 /** @typedef {import("../../src/rp_ylx/web/state.js").DeviceDescriptor} DeviceDescriptor */
+/** @typedef {import("../../src/rp_ylx/web/state.js").DeviceRuntime} DeviceRuntime */
 /** @typedef {import("../../src/rp_ylx/web/state.js").SafeSwapReceipt} SafeSwapReceipt */
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,6 +75,7 @@ const previewJpeg = Buffer.from(
  * @property {ReturnType<typeof captureEvent> | null} staleSafeSwapEvent
  */
 
+/** @returns {DeviceRuntime} */
 const makeRuntime = () => ({
   observed_at: "2026-08-12T02:25:00Z",
   connection_method: "wifi_ap",
@@ -102,13 +104,15 @@ const makeRuntime = () => ({
   live_imu: {
     session_id: sessionId,
     clock: {
-      time_base: "session_monotonic",
-      epoch_id: sessionId,
+      time_base: "host_monotonic",
       timestamp_ns: 4_250_000_000,
     },
-    acceleration_m_s2: { x: 0.12, y: -0.08, z: 9.79 },
-    angular_velocity_rad_s: { x: 0.01, y: -0.02, z: 0.005 },
-    orientation_quaternion: { w: 0.999, x: 0.002, y: -0.004, z: 0.01 },
+    raw: {
+      units: "raw_int16",
+      accelerometer: { x: 12, y: -8, z: 979 },
+      gyroscope: { x: 1, y: -2, z: 5 },
+    },
+    sync: { quality: "good" },
   },
 });
 

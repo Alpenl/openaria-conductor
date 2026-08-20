@@ -162,6 +162,22 @@ class NativeImuCollector:
                 self.close()
             raise imu_error from error
 
+    def latest_observation(self) -> ImuObservation | None:
+        """Return the newest Rust-owned IMU observation without reading the device."""
+
+        if self._closed:
+            return None
+        latest = getattr(self._owner, "latest_observation", None)
+        if not callable(latest):
+            return None
+        try:
+            raw = latest()
+        except BaseException as error:
+            raise _to_imu_error(error, fallback_code="native_imu_failed") from error
+        if raw is None:
+            return None
+        return _observation(raw)
+
     def close(self) -> None:
         if not self._closed:
             self._closed = True

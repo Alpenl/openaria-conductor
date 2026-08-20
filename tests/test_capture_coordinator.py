@@ -30,6 +30,7 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.camera import FrameObservation, StereoFrame
+from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.recording import (
     CaptureCoordinator,
     CoordinatorConfig,
@@ -135,6 +136,15 @@ class FakeSources:
 
     def stop(self) -> None:
         self.open_handle_count = 0
+
+
+class FakeSourcesWithLatestImu(FakeSources):
+    def __init__(self, observation: ImuObservation) -> None:
+        super().__init__()
+        self.observation = observation
+
+    def latest_imu_observation(self) -> ImuObservation:
+        return self.observation
 
 
 class FakeSplitEyeEncoder:
@@ -257,6 +267,36 @@ def frame(
     )
 
 
+def imu_observation(
+    sequence: int = 0,
+    *,
+    accelerometer: tuple[int, int, int] = (1, 2, 3),
+    gyroscope: tuple[int, int, int] = (4, 5, 6),
+    sync_quality: str = "insufficient",
+) -> ImuObservation:
+    samples = []
+    for sample_index in range(2):
+        sample_sequence = sequence + sample_index
+        samples.append(
+            ImuSample(
+                sequence=sample_sequence,
+                packet_sequence=sequence // 2,
+                sample_index=sample_index,
+                device_timestamp_raw=sample_sequence,
+                device_ticks=sample_sequence,
+                host_read_start_ns=10_000 + sample_sequence,
+                host_read_end_ns=10_100 + sample_sequence,
+                host_monotonic_ns=10_050 + sample_sequence,
+                accelerometer=RawVector3(*accelerometer),
+                gyroscope=RawVector3(*gyroscope),
+                sync_offset_ns=None,
+                sync_residual_ns=None,
+                sync_quality=sync_quality,
+            )
+        )
+    return ImuObservation((samples[0], samples[1]), dropped_samples=0)
+
+
 class CaptureCoordinatorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -289,6 +329,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         checkpoint_interval: float = 1.0,
         queue_capacity: int = 128,
         enqueue_timeout: float = 0.05,
+        sources: object | None = None,
     ) -> CaptureCoordinator:
         return CaptureCoordinator(
             CoordinatorConfig(
@@ -302,6 +343,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 enqueue_timeout=enqueue_timeout,
             ),
             mount_checker=lambda path: path == self.mountpoint.resolve(),
+            sources=sources,  # type: ignore[arg-type]
             before_write=before_write,  # type: ignore[arg-type]
         )
 
@@ -590,6 +632,73 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(result.status, 202)
             with self.assertRaises(PreviewFrameUnavailable):
                 coordinator.latest_preview(fps=None, accept="image/jpeg")
+        finally:
+            coordinator.close()
+
+    def test_capture_status_exposes_latest_live_raw_imu_during_recording(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("live-imu"))
+            session_id = self.active_session_id(coordinator)
+            self.assertTrue(
+                coordinator.submit_imu(
+                    imu_observation(
+                        20,
+                        accelerometer=(12, -8, 979),
+                        gyroscope=(1, -2, 5),
+                        sync_quality="good",
+                    )
+                )
+            )
+
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            live_imu = status["snapshot"]["runtime"]["live_imu"]
+            self.assertEqual(live_imu["session_id"], session_id)
+            self.assertEqual(
+                live_imu["clock"],
+                {"time_base": "host_monotonic", "timestamp_ns": 10_071},
+            )
+            self.assertEqual(
+                live_imu["raw"],
+                {
+                    "units": "raw_int16",
+                    "accelerometer": {"x": 12, "y": -8, "z": 979},
+                    "gyroscope": {"x": 1, "y": -2, "z": 5},
+                },
+            )
+            self.assertEqual(live_imu["sync"], {"quality": "good"})
+
+            self.assertTrue(coordinator.submit_frame(frame()))
+            result = coordinator.stop_capture(stop_command("live-imu-stop"))
+            self.assertEqual(result.status, 202)
+            validate_capture_status(result.body)
+            self.assertIsNone(result.body["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
+    def test_capture_status_reads_live_raw_imu_from_sources_latest_snapshot(self) -> None:
+        sources = FakeSourcesWithLatestImu(
+            imu_observation(
+                40,
+                accelerometer=(-1, -2, -3),
+                gyroscope=(7, 8, 9),
+                sync_quality="degraded",
+            )
+        )
+        coordinator = self.coordinator(sources=sources)
+        try:
+            coordinator.start_capture(start_command("sources-live-imu"))
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            live_imu = status["snapshot"]["runtime"]["live_imu"]
+            self.assertEqual(live_imu["clock"]["timestamp_ns"], 10_091)
+            self.assertEqual(
+                live_imu["raw"]["accelerometer"],
+                {"x": -1, "y": -2, "z": -3},
+            )
+            self.assertEqual(live_imu["raw"]["gyroscope"], {"x": 7, "y": 8, "z": 9})
+            self.assertEqual(live_imu["sync"], {"quality": "degraded"})
         finally:
             coordinator.close()
 

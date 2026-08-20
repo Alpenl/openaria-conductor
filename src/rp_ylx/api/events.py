@@ -47,9 +47,9 @@ RUNTIME_KEYS = frozenset(
 )
 NETWORK_KEYS = frozenset({"ap", "wifi_client", "wired", "default_route"})
 NETWORK_INTERFACE_KEYS = frozenset({"state", "interface", "addresses", "peer_or_ssid"})
-LIVE_IMU_KEYS = frozenset(
-    {"session_id", "clock", "acceleration_m_s2", "angular_velocity_rad_s", "orientation_quaternion"}
-)
+LIVE_IMU_KEYS = frozenset({"session_id", "clock", "raw", "sync"})
+LIVE_IMU_RAW_KEYS = frozenset({"units", "accelerometer", "gyroscope"})
+LIVE_IMU_SYNC_KEYS = frozenset({"quality"})
 SAFE_SWAP_V3_KEYS = frozenset(
     {
         "schema",
@@ -785,25 +785,33 @@ def _validate_live_imu(value: object) -> None:
     clock = value["clock"]
     if (
         not isinstance(clock, Mapping)
-        or set(clock) != {"time_base", "epoch_id", "timestamp_ns"}
-        or clock["time_base"] != "session_monotonic"
-        or clock["epoch_id"] != session_id
+        or set(clock) != {"time_base", "timestamp_ns"}
+        or clock["time_base"] != "host_monotonic"
         or type(clock["timestamp_ns"]) is not int
         or clock["timestamp_ns"] < 0
     ):
         raise InvalidSourceEvent("live_imu clock 无效")
-    _validate_vector(value["acceleration_m_s2"], {"x", "y", "z"})
-    _validate_vector(value["angular_velocity_rad_s"], {"x", "y", "z"})
-    _validate_vector(value["orientation_quaternion"], {"w", "x", "y", "z"})
+    raw = value["raw"]
+    if not isinstance(raw, Mapping) or set(raw) != LIVE_IMU_RAW_KEYS or raw["units"] != "raw_int16":
+        raise InvalidSourceEvent("live_imu raw 无效")
+    _validate_raw_vector(raw["accelerometer"])
+    _validate_raw_vector(raw["gyroscope"])
+    sync = value["sync"]
+    if (
+        not isinstance(sync, Mapping)
+        or set(sync) != LIVE_IMU_SYNC_KEYS
+        or not _is_enum(sync["quality"], {"insufficient", "good", "degraded"})
+    ):
+        raise InvalidSourceEvent("live_imu sync 无效")
 
 
-def _validate_vector(value: object, keys: set[str]) -> None:
+def _validate_raw_vector(value: object) -> None:
     if (
         not isinstance(value, Mapping)
-        or set(value) != keys
-        or any(not _number(value[key]) for key in keys)
+        or set(value) != {"x", "y", "z"}
+        or any(type(value[key]) is not int or not -32768 <= value[key] <= 32767 for key in value)
     ):
-        raise InvalidSourceEvent("live_imu vector 无效")
+        raise InvalidSourceEvent("live_imu raw vector 无效")
 
 
 def _validate_state_data(data: Mapping[str, object]) -> None:

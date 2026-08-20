@@ -358,6 +358,20 @@ class NativeContinuousCaptureSources:
         with self._lock:
             return self._last_preview_error
 
+    def latest_imu_observation(self) -> ImuObservation | None:
+        with self._lock:
+            tap = self._recording
+            if tap is None:
+                return None
+            cached = tap.latest_imu
+            imu = tap.imu
+        if cached is not None:
+            return cached
+        latest = getattr(imu, "latest_observation", None)
+        if callable(latest):
+            return latest()
+        return None
+
     def start_preview(self) -> None:
         with self._lock:
             if self._runtime is not None:
@@ -620,6 +634,9 @@ class NativeContinuousCaptureSources:
         if self._recording_snapshot() is not tap:
             return False
         observation = decode_native_imu_observation(raw)
+        with self._lock:
+            if self._recording is tap:
+                tap.latest_imu = observation
         if self._recording_snapshot() is not tap:
             return False
         return tap.submit_imu(observation)
@@ -645,6 +662,9 @@ class NativeContinuousCaptureSources:
                 observation = tap.imu.read(timeout=self._read_timeout)
                 if self._recording_snapshot() is not tap:
                     break
+                with self._lock:
+                    if self._recording is tap:
+                        tap.latest_imu = observation
                 tap.submit_imu(observation)
         except BaseException as error:
             if self._recording_snapshot() is tap:
@@ -724,6 +744,7 @@ class _RecordingTap:
     native_fanout: NativeCaptureFanoutState | None = None
     native_tap_state: NativeRecordingTapState | None = None
     native_frame_gate: NativeRecordingFrameGate | None = None
+    latest_imu: ImuObservation | None = None
 
 
 class ContinuousCaptureSources:
@@ -942,6 +963,9 @@ class ContinuousCaptureSources:
                 observation = tap.imu.read(timeout=self._read_timeout)
                 if self._stop.is_set() or self._recording_snapshot() is not tap:
                     break
+                with self._lock:
+                    if self._recording is tap:
+                        tap.latest_imu = observation
                 tap.submit_imu(observation)
         except BaseException as error:
             if not self._stop.is_set() and self._recording_snapshot() is tap:

@@ -148,16 +148,14 @@ function render() {
 
   const imu = runtime?.live_imu;
   element('[data-testid="acceleration"]').textContent = formatVector(
-    imu?.acceleration_m_s2,
-    "m/s²",
+    imu?.raw?.accelerometer,
+    "raw",
   );
   element('[data-testid="angular-velocity"]').textContent = formatVector(
-    imu?.angular_velocity_rad_s,
-    "rad/s",
+    imu?.raw?.gyroscope,
+    "raw",
   );
-  element('[data-testid="orientation"]').textContent = imu?.orientation_quaternion
-    ? `w ${formatNumber(imu.orientation_quaternion.w)}  x ${formatNumber(imu.orientation_quaternion.x)}  y ${formatNumber(imu.orientation_quaternion.y)}  z ${formatNumber(imu.orientation_quaternion.z)}`
-    : "不可用";
+  element('[data-testid="imu-sync"]').textContent = imu?.sync?.quality ?? "不可用";
 
   const safeSwap = /** @type {HTMLElement} */ (element(".safe-swap"));
   safeSwap.hidden = !state.safeSwapReceipt;

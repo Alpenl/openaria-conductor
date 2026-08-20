@@ -22,16 +22,18 @@ test("设备工作台完全从同源离线加载", async ({ page }) => {
   expect(externalRequests).toEqual([]);
 });
 
-test("权威快照呈现设备、容量和明确单位的 IMU", async ({ page }) => {
+test("权威快照呈现设备、容量和真实 raw IMU", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByText("YLX-A1B2C3D4", { exact: true })).toBeVisible();
   await expect(page.getByTestId("capture-state")).toHaveText("待机");
   await expect(page.getByTestId("storage-available")).toHaveText("82.0 GiB");
   await expect(page.getByTestId("temperature")).toHaveText("43.5 °C");
-  await expect(page.getByTestId("acceleration")).toContainText("m/s²");
-  await expect(page.getByTestId("angular-velocity")).toContainText("rad/s");
-  await expect(page.getByTestId("orientation")).toContainText("w 0.999");
+  await expect(page.getByTestId("acceleration")).toContainText("x 12.000");
+  await expect(page.getByTestId("acceleration")).toContainText("raw");
+  await expect(page.getByTestId("angular-velocity")).toContainText("x 1.000");
+  await expect(page.getByTestId("angular-velocity")).toContainText("raw");
+  await expect(page.getByTestId("imu-sync")).toHaveText("good");
 });
 
 test("无录制卷时设备保持在线并显示空会话列表", async ({ page, request }) => {
