@@ -486,9 +486,83 @@ def _first_last_status(
     return (valid[0], valid[-1]) if valid else (None, None)
 
 
+def _sse_progress_records(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in events:
+        envelope = item.get("data")
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        if (
+            item.get("kind") != "event"
+            or item.get("event") != "progress"
+            or not isinstance(envelope, dict)
+            or not isinstance(data, dict)
+        ):
+            continue
+        records.append(
+            {
+                "event_id": item.get("id"),
+                "authority_epoch": envelope.get("authority_epoch"),
+                "source_revision": envelope.get("source_revision"),
+                "session_id": envelope.get("session_id"),
+                "phase": data.get("phase"),
+                "elapsed_seconds": data.get("elapsed_seconds"),
+                "completed_units": data.get("completed_units"),
+            }
+        )
+    return records
+
+
+def _finalizing_projection(
+    events: list[dict[str, Any]],
+    *,
+    session_id: str | None,
+    manifest_summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    manifest_elapsed = manifest_summary.get("duration_seconds")
+    manifest_frames = manifest_summary.get("frames")
+    if (
+        isinstance(manifest_elapsed, bool)
+        or not isinstance(manifest_elapsed, (int, float))
+        or type(manifest_frames) is not int
+    ):
+        return None
+    candidates = []
+    for record in _sse_progress_records(events):
+        elapsed = record.get("elapsed_seconds")
+        frames = record.get("completed_units")
+        if (
+            record.get("phase") != "finalizing"
+            or (session_id is not None and record.get("session_id") != session_id)
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or type(frames) is not int
+            or elapsed < 0
+            or frames < 0
+            or elapsed > manifest_elapsed
+            or frames > manifest_frames
+        ):
+            continue
+        candidates.append(record)
+    if not candidates:
+        return None
+    selected = candidates[-1]
+    return {
+        "kind": "sse_finalizing",
+        "event_id": selected.get("event_id"),
+        "authority_epoch": selected.get("authority_epoch"),
+        "source_revision": selected.get("source_revision"),
+        "session_id": selected.get("session_id"),
+        "elapsed_seconds": selected.get("elapsed_seconds"),
+        "captured_frames": selected.get("completed_units"),
+    }
+
+
 def _counter_reconciliation(
     samples: list[dict[str, Any]],
     manifest_summary: dict[str, Any],
+    *,
+    sse_events: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     first, last = _first_last_status(samples)
     last_progress = last.get("progress") if isinstance(last, dict) else None
@@ -510,15 +584,31 @@ def _counter_reconciliation(
             "bytes_written": _numeric_delta(first_progress, last_progress, "bytes_written"),
         }
     if isinstance(last_progress, dict):
+        final_projection: dict[str, Any] = {
+            "kind": "recording_status",
+            "elapsed_seconds": last_progress.get("elapsed_seconds"),
+            "captured_frames": last_progress.get("captured_frames"),
+            "bytes_written": last_progress.get("bytes_written"),
+        }
+        finalizing = _finalizing_projection(
+            sse_events or [],
+            session_id=session_id,
+            manifest_summary=manifest_summary,
+        )
+        if finalizing is not None:
+            final_projection.update(finalizing)
+            final_projection["bytes_written"] = last_progress.get("bytes_written")
+            final_projection["bytes_source"] = "recording_status"
+        result["final_projection"] = final_projection
         result["final_delta"] = {
             "elapsed_seconds": _numeric_pair_delta(
-                last_progress.get("elapsed_seconds"), manifest_summary.get("duration_seconds")
+                final_projection.get("elapsed_seconds"), manifest_summary.get("duration_seconds")
             ),
             "captured_frames": _numeric_pair_delta(
-                last_progress.get("captured_frames"), manifest_summary.get("frames")
+                final_projection.get("captured_frames"), manifest_summary.get("frames")
             ),
             "bytes_written": _numeric_pair_delta(
-                last_progress.get("bytes_written"), manifest_summary.get("artifact_bytes")
+                final_projection.get("bytes_written"), manifest_summary.get("artifact_bytes")
             ),
         }
     return result
@@ -562,20 +652,69 @@ def _sse_reconnect_converged(events: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _sse_progress_advances(events: list[dict[str, Any]]) -> bool:
+def _sse_progress_advances(
+    events: list[dict[str, Any]],
+    *,
+    expected_source: tuple[object, object] | None = None,
+    session_id: str | None = None,
+) -> bool:
     progress = [
-        item.get("data", {}).get("data")
-        for item in events
-        if item.get("kind") == "event"
-        and item.get("event") == "progress"
-        and isinstance(item.get("data"), dict)
-        and isinstance(item["data"].get("data"), dict)
+        record
+        for record in _sse_progress_records(events)
+        if record.get("phase") == "recording"
+        and (
+            expected_source is None
+            or (record.get("authority_epoch"), record.get("source_revision")) == expected_source
+        )
+        and (session_id is None or record.get("session_id") == session_id)
     ]
     if len(progress) < 2:
         return False
-    return _progress_increases(
-        progress[0], progress[-1], "elapsed_seconds"
-    ) and _progress_increases(progress[0], progress[-1], "completed_units")
+    for key in ("elapsed_seconds", "completed_units"):
+        values = [record.get(key) for record in progress]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            return False
+        if any(after < before for before, after in zip(values, values[1:], strict=False)):
+            return False
+        if values[-1] <= values[0]:
+            return False
+    return True
+
+
+def _sse_finalizing_progress_non_regressing(
+    events: list[dict[str, Any]], *, session_id: str | None
+) -> bool:
+    records = [
+        record
+        for record in _sse_progress_records(events)
+        if (session_id is None or record.get("session_id") == session_id)
+        and record.get("phase") in {"recording", "finalizing"}
+    ]
+    finalizing_seen = False
+    previous_elapsed: float | int | None = None
+    previous_units: float | int | None = None
+    for record in records:
+        elapsed = record.get("elapsed_seconds")
+        units = record.get("completed_units")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or isinstance(units, bool)
+            or not isinstance(units, (int, float))
+        ):
+            return False
+        if record.get("phase") == "recording":
+            previous_elapsed = elapsed
+            previous_units = units
+            continue
+        finalizing_seen = True
+        if previous_elapsed is not None and elapsed < previous_elapsed:
+            return False
+        if previous_units is not None and units < previous_units:
+            return False
+        previous_elapsed = elapsed
+        previous_units = units
+    return not finalizing_seen or previous_units is not None
 
 
 def _numeric_delta(first: dict[str, Any], last: dict[str, Any], key: str) -> float | int | None:
@@ -605,16 +744,16 @@ def _checks(
     sample_interval_s: float,
     reconciliation: dict[str, Any],
     range_probe: dict[str, Any],
+    session_id: str | None = None,
 ) -> dict[str, bool]:
     first, last = _first_last_status(samples)
     first_progress = first.get("progress") if isinstance(first, dict) else None
     last_progress = last.get("progress") if isinstance(last, dict) else None
     first_imu = first.get("live_imu") if isinstance(first, dict) else None
     last_imu = last.get("live_imu") if isinstance(last, dict) else None
-    progress_events = [
-        item
-        for item in sse_events
-        if item.get("kind") == "event" and item.get("event") == "progress"
+    progress_records = _sse_progress_records(sse_events)
+    recording_progress = [
+        record for record in progress_records if record.get("phase") == "recording"
     ]
     valid_samples = [item for item in samples if item.get("http_status") == 200]
     revision_stable = _same_non_null_value(
@@ -627,11 +766,10 @@ def _checks(
         if isinstance(first, dict)
         else None
     )
-    progress_sources_match = bool(progress_events) and all(
-        isinstance(item.get("data"), dict)
-        and (item["data"].get("authority_epoch"), item["data"].get("source_revision"))
-        == expected_source
-        for item in progress_events
+    progress_sources_match = bool(recording_progress) and all(
+        (item.get("authority_epoch"), item.get("source_revision")) == expected_source
+        and (session_id is None or item.get("session_id") == session_id)
+        for item in recording_progress
     )
     roles = manifest_summary.get("roles")
     content_range = range_probe.get("content_range")
@@ -666,10 +804,17 @@ def _checks(
         "live_imu_raw_changes": isinstance(first_imu, dict)
         and isinstance(last_imu, dict)
         and first_imu.get("raw") != last_imu.get("raw"),
-        "sse_progress_rate_bounded": len(progress_events)
+        "sse_progress_rate_bounded": len(recording_progress)
         >= max(2, int(duration_requested_s * 0.5)),
         "sse_progress_source_revision_stable": progress_sources_match,
-        "sse_progress_payload_advances": _sse_progress_advances(sse_events),
+        "sse_progress_payload_advances": _sse_progress_advances(
+            sse_events,
+            expected_source=expected_source,
+            session_id=session_id,
+        ),
+        "sse_finalizing_progress_non_regressing": _sse_finalizing_progress_non_regressing(
+            sse_events, session_id=session_id
+        ),
         "sse_reconnect_attempted": any(item.get("kind") == "reconnect" for item in sse_events),
         "sse_reconnect_converged": _sse_reconnect_converged(sse_events),
         "sse_errors_absent": not any(item.get("kind") == "error" for item in sse_events),
@@ -803,7 +948,12 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     validation = _run_validate(args.rp_ylx_bin, session_dir)
     range_probe = _artifact_range_probe(args.base_url, session_id, manifest)
     service_after = _service_status(args.service_name)
-    reconciliation = _counter_reconciliation(status_samples, manifest_summary)
+    reconciliation = _counter_reconciliation(
+        status_samples,
+        manifest_summary,
+        sse_events=sse_events,
+        session_id=session_id,
+    )
     checks = _checks(
         expected_commit=args.expected_commit,
         device_commit=device_commit,
@@ -818,6 +968,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         sample_interval_s=args.sample_interval,
         reconciliation=reconciliation,
         range_probe=range_probe,
+        session_id=session_id,
     )
     return {
         "schema": SCHEMA,

@@ -1056,6 +1056,11 @@ class DeviceSessionRecorder:
         progress = dict(raw_progress) if isinstance(raw_progress, Mapping) else {}
         if self._state in {"recording", "finalizing", "verifying"}:
             progress["elapsed_seconds"] = self._elapsed()
+        persisted_frames = progress.get("captured_frames")
+        progress["captured_frames"] = max(
+            persisted_frames if type(persisted_frames) is int else 0,
+            self._frames_written,
+        )
         progress["bytes_written"] = self._project_recording_bytes(self._bytes_written)
         if self._native_direct_recording:
             frames_written: int | None = None

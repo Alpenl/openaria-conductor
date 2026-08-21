@@ -906,6 +906,43 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 finally:
                     recorder.fail("test_cleanup", "cleanup", recoverable=False)
 
+    def test_native_direct_finalizing_progress_does_not_regress_after_sink_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            sink = FakeLiveNativeRecordingSink()
+            recorder.start()
+            try:
+                sink.advance(frames=53_555, bytes_written=719_135_791)
+                with recorder._lock:
+                    recorder._state = "finalizing"
+                    recorder._native_direct_recording = True
+                    recorder._native_recording_sink = sink
+                    assert recorder._current_state is not None
+                    current = deepcopy(recorder._current_state)
+                    current["state"] = "finalizing"
+                    current["progress"] = {
+                        "elapsed_seconds": 1_800.0,
+                        "captured_frames": 0,
+                        "bytes_written": 0,
+                    }
+                    recorder._current_state = current
+
+                with_sink = recorder.current_recording_state
+                assert with_sink is not None
+                self.assertEqual(with_sink["progress"]["captured_frames"], 53_555)
+
+                with recorder._lock:
+                    recorder._frames_written = 53_555
+                    recorder._bytes_written = 719_135_791
+                    recorder._native_recording_sink = None
+
+                after_close = recorder.current_recording_state
+                assert after_close is not None
+                self.assertEqual(after_close["progress"]["captured_frames"], 53_555)
+                self.assertEqual(after_close["progress"]["bytes_written"], 719_135_791)
+            finally:
+                recorder.abort()
+
     def test_live_progress_includes_audio_snapshot_bytes_before_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
