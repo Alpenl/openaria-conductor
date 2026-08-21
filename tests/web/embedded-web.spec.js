@@ -36,6 +36,33 @@ test("权威快照呈现设备、容量和真实 raw IMU", async ({ page }) => {
   await expect(page.getByTestId("imu-sync")).toHaveText("good");
 });
 
+test("网页可以调整相机焦距并同步到权威快照", async ({ page, request }) => {
+  await page.goto("/");
+
+  await expect(page.getByTestId("camera-focus-value")).toHaveText("42");
+  await expect(page.locator("#focus-status")).toContainText("手动焦距 42");
+
+  await page.locator("#camera-focus-range").evaluate((node) => {
+    const input = /** @type {HTMLInputElement} */ (node);
+    input.value = "64";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.getByTestId("camera-focus-value")).toHaveText("64");
+  await page.getByRole("button", { name: "应用焦距" }).click();
+
+  await expect(page.getByTestId("camera-focus-value")).toHaveText("64");
+  await expect(page.locator("#focus-status")).toContainText("手动焦距 64");
+
+  const response = await request.get("/__fixture/requests");
+  const body = /** @type {{requests: Array<{path: string, idempotencyKey: string | null}>}} */ (
+    await response.json()
+  );
+  const focusRequests = body.requests.filter(
+    (entry) => entry.path === "/api/v3/camera/focus" && entry.idempotencyKey,
+  );
+  expect(focusRequests).toHaveLength(1);
+});
+
 test("无录制卷时设备保持在线并显示空会话列表", async ({ page, request }) => {
   await request.post("/__fixture/config", { data: { sessionsVolumeUnavailable: true } });
 

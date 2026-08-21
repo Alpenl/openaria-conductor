@@ -72,6 +72,57 @@ function formatVector(vector, unit) {
   return `x ${formatNumber(vector.x)}  y ${formatNumber(vector.y)}  z ${formatNumber(vector.z)} ${unit}`;
 }
 
+function currentCameraFocus() {
+  return state.capture?.snapshot.runtime.camera_focus ?? state.device?.runtime?.camera_focus ?? null;
+}
+
+function syncFocusDraftControls() {
+  const focus = currentCameraFocus();
+  const range = /** @type {HTMLInputElement} */ (element("#camera-focus-range"));
+  const auto = /** @type {HTMLInputElement} */ (element("#camera-focus-auto"));
+  const command = /** @type {HTMLButtonElement} */ (element("#focus-command"));
+  const connected = state.connection === "connected";
+  const available = Boolean(focus);
+  const autoChecked = available && focus?.auto_supported === true && auto.checked;
+  range.disabled = !available || !connected || state.focusPending || autoChecked;
+  auto.disabled = !available || !connected || state.focusPending || focus?.auto_supported !== true;
+  command.disabled = !available || !connected || state.focusPending;
+}
+
+/** @param {import("./state.js").CameraFocusStatus | null | undefined} focus */
+function renderCameraFocus(focus = currentCameraFocus()) {
+  const range = /** @type {HTMLInputElement} */ (element("#camera-focus-range"));
+  const auto = /** @type {HTMLInputElement} */ (element("#camera-focus-auto"));
+  const command = /** @type {HTMLButtonElement} */ (element("#focus-command"));
+  const value = /** @type {HTMLOutputElement} */ (
+    element('[data-testid="camera-focus-value"]')
+  );
+  const status = element("#focus-status");
+  command.textContent = state.focusPending ? "正在应用" : "应用焦距";
+  if (!focus) {
+    range.min = "0";
+    range.max = "0";
+    range.step = "1";
+    range.value = "0";
+    auto.checked = false;
+    value.textContent = "不可用";
+    status.textContent = "设备焦距控制不可用";
+    syncFocusDraftControls();
+    return;
+  }
+  range.min = String(focus.minimum);
+  range.max = String(focus.maximum);
+  range.step = String(focus.step);
+  range.value = String(focus.value);
+  auto.checked = focus.auto_enabled === true;
+  value.textContent = String(focus.value);
+  status.textContent =
+    focus.auto_enabled === true
+      ? "自动对焦已开启"
+      : `手动焦距 ${focus.value}（${focus.minimum}–${focus.maximum}，步进 ${focus.step}）`;
+  syncFocusDraftControls();
+}
+
 function render() {
   const connection = element(".connection");
   connection.textContent = connectionLabels[state.connection] ?? "状态未知";
@@ -89,6 +140,7 @@ function render() {
 
   const snapshot = state.capture?.snapshot;
   if (!snapshot) {
+    renderCameraFocus();
     renderDiagnostics();
     return;
   }
@@ -145,6 +197,7 @@ function render() {
     : "不可用";
   element('[data-testid="connection-method"]').textContent =
     connectionMethodLabels[runtime?.connection_method] ?? "未知";
+  renderCameraFocus(runtime?.camera_focus);
 
   const imu = runtime?.live_imu;
   element('[data-testid="acceleration"]').textContent = formatVector(
@@ -586,12 +639,59 @@ async function submitCapture(event) {
   }
 }
 
+/** @param {Event} event */
+async function submitFocus(event) {
+  event.preventDefault();
+  if (state.focusPending || state.connection !== "connected") {
+    return;
+  }
+  const focus = currentCameraFocus();
+  if (!focus) {
+    return;
+  }
+  const range = /** @type {HTMLInputElement} */ (element("#camera-focus-range"));
+  const auto = /** @type {HTMLInputElement} */ (element("#camera-focus-auto"));
+  /** @type {{value?: number, auto_enabled?: boolean}} */
+  const request = {};
+  if (focus.auto_supported && auto.checked) {
+    request.auto_enabled = true;
+  } else {
+    const value = Number(range.value);
+    if (!Number.isInteger(value)) {
+      return;
+    }
+    request.value = value;
+    if (focus.auto_supported) {
+      request.auto_enabled = false;
+    }
+  }
+  dispatch({ type: "camera-focus.pending" });
+  try {
+    const updated = await deviceApi.setCameraFocus(request);
+    dispatch({ type: "camera-focus.updated", payload: updated });
+    await refreshCapture();
+  } catch (error) {
+    dispatch({
+      type: "command.failed",
+      error: visibleError(error),
+    });
+  } finally {
+    dispatch({ type: "camera-focus.settled" });
+  }
+}
+
 render();
 /** @type {HTMLFormElement} */ (element("#credential-form")).addEventListener(
   "submit",
   submitCredentials,
 );
 /** @type {HTMLFormElement} */ (element("#capture-form")).addEventListener("submit", submitCapture);
+/** @type {HTMLFormElement} */ (element("#focus-form")).addEventListener("submit", submitFocus);
+element("#camera-focus-range").addEventListener("input", () => {
+  element('[data-testid="camera-focus-value"]').textContent =
+    /** @type {HTMLInputElement} */ (element("#camera-focus-range")).value;
+});
+element("#camera-focus-auto").addEventListener("change", syncFocusDraftControls);
 element("#stop-command").addEventListener("click", () => void stopCapture("user"));
 element("#safe-swap-command").addEventListener("click", () => void stopCapture("safe_swap"));
 void loadInitialState().then((connected) => {

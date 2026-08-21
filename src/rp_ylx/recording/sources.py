@@ -38,6 +38,15 @@ class CaptureCamera(Protocol):
 
     def close(self) -> None: ...
 
+    def camera_focus_status(self) -> dict[str, object] | None: ...
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]: ...
+
 
 class CaptureImu(Protocol):
     def read(self, *, timeout: float) -> ImuObservation: ...
@@ -301,6 +310,23 @@ class ThreadedCaptureSources:
             if current not in self._threads:
                 self._threads.clear()
             self._on_failure = None
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        with self._lock:
+            camera = self._camera
+        return None if camera is None else camera.camera_focus_status()
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            camera = self._camera
+        if camera is None:
+            raise RuntimeError("采集来源尚未启动")
+        return camera.set_camera_focus(value=value, auto_enabled=auto_enabled)
 
 
 class NativeContinuousCaptureSources:
@@ -843,6 +869,28 @@ class ContinuousCaptureSources:
                 with suppress(BaseException):
                     camera.close()
             raise
+
+    def _camera_for_control(self) -> CaptureCamera:
+        self.start_preview()
+        with self._lock:
+            camera = self._camera
+        if camera is None:
+            raise RuntimeError("预览相机尚未启动")
+        return camera
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        return self._camera_for_control().camera_focus_status()
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        return self._camera_for_control().set_camera_focus(
+            value=value,
+            auto_enabled=auto_enabled,
+        )
 
     def start(
         self,

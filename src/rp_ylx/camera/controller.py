@@ -17,6 +17,8 @@ from rp_ylx.native import (
     NativeCameraFrameValidator,
     NativeModuleError,
     create_native_camera_frame_validator,
+    native_camera_focus_status,
+    set_native_camera_focus,
 )
 from rp_ylx.performance.metrics import PerformanceMetrics
 
@@ -122,6 +124,50 @@ class CameraController:
             with suppress(Exception):
                 self.close()
             raise CameraError("disconnected", f"相机读取失败：{exc}", retryable=True) from exc
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return None
+        try:
+            return native_camera_focus_status(descriptor.node)
+        except NativeModuleError as exc:
+            if exc.code in {
+                "native_focus_unavailable",
+                "native_import_failed",
+                "native_dependency_missing",
+                "unsupported_native_abi",
+                "missing_native_capability",
+                "camera_focus_unsupported",
+            }:
+                return None
+            raise CameraError(exc.code, exc.message, retryable=True) from exc
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        descriptor = self._descriptor
+        if descriptor is None:
+            raise CameraError("invalid_state", "相机必须先打开")
+        try:
+            return set_native_camera_focus(
+                descriptor.node,
+                value=value,
+                auto_enabled=auto_enabled,
+            )
+        except NativeModuleError as exc:
+            retryable = exc.code in {
+                "camera_focus_open_failed",
+                "camera_focus_get_failed",
+                "camera_focus_set_failed",
+                "camera_focus_query_failed",
+                "native_focus_status_failed",
+                "native_focus_set_failed",
+            }
+            raise CameraError(exc.code, exc.message, retryable=retryable) from exc
 
     def stop(self) -> None:
         if self._stream is None:

@@ -38,6 +38,16 @@ from rp_ylx.camera.v4l2 import (
 )
 
 MODE = CameraMode(1920, 1080, 30.0, "mjpg")
+FOCUS_STATUS = {
+    "schema": "ylx.camera-focus.v1",
+    "value": 42,
+    "minimum": 0,
+    "maximum": 255,
+    "step": 1,
+    "default": 32,
+    "auto_supported": True,
+    "auto_enabled": False,
+}
 
 
 def descriptor(stable_id: str) -> CameraDescriptor:
@@ -164,6 +174,34 @@ class CameraControllerTest(unittest.TestCase):
         controller.start()
 
         self.assertEqual(controller.read().frame.raw_side_by_side, b"raw-sbs")
+        controller.close()
+
+    def test_focus_control_uses_open_camera_device_node(self) -> None:
+        device = descriptor("camera-focus")
+        controller = CameraController(SyntheticCameraBackend((device,)))
+        controller.open(MODE)
+
+        with patch(
+            "rp_ylx.camera.controller.native_camera_focus_status",
+            return_value=FOCUS_STATUS,
+        ) as read_focus:
+            self.assertEqual(controller.camera_focus_status(), FOCUS_STATUS)
+        read_focus.assert_called_once_with("/dev/camera-focus")
+
+        updated = {**FOCUS_STATUS, "value": 77}
+        with patch(
+            "rp_ylx.camera.controller.set_native_camera_focus",
+            return_value=updated,
+        ) as set_focus:
+            self.assertEqual(
+                controller.set_camera_focus(value=77, auto_enabled=False),
+                updated,
+            )
+        set_focus.assert_called_once_with(
+            "/dev/camera-focus",
+            value=77,
+            auto_enabled=False,
+        )
         controller.close()
 
     def test_context_manager_releases_open_stream(self) -> None:

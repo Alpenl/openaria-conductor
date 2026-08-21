@@ -34,8 +34,10 @@ from rp_ylx.native import (
     create_native_stereo_encoder_process,
     create_native_timeline,
     evaluate_native_drop_quality_policy,
+    native_camera_focus_status,
     native_capabilities,
     parse_native_single_range,
+    set_native_camera_focus,
 )
 
 
@@ -72,6 +74,56 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 owner,
             )
         constructor.assert_called_once_with("/dev/video0", 3840, 1080, 60, "mjpg", 6, 4, True)
+
+    def test_explicit_camera_focus_requires_native_capability(self) -> None:
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "v4l2_capture"],
+            }
+        )
+        with (
+            patch("rp_ylx.native.importlib.import_module", return_value=module),
+            self.assertRaises(NativeModuleError) as raised,
+        ):
+            native_camera_focus_status("/dev/video0")
+        self.assertEqual(raised.exception.code, "native_focus_unavailable")
+
+    def test_explicit_camera_focus_reads_sets_and_validates_inputs(self) -> None:
+        status = {
+            "schema": "ylx.camera-focus.v1",
+            "value": 42,
+            "minimum": 0,
+            "maximum": 255,
+            "step": 1,
+            "default": 32,
+            "auto_supported": True,
+            "auto_enabled": False,
+        }
+        updated = {**status, "value": 77}
+        module = SimpleNamespace(
+            capabilities=lambda: {
+                "module_version": "0.1.0",
+                "abi": 4,
+                "features": ["capability_probe", "v4l2_focus_control"],
+            },
+            v4l2_focus_status=unittest.mock.Mock(side_effect=[status, updated]),
+            v4l2_set_focus=unittest.mock.Mock(return_value=updated),
+        )
+        with patch("rp_ylx.native.importlib.import_module", return_value=module):
+            self.assertEqual(native_camera_focus_status("/dev/video0"), status)
+            self.assertEqual(
+                set_native_camera_focus("/dev/video0", value=77, auto_enabled=False),
+                updated,
+            )
+            with self.assertRaises(NativeModuleError) as raised:
+                set_native_camera_focus("/dev/video0", value=True)
+        module.v4l2_focus_status.assert_has_calls(
+            [unittest.mock.call("/dev/video0"), unittest.mock.call("/dev/video0")]
+        )
+        module.v4l2_set_focus.assert_called_once_with("/dev/video0", 77, False)
+        self.assertEqual(raised.exception.code, "invalid_camera_focus")
 
     def test_explicit_camera_can_disable_eye_splitting(self) -> None:
         owner = object()

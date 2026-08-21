@@ -22,6 +22,18 @@
  * @property {number} temperature_celsius
  * @property {{ap: NetworkInterfaceStatus, wifi_client: NetworkInterfaceStatus, wired: NetworkInterfaceStatus, default_route: string}} network
  * @property {LiveImu | null} live_imu
+ * @property {CameraFocusStatus | null} camera_focus
+ */
+/**
+ * @typedef {object} CameraFocusStatus
+ * @property {"ylx.camera-focus.v1"} schema
+ * @property {number} value
+ * @property {number} minimum
+ * @property {number} maximum
+ * @property {number} step
+ * @property {number} default
+ * @property {boolean} auto_supported
+ * @property {boolean | null} auto_enabled
  */
 /**
  * @typedef {object} RecordingState
@@ -58,6 +70,7 @@
  * @property {{device_id: string, device_label: string}} device
  * @property {{capture: boolean, preview: boolean, range_download: boolean, network_mutation: boolean}} capabilities
  * @property {{volume_id: string | null, total_bytes: number, available_bytes: number, writable: boolean}} storage
+ * @property {DeviceRuntime} runtime
  */
 /**
  * @typedef {object} AppState
@@ -68,6 +81,7 @@
  * @property {SessionList | null} sessions
  * @property {Diagnostic[]} diagnostics
  * @property {boolean} commandPending
+ * @property {boolean} focusPending
  * @property {{code: string, message: string, details?: Record<string, unknown>} | null} error
  */
 /**
@@ -77,6 +91,9 @@
  *   {type: "command.settled"} |
  *   {type: "command.succeeded"} |
  *   {type: "command.failed", error: {code: string, message: string, details?: Record<string, unknown>}} |
+ *   {type: "camera-focus.pending"} |
+ *   {type: "camera-focus.settled"} |
+ *   {type: "camera-focus.updated", payload: CameraFocusStatus} |
  *   {type: "error.cleared"} |
  *   {type: "safe-swap.received", payload: SafeSwapState} |
  *   {type: "safe-swap.cleared"} |
@@ -141,8 +158,14 @@ export const initialState = {
   sessions: null,
   diagnostics: [],
   commandPending: false,
+  focusPending: false,
   error: null,
 };
+
+/** @param {DeviceRuntime} runtime @param {CameraFocusStatus} focus @returns {DeviceRuntime} */
+function withCameraFocus(runtime, focus) {
+  return { ...runtime, camera_focus: focus };
+}
 
 /** @param {SafeSwapState | null} safeSwap @param {CaptureStatus} capture */
 function receiptMatchesCapture(safeSwap, capture) {
@@ -202,6 +225,30 @@ export function reduceState(state, action) {
   }
   if (action.type === "command.failed") {
     return { ...state, error: action.error };
+  }
+  if (action.type === "camera-focus.pending") {
+    return { ...state, focusPending: true, error: null };
+  }
+  if (action.type === "camera-focus.settled") {
+    return { ...state, focusPending: false };
+  }
+  if (action.type === "camera-focus.updated") {
+    return {
+      ...state,
+      error: null,
+      device: state.device
+        ? { ...state.device, runtime: withCameraFocus(state.device.runtime, action.payload) }
+        : state.device,
+      capture: state.capture
+        ? {
+            ...state.capture,
+            snapshot: {
+              ...state.capture.snapshot,
+              runtime: withCameraFocus(state.capture.snapshot.runtime, action.payload),
+            },
+          }
+        : state.capture,
+    };
   }
   if (action.type === "error.cleared") {
     return { ...state, error: null };

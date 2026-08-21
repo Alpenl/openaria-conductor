@@ -603,6 +603,94 @@ def create_native_camera(
         raise NativeModuleError(code, message) from exc
 
 
+def _parse_native_error(exc: Exception, fallback_code: str) -> NativeModuleError:
+    raw = str(exc)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = fallback_code, raw
+    return NativeModuleError(code, message)
+
+
+def native_camera_focus_status(device: str) -> dict[str, object] | None:
+    """Read V4L2 focus controls through the Rust native control path."""
+
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_focus_unavailable", f"无法加载原生相机控制模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "v4l2_focus_control" not in capabilities.features:
+        raise NativeModuleError("native_focus_unavailable", "原生模块缺少 V4L2 焦距控制能力")
+    try:
+        status = module.v4l2_focus_status(device)
+    except Exception as exc:
+        raise _parse_native_error(exc, "native_focus_status_failed") from exc
+    if status is not None and (
+        not isinstance(status, dict)
+        or set(status)
+        != {
+            "schema",
+            "value",
+            "minimum",
+            "maximum",
+            "step",
+            "default",
+            "auto_supported",
+            "auto_enabled",
+        }
+        or status["schema"] != "ylx.camera-focus.v1"
+        or any(
+            isinstance(status[key], bool) or not isinstance(status[key], int)
+            for key in ("value", "minimum", "maximum", "step", "default")
+        )
+        or status["step"] <= 0
+        or status["minimum"] > status["maximum"]
+        or not status["minimum"] <= status["value"] <= status["maximum"]
+        or (status["value"] - status["minimum"]) % status["step"] != 0
+        or not status["minimum"] <= status["default"] <= status["maximum"]
+        or type(status["auto_supported"]) is not bool
+        or (status["auto_enabled"] is not None and type(status["auto_enabled"]) is not bool)
+        or (not status["auto_supported"] and status["auto_enabled"] is not None)
+    ):
+        raise NativeModuleError("invalid_native_focus_status", "原生焦距状态无效")
+    return status
+
+
+def set_native_camera_focus(
+    device: str,
+    *,
+    value: int | None = None,
+    auto_enabled: bool | None = None,
+) -> dict[str, object]:
+    """Set V4L2 focus controls through the Rust native control path."""
+
+    if value is None and auto_enabled is None:
+        raise NativeModuleError("invalid_camera_focus", "焦距请求必须包含 value 或 auto_enabled")
+    if value is not None and type(value) is not int:
+        raise NativeModuleError("invalid_camera_focus", "焦距 value 必须是整数")
+    if auto_enabled is not None and type(auto_enabled) is not bool:
+        raise NativeModuleError("invalid_camera_focus", "auto_enabled 必须是布尔值")
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise NativeModuleError(
+            "native_focus_unavailable", f"无法加载原生相机控制模块：{exc}"
+        ) from exc
+    capabilities = _validate_capabilities(module)
+    if "v4l2_focus_control" not in capabilities.features:
+        raise NativeModuleError("native_focus_unavailable", "原生模块缺少 V4L2 焦距控制能力")
+    try:
+        module.v4l2_set_focus(device, value, auto_enabled)
+    except Exception as exc:
+        raise _parse_native_error(exc, "native_focus_set_failed") from exc
+    status = native_camera_focus_status(device)
+    if status is None:
+        raise NativeModuleError("camera_focus_unsupported", "相机没有可读取的焦距控制")
+    return status
+
+
 def create_native_camera_frame_validator() -> NativeCameraFrameValidator:
     """Create the Rust camera continuity/drop-accounting validator or fail explicitly."""
 

@@ -43,6 +43,7 @@ function captureStatus(sourceRevision, deviceState) {
           default_route: "none",
         },
         live_imu: null,
+        camera_focus: null,
       },
     },
   };
@@ -61,4 +62,42 @@ test("同 authority 下旧 capture snapshot 不能覆盖更高 revision 状态",
 
   expect(state.capture?.source_revision).toBe(5);
   expect(state.capture?.snapshot.device_state).toBe("idle");
+});
+
+test("焦距更新同步写入 device 与 capture runtime", () => {
+  /** @type {import("../../src/rp_ylx/web/state.js").CameraFocusStatus} */
+  const focus = {
+    schema: "ylx.camera-focus.v1",
+    value: 77,
+    minimum: 0,
+    maximum: 255,
+    step: 1,
+    default: 32,
+    auto_supported: true,
+    auto_enabled: false,
+  };
+  /** @type {import("../../src/rp_ylx/web/state.js").DeviceDescriptor} */
+  const device = {
+    device: { device_id: "device", device_label: "YLX" },
+    capabilities: {
+      capture: true,
+      preview: true,
+      range_download: true,
+      network_mutation: false,
+    },
+    storage: {
+      volume_id: "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+      total_bytes: 10,
+      available_bytes: 5,
+      writable: true,
+    },
+    runtime: captureStatus(5, "idle").snapshot.runtime,
+  };
+  let state = reduceState(initialState, { type: "device.loaded", payload: device });
+  state = reduceState(state, { type: "capture.snapshot", payload: captureStatus(5, "idle") });
+  state = reduceState(state, { type: "camera-focus.updated", payload: focus });
+
+  expect(state.device?.runtime.camera_focus).toEqual(focus);
+  expect(state.capture?.snapshot.runtime.camera_focus).toEqual(focus);
+  expect(state.error).toBeNull();
 });

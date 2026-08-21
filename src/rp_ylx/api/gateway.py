@@ -107,6 +107,10 @@ class DeviceProvider(Protocol):
 
     def stop_capture(self, command: CaptureCommand) -> CaptureCommandResult: ...
 
+    def camera_focus_status(self) -> Mapping[str, object] | None: ...
+
+    def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult: ...
+
     def list_sessions(
         self, *, cursor: str | None, limit: int, take_id: str | None
     ) -> Mapping[str, object]: ...
@@ -419,6 +423,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return ("POST", "OPTIONS")
             if parts[4] in {"status", "events", "safe-swap"}:
                 return ("GET", "OPTIONS")
+        if len(parts) == 5 and parts[2] == "v3" and parts[3:] == ["camera", "focus"]:
+            return ("GET", "POST", "OPTIONS")
         if len(parts) == 5 and parts[3] == "sessions" and _valid_session_id(parts[2], parts[4]):
             return ("GET", "OPTIONS")
         if (
@@ -531,6 +537,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._get_safe_swap(parts[2])
             return
         if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] == "v3"
+            and parts[3:] == ["camera", "focus"]
+        ):
+            self._get_camera_focus()
+            return
+        if (
             len(parts) == 4
             and parts[1] == "api"
             and parts[2] in {"v2", "v3"}
@@ -595,6 +609,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ):
             self._capture_command(parts[4])
             return
+        if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] == "v3"
+            and parts[3:] == ["camera", "focus"]
+        ):
+            self._camera_focus_command()
+            return
         self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
 
     def _get_device(self, api_version: str) -> None:
@@ -653,6 +675,47 @@ class GatewayHandler(BaseHTTPRequestHandler):
             validate_capture_status(body)
         except InvalidSourceEvent:
             self._invalid_source_state("daemon capture status 无效")
+            return
+        self._send_json(status, body, headers=headers)
+
+    @staticmethod
+    def _valid_camera_focus_status(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema",
+            "value",
+            "minimum",
+            "maximum",
+            "step",
+            "default",
+            "auto_supported",
+            "auto_enabled",
+        }:
+            return False
+        return not (
+            value["schema"] != "ylx.camera-focus.v1"
+            or any(
+                type(value[key]) is not int
+                for key in ("value", "minimum", "maximum", "step", "default")
+            )
+            or value["minimum"] > value["maximum"]
+            or value["step"] <= 0
+            or not value["minimum"] <= value["value"] <= value["maximum"]
+            or (value["value"] - value["minimum"]) % value["step"] != 0
+            or not value["minimum"] <= value["default"] <= value["maximum"]
+            or type(value["auto_supported"]) is not bool
+            or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
+            or (not value["auto_supported"] and value["auto_enabled"] is not None)
+        )
+
+    def _send_camera_focus_status(
+        self,
+        status: int,
+        body: object,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        if not self._valid_camera_focus_status(body):
+            self._invalid_source_state("daemon camera focus 状态无效")
             return
         self._send_json(status, body, headers=headers)
 
@@ -848,6 +911,32 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "当前没有可读取的安全换盘回执")
             return
         self._send_json(HTTPStatus.OK, resource)
+
+    def _get_camera_focus(self) -> None:
+        if self._principal("getCameraFocus") is None:
+            return
+        try:
+            status = self.server.provider.camera_focus_status()
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if status is None:
+            self._problem(
+                HTTPStatus.NOT_FOUND,
+                "camera_focus_unsupported",
+                "当前相机没有可读取的焦距控制",
+            )
+            return
+        self._send_camera_focus_status(HTTPStatus.OK, status)
 
     def _get_preview(self, query: Mapping[str, list[str]]) -> None:
         if self._principal("getPreview") is None:
@@ -1107,11 +1196,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and body.get("reason") in {"user", "safe_swap"}
         )
 
-    def _capture_command(self, operation: str) -> None:
-        operation_id = "startCapture" if operation == "start" else "stopCapture"
+    @staticmethod
+    def _validate_camera_focus_body(body: Mapping[str, object]) -> bool:
+        if set(body) - {"schema", "value", "auto_enabled"}:
+            return False
+        if body.get("schema") != "ylx.camera-focus-set.v1":
+            return False
+        has_value = "value" in body
+        has_auto = "auto_enabled" in body
+        if not has_value and not has_auto:
+            return False
+        if has_value and type(body["value"]) is not int:
+            return False
+        return not (has_auto and type(body["auto_enabled"]) is not bool)
+
+    def _command_principal(
+        self,
+        operation_id: str,
+    ) -> tuple[Principal, str] | None:
         principal = self._principal(operation_id)
         if principal is None:
-            return
+            return None
         origin, _ = self._single_header("Origin")
         csrf_token = self.server.security.csrf_token
         csrf_value, csrf_is_single = self._single_header("X-CSRF-Token")
@@ -1122,7 +1227,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ):
             self._audit(operation_id, None, "csrf_forbidden", principal)
             self._problem(HTTPStatus.FORBIDDEN, "csrf_forbidden", "CSRF token 缺失或无效")
-            return
+            return None
         key, key_is_single = self._single_header("Idempotency-Key")
         if (
             not key_is_single
@@ -1131,7 +1236,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             or any(character == " " or not 0x21 <= ord(character) <= 0x7E for character in key)
         ):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "Idempotency-Key 无效")
+            return None
+        return principal, key
+
+    def _capture_command(self, operation: str) -> None:
+        operation_id = "startCapture" if operation == "start" else "stopCapture"
+        command_identity = self._command_principal(operation_id)
+        if command_identity is None:
             return
+        principal, key = command_identity
         body = self._read_json()
         if body is None:
             return
@@ -1168,6 +1281,42 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "invalid_source_state",
                 "daemon capture command 响应无效",
             )
+
+    def _camera_focus_command(self) -> None:
+        command_identity = self._command_principal("setCameraFocus")
+        if command_identity is None:
+            return
+        principal, key = command_identity
+        body = self._read_json()
+        if body is None:
+            return
+        if not self._validate_camera_focus_body(body):
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不符合相机焦距契约")
+            return
+        canonical = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        command = CaptureCommand(principal.principal_id, key, body, canonical)
+        try:
+            result = self.server.provider.set_camera_focus(command)
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        headers = {"Idempotency-Replayed": "true"} if result.replayed else None
+        if result.status == HTTPStatus.OK:
+            self._send_camera_focus_status(result.status, result.body, headers=headers)
+            return
+        self._problem(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid_source_state",
+            "daemon camera focus command 响应无效",
+        )
 
 
 def create_gateway_server(

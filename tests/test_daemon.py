@@ -215,6 +215,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 port = listener.getsockname()[1]
             config = replace(self.config(root), port=port)
             source = Mock(open_handle_count=0)
+            source.camera_focus_status.return_value = None
             mdns_publisher = Mock()
             with (
                 patch("rp_ylx.daemon.__commit__", "a" * 40),

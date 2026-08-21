@@ -24,7 +24,7 @@ from rp_ylx.api.downloads import (
 from rp_ylx.api.events import validate_safe_swap_v3_receipt
 from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderError
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
-from rp_ylx.camera import FrameObservation
+from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
@@ -81,6 +81,15 @@ class CaptureSources(Protocol):
     ) -> None: ...
 
     def stop(self) -> None: ...
+
+    def camera_focus_status(self) -> dict[str, object] | None: ...
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,12 +814,28 @@ class CaptureCoordinator:
                 return self._latest_imu
         return None
 
+    def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
+        sources = self._sources
+        if sources is None:
+            return None
+        try:
+            return sources.camera_focus_status()
+        except CameraError:
+            if raise_errors:
+                raise
+            return None
+        except Exception as exc:
+            if raise_errors:
+                raise CameraError("camera_focus_unavailable", str(exc), retryable=True) from exc
+            return None
+
     def _runtime_snapshot(self) -> Mapping[str, object]:
         runtime = dict(copy.deepcopy(self._runtime()))
         latest = self._latest_imu_sample()
         runtime["live_imu"] = (
             None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
         )
+        runtime["camera_focus"] = self._camera_focus_status()
         return runtime
 
     def _snapshot(self) -> Mapping[str, object]:
@@ -901,6 +926,77 @@ class CaptureCoordinator:
             },
             "runtime": self._runtime_snapshot(),
         }
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        try:
+            return self._camera_focus_status(raise_errors=True)
+        except CameraError as error:
+            status = HTTPStatus.SERVICE_UNAVAILABLE if error.retryable else HTTPStatus.CONFLICT
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=status,
+                retryable=error.retryable,
+            ) from error
+
+    def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
+        with self._lock:
+            return self._idempotent(
+                "set_camera_focus",
+                command,
+                lambda: CaptureCommandResult(200, self._set_camera_focus(command.body)),
+            )
+
+    def _set_camera_focus(self, body: Mapping[str, object]) -> dict[str, object]:
+        value = body.get("value")
+        auto_enabled = body.get("auto_enabled")
+        if value is None and auto_enabled is None:
+            raise ProviderError(
+                "invalid_camera_focus",
+                "焦距请求必须包含 value 或 auto_enabled",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if value is not None and type(value) is not int:
+            raise ProviderError(
+                "invalid_camera_focus",
+                "焦距 value 必须是整数",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        if auto_enabled is not None and type(auto_enabled) is not bool:
+            raise ProviderError(
+                "invalid_camera_focus",
+                "auto_enabled 必须是布尔值",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        try:
+            result = self._sources.set_camera_focus(  # type: ignore[union-attr]
+                value=value,
+                auto_enabled=auto_enabled,
+            )
+        except CameraError as error:
+            if error.code in {"invalid_camera_focus", "invalid_focus_value"}:
+                status = HTTPStatus.BAD_REQUEST
+            elif error.code in {"camera_focus_unsupported", "camera_focus_auto_unsupported"}:
+                status = HTTPStatus.CONFLICT
+            elif error.retryable:
+                status = HTTPStatus.SERVICE_UNAVAILABLE
+            else:
+                status = HTTPStatus.CONFLICT
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=status,
+                retryable=error.retryable,
+            ) from error
+        except Exception as exc:
+            raise ProviderError(
+                "camera_focus_unavailable",
+                str(exc),
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from exc
+        self._next_revision()
+        return result
 
     def _idempotent(
         self,

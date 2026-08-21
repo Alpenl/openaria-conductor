@@ -154,6 +154,7 @@ export const deviceApi = {
   getDevice: () => requestJson("/device"),
   getCaptureStatus: () => requestJson("/capture/status"),
   getSafeSwap: () => requestOptionalJson("/capture/safe-swap"),
+  getCameraFocus: () => requestOptionalJson("/camera/focus"),
   listSessions: () => requestJson("/sessions?limit=50"),
   /** @param {string} displayName */
   startCapture: (displayName) =>
@@ -179,6 +180,16 @@ export const deviceApi = {
         "Idempotency-Key": idempotencyKey(),
       },
       body: JSON.stringify({ schema: "ylx.capture-stop.v2", reason }),
+    }),
+  /** @param {{value?: number, auto_enabled?: boolean}} request */
+  setCameraFocus: (request) =>
+    requestJson("/camera/focus", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey(),
+      },
+      body: JSON.stringify({ schema: "ylx.camera-focus-set.v1", ...request }),
     }),
 };
 

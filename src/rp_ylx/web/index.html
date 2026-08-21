@@ -101,6 +101,31 @@
             </div>
           </dl>
         </div>
+        <form class="focus-control" id="focus-form" aria-label="相机焦距">
+          <div class="focus-heading">
+            <span>相机焦距</span>
+            <output data-testid="camera-focus-value">不可用</output>
+          </div>
+          <label class="field-label" for="camera-focus-range">手动焦距</label>
+          <input
+            id="camera-focus-range"
+            name="value"
+            type="range"
+            min="0"
+            max="0"
+            step="1"
+            value="0"
+            disabled
+          />
+          <label class="checkbox-field" for="camera-focus-auto">
+            <input id="camera-focus-auto" name="auto_enabled" type="checkbox" disabled />
+            自动对焦
+          </label>
+          <button class="secondary-command" id="focus-command" type="submit" disabled>
+            应用焦距
+          </button>
+          <p id="focus-status">设备焦距控制不可用</p>
+        </form>
       </aside>
 
       <section class="safe-swap panel" aria-labelledby="safe-swap-title" hidden>
