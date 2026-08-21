@@ -118,10 +118,10 @@ paths:
         Returns the current daemon authority identity and the same closed snapshot
         payload used by a snapshot CaptureEvent. source_revision is the daemon journal
         revision of this snapshot; it is never an SSE delivery ID. An idle snapshot may
-        retain the most recent unsuccessful terminal outcome even after later successful
-        sessions; historical outcomes remain queryable per session. Ordinary idle with no
-        retained outcome is still a 200 snapshot with active_recording and
-        retained_unsuccessful both null; runtime remains present.
+        retain the most recent unsuccessful terminal outcome. Starting a new session
+        removes that outcome from current status but never deletes its per-session
+        retained resource. Ordinary idle with no retained outcome is still a 200 snapshot
+        with active_recording and retained_unsuccessful both null; runtime remains present.
       x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
@@ -426,7 +426,7 @@ paths:
           description: |
             Cursor page of discovered candidates. Every schema-valid
             ylx.device-session.v1 sealed candidate is projected once as SessionSummary,
-            ordered newest first by manifest started_at then session_id. A malformed, unreadable,
+            ordered by manifest started_at then session_id. A malformed, unreadable,
             unsealed, unknown-schema, schema-invalid, or manifest-local-semantics-invalid
             manifest is projected once only as a closed
             SessionDiscoveryDiagnostic and MUST NOT be promoted into items by inventing
@@ -987,10 +987,7 @@ components:
           required: [volume_id, total_bytes, available_bytes, writable]
           properties:
             volume_id:
-              description: Null when no recording volume is currently admitted.
-              oneOf:
-                - $ref: "#/components/schemas/UuidV4"
-                - type: "null"
+              $ref: "#/components/schemas/UuidV4"
             total_bytes:
               type: integer
               minimum: 0
@@ -1018,7 +1015,7 @@ components:
     DeviceRuntimeStatus:
       type: object
       additionalProperties: false
-      required: [observed_at, connection_method, temperature_celsius, network, live_imu, camera_focus]
+      required: [observed_at, connection_method, temperature_celsius, network, live_imu]
       properties:
         observed_at:
           type: string
@@ -1039,46 +1036,6 @@ components:
             - $ref: "#/components/schemas/LiveImuObservation"
             - type: "null"
           description: Latest non-stale live sample, or null when no active session sample is available
-        camera_focus:
-          oneOf:
-            - $ref: "#/components/schemas/CameraFocusStatus"
-            - type: "null"
-          description: Current V4L2 camera focus status, or null when unsupported or temporarily unreadable
-    CameraFocusStatus:
-      type: object
-      additionalProperties: false
-      required:
-        - schema
-        - value
-        - minimum
-        - maximum
-        - step
-        - default
-        - auto_supported
-        - auto_enabled
-      properties:
-        schema:
-          const: ylx.camera-focus.v1
-        value:
-          type: integer
-          description: Current focus_absolute value in driver-native units.
-        minimum:
-          type: integer
-        maximum:
-          type: integer
-        step:
-          type: integer
-          minimum: 1
-        default:
-          type: integer
-        auto_supported:
-          type: boolean
-          description: Whether this device exposes focus_auto.
-        auto_enabled:
-          oneOf:
-            - type: boolean
-            - type: "null"
-          description: Current auto-focus state, or null when focus_auto is unavailable.
     NetworkRuntimeStatus:
       type: object
       additionalProperties: false
@@ -1138,46 +1095,44 @@ components:
     LiveImuObservation:
       type: object
       additionalProperties: false
-      required: [session_id, clock, raw, sync]
+      required: [session_id, clock, acceleration_m_s2, angular_velocity_rad_s, orientation_quaternion]
       properties:
         session_id:
           $ref: "#/components/schemas/UuidV7"
         clock:
           type: object
           additionalProperties: false
-          required: [time_base, timestamp_ns]
+          required: [time_base, epoch_id, timestamp_ns]
           properties:
             time_base:
-              const: host_monotonic
+              const: session_monotonic
+            epoch_id:
+              $ref: "#/components/schemas/UuidV7"
+              description: Must equal the enclosing live IMU session_id
             timestamp_ns:
               type: integer
               minimum: 0
-        raw:
+        acceleration_m_s2:
+          $ref: "#/components/schemas/Vector3"
+        angular_velocity_rad_s:
+          $ref: "#/components/schemas/Vector3"
+        orientation_quaternion:
           type: object
           additionalProperties: false
-          required: [units, accelerometer, gyroscope]
+          required: [w, x, y, z]
           properties:
-            units:
-              const: raw_int16
-            accelerometer:
-              $ref: "#/components/schemas/RawImuVector3"
-            gyroscope:
-              $ref: "#/components/schemas/RawImuVector3"
-        sync:
-          type: object
-          additionalProperties: false
-          required: [quality]
-          properties:
-            quality:
-              enum: [insufficient, good, degraded]
-    RawImuVector3:
+            w: {type: number}
+            x: {type: number}
+            y: {type: number}
+            z: {type: number}
+    Vector3:
       type: object
       additionalProperties: false
       required: [x, y, z]
       properties:
-        x: {type: integer, minimum: -32768, maximum: 32767}
-        y: {type: integer, minimum: -32768, maximum: 32767}
-        z: {type: integer, minimum: -32768, maximum: 32767}
+        x: {type: number}
+        y: {type: number}
+        z: {type: number}
     CaptureStartRequest:
       type: object
       additionalProperties: false

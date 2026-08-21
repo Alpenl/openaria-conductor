@@ -7,7 +7,7 @@ import {
   waitForAbortableDelay,
 } from "./api-client.js";
 
-const EVENT_URL = "/api/v3/capture/events";
+const EVENT_URL = "/api/v4/capture/events";
 
 /** @param {string} block */
 function parseEvent(block) {
@@ -36,7 +36,7 @@ function parseEvent(block) {
   const payload = JSON.parse(data.join("\n"));
   if (
     !payload ||
-    payload.schema !== "ylx.capture-event.v3" ||
+    payload.schema !== "ylx.capture-event.v4" ||
     payload.sse_delivery_id !== id ||
     payload.type !== event
   ) {

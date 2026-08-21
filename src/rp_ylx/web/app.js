@@ -482,7 +482,7 @@ async function acceptCaptureEvent(event) {
     dispatch({
       type: "capture.snapshot",
       payload: {
-        schema: "ylx.capture-status.v2",
+        schema: "ylx.capture-status.v4",
         authority_epoch: event.authority_epoch,
         source_revision: event.source_revision,
         snapshot: event.data,

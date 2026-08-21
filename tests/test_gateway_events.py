@@ -8,7 +8,12 @@ from copy import deepcopy
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from rp_ylx.api.events import EventReplayBuffer, InvalidSourceEvent, validate_session_list
+from rp_ylx.api.events import (
+    EventReplayBuffer,
+    InvalidSourceEvent,
+    validate_capture_status,
+    validate_session_list,
+)
 from rp_ylx.api.gateway import (
     CaptureCommand,
     CaptureCommandResult,
@@ -20,6 +25,16 @@ AUTHORITY_EPOCH = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
 NEXT_AUTHORITY_EPOCH = "123e4567-e89b-42d3-a456-426614174000"
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
 NEXT_SESSION_ID = "01989f6a-2c02-7c3d-ae4f-5061728394a5"
+RAW_LIVE_IMU = {
+    "session_id": SESSION_ID,
+    "clock": {"time_base": "host_monotonic", "timestamp_ns": 10_091},
+    "raw": {
+        "units": "raw_int16",
+        "accelerometer": {"x": 1, "y": 2, "z": 3},
+        "gyroscope": {"x": 4, "y": 5, "z": 6},
+    },
+    "sync": {"quality": "good"},
+}
 
 SNAPSHOT_SOURCE_EVENT = {
     "authority_epoch": AUTHORITY_EPOCH,
@@ -62,6 +77,65 @@ SNAPSHOT_SOURCE_EVENT = {
         },
     },
 }
+
+
+def _snapshot_source_event_for_api(
+    api_version: str,
+    source_event: dict[str, object] | None = None,
+) -> dict[str, object]:
+    projected = deepcopy(SNAPSHOT_SOURCE_EVENT if source_event is None else source_event)
+    data = projected["data"]
+    assert isinstance(data, dict)
+    data["schema"] = (
+        "ylx.capture-snapshot-event.v2"
+        if api_version in {"v2", "v3"}
+        else "ylx.capture-snapshot-event.v4"
+    )
+    runtime = data["runtime"]
+    assert isinstance(runtime, dict)
+    if api_version in {"v2", "v3"}:
+        runtime["live_imu"] = None
+        runtime.pop("camera_focus", None)
+    return projected
+
+
+def _sse_data_for_api(
+    api_version: str,
+    delivery_id: str,
+    source_event: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema": f"ylx.capture-event.{api_version}",
+        "sse_delivery_id": delivery_id,
+        **_snapshot_source_event_for_api(api_version, source_event),
+    }
+
+
+def _active_snapshot_source_event(session_id: str = SESSION_ID) -> dict[str, object]:
+    event = deepcopy(SNAPSHOT_SOURCE_EVENT)
+    event["source_revision"] = RECORDING_STATE["state_revision"]
+    event["session_id"] = session_id
+    event["data"]["device_state"] = "recording"
+    event["data"]["active_recording"] = {
+        "generation_id": "7d516b70-d8ab-47d1-b2dc-5b1250138789",
+        "recording_state": {**deepcopy(RECORDING_STATE), "session_id": session_id},
+    }
+    return event
+
+
+def _capture_status_from_snapshot_event(
+    source_event: dict[str, object],
+    *,
+    api_version: str,
+) -> dict[str, object]:
+    snapshot = _snapshot_source_event_for_api(api_version, source_event)["data"]
+    return {
+        "schema": "ylx.capture-status.v4" if api_version == "v4" else "ylx.capture-status.v2",
+        "authority_epoch": source_event["authority_epoch"],
+        "source_revision": source_event["source_revision"],
+        "snapshot": snapshot,
+    }
+
 
 STATE_SOURCE_EVENT = {
     "authority_epoch": AUTHORITY_EPOCH,
@@ -264,7 +338,7 @@ class GatewayEventHttpTest(unittest.TestCase):
             connection.close()
 
     def test_first_connection_gets_current_source_snapshot_in_each_api_envelope(self) -> None:
-        for expected_id, version in (("1", "v2"), ("2", "v3")):
+        for expected_id, version in (("1", "v2"), ("2", "v3"), ("3", "v4")):
             with self.subTest(version=version):
                 status, payload, headers = self.request_events(version)
 
@@ -278,14 +352,124 @@ class GatewayEventHttpTest(unittest.TestCase):
                         {
                             "id": expected_id,
                             "event": "snapshot",
-                            "data": {
-                                "schema": f"ylx.capture-event.{version}",
-                                "sse_delivery_id": expected_id,
-                                **SNAPSHOT_SOURCE_EVENT,
-                            },
+                            "data": _sse_data_for_api(version, expected_id),
                         }
                     ],
                 )
+
+    def test_snapshot_live_imu_raw_is_projected_by_api_major(self) -> None:
+        snapshot = _active_snapshot_source_event()
+        snapshot["data"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        self.provider.snapshot_event = snapshot
+
+        for version in ("v2", "v3"):
+            with self.subTest(version=version):
+                status, payload, _ = self.request_events(version)
+                self.assertEqual(status, 200)
+                event = parse_sse(payload)[0]
+                self.assertEqual(event["data"]["schema"], f"ylx.capture-event.{version}")
+                self.assertEqual(event["data"]["data"]["schema"], "ylx.capture-snapshot-event.v2")
+                self.assertNotIn("camera_focus", event["data"]["data"]["runtime"])
+                self.assertIsNone(event["data"]["data"]["runtime"]["live_imu"])
+                self.assertNotIn(b"raw_int16", payload)
+
+        status, payload, _ = self.request_events("v4")
+        self.assertEqual(status, 200)
+        event = parse_sse(payload)[0]
+        self.assertEqual(event["data"]["schema"], "ylx.capture-event.v4")
+        self.assertEqual(event["data"]["data"]["schema"], "ylx.capture-snapshot-event.v4")
+        live_imu = event["data"]["data"]["runtime"]["live_imu"]
+        self.assertEqual(live_imu, RAW_LIVE_IMU)
+        self.assertEqual(live_imu["clock"]["time_base"], "host_monotonic")
+
+    def test_v4_live_imu_requires_matching_active_session_in_status_validator(self) -> None:
+        idle = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        idle["data"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        with self.assertRaises(InvalidSourceEvent):
+            validate_capture_status(
+                _capture_status_from_snapshot_event(idle, api_version="v4"),
+                api_version="v4",
+            )
+
+        mismatch = _active_snapshot_source_event(session_id=NEXT_SESSION_ID)
+        mismatch["data"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        with self.assertRaises(InvalidSourceEvent):
+            validate_capture_status(
+                _capture_status_from_snapshot_event(mismatch, api_version="v4"),
+                api_version="v4",
+            )
+
+        matching = _active_snapshot_source_event()
+        matching["data"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        validate_capture_status(
+            _capture_status_from_snapshot_event(matching, api_version="v4"),
+            api_version="v4",
+        )
+
+    def test_v4_sse_initial_snapshot_rejects_live_imu_without_matching_active_session(
+        self,
+    ) -> None:
+        for name, source_event in (
+            ("idle-with-live-imu", deepcopy(SNAPSHOT_SOURCE_EVENT)),
+            ("active-session-mismatch", _active_snapshot_source_event(session_id=NEXT_SESSION_ID)),
+        ):
+            with self.subTest(name=name):
+                source_event["data"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+                self.provider.snapshot_event = source_event
+
+                status, payload, _ = self.request_events("v4")
+
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_event")
+
+        self.provider.snapshot_event = deepcopy(SNAPSHOT_SOURCE_EVENT)
+
+    def test_initial_snapshot_rejects_extra_properties_and_bad_consts_by_major(self) -> None:
+        mutations = {
+            "data-extra": lambda event: event["data"].update({"unexpected": "forbidden"}),
+            "runtime-extra": lambda event: event["data"]["runtime"].update(
+                {"unexpected": "forbidden"}
+            ),
+            "bad-const": lambda event: event["data"].update(
+                {"schema": "ylx.capture-snapshot-event.v5"}
+            ),
+        }
+
+        for version in ("v2", "v3", "v4"):
+            for name, mutate in mutations.items():
+                with self.subTest(version=version, mutation=name):
+                    malformed = deepcopy(SNAPSHOT_SOURCE_EVENT)
+                    mutate(malformed)
+                    self.provider.snapshot_event = malformed
+
+                    status, payload, _ = self.request_events(version)
+
+                    self.assertEqual(status, 500)
+                    self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_event")
+
+        self.provider.snapshot_event = deepcopy(SNAPSHOT_SOURCE_EVENT)
+
+    def test_encoding_snapshot_state_is_accepted_in_each_api_projection(self) -> None:
+        recording_state = deepcopy(RECORDING_STATE)
+        recording_state["state"] = "encoding"
+        recording_state["state_revision"] = 49
+        snapshot = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        snapshot["source_revision"] = 49
+        snapshot["session_id"] = SESSION_ID
+        snapshot["data"]["device_state"] = "encoding"
+        snapshot["data"]["active_recording"] = {
+            "generation_id": "7d516b70-d8ab-47d1-b2dc-5b1250138789",
+            "recording_state": recording_state,
+        }
+        self.provider.snapshot_event = snapshot
+
+        for version in ("v2", "v3", "v4"):
+            with self.subTest(version=version):
+                status, payload, _ = self.request_events(version)
+                event = parse_sse(payload)[0]
+
+                self.assertEqual(status, 200)
+                self.assertEqual(event["data"], _sse_data_for_api(version, event["id"], snapshot))
 
     def test_reconnect_with_buffered_cursor_replays_only_later_source_events(self) -> None:
         _, initial_payload, _ = self.request_events("v3")
@@ -344,11 +528,7 @@ class GatewayEventHttpTest(unittest.TestCase):
                 self.assertEqual(events[0]["event"], "snapshot")
                 self.assertEqual(
                     events[0]["data"],
-                    {
-                        "schema": "ylx.capture-event.v3",
-                        "sse_delivery_id": events[0]["id"],
-                        **current_snapshot,
-                    },
+                    _sse_data_for_api("v3", events[0]["id"], current_snapshot),
                 )
 
     def test_reconnect_resynchronizes_on_source_revision_gap_and_authority_change(self) -> None:
@@ -368,11 +548,7 @@ class GatewayEventHttpTest(unittest.TestCase):
         self.assertEqual(gap_event["event"], "snapshot")
         self.assertEqual(
             gap_event["data"],
-            {
-                "schema": "ylx.capture-event.v3",
-                "sse_delivery_id": gap_event["id"],
-                **gap_snapshot,
-            },
+            _sse_data_for_api("v3", gap_event["id"], gap_snapshot),
         )
 
         self.event_buffer.publish(
@@ -396,11 +572,7 @@ class GatewayEventHttpTest(unittest.TestCase):
         self.assertEqual(epoch_event["event"], "snapshot")
         self.assertEqual(
             epoch_event["data"],
-            {
-                "schema": "ylx.capture-event.v3",
-                "sse_delivery_id": epoch_event["id"],
-                **epoch_snapshot,
-            },
+            _sse_data_for_api("v3", epoch_event["id"], epoch_snapshot),
         )
 
     def test_same_revision_progress_is_live_and_replayed_without_resync(self) -> None:

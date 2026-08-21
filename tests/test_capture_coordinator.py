@@ -983,6 +983,48 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_v4_device_descriptor_does_not_leak_live_imu_after_stop_or_source_miss(
+        self,
+    ) -> None:
+        first_observation = single_imu_observation(
+            host_monotonic_ns=100,
+            accelerometer=(1, 2, 3),
+            gyroscope=(4, 5, 6),
+        )
+        sources = FakeSourcesWithScriptedLatestImu([first_observation, None])
+        coordinator = self.coordinator(sources=sources)
+        try:
+            first = coordinator.start_capture(start_command("descriptor-session-one"))
+            validate_capture_status(first.body)
+            self.assertEqual(
+                first.body["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                100,
+            )
+            self.assertTrue(coordinator.submit_frame(frame()))
+            coordinator.stop_capture(stop_command("descriptor-session-one-stop"))
+
+            idle_descriptor = coordinator.device_descriptor("v4", "customer")
+            validate_device_descriptor(
+                idle_descriptor,
+                api_version="v4",
+                security_profile="customer",
+            )
+            self.assertIsNone(idle_descriptor["runtime"]["live_imu"])
+
+            second = coordinator.start_capture(start_command("descriptor-session-two"))
+            validate_capture_status(second.body)
+            self.assertIsNone(second.body["snapshot"]["runtime"]["live_imu"])
+
+            active_descriptor = coordinator.device_descriptor("v4", "customer")
+            validate_device_descriptor(
+                active_descriptor,
+                api_version="v4",
+                security_profile="customer",
+            )
+            self.assertIsNone(active_descriptor["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
     def test_camera_focus_status_and_set_are_reflected_in_runtime_snapshot(self) -> None:
         sources = FakeSources()
         sources.focus = deepcopy(CAMERA_FOCUS_STATUS)

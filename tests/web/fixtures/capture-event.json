@@ -1,5 +1,5 @@
 {
-  "schema": "ylx.capture-event.v3",
+  "schema": "ylx.capture-event.v4",
   "sse_delivery_id": "1043",
   "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
   "source_revision": 43,

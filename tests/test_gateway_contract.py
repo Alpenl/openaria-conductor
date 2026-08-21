@@ -7,6 +7,7 @@ import threading
 import unittest
 from copy import deepcopy
 from importlib.resources import files
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -19,18 +20,31 @@ from rp_ylx.api import (
     create_gateway_server,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_GOLDENS = {
     "v2": {
         "filename": "ylx-device-v2.openapi.yaml",
-        "sha256": "72593b2b9b3ee4be289c4706846858f69bd0f06b3371df2da66667c52ba38ef2",
+        "sha256": "274216d7f140b296dacf70fb669e37eb7be2ccf48f51e9d354a5245e01e05599",
+        "bytes": 67_834,
         "info_version": "2.0.0",
         "server_suffix": "/api/v2",
+        "lifecycle": "frozen_compat",
     },
     "v3": {
         "filename": "ylx-device-v3.openapi.yaml",
-        "sha256": "ec128066efa93b1a20f78b50dacf453829a624c225cec685320de2e6781cc961",
+        "sha256": "72b70dd6d9ab87e70abc0bf4af519435435bba05a33d512d4c394f25b1ef4297",
+        "bytes": 68_520,
         "info_version": "3.0.0",
         "server_suffix": "/api/v3",
+        "lifecycle": "frozen_compat",
+    },
+    "v4": {
+        "filename": "ylx-device-v4.openapi.yaml",
+        "sha256": "6740c9875ee6dcf1564062b3b7e63d995d4c01cdd1e3fadcc49bd54b13ffc899",
+        "bytes": 75_767,
+        "info_version": "4.0.0",
+        "server_suffix": "/api/v4",
+        "lifecycle": "current",
     },
 }
 
@@ -39,7 +53,7 @@ SCHEMA_GOLDENS = {
         "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
     ),
     "ylx-recording-state-v1.schema.json": (
-        "e787e168ee508256628fd12067fdeb2305c35688730aa4dfe01c06f1c04d5f8c"
+        "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"
     ),
 }
 
@@ -63,7 +77,8 @@ COMMON_ROUTE_GOLDEN = {
 }
 ROUTE_GOLDENS = {
     "v2": COMMON_ROUTE_GOLDEN,
-    "v3": COMMON_ROUTE_GOLDEN
+    "v3": COMMON_ROUTE_GOLDEN,
+    "v4": COMMON_ROUTE_GOLDEN
     | {
         ("/camera/focus", "get", "getCameraFocus"),
         ("/camera/focus", "post", "setCameraFocus"),
@@ -73,7 +88,7 @@ ROUTE_GOLDENS = {
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
 MANIFEST_WIRE = b'{ "schema": "ylx.device-session.v1", "sealed": true }\n'
 MANIFEST_SHA256 = "5967f1d39a638ce5737c1ef922d3eb6c5f08fd3fc32099751e0f9f419795f5d6"
-STATUS_WIRE = (
+STATUS_WIRE_LEGACY = (
     b'{"schema":"ylx.capture-status.v2",'
     b'"authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6",'
     b'"source_revision":7,"snapshot":{"schema":"ylx.capture-snapshot-event.v2",'
@@ -85,9 +100,28 @@ STATUS_WIRE = (
     b'"wifi_client":{"state":"disconnected","interface":"wlan1",'
     b'"addresses":[],"peer_or_ssid":null},"wired":{"state":"connected",'
     b'"interface":"eth0","addresses":["192.0.2.24/24"],'
+    b'"peer_or_ssid":null},"default_route":"wired"},"live_imu":null}}}'
+)
+STATUS_WIRE_V4 = (
+    b'{"schema":"ylx.capture-status.v4",'
+    b'"authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6",'
+    b'"source_revision":7,"snapshot":{"schema":"ylx.capture-snapshot-event.v4",'
+    b'"device_state":"idle","active_recording":null,"retained_unsuccessful":null,'
+    b'"runtime":{"observed_at":"2026-08-08T10:25:01+08:00",'
+    b'"connection_method":"ethernet_lan","temperature_celsius":52.0,'
+    b'"network":{"ap":{"state":"active","interface":"wlan0",'
+    b'"addresses":["10.42.0.1/24"],"peer_or_ssid":"YLX-30D5872D"},'
+    b'"wifi_client":{"state":"disconnected","interface":"wlan1",'
+    b'"addresses":[],"peer_or_ssid":null},"wired":{"state":"connected",'
+    b'"interface":"eth0","addresses":["192.0.2.24/24"],'
     b'"peer_or_ssid":null},"default_route":"wired"},"live_imu":null,'
     b'"camera_focus":null}}}'
 )
+STATUS_WIRE_BY_VERSION = {
+    "v2": STATUS_WIRE_LEGACY,
+    "v3": STATUS_WIRE_LEGACY,
+    "v4": STATUS_WIRE_V4,
+}
 SESSION_LIST_WIRE = (
     b'{"schema":"ylx.session-list.v2","items":[],"diagnostics":[],"next_cursor":null}'
 )
@@ -145,6 +179,15 @@ DEVICE_COMMON = {
 }
 
 
+def _device_common_for_api(api_version: str) -> dict[str, object]:
+    common = deepcopy(DEVICE_COMMON)
+    if api_version in {"v2", "v3"}:
+        runtime = common["runtime"]
+        assert isinstance(runtime, dict)
+        runtime.pop("camera_focus", None)
+    return common
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -177,6 +220,7 @@ class GatewayContractResourceTest(unittest.TestCase):
             with self.subTest(version=version):
                 payload = api_resources.joinpath(golden["filename"]).read_bytes()
                 self.assertEqual(_sha256(payload), golden["sha256"])
+                self.assertEqual(len(payload), golden["bytes"])
 
     def test_frozen_openapi_versions_servers_and_operations_are_exact(self) -> None:
         api_resources = files("rp_ylx.api")
@@ -193,11 +237,44 @@ class GatewayContractResourceTest(unittest.TestCase):
                 self.assertEqual(info.group(1), golden["info_version"])
 
                 server = re.search(
-                    r"^  - url: https://\{device_host\}(/api/v[23])$", contract, re.M
+                    r"^  - url: https://\{device_host\}(/api/v[234])$",
+                    contract,
+                    re.M,
                 )
                 self.assertIsNotNone(server)
                 self.assertEqual(server.group(1), golden["server_suffix"])
                 self.assertEqual(_declared_routes(contract), ROUTE_GOLDENS[version])
+                if version in {"v2", "v3"}:
+                    self.assertNotIn("raw_int16", contract)
+                else:
+                    self.assertIn("raw_int16", contract)
+
+    def test_device_api_support_manifest_matches_central_identity(self) -> None:
+        support = json.loads(
+            (REPO_ROOT / "contracts" / "ylx-device-api-support.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            support,
+            {
+                "schema": "ylx.device-api-consumer-support.v1",
+                "consumer": "openaria-conductor",
+                "supported_device_api_majors": [2, 3, 4],
+                "unknown_major_policy": "fail_closed",
+                "required_contracts": [
+                    {
+                        "major": int(version.removeprefix("v")),
+                        "path": f"openapi/{golden['filename']}",
+                        "sha256": golden["sha256"],
+                        "bytes": golden["bytes"],
+                        "info_version": golden["info_version"],
+                        "server_base_path": golden["server_suffix"],
+                        "lifecycle": golden["lifecycle"],
+                    }
+                    for version, golden in CONTRACT_GOLDENS.items()
+                ],
+            },
+        )
 
     def test_every_external_schema_reference_resolves_to_a_frozen_resource(self) -> None:
         api_resources = files("rp_ylx.api")
@@ -241,7 +318,7 @@ class _Manifest:
 
 class _WireProvider:
     def device_descriptor(self, api_version: str, security_profile: str) -> dict[str, object]:
-        version = "2.0" if api_version == "v2" else "3.0"
+        version = f"{api_version.removeprefix('v')}.0"
         return {
             "schema": f"ylx.device.{api_version}",
             **deepcopy(DEVICE_COMMON),
@@ -310,7 +387,7 @@ class _WireProvider:
         }
 
     def open_manifest(self, session_id: str, api_version: str) -> _Manifest:
-        if api_version not in {"v2", "v3"}:
+        if api_version not in {"v2", "v3", "v4"}:
             raise AssertionError("gateway 传递了未知 API 版本")
         if session_id != SESSION_ID:
             raise ProviderError("not_found", "会话不存在", status=404)
@@ -364,7 +441,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
         except HTTPError as error:
             return error.code, error.read(), error.headers
 
-    def test_v2_and_v3_wire_contracts_share_the_frozen_common_payloads(self) -> None:
+    def test_v2_v3_and_v4_wire_contracts_share_the_frozen_common_payloads(self) -> None:
         start_wire = b'{"schema":"ylx.capture-start.v2","mode":"production","take":{"kind":"new"}}'
         stop_wire = b'{"schema":"ylx.capture-stop.v2","reason":"user"}'
 
@@ -374,7 +451,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schema": "ylx.device.v2",
-                        **DEVICE_COMMON,
+                        **_device_common_for_api("v2"),
                         "api_version": "2.0",
                         "security_profile": "customer",
                     },
@@ -386,8 +463,20 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schema": "ylx.device.v3",
-                        **DEVICE_COMMON,
+                        **_device_common_for_api("v3"),
                         "api_version": "3.0",
+                        "security_profile": "customer",
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+            ),
+            (
+                "v4",
+                json.dumps(
+                    {
+                        "schema": "ylx.device.v4",
+                        **_device_common_for_api("v4"),
+                        "api_version": "4.0",
                         "security_profile": "customer",
                     },
                     separators=(",", ":"),
@@ -400,7 +489,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
 
             with self.subTest(version=version, resource="status"):
                 status, payload, _ = self.request(f"/api/{version}/capture/status")
-                self.assertEqual((status, payload), (200, STATUS_WIRE))
+                self.assertEqual((status, payload), (200, STATUS_WIRE_BY_VERSION[version]))
 
             with self.subTest(version=version, resource="start"):
                 status, payload, headers = self.request(
@@ -408,7 +497,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
                     body=start_wire,
                     idempotency_key=f"start-{version}",
                 )
-                self.assertEqual((status, payload), (202, STATUS_WIRE))
+                self.assertEqual((status, payload), (202, STATUS_WIRE_BY_VERSION[version]))
                 self.assertIsNone(headers["Idempotency-Replayed"])
 
             with self.subTest(version=version, resource="stop"):
@@ -430,8 +519,8 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
                 self.assertEqual(headers["ETag"], f'"{MANIFEST_SHA256}"')
                 self.assertEqual(headers["YLX-Manifest-SHA256"], MANIFEST_SHA256)
 
-    def test_v2_and_v3_errors_keep_the_same_frozen_envelope(self) -> None:
-        for version in ("v2", "v3"):
+    def test_v2_v3_and_v4_errors_keep_the_same_frozen_envelope(self) -> None:
+        for version in ("v2", "v3", "v4"):
             with self.subTest(version=version):
                 status, payload, headers = self.request(f"/api/{version}/device", token=None)
                 error = json.loads(payload)

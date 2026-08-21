@@ -42,7 +42,16 @@ PROGRESS_KEYS = frozenset(
     {"schema", "phase", "elapsed_seconds", "completed_units", "total_units", "unit"}
 )
 DIAGNOSTIC_EVENT_KEYS = frozenset({"schema", "diagnostic"})
-RUNTIME_KEYS = frozenset(
+RUNTIME_BASE_KEYS = frozenset(
+    {
+        "observed_at",
+        "connection_method",
+        "temperature_celsius",
+        "network",
+        "live_imu",
+    }
+)
+RUNTIME_SOURCE_KEYS = frozenset(
     {
         "observed_at",
         "connection_method",
@@ -52,11 +61,22 @@ RUNTIME_KEYS = frozenset(
         "camera_focus",
     }
 )
+SOURCE_API_VERSION = "source"
+CAPTURE_STATUS_SCHEMA_V2 = "ylx.capture-status.v2"
+CAPTURE_STATUS_SCHEMA_V4 = "ylx.capture-status.v4"
+CAPTURE_SNAPSHOT_SCHEMA_V2 = "ylx.capture-snapshot-event.v2"
+CAPTURE_SNAPSHOT_SCHEMA_V4 = "ylx.capture-snapshot-event.v4"
+CAPTURE_ACTIVE_STATES = frozenset({"recording", "finalizing", "encoding", "verifying"})
+CAPTURE_DEVICE_STATES = frozenset({"idle", *CAPTURE_ACTIVE_STATES, "blocked"})
+CAPTURE_TERMINAL_STATES = frozenset({"recoverable", "failed", "abandoned"})
+CAPTURE_RECORDING_STATES = frozenset({*CAPTURE_ACTIVE_STATES, *CAPTURE_TERMINAL_STATES})
 NETWORK_KEYS = frozenset({"ap", "wifi_client", "wired", "default_route"})
 NETWORK_INTERFACE_KEYS = frozenset({"state", "interface", "addresses", "peer_or_ssid"})
 LIVE_IMU_KEYS = frozenset({"session_id", "clock", "raw", "sync"})
 LIVE_IMU_RAW_KEYS = frozenset({"units", "accelerometer", "gyroscope"})
 LIVE_IMU_SYNC_KEYS = frozenset({"quality"})
+SUPPORTED_DEVICE_API_VERSIONS = frozenset({"v2", "v3", "v4"})
+LEGACY_DEVICE_API_VERSIONS = frozenset({"v2", "v3"})
 SAFE_SWAP_V3_KEYS = frozenset(
     {
         "schema",
@@ -225,9 +245,52 @@ def heartbeat_comment() -> bytes:
     return b": heartbeat\n\n"
 
 
-def validate_capture_status(status: object) -> None:
+def project_capture_status(status: object, *, api_version: str) -> object:
+    """Project the canonical daemon capture status into the requested Device API major."""
+
+    _event_schema_version(api_version)
+    projected = deepcopy(status)
+    if isinstance(projected, dict):
+        if projected.get("schema") == CAPTURE_STATUS_SCHEMA_V2:
+            projected["schema"] = _capture_status_schema_for_api(api_version)
+        snapshot = projected.get("snapshot")
+        if isinstance(snapshot, dict):
+            _project_snapshot_data(snapshot, api_version=api_version)
+    return projected
+
+
+def project_device_descriptor(descriptor: object, *, api_version: str) -> object:
+    """Project the canonical provider device descriptor into the requested Device API major."""
+
+    _event_schema_version(api_version)
+    projected = deepcopy(descriptor)
+    if isinstance(projected, dict):
+        runtime = projected.get("runtime")
+        if isinstance(runtime, dict):
+            _project_runtime(runtime, api_version=api_version)
+    return projected
+
+
+def project_source_event(
+    source_event: Mapping[str, object],
+    *,
+    api_version: str,
+) -> Mapping[str, object]:
+    """Project a canonical source event into the requested SSE CaptureEvent major."""
+
+    _event_schema_version(api_version)
+    projected = deepcopy(dict(source_event))
+    if projected.get("type") == "snapshot":
+        data = projected.get("data")
+        if isinstance(data, dict):
+            _project_snapshot_data(data, api_version=api_version)
+    return projected
+
+
+def validate_capture_status(status: object, *, api_version: str = SOURCE_API_VERSION) -> None:
     """验证 HTTP 与命令响应共用的权威 capture status。"""
 
+    _validate_source_or_api_version(api_version)
     _validate_finite_json(status)
     if not isinstance(status, Mapping) or set(status) != {
         "schema",
@@ -240,7 +303,7 @@ def validate_capture_status(status: object) -> None:
     source_revision = status["source_revision"]
     snapshot = status["snapshot"]
     if (
-        status["schema"] != "ylx.capture-status.v2"
+        status["schema"] != _capture_status_schema_for_api(api_version)
         or not _uuid(authority_epoch, UUID_V4)
         or isinstance(source_revision, bool)
         or not isinstance(source_revision, int)
@@ -260,6 +323,7 @@ def validate_capture_status(status: object) -> None:
         authority_epoch,
         source_revision,
         source_session_id,
+        api_version=api_version,
     )
 
 
@@ -287,7 +351,7 @@ def validate_device_descriptor(
     expected_version = api_version.removeprefix("v")
     fingerprint = descriptor["hardware_fingerprint"]
     if (
-        api_version not in {"v2", "v3"}
+        api_version not in SUPPORTED_DEVICE_API_VERSIONS
         or descriptor["schema"] != f"ylx.device.{api_version}"
         or descriptor["api_version"] != f"{expected_version}.0"
         or descriptor["security_profile"] != security_profile
@@ -300,7 +364,7 @@ def validate_device_descriptor(
     _validate_build(descriptor["build"])
     _validate_capabilities(descriptor["capabilities"])
     _validate_device_storage(descriptor["storage"])
-    _validate_runtime(descriptor["runtime"])
+    _validate_runtime(descriptor["runtime"], api_version=api_version)
 
 
 def validate_session_list(
@@ -382,15 +446,19 @@ def _parse_cursor(last_event_id: str | None) -> int | None:
 
 
 def _event_schema_version(api_version: str) -> str:
-    if api_version not in {"v2", "v3"}:
-        raise ValueError("api_version 必须是 v2 或 v3")
+    if api_version not in SUPPORTED_DEVICE_API_VERSIONS:
+        raise ValueError("api_version 必须是 v2、v3 或 v4")
     return api_version
 
 
 def _for_version(event: _BufferedEvent, api_version: str) -> SseEvent:
     if api_version == "v2" and event.source_event["type"] == "safe_swap":
         raise UnsupportedEventVersion("v3 safe-swap event 不能投影为 v2")
-    return SseEvent(event.delivery_id, api_version, event.source_event)
+    return SseEvent(
+        event.delivery_id,
+        api_version,
+        project_source_event(event.source_event, api_version=api_version),
+    )
 
 
 def _source_is_contiguous(events: tuple[_BufferedEvent, ...]) -> bool:
@@ -449,7 +517,13 @@ def _validate_source_event(source_event: Mapping[str, object]) -> None:
     if not isinstance(data, Mapping):
         raise InvalidSourceEvent("data 必须是对象")
     if event_type == "snapshot":
-        _validate_snapshot_data(data, authority_epoch, source_revision, session_id)
+        _validate_snapshot_data(
+            data,
+            authority_epoch,
+            source_revision,
+            session_id,
+            api_version=SOURCE_API_VERSION,
+        )
     elif event_type == "state":
         _require_session_id(session_id, event_type)
         _validate_state_data(data)
@@ -475,19 +549,22 @@ def _validate_snapshot_data(
     source_authority_epoch: object,
     source_revision: object,
     source_session_id: object,
+    *,
+    api_version: str = SOURCE_API_VERSION,
 ) -> None:
-    if set(data) != SNAPSHOT_KEYS or data["schema"] != "ylx.capture-snapshot-event.v2":
+    _validate_source_or_api_version(api_version)
+    if set(data) != SNAPSHOT_KEYS or data["schema"] != _capture_snapshot_schema_for_api(
+        api_version
+    ):
         raise InvalidSourceEvent("snapshot data 字段或 schema 无效")
     device_state = data["device_state"]
-    if not _is_enum(
-        device_state,
-        {"idle", "recording", "finalizing", "verifying", "blocked"},
-    ):
+    if not _is_enum(device_state, CAPTURE_DEVICE_STATES):
         raise InvalidSourceEvent("snapshot device_state 无效")
 
     active = data["active_recording"]
     retained = data["retained_unsuccessful"]
-    if device_state in {"recording", "finalizing", "verifying"}:
+    active_session_id: str | None = None
+    if device_state in CAPTURE_ACTIVE_STATES:
         _require_session_id(source_session_id, "active snapshot")
         _validate_snapshot_recording(
             active,
@@ -496,6 +573,10 @@ def _validate_snapshot_data(
             source_revision=source_revision,
             source_session_id=source_session_id,
         )
+        if isinstance(active, Mapping) and isinstance(active.get("recording_state"), Mapping):
+            session_id = active["recording_state"].get("session_id")
+            if isinstance(session_id, str):
+                active_session_id = session_id
         if retained is not None:
             raise InvalidSourceEvent("活动 snapshot 不得携带 retained_unsuccessful")
     elif active is not None:
@@ -506,12 +587,17 @@ def _validate_snapshot_data(
             raise InvalidSourceEvent("retained_unsuccessful 只允许出现在 idle snapshot")
         _validate_snapshot_recording(
             retained,
-            expected_states={"recoverable", "failed", "abandoned"},
+            expected_states=set(CAPTURE_TERMINAL_STATES),
             source_authority_epoch=source_authority_epoch,
             source_revision=source_revision,
             source_session_id=None,
         )
-    _validate_runtime(data["runtime"])
+    _validate_runtime(data["runtime"], api_version=api_version)
+    _validate_runtime_live_imu_session_relation(
+        data["runtime"],
+        active_session_id=active_session_id,
+        api_version=api_version,
+    )
 
 
 def _validate_snapshot_recording(
@@ -720,8 +806,42 @@ def _validate_session_discovery_diagnostic(value: object) -> None:
         raise InvalidSourceEvent("session discovery diagnostic 无效")
 
 
-def _validate_runtime(value: object) -> None:
-    if not isinstance(value, Mapping) or set(value) != RUNTIME_KEYS:
+def _project_snapshot_data(data: dict[str, object], *, api_version: str) -> None:
+    if data.get("schema") == CAPTURE_SNAPSHOT_SCHEMA_V2:
+        data["schema"] = _capture_snapshot_schema_for_api(api_version)
+    runtime = data.get("runtime")
+    if isinstance(runtime, dict):
+        _project_runtime(runtime, api_version=api_version)
+
+
+def _project_runtime(runtime: dict[str, object], *, api_version: str) -> None:
+    if api_version in LEGACY_DEVICE_API_VERSIONS:
+        runtime["live_imu"] = None
+        runtime.pop("camera_focus", None)
+
+
+def _capture_status_schema_for_api(api_version: str) -> str:
+    _validate_source_or_api_version(api_version)
+    return CAPTURE_STATUS_SCHEMA_V4 if api_version == "v4" else CAPTURE_STATUS_SCHEMA_V2
+
+
+def _capture_snapshot_schema_for_api(api_version: str) -> str:
+    _validate_source_or_api_version(api_version)
+    return CAPTURE_SNAPSHOT_SCHEMA_V4 if api_version == "v4" else CAPTURE_SNAPSHOT_SCHEMA_V2
+
+
+def _validate_source_or_api_version(api_version: str) -> None:
+    if api_version != SOURCE_API_VERSION:
+        _event_schema_version(api_version)
+
+
+def _runtime_keys_for_api(api_version: str) -> frozenset[str]:
+    _validate_source_or_api_version(api_version)
+    return RUNTIME_BASE_KEYS if api_version in LEGACY_DEVICE_API_VERSIONS else RUNTIME_SOURCE_KEYS
+
+
+def _validate_runtime(value: object, *, api_version: str = SOURCE_API_VERSION) -> None:
+    if not isinstance(value, Mapping) or set(value) != _runtime_keys_for_api(api_version):
         raise InvalidSourceEvent("runtime 必须是闭合对象")
     if not _date_time(value["observed_at"]):
         raise InvalidSourceEvent("runtime observed_at 无效")
@@ -734,10 +854,31 @@ def _validate_runtime(value: object) -> None:
     if not _number(temperature) or not -40 <= temperature <= 125:
         raise InvalidSourceEvent("runtime temperature_celsius 无效")
     _validate_network(value["network"])
-    if value["live_imu"] is not None:
+    if api_version in LEGACY_DEVICE_API_VERSIONS and value["live_imu"] is not None:
+        raise InvalidSourceEvent("v2/v3 runtime live_imu 必须是 null")
+    if api_version not in LEGACY_DEVICE_API_VERSIONS and value["live_imu"] is not None:
         _validate_live_imu(value["live_imu"])
-    if value["camera_focus"] is not None:
+    if "camera_focus" in value and value["camera_focus"] is not None:
         _validate_camera_focus(value["camera_focus"])
+
+
+def _validate_runtime_live_imu_session_relation(
+    runtime: object,
+    *,
+    active_session_id: str | None,
+    api_version: str,
+) -> None:
+    if api_version in LEGACY_DEVICE_API_VERSIONS:
+        return
+    if not isinstance(runtime, Mapping):
+        raise InvalidSourceEvent("runtime 必须是闭合对象")
+    live_imu = runtime["live_imu"]
+    if live_imu is None:
+        return
+    if active_session_id is None:
+        raise InvalidSourceEvent("v4/source runtime live_imu 仅允许出现在活动录制 snapshot")
+    if not isinstance(live_imu, Mapping) or live_imu.get("session_id") != active_session_id:
+        raise InvalidSourceEvent("v4/source runtime live_imu session_id 必须与活动录制一致")
 
 
 def _validate_camera_focus(value: object) -> None:
@@ -862,14 +1003,7 @@ def _validate_state_data(data: Mapping[str, object]) -> None:
         raise InvalidSourceEvent("state data 字段或 schema 无效")
     if not _is_enum(
         data["state"],
-        {
-            "recording",
-            "finalizing",
-            "verifying",
-            "recoverable",
-            "failed",
-            "abandoned",
-        },
+        CAPTURE_RECORDING_STATES,
     ):
         raise InvalidSourceEvent("state 值无效")
     for field in ("volume_id", "generation_id"):
@@ -881,7 +1015,7 @@ def _validate_state_data(data: Mapping[str, object]) -> None:
 def _validate_progress_data(data: Mapping[str, object]) -> None:
     if set(data) != PROGRESS_KEYS or data["schema"] != "ylx.capture-progress-event.v2":
         raise InvalidSourceEvent("progress data 字段或 schema 无效")
-    if not _is_enum(data["phase"], {"recording", "finalizing", "verifying"}):
+    if not _is_enum(data["phase"], CAPTURE_ACTIVE_STATES):
         raise InvalidSourceEvent("progress phase 无效")
     if not _is_enum(data["unit"], {"frames", "bytes", "artifacts", "checks"}):
         raise InvalidSourceEvent("progress unit 无效")

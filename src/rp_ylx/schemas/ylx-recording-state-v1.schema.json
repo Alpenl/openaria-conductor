@@ -27,6 +27,7 @@
       "enum": [
         "recording",
         "finalizing",
+        "encoding",
         "verifying",
         "recoverable",
         "failed",

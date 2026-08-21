@@ -22,11 +22,15 @@ test("设备工作台完全从同源离线加载", async ({ page }) => {
   expect(externalRequests).toEqual([]);
 });
 
-test("权威快照呈现设备、容量和真实 raw IMU", async ({ page }) => {
+test("权威快照呈现设备、容量和 active raw IMU", async ({ page, request }) => {
+  await request.post("/__fixture/state", {
+    data: { deviceState: "recording", displayName: "active raw IMU", broadcast: false },
+  });
+
   await page.goto("/");
 
   await expect(page.getByText("YLX-A1B2C3D4", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("capture-state")).toHaveText("待机");
+  await expect(page.getByTestId("capture-state")).toHaveText("录制中");
   await expect(page.getByTestId("storage-available")).toHaveText("82.0 GiB");
   await expect(page.getByTestId("temperature")).toHaveText("43.5 °C");
   await expect(page.getByTestId("acceleration")).toContainText("x 12.000");
@@ -58,7 +62,7 @@ test("网页可以调整相机焦距并同步到权威快照", async ({ page, re
     await response.json()
   );
   const focusRequests = body.requests.filter(
-    (entry) => entry.path === "/api/v3/camera/focus" && entry.idempotencyKey,
+    (entry) => entry.path === "/api/v4/camera/focus" && entry.idempotencyKey,
   );
   expect(focusRequests).toHaveLength(1);
 });
@@ -109,7 +113,7 @@ test("缺少 crypto.randomUUID 的 HTTP LAN 浏览器仍能发送录制命令", 
   const body = /** @type {{requests: Array<{path: string, idempotencyKey: string | null}>}} */ (
     await response.json()
   );
-  const starts = body.requests.filter((entry) => entry.path === "/api/v3/capture/start");
+  const starts = body.requests.filter((entry) => entry.path === "/api/v4/capture/start");
   expect(starts).toHaveLength(1);
   expect(starts[0].idempotencyKey).toMatch(
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -131,7 +135,7 @@ test("录制命令只在本次请求结束后解锁", async ({ page, request }) 
     await pendingResponse.json()
   ).requests;
   expect(
-    pendingRequests.filter((entry) => entry.path === "/api/v3/capture/start"),
+    pendingRequests.filter((entry) => entry.path === "/api/v4/capture/start"),
   ).toHaveLength(1);
 
   await expect(page.getByTestId("capture-state")).toHaveText("录制中");
@@ -142,7 +146,7 @@ test("customer 事件流携带令牌并在断线后从权威快照收敛", async
   /** @type {import("@playwright/test").Request[]} */
   const pageEventRequests = [];
   page.on("request", (browserRequest) => {
-    if (new URL(browserRequest.url()).pathname === "/api/v3/capture/events") {
+    if (new URL(browserRequest.url()).pathname === "/api/v4/capture/events") {
       pageEventRequests.push(browserRequest);
     }
   });
@@ -157,7 +161,7 @@ test("customer 事件流携带令牌并在断线后从权威快照收敛", async
     .poll(async () => {
       const response = await request.get("/__fixture/requests");
       const body = /** @type {{requests: Array<{path: string}>}} */ (await response.json());
-      return body.requests.filter((entry) => entry.path === "/api/v3/capture/events").length;
+      return body.requests.filter((entry) => entry.path === "/api/v4/capture/events").length;
     })
     .toBe(1);
 
@@ -175,7 +179,7 @@ test("customer 事件流携带令牌并在断线后从权威快照收敛", async
   );
   const events = body.requests.filter(
     (entry) =>
-      entry.path === "/api/v3/capture/events" &&
+      entry.path === "/api/v4/capture/events" &&
       entry.authorization === "Bearer customer-token",
   );
   expect(events.length).toBeGreaterThanOrEqual(2);
@@ -203,7 +207,7 @@ test("事件流持续断线时禁用写操作且限制重连频率", async ({ pa
     await firstResponse.json()
   );
   const firstCount = firstBody.requests.filter(
-    (entry) => entry.path === "/api/v3/capture/events",
+    (entry) => entry.path === "/api/v4/capture/events",
   ).length;
 
   await page.waitForTimeout(650);
@@ -213,7 +217,7 @@ test("事件流持续断线时禁用写操作且限制重连频率", async ({ pa
     await laterResponse.json()
   );
   const laterCount = laterBody.requests.filter(
-    (entry) => entry.path === "/api/v3/capture/events",
+    (entry) => entry.path === "/api/v4/capture/events",
   ).length;
   expect(laterCount - firstCount).toBeLessThanOrEqual(1);
 });
@@ -229,7 +233,7 @@ test("事件流重连处理首个权威事件前保持写操作禁用", async ({
     .poll(async () => {
       const response = await request.get("/__fixture/requests");
       const body = /** @type {{requests: Array<{path: string}>}} */ (await response.json());
-      return body.requests.filter((entry) => entry.path === "/api/v3/capture/events").length;
+      return body.requests.filter((entry) => entry.path === "/api/v4/capture/events").length;
     })
     .toBeGreaterThanOrEqual(2);
   await expect(page.locator(".connection")).toHaveText("连接中断");
@@ -253,7 +257,7 @@ test("事件流 401 停止重连并回到令牌入口", async ({ page, request }
     await unauthorizedResponse.json()
   );
   const unauthorizedCount = unauthorizedBody.requests.filter(
-    (entry) => entry.path === "/api/v3/capture/events",
+    (entry) => entry.path === "/api/v4/capture/events",
   ).length;
 
   await page.waitForTimeout(500);
@@ -263,7 +267,7 @@ test("事件流 401 停止重连并回到令牌入口", async ({ page, request }
     await laterResponse.json()
   );
   const laterCount = laterBody.requests.filter(
-    (entry) => entry.path === "/api/v3/capture/events",
+    (entry) => entry.path === "/api/v4/capture/events",
   ).length;
   expect(laterCount).toBe(unauthorizedCount);
 });
@@ -273,7 +277,7 @@ test("慢预览响应不排队且录制期间继续更新左眼画面", async ({
   let previewMaxInFlight = 0;
   /** @param {import("@playwright/test").Request} networkRequest */
   const isPagePreview = (networkRequest) =>
-    new URL(networkRequest.url()).pathname === "/api/v3/preview";
+    new URL(networkRequest.url()).pathname === "/api/v4/preview";
   page.on("request", (networkRequest) => {
     if (isPagePreview(networkRequest)) {
       previewInFlight += 1;
@@ -362,7 +366,7 @@ test("空闲预览不可用不会持续污染浏览器控制台", async ({ page 
       warnings.push(message.text());
     }
   });
-  await page.route("**/api/v3/preview", async (route) => {
+  await page.route("**/api/v4/preview", async (route) => {
     await route.fulfill({
       status: 503,
       contentType: "application/problem+json",
@@ -606,10 +610,10 @@ test("progress 事件触发权威快照刷新并显示录制计数", async ({ pa
   await page.getByLabel("录制名称").fill("进度测试");
   await page.getByRole("button", { name: "开始录制" }).click();
   await expect(page.getByTestId("capture-state")).toHaveText("录制中");
-  const before = await (await request.get("/api/v3/capture/status")).json();
+  const before = await (await request.get("/api/v4/capture/status")).json();
 
   await request.post("/__fixture/progress");
-  const after = await (await request.get("/api/v3/capture/status")).json();
+  const after = await (await request.get("/api/v4/capture/status")).json();
   await expect(page.getByTestId("elapsed-seconds")).toHaveText("12.4 秒");
   await expect(page.getByTestId("captured-frames")).toHaveText("744");
   await expect(page.getByTestId("bytes-written")).toHaveText("42.0 MiB");
@@ -645,7 +649,7 @@ test("customer 401 后可输入 Bearer 令牌并连接设备", async ({ page, re
   );
   const authenticatedEvents = body.requests.filter(
     (entry) =>
-      entry.path === "/api/v3/capture/events" &&
+      entry.path === "/api/v4/capture/events" &&
       entry.authorization === "Bearer customer-token",
   );
   expect(authenticatedEvents).toHaveLength(1);

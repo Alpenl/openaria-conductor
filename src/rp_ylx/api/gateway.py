@@ -1,4 +1,4 @@
-"""冻结 Device API v2 与当前 v3 的共享 HTTP gateway。"""
+"""Device API v2/v3/v4 的共享 HTTP gateway。"""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ from rp_ylx.api.events import (
     InvalidSourceEvent,
     UnsupportedEventVersion,
     heartbeat_comment,
+    project_capture_status,
+    project_device_descriptor,
     validate_capture_status,
     validate_device_descriptor,
     validate_retained_unsuccessful_outcome,
@@ -53,6 +55,8 @@ WEB_CONTENT_SECURITY_POLICY = (
     "frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; "
     "script-src 'self'; style-src 'self'"
 )
+SUPPORTED_API_VERSIONS = frozenset({"v2", "v3", "v4"})
+CAMERA_FOCUS_API_VERSIONS = frozenset({"v4"})
 
 
 def _valid_session_id(api_version: str, session_id: str) -> bool:
@@ -416,7 +420,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
         parts = path.split("/")
-        if len(parts) < 4 or parts[1] != "api" or parts[2] not in {"v2", "v3"}:
+        if len(parts) < 4 or parts[1] != "api" or parts[2] not in SUPPORTED_API_VERSIONS:
             return None
         if len(parts) == 4 and parts[3] in {"device", "preview", "sessions"}:
             return ("GET", "OPTIONS")
@@ -425,7 +429,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return ("POST", "OPTIONS")
             if parts[4] in {"status", "events", "safe-swap"}:
                 return ("GET", "OPTIONS")
-        if len(parts) == 5 and parts[2] == "v3" and parts[3:] == ["camera", "focus"]:
+        if (
+            len(parts) == 5
+            and parts[2] in CAMERA_FOCUS_API_VERSIONS
+            and parts[3:] == ["camera", "focus"]
+        ):
             return ("GET", "POST", "OPTIONS")
         if len(parts) == 5 and parts[3] == "sessions" and _valid_session_id(parts[2], parts[4]):
             return ("GET", "OPTIONS")
@@ -509,7 +517,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 4
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "device"
         ):
             self._get_device(parts[2])
@@ -517,15 +525,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3:] == ["capture", "status"]
         ):
-            self._get_capture_status()
+            self._get_capture_status(parts[2])
             return
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3:] == ["capture", "events"]
         ):
             self._capture_events(parts[2], parse_qs(parsed.query, keep_blank_values=True))
@@ -533,7 +541,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3:] == ["capture", "safe-swap"]
         ):
             self._get_safe_swap(parts[2])
@@ -541,7 +549,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] == "v3"
+            and parts[2] in CAMERA_FOCUS_API_VERSIONS
             and parts[3:] == ["camera", "focus"]
         ):
             self._get_camera_focus()
@@ -549,7 +557,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 4
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "preview"
         ):
             self._get_preview(parse_qs(parsed.query, keep_blank_values=True))
@@ -557,7 +565,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 4
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "sessions"
         ):
             self._list_sessions(parse_qs(parsed.query, keep_blank_values=True))
@@ -565,7 +573,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "sessions"
             and _valid_session_id(parts[2], parts[4])
         ):
@@ -574,7 +582,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 6
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "sessions"
             and _valid_session_id(parts[2], parts[4])
             and parts[5] == "unsuccessful-outcome"
@@ -609,16 +617,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "capture"
             and parts[4] in {"start", "stop"}
         ):
-            self._capture_command(parts[4])
+            self._capture_command(parts[2], parts[4])
             return
         if (
             len(parts) == 5
             and parts[1] == "api"
-            and parts[2] == "v3"
+            and parts[2] in CAMERA_FOCUS_API_VERSIONS
             and parts[3:] == ["camera", "focus"]
         ):
             self._camera_focus_command()
@@ -629,9 +637,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self._principal("getDevice") is None:
             return
         try:
-            descriptor = self.server.provider.device_descriptor(
+            source_descriptor = self.server.provider.device_descriptor(
                 api_version, self.server.security.profile
             )
+            descriptor = project_device_descriptor(source_descriptor, api_version=api_version)
             validate_device_descriptor(
                 descriptor,
                 api_version=api_version,
@@ -645,15 +654,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, descriptor)
 
-    def _get_capture_status(self) -> None:
+    def _get_capture_status(self, api_version: str) -> None:
         if self._principal("getCaptureStatus") is None:
             return
         try:
-            body = self.server.provider.capture_status()
+            source_body = self.server.provider.capture_status()
+            body = project_capture_status(source_body, api_version=api_version)
         except Exception:
             self._provider_failure()
             return
-        self._send_capture_status(HTTPStatus.OK, body)
+        self._send_capture_status(HTTPStatus.OK, body, api_version=api_version)
 
     def _invalid_source_state(self, message: str) -> None:
         self._problem(
@@ -675,10 +685,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         status: int,
         body: object,
         *,
+        api_version: str,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         try:
-            validate_capture_status(body)
+            validate_capture_status(body, api_version=api_version)
         except InvalidSourceEvent:
             self._invalid_source_state("daemon capture status 无效")
             return
@@ -899,7 +910,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         schema = resource.get("schema")
         receipt = resource.get("receipt")
-        expected_schema = f"ylx.safe-swap-receipt-resource.{api_version}"
+        expected_schema_version = "v2" if api_version == "v2" else "v3"
+        expected_schema = f"ylx.safe-swap-receipt-resource.{expected_schema_version}"
         if schema != expected_schema or not isinstance(receipt, Mapping):
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "当前没有可读取的安全换盘回执")
             return
@@ -1020,7 +1032,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 7
             and parts[1] == "api"
-            and parts[2] in {"v2", "v3"}
+            and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "sessions"
             and parts[5] == "artifacts"
             and _valid_session_id(parts[2], parts[4])
@@ -1245,7 +1257,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         return principal, key
 
-    def _capture_command(self, operation: str) -> None:
+    def _capture_command(self, api_version: str, operation: str) -> None:
         operation_id = "startCapture" if operation == "start" else "stopCapture"
         command_identity = self._command_principal(operation_id)
         if command_identity is None:
@@ -1280,7 +1292,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if operation == "stop" and result.status == HTTPStatus.NO_CONTENT and result.body is None:
             self._send_empty(result.status, headers=headers)
         elif result.status == HTTPStatus.ACCEPTED:
-            self._send_capture_status(result.status, result.body, headers=headers)
+            body = project_capture_status(result.body, api_version=api_version)
+            self._send_capture_status(
+                result.status,
+                body,
+                api_version=api_version,
+                headers=headers,
+            )
         else:
             self._problem(
                 HTTPStatus.INTERNAL_SERVER_ERROR,

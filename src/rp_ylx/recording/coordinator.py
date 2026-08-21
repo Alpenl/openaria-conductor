@@ -21,7 +21,7 @@ from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
 )
-from rp_ylx.api.events import validate_safe_swap_v3_receipt
+from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
 from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderError
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
@@ -946,7 +946,7 @@ class CaptureCoordinator:
             available_bytes = 0
             writable = False
         commit = self._config.session.commit
-        return {
+        descriptor = {
             "schema": f"ylx.device.{api_version}",
             "device": {
                 "device_id": self._config.session.device_id,
@@ -974,6 +974,9 @@ class CaptureCoordinator:
             },
             "runtime": self._runtime_snapshot(),
         }
+        projected = project_device_descriptor(descriptor, api_version=api_version)
+        assert isinstance(projected, Mapping)
+        return projected
 
     def camera_focus_status(self) -> dict[str, object] | None:
         try:
