@@ -20,6 +20,40 @@ from rp_ylx.api import (
 )
 from rp_ylx.web import read_asset
 
+WEB_ASSET_EXPECTATIONS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/api-client.js": ("api-client.js", "text/javascript; charset=utf-8"),
+    "/state.js": ("state.js", "text/javascript; charset=utf-8"),
+    "/event-stream.js": ("event-stream.js", "text/javascript; charset=utf-8"),
+    "/preview.js": ("preview.js", "text/javascript; charset=utf-8"),
+}
+WEB_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+WEB_HEADER_NAMES = (
+    "Content-Type",
+    "Content-Length",
+    "Cache-Control",
+    "Content-Security-Policy",
+    "Cross-Origin-Resource-Policy",
+    "Referrer-Policy",
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+)
+UNKNOWN_WEB_PATHS = (
+    "/index.html",
+    "/assets.json",
+    "/missing.js",
+    "/nested/app.js",
+    "/%2e%2e/index.html",
+)
+
 DEVICE_V3 = {
     "schema": "ylx.device.v3",
     "device": {
@@ -405,30 +439,19 @@ class GatewayHttpTest(unittest.TestCase):
             connection.close()
 
     def test_embedded_web_is_anonymous_same_origin_and_closed_to_unknown_paths(self) -> None:
-        expected_assets = {
-            "/": ("index.html", "text/html; charset=utf-8"),
-            "/styles.css": ("styles.css", "text/css; charset=utf-8"),
-            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-            "/api-client.js": ("api-client.js", "text/javascript; charset=utf-8"),
-            "/state.js": ("state.js", "text/javascript; charset=utf-8"),
-            "/event-stream.js": ("event-stream.js", "text/javascript; charset=utf-8"),
-            "/preview.js": ("preview.js", "text/javascript; charset=utf-8"),
-        }
-        for path, (name, content_type) in expected_assets.items():
+        for path, (name, content_type) in WEB_ASSET_EXPECTATIONS.items():
             with self.subTest(path=path):
                 status, payload, headers = self.request(path)
                 self.assertEqual(status, 200)
                 self.assertEqual(payload, read_asset(name))
                 self.assertEqual(headers["Content-Type"], content_type)
-                self.assertEqual(headers["Cache-Control"], "no-store")
-                self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
-                self.assertEqual(headers["Referrer-Policy"], "no-referrer")
-                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
-                self.assertEqual(headers["X-Frame-Options"], "DENY")
+                self.assertEqual(headers["Content-Length"], str(len(payload)))
+                for header_name, expected in WEB_SECURITY_HEADERS.items():
+                    self.assertEqual(headers[header_name], expected)
                 self.assertIn("connect-src 'self'", headers["Content-Security-Policy"])
                 self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
 
-        for path in ("/index.html", "/nested/app.js", "/%2e%2e/index.html", "/missing.js"):
+        for path in UNKNOWN_WEB_PATHS:
             with self.subTest(path=path):
                 status, payload, headers = self.request(path)
                 self.assertEqual(status, 404)
@@ -438,6 +461,28 @@ class GatewayHttpTest(unittest.TestCase):
         status, payload, _ = self.request("/api/v3/device")
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(payload)["error"]["code"], "unauthorized")
+
+    def test_embedded_web_head_matches_get_headers_without_body(self) -> None:
+        for path in WEB_ASSET_EXPECTATIONS:
+            with self.subTest(path=path):
+                get_status, get_payload, get_headers = self.request(path)
+                head_status, head_payload, head_headers = self.request(path, method="HEAD")
+
+                self.assertEqual(get_status, 200)
+                self.assertEqual(head_status, 200)
+                self.assertEqual(head_payload, b"")
+                for header_name in WEB_HEADER_NAMES:
+                    self.assertEqual(head_headers[header_name], get_headers[header_name])
+                self.assertEqual(head_headers["Content-Length"], str(len(get_payload)))
+
+    def test_embedded_web_head_closed_set_returns_problem_without_body(self) -> None:
+        for path in UNKNOWN_WEB_PATHS:
+            with self.subTest(path=path):
+                status, payload, headers = self.request(path, method="HEAD")
+                self.assertEqual(status, 404)
+                self.assertEqual(payload, b"")
+                self.assertEqual(headers["Content-Type"], "application/problem+json")
+                self.assertIsNotNone(headers["Content-Length"])
 
     def test_embedded_web_same_origin_command_does_not_need_a_second_secret(self) -> None:
         status, payload, headers = self.request(

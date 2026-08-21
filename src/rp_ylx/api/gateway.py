@@ -255,7 +255,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
         self._cors_headers()
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
     def _send_empty(
         self,
@@ -272,7 +273,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
 
-    def _send_web_asset(self, name: str) -> None:
+    def _send_web_asset(self, name: str, *, head: bool = False) -> None:
         try:
             payload = read_asset(name)
         except OSError:
@@ -292,7 +293,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        self.wfile.write(payload)
+        if not head:
+            self.wfile.write(payload)
 
     def _send_representation(
         self,
@@ -589,6 +591,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._begin_request()
         path = urlsplit(self.path).path
+        web_asset = WEB_PATHS.get(path)
+        if web_asset is not None:
+            self._send_web_asset(web_asset, head=True)
+            return
         artifact = self._artifact_route(path.split("/"))
         if artifact is not None:
             api_version, session_id, artifact_id = artifact
