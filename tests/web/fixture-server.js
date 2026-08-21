@@ -9,6 +9,7 @@ import { createServer } from "node:http";
 /** @typedef {import("../../src/rp_ylx/web/state.js").CameraFocusStatus} CameraFocusStatus */
 /** @typedef {import("../../src/rp_ylx/web/state.js").DeviceDescriptor} DeviceDescriptor */
 /** @typedef {import("../../src/rp_ylx/web/state.js").DeviceRuntime} DeviceRuntime */
+/** @typedef {import("../../src/rp_ylx/web/state.js").LiveImu} LiveImu */
 /** @typedef {import("../../src/rp_ylx/web/state.js").SafeSwapReceipt} SafeSwapReceipt */
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +89,21 @@ const makeCameraFocusStatus = () => ({
   auto_enabled: false,
 });
 
+/** @param {string} subjectSessionId @returns {LiveImu} */
+const makeLiveImu = (subjectSessionId) => ({
+  session_id: subjectSessionId,
+  clock: {
+    time_base: "host_monotonic",
+    timestamp_ns: 4_250_000_000,
+  },
+  raw: {
+    units: "raw_int16",
+    accelerometer: { x: 12, y: -8, z: 979 },
+    gyroscope: { x: 1, y: -2, z: 5 },
+  },
+  sync: { quality: "good" },
+});
+
 /** @returns {DeviceRuntime} */
 const makeRuntime = () => ({
   observed_at: "2026-08-12T02:25:00Z",
@@ -114,28 +130,16 @@ const makeRuntime = () => ({
     },
     default_route: "none",
   },
-  live_imu: {
-    session_id: sessionId,
-    clock: {
-      time_base: "host_monotonic",
-      timestamp_ns: 4_250_000_000,
-    },
-    raw: {
-      units: "raw_int16",
-      accelerometer: { x: 12, y: -8, z: 979 },
-      gyroscope: { x: 1, y: -2, z: 5 },
-    },
-    sync: { quality: "good" },
-  },
+  live_imu: null,
   camera_focus: makeCameraFocusStatus(),
 });
 
 /** @returns {DeviceDescriptor & Record<string, unknown>} */
 const makeDevice = () => ({
-  schema: "ylx.device.v3",
+  schema: "ylx.device.v4",
   device: { device_id: deviceId, device_label: "YLX-A1B2C3D4" },
   hardware_fingerprint: `sha256:${"a".repeat(64)}`,
-  api_version: "3.0",
+  api_version: "4.0",
   build: {
     package_version: "0.5.0-dev",
     commit: "b".repeat(40),
@@ -159,11 +163,11 @@ const makeDevice = () => ({
 
 /** @returns {CaptureStatus} */
 const makeSnapshot = () => ({
-  schema: "ylx.capture-status.v2",
+  schema: "ylx.capture-status.v4",
   authority_epoch: authorityEpoch,
   source_revision: 1,
   snapshot: {
-    schema: "ylx.capture-snapshot-event.v2",
+    schema: "ylx.capture-snapshot-event.v4",
     device_state: "idle",
     active_recording: null,
     retained_unsuccessful: null,
@@ -278,7 +282,7 @@ function sendJson(response, status, body) {
 function captureEvent(type, data, subjectSessionId = null) {
   const deliveryId = String(fixture.nextDeliveryId++);
   return {
-    schema: "ylx.capture-event.v3",
+    schema: "ylx.capture-event.v4",
     sse_delivery_id: deliveryId,
     authority_epoch: fixture.snapshot.authority_epoch,
     source_revision: fixture.snapshot.source_revision,
@@ -352,6 +356,22 @@ function setCameraFocus(body) {
   return next;
 }
 
+/** @param {string | null} activeSessionId */
+function setLiveImu(activeSessionId) {
+  const liveImu = activeSessionId ? makeLiveImu(activeSessionId) : null;
+  fixture.device.runtime = {
+    ...fixture.device.runtime,
+    live_imu: liveImu ? { ...liveImu } : null,
+  };
+  fixture.snapshot.snapshot = {
+    ...fixture.snapshot.snapshot,
+    runtime: {
+      ...fixture.snapshot.snapshot.runtime,
+      live_imu: liveImu ? { ...liveImu } : null,
+    },
+  };
+}
+
 /** @param {IncomingMessage} request @returns {Promise<unknown>} */
 async function readJson(request) {
   const chunks = [];
@@ -396,6 +416,7 @@ function setRecording(displayName) {
     },
     retained_unsuccessful: null,
   };
+  setLiveImu(sessionId);
 }
 
 function setFinalizing() {
@@ -427,6 +448,7 @@ function setIdleAfterUserStop() {
     active_recording: null,
     retained_unsuccessful: null,
   };
+  setLiveImu(null);
 }
 
 function setFailed() {
@@ -443,6 +465,7 @@ function setFailed() {
       recording_state: recordingState,
     },
   };
+  setLiveImu(null);
   broadcastSnapshot();
 }
 
@@ -507,6 +530,7 @@ function completeSafeSwap() {
     active_recording: null,
     retained_unsuccessful: null,
   };
+  setLiveImu(null);
   broadcastSnapshot();
   fixture.staleSafeSwapEvent = captureEvent("safe_swap", receipt, sessionId);
   broadcastEvent(fixture.staleSafeSwapEvent);
@@ -537,6 +561,7 @@ function completeSafeSwapWithGap() {
     active_recording: null,
     retained_unsuccessful: null,
   };
+  setLiveImu(null);
   broadcastEvent(captureEvent("safe_swap", receipt, sessionId));
 }
 
@@ -574,6 +599,7 @@ function startNewAuthorityRecording() {
     session_id: nextSessionId,
     take_id: nextTakeId,
   };
+  setLiveImu(nextSessionId);
   broadcastSnapshot();
 }
 
@@ -772,7 +798,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname.startsWith("/api/v3/")) {
+  if (url.pathname.startsWith("/api/v4/")) {
     fixture.apiRequests.push({
       path: url.pathname,
       authorization: request.headers.authorization ?? null,
@@ -790,17 +816,17 @@ const server = createServer(async (request, response) => {
     }
   }
 
-  if (url.pathname === "/api/v3/device") {
+  if (url.pathname === "/api/v4/device") {
     sendJson(response, 200, fixture.device);
     return;
   }
 
-  if (url.pathname === "/api/v3/capture/status") {
+  if (url.pathname === "/api/v4/capture/status") {
     sendJson(response, 200, fixture.snapshot);
     return;
   }
 
-  if (url.pathname === "/api/v3/camera/focus") {
+  if (url.pathname === "/api/v4/camera/focus") {
     const current = currentCameraFocus();
     if (!current) {
       sendJson(response, 404, {
@@ -835,7 +861,7 @@ const server = createServer(async (request, response) => {
           schema: "ylx.api-error.v2",
           error: {
             code: "invalid_camera_focus",
-            message: "焦距请求不符合 v3 契约",
+            message: "焦距请求不符合 v4 契约",
             request_id: "f347fe47-1556-4c1c-b855-90f3fa9733bd",
             retryable: false,
           },
@@ -849,7 +875,7 @@ const server = createServer(async (request, response) => {
     }
   }
 
-  if (url.pathname === "/api/v3/preview") {
+  if (url.pathname === "/api/v4/preview") {
     fixture.previewRequests += 1;
     const requestId = fixture.previewRequests;
     fixture.previewActive.add(requestId);
@@ -879,7 +905,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/v3/capture/start" && request.method === "POST") {
+  if (url.pathname === "/api/v4/capture/start" && request.method === "POST") {
     const body = /** @type {{schema?: string, mode?: string, take?: {kind?: string}, display_name?: string}} */ (
       await readJson(request)
     );
@@ -893,7 +919,7 @@ const server = createServer(async (request, response) => {
         schema: "ylx.api-error.v2",
         error: {
           code: "invalid_capture_start",
-          message: "录制请求不符合 v3 契约",
+          message: "录制请求不符合 v4 契约",
           request_id: "f91cd40f-5715-46be-8fa8-cc67b58d1572",
           retryable: false,
         },
@@ -911,7 +937,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/v3/capture/stop" && request.method === "POST") {
+  if (url.pathname === "/api/v4/capture/stop" && request.method === "POST") {
     const body = /** @type {{schema?: string, reason?: string}} */ (await readJson(request));
     if (
       !request.headers["idempotency-key"] ||
@@ -922,7 +948,7 @@ const server = createServer(async (request, response) => {
         schema: "ylx.api-error.v2",
         error: {
           code: "invalid_capture_stop",
-          message: "结束请求不符合 v3 契约",
+          message: "结束请求不符合 v4 契约",
           request_id: "024d4a33-8d89-43f8-87e6-413fc0c8aaef",
           retryable: false,
         },
@@ -963,7 +989,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/v3/sessions") {
+  if (url.pathname === "/api/v4/sessions") {
     if (fixture.sessionsVolumeUnavailable) {
       sendJson(response, 409, {
         schema: "ylx.api-error.v2",
@@ -981,7 +1007,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/v3/capture/safe-swap") {
+  if (url.pathname === "/api/v4/capture/safe-swap") {
     if (fixture.safeSwapResource) {
       sendJson(response, 200, fixture.safeSwapResource);
       return;
@@ -998,7 +1024,7 @@ const server = createServer(async (request, response) => {
     return;
   }
 
-  if (url.pathname === "/api/v3/capture/events") {
+  if (url.pathname === "/api/v4/capture/events") {
     if (fixture.eventsUnavailable) {
       sendJson(response, 503, {
         schema: "ylx.api-error.v2",

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: YLX Device API
-  version: 3.0.0
+  version: 4.0.0
   summary: Target HTTP contract for YLX 0.5 device control and completed-session transfer
   description: |
     This is a target contract, not a statement that an implementation exists.
@@ -10,7 +10,7 @@ info:
     idempotent commands, completed sessions are immutable, and artifact bytes are
     served with byte-range and HEAD support.
 servers:
-  - url: https://{device_host}/api/v3
+  - url: https://{device_host}/api/v4
     description: A device reached through AP, Ethernet, or an explicitly configured LAN
     variables:
       device_host:
@@ -47,6 +47,8 @@ x-ylx-security-profiles:
       - streamCaptureEvents
       - getCurrentSafeSwapReceipt
       - getPreview
+      - getCameraFocus
+      - setCameraFocus
       - listSessions
       - getSession
       - getRetainedUnsuccessfulSessionOutcome
@@ -245,7 +247,7 @@ paths:
               example: |
                 id: 1042
                 event: state
-                data: {"schema":"ylx.capture-event.v3","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-08-08T02:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"ylx.capture-state-event.v2","state":"encoding","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
+                data: {"schema":"ylx.capture-event.v4","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-08-08T02:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"ylx.capture-state-event.v2","state":"encoding","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
 
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -361,6 +363,82 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /camera/focus:
+    get:
+      tags: [Device]
+      operationId: getCameraFocus
+      summary: Read current V4L2 camera focus controls
+      description: |
+        Returns the latest reconciled focus_absolute/focus_auto observation. Devices
+        that do not expose focus_absolute return the typed camera_focus_unsupported
+        problem; status snapshots instead carry runtime.camera_focus as null.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current focus control state
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CameraFocusStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/CameraFocusUnsupported"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [Device]
+      operationId: setCameraFocus
+      summary: Idempotently set manual or automatic camera focus
+      description: |
+        Applies a focus_absolute value, toggles focus_auto when exposed, or both.
+        The response is the reconciled camera state after the accepted command.
+        Omitting both value and auto_enabled is invalid. Setting auto_enabled is
+        rejected with 422 when the device exposes focus_absolute but not focus_auto.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CameraFocusSetRequest"
+      responses:
+        "200":
+          description: Focus command accepted; response is the reconciled focus control state
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CameraFocusStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/CameraFocusUnsupported"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/InvalidCameraFocus"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /sessions:
     get:
       tags: [Sessions]
@@ -780,6 +858,30 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    CameraFocusUnsupported:
+      description: Device does not expose V4L2 focus_absolute and cannot report or set camera focus
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: camera_focus_unsupported
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/CameraFocusUnsupportedError"
+    InvalidCameraFocus:
+      description: Requested focus value or auto toggle is outside the exposed V4L2 control range/capability
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: invalid_camera_focus
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/InvalidCameraFocusError"
     SessionNotVerified:
       description: |
         The sealed session or artifact exists, but the gateway has no current usable
@@ -905,7 +1007,7 @@ components:
         - runtime
       properties:
         schema:
-          const: ylx.device.v3
+          const: ylx.device.v4
         device:
           $ref: "#/components/schemas/DeviceIdentity"
         hardware_fingerprint:
@@ -913,7 +1015,7 @@ components:
           pattern: '^sha256:[0-9a-f]{64}$'
           description: Diagnostic hardware binding; never a device identity or authorization key
         api_version:
-          const: "3.0"
+          const: "4.0"
         build:
           type: object
           additionalProperties: false
@@ -981,7 +1083,7 @@ components:
     DeviceRuntimeStatus:
       type: object
       additionalProperties: false
-      required: [observed_at, connection_method, temperature_celsius, network, live_imu]
+      required: [observed_at, connection_method, temperature_celsius, network, live_imu, camera_focus]
       properties:
         observed_at:
           type: string
@@ -1002,6 +1104,11 @@ components:
             - $ref: "#/components/schemas/LiveImuObservation"
             - type: "null"
           description: Latest non-stale live sample, or null when no active session sample is available
+        camera_focus:
+          oneOf:
+            - $ref: "#/components/schemas/CameraFocusStatus"
+            - type: "null"
+          description: Latest focus control status, or null when focus_absolute is not exposed
     NetworkRuntimeStatus:
       type: object
       additionalProperties: false
@@ -1061,36 +1168,98 @@ components:
     LiveImuObservation:
       type: object
       additionalProperties: false
-      required: [session_id, clock, acceleration_m_s2, angular_velocity_rad_s, orientation_quaternion]
+      required: [session_id, clock, raw, sync]
       properties:
         session_id:
           $ref: "#/components/schemas/UuidV7"
         clock:
           type: object
           additionalProperties: false
-          required: [time_base, epoch_id, timestamp_ns]
+          required: [time_base, timestamp_ns]
           properties:
             time_base:
-              const: session_monotonic
-            epoch_id:
-              $ref: "#/components/schemas/UuidV7"
-              description: Must equal the enclosing live IMU session_id
+              const: host_monotonic
             timestamp_ns:
               type: integer
               minimum: 0
-        acceleration_m_s2:
-          $ref: "#/components/schemas/Vector3"
-        angular_velocity_rad_s:
-          $ref: "#/components/schemas/Vector3"
-        orientation_quaternion:
+        raw:
           type: object
           additionalProperties: false
-          required: [w, x, y, z]
+          required: [units, accelerometer, gyroscope]
           properties:
-            w: {type: number}
-            x: {type: number}
-            y: {type: number}
-            z: {type: number}
+            units:
+              const: raw_int16
+            accelerometer:
+              $ref: "#/components/schemas/RawInt16Vector3"
+            gyroscope:
+              $ref: "#/components/schemas/RawInt16Vector3"
+        sync:
+          type: object
+          additionalProperties: false
+          required: [quality]
+          properties:
+            quality:
+              enum: [insufficient, degraded, good]
+    RawInt16Vector3:
+      type: object
+      additionalProperties: false
+      required: [x, y, z]
+      properties:
+        x: {type: integer, minimum: -32768, maximum: 32767}
+        y: {type: integer, minimum: -32768, maximum: 32767}
+        z: {type: integer, minimum: -32768, maximum: 32767}
+    CameraFocusStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, value, minimum, maximum, step, default, auto_supported, auto_enabled]
+      properties:
+        schema:
+          const: ylx.camera-focus.v1
+        value:
+          type: integer
+          minimum: 0
+          description: Current V4L2 focus_absolute value
+        minimum:
+          type: integer
+          minimum: 0
+          description: Minimum accepted focus_absolute value reported by the device
+        maximum:
+          type: integer
+          minimum: 0
+          description: Maximum accepted focus_absolute value reported by the device
+        step:
+          type: integer
+          minimum: 1
+          description: V4L2 focus_absolute increment
+        default:
+          type: integer
+          minimum: 0
+          description: Device-reported default focus_absolute value
+        auto_supported:
+          type: boolean
+          description: Whether V4L2 focus_auto is exposed
+        auto_enabled:
+          oneOf:
+            - type: boolean
+            - type: "null"
+          description: Current focus_auto state, or null when focus_auto is not exposed
+    CameraFocusSetRequest:
+      type: object
+      additionalProperties: false
+      required: [schema]
+      anyOf:
+        - required: [value]
+        - required: [auto_enabled]
+      properties:
+        schema:
+          const: ylx.camera-focus-set.v1
+        value:
+          type: integer
+          minimum: 0
+          description: Requested focus_absolute value
+        auto_enabled:
+          type: boolean
+          description: Requested focus_auto state when the device exposes that control
     Vector3:
       type: object
       additionalProperties: false
@@ -1151,7 +1320,7 @@ components:
       required: [schema, authority_epoch, source_revision, snapshot]
       properties:
         schema:
-          const: ylx.capture-status.v2
+          const: ylx.capture-status.v4
         authority_epoch:
           $ref: "#/components/schemas/UuidV4"
           description: Current daemon authority lifetime, copied without gateway substitution
@@ -1171,7 +1340,7 @@ components:
       required: [schema, sse_delivery_id, authority_epoch, source_revision, type, occurred_at, session_id, data]
       properties:
         schema:
-          const: ylx.capture-event.v3
+          const: ylx.capture-event.v4
         sse_delivery_id:
           type: string
           pattern: '^[0-9]+$'
@@ -1254,7 +1423,7 @@ components:
       required: [schema, device_state, active_recording, retained_unsuccessful, runtime]
       properties:
         schema:
-          const: ylx.capture-snapshot-event.v2
+          const: ylx.capture-snapshot-event.v4
         device_state:
           enum: [idle, recording, finalizing, encoding, verifying, blocked]
         active_recording:
@@ -1885,3 +2054,55 @@ components:
                   minimum: 1
                 current_state:
                   enum: [recording, finalizing, encoding, verifying]
+    CameraFocusUnsupportedError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable]
+          properties:
+            code:
+              const: camera_focus_unsupported
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: false
+            details:
+              type: object
+              additionalProperties: true
+    InvalidCameraFocusError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable]
+          properties:
+            code:
+              const: invalid_camera_focus
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: false
+            details:
+              type: object
+              additionalProperties: true

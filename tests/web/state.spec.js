@@ -9,11 +9,11 @@ const authorityEpoch = "4fa85f64-5717-4562-b3fc-2c963f66afa6";
 /** @param {number} sourceRevision @param {string} deviceState */
 function captureStatus(sourceRevision, deviceState) {
   return {
-    schema: "ylx.capture-status.v2",
+    schema: "ylx.capture-status.v4",
     authority_epoch: authorityEpoch,
     source_revision: sourceRevision,
     snapshot: {
-      schema: "ylx.capture-snapshot-event.v2",
+      schema: "ylx.capture-snapshot-event.v4",
       device_state: deviceState,
       active_recording: null,
       retained_unsuccessful: null,

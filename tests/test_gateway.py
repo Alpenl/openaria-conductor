@@ -110,6 +110,9 @@ DEVICE_V3 = {
     },
 }
 
+SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
+NEXT_SESSION_ID = "01989f6a-2c02-7c3d-ae4f-5061728394a5"
+
 CAPTURE_STATUS = {
     "schema": "ylx.capture-status.v2",
     "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
@@ -121,6 +124,89 @@ CAPTURE_STATUS = {
         "retained_unsuccessful": None,
         "runtime": deepcopy(DEVICE_V3["runtime"]),
     },
+}
+
+
+def _active_capture_status(session_id: str = SESSION_ID) -> dict[str, object]:
+    status = deepcopy(CAPTURE_STATUS)
+    snapshot = status["snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["device_state"] = "recording"
+    snapshot["active_recording"] = {
+        "generation_id": "7d516b70-d8ab-47d1-b2dc-5b1250138789",
+        "recording_state": {
+            "schema": "ylx.recording-state.v1",
+            "state": "recording",
+            "authority_epoch": status["authority_epoch"],
+            "state_revision": status["source_revision"],
+            "updated_at": "2026-08-08T10:24:16+08:00",
+            "session_id": session_id,
+            "take_id": "01989f69-f000-7c3d-ae4f-5061728394a5",
+            "display_name": "active live imu relation",
+            "device": deepcopy(DEVICE_V3["device"]),
+            "storage": {
+                "volume_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+                "status": "mounted",
+                "writable": True,
+                "remaining_bytes": 1024,
+            },
+            "progress": {
+                "elapsed_seconds": 1.5,
+                "captured_frames": 45,
+                "bytes_written": 4096,
+            },
+            "diagnostics": [],
+        },
+    }
+    return status
+
+
+def _runtime_for_api(runtime: dict[str, object], api_version: str) -> dict[str, object]:
+    projected = deepcopy(runtime)
+    if api_version in {"v2", "v3"}:
+        projected["live_imu"] = None
+        projected.pop("camera_focus", None)
+    return projected
+
+
+def _device_for_api(api_version: str) -> dict[str, object]:
+    device = deepcopy(DEVICE_V3)
+    device["schema"] = f"ylx.device.{api_version}"
+    device["api_version"] = f"{api_version.removeprefix('v')}.0"
+    device["runtime"] = _runtime_for_api(device["runtime"], api_version)
+    return device
+
+
+def _capture_status_for_api(
+    api_version: str,
+    status: dict[str, object] | None = None,
+) -> dict[str, object]:
+    projected = deepcopy(CAPTURE_STATUS if status is None else status)
+    projected["schema"] = (
+        "ylx.capture-status.v2" if api_version in {"v2", "v3"} else "ylx.capture-status.v4"
+    )
+    snapshot = projected["snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["schema"] = (
+        "ylx.capture-snapshot-event.v2"
+        if api_version in {"v2", "v3"}
+        else "ylx.capture-snapshot-event.v4"
+    )
+    runtime = snapshot["runtime"]
+    assert isinstance(runtime, dict)
+    snapshot["runtime"] = _runtime_for_api(runtime, api_version)
+    return projected
+
+
+RAW_LIVE_IMU = {
+    "session_id": SESSION_ID,
+    "clock": {"time_base": "host_monotonic", "timestamp_ns": 10_091},
+    "raw": {
+        "units": "raw_int16",
+        "accelerometer": {"x": 1, "y": 2, "z": 3},
+        "gyroscope": {"x": 4, "y": 5, "z": 6},
+    },
+    "sync": {"quality": "good"},
 }
 
 CAMERA_FOCUS_STATUS = {
@@ -148,7 +234,6 @@ SESSION_LIST = {
     "next_cursor": None,
 }
 
-SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
 MANIFEST_BYTES = b'{ "schema": "ylx.device-session.v1", "sealed": true }\n'
 MANIFEST_DIGEST = hashlib.sha256(MANIFEST_BYTES).hexdigest()
 RETAINED_OUTCOME = {
@@ -273,7 +358,10 @@ class DeviceProvider:
         self.safe_swap: object | None = deepcopy(SAFE_SWAP_V3)
         self.status: object = deepcopy(CAPTURE_STATUS)
         self.focus: object | None = None
+        self.live_imu: object | None = None
         self.stop_status = 204
+        self.device_schema_override: str | None = None
+        self.device_extra: dict[str, object] = {}
 
     def device_descriptor(self, api_version: str, security_profile: str) -> dict[str, object]:
         descriptor = deepcopy(DEVICE_V3)
@@ -281,6 +369,10 @@ class DeviceProvider:
         descriptor["api_version"] = f"{api_version.removeprefix('v')}.0"
         descriptor["security_profile"] = security_profile
         descriptor["runtime"]["camera_focus"] = deepcopy(self.focus)
+        descriptor["runtime"]["live_imu"] = deepcopy(self.live_imu)
+        if self.device_schema_override is not None:
+            descriptor["schema"] = self.device_schema_override
+        descriptor.update(deepcopy(self.device_extra))
         return descriptor
 
     def capture_status(self) -> object:
@@ -332,7 +424,7 @@ class DeviceProvider:
         return deepcopy(SESSION_LIST)
 
     def open_manifest(self, session_id: str, api_version: str) -> MemoryRepresentation:
-        if api_version not in {"v2", "v3"}:
+        if api_version not in {"v2", "v3", "v4"}:
             raise AssertionError("gateway 传递了未知 API 版本")
         if session_id != SESSION_ID:
             raise ProviderError("not_found", "会话不存在", status=404)
@@ -383,7 +475,12 @@ class GatewayHttpTest(unittest.TestCase):
         )
         denied = Principal("denied", permissions={})
         self.policy = SecurityPolicy.customer(
-            tokens={"reader": reader, "denied": denied},
+            tokens={
+                "reader": reader,
+                "reader-token": reader,
+                "denied": denied,
+                "denied-token": denied,
+            },
             allowed_origins={"http://127.0.0.1:4173"},
             csrf_token="csrf",
         )
@@ -501,7 +598,7 @@ class GatewayHttpTest(unittest.TestCase):
         )
 
         self.assertEqual(status, 202)
-        self.assertEqual(json.loads(payload), CAPTURE_STATUS)
+        self.assertEqual(json.loads(payload), _capture_status_for_api("v3"))
         self.assertIsNone(headers["Access-Control-Allow-Origin"])
 
         status, payload, _ = self.request(
@@ -517,7 +614,7 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(payload, b"")
 
     def test_customer_authenticates_and_authorizes_each_versioned_device_resource(self) -> None:
-        for path in ("/api/v2/device", "/api/v3/device"):
+        for path in ("/api/v2/device", "/api/v3/device", "/api/v4/device"):
             with self.subTest(path=path, credential="missing"):
                 status, payload, headers = self.request(path)
                 self.assertEqual(status, 401)
@@ -539,11 +636,72 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(headers["Cache-Control"], "no-store")
                 version = path.split("/")[2]
-                self.assertEqual(json.loads(payload)["schema"], f"ylx.device.{version}")
+                device = json.loads(payload)
+                self.assertEqual(device["schema"], f"ylx.device.{version}")
+                self.assertEqual(device, _device_for_api(version))
 
-        status, payload, _ = self.request("/api/v4/device", token="reader")
+        status, payload, _ = self.request("/api/v5/device", token="reader-token")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
+
+    def test_raw_live_imu_is_exposed_only_by_v4_device_and_status(self) -> None:
+        status_with_raw = _active_capture_status()
+        status_with_raw["snapshot"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        self.server.provider.status = status_with_raw
+        self.server.provider.live_imu = deepcopy(RAW_LIVE_IMU)
+
+        for version in ("v2", "v3"):
+            with self.subTest(version=version, resource="device"):
+                status, payload, _ = self.request(f"/api/{version}/device", token="reader-token")
+                self.assertEqual(status, 200)
+                device = json.loads(payload)
+                self.assertNotIn("camera_focus", device["runtime"])
+                self.assertIsNone(device["runtime"]["live_imu"])
+                self.assertNotIn(b"raw_int16", payload)
+
+            with self.subTest(version=version, resource="status"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/capture/status", token="reader-token"
+                )
+                self.assertEqual(status, 200)
+                snapshot = json.loads(payload)["snapshot"]
+                self.assertNotIn("camera_focus", snapshot["runtime"])
+                self.assertIsNone(snapshot["runtime"]["live_imu"])
+                self.assertNotIn(b"raw_int16", payload)
+
+        for resource in ("device", "capture/status"):
+            with self.subTest(version="v4", resource=resource):
+                status, payload, _ = self.request(f"/api/v4/{resource}", token="reader-token")
+                self.assertEqual(status, 200)
+                body = json.loads(payload)
+                runtime = body["runtime"] if resource == "device" else body["snapshot"]["runtime"]
+                self.assertEqual(runtime["live_imu"], RAW_LIVE_IMU)
+                self.assertEqual(runtime["live_imu"]["clock"]["time_base"], "host_monotonic")
+
+    def test_v4_capture_status_rejects_live_imu_without_matching_active_session(self) -> None:
+        idle_with_live_imu = deepcopy(CAPTURE_STATUS)
+        idle_with_live_imu["snapshot"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        self.server.provider.status = idle_with_live_imu
+
+        status, payload, _ = self.request("/api/v4/capture/status", token="reader-token")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+        mismatch = _active_capture_status(session_id=NEXT_SESSION_ID)
+        mismatch["snapshot"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        self.server.provider.status = mismatch
+
+        status, payload, _ = self.request("/api/v4/capture/status", token="reader-token")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+        matching = _active_capture_status()
+        matching["snapshot"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
+        self.server.provider.status = matching
+
+        status, payload, _ = self.request("/api/v4/capture/status", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), _capture_status_for_api("v4", matching))
 
     def test_repeated_authorization_headers_fail_closed_regardless_of_order(self) -> None:
         for values in (
@@ -657,10 +815,15 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertNotIn("token", repr(audit))
 
     def test_status_is_exact_and_commands_are_principal_scoped_and_csrf_protected(self) -> None:
-        for version in ("v2", "v3"):
-            status, payload, _ = self.request(f"/api/{version}/capture/status", token="reader")
+        for version in ("v2", "v3", "v4"):
+            status, payload, _ = self.request(
+                f"/api/{version}/capture/status", token="reader-token"
+            )
             self.assertEqual(status, 200)
-            self.assertEqual(payload, json.dumps(CAPTURE_STATUS, separators=(",", ":")).encode())
+            self.assertEqual(
+                payload,
+                json.dumps(_capture_status_for_api(version), separators=(",", ":")).encode(),
+            )
 
         start = {
             "schema": "ylx.capture-start.v2",
@@ -680,7 +843,7 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 202)
         self.assertIsNone(headers["Idempotency-Replayed"])
-        self.assertEqual(json.loads(first), CAPTURE_STATUS)
+        self.assertEqual(json.loads(first), _capture_status_for_api("v3"))
 
         status, repeated, headers = self.request(
             "/api/v3/capture/start",
@@ -723,13 +886,45 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 204)
         self.assertEqual(payload, b"")
 
-    def test_camera_focus_is_v3_only_readable_settable_and_idempotent(self) -> None:
+        status, payload, _ = self.request(
+            "/api/v4/capture/start",
+            token="reader-token",
+            headers={**mutation_headers, "Idempotency-Key": "v4-start"},
+            body=start,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(payload), _capture_status_for_api("v4"))
+
+        status, payload, _ = self.request(
+            "/api/v4/capture/stop",
+            token="reader-token",
+            headers={**mutation_headers, "Idempotency-Key": "v4-stop"},
+            body={"schema": "ylx.capture-stop.v2", "reason": "user"},
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(payload, b"")
+
+    def test_camera_focus_is_v4_only_readable_settable_and_projected_to_runtime(self) -> None:
         self.server.provider.focus = deepcopy(CAMERA_FOCUS_STATUS)
 
-        status, payload, _ = self.request("/api/v2/camera/focus", token="reader")
-        self.assertEqual(status, 404)
+        for version in ("v2", "v3"):
+            with self.subTest(version=version, operation="read"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/camera/focus",
+                    token="reader-token",
+                )
+                self.assertEqual(status, 404)
 
-        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
+            with self.subTest(version=version, operation="write"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/camera/focus",
+                    token="reader-token",
+                    headers={"Origin": self.base, "Idempotency-Key": f"{version}-focus"},
+                    body={"schema": "ylx.camera-focus-set.v1", "value": 64},
+                )
+                self.assertEqual(status, 404)
+
+        status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), CAMERA_FOCUS_STATUS)
 
@@ -743,8 +938,8 @@ class GatewayHttpTest(unittest.TestCase):
             "auto_enabled": False,
         }
         status, first, response_headers = self.request(
-            "/api/v3/camera/focus",
-            token="reader",
+            "/api/v4/camera/focus",
+            token="reader-token",
             headers=headers,
             body=body,
         )
@@ -754,8 +949,8 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertIsNone(response_headers["Idempotency-Replayed"])
 
         status, repeated, response_headers = self.request(
-            "/api/v3/camera/focus",
-            token="reader",
+            "/api/v4/camera/focus",
+            token="reader-token",
             headers=headers,
             body=body,
         )
@@ -763,13 +958,34 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(repeated, first)
         self.assertEqual(response_headers["Idempotency-Replayed"], "true")
 
-        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
+        status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), updated)
 
+        for version in ("v2", "v3"):
+            with self.subTest(version=version, operation="runtime-redacted"):
+                status, payload, _ = self.request(f"/api/{version}/device", token="reader-token")
+                self.assertEqual(status, 200)
+                self.assertNotIn("camera_focus", json.loads(payload)["runtime"])
+
+                status, payload, _ = self.request(
+                    f"/api/{version}/capture/status",
+                    token="reader-token",
+                )
+                self.assertEqual(status, 200)
+                self.assertNotIn("camera_focus", json.loads(payload)["snapshot"]["runtime"])
+
+        status, payload, _ = self.request("/api/v4/device", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["runtime"]["camera_focus"], updated)
+
+        status, payload, _ = self.request("/api/v4/capture/status", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["snapshot"]["runtime"]["camera_focus"], updated)
+
         status, payload, _ = self.request(
-            "/api/v3/camera/focus",
-            token="reader",
+            "/api/v4/camera/focus",
+            token="reader-token",
             headers=headers,
             body={**body, "value": 65},
         )
@@ -777,13 +993,122 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "idempotency_conflict")
 
         status, payload, _ = self.request(
-            "/api/v3/camera/focus",
-            token="reader",
+            "/api/v4/camera/focus",
+            token="reader-token",
             headers={"Origin": self.base, "Idempotency-Key": "invalid-focus"},
             body={"schema": "ylx.camera-focus-set.v1", "value": True},
         )
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+
+    def test_status_start_stop_and_device_are_major_specific_closed_wire_shapes(self) -> None:
+        start = {
+            "schema": "ylx.capture-start.v2",
+            "mode": "production",
+            "take": {"kind": "new"},
+        }
+        stop = {"schema": "ylx.capture-stop.v2", "reason": "user"}
+        self.server.provider.stop_status = 202
+
+        for version in ("v2", "v3", "v4"):
+            with self.subTest(version=version, resource="device"):
+                status, payload, _ = self.request(f"/api/{version}/device", token="reader-token")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(payload), _device_for_api(version))
+
+            with self.subTest(version=version, resource="status"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/capture/status",
+                    token="reader-token",
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(payload), _capture_status_for_api(version))
+
+            with self.subTest(version=version, resource="start"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/capture/start",
+                    token="reader-token",
+                    headers={
+                        "Origin": self.base,
+                        "Idempotency-Key": f"major-start-{version}",
+                    },
+                    body=start,
+                )
+                self.assertEqual(status, 202)
+                self.assertEqual(json.loads(payload), _capture_status_for_api(version))
+
+            with self.subTest(version=version, resource="stop"):
+                status, payload, _ = self.request(
+                    f"/api/{version}/capture/stop",
+                    token="reader-token",
+                    headers={
+                        "Origin": self.base,
+                        "Idempotency-Key": f"major-stop-{version}",
+                    },
+                    body=stop,
+                )
+                self.assertEqual(status, 202)
+                self.assertEqual(json.loads(payload), _capture_status_for_api(version))
+
+    def test_major_http_validators_reject_extra_properties_and_bad_consts(self) -> None:
+        start = {
+            "schema": "ylx.capture-start.v2",
+            "mode": "production",
+            "take": {"kind": "new"},
+        }
+        stop = {"schema": "ylx.capture-stop.v2", "reason": "user"}
+        self.server.provider.stop_status = 202
+        status_mutations = {
+            "status-extra": lambda status: status["snapshot"]["runtime"].update(
+                {"unexpected": "forbidden"}
+            ),
+            "status-const": lambda status: status.update({"schema": "ylx.capture-status.v5"}),
+            "snapshot-const": lambda status: status["snapshot"].update(
+                {"schema": "ylx.capture-snapshot-event.v5"}
+            ),
+        }
+
+        for version in ("v2", "v3", "v4"):
+            with self.subTest(version=version, mutation="device-extra"):
+                self.server.provider.device_extra = {"unexpected": "forbidden"}
+                status, payload, _ = self.request(f"/api/{version}/device", token="reader-token")
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+                self.server.provider.device_extra = {}
+
+            with self.subTest(version=version, mutation="device-const"):
+                self.server.provider.device_schema_override = "ylx.device.v5"
+                status, payload, _ = self.request(f"/api/{version}/device", token="reader-token")
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+                self.server.provider.device_schema_override = None
+
+            for mutation, mutate in status_mutations.items():
+                malformed = deepcopy(CAPTURE_STATUS)
+                mutate(malformed)
+                self.server.provider.status = malformed
+                for resource, path, body in (
+                    ("status", f"/api/{version}/capture/status", None),
+                    ("start", f"/api/{version}/capture/start", start),
+                    ("stop", f"/api/{version}/capture/stop", stop),
+                ):
+                    with self.subTest(version=version, mutation=mutation, resource=resource):
+                        status, payload, _ = self.request(
+                            path,
+                            token="reader-token",
+                            headers={
+                                "Origin": self.base,
+                                "Idempotency-Key": f"bad-{mutation}-{resource}-{version}",
+                            },
+                            body=body,
+                        )
+                        self.assertEqual(status, 500)
+                        self.assertEqual(
+                            json.loads(payload)["error"]["code"],
+                            "invalid_source_state",
+                        )
+
+        self.server.provider.status = deepcopy(CAPTURE_STATUS)
 
     def test_invalid_provider_capture_status_fails_closed_for_reads_and_commands(self) -> None:
         self.server.provider.status = {"schema": "ylx.capture-status.v2"}
@@ -825,13 +1150,12 @@ class GatewayHttpTest(unittest.TestCase):
     def test_invalid_provider_camera_focus_fails_closed(self) -> None:
         self.server.provider.focus = {"schema": "ylx.camera-focus.v1"}
 
-        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
-        self.assertEqual(status, 500)
-        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+        status, payload, _ = self.request("/api/v3/camera/focus", token="reader-token")
+        self.assertEqual(status, 404)
 
         status, payload, _ = self.request(
-            "/api/v3/camera/focus",
-            token="reader",
+            "/api/v4/camera/focus",
+            token="reader-token",
             headers={"Origin": self.base, "Idempotency-Key": "bad-provider-focus"},
             body={"schema": "ylx.camera-focus-set.v1", "value": 44},
         )
@@ -873,6 +1197,11 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload), SAFE_SWAP_V3)
         self.assertNotIn("handle_audit", json.loads(payload)["receipt"])
 
+        status, payload, _ = self.request("/api/v4/capture/safe-swap", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), SAFE_SWAP_V3)
+        self.assertNotIn("handle_audit", json.loads(payload)["receipt"])
+
         for mutation in ("wrapper_extra", "receipt_extra", "boolean_handle_count"):
             with self.subTest(mutation=mutation):
                 malformed = deepcopy(SAFE_SWAP_V3)
@@ -893,6 +1222,10 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload), SAFE_SWAP_V2)
 
         status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
+
+        status, payload, _ = self.request("/api/v4/capture/safe-swap", token="reader-token")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
@@ -945,7 +1278,7 @@ class GatewayHttpTest(unittest.TestCase):
                 {"authorization"},
             ),
             (
-                "/api/v3/camera/focus",
+                "/api/v4/camera/focus",
                 "POST",
                 "authorization, content-type, idempotency-key, x-csrf-token",
                 {"authorization", "content-type", "idempotency-key", "x-csrf-token"},

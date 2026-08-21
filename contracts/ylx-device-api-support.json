@@ -1,0 +1,35 @@
+{
+  "schema": "ylx.device-api-consumer-support.v1",
+  "consumer": "openaria-conductor",
+  "supported_device_api_majors": [2, 3, 4],
+  "unknown_major_policy": "fail_closed",
+  "required_contracts": [
+    {
+      "major": 2,
+      "path": "openapi/ylx-device-v2.openapi.yaml",
+      "sha256": "274216d7f140b296dacf70fb669e37eb7be2ccf48f51e9d354a5245e01e05599",
+      "bytes": 67834,
+      "info_version": "2.0.0",
+      "server_base_path": "/api/v2",
+      "lifecycle": "frozen_compat"
+    },
+    {
+      "major": 3,
+      "path": "openapi/ylx-device-v3.openapi.yaml",
+      "sha256": "72b70dd6d9ab87e70abc0bf4af519435435bba05a33d512d4c394f25b1ef4297",
+      "bytes": 68520,
+      "info_version": "3.0.0",
+      "server_base_path": "/api/v3",
+      "lifecycle": "frozen_compat"
+    },
+    {
+      "major": 4,
+      "path": "openapi/ylx-device-v4.openapi.yaml",
+      "sha256": "6740c9875ee6dcf1564062b3b7e63d995d4c01cdd1e3fadcc49bd54b13ffc899",
+      "bytes": 75767,
+      "info_version": "4.0.0",
+      "server_base_path": "/api/v4",
+      "lifecycle": "current"
+    }
+  ]
+}

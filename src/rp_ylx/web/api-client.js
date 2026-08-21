@@ -1,6 +1,6 @@
 // @ts-check
 
-const API_ROOT = "/api/v3";
+const API_ROOT = "/api/v4";
 const TOKEN_KEY = "rp-ylx-access-token";
 
 export class DeviceApiError extends Error {

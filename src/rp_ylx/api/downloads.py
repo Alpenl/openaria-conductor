@@ -954,8 +954,8 @@ def _read_exact_file(descriptor: int, identity: _FileIdentity) -> bytes:
 
 
 def _validated_manifest(payload: bytes, session_id: str, api_version: str) -> Mapping[str, object]:
-    if api_version not in {"v2", "v3"}:
-        raise ValueError("api_version 必须是 v2 或 v3")
+    if api_version not in {"v2", "v3", "v4"}:
+        raise ValueError("api_version 必须是 v2、v3 或 v4")
     manifest_sha256 = hashlib.sha256(payload).hexdigest()
     cache_key = (api_version, session_id, manifest_sha256)
     with _VALIDATED_MANIFEST_CACHE_LOCK:

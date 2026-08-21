@@ -108,7 +108,7 @@ class GatewayPreviewHttpTest(unittest.TestCase):
         return connection, connection.getresponse()
 
     def test_each_version_returns_the_exact_latest_jpeg_and_closes(self) -> None:
-        for version in ("v2", "v3"):
+        for version in ("v2", "v3", "v4"):
             with self.subTest(version=version):
                 status, payload, headers = self.request(
                     f"/api/{version}/preview", headers={"Accept": "image/jpeg"}

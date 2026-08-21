@@ -126,7 +126,7 @@ class _MemoryProvider:
         self, session_id: str, artifact_id: str, api_version: str
     ) -> _MemoryArtifact:
         self.open_count += 1
-        if api_version not in {"v2", "v3"}:
+        if api_version not in {"v2", "v3", "v4"}:
             raise AssertionError("gateway 传递了未知 API 版本")
         if self.access_error is not None:
             raise self.access_error
@@ -314,7 +314,7 @@ class SessionDownloadHttpTest(unittest.TestCase):
             return error.code, error.read(), error.headers
 
     def test_authorized_get_returns_complete_immutable_artifact(self) -> None:
-        for api_version in ("v2", "v3"):
+        for api_version in ("v2", "v3", "v4"):
             with self.subTest(api_version=api_version):
                 status, payload, headers = self.request(
                     f"/api/{api_version}/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
@@ -683,20 +683,23 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         return payload
 
     def test_directory_store_serves_exact_manifest_and_verified_artifact(self) -> None:
-        status, payload, headers = self.request(f"/api/v3/sessions/{SESSION_ID}")
+        for api_version in ("v3", "v4"):
+            with self.subTest(api_version=api_version, resource="manifest"):
+                status, payload, headers = self.request(f"/api/{api_version}/sessions/{SESSION_ID}")
 
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, self.manifest_bytes)
-        self.assertEqual(headers["ETag"], f'"{self.manifest_sha256}"')
-        self.assertEqual(headers["YLX-Manifest-SHA256"], self.manifest_sha256)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload, self.manifest_bytes)
+                self.assertEqual(headers["ETag"], f'"{self.manifest_sha256}"')
+                self.assertEqual(headers["YLX-Manifest-SHA256"], self.manifest_sha256)
 
-        status, payload, headers = self.request(
-            f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, ARTIFACT_BYTES)
-        self.assertEqual(headers["Content-Type"], "video/mp4")
-        self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
+            with self.subTest(api_version=api_version, resource="artifact"):
+                status, payload, headers = self.request(
+                    f"/api/{api_version}/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload, ARTIFACT_BYTES)
+                self.assertEqual(headers["Content-Type"], "video/mp4")
+                self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
 
     def test_directory_store_prefers_native_v1_artifact_descriptors(self) -> None:
         native = _NativeArtifacts(
