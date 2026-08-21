@@ -335,6 +335,11 @@ impl NativeAudioRecorder {
             .map_err(audio_error)
     }
 
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let snapshot = self.recorder.snapshot();
+        audio_snapshot_dict(py, &snapshot)
+    }
+
     #[pyo3(signature = (timeout_seconds=5.0))]
     fn stop(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<Py<PyDict>> {
         if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
@@ -1006,6 +1011,18 @@ impl NativeRecordingSink {
                 )
             })?;
             sink.flush_and_close().map_err(recording_error)?
+        };
+        recording_sink_snapshot_dict(py, &snapshot)
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let snapshot = {
+            let sink = self.sink.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "native_recording_poisoned: recording sink mutex is poisoned",
+                )
+            })?;
+            sink.snapshot()
         };
         recording_sink_snapshot_dict(py, &snapshot)
     }
@@ -2489,6 +2506,17 @@ fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> Py
         segments.append(item)?;
     }
     value.set_item("segments", segments)?;
+    Ok(value.unbind())
+}
+
+fn audio_snapshot_dict(
+    py: Python<'_>,
+    snapshot: &audio::AudioRecordingSnapshot,
+) -> PyResult<Py<PyDict>> {
+    let value = PyDict::new(py);
+    value.set_item("sample_count", snapshot.sample_count)?;
+    value.set_item("bytes_written", snapshot.bytes_written)?;
+    value.set_item("segment_count", snapshot.segment_count)?;
     Ok(value.unbind())
 }
 

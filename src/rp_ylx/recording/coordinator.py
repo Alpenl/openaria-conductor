@@ -45,6 +45,7 @@ from rp_ylx.runtime import collect_linux_runtime
 VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
+LIVE_IMU_STALE_SECONDS = 2.0
 
 
 class _Representation(Protocol):
@@ -128,6 +129,14 @@ class CoordinatorConfig:
             or self.checkpoint_interval < 0
         ):
             raise ValueError("录制协调器配置无效")
+
+
+@dataclass(frozen=True, slots=True)
+class _LatestImuReceipt:
+    session_id: str
+    sample: ImuSample
+    sample_key: tuple[int, int, int, int, int]
+    received_at_monotonic: float
 
 
 def initialize_capture_volume(mountpoint: str | Path, *, volume_id: str | None = None) -> str:
@@ -362,7 +371,7 @@ class CaptureCoordinator:
         self._active_plan: SessionPlan | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
-        self._latest_imu: tuple[str, ImuSample] | None = None
+        self._latest_imu: _LatestImuReceipt | None = None
         self._open_representations = 0
         self._released = False
         self._media_lost = False
@@ -786,32 +795,71 @@ class CaptureCoordinator:
             "sync": {"quality": sample.sync_quality},
         }
 
+    @staticmethod
+    def _imu_sample_key(sample: ImuSample) -> tuple[int, int, int, int, int]:
+        return (
+            sample.sequence,
+            sample.packet_sequence,
+            sample.sample_index,
+            sample.device_timestamp_raw,
+            sample.host_monotonic_ns,
+        )
+
+    @staticmethod
+    def _fresh_live_imu(
+        receipt: _LatestImuReceipt | None,
+        session_id: str,
+        observed_at_monotonic: float,
+    ) -> tuple[str, ImuSample] | None:
+        if receipt is None or receipt.session_id != session_id:
+            return None
+        if observed_at_monotonic - receipt.received_at_monotonic > LIVE_IMU_STALE_SECONDS:
+            return None
+        return receipt.session_id, receipt.sample
+
+    def _store_latest_imu_locked(
+        self,
+        session_id: str,
+        sample: ImuSample,
+        *,
+        observed_at_monotonic: float,
+    ) -> _LatestImuReceipt:
+        key = self._imu_sample_key(sample)
+        cached = self._latest_imu
+        if cached is not None and cached.session_id == session_id and cached.sample_key == key:
+            return cached
+        receipt = _LatestImuReceipt(session_id, sample, key, observed_at_monotonic)
+        self._latest_imu = receipt
+        return receipt
+
     def _latest_imu_sample(self) -> tuple[str, ImuSample] | None:
         with self._lock:
             plan = self._active_plan
             if self._active is None or plan is None:
                 return None
-            cached = self._latest_imu
-            if cached is not None and cached[0] == plan.session_id:
-                return cached
             session_id = plan.session_id
             sources = self._sources
+        observed_at = time.monotonic()
         latest = getattr(sources, "latest_imu_observation", None)
         if not callable(latest):
-            return None
+            with self._lock:
+                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
         try:
             observation = latest()
         except BaseException:
-            return None
-        if observation is None:
-            return None
-        if not observation.samples:
-            return None
+            observation = None
+        if observation is None or not observation.samples:
+            with self._lock:
+                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
         sample = observation.samples[-1]
         with self._lock:
             if self._active_plan is not None and self._active_plan.session_id == session_id:
-                self._latest_imu = (session_id, sample)
-                return self._latest_imu
+                receipt = self._store_latest_imu_locked(
+                    session_id,
+                    sample,
+                    observed_at_monotonic=observed_at,
+                )
+                return self._fresh_live_imu(receipt, session_id, observed_at)
         return None
 
     def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
@@ -1438,7 +1486,11 @@ class CaptureCoordinator:
                 self._check_generation(generation_id or self._active_plan.generation_id)
                 accepted = self._active.submit_imu(observation)
                 if accepted:
-                    self._latest_imu = (self._active_plan.session_id, observation.samples[-1])
+                    self._store_latest_imu_locked(
+                        self._active_plan.session_id,
+                        observation.samples[-1],
+                        observed_at_monotonic=time.monotonic(),
+                    )
                 return accepted
             except DeviceRecordingError as error:
                 if error.code == "stale_generation" or not retain_failure:

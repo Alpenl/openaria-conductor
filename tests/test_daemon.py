@@ -322,6 +322,93 @@ class ProductionDaemonTest(unittest.TestCase):
         finally:
             pump.close()
 
+    def test_event_pump_default_polling_is_not_faster_than_progress_throttle(self) -> None:
+        source = {"authority_epoch": str(uuid.uuid4()), "source_revision": 1}
+        coordinator = Mock(capture_snapshot_event=lambda: dict(source))
+        event_buffer = Mock()
+        pump = CaptureEventPump(coordinator, event_buffer)
+        try:
+            self.assertEqual(pump._interval, 1.0)
+            self.assertEqual(pump._progress_interval, 1.0)
+        finally:
+            pump.close()
+
+    def test_event_pump_publishes_same_revision_recording_progress(self) -> None:
+        source = {
+            "authority_epoch": str(uuid.uuid4()),
+            "source_revision": 7,
+            "type": "snapshot",
+            "occurred_at": "2026-08-21T02:25:01Z",
+            "session_id": "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
+            "data": {
+                "schema": "ylx.capture-snapshot-event.v2",
+                "device_state": "recording",
+                "active_recording": {
+                    "generation_id": str(uuid.uuid4()),
+                    "recording_state": {
+                        "schema": "ylx.recording-state.v1",
+                        "state": "recording",
+                        "authority_epoch": None,
+                        "state_revision": 7,
+                        "updated_at": "2026-08-21T02:25:01Z",
+                        "session_id": "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
+                        "take_id": "01989f6a-2c00-7a1b-8c2d-3e4f50617284",
+                        "display_name": "live projection",
+                        "device": {
+                            "device_id": str(uuid.uuid4()),
+                            "device_label": "YLX-12AB34CD",
+                        },
+                        "storage": {
+                            "volume_id": str(uuid.uuid4()),
+                            "status": "mounted",
+                            "writable": True,
+                            "remaining_bytes": 1024,
+                        },
+                        "progress": {
+                            "elapsed_seconds": 0.0,
+                            "captured_frames": 0,
+                            "bytes_written": 0,
+                        },
+                        "diagnostics": [],
+                    },
+                },
+                "retained_unsuccessful": None,
+                "runtime": {},
+            },
+        }
+        source["data"]["active_recording"]["recording_state"]["authority_epoch"] = source[
+            "authority_epoch"
+        ]
+
+        def snapshot_event() -> dict[str, object]:
+            return dict(source)
+
+        coordinator = Mock(capture_snapshot_event=snapshot_event)
+        event_buffer = Mock()
+        pump = CaptureEventPump(
+            coordinator,
+            event_buffer,
+            interval=0.01,
+            progress_interval=0.02,
+        )
+        try:
+            progress = source["data"]["active_recording"]["recording_state"]["progress"]
+            progress["elapsed_seconds"] = 1.0
+            progress["captured_frames"] = 60
+            progress["bytes_written"] = 4096
+            deadline = time.monotonic() + 1.0
+            while event_buffer.publish.call_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(event_buffer.publish.call_count, 1)
+            event = event_buffer.publish.call_args.args[0]
+            self.assertEqual(event["type"], "progress")
+            self.assertEqual(event["source_revision"], 7)
+            self.assertEqual(event["session_id"], source["session_id"])
+            self.assertEqual(event["data"]["phase"], "recording")
+            self.assertEqual(event["data"]["completed_units"], 60)
+        finally:
+            pump.close()
+
     def test_source_checkout_cannot_start_production_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))

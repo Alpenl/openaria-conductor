@@ -19,6 +19,7 @@ from rp_ylx.api.security import Principal, SecurityPolicy
 AUTHORITY_EPOCH = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
 NEXT_AUTHORITY_EPOCH = "123e4567-e89b-42d3-a456-426614174000"
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
+NEXT_SESSION_ID = "01989f6a-2c02-7c3d-ae4f-5061728394a5"
 
 SNAPSHOT_SOURCE_EVENT = {
     "authority_epoch": AUTHORITY_EPOCH,
@@ -401,6 +402,83 @@ class GatewayEventHttpTest(unittest.TestCase):
                 **epoch_snapshot,
             },
         )
+
+    def test_same_revision_progress_is_live_and_replayed_without_resync(self) -> None:
+        recording_state = deepcopy(RECORDING_STATE)
+        recording_state["state_revision"] = 7
+        snapshot = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        snapshot["source_revision"] = 7
+        snapshot["session_id"] = SESSION_ID
+        snapshot["data"]["device_state"] = "recording"
+        snapshot["data"]["active_recording"] = {
+            "generation_id": "7d516b70-d8ab-47d1-b2dc-5b1250138789",
+            "recording_state": recording_state,
+        }
+        progress = deepcopy(PROGRESS_SOURCE_EVENT)
+        progress["source_revision"] = 7
+        self.provider.snapshot_event = snapshot
+
+        with self.subTest("reconnect"):
+            _, initial_payload, _ = self.request_events("v3")
+            initial_id = str(parse_sse(initial_payload)[0]["id"])
+            self.event_buffer.publish(progress)
+
+            status, payload, _ = self.request_events(
+                "v3",
+                last_event_id=initial_id,
+                expected_blocks=1,
+            )
+            events = parse_sse(payload)
+
+            self.assertEqual(status, 200)
+            self.assertEqual(events[0]["event"], "progress")
+            self.assertEqual(events[0]["data"]["source_revision"], 7)
+
+        with self.subTest("live"):
+            request = Request(
+                f"{self.base}/api/v3/capture/events",
+                headers={"Authorization": "Bearer reader-token"},
+            )
+            with urlopen(request, timeout=2) as response:
+                initial = read_next_sse_event(response)
+                self.assertEqual(initial["event"], "snapshot")
+                self.event_buffer.publish(progress)
+                published = read_next_sse_event(response)
+
+            self.assertEqual(published["event"], "progress")
+            self.assertEqual(published["data"]["source_revision"], 7)
+
+    def test_same_revision_progress_for_different_session_resynchronizes(self) -> None:
+        recording_state = deepcopy(RECORDING_STATE)
+        recording_state["state_revision"] = 7
+        snapshot = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        snapshot["source_revision"] = 7
+        snapshot["session_id"] = SESSION_ID
+        snapshot["data"]["device_state"] = "recording"
+        snapshot["data"]["active_recording"] = {
+            "generation_id": "7d516b70-d8ab-47d1-b2dc-5b1250138789",
+            "recording_state": recording_state,
+        }
+        progress = deepcopy(PROGRESS_SOURCE_EVENT)
+        progress["source_revision"] = 7
+        progress["session_id"] = NEXT_SESSION_ID
+        self.provider.snapshot_event = snapshot
+
+        _, initial_payload, _ = self.request_events("v3")
+        initial_id = str(parse_sse(initial_payload)[0]["id"])
+        self.event_buffer.publish(progress)
+
+        status, payload, _ = self.request_events(
+            "v3",
+            last_event_id=initial_id,
+            expected_blocks=1,
+        )
+        events = parse_sse(payload)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(events[0]["event"], "snapshot")
+        self.assertEqual(events[0]["data"]["session_id"], SESSION_ID)
+        self.assertEqual(events[0]["data"]["source_revision"], 7)
 
     def test_live_connection_receives_events_published_after_it_opens(self) -> None:
         request = Request(

@@ -862,7 +862,9 @@ class DeviceSessionRecorder:
     @property
     def current_recording_state(self) -> Mapping[str, object] | None:
         with self._lock:
-            return None if self._current_state is None else dict(self._current_state)
+            if self._current_state is None:
+                return None
+            return self._live_recording_state_locked(self._current_state)
 
     def native_raw_sink_targets(
         self,
@@ -977,7 +979,7 @@ class DeviceSessionRecorder:
         progress: dict[str, object] = {
             "elapsed_seconds": self._elapsed(),
             "captured_frames": self._frames_written,
-            "bytes_written": self._bytes_written,
+            "bytes_written": self._project_recording_bytes(self._bytes_written),
         }
         if state == "verifying":
             progress["verification"] = {"completed": 0, "total": 1}
@@ -1020,6 +1022,66 @@ class DeviceSessionRecorder:
         with self._lock:
             self._current_state = document
         self._state_sink(document)
+        return document
+
+    def _live_audio_bytes(self) -> int:
+        recorder = self._audio_recorder
+        live_bytes: int | None = None
+        snapshot = getattr(recorder, "snapshot", None) if recorder is not None else None
+        if callable(snapshot):
+            try:
+                raw_snapshot = snapshot()
+            except BaseException:
+                raw_snapshot = None
+            if isinstance(raw_snapshot, Mapping):
+                with suppress(DeviceRecordingError):
+                    _strict_int(raw_snapshot.get("sample_count"), "audio.snapshot.sample_count")
+                    live_bytes = _strict_int(
+                        raw_snapshot.get("bytes_written"), "audio.snapshot.bytes_written"
+                    )
+        with self._counter_lock:
+            finalized_bytes = self._audio_bytes
+        if live_bytes is None:
+            return finalized_bytes
+        return max(finalized_bytes, live_bytes)
+
+    def _project_recording_bytes(self, base_bytes: int) -> int:
+        with self._counter_lock:
+            segment_bytes = self._segment_bytes
+        return base_bytes + segment_bytes + self._live_audio_bytes()
+
+    def _live_recording_state_locked(self, current: Mapping[str, object]) -> dict[str, object]:
+        document = dict(current)
+        raw_progress = document.get("progress")
+        progress = dict(raw_progress) if isinstance(raw_progress, Mapping) else {}
+        if self._state in {"recording", "finalizing", "verifying"}:
+            progress["elapsed_seconds"] = self._elapsed()
+        progress["bytes_written"] = self._project_recording_bytes(self._bytes_written)
+        if self._native_direct_recording:
+            frames_written: int | None = None
+            bytes_written: int | None = None
+            sink = self._native_recording_sink
+            snapshot = getattr(sink, "snapshot", None) if sink is not None else None
+            if callable(snapshot):
+                try:
+                    sink_snapshot = snapshot()
+                except BaseException:
+                    sink_snapshot = None
+                if isinstance(sink_snapshot, Mapping):
+                    with suppress(DeviceRecordingError):
+                        frames_written = _native_uint(
+                            sink_snapshot.get("frames_written"), "recording_sink.frames_written"
+                        )
+                    with suppress(DeviceRecordingError):
+                        sink_bytes = _native_uint(
+                            sink_snapshot.get("bytes_written"), "recording_sink.bytes_written"
+                        )
+                        bytes_written = self._project_recording_bytes(sink_bytes)
+            if frames_written is not None:
+                progress["captured_frames"] = frames_written
+            if bytes_written is not None:
+                progress["bytes_written"] = bytes_written
+        document["progress"] = progress
         return document
 
     def start(self) -> Path:

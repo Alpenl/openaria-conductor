@@ -451,14 +451,12 @@ function advanceProgress() {
   if (!current) {
     return;
   }
-  fixture.snapshot.source_revision += 1;
   fixture.snapshot.snapshot = {
     ...fixture.snapshot.snapshot,
     active_recording: {
       generation_id: generationId,
       recording_state: {
         ...current,
-        state_revision: fixture.snapshot.source_revision,
         updated_at: "2026-08-12T02:25:13Z",
         progress: {
           elapsed_seconds: 12.4,

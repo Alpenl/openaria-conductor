@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -34,6 +35,7 @@ from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     _finalize_artifact,
     inspect_device_session_directory,
+    manifest_artifact_bytes_total,
     validate_device_session_directory,
 )
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
@@ -156,10 +158,22 @@ class FakeAudioRecorder:
         self.started = False
         self.aborted = False
         self.started_monotonic_ns = 0
+        self.live_sample_count = 0
+        self.live_bytes_written = 0
 
     def start(self) -> None:
         self.started = True
         self.started_monotonic_ns = time.monotonic_ns()
+
+    def advance_live(self, *, sample_count: int, bytes_written: int) -> None:
+        self.live_sample_count = sample_count
+        self.live_bytes_written = bytes_written
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "sample_count": self.live_sample_count,
+            "bytes_written": self.live_bytes_written,
+        }
 
     def stop(self, timeout_seconds: float = 5.0) -> dict[str, object]:
         del timeout_seconds
@@ -377,6 +391,57 @@ class FakeNativeSessionIo:
             "artifact_count": len(artifacts),
             "manifest_bytes": len(manifest),
         }
+
+
+class FakeLiveNativeActiveTake:
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.frames_written = 0
+        self.frame_domain = 0
+
+    def advance(self, frames: int) -> None:
+        self.frames_written = frames
+        self.frame_domain = frames
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "frame_domain": self.frame_domain,
+            "frames_written": self.frames_written,
+            "pending_frames": 0,
+            "drop_events": [],
+        }
+
+    def finish(self) -> dict[str, object]:
+        return self.snapshot()
+
+
+class FakeLiveNativeRecordingSink:
+    def __init__(self) -> None:
+        self.frames_written = 0
+        self.bytes_written = 0
+        self.imu_samples_written = 0
+        self.closed = False
+
+    def advance(self, *, frames: int, bytes_written: int, imu_samples: int = 0) -> None:
+        self.frames_written = frames
+        self.bytes_written = bytes_written
+        self.imu_samples_written = imu_samples
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "frames_written": self.frames_written,
+            "imu_samples_written": self.imu_samples_written,
+            "bytes_written": self.bytes_written,
+            "artifacts": {},
+        }
+
+    def flush_and_close(self) -> dict[str, object]:
+        self.closed = True
+        return self.snapshot()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class SplitEyeRecordingTest(unittest.TestCase):
@@ -666,6 +731,193 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertEqual(manifest["integrity"]["dropped_frames"], 0)
             validate_device_session_manifest(manifest)
             validate_device_session_directory(sealed.path)
+
+    def test_native_direct_sink_live_counters_update_without_new_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = 0
+            active_take: FakeLiveNativeActiveTake | None = None
+            sink = FakeLiveNativeRecordingSink()
+
+            def allocate_revision() -> int:
+                nonlocal revision
+                revision += 1
+                return revision
+
+            def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
+                nonlocal active_take
+                active_take = FakeLiveNativeActiveTake(session_id)
+                return active_take
+
+            config = DeviceSessionConfig(
+                device_id=str(uuid.uuid4()),
+                device_label="YLX-12AB34CD",
+                hardware_fingerprint="sha256:" + "a" * 64,
+                platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+                software_version="0.5.0",
+                commit="b" * 40,
+                width=3840,
+                height=1080,
+                sensor_fps=60.0,
+                frame_decimation=1,
+                video_layout="raw-side-by-side",
+                segment_seconds=self.segment_seconds,
+            )
+            with (
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
+                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_active_take_writer",
+                    side_effect=active_take_factory,
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_sink",
+                    return_value=sink,
+                ),
+            ):
+                recorder = DeviceSessionRecorder(
+                    root,
+                    config,
+                    SessionPlan(
+                        session_id=uuid7(),
+                        volume_id=str(uuid.uuid4()),
+                        generation_id=str(uuid.uuid4()),
+                        capture_mode="production",
+                        display_name="raw direct live fixture",
+                        take_id=uuid7(),
+                        take_sequence=1,
+                        continuation_of=None,
+                    ),
+                    authority_epoch=str(uuid.uuid4()),
+                    allocate_revision=allocate_revision,
+                    storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
+                    checkpoint_interval=0.0,
+                )
+                try:
+                    recorder.start()
+                    targets = recorder.native_raw_sink_targets()
+                    self.assertIsNotNone(targets)
+                    assert active_take is not None
+                    initial = recorder.current_recording_state
+                    assert initial is not None
+                    initial_revision = initial["state_revision"]
+
+                    active_take.advance(5)
+                    sink.advance(frames=5, bytes_written=4096, imu_samples=8)
+
+                    live = recorder.current_recording_state
+                    assert live is not None
+                    self.assertEqual(live["state_revision"], initial_revision)
+                    self.assertEqual(
+                        (
+                            live["progress"]["captured_frames"],
+                            live["progress"]["bytes_written"],
+                        ),
+                        (5, 4096),
+                    )
+                finally:
+                    recorder.fail("test_cleanup", "cleanup", recoverable=False)
+
+    def test_native_direct_live_progress_uses_sink_snapshot_tuple_as_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = 0
+            active_take: FakeLiveNativeActiveTake | None = None
+            sink = FakeLiveNativeRecordingSink()
+
+            def allocate_revision() -> int:
+                nonlocal revision
+                revision += 1
+                return revision
+
+            def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
+                nonlocal active_take
+                active_take = FakeLiveNativeActiveTake(session_id)
+                return active_take
+
+            config = DeviceSessionConfig(
+                device_id=str(uuid.uuid4()),
+                device_label="YLX-12AB34CD",
+                hardware_fingerprint="sha256:" + "a" * 64,
+                platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+                software_version="0.5.0",
+                commit="b" * 40,
+                width=3840,
+                height=1080,
+                sensor_fps=60.0,
+                frame_decimation=1,
+                video_layout="raw-side-by-side",
+                segment_seconds=self.segment_seconds,
+            )
+            with (
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
+                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_active_take_writer",
+                    side_effect=active_take_factory,
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_sink",
+                    return_value=sink,
+                ),
+            ):
+                recorder = DeviceSessionRecorder(
+                    root,
+                    config,
+                    SessionPlan(
+                        session_id=uuid7(),
+                        volume_id=str(uuid.uuid4()),
+                        generation_id=str(uuid.uuid4()),
+                        capture_mode="production",
+                        display_name="raw direct owner fixture",
+                        take_id=uuid7(),
+                        take_sequence=1,
+                        continuation_of=None,
+                    ),
+                    authority_epoch=str(uuid.uuid4()),
+                    allocate_revision=allocate_revision,
+                    storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
+                    checkpoint_interval=0.0,
+                )
+                try:
+                    recorder.start()
+                    self.assertIsNotNone(recorder.native_raw_sink_targets())
+                    assert active_take is not None
+                    initial = recorder.current_recording_state
+                    assert initial is not None
+
+                    active_take.advance(6)
+                    sink.advance(frames=5, bytes_written=4096, imu_samples=8)
+
+                    live = recorder.current_recording_state
+                    assert live is not None
+                    self.assertEqual(live["state_revision"], initial["state_revision"])
+                    self.assertEqual(
+                        (
+                            live["progress"]["captured_frames"],
+                            live["progress"]["bytes_written"],
+                        ),
+                        (5, 4096),
+                    )
+                finally:
+                    recorder.fail("test_cleanup", "cleanup", recoverable=False)
+
+    def test_live_progress_includes_audio_snapshot_bytes_before_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder, _, audios = self.build(root, audio_enabled=True)
+            recorder.start()
+            audios[0].advance_live(sample_count=4_800, bytes_written=47)
+
+            live = recorder.current_recording_state
+
+            assert live is not None
+            self.assertEqual(live["progress"]["bytes_written"], 47)
+            recorder.fail("test_cleanup", "cleanup", recoverable=False)
 
     def test_recorder_uses_native_event_queue_when_available(self) -> None:
         queues: list[FakeNativeEventQueue] = []
@@ -1104,6 +1356,32 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 [item["path"] for item in iter_device_session_v1_artifacts(sealed.manifest)],
             )
             validate_device_session_manifest(sealed.manifest)
+
+    def test_final_progress_bytes_match_manifest_artifact_bytes_including_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder, _, audios = self.build(root, audio_enabled=True)
+            recorder.start()
+            self.feed(recorder, 3)
+            audios[0].advance_live(sample_count=4_800, bytes_written=47)
+            verifying_states: list[dict[str, object]] = []
+
+            sealed = recorder.stop(
+                before_publish=lambda: verifying_states.append(
+                    deepcopy(recorder.current_recording_state)
+                )
+            )
+
+            self.assertEqual(len(verifying_states), 1)
+            final_state = verifying_states[0]
+            self.assertEqual(final_state["state"], "verifying")
+            expected_bytes = manifest_artifact_bytes_total(
+                sealed.manifest,
+                manifest_bytes=sealed.manifest_bytes,
+                session_id=sealed.manifest["session_id"],
+                code="artifact_invalid",
+            )
+            self.assertEqual(final_state["progress"]["bytes_written"], expected_bytes)
 
     def test_audio_failure_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

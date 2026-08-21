@@ -7,10 +7,12 @@ import ipaddress
 import json
 import signal
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -264,23 +266,27 @@ class ProductionService:
 
 
 class CaptureEventPump:
-    """把 coordinator 的持久 source revision 变化发布到有界 SSE 重放缓存。"""
+    """把 coordinator 的持久 revision 与同 revision 录制进度发布到 SSE 重放缓存。"""
 
     def __init__(
         self,
         coordinator: CaptureCoordinator,
         event_buffer: EventReplayBuffer,
         *,
-        interval: float = 0.25,
+        interval: float = 1.0,
+        progress_interval: float = 1.0,
     ) -> None:
-        if interval <= 0:
+        if interval <= 0 or progress_interval <= 0:
             raise ValueError("事件泵 interval 必须大于零")
         self._coordinator = coordinator
         self._event_buffer = event_buffer
         self._interval = interval
+        self._progress_interval = progress_interval
         self._stop = threading.Event()
         initial = coordinator.capture_snapshot_event()
         self._last_source = (initial["authority_epoch"], initial["source_revision"])
+        self._last_progress_key = self._progress_key(initial)
+        self._last_progress_at = 0.0
         self._thread = threading.Thread(
             target=self._run,
             name="rp-ylx-capture-events",
@@ -290,12 +296,96 @@ class CaptureEventPump:
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
+            now = time.monotonic()
             event = self._coordinator.capture_snapshot_event()
             source = (event["authority_epoch"], event["source_revision"])
             if source == self._last_source:
+                progress_event = self._progress_event(event)
+                progress_key = self._progress_key(event)
+                if (
+                    progress_event is not None
+                    and progress_key != self._last_progress_key
+                    and (
+                        self._last_progress_at == 0.0
+                        or now - self._last_progress_at >= self._progress_interval
+                    )
+                ):
+                    self._event_buffer.publish(progress_event)
+                    self._last_progress_key = progress_key
+                    self._last_progress_at = now
                 continue
             self._event_buffer.publish(event)
             self._last_source = source
+            self._last_progress_key = self._progress_key(event)
+            self._last_progress_at = now
+
+    @staticmethod
+    def _active_recording(event: Mapping[str, object]) -> Mapping[str, object] | None:
+        data = event.get("data")
+        if not isinstance(data, Mapping):
+            return None
+        active = data.get("active_recording")
+        return active if isinstance(active, Mapping) else None
+
+    @classmethod
+    def _progress_key(cls, event: Mapping[str, object]) -> tuple[object, ...] | None:
+        active = cls._active_recording(event)
+        if active is None:
+            return None
+        state = active.get("recording_state")
+        if not isinstance(state, Mapping):
+            return None
+        progress = state.get("progress")
+        if not isinstance(progress, Mapping):
+            return None
+        return (
+            event.get("authority_epoch"),
+            event.get("source_revision"),
+            state.get("session_id"),
+            state.get("state"),
+            progress.get("elapsed_seconds"),
+            progress.get("captured_frames"),
+            progress.get("bytes_written"),
+        )
+
+    @classmethod
+    def _progress_event(cls, event: Mapping[str, object]) -> dict[str, object] | None:
+        active = cls._active_recording(event)
+        if active is None:
+            return None
+        state = active.get("recording_state")
+        if not isinstance(state, Mapping):
+            return None
+        phase = state.get("state")
+        if phase not in {"recording", "finalizing", "verifying"}:
+            return None
+        session_id = state.get("session_id")
+        if not isinstance(session_id, str):
+            return None
+        progress = state.get("progress")
+        if not isinstance(progress, Mapping):
+            return None
+        elapsed = progress.get("elapsed_seconds")
+        frames = progress.get("captured_frames")
+        if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
+            return None
+        if type(frames) is not int or frames < 0:
+            return None
+        return {
+            "authority_epoch": event["authority_epoch"],
+            "source_revision": event["source_revision"],
+            "type": "progress",
+            "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "session_id": session_id,
+            "data": {
+                "schema": "ylx.capture-progress-event.v2",
+                "phase": phase,
+                "elapsed_seconds": float(elapsed),
+                "completed_units": frames,
+                "total_units": None,
+                "unit": "frames",
+            },
+        }
 
     def close(self) -> None:
         self._stop.set()
