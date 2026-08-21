@@ -399,11 +399,17 @@ def _source_is_contiguous(events: tuple[_BufferedEvent, ...]) -> bool:
         current_source = current.source_event
         if current.resync:
             continue
-        if current_source.get("authority_epoch") != previous_source.get(
-            "authority_epoch"
-        ) or current_source.get("source_revision") != _next_revision(
-            previous_source.get("source_revision")
+        if current_source.get("authority_epoch") != previous_source.get("authority_epoch"):
+            return False
+        current_revision = current_source.get("source_revision")
+        previous_revision = previous_source.get("source_revision")
+        if (
+            current_source.get("type") == "progress"
+            and current_revision == previous_revision
+            and current_source.get("session_id") == previous_source.get("session_id")
         ):
+            continue
+        if current_revision != _next_revision(previous_revision):
             return False
     return True
 

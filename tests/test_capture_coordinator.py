@@ -179,6 +179,37 @@ class FakeSourcesWithLatestImu(FakeSources):
         return self.observation
 
 
+class FakeSourcesWithSequentialLatestImu(FakeSources):
+    def __init__(self, observations: list[ImuObservation]) -> None:
+        super().__init__()
+        self._observations = observations
+        self._index = 0
+
+    def latest_imu_observation(self) -> ImuObservation:
+        if self._index < len(self._observations):
+            observation = self._observations[self._index]
+            self._index += 1
+            return observation
+        return self._observations[-1]
+
+
+class FakeSourcesWithScriptedLatestImu(FakeSources):
+    def __init__(self, observations: list[ImuObservation | BaseException | None]) -> None:
+        super().__init__()
+        self._observations = observations
+        self._index = 0
+
+    def latest_imu_observation(self) -> ImuObservation | None:
+        if self._index < len(self._observations):
+            observation = self._observations[self._index]
+            self._index += 1
+        else:
+            observation = self._observations[-1]
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+
 class FakeSplitEyeEncoder:
     def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
         del unused
@@ -327,6 +358,31 @@ def imu_observation(
             )
         )
     return ImuObservation((samples[0], samples[1]), dropped_samples=0)
+
+
+def single_imu_observation(
+    *,
+    host_monotonic_ns: int,
+    accelerometer: tuple[int, int, int],
+    gyroscope: tuple[int, int, int],
+    sync_quality: str = "degraded",
+) -> ImuObservation:
+    sample = ImuSample(
+        sequence=host_monotonic_ns,
+        packet_sequence=0,
+        sample_index=0,
+        device_timestamp_raw=host_monotonic_ns,
+        device_ticks=host_monotonic_ns,
+        host_read_start_ns=host_monotonic_ns,
+        host_read_end_ns=host_monotonic_ns,
+        host_monotonic_ns=host_monotonic_ns,
+        accelerometer=RawVector3(*accelerometer),
+        gyroscope=RawVector3(*gyroscope),
+        sync_offset_ns=None,
+        sync_residual_ns=None,
+        sync_quality=sync_quality,
+    )
+    return ImuObservation((sample,), dropped_samples=0)
 
 
 class CaptureCoordinatorTest(unittest.TestCase):
@@ -773,6 +829,157 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertEqual(live_imu["raw"]["gyroscope"], {"x": 7, "y": 8, "z": 9})
             self.assertEqual(live_imu["sync"], {"quality": "degraded"})
+        finally:
+            coordinator.close()
+
+    def test_capture_status_refreshes_native_source_imu_for_same_session_revision(self) -> None:
+        sources = FakeSourcesWithSequentialLatestImu(
+            [
+                single_imu_observation(
+                    host_monotonic_ns=100,
+                    accelerometer=(1, 2, 3),
+                    gyroscope=(4, 5, 6),
+                ),
+                single_imu_observation(
+                    host_monotonic_ns=200,
+                    accelerometer=(7, 8, 9),
+                    gyroscope=(10, 11, 12),
+                ),
+                single_imu_observation(
+                    host_monotonic_ns=300,
+                    accelerometer=(13, 14, 15),
+                    gyroscope=(16, 17, 18),
+                ),
+            ]
+        )
+        coordinator = self.coordinator(sources=sources)
+        try:
+            started = coordinator.start_capture(start_command("sources-fresh-imu"))
+
+            first = started.body
+            validate_capture_status(first)
+            second = coordinator.capture_status()
+            validate_capture_status(second)
+            third = coordinator.capture_status()
+            validate_capture_status(third)
+
+            self.assertEqual(second["source_revision"], first["source_revision"])
+            self.assertEqual(third["source_revision"], first["source_revision"])
+            self.assertEqual(
+                first["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                100,
+            )
+            self.assertEqual(
+                second["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                200,
+            )
+            self.assertEqual(
+                third["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                300,
+            )
+        finally:
+            coordinator.close()
+
+    def test_live_imu_source_miss_reuses_cache_only_within_bounded_freshness(self) -> None:
+        observation = single_imu_observation(
+            host_monotonic_ns=100,
+            accelerometer=(1, 2, 3),
+            gyroscope=(4, 5, 6),
+        )
+        sources = FakeSourcesWithScriptedLatestImu(
+            [
+                observation,
+                None,
+                RuntimeError("temporary native IMU failure"),
+                None,
+            ]
+        )
+        clock = {"now": 1.0}
+
+        def monotonic() -> float:
+            return clock["now"]
+
+        coordinator = self.coordinator(sources=sources)
+        try:
+            with patch("rp_ylx.recording.coordinator.time.monotonic", side_effect=monotonic):
+                coordinator.start_capture(start_command("sources-bounded-imu"))
+
+                clock["now"] = 1.2
+                short_miss = coordinator.capture_status()
+                validate_capture_status(short_miss)
+                self.assertEqual(
+                    short_miss["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                    100,
+                )
+
+                clock["now"] = 1.4
+                short_error = coordinator.capture_status()
+                validate_capture_status(short_error)
+                self.assertEqual(
+                    short_error["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                    100,
+                )
+
+                clock["now"] = 11.0
+                stale = coordinator.capture_status()
+                validate_capture_status(stale)
+                self.assertIsNone(stale["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
+    def test_repeated_live_imu_sample_does_not_refresh_cache_age(self) -> None:
+        observation = single_imu_observation(
+            host_monotonic_ns=100,
+            accelerometer=(1, 2, 3),
+            gyroscope=(4, 5, 6),
+        )
+        sources = FakeSourcesWithScriptedLatestImu([observation, observation, observation])
+        clock = {"now": 20.0}
+
+        def monotonic() -> float:
+            return clock["now"]
+
+        coordinator = self.coordinator(sources=sources)
+        try:
+            with patch("rp_ylx.recording.coordinator.time.monotonic", side_effect=monotonic):
+                coordinator.start_capture(start_command("sources-repeated-imu"))
+
+                clock["now"] = 20.5
+                repeated = coordinator.capture_status()
+                validate_capture_status(repeated)
+                self.assertEqual(
+                    repeated["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                    100,
+                )
+
+                clock["now"] = 30.0
+                stale = coordinator.capture_status()
+                validate_capture_status(stale)
+                self.assertIsNone(stale["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
+    def test_live_imu_cache_is_cleared_between_sessions(self) -> None:
+        first_observation = single_imu_observation(
+            host_monotonic_ns=100,
+            accelerometer=(1, 2, 3),
+            gyroscope=(4, 5, 6),
+        )
+        sources = FakeSourcesWithScriptedLatestImu([first_observation, None])
+        coordinator = self.coordinator(sources=sources)
+        try:
+            first = coordinator.start_capture(start_command("sources-session-one"))
+            validate_capture_status(first.body)
+            self.assertEqual(
+                first.body["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
+                100,
+            )
+            self.assertTrue(coordinator.submit_frame(frame()))
+            coordinator.stop_capture(stop_command("sources-session-one-stop"))
+
+            second = coordinator.start_capture(start_command("sources-session-two"))
+            validate_capture_status(second.body)
+            self.assertIsNone(second.body["snapshot"]["runtime"]["live_imu"])
         finally:
             coordinator.close()
 

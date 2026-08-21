@@ -606,11 +606,14 @@ test("progress 事件触发权威快照刷新并显示录制计数", async ({ pa
   await page.getByLabel("录制名称").fill("进度测试");
   await page.getByRole("button", { name: "开始录制" }).click();
   await expect(page.getByTestId("capture-state")).toHaveText("录制中");
+  const before = await (await request.get("/api/v3/capture/status")).json();
 
   await request.post("/__fixture/progress");
+  const after = await (await request.get("/api/v3/capture/status")).json();
   await expect(page.getByTestId("elapsed-seconds")).toHaveText("12.4 秒");
   await expect(page.getByTestId("captured-frames")).toHaveText("744");
   await expect(page.getByTestId("bytes-written")).toHaveText("42.0 MiB");
+  expect(after.source_revision).toBe(before.source_revision);
 });
 
 test("customer 401 后可输入 Bearer 令牌并连接设备", async ({ page, request }) => {

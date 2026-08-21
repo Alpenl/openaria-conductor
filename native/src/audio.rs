@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,6 +18,7 @@ const SND_PCM_FORMAT_S16_LE: c_int = 2;
 const SAMPLE_FORMAT: &str = "S16_LE";
 const SAMPLE_CODEC: &str = "pcm_s16le";
 const BYTES_PER_SAMPLE: u64 = 2;
+const WAV_HEADER_BYTES: u64 = 44;
 const DEFAULT_PERIOD_FRAMES: u64 = 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
@@ -102,6 +103,39 @@ pub(crate) struct AudioRecordingResult {
     pub(crate) segments: Vec<AudioSegment>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioRecordingSnapshot {
+    pub(crate) sample_count: u64,
+    pub(crate) bytes_written: u64,
+    pub(crate) segment_count: u64,
+}
+
+#[derive(Default)]
+struct AudioProgress {
+    sample_count: AtomicU64,
+    bytes_written: AtomicU64,
+    segment_count: AtomicU64,
+}
+
+impl AudioProgress {
+    fn publish(&self, snapshot: &AudioRecordingSnapshot) {
+        self.sample_count
+            .store(snapshot.sample_count, Ordering::Release);
+        self.bytes_written
+            .store(snapshot.bytes_written, Ordering::Release);
+        self.segment_count
+            .store(snapshot.segment_count, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> AudioRecordingSnapshot {
+        AudioRecordingSnapshot {
+            sample_count: self.sample_count.load(Ordering::Acquire),
+            bytes_written: self.bytes_written.load(Ordering::Acquire),
+            segment_count: self.segment_count.load(Ordering::Acquire),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RecorderConfig {
     session_root: PathBuf,
@@ -115,6 +149,7 @@ pub(crate) struct Recorder {
     config: RecorderConfig,
     lifecycle: Mutex<Lifecycle>,
     stop: Arc<AtomicBool>,
+    progress: Arc<AudioProgress>,
 }
 
 struct Lifecycle {
@@ -167,6 +202,7 @@ impl Recorder {
                 result: None,
             }),
             stop: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AudioProgress::default()),
         })
     }
 
@@ -186,8 +222,9 @@ impl Recorder {
         let (done_tx, done_rx) = mpsc::channel();
         let config = self.config.clone();
         let stop = Arc::clone(&self.stop);
+        let progress = Arc::clone(&self.progress);
         let worker = thread::spawn(move || {
-            let result = start_and_capture(config, stop, ready_tx);
+            let result = start_and_capture(config, stop, progress, ready_tx);
             let _ = done_tx.send(result);
         });
         match ready_rx.recv_timeout(START_TIMEOUT) {
@@ -299,6 +336,10 @@ impl Recorder {
                 ))
             }
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> AudioRecordingSnapshot {
+        self.progress.snapshot()
     }
 
     pub(crate) fn abort(&self) {
@@ -652,6 +693,7 @@ struct SegmentWriter {
     next_index: u64,
     active: Option<ActiveSegment>,
     records: Vec<AudioSegment>,
+    progress: Arc<AudioProgress>,
 }
 
 struct ActiveSegment {
@@ -663,7 +705,15 @@ struct ActiveSegment {
 }
 
 impl SegmentWriter {
+    #[cfg(test)]
     fn new(config: &RecorderConfig) -> Result<Self, AudioError> {
+        Self::with_progress(config, Arc::new(AudioProgress::default()))
+    }
+
+    fn with_progress(
+        config: &RecorderConfig,
+        progress: Arc<AudioProgress>,
+    ) -> Result<Self, AudioError> {
         let segment_frames = (config.sample_rate_hz as f64 * config.segment_seconds).round();
         if !segment_frames.is_finite() || segment_frames < 1.0 || segment_frames > u64::MAX as f64 {
             return Err(AudioError::new(
@@ -681,7 +731,37 @@ impl SegmentWriter {
             next_index: 0,
             active: None,
             records: Vec::new(),
+            progress,
         })
+    }
+
+    fn snapshot(&self) -> AudioRecordingSnapshot {
+        let mut sample_count = 0_u64;
+        let mut bytes_written = 0_u64;
+        let mut segment_count = 0_u64;
+        for record in &self.records {
+            sample_count = sample_count.max(record.end_sample);
+            bytes_written +=
+                WAV_HEADER_BYTES + (record.end_sample - record.start_sample) * self.bytes_per_frame;
+            segment_count += 1;
+        }
+        if let Some(active) = &self.active {
+            if active.data_bytes > 0 {
+                let active_samples = active.data_bytes / self.bytes_per_frame;
+                sample_count = sample_count.max(active.start_sample + active_samples);
+                bytes_written += WAV_HEADER_BYTES + active.data_bytes;
+                segment_count += 1;
+            }
+        }
+        AudioRecordingSnapshot {
+            sample_count,
+            bytes_written,
+            segment_count,
+        }
+    }
+
+    fn publish_snapshot(&self) {
+        self.progress.publish(&self.snapshot());
     }
 
     fn write_frames(
@@ -724,6 +804,7 @@ impl SegmentWriter {
                 self.finish_active()?;
             }
         }
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -785,6 +866,7 @@ impl SegmentWriter {
             start_time_seconds: segment.start_sample as f64 / f64::from(self.sample_rate_hz),
             end_time_seconds: end_sample as f64 / f64::from(self.sample_rate_hz),
         });
+        self.publish_snapshot();
         Ok(())
     }
 }
@@ -792,6 +874,7 @@ impl SegmentWriter {
 fn start_and_capture(
     config: RecorderConfig,
     stop: Arc<AtomicBool>,
+    progress: Arc<AudioProgress>,
     ready: mpsc::SyncSender<Result<(), AudioError>>,
 ) -> Result<AudioRecordingResult, AudioError> {
     let mut pcm = match Pcm::open(&config) {
@@ -801,7 +884,7 @@ fn start_and_capture(
             return Err(error);
         }
     };
-    let mut writer = match SegmentWriter::new(&config) {
+    let mut writer = match SegmentWriter::with_progress(&config, progress) {
         Ok(writer) => writer,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
@@ -964,6 +1047,28 @@ mod tests {
         assert_eq!(records[1].end_sample, 5);
         assert!(root.join("audio/audio_00000.wav").is_file());
         assert!(root.join("audio/audio_00001.wav").is_file());
+    }
+
+    #[test]
+    fn segment_writer_snapshot_counts_active_wav_bytes_without_closing() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root,
+            device: "hw:0,0".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 1.0,
+        };
+        let mut writer = SegmentWriter::new(&config).unwrap();
+        let mut total = 0_u64;
+        let payload = vec![1_u8; 2 * 2 * 2];
+
+        writer.write_frames(&payload, 2, &mut total).unwrap();
+        let snapshot = writer.snapshot();
+
+        assert_eq!(snapshot.sample_count, 2);
+        assert_eq!(snapshot.bytes_written, 44 + 2 * 2 * 2);
+        assert_eq!(snapshot.segment_count, 1);
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

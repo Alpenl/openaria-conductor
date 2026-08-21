@@ -897,6 +897,15 @@ impl RecordingSink {
         })
     }
 
+    pub(crate) fn snapshot(&self) -> RecordingSinkSnapshot {
+        RecordingSinkSnapshot {
+            artifacts: Vec::new(),
+            bytes_written: self.bytes_written,
+            frames_written: self.frames_written,
+            imu_samples_written: self.imu_samples_written,
+        }
+    }
+
     pub(crate) fn close(&mut self) {
         self.frames.close();
         self.imu.close();
@@ -1582,6 +1591,42 @@ mod tests {
             roles,
             vec!["frames.index", "imu.samples", "video.raw-side-by-side"]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recording_sink_snapshot_reports_counters_without_closing() {
+        let root = temp_root("snapshot");
+        let mut sink = RecordingSink::create(&root, "session", true).unwrap();
+        let frame_bytes = sink.write_split_frame_index(7, 99, 1234, 2, 3).unwrap();
+
+        let snapshot = sink.snapshot();
+        assert_eq!(snapshot.frames_written, 1);
+        assert_eq!(snapshot.imu_samples_written, 0);
+        assert_eq!(snapshot.bytes_written, frame_bytes);
+        assert!(snapshot.artifacts.is_empty());
+
+        let imu_bytes = sink
+            .write_imu_sample(
+                1,
+                2,
+                1,
+                1000,
+                2000,
+                10,
+                20,
+                15,
+                (1, -2, 3),
+                (4, 5, -6),
+                None,
+                Some(100),
+                "good",
+            )
+            .unwrap();
+        let final_snapshot = sink.flush_and_close().unwrap();
+        assert_eq!(final_snapshot.frames_written, 1);
+        assert_eq!(final_snapshot.imu_samples_written, 1);
+        assert_eq!(final_snapshot.bytes_written, frame_bytes + imu_bytes);
         fs::remove_dir_all(root).unwrap();
     }
 }
