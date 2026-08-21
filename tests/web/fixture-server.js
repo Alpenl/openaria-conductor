@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 /** @typedef {import("node:http").IncomingMessage} IncomingMessage */
 /** @typedef {import("node:http").ServerResponse} ServerResponse */
 /** @typedef {import("../../src/rp_ylx/web/state.js").CaptureStatus} CaptureStatus */
+/** @typedef {import("../../src/rp_ylx/web/state.js").CameraFocusStatus} CameraFocusStatus */
 /** @typedef {import("../../src/rp_ylx/web/state.js").DeviceDescriptor} DeviceDescriptor */
 /** @typedef {import("../../src/rp_ylx/web/state.js").DeviceRuntime} DeviceRuntime */
 /** @typedef {import("../../src/rp_ylx/web/state.js").SafeSwapReceipt} SafeSwapReceipt */
@@ -75,6 +76,18 @@ const previewJpeg = Buffer.from(
  * @property {ReturnType<typeof captureEvent> | null} staleSafeSwapEvent
  */
 
+/** @returns {CameraFocusStatus} */
+const makeCameraFocusStatus = () => ({
+  schema: "ylx.camera-focus.v1",
+  value: 42,
+  minimum: 0,
+  maximum: 255,
+  step: 1,
+  default: 32,
+  auto_supported: true,
+  auto_enabled: false,
+});
+
 /** @returns {DeviceRuntime} */
 const makeRuntime = () => ({
   observed_at: "2026-08-12T02:25:00Z",
@@ -114,6 +127,7 @@ const makeRuntime = () => ({
     },
     sync: { quality: "good" },
   },
+  camera_focus: makeCameraFocusStatus(),
 });
 
 /** @returns {DeviceDescriptor & Record<string, unknown>} */
@@ -301,6 +315,41 @@ function broadcastEvent(event) {
   for (const response of eventResponses) {
     writeEvent(response, event);
   }
+}
+
+/** @returns {CameraFocusStatus | null} */
+function currentCameraFocus() {
+  return fixture.snapshot.snapshot.runtime.camera_focus ?? fixture.device.runtime.camera_focus;
+}
+
+/** @param {{value?: unknown, auto_enabled?: unknown}} body @returns {CameraFocusStatus | null} */
+function setCameraFocus(body) {
+  const current = currentCameraFocus();
+  if (!current) {
+    return null;
+  }
+  const next = { ...current };
+  if (body.auto_enabled === true) {
+    next.auto_enabled = true;
+  } else if (typeof body.value === "number" && Number.isInteger(body.value)) {
+    next.value = body.value;
+    if (next.auto_supported) {
+      next.auto_enabled = false;
+    }
+  }
+  fixture.device.runtime = {
+    ...fixture.device.runtime,
+    camera_focus: { ...next },
+  };
+  fixture.snapshot.source_revision += 1;
+  fixture.snapshot.snapshot = {
+    ...fixture.snapshot.snapshot,
+    runtime: {
+      ...fixture.snapshot.snapshot.runtime,
+      camera_focus: { ...next },
+    },
+  };
+  return next;
 }
 
 /** @param {IncomingMessage} request @returns {Promise<unknown>} */
@@ -751,6 +800,55 @@ const server = createServer(async (request, response) => {
   if (url.pathname === "/api/v3/capture/status") {
     sendJson(response, 200, fixture.snapshot);
     return;
+  }
+
+  if (url.pathname === "/api/v3/camera/focus") {
+    const current = currentCameraFocus();
+    if (!current) {
+      sendJson(response, 404, {
+        schema: "ylx.api-error.v2",
+        error: {
+          code: "camera_focus_unsupported",
+          message: "当前相机没有可读取的焦距控制",
+          request_id: "ff5dd970-a6db-4872-91da-f28c0cd12b70",
+          retryable: false,
+        },
+      });
+      return;
+    }
+    if (request.method === "GET") {
+      sendJson(response, 200, current);
+      return;
+    }
+    if (request.method === "POST") {
+      const body = /** @type {{schema?: string, value?: unknown, auto_enabled?: unknown}} */ (
+        await readJson(request)
+      );
+      const hasValue = Object.hasOwn(body, "value");
+      const hasAuto = Object.hasOwn(body, "auto_enabled");
+      if (
+        !request.headers["idempotency-key"] ||
+        body.schema !== "ylx.camera-focus-set.v1" ||
+        (!hasValue && !hasAuto) ||
+        (hasValue && (typeof body.value !== "number" || !Number.isInteger(body.value))) ||
+        (hasAuto && typeof body.auto_enabled !== "boolean")
+      ) {
+        sendJson(response, 400, {
+          schema: "ylx.api-error.v2",
+          error: {
+            code: "invalid_camera_focus",
+            message: "焦距请求不符合 v3 契约",
+            request_id: "f347fe47-1556-4c1c-b855-90f3fa9733bd",
+            retryable: false,
+          },
+        });
+        return;
+      }
+      const next = setCameraFocus(body);
+      sendJson(response, 200, next);
+      broadcastSnapshot();
+      return;
+    }
   }
 
   if (url.pathname === "/api/v3/preview") {

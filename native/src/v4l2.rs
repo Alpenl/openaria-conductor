@@ -30,11 +30,32 @@ const QUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 15, 88);
 const DEQUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 17, 88);
 const STREAM_ON: c_ulong = ioc(IOC_WRITE, 18, 4);
 const STREAM_OFF: c_ulong = ioc(IOC_WRITE, 19, 4);
+const GET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 27, 8);
+const SET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 28, 8);
+const QUERY_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 36, 68);
+const CTRL_TYPE_INTEGER: u32 = 1;
+const CTRL_TYPE_BOOLEAN: u32 = 2;
+const CTRL_FLAG_DISABLED: u32 = 0x0000_0001;
+const CTRL_CLASS_CAMERA: u32 = 0x009a_0000;
+const CID_CAMERA_CLASS_BASE: u32 = CTRL_CLASS_CAMERA | 0x900;
+const CID_FOCUS_ABSOLUTE: u32 = CID_CAMERA_CLASS_BASE + 10;
+const CID_FOCUS_AUTO: u32 = CID_CAMERA_CLASS_BASE + 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FocusStatus {
+    pub(crate) value: i32,
+    pub(crate) minimum: i32,
+    pub(crate) maximum: i32,
+    pub(crate) step: i32,
+    pub(crate) default_value: i32,
+    pub(crate) auto_supported: bool,
+    pub(crate) auto_enabled: Option<bool>,
 }
 
 impl CaptureError {
@@ -207,7 +228,110 @@ impl V4l2Io for SystemIo {
     }
 }
 
+struct ControlDevice {
+    io: Arc<dyn V4l2Io>,
+    fd: Option<RawFd>,
+}
+
+impl ControlDevice {
+    fn open(device: &str) -> Result<Self, CaptureError> {
+        let io = Arc::new(SystemIo);
+        let path = CString::new(device).map_err(|_| {
+            CaptureError::new("camera_focus_invalid_device", "device path contains NUL")
+        })?;
+        let fd = io
+            .open(&path)
+            .map_err(|error| CaptureError::io("camera_focus_open_failed", "open", error))?;
+        Ok(Self { io, fd: Some(fd) })
+    }
+
+    fn fd(&self) -> Result<RawFd, CaptureError> {
+        self.fd
+            .ok_or_else(|| CaptureError::new("invalid_state", "V4L2 control device is closed"))
+    }
+
+    fn close(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            let _ = self.io.close(fd);
+        }
+    }
+
+    fn query_control(
+        &self,
+        id: u32,
+        expected_type: u32,
+    ) -> Result<Option<QueryControl>, CaptureError> {
+        let mut payload = [0; 68];
+        write_u32(&mut payload, 0, id);
+        match self.io.ioctl(self.fd()?, QUERY_CONTROL, &mut payload) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::ENOTTY)
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(CaptureError::io(
+                    "camera_focus_query_failed",
+                    "VIDIOC_QUERYCTRL",
+                    error,
+                ));
+            }
+        }
+        let control_type = read_u32(&payload, 4);
+        let flags = read_u32(&payload, 56);
+        if flags & CTRL_FLAG_DISABLED != 0 || control_type != expected_type {
+            return Ok(None);
+        }
+        Ok(Some(QueryControl {
+            minimum: read_i32(&payload, 40),
+            maximum: read_i32(&payload, 44),
+            step: read_i32(&payload, 48).max(1),
+            default_value: read_i32(&payload, 52),
+        }))
+    }
+
+    fn get_control(&self, id: u32) -> Result<i32, CaptureError> {
+        let mut payload = [0; 8];
+        write_u32(&mut payload, 0, id);
+        self.io
+            .ioctl(self.fd()?, GET_CONTROL, &mut payload)
+            .map_err(|error| CaptureError::io("camera_focus_get_failed", "VIDIOC_G_CTRL", error))?;
+        Ok(read_i32(&payload, 4))
+    }
+
+    fn set_control(&self, id: u32, value: i32) -> Result<(), CaptureError> {
+        let mut payload = [0; 8];
+        write_u32(&mut payload, 0, id);
+        write_i32(&mut payload, 4, value);
+        self.io
+            .ioctl(self.fd()?, SET_CONTROL, &mut payload)
+            .map_err(|error| CaptureError::io("camera_focus_set_failed", "VIDIOC_S_CTRL", error))
+    }
+}
+
+impl Drop for ControlDevice {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueryControl {
+    minimum: i32,
+    maximum: i32,
+    step: i32,
+    default_value: i32,
+}
+
 fn write_u32(payload: &mut [u8], offset: usize, value: u32) {
+    payload[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_i32(payload: &mut [u8], offset: usize, value: i32) {
     payload[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
 }
 
@@ -215,8 +339,77 @@ fn read_u32(payload: &[u8], offset: usize) -> u32 {
     u32::from_ne_bytes(payload[offset..offset + 4].try_into().unwrap())
 }
 
+fn read_i32(payload: &[u8], offset: usize) -> i32 {
+    i32::from_ne_bytes(payload[offset..offset + 4].try_into().unwrap())
+}
+
 fn read_i64(payload: &[u8], offset: usize) -> i64 {
     i64::from_ne_bytes(payload[offset..offset + 8].try_into().unwrap())
+}
+
+pub(crate) fn focus_status(device: &str) -> Result<Option<FocusStatus>, CaptureError> {
+    let control = ControlDevice::open(device)?;
+    let Some(focus) = control.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
+        return Ok(None);
+    };
+    let value = control.get_control(CID_FOCUS_ABSOLUTE)?;
+    let auto = control.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
+    let auto_enabled = if auto.is_some() {
+        Some(control.get_control(CID_FOCUS_AUTO)? != 0)
+    } else {
+        None
+    };
+    Ok(Some(FocusStatus {
+        value,
+        minimum: focus.minimum,
+        maximum: focus.maximum,
+        step: focus.step,
+        default_value: focus.default_value,
+        auto_supported: auto.is_some(),
+        auto_enabled,
+    }))
+}
+
+pub(crate) fn set_focus(
+    device: &str,
+    value: Option<i32>,
+    auto_enabled: Option<bool>,
+) -> Result<FocusStatus, CaptureError> {
+    let control = ControlDevice::open(device)?;
+    let Some(focus) = control.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
+        return Err(CaptureError::new(
+            "camera_focus_unsupported",
+            "V4L2 device does not expose focus_absolute",
+        ));
+    };
+    let auto = control.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
+    if let Some(enabled) = auto_enabled {
+        if auto.is_none() {
+            return Err(CaptureError::new(
+                "camera_focus_auto_unsupported",
+                "V4L2 device does not expose focus_auto",
+            ));
+        }
+        control.set_control(CID_FOCUS_AUTO, i32::from(enabled))?;
+    }
+    if let Some(next) = value {
+        if next < focus.minimum || next > focus.maximum || (next - focus.minimum) % focus.step != 0
+        {
+            return Err(CaptureError::new(
+                "invalid_camera_focus",
+                format!(
+                    "focus value must be between {} and {} with step {}",
+                    focus.minimum, focus.maximum, focus.step
+                ),
+            ));
+        }
+        if auto.is_some() && auto_enabled != Some(false) {
+            control.set_control(CID_FOCUS_AUTO, 0)?;
+        }
+        control.set_control(CID_FOCUS_ABSOLUTE, next)?;
+    }
+    focus_status(device)?
+        .ok_or_else(|| CaptureError::new("camera_focus_unsupported", "focus control disappeared"))
 }
 
 fn queue_payload(index: u32) -> [u8; 88] {

@@ -57,6 +57,7 @@ SNAPSHOT_SOURCE_EVENT = {
                 "default_route": "wired",
             },
             "live_imu": None,
+            "camera_focus": None,
         },
     },
 }

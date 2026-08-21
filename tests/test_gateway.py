@@ -72,6 +72,7 @@ DEVICE_V3 = {
             "default_route": "wired",
         },
         "live_imu": None,
+        "camera_focus": None,
     },
 }
 
@@ -86,6 +87,17 @@ CAPTURE_STATUS = {
         "retained_unsuccessful": None,
         "runtime": deepcopy(DEVICE_V3["runtime"]),
     },
+}
+
+CAMERA_FOCUS_STATUS = {
+    "schema": "ylx.camera-focus.v1",
+    "value": 42,
+    "minimum": 0,
+    "maximum": 255,
+    "step": 1,
+    "default": 32,
+    "auto_supported": True,
+    "auto_enabled": False,
 }
 
 SESSION_LIST = {
@@ -226,6 +238,7 @@ class DeviceProvider:
         self.commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
         self.safe_swap: object | None = deepcopy(SAFE_SWAP_V3)
         self.status: object = deepcopy(CAPTURE_STATUS)
+        self.focus: object | None = None
         self.stop_status = 204
 
     def device_descriptor(self, api_version: str, security_profile: str) -> dict[str, object]:
@@ -233,10 +246,18 @@ class DeviceProvider:
         descriptor["schema"] = f"ylx.device.{api_version}"
         descriptor["api_version"] = f"{api_version.removeprefix('v')}.0"
         descriptor["security_profile"] = security_profile
+        descriptor["runtime"]["camera_focus"] = deepcopy(self.focus)
         return descriptor
 
     def capture_status(self) -> object:
-        return deepcopy(self.status)
+        status = deepcopy(self.status)
+        if isinstance(status, dict):
+            snapshot = status.get("snapshot")
+            if isinstance(snapshot, dict):
+                runtime = snapshot.get("runtime")
+                if isinstance(runtime, dict):
+                    runtime["camera_focus"] = deepcopy(self.focus)
+        return status
 
     def start_capture(self, command: CaptureCommand) -> CaptureCommandResult:
         return self._command("start", command, status=202, body=self.status)
@@ -244,6 +265,31 @@ class DeviceProvider:
     def stop_capture(self, command: CaptureCommand) -> CaptureCommandResult:
         body = self.status if self.stop_status == 202 else None
         return self._command("stop", command, status=self.stop_status, body=body)
+
+    def camera_focus_status(self) -> object | None:
+        return deepcopy(self.focus)
+
+    def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
+        if self.focus is None:
+            raise ProviderError(
+                "camera_focus_unsupported",
+                "当前相机没有可读取的焦距控制",
+                status=404,
+            )
+        next_focus = deepcopy(self.focus)
+        if not isinstance(next_focus, dict):
+            return self._command("set_camera_focus", command, status=200, body=next_focus)
+        body = command.body
+        if body.get("auto_enabled") is True:
+            next_focus["auto_enabled"] = True
+        if "value" in body:
+            next_focus["value"] = body["value"]
+            if next_focus.get("auto_supported") is True:
+                next_focus["auto_enabled"] = False
+        result = self._command("set_camera_focus", command, status=200, body=next_focus)
+        if not result.replayed:
+            self.focus = deepcopy(result.body)
+        return result
 
     def list_sessions(
         self, *, cursor: str | None, limit: int, take_id: str | None
@@ -297,6 +343,8 @@ class GatewayHttpTest(unittest.TestCase):
                 "getSession": {SESSION_ID},
                 "getRetainedUnsuccessfulSessionOutcome": {SESSION_ID},
                 "getCurrentSafeSwapReceipt": None,
+                "getCameraFocus": None,
+                "setCameraFocus": None,
             },
         )
         denied = Principal("denied", permissions={})
@@ -630,6 +678,68 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 204)
         self.assertEqual(payload, b"")
 
+    def test_camera_focus_is_v3_only_readable_settable_and_idempotent(self) -> None:
+        self.server.provider.focus = deepcopy(CAMERA_FOCUS_STATUS)
+
+        status, payload, _ = self.request("/api/v2/camera/focus", token="reader")
+        self.assertEqual(status, 404)
+
+        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), CAMERA_FOCUS_STATUS)
+
+        headers = {
+            "Origin": self.base,
+            "Idempotency-Key": "focus-64",
+        }
+        body = {
+            "schema": "ylx.camera-focus-set.v1",
+            "value": 64,
+            "auto_enabled": False,
+        }
+        status, first, response_headers = self.request(
+            "/api/v3/camera/focus",
+            token="reader",
+            headers=headers,
+            body=body,
+        )
+        self.assertEqual(status, 200)
+        updated = {**CAMERA_FOCUS_STATUS, "value": 64, "auto_enabled": False}
+        self.assertEqual(json.loads(first), updated)
+        self.assertIsNone(response_headers["Idempotency-Replayed"])
+
+        status, repeated, response_headers = self.request(
+            "/api/v3/camera/focus",
+            token="reader",
+            headers=headers,
+            body=body,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repeated, first)
+        self.assertEqual(response_headers["Idempotency-Replayed"], "true")
+
+        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), updated)
+
+        status, payload, _ = self.request(
+            "/api/v3/camera/focus",
+            token="reader",
+            headers=headers,
+            body={**body, "value": 65},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload)["error"]["code"], "idempotency_conflict")
+
+        status, payload, _ = self.request(
+            "/api/v3/camera/focus",
+            token="reader",
+            headers={"Origin": self.base, "Idempotency-Key": "invalid-focus"},
+            body={"schema": "ylx.camera-focus-set.v1", "value": True},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+
     def test_invalid_provider_capture_status_fails_closed_for_reads_and_commands(self) -> None:
         self.server.provider.status = {"schema": "ylx.capture-status.v2"}
 
@@ -663,6 +773,22 @@ class GatewayHttpTest(unittest.TestCase):
             token="reader",
             headers={**headers, "Idempotency-Key": "invalid-stop-status"},
             body={"schema": "ylx.capture-stop.v2", "reason": "user"},
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+    def test_invalid_provider_camera_focus_fails_closed(self) -> None:
+        self.server.provider.focus = {"schema": "ylx.camera-focus.v1"}
+
+        status, payload, _ = self.request("/api/v3/camera/focus", token="reader")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+        status, payload, _ = self.request(
+            "/api/v3/camera/focus",
+            token="reader",
+            headers={"Origin": self.base, "Idempotency-Key": "bad-provider-focus"},
+            body={"schema": "ylx.camera-focus-set.v1", "value": 44},
         )
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
@@ -772,6 +898,12 @@ class GatewayHttpTest(unittest.TestCase):
                 "GET",
                 "authorization",
                 {"authorization"},
+            ),
+            (
+                "/api/v3/camera/focus",
+                "POST",
+                "authorization, content-type, idempotency-key, x-csrf-token",
+                {"authorization", "content-type", "idempotency-key", "x-csrf-token"},
             ),
         ):
             with self.subTest(path=path, method=method):

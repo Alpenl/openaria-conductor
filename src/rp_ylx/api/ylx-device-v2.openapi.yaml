@@ -1018,7 +1018,7 @@ components:
     DeviceRuntimeStatus:
       type: object
       additionalProperties: false
-      required: [observed_at, connection_method, temperature_celsius, network, live_imu]
+      required: [observed_at, connection_method, temperature_celsius, network, live_imu, camera_focus]
       properties:
         observed_at:
           type: string
@@ -1039,6 +1039,46 @@ components:
             - $ref: "#/components/schemas/LiveImuObservation"
             - type: "null"
           description: Latest non-stale live sample, or null when no active session sample is available
+        camera_focus:
+          oneOf:
+            - $ref: "#/components/schemas/CameraFocusStatus"
+            - type: "null"
+          description: Current V4L2 camera focus status, or null when unsupported or temporarily unreadable
+    CameraFocusStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - value
+        - minimum
+        - maximum
+        - step
+        - default
+        - auto_supported
+        - auto_enabled
+      properties:
+        schema:
+          const: ylx.camera-focus.v1
+        value:
+          type: integer
+          description: Current focus_absolute value in driver-native units.
+        minimum:
+          type: integer
+        maximum:
+          type: integer
+        step:
+          type: integer
+          minimum: 1
+        default:
+          type: integer
+        auto_supported:
+          type: boolean
+          description: Whether this device exposes focus_auto.
+        auto_enabled:
+          oneOf:
+            - type: boolean
+            - type: "null"
+          description: Current auto-focus state, or null when focus_auto is unavailable.
     NetworkRuntimeStatus:
       type: object
       additionalProperties: false

@@ -43,7 +43,14 @@ PROGRESS_KEYS = frozenset(
 )
 DIAGNOSTIC_EVENT_KEYS = frozenset({"schema", "diagnostic"})
 RUNTIME_KEYS = frozenset(
-    {"observed_at", "connection_method", "temperature_celsius", "network", "live_imu"}
+    {
+        "observed_at",
+        "connection_method",
+        "temperature_celsius",
+        "network",
+        "live_imu",
+        "camera_focus",
+    }
 )
 NETWORK_KEYS = frozenset({"ap", "wifi_client", "wired", "default_route"})
 NETWORK_INTERFACE_KEYS = frozenset({"state", "interface", "addresses", "peer_or_ssid"})
@@ -723,6 +730,36 @@ def _validate_runtime(value: object) -> None:
     _validate_network(value["network"])
     if value["live_imu"] is not None:
         _validate_live_imu(value["live_imu"])
+    if value["camera_focus"] is not None:
+        _validate_camera_focus(value["camera_focus"])
+
+
+def _validate_camera_focus(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "value",
+        "minimum",
+        "maximum",
+        "step",
+        "default",
+        "auto_supported",
+        "auto_enabled",
+    }:
+        raise InvalidSourceEvent("camera focus 必须是闭合对象")
+    integers = ("value", "minimum", "maximum", "step", "default")
+    if (
+        value["schema"] != "ylx.camera-focus.v1"
+        or any(type(value[key]) is not int for key in integers)
+        or value["minimum"] > value["maximum"]
+        or value["step"] <= 0
+        or not value["minimum"] <= value["value"] <= value["maximum"]
+        or (value["value"] - value["minimum"]) % value["step"] != 0
+        or not value["minimum"] <= value["default"] <= value["maximum"]
+        or type(value["auto_supported"]) is not bool
+        or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
+        or (not value["auto_supported"] and value["auto_enabled"] is not None)
+    ):
+        raise InvalidSourceEvent("camera focus 无效")
 
 
 def _validate_network(value: object) -> None:

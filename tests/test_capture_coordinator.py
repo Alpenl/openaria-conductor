@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 import uuid
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO
@@ -44,6 +45,16 @@ from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 
 JPEG = b"\xff\xd8raw-side-by-side\xff\xd9"
 COMMIT = "a" * 40
+CAMERA_FOCUS_STATUS = {
+    "schema": "ylx.camera-focus.v1",
+    "value": 42,
+    "minimum": 0,
+    "maximum": 255,
+    "step": 1,
+    "default": 32,
+    "auto_supported": True,
+    "auto_enabled": False,
+}
 
 
 class _FaultingBinaryStream:
@@ -117,6 +128,7 @@ class FakeSources:
         self.generation_id: str | None = None
         self.submit_frame: object | None = None
         self.submit_imu: object | None = None
+        self.focus: dict[str, object] | None = None
 
     def start(
         self,
@@ -137,6 +149,25 @@ class FakeSources:
 
     def stop(self) -> None:
         self.open_handle_count = 0
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        return deepcopy(self.focus)
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        if self.focus is None:
+            raise RuntimeError("焦距控制不可用")
+        if value is not None:
+            self.focus["value"] = value
+            if self.focus["auto_supported"] is True:
+                self.focus["auto_enabled"] = False
+        if auto_enabled is not None:
+            self.focus["auto_enabled"] = auto_enabled
+        return deepcopy(self.focus)
 
 
 class FakeSourcesWithLatestImu(FakeSources):
@@ -742,6 +773,52 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertEqual(live_imu["raw"]["gyroscope"], {"x": 7, "y": 8, "z": 9})
             self.assertEqual(live_imu["sync"], {"quality": "degraded"})
+        finally:
+            coordinator.close()
+
+    def test_camera_focus_status_and_set_are_reflected_in_runtime_snapshot(self) -> None:
+        sources = FakeSources()
+        sources.focus = deepcopy(CAMERA_FOCUS_STATUS)
+        coordinator = self.coordinator(sources=sources)
+        try:
+            self.assertEqual(coordinator.camera_focus_status(), CAMERA_FOCUS_STATUS)
+            before = coordinator.capture_status()["source_revision"]
+
+            focus_command = command(
+                "focus-set-77",
+                {
+                    "schema": "ylx.camera-focus-set.v1",
+                    "value": 77,
+                    "auto_enabled": False,
+                },
+            )
+            result = coordinator.set_camera_focus(focus_command)
+            self.assertEqual(result.status, 200)
+            self.assertEqual(result.body["value"], 77)
+            self.assertFalse(result.replayed)
+
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertGreater(status["source_revision"], before)
+            self.assertEqual(status["snapshot"]["runtime"]["camera_focus"]["value"], 77)
+
+            replayed = coordinator.set_camera_focus(focus_command)
+            self.assertEqual(replayed.status, 200)
+            self.assertTrue(replayed.replayed)
+            self.assertEqual(replayed.body["value"], 77)
+
+            with self.assertRaises(ProviderError) as invalid:
+                coordinator.set_camera_focus(
+                    command(
+                        "focus-invalid",
+                        {
+                            "schema": "ylx.camera-focus-set.v1",
+                            "auto_enabled": "false",
+                        },
+                    )
+                )
+            self.assertEqual(invalid.exception.code, "invalid_camera_focus")
+            self.assertEqual(invalid.exception.status, 400)
         finally:
             coordinator.close()
 

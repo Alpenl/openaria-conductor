@@ -48,6 +48,8 @@ LAB_OPERATIONS = frozenset(
         "getRetainedUnsuccessfulSessionOutcome",
         "getCurrentSafeSwapReceipt",
         "getPreview",
+        "getCameraFocus",
+        "setCameraFocus",
         "headSessionArtifact",
         "getSessionArtifact",
         "startCapture",

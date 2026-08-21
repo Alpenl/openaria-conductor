@@ -22,13 +22,13 @@ from rp_ylx.api import (
 CONTRACT_GOLDENS = {
     "v2": {
         "filename": "ylx-device-v2.openapi.yaml",
-        "sha256": "b705823ae82a7fcd55385866dfd2f96464c2ed23e2c8ca65aa8933aa057e6933",
+        "sha256": "72593b2b9b3ee4be289c4706846858f69bd0f06b3371df2da66667c52ba38ef2",
         "info_version": "2.0.0",
         "server_suffix": "/api/v2",
     },
     "v3": {
         "filename": "ylx-device-v3.openapi.yaml",
-        "sha256": "a348c4d2527a60448525298a4518b97ce99333f7212f3ff5f3c9c4f7503a97ab",
+        "sha256": "ec128066efa93b1a20f78b50dacf453829a624c225cec685320de2e6781cc961",
         "info_version": "3.0.0",
         "server_suffix": "/api/v3",
     },
@@ -43,7 +43,7 @@ SCHEMA_GOLDENS = {
     ),
 }
 
-ROUTE_GOLDEN = {
+COMMON_ROUTE_GOLDEN = {
     ("/device", "get", "getDevice"),
     ("/capture/status", "get", "getCaptureStatus"),
     ("/capture/start", "post", "startCapture"),
@@ -61,6 +61,14 @@ ROUTE_GOLDEN = {
     ("/sessions/{session_id}/artifacts/{artifact_id}", "get", "getSessionArtifact"),
     ("/sessions/{session_id}/artifacts/{artifact_id}", "head", "headSessionArtifact"),
 }
+ROUTE_GOLDENS = {
+    "v2": COMMON_ROUTE_GOLDEN,
+    "v3": COMMON_ROUTE_GOLDEN
+    | {
+        ("/camera/focus", "get", "getCameraFocus"),
+        ("/camera/focus", "post", "setCameraFocus"),
+    },
+}
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
 MANIFEST_WIRE = b'{ "schema": "ylx.device-session.v1", "sealed": true }\n'
@@ -77,7 +85,8 @@ STATUS_WIRE = (
     b'"wifi_client":{"state":"disconnected","interface":"wlan1",'
     b'"addresses":[],"peer_or_ssid":null},"wired":{"state":"connected",'
     b'"interface":"eth0","addresses":["192.0.2.24/24"],'
-    b'"peer_or_ssid":null},"default_route":"wired"},"live_imu":null}}}'
+    b'"peer_or_ssid":null},"default_route":"wired"},"live_imu":null,'
+    b'"camera_focus":null}}}'
 )
 SESSION_LIST_WIRE = (
     b'{"schema":"ylx.session-list.v2","items":[],"diagnostics":[],"next_cursor":null}'
@@ -131,6 +140,7 @@ DEVICE_COMMON = {
             "default_route": "wired",
         },
         "live_imu": None,
+        "camera_focus": None,
     },
 }
 
@@ -187,7 +197,7 @@ class GatewayContractResourceTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(server)
                 self.assertEqual(server.group(1), golden["server_suffix"])
-                self.assertEqual(_declared_routes(contract), ROUTE_GOLDEN)
+                self.assertEqual(_declared_routes(contract), ROUTE_GOLDENS[version])
 
     def test_every_external_schema_reference_resolves_to_a_frozen_resource(self) -> None:
         api_resources = files("rp_ylx.api")
@@ -275,6 +285,7 @@ class _WireProvider:
                         "default_route": "wired",
                     },
                     "live_imu": None,
+                    "camera_focus": None,
                 },
             },
         }

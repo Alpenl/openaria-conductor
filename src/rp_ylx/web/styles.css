@@ -260,6 +260,56 @@ output {
   border-top: 1px solid #e1e5e6;
 }
 
+.focus-control {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e1e5e6;
+}
+
+.focus-heading {
+  margin-bottom: 8px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.focus-heading span {
+  color: #68747a;
+  font-size: 0.75rem;
+}
+
+.focus-heading output {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+#camera-focus-range {
+  width: 100%;
+  margin-bottom: 10px;
+}
+
+.checkbox-field {
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #4d5960;
+  font-size: 0.82rem;
+}
+
+#focus-command {
+  width: 100%;
+}
+
+#focus-status {
+  margin: 8px 0 0;
+  color: #667178;
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
 .safe-swap {
   grid-column: 1 / -1;
   border-color: #4f7d60;

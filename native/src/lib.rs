@@ -28,6 +28,7 @@ const JPEG_CONTRACT: &str = "jpeg_contract";
 const FRAME_STREAM: &str = "frame_stream";
 const TURBOJPEG_SPLIT: &str = "turbojpeg_split";
 const V4L2_CAPTURE: &str = "v4l2_capture";
+const V4L2_FOCUS_CONTROL: &str = "v4l2_focus_control";
 const NATIVE_CAMERA: &str = "native_camera";
 const CAMERA_FRAME_VALIDATOR: &str = "camera_frame_validator";
 const NATIVE_AUDIO: &str = "native_audio";
@@ -62,6 +63,10 @@ fn native_error(error: turbojpeg::TurboJpegError) -> PyErr {
 }
 
 fn camera_error(error: native_camera::StreamError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+}
+
+fn v4l2_error(error: v4l2::CaptureError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
 
@@ -2384,6 +2389,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     features.push(CONTINUOUS_CAPTURE_RAW_SINK);
     features.push(CONTINUOUS_CAPTURE_SPLIT_SINK);
     features.push(V4L2_CAPTURE);
+    features.push(V4L2_FOCUS_CONTROL);
     if turbojpeg::available() {
         features.push(TURBOJPEG_SPLIT);
         features.push(NATIVE_CAMERA);
@@ -2412,6 +2418,41 @@ fn encode_frame<'py>(py: Python<'py>, payload: &[u8]) -> PyResult<Bound<'py, PyB
     let encoded = frame_stream::encode(payload)
         .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid_frame_length"))?;
     Ok(PyBytes::new(py, &encoded))
+}
+
+fn focus_status_dict(py: Python<'_>, status: v4l2::FocusStatus) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("schema", "ylx.camera-focus.v1")?;
+    result.set_item("value", status.value)?;
+    result.set_item("minimum", status.minimum)?;
+    result.set_item("maximum", status.maximum)?;
+    result.set_item("step", status.step)?;
+    result.set_item("default", status.default_value)?;
+    result.set_item("auto_supported", status.auto_supported)?;
+    result.set_item("auto_enabled", status.auto_enabled)?;
+    Ok(result.unbind())
+}
+
+#[pyfunction]
+fn v4l2_focus_status(py: Python<'_>, device: &str) -> PyResult<Option<Py<PyDict>>> {
+    py.allow_threads(|| v4l2::focus_status(device))
+        .map_err(v4l2_error)?
+        .map(|status| focus_status_dict(py, status))
+        .transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (device, value=None, auto_enabled=None))]
+fn v4l2_set_focus(
+    py: Python<'_>,
+    device: &str,
+    value: Option<i32>,
+    auto_enabled: Option<bool>,
+) -> PyResult<Py<PyDict>> {
+    let status = py
+        .allow_threads(|| v4l2::set_focus(device, value, auto_enabled))
+        .map_err(v4l2_error)?;
+    focus_status_dict(py, status)
 }
 
 fn camera_frame_validation_dict(
@@ -2946,6 +2987,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_drop_quality_policy, module)?)?;
     module.add_function(wrap_pyfunction!(jpeg_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(encode_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(v4l2_focus_status, module)?)?;
+    module.add_function(wrap_pyfunction!(v4l2_set_focus, module)?)?;
     module.add_class::<NativeSplitter>()?;
     module.add_class::<NativeCameraStream>()?;
     module.add_class::<NativeCameraFrameValidator>()?;
@@ -2982,7 +3025,7 @@ mod tests {
         RECORDING_CODEC, RECORDING_EVENT_QUEUE, RECORDING_FRAME_GATE, RECORDING_IMU_BATCH,
         RECORDING_SEGMENT_PLANNER, RECORDING_SINK, RECORDING_TAP_STATE, SESSION_IO,
         STEREO_ENCODER_EVENTS, STEREO_ENCODER_PIPE, STEREO_ENCODER_PROCESS, TURBOJPEG_SPLIT,
-        V4L2_CAPTURE, parse_single_http_range,
+        V4L2_CAPTURE, V4L2_FOCUS_CONTROL, parse_single_http_range,
     };
 
     #[test]
@@ -2993,6 +3036,7 @@ mod tests {
         assert_eq!(FRAME_STREAM, "frame_stream");
         assert_eq!(TURBOJPEG_SPLIT, "turbojpeg_split");
         assert_eq!(V4L2_CAPTURE, "v4l2_capture");
+        assert_eq!(V4L2_FOCUS_CONTROL, "v4l2_focus_control");
         assert_eq!(NATIVE_CAMERA, "native_camera");
         assert_eq!(CAMERA_FRAME_VALIDATOR, "camera_frame_validator");
         assert_eq!(NATIVE_AUDIO, "native_audio");
