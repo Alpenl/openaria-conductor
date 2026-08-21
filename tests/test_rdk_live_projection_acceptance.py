@@ -82,6 +82,142 @@ class RdkLiveProjectionAcceptanceTest(unittest.TestCase):
             with self.subTest(final_delta=final_delta):
                 self.assertFalse(harness._final_lag_is_bounded({"final_delta": final_delta}))
 
+    def test_sse_checks_scope_recording_revision_and_reject_finalizing_regression(self) -> None:
+        session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
+        source = ("epoch", 2243)
+
+        def progress(
+            delivery_id: int,
+            revision: int,
+            phase: str,
+            elapsed_seconds: float,
+            completed_units: int,
+        ) -> dict[str, object]:
+            return {
+                "kind": "event",
+                "id": str(delivery_id),
+                "event": "progress",
+                "data": {
+                    "authority_epoch": "epoch",
+                    "source_revision": revision,
+                    "session_id": session_id,
+                    "data": {
+                        "phase": phase,
+                        "elapsed_seconds": elapsed_seconds,
+                        "completed_units": completed_units,
+                    },
+                },
+            }
+
+        events = [
+            progress(1, 2243, "recording", 1_799.8, 53_517),
+            progress(2, 2243, "recording", 1_800.8, 53_547),
+            progress(3, 2244, "finalizing", 1_802.9, 53_555),
+            progress(4, 2244, "finalizing", 1_806.9, 53_555),
+            progress(5, 2244, "finalizing", 1_807.9, 0),
+        ]
+
+        self.assertTrue(
+            harness._sse_progress_advances(
+                events,
+                expected_source=source,
+                session_id=session_id,
+            )
+        )
+        self.assertFalse(
+            harness._sse_finalizing_progress_non_regressing(events, session_id=session_id)
+        )
+
+        events.pop()
+        self.assertTrue(
+            harness._sse_finalizing_progress_non_regressing(events, session_id=session_id)
+        )
+
+    def test_counter_reconciliation_uses_finalizing_boundary_without_hiding_regression(
+        self,
+    ) -> None:
+        session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
+        samples = [
+            {
+                "http_status": 200,
+                "progress": {
+                    "elapsed_seconds": 1_800.098491,
+                    "captured_frames": 53_524,
+                    "bytes_written": 1_046_312_942,
+                },
+            }
+        ]
+        events = [
+            {
+                "kind": "event",
+                "id": "1786",
+                "event": "progress",
+                "data": {
+                    "authority_epoch": "epoch",
+                    "source_revision": 2244,
+                    "session_id": session_id,
+                    "data": {
+                        "phase": "finalizing",
+                        "elapsed_seconds": 1_802.907502,
+                        "completed_units": 53_555,
+                    },
+                },
+            },
+            {
+                "kind": "event",
+                "id": "1790",
+                "event": "progress",
+                "data": {
+                    "authority_epoch": "epoch",
+                    "source_revision": 2244,
+                    "session_id": session_id,
+                    "data": {
+                        "phase": "finalizing",
+                        "elapsed_seconds": 1_806.927320,
+                        "completed_units": 53_555,
+                    },
+                },
+            },
+            {
+                "kind": "event",
+                "id": "1791",
+                "event": "progress",
+                "data": {
+                    "authority_epoch": "epoch",
+                    "source_revision": 2244,
+                    "session_id": session_id,
+                    "data": {
+                        "phase": "finalizing",
+                        "elapsed_seconds": 1_807.932765,
+                        "completed_units": 0,
+                    },
+                },
+            },
+        ]
+
+        reconciled = harness._counter_reconciliation(
+            samples,
+            {
+                "duration_seconds": 1_807.520448588,
+                "frames": 53_555,
+                "artifact_bytes": 1_051_752_927,
+                "imu_samples": 214_216,
+            },
+            sse_events=events,
+            session_id=session_id,
+        )
+
+        self.assertEqual(reconciled["final_projection"]["kind"], "sse_finalizing")
+        self.assertEqual(reconciled["final_projection"]["event_id"], "1790")
+        self.assertAlmostEqual(
+            reconciled["final_delta"]["elapsed_seconds"],
+            0.593128588,
+            places=6,
+        )
+        self.assertEqual(reconciled["final_delta"]["captured_frames"], 0)
+        self.assertEqual(reconciled["final_delta"]["bytes_written"], 5_439_985)
+        self.assertTrue(harness._final_lag_is_bounded(reconciled))
+
     def test_same_revision_helper_rejects_revision_heartbeat(self) -> None:
         stable = [{"source_revision": 7}, {"source_revision": 7}]
         heartbeat = [{"source_revision": 7}, {"source_revision": 8}]
@@ -159,6 +295,7 @@ class RdkLiveProjectionAcceptanceTest(unittest.TestCase):
                 "body_bytes": 1,
                 "content_range": "bytes 0-0/10",
             },
+            session_id="01989f6a-2c00-7a1b-8c2d-3e4f50617283",
         )
 
         self.assertFalse(checks["recording_source_revision_stable"])
