@@ -368,7 +368,7 @@ pub fn device_session_v1_artifacts(
     payload: &[u8],
     expected_session_id: &str,
 ) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
-    let root = parse_device_session_v1_manifest(payload, expected_session_id)?;
+    let root = parse_device_session_manifest(payload, expected_session_id)?;
     collect_device_session_v1_artifacts(manifest_object(&root)?)
 }
 
@@ -376,7 +376,7 @@ pub fn device_session_v1_summary(
     payload: &[u8],
     expected_session_id: &str,
 ) -> Result<DeviceSessionV1Summary, SessionIoError> {
-    let root = parse_device_session_v1_manifest(payload, expected_session_id)?;
+    let root = parse_device_session_manifest(payload, expected_session_id)?;
     let object = manifest_object(&root)?;
     let time = object_field(object, "time", "manifest time 结构无效")?;
     let frames = object_field(object, "frames", "manifest frames 结构无效")?;
@@ -387,9 +387,16 @@ pub fn device_session_v1_summary(
             let audio = audio.as_object().ok_or_else(|| {
                 SessionIoError::new("manifest_invalid", "manifest audio 结构无效")
             })?;
-            u64_field(audio, "sample_count", "manifest audio sample_count 无效")
+            if matches!(
+                audio.get("state").and_then(Value::as_str),
+                Some("not_recorded")
+            ) {
+                return Ok(None);
+            }
+            u64_field(audio, "sample_count", "manifest audio sample_count 无效").map(Some)
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
 
     let artifacts = collect_device_session_v1_artifacts(object)?;
     let total_bytes = total_artifact_bytes(&artifacts)?;
@@ -411,7 +418,7 @@ pub fn device_session_v1_summary(
     })
 }
 
-fn parse_device_session_v1_manifest(
+fn parse_device_session_manifest(
     payload: &[u8],
     expected_session_id: &str,
 ) -> Result<Value, SessionIoError> {
@@ -419,10 +426,11 @@ fn parse_device_session_v1_manifest(
         SessionIoError::new("manifest_invalid", format!("manifest JSON 无效: {error}"))
     })?;
     let object = manifest_object(&root)?;
-    if string_field(object, "schema")? != "ylx.device-session.v1" {
+    let schema = string_field(object, "schema")?;
+    if !matches!(schema, "ylx.device-session.v1" | "ylx.device-session.v2") {
         return Err(SessionIoError::new(
             "manifest_invalid",
-            "manifest 不是 device-session v1",
+            "manifest 不是支持的 device-session",
         ));
     }
     if bool_field(object, "sealed")? != Some(true) {
@@ -483,6 +491,12 @@ fn collect_device_session_v1_artifacts(
         let audio = audio
             .as_object()
             .ok_or_else(|| SessionIoError::new("manifest_invalid", "manifest audio 结构无效"))?;
+        if matches!(
+            audio.get("state").and_then(Value::as_str),
+            Some("not_recorded")
+        ) {
+            return Ok(collector.finish());
+        }
         let segments = array_field(audio, "segments", "manifest audio segments 无效")?;
         for segment in segments {
             let segment = segment.as_object().ok_or_else(|| {
@@ -1334,6 +1348,34 @@ mod tests {
         );
         assert_eq!(artifacts[0].media_type, "video/mp4");
         assert_eq!(artifacts[4].bytes, 14);
+    }
+
+    #[test]
+    fn handles_device_session_v2_not_recorded_audio_without_audio_artifacts() {
+        let payload = br#"{
+          "schema":"ylx.device-session.v2",
+          "sealed":true,
+          "session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283",
+          "display_name":"test capture",
+          "time":{"started_at":"2026-08-08T02:24:00Z","ended_at":"2026-08-08T02:24:01.250Z","duration_seconds":1.25},
+          "video":{"layout":"raw-side-by-side","artifact":{"artifact_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+          "frames":{"count":7,"artifact":{"artifact_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+          "imu":{"sample_count":42,"artifact":{"artifact_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":13,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
+          "audio":{"state":"not_recorded","requested_mode":"disabled","resolved_mode":"disabled","reason":"user_disabled"}
+        }"#;
+
+        let artifacts =
+            device_session_v1_artifacts(payload, "01989f6a-2c00-7a1b-8c2d-3e4f50617283").unwrap();
+        let paths: Vec<_> = artifacts.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["video/raw.mjpeg", "frames.ndjson", "imu.ndjson"]
+        );
+
+        let summary =
+            device_session_v1_summary(payload, "01989f6a-2c00-7a1b-8c2d-3e4f50617283").unwrap();
+        assert_eq!(summary.audio_sample_count, None);
+        assert_eq!(summary.total_bytes, 35);
     }
 
     #[test]

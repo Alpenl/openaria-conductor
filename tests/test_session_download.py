@@ -701,6 +701,53 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
                 self.assertEqual(headers["Content-Type"], "video/mp4")
                 self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
 
+    def test_directory_store_serves_device_session_v2_manifest(self) -> None:
+        manifest = json.loads(json.dumps(self.manifest))
+        manifest["schema"] = "ylx.device-session.v2"
+        manifest["camera"]["nominal_fps"] = 30
+        manifest["camera"]["effective_fps"] = 1
+        manifest["imu"]["coordinate_frame"] = "raw_device_axes"
+        manifest["audio"] = {
+            "state": "not_recorded",
+            "requested_mode": "disabled",
+            "resolved_mode": "disabled",
+            "reason": "user_disabled",
+        }
+        manifest["integrity"]["quality_policy"] = {
+            "policy_id": "rdk-x5-lossless-v1",
+            "max_contiguous_dropped_frames": 0,
+            "max_total_dropped_frames": 0,
+            "max_drop_fraction": 0,
+            "window_seconds": 1,
+            "max_dropped_frames_per_window": 0,
+        }
+        manifest["integrity"]["media_write_throughput_bytes_per_second"] = sum(
+            artifact["bytes"] for artifact in downloads.iter_device_session_v1_artifacts(manifest)
+        )
+        v2_manifest_bytes = self.write_manifest(manifest)
+        v2_manifest_sha256 = hashlib.sha256(v2_manifest_bytes).hexdigest()
+
+        for api_version in ("v3", "v4"):
+            with self.subTest(api_version=api_version, resource="manifest"):
+                status, payload, headers = self.request(f"/api/{api_version}/sessions/{SESSION_ID}")
+
+                self.assertEqual(status, 200)
+                self.assertEqual(payload, v2_manifest_bytes)
+                self.assertEqual(headers["ETag"], f'"{v2_manifest_sha256}"')
+                self.assertEqual(headers["YLX-Manifest-SHA256"], v2_manifest_sha256)
+
+            with self.subTest(api_version=api_version, resource="artifact"):
+                status, payload, headers = self.request(
+                    f"/api/{api_version}/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload, ARTIFACT_BYTES)
+                self.assertEqual(headers["Content-Type"], "video/mp4")
+
+        summary = downloads.device_session_v1_summary(v2_manifest_bytes, SESSION_ID)
+        self.assertEqual(summary["session_id"], SESSION_ID)
+        self.assertIsNone(summary["audio_sample_count"])
+
     def test_directory_store_prefers_native_v1_artifact_descriptors(self) -> None:
         native = _NativeArtifacts(
             [

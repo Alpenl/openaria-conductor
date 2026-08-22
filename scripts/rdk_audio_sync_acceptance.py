@@ -162,6 +162,35 @@ def _first_audio_artifact(audio: dict[str, Any]) -> dict[str, Any]:
     return first["artifact"]
 
 
+def _audio_sample_rate(audio: dict[str, Any]) -> Any:
+    return audio.get("sample_rate", audio.get("sample_rate_hz"))
+
+
+def _audio_sync_is_host_monotonic(sync: Any) -> bool:
+    if not isinstance(sync, dict):
+        return False
+    return (sync.get("clock") == "host_monotonic" and sync.get("timebase") == "monotonic_ns") or (
+        sync.get("time_base") == "host_monotonic"
+        and sync.get("video_time_reference") == "session_time_seconds"
+    )
+
+
+def _audio_sync_offsets_are_monotonic(sync: Any) -> bool:
+    if not isinstance(sync, dict):
+        return False
+    if isinstance(sync.get("session_start_offset_ns"), int) and isinstance(
+        sync.get("session_stop_offset_ns"), int
+    ):
+        return sync["session_stop_offset_ns"] >= sync["session_start_offset_ns"]
+    start_seconds = sync.get("start_time_seconds")
+    end_seconds = sync.get("end_time_seconds")
+    return (
+        isinstance(start_seconds, (int, float))
+        and isinstance(end_seconds, (int, float))
+        and end_seconds >= start_seconds
+    )
+
+
 def _run_validate(rp_ylx_bin: Path, session_dir: Path) -> dict[str, Any]:
     completed = subprocess.run(
         [str(rp_ylx_bin), "validate", str(session_dir)],
@@ -221,7 +250,7 @@ def _checks(
     video_artifacts = _iter_video_artifacts(manifest)
     sync = audio.get("sync")
     integrity = manifest.get("integrity")
-    sample_rate = audio.get("sample_rate_hz")
+    sample_rate = _audio_sample_rate(audio)
     sample_count = audio.get("sample_count")
     segments = audio.get("segments")
     return {
@@ -237,6 +266,7 @@ def _checks(
         "has_video_left": any(item.get("role") == "video.left" for item in video_artifacts),
         "has_video_right": any(item.get("role") == "video.right" for item in video_artifacts),
         "has_audio_manifest": bool(audio),
+        "audio_state_recorded": audio.get("state", "recorded") == "recorded",
         "audio_codec_pcm_s16le": audio.get("codec") == "pcm_s16le",
         "audio_container_wav": audio.get("container") == "wav",
         "audio_sample_rate_48000": sample_rate == 48_000,
@@ -245,13 +275,8 @@ def _checks(
         "audio_segments_positive": isinstance(segments, list) and len(segments) > 0,
         "audio_artifact_declared": first_audio_artifact.get("role") == "audio.wav"
         and first_audio_artifact.get("media_type") == "audio/wav",
-        "audio_sync_host_monotonic": isinstance(sync, dict)
-        and sync.get("clock") == "host_monotonic"
-        and sync.get("timebase") == "monotonic_ns",
-        "audio_offsets_monotonic": isinstance(sync, dict)
-        and isinstance(sync.get("session_start_offset_ns"), int)
-        and isinstance(sync.get("session_stop_offset_ns"), int)
-        and sync["session_stop_offset_ns"] >= sync["session_start_offset_ns"],
+        "audio_sync_host_monotonic": _audio_sync_is_host_monotonic(sync),
+        "audio_offsets_monotonic": _audio_sync_offsets_are_monotonic(sync),
         "audio_wav_header_ok": wav_header[:4] == b"RIFF" and wav_header[8:12] == b"WAVE",
         "audio_range_ok": range_result.status == 206
         and range_result.body[:4] == b"RIFF"
@@ -362,7 +387,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         f"/api/v3/sessions/{session_id}/artifacts/{first_audio_artifact['artifact_id']}",
         "bytes=0-43",
     )
-    sample_rate = audio.get("sample_rate_hz")
+    sample_rate = _audio_sample_rate(audio)
     sample_count = audio.get("sample_count")
     duration_from_samples = (
         sample_count / sample_rate

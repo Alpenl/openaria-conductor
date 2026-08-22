@@ -179,9 +179,31 @@ class FakeAudioRecorder:
         del timeout_seconds
         if self._fail_stop:
             raise RuntimeError("audio_failed: fake audio stop failure")
+        target_stop = self.started_monotonic_ns + 100_000_000
+        while time.monotonic_ns() < target_stop:
+            time.sleep(0.001)
+        stopped_monotonic_ns = time.monotonic_ns()
         path = self._session_root / "audio/audio_00000.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"RIFF" + b"\x00" * 40 + b"pcm")
+        sample_count = 4_800
+        channels = 2
+        bits_per_sample = 16
+        pcm_payload = b"\x00" * (sample_count * channels * (bits_per_sample // 8))
+        header = bytearray(44)
+        header[0:4] = b"RIFF"
+        header[4:8] = (36 + len(pcm_payload)).to_bytes(4, "little")
+        header[8:12] = b"WAVE"
+        header[12:16] = b"fmt "
+        header[16:20] = (16).to_bytes(4, "little")
+        header[20:22] = (1).to_bytes(2, "little")
+        header[22:24] = channels.to_bytes(2, "little")
+        header[24:28] = (48_000).to_bytes(4, "little")
+        header[28:32] = (48_000 * channels * (bits_per_sample // 8)).to_bytes(4, "little")
+        header[32:34] = (channels * (bits_per_sample // 8)).to_bytes(2, "little")
+        header[34:36] = bits_per_sample.to_bytes(2, "little")
+        header[36:40] = b"data"
+        header[40:44] = len(pcm_payload).to_bytes(4, "little")
+        path.write_bytes(bytes(header) + pcm_payload)
         return {
             "device": "hw:0,0",
             "codec": "pcm_s16le",
@@ -189,15 +211,15 @@ class FakeAudioRecorder:
             "sample_rate_hz": 48_000,
             "channels": 2,
             "sample_format": "S16_LE",
-            "sample_count": 4_800,
+            "sample_count": sample_count,
             "started_monotonic_ns": self.started_monotonic_ns,
-            "stopped_monotonic_ns": self.started_monotonic_ns + 100_000_000,
+            "stopped_monotonic_ns": stopped_monotonic_ns,
             "segments": [
                 {
                     "index": 0,
                     "path": "audio/audio_00000.wav",
                     "start_sample": 0,
-                    "end_sample": 4_800,
+                    "end_sample": sample_count,
                     "start_time_seconds": 0.0,
                     "end_time_seconds": 0.1,
                 }
@@ -1368,22 +1390,24 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
             self.assertTrue(audios[0].started)
             audio = sealed.manifest["audio"]
+            self.assertEqual(sealed.manifest["schema"], "ylx.device-session.v2")
+            self.assertEqual(sealed.manifest["imu"]["coordinate_frame"], "raw_device_axes")
+            self.assertEqual(audio["state"], "recorded")
+            self.assertEqual(audio["requested_mode"], "enabled")
+            self.assertEqual(audio["resolved_mode"], "enabled")
             self.assertEqual(audio["codec"], "pcm_s16le")
             self.assertEqual(audio["container"], "wav")
-            self.assertEqual(audio["sample_rate_hz"], 48_000)
+            self.assertEqual(audio["sample_rate"], 48_000)
             self.assertEqual(audio["sample_count"], 4_800)
-            self.assertEqual(audio["sync"]["clock"], "host_monotonic")
-            self.assertEqual(audio["sync"]["timebase"], "monotonic_ns")
-            self.assertGreater(audio["sync"]["session_start_monotonic_ns"], 0)
-            self.assertEqual(
-                audio["sync"]["session_start_offset_ns"],
-                audio["sync"]["started_monotonic_ns"] - audio["sync"]["session_start_monotonic_ns"],
+            self.assertEqual(audio["sync"]["time_base"], "host_monotonic")
+            self.assertEqual(audio["sync"]["video_time_reference"], "session_time_seconds")
+            self.assertGreaterEqual(audio["sync"]["start_time_seconds"], 0)
+            self.assertGreater(
+                audio["sync"]["end_time_seconds"],
+                audio["sync"]["start_time_seconds"],
             )
-            self.assertEqual(
-                audio["sync"]["session_stop_offset_ns"],
-                audio["sync"]["stopped_monotonic_ns"] - audio["sync"]["session_start_monotonic_ns"],
-            )
-            self.assertEqual(audio["sync"]["sample_duration_ns"], 20_833)
+            self.assertEqual(audio["segments"][0]["pcm_payload_bytes"], 4_800 * 2 * 2)
+            self.assertEqual(audio["segments"][0]["wav_header_bytes"], 44)
             artifact = audio["segments"][0]["artifact"]
             self.assertEqual(artifact["role"], "audio.wav")
             self.assertEqual(artifact["media_type"], "audio/wav")
@@ -1393,6 +1417,30 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 [item["path"] for item in iter_device_session_v1_artifacts(sealed.manifest)],
             )
             validate_device_session_manifest(sealed.manifest)
+
+    def test_audio_disabled_is_declared_as_not_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder, _, _ = self.build(root, audio_enabled=False)
+            recorder.start()
+            self.feed(recorder, 3)
+            sealed = recorder.stop()
+
+        self.assertEqual(sealed.manifest["schema"], "ylx.device-session.v2")
+        self.assertEqual(
+            sealed.manifest["audio"],
+            {
+                "state": "not_recorded",
+                "requested_mode": "disabled",
+                "resolved_mode": "disabled",
+                "reason": "user_disabled",
+            },
+        )
+        self.assertNotIn(
+            "audio/audio_00000.wav",
+            [item["path"] for item in iter_device_session_v1_artifacts(sealed.manifest)],
+        )
+        validate_device_session_manifest(sealed.manifest)
 
     def test_final_progress_bytes_match_manifest_artifact_bytes_including_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

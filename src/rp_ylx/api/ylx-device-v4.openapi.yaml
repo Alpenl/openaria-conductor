@@ -473,7 +473,7 @@ paths:
         "200":
           description: |
             Cursor page of discovered candidates. Every schema-valid
-            ylx.device-session.v1 sealed candidate is projected once as SessionSummary,
+            ylx.device-session.v2 sealed candidate is projected once as SessionSummary,
             ordered by manifest started_at then session_id. A malformed, unreadable,
             unsealed, unknown-schema, schema-invalid, or manifest-local-semantics-invalid
             manifest is projected once only as a closed
@@ -523,7 +523,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "../schemas/ylx-device-session-v1.schema.json"
+                $ref: "../schemas/ylx-device-session-v2.schema.json"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

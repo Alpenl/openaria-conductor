@@ -73,7 +73,7 @@ def validate_public_session(directory: str | Path) -> dict[str, Any]:
             "schema and format discriminators cannot both be present",
         )
     try:
-        if schema == "ylx.device-session.v1":
+        if schema in {"ylx.device-session.v1", "ylx.device-session.v2"}:
             return dict(validate_device_session_directory(root))
         if legacy_format == "ylx.recording-session.v0":
             return validate_session(root)

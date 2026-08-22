@@ -646,13 +646,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_normal_v1_seal_is_manifest_last_and_gateway_readable(self) -> None:
+    def test_normal_v2_seal_is_manifest_last_and_gateway_readable(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator)
             session = self.mountpoint / "recordings" / session_id
             manifest = validate_device_session_directory(session)
-            self.assertEqual(manifest["schema"], "ylx.device-session.v1")
+            self.assertEqual(manifest["schema"], "ylx.device-session.v2")
+            self.assertEqual(manifest["imu"]["coordinate_frame"], "raw_device_axes")
+            self.assertEqual(manifest["audio"]["state"], "not_recorded")
             self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
             self.assertEqual(manifest["frames"]["count"], 1)
             self.assertEqual(manifest["camera"]["nominal_fps"], 60.0)
@@ -1432,7 +1434,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         original_next_revision = coordinator._next_revision
 
         def next_revision() -> int:
-            if threading.current_thread().name.startswith("rp-ylx-v1-writer-"):
+            if threading.current_thread().name.startswith("rp-ylx-session-writer-"):
                 checkpoint_started.set()
                 if not release_checkpoint.wait(timeout=2):
                     raise TimeoutError("测试没有释放 checkpoint")
