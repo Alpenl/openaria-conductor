@@ -1,4 +1,4 @@
-"""Device Session v1 的有界写入、验证与原子封存。"""
+"""Device Session v2 的有界写入、验证与原子封存。"""
 
 from __future__ import annotations
 
@@ -530,7 +530,7 @@ def _native_device_session_artifacts(
     code: str,
 ) -> list[Mapping[str, object]] | None:
     if (
-        manifest.get("schema") != "ylx.device-session.v1"
+        manifest.get("schema") not in {"ylx.device-session.v1", "ylx.device-session.v2"}
         or manifest_bytes is None
         or not isinstance(session_id, str)
         or not session_id
@@ -735,7 +735,7 @@ def _native_segment_float(value: object, field: str) -> float:
 
 
 class DeviceSessionRecorder:
-    """只负责一个 v1 会话的 artifact 写入与成功封存。"""
+    """只负责一个 Device Session 会话的 artifact 写入与成功封存。"""
 
     def __init__(
         self,
@@ -1153,11 +1153,13 @@ class DeviceSessionRecorder:
                 self._close_files(ignore_errors=True)
                 self._state = "failed"
                 self._mark_failed("start_failed", str(error), recoverable=False)
-                raise DeviceRecordingError("start_failed", f"创建 v1 会话失败：{error}") from error
+                raise DeviceRecordingError(
+                    "start_failed", f"创建 device-session 会话失败：{error}"
+                ) from error
             self._state = "recording"
             self._writer = threading.Thread(
                 target=self._writer_loop,
-                name=f"rp-ylx-v1-writer-{self._plan.session_id[:8]}",
+                name=f"rp-ylx-session-writer-{self._plan.session_id[:8]}",
                 daemon=True,
             )
             self._writer.start()
@@ -2028,6 +2030,16 @@ class DeviceSessionRecorder:
         segments = result.get("segments")
         if not isinstance(segments, list) or not segments:
             raise DeviceRecordingError("audio_empty", "音频录制没有可封存分段")
+        sample_rate_hz = _strict_int(result.get("sample_rate_hz"), "audio.sample_rate_hz")
+        channels = _strict_int(result.get("channels"), "audio.channels")
+        sample_format = str(result.get("sample_format"))
+        if sample_rate_hz <= 0:
+            raise DeviceRecordingError("audio_invalid", "audio.sample_rate_hz 必须是正整数")
+        if channels <= 0:
+            raise DeviceRecordingError("audio_invalid", "audio.channels 必须是正整数")
+        if sample_format != "S16_LE":
+            raise DeviceRecordingError("audio_invalid", "audio.sample_format 必须是 S16_LE")
+        bytes_per_sample_frame = channels * 2
         self._audio_result = dict(result)
         self._audio_segment_records = []
         self._audio_bytes = 0
@@ -2051,6 +2063,10 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError("audio_invalid", "音频 artifact 路径无效")
             path = self._partial / relative
             finalized = _finalize_artifact(path, None, code="audio_invalid")
+            pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
+            wav_header_bytes = finalized.bytes - pcm_payload_bytes
+            if wav_header_bytes < 44 or wav_header_bytes > 65_536:
+                raise DeviceRecordingError("audio_invalid", "音频 WAV header 与采样字节数不一致")
             self._artifact_identities[relative] = finalized.identity
             self._audio_bytes += finalized.bytes
             self._audio_segment_records.append(
@@ -2060,6 +2076,8 @@ class DeviceSessionRecorder:
                     "end_sample": end_sample,
                     "start_time_seconds": float(raw_segment["start_time_seconds"]),
                     "end_time_seconds": float(raw_segment["end_time_seconds"]),
+                    "pcm_payload_bytes": pcm_payload_bytes,
+                    "wav_header_bytes": wav_header_bytes,
                     "artifact": {
                         "artifact_id": finalized.sha256,
                         "role": "audio.wav",
@@ -2129,17 +2147,28 @@ class DeviceSessionRecorder:
             or sync.get("stopped_monotonic_ns") != stopped_monotonic_ns
         ):
             raise DeviceRecordingError("audio_invalid", "音频时间线结果无效")
+        start_time_seconds = float(sync["session_start_offset_seconds"])
+        end_time_seconds = float(sync["session_stop_offset_seconds"])
+        if start_time_seconds < 0 or end_time_seconds <= start_time_seconds:
+            raise DeviceRecordingError("audio_invalid", "音频时间线 offset 无效")
         return {
-            "device": str(self._audio_result["device"]),
+            "state": "recorded",
+            "requested_mode": "enabled",
+            "resolved_mode": "enabled",
             "codec": "pcm_s16le",
             "container": "wav",
-            "sample_rate_hz": sample_rate_hz,
+            "sample_format": "S16_LE",
+            "sample_rate": sample_rate_hz,
             "channels": _strict_int(self._audio_result.get("channels"), "audio.channels"),
-            "sample_format": str(self._audio_result["sample_format"]),
             "sample_count": _strict_int(
                 self._audio_result.get("sample_count"), "audio.sample_count"
             ),
-            "sync": sync,
+            "sync": {
+                "time_base": "host_monotonic",
+                "start_time_seconds": start_time_seconds,
+                "end_time_seconds": end_time_seconds,
+                "video_time_reference": "session_time_seconds",
+            },
             "segments": list(self._audio_segment_records),
         }
 
@@ -2180,7 +2209,7 @@ class DeviceSessionRecorder:
         nominal_fps = self._config.sensor_fps / self._config.frame_decimation
         effective_fps = 0.0 if duration == 0 else self._frames_written / duration
         manifest: dict[str, object] = {
-            "schema": "ylx.device-session.v1",
+            "schema": "ylx.device-session.v2",
             "manifest_id": uuid7(),
             "sealed": True,
             "sealed_at": self._timestamp(sealed_at),
@@ -2223,7 +2252,7 @@ class DeviceSessionRecorder:
                 "artifact": imu,
                 "sample_count": self._imu_written,
                 "units": "raw_int16",
-                "coordinate_frame": "opencv_optical",
+                "coordinate_frame": "raw_device_axes",
             },
             "frames": {"artifact": frames, "count": self._frames_written},
             "logs": [],
@@ -2249,8 +2278,16 @@ class DeviceSessionRecorder:
                 "fatal_errors": [],
             },
         }
-        if self._config.audio_enabled:
-            manifest["audio"] = self._audio_block()
+        manifest["audio"] = (
+            self._audio_block()
+            if self._config.audio_enabled
+            else {
+                "state": "not_recorded",
+                "requested_mode": "disabled",
+                "resolved_mode": "disabled",
+                "reason": "user_disabled",
+            }
+        )
         return manifest
 
     def _validate_artifact_bytes(
@@ -2427,7 +2464,7 @@ class DeviceSessionRecorder:
                 code, _, _ = _failure_details(error)
                 raise DeviceRecordingError(
                     str(code),
-                    f"v1 会话发布后的独立校验失败：{error}",
+                    f"device-session 会话发布后的独立校验失败：{error}",
                 ) from error
             for failed_root in (self._partial,):
                 with suppress(OSError):
@@ -2439,7 +2476,10 @@ class DeviceSessionRecorder:
                 recoverable=recoverable,
                 media_lost=media_lost,
             )
-            raise DeviceRecordingError(str(code), f"v1 会话封存失败：{error}") from error
+            raise DeviceRecordingError(
+                str(code),
+                f"device-session 会话封存失败：{error}",
+            ) from error
         return SealedDeviceSession(
             self._final,
             manifest,
@@ -2674,7 +2714,7 @@ def validate_device_session_directory(
     *,
     expected_session_id: str | None = None,
 ) -> Mapping[str, object]:
-    """独立校验一个已密封 v1 会话的 manifest 与所有 artifact 字节。"""
+    """独立校验一个已密封 Device Session 会话的 manifest 与所有 artifact 字节。"""
 
     root = Path(path)
     root_flags = (

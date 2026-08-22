@@ -36,13 +36,30 @@ _SESSION_ID = re.compile(
 )
 _TEMP_COMPONENT = re.compile(r"^[^/]*\.tmp(?:[._-][^/]*)?$")
 _READ_CHUNK = 1024 * 1024
-_DEVICE_SESSION_SCHEMA = json.loads(
+_DEVICE_SESSION_V1_SCHEMA_ID = "ylx.device-session.v1"
+_DEVICE_SESSION_V2_SCHEMA_ID = "ylx.device-session.v2"
+_DEVICE_SESSION_SCHEMA_IDS = frozenset(
+    {
+        _DEVICE_SESSION_V1_SCHEMA_ID,
+        _DEVICE_SESSION_V2_SCHEMA_ID,
+    }
+)
+_DEVICE_SESSION_V1_SCHEMA = json.loads(
     files("rp_ylx.schemas")
     .joinpath("ylx-device-session-v1.schema.json")
     .read_text(encoding="utf-8")
 )
-_DEVICE_SESSION_VALIDATOR = Draft202012Validator(
-    _DEVICE_SESSION_SCHEMA,
+_DEVICE_SESSION_V1_VALIDATOR = Draft202012Validator(
+    _DEVICE_SESSION_V1_SCHEMA,
+    format_checker=FormatChecker(),
+)
+_DEVICE_SESSION_V2_SCHEMA = json.loads(
+    files("rp_ylx.schemas")
+    .joinpath("ylx-device-session-v2.schema.json")
+    .read_text(encoding="utf-8")
+)
+_DEVICE_SESSION_V2_VALIDATOR = Draft202012Validator(
+    _DEVICE_SESSION_V2_SCHEMA,
     format_checker=FormatChecker(),
 )
 _RECORDING_SESSION_SCHEMA = json.loads(
@@ -391,7 +408,7 @@ def _native_device_session_v1_artifact_descriptors(
     session_id: str,
     manifest: Mapping[str, object],
 ) -> dict[str, ArtifactDescriptor] | None:
-    if manifest.get("schema") != "ylx.device-session.v1":
+    if manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
         return None
     summary = _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
     if summary is not None:
@@ -427,13 +444,17 @@ def device_session_v1_summary(
     session_id: str,
     manifest: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return the sealed Device Session v1 summary, preferring Rust's manifest fast path."""
+    """Return the sealed Device Session summary, preferring Rust's v1 manifest fast path."""
 
-    native_summary = _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
-    if native_summary is not None:
-        return native_summary
     if manifest is None:
         manifest = _validated_manifest(manifest_bytes, session_id, "v3")
+    native_summary = (
+        _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
+        if manifest.get("schema") == _DEVICE_SESSION_V1_SCHEMA_ID
+        else None
+    )
+    if native_summary is not None:
+        return native_summary
     return _device_session_v1_summary_python(
         manifest,
         manifest_bytes=manifest_bytes,
@@ -446,7 +467,7 @@ def _native_device_session_v1_summary(
     session_id: str,
     manifest: Mapping[str, object] | None,
 ) -> dict[str, object] | None:
-    if manifest is not None and manifest.get("schema") != "ylx.device-session.v1":
+    if manifest is not None and manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
         return None
     global _DEVICE_SESSION_SUMMARY_UNAVAILABLE
     if _DEVICE_SESSION_SUMMARY_UNAVAILABLE:
@@ -478,11 +499,11 @@ def _device_session_v1_summary_python(
     del manifest_bytes
     try:
         if (
-            manifest.get("schema") != "ylx.device-session.v1"
+            manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS
             or manifest.get("sealed") is not True
             or manifest.get("session_id") != session_id
         ):
-            raise ArtifactAccessError("not_verified", "manifest 不是 sealed device-session v1")
+            raise ArtifactAccessError("not_verified", "manifest 不是 sealed device-session")
         time = manifest["time"]
         frames = manifest["frames"]
         imu = manifest["imu"]
@@ -493,10 +514,11 @@ def _device_session_v1_summary_python(
         if audio is not None:
             if not isinstance(audio, Mapping):
                 raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
-            audio_sample_count = _non_negative_int(
-                audio.get("sample_count"),
-                "manifest audio sample_count 无效",
-            )
+            if audio.get("state") != "not_recorded":
+                audio_sample_count = _non_negative_int(
+                    audio.get("sample_count"),
+                    "manifest audio sample_count 无效",
+                )
         descriptors = _artifact_descriptors(manifest)
         artifacts = _artifact_descriptor_payloads(descriptors)
         return {
@@ -603,7 +625,7 @@ def _native_device_session_v1_artifact_descriptor(
     manifest: Mapping[str, object],
     artifact_id: str,
 ) -> ArtifactDescriptor | None:
-    if manifest.get("schema") != "ylx.device-session.v1":
+    if manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
         return None
     global _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE
     if _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE:
@@ -985,14 +1007,15 @@ def _decode_and_validate_manifest(
         raise ArtifactAccessError("not_found", "会话 manifest 无效") from error
     if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
         raise ArtifactAccessError("not_found", "会话 manifest 身份不匹配")
-    is_v1 = manifest.get("schema") == "ylx.device-session.v1" and manifest.get("sealed") is True
+    schema = manifest.get("schema")
+    is_device_session = schema in _DEVICE_SESSION_SCHEMA_IDS and manifest.get("sealed") is True
     is_v0 = (
         manifest.get("format") == "ylx.recording-session.v0" and manifest.get("state") == "sealed"
     )
-    if not is_v1 and not (api_version == "v2" and is_v0):
+    if not is_device_session and not (api_version == "v2" and is_v0):
         raise ArtifactAccessError("not_found", "会话不存在或尚未封存")
-    if is_v1:
-        _validate_device_session_v1(manifest)
+    if is_device_session:
+        _validate_device_session_manifest(manifest)
     else:
         _validate_recording_session_v0(manifest)
     return manifest
@@ -1015,7 +1038,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _artifact_descriptors(manifest: Mapping[str, object]) -> dict[str, ArtifactDescriptor]:
     raw_descriptors: list[object]
     legacy = False
-    if manifest.get("schema") == "ylx.device-session.v1":
+    if manifest.get("schema") in _DEVICE_SESSION_SCHEMA_IDS:
         raw_descriptors = list(iter_device_session_v1_artifacts(manifest))
     else:
         artifacts = manifest.get("artifacts")
@@ -1096,7 +1119,7 @@ def _non_negative_number(value: object, message: str) -> int | float:
 def iter_device_session_v1_artifacts(
     manifest: Mapping[str, object],
 ) -> Iterator[Mapping[str, object]]:
-    """Yield every artifact descriptor declared by a Device Session v1 manifest."""
+    """Yield every artifact descriptor declared by a Device Session v1/v2 manifest."""
 
     try:
         video = manifest["video"]
@@ -1143,6 +1166,8 @@ def iter_device_session_v1_artifacts(
     if audio is not None:
         if not isinstance(audio, Mapping):
             raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+        if audio.get("state") == "not_recorded":
+            return
         segments = audio.get("segments")
         if not isinstance(segments, list):
             raise ArtifactAccessError("not_verified", "manifest audio segments 无效")
@@ -1157,18 +1182,48 @@ def iter_device_session_v1_artifacts(
 
 def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
     try:
-        _DEVICE_SESSION_VALIDATOR.validate(manifest)
+        _DEVICE_SESSION_V1_VALIDATOR.validate(manifest)
     except ValidationError as error:
         raise ArtifactAccessError(
             "not_verified", "manifest 不符合 device-session v1 契约"
         ) from error
 
+    _validate_device_session_semantics(manifest, schema_version="v1")
+
+
+def _validate_device_session_v2(manifest: Mapping[str, object]) -> None:
+    try:
+        _DEVICE_SESSION_V2_VALIDATOR.validate(manifest)
+    except ValidationError as error:
+        raise ArtifactAccessError(
+            "not_verified", "manifest 不符合 device-session v2 契约"
+        ) from error
+
+    _validate_device_session_semantics(manifest, schema_version="v2")
+
+
+def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
+    schema = manifest.get("schema")
+    if schema == _DEVICE_SESSION_V1_SCHEMA_ID:
+        _validate_device_session_v1(manifest)
+        return
+    if schema == _DEVICE_SESSION_V2_SCHEMA_ID:
+        _validate_device_session_v2(manifest)
+        return
+    raise ArtifactAccessError("not_verified", "manifest 不是支持的 device-session 契约")
+
+
+def _validate_device_session_semantics(
+    manifest: Mapping[str, object],
+    *,
+    schema_version: str,
+) -> None:
     camera = manifest["camera"]
     time = manifest["time"]
     integrity = manifest["integrity"]
     take = manifest["take"]
     if not all(isinstance(value, Mapping) for value in (camera, time, integrity, take)):
-        raise ArtifactAccessError("not_verified", "manifest v1 结构无效")
+        raise ArtifactAccessError("not_verified", "manifest device-session 结构无效")
     if camera["width"] != camera["eye_width"] * 2:
         raise ArtifactAccessError("not_verified", "camera width 与 eye_width 不一致")
     nominal_fps = camera["sensor_fps"] / camera["frame_decimation"]
@@ -1255,13 +1310,16 @@ def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
     if audio is not None:
         if not isinstance(audio, Mapping):
             raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
-        _validate_audio(audio)
+        if schema_version == "v2":
+            _validate_audio_v2(manifest, audio)
+        else:
+            _validate_audio_v1(audio)
 
 
 def validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
-    """验证生产者与下载路径共享的 Device Session v1 语义。"""
+    """验证生产者与下载路径共享的 Device Session v1/v2 语义。"""
 
-    _validate_device_session_v1(manifest)
+    _validate_device_session_manifest(manifest)
 
 
 def _validate_recording_session_v0(manifest: Mapping[str, object]) -> None:
@@ -1313,7 +1371,7 @@ def _validate_split_eye_segments(
         raise ArtifactAccessError("not_verified", "frames count 与视频帧域不一致")
 
 
-def _validate_audio(audio: Mapping[str, object]) -> None:
+def _validate_audio_v1(audio: Mapping[str, object]) -> None:
     sample_rate = audio["sample_rate_hz"]
     sample_count = audio["sample_count"]
     if (
@@ -1349,6 +1407,96 @@ def _validate_audio(audio: Mapping[str, object]) -> None:
             or abs(segment["end_time_seconds"] - end_time) > 1e-9
         ):
             raise ArtifactAccessError("not_verified", "manifest audio 时间域无效")
+        previous_end = segment["end_sample"]
+    if previous_end != sample_count:
+        raise ArtifactAccessError("not_verified", "manifest audio sample_count 不一致")
+
+
+def _validate_audio_v2(manifest: Mapping[str, object], audio: Mapping[str, object]) -> None:
+    state = audio.get("state")
+    if state == "not_recorded":
+        return
+    if state != "recorded":
+        raise ArtifactAccessError("not_verified", "manifest audio state 无效")
+
+    sample_rate = audio["sample_rate"]
+    channels = audio["channels"]
+    sample_count = audio["sample_count"]
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or isinstance(channels, bool)
+        or not isinstance(channels, int)
+        or isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 采样字段无效")
+    if audio.get("sample_format") != "S16_LE":
+        raise ArtifactAccessError("not_verified", "manifest audio sample_format 无效")
+    sync = audio["sync"]
+    segments = audio["segments"]
+    if not isinstance(sync, Mapping) or not isinstance(segments, list):
+        raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
+    if (
+        sync.get("time_base") != "host_monotonic"
+        or sync.get("video_time_reference") != "session_time_seconds"
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio 时间线无效")
+    start = sync.get("start_time_seconds")
+    end = sync.get("end_time_seconds")
+    duration = manifest["time"]["duration_seconds"]
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, (int, float))
+        or isinstance(end, bool)
+        or not isinstance(end, (int, float))
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(start))
+        or not math.isfinite(float(end))
+        or not math.isfinite(float(duration))
+        or float(start) < 0
+        or float(end) <= float(start)
+        or float(end) > float(duration) + 1e-6
+    ):
+        raise ArtifactAccessError("not_verified", "manifest audio sync 超出会话时间域")
+
+    previous_end = 0
+    bytes_per_sample_frame = channels * 2
+    for expected_index, segment in enumerate(segments):
+        if not isinstance(segment, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+        if (
+            segment["index"] != expected_index
+            or segment["start_sample"] != previous_end
+            or segment["end_sample"] <= segment["start_sample"]
+            or segment["start_time_seconds"] >= segment["end_time_seconds"]
+        ):
+            raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+        start_time = segment["start_sample"] / sample_rate
+        end_time = segment["end_sample"] / sample_rate
+        if (
+            abs(segment["start_time_seconds"] - start_time) > 1e-9
+            or abs(segment["end_time_seconds"] - end_time) > 1e-9
+        ):
+            raise ArtifactAccessError("not_verified", "manifest audio 时间域无效")
+        pcm_payload_bytes = segment["pcm_payload_bytes"]
+        wav_header_bytes = segment["wav_header_bytes"]
+        artifact = segment["artifact"]
+        if not isinstance(artifact, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest audio artifact 无效")
+        expected_payload_bytes = (segment["end_sample"] - segment["start_sample"]) * (
+            bytes_per_sample_frame
+        )
+        if (
+            isinstance(pcm_payload_bytes, bool)
+            or not isinstance(pcm_payload_bytes, int)
+            or isinstance(wav_header_bytes, bool)
+            or not isinstance(wav_header_bytes, int)
+            or pcm_payload_bytes != expected_payload_bytes
+            or artifact["bytes"] != pcm_payload_bytes + wav_header_bytes
+        ):
+            raise ArtifactAccessError("not_verified", "manifest audio bytes 域无效")
         previous_end = segment["end_sample"]
     if previous_end != sample_count:
         raise ArtifactAccessError("not_verified", "manifest audio sample_count 不一致")

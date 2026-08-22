@@ -40,7 +40,7 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "6740c9875ee6dcf1564062b3b7e63d995d4c01cdd1e3fadcc49bd54b13ffc899",
+        "sha256": "5808b4449201ce4657a3d0b80d018466c6294c81732d3b93a9f2b575c5e0d905",
         "bytes": 75_767,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
@@ -52,9 +52,17 @@ SCHEMA_GOLDENS = {
     "ylx-device-session-v1.schema.json": (
         "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
     ),
+    "ylx-device-session-v2.schema.json": (
+        "8dc6096981f3fc50f9b4418000431955e0ba9424c7c0257cd2e129251a6a715b"
+    ),
     "ylx-recording-state-v1.schema.json": (
         "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"
     ),
+}
+SCHEMA_REFERENCES_BY_VERSION = {
+    "v2": {"ylx-device-session-v1.schema.json", "ylx-recording-state-v1.schema.json"},
+    "v3": {"ylx-device-session-v1.schema.json", "ylx-recording-state-v1.schema.json"},
+    "v4": {"ylx-device-session-v2.schema.json", "ylx-recording-state-v1.schema.json"},
 }
 
 COMMON_ROUTE_GOLDEN = {
@@ -284,7 +292,7 @@ class GatewayContractResourceTest(unittest.TestCase):
             contract = api_resources.joinpath(golden["filename"]).read_text(encoding="utf-8")
             referenced = set(re.findall(r'\$ref: "\.\./schemas/([^"#]+)(?:#[^"]+)?"', contract))
             with self.subTest(version=version):
-                self.assertEqual(referenced, set(SCHEMA_GOLDENS))
+                self.assertEqual(referenced, SCHEMA_REFERENCES_BY_VERSION[version])
 
         for filename, expected_sha256 in SCHEMA_GOLDENS.items():
             with self.subTest(schema=filename):
