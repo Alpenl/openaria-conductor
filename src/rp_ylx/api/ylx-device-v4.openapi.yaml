@@ -48,6 +48,7 @@ x-ylx-security-profiles:
       - getCurrentSafeSwapReceipt
       - getPreview
       - getCameraFocus
+      - getNetworkStatus
       - setCameraFocus
       - listSessions
       - getSession
@@ -439,6 +440,43 @@ paths:
           $ref: "#/components/responses/InvalidCameraFocus"
         "500":
           $ref: "#/components/responses/InternalError"
+  /network:
+    get:
+      tags: [Device]
+      operationId: getNetworkStatus
+      summary: Read NetworkManager capabilities, device states, and mDNS coordinates
+      description: |
+        This resource is read-only and has no NetworkManager side effects. The supported
+        mode inventory does not imply that network mutation is currently enabled; clients
+        continue to use DeviceDescriptor.capabilities.network_mutation as the write gate.
+        No Wi-Fi secret, saved profile, credential, or mutation receipt is returned.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current read-only network status
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: NetworkManager status is temporarily unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /sessions:
     get:
       tags: [Sessions]
@@ -1123,6 +1161,71 @@ components:
         default_route:
           enum: [wifi_client, wired, none]
           description: Interface class currently owning the default route
+    NetworkStatus:
+      type: object
+      additionalProperties: false
+      required: [format, capabilities, mdns, devices]
+      properties:
+        format:
+          type: string
+          const: ylx.network-status.v0
+        capabilities:
+          type: object
+          additionalProperties: false
+          required: [modes, wifi_interface, ethernet_interface, second_wifi]
+          properties:
+            modes:
+              type: array
+              const: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
+              items:
+                enum: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
+            wifi_interface:
+              type: string
+              pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+            ethernet_interface:
+              type: string
+              pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+            second_wifi:
+              type: boolean
+        mdns:
+          type: object
+          additionalProperties: false
+          required: [hostname, service, aliases, port]
+          properties:
+            hostname:
+              type: string
+              pattern: '^[A-Za-z0-9_.-]{1,122}\.local$'
+            service:
+              type: string
+              pattern: '^[A-Za-z0-9_.-]{1,128}$'
+            aliases:
+              type: array
+              maxItems: 16
+              uniqueItems: true
+              items:
+                type: string
+                pattern: '^[A-Za-z0-9_.-]{1,128}$'
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+        devices:
+          type: array
+          maxItems: 64
+          items:
+            type: object
+            additionalProperties: false
+            required: [interface, type, state]
+            properties:
+              interface:
+                type: string
+                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+              type:
+                type: string
+                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+              state:
+                type: string
+                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
     NetworkInterfaceStatus:
       type: object
       additionalProperties: false

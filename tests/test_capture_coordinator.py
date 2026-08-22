@@ -41,6 +41,7 @@ from rp_ylx.recording import (
     validate_device_session_directory,
 )
 from rp_ylx.recording.coordinator import _TrackedRepresentation
+from rp_ylx.recording.device_session import inspect_device_session_directory
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 
 JPEG = b"\xff\xd8raw-side-by-side\xff\xd9"
@@ -740,6 +741,33 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertIsNone(second_page["next_cursor"])
         finally:
             coordinator.close()
+
+    def test_list_sessions_reuses_startup_catalog_instead_of_reinspecting_artifacts(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="catalog-cache")
+        finally:
+            first.close()
+
+        with patch(
+            "rp_ylx.recording.coordinator.inspect_device_session_directory",
+            side_effect=inspect_device_session_directory,
+        ) as inspect_session:
+            restarted = self.coordinator()
+            try:
+                startup_inspections = inspect_session.call_count
+                self.assertGreater(startup_inspections, 0)
+
+                for _ in range(2):
+                    listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                    self.assertEqual(
+                        [item["session_id"] for item in listed["items"]],
+                        [session_id],
+                    )
+
+                self.assertEqual(inspect_session.call_count, startup_inspections)
+            finally:
+                restarted.close()
 
     def test_raw_sbs_frame_is_used_for_preview_without_eye_materialization(self) -> None:
         coordinator = self.coordinator()

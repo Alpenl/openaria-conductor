@@ -322,14 +322,14 @@ class ProductionDaemonTest(unittest.TestCase):
         finally:
             pump.close()
 
-    def test_event_pump_default_polling_is_not_faster_than_progress_throttle(self) -> None:
+    def test_event_pump_defaults_keep_idle_light_and_active_progress_live(self) -> None:
         source = {"authority_epoch": str(uuid.uuid4()), "source_revision": 1}
         coordinator = Mock(capture_snapshot_event=lambda: dict(source))
         event_buffer = Mock()
         pump = CaptureEventPump(coordinator, event_buffer)
         try:
             self.assertEqual(pump._interval, 1.0)
-            self.assertEqual(pump._progress_interval, 1.0)
+            self.assertEqual(pump._progress_interval, 0.2)
         finally:
             pump.close()
 

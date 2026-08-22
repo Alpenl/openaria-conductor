@@ -134,6 +134,36 @@ class InstalledWheelTest(unittest.TestCase):
                         text=True,
                     ).stdout
                 )
+                embedded_web = json.loads(
+                    subprocess.run(
+                        [
+                            str(python),
+                            "-c",
+                            (
+                                "import hashlib, json; "
+                                "from rp_ylx.web import "
+                                "ECHO_WEB_SOURCE_COMMIT, asset_content_type, "
+                                "read_asset, web_assets; "
+                                "payload={"
+                                "'source_commit': ECHO_WEB_SOURCE_COMMIT, "
+                                "'assets': {"
+                                "name: {"
+                                "'bytes': len(read_asset(name)), "
+                                "'sha256': hashlib.sha256(read_asset(name)).hexdigest(), "
+                                "'content_type': asset_content_type(name),"
+                                "} for name in sorted(web_assets())"
+                                "}"
+                                "}; "
+                                "print(json.dumps(payload, sort_keys=True))"
+                            ),
+                        ],
+                        cwd=external_root,
+                        env=environment,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                )
                 module_path = Path(
                     subprocess.run(
                         [
@@ -158,6 +188,35 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertIn("capability_probe", status["native"]["features"])
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])
+                self.assertEqual(
+                    embedded_web,
+                    {
+                        "source_commit": "c47e05813597f6d5c0eb5abad21dc3f57e7157bd",
+                        "assets": {
+                            "app.js": {
+                                "bytes": 74551,
+                                "content_type": "text/javascript; charset=utf-8",
+                                "sha256": (
+                                    "8ff363ae1c2a34b28e0a94e1b238481fd2f44eb9abac50bd6f3970b65e577052"
+                                ),
+                            },
+                            "index.html": {
+                                "bytes": 454,
+                                "content_type": "text/html; charset=utf-8",
+                                "sha256": (
+                                    "6149533de647bab93b56d60bd2c3568e78ce675b83c9dc438ea8c614e94a2272"
+                                ),
+                            },
+                            "styles.css": {
+                                "bytes": 19206,
+                                "content_type": "text/css; charset=utf-8",
+                                "sha256": (
+                                    "3ff1df2c1d656f1ede999d24c17d9ad3543bf5493792c9d664cf0511d34e51b1"
+                                ),
+                            },
+                        },
+                    },
+                )
                 self.assertIn(virtual_environment, module_path.parents)
                 self.assertIn("site-packages", module_path.parts)
                 self.assertNotIn(REPOSITORY.resolve(), module_path.parents)

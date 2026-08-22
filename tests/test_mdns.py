@@ -29,15 +29,15 @@ class MdnsPublisherTest(unittest.TestCase):
         runtime = {
             "network": {
                 "ap": {"addresses": ["10.42.0.1/24", "invalid"]},
-                "wifi_client": {"addresses": ["192.168.110.36/24", "127.0.0.1/8"]},
-                "wired": {"addresses": ["169.254.1.2/16", "192.168.110.36/24"]},
+                "wifi_client": {"addresses": ["198.51.100.36/24", "127.0.0.1/8"]},
+                "wired": {"addresses": ["169.254.1.2/16", "198.51.100.36/24"]},
             }
         }
         with patch("rp_ylx.mdns.collect_linux_runtime", return_value=runtime):
-            self.assertEqual(runtime_ipv4_addresses(), ("10.42.0.1", "192.168.110.36"))
+            self.assertEqual(runtime_ipv4_addresses(), ("10.42.0.1", "198.51.100.36"))
 
     def test_publisher_registers_both_services_and_refreshes_after_address_change(self) -> None:
-        current = [("192.168.110.36",)]
+        current = [("198.51.100.36",)]
         responders: list[FakeResponder] = []
 
         def factory(addresses: tuple[str, ...]) -> FakeResponder:
@@ -55,21 +55,21 @@ class MdnsPublisherTest(unittest.TestCase):
         try:
             self._wait_for(lambda: len(responders) == 1)
             first = responders[0]
-            self.assertEqual(first.addresses, ("192.168.110.36",))
+            self.assertEqual(first.addresses, ("198.51.100.36",))
             self.assertEqual(
                 {service.type for service, _ in first.registered}, set(MDNS_SERVICE_TYPES)
             )
             for service, options in first.registered:
                 self.assertEqual(service.server, MDNS_HOSTNAME)
                 self.assertEqual(service.port, 8080)
-                self.assertEqual(service.parsed_addresses(), ["192.168.110.36"])
+                self.assertEqual(service.parsed_addresses(), ["198.51.100.36"])
                 self.assertEqual(options, {"allow_name_change": True})
 
-            current[0] = ("192.168.110.37",)
+            current[0] = ("198.51.100.37",)
             self._wait_for(lambda: len(responders) == 2)
             self.assertTrue(first.closed)
             self.assertEqual(len(first.unregistered), 2)
-            self.assertEqual(responders[1].addresses, ("192.168.110.37",))
+            self.assertEqual(responders[1].addresses, ("198.51.100.37",))
 
             current[0] = ()
             self._wait_for(lambda: responders[1].closed)
