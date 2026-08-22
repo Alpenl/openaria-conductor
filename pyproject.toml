@@ -51,7 +51,8 @@ rp_ylx = [
   "rp-ylx-data-volume",
   "rp-ylx-wifi-watchdog",
 ]
-"rp_ylx.web" = ["*.html", "*.css", "*.js"]
+# Echo / Web 制品：托管集合由内部 assets.json 声明，打包时必须整份带上。
+"rp_ylx.web" = ["assets.json", "*.html", "*.css", "*.js"]
 
 [tool.ruff]
 line-length = 100
