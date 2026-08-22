@@ -1,10 +1,11 @@
-# RP-YLX
+# Open Aria Conductor
 
-RP-YLX 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 的双目视频与 IMU 同步录制
-软件。本版本只支持这一硬件组合；Raspberry Pi 仅保留为旧项目历史参考，不属于支持矩阵。
-Project #1 已完成 Rewrite MVP；本仓库在该可运行基线上继续交付 0.5 功能。
+Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 的双目视频与 IMU
+同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。0.5 代码仍保留
+`rp-ylx` package、CLI、systemd unit 和数据标识，以兼容现有安装与已录制会话。
 
-旧项目参考：<https://github.com/mirrorbloom/RP-YLX>
+浏览器控制端由 [Open Aria Echo / Web](https://github.com/Alpenl/openaria-echo-web)
+独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
 
 ## 项目职责
 
@@ -19,7 +20,7 @@ Project #1 已完成 Rewrite MVP；本仓库在该可运行基线上继续交付
 
 ## 项目边界
 
-RP-YLX 负责设备端采集以及写入 RDK X5 存储设备的录制会话。PC 端会话管理、批量数据处理和
+Conductor 负责设备端采集以及写入 RDK X5 存储设备的录制会话。PC 端会话管理、批量数据处理和
 最终结果展示不属于本项目。
 
 录制正确性不能依赖预览客户端是否在线。预览、日志和控制通信不得暗中改变采集格式，
@@ -27,9 +28,9 @@ RP-YLX 负责设备端采集以及写入 RDK X5 存储设备的录制会话。PC
 
 ## 对外接口
 
-- 供 `ylx-card-pipeline` 和 `ylx-transfer` 使用的录制会话格式。
-- RP-YLX 自带 Web Server 使用的实时预览、控制、状态和诊断接口。
-- `ylx-preview` 仅是未来移动端规划，不属于当前交付。
+- 供 Open Aria Bridge / SDK 与 Desktop 使用的录制会话格式。
+- Echo / Web 使用的实时预览、控制、状态和诊断 Device API。
+- 未来移动端可复用的同一 Device API；移动端不属于当前交付。
 - 可在没有真实相机时运行自动化测试的硬件抽象接口。
 
 任何消费者依赖具体实现行为之前，都必须先确定接口版本和兼容规则。
@@ -75,4 +76,4 @@ RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援
 
 Rewrite MVP 已建立最小可运行基线。0.5 的差量功能按 GitHub Issue 逐项实现与验收。
 
-开发任务以 [GitHub Issues](https://github.com/mirrorbloom/RP-YLX/issues?q=state%3Aopen%20label%3Arewrite) 为准。
+公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。

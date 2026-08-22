@@ -34,7 +34,7 @@ class LinuxRuntimeTelemetryTest(unittest.TestCase):
                 net_root=net_root,
                 route_path=route,
                 thermal_paths=(thermal,),
-                ipv4_lookup=lambda name: ["192.168.110.36/24"] if name == "wlan0" else [],
+                ipv4_lookup=lambda name: ["198.51.100.36/24"] if name == "wlan0" else [],
             )
 
         self.assertEqual(runtime["connection_method"], "wifi_client")
@@ -44,7 +44,7 @@ class LinuxRuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(runtime["network"]["wifi_client"]["interface"], "wlan0")
         self.assertEqual(
             runtime["network"]["wifi_client"]["addresses"],
-            ["192.168.110.36/24"],
+            ["198.51.100.36/24"],
         )
         self.assertEqual(runtime["network"]["wired"]["state"], "disconnected")
 

@@ -26,6 +26,8 @@ from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderErr
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.network import NetworkError
+from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -365,12 +367,15 @@ class CaptureCoordinator:
         self._lock = threading.RLock()
         self._stop_condition = threading.Condition(self._lock)
         self._storage_lock = threading.Lock()
+        self._catalog_lock = threading.Lock()
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
         self._active: DeviceSessionRecorder | None = None
         self._active_plan: SessionPlan | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
+        self._session_summaries: dict[str, dict[str, object]] = {}
+        self._session_diagnostics: dict[str, dict[str, object]] = {}
         self._latest_imu: _LatestImuReceipt | None = None
         self._open_representations = 0
         self._released = False
@@ -737,22 +742,106 @@ class CaptureCoordinator:
 
     def _catalog_sessions(self) -> None:
         admission = self._require_admission()
-        for sessions_root in admission.catalog_roots:
-            for candidate in sessions_root.iterdir():
-                if (
-                    not candidate.is_dir()
-                    or candidate.name.endswith(".partial")
-                    or candidate.name in self._verified
-                ):
-                    continue
-                try:
-                    parsed = uuid.UUID(candidate.name)
-                    if parsed.version != 7 or str(parsed) != candidate.name:
+        # Sealed directories are immutable; rescan names for arrivals/removals but inspect once.
+        with self._catalog_lock:
+            discovered: set[str] = set()
+            for sessions_root in admission.catalog_roots:
+                for candidate in sessions_root.iterdir():
+                    if (
+                        not candidate.is_dir()
+                        or candidate.name.endswith(".partial")
+                        or candidate.name in discovered
+                    ):
                         continue
-                    _, payload = inspect_device_session_directory(candidate)
-                    self._verified[candidate.name] = hashlib.sha256(payload).hexdigest()
-                except (OSError, ValueError, DeviceRecordingError):
-                    continue
+                    discovered.add(candidate.name)
+                    if (
+                        candidate.name in self._session_summaries
+                        or candidate.name in self._session_diagnostics
+                    ):
+                        continue
+                    if candidate.name in self._retained and candidate.name not in self._verified:
+                        self._session_diagnostics[candidate.name] = self._session_diagnostic(
+                            "会话发布失败，未进入可下载 catalog"
+                        )
+                        continue
+                    try:
+                        manifest, payload = inspect_device_session_directory(candidate)
+                        self._session_summaries[candidate.name] = self._session_summary(
+                            candidate.name,
+                            manifest,
+                            payload,
+                        )
+                        self._verified[candidate.name] = hashlib.sha256(payload).hexdigest()
+                    except (
+                        OSError,
+                        DeviceRecordingError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        self._session_diagnostics[candidate.name] = self._session_diagnostic(error)
+
+            for session_id in set(self._session_summaries) - discovered:
+                self._session_summaries.pop(session_id, None)
+                self._verified.pop(session_id, None)
+            for session_id in set(self._session_diagnostics) - discovered:
+                self._session_diagnostics.pop(session_id, None)
+
+    @staticmethod
+    def _session_diagnostic(error: object) -> dict[str, object]:
+        return {
+            "quarantine_id": str(uuid.uuid4()),
+            "code": "manifest_invalid",
+            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "message": str(error)[:512],
+        }
+
+    @staticmethod
+    def _session_summary(
+        session_id: str,
+        manifest: Mapping[str, object],
+        manifest_payload: bytes,
+    ) -> dict[str, object]:
+        take = manifest["take"]
+        timing = manifest["time"]
+        device = manifest["device"]
+        integrity = manifest["integrity"]
+        if not all(isinstance(value, Mapping) for value in (take, timing, device, integrity)):
+            raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        return {
+            "session_id": manifest["session_id"],
+            "producer_outcome": "sealed",
+            "take_id": take["take_id"],
+            "take_sequence": take["sequence"],
+            "continuation_of": take["continuation_of"],
+            "display_name": manifest["display_name"],
+            "device": {
+                "device_id": device["device_id"],
+                "device_label": device["device_label"],
+            },
+            "started_at": timing["started_at"],
+            "ended_at": timing["ended_at"],
+            "duration_seconds": timing["duration_seconds"],
+            "total_bytes": manifest_artifact_bytes_total(
+                manifest,
+                manifest_bytes=manifest_payload,
+                session_id=session_id,
+                code="manifest_invalid",
+            ),
+            "verification": {
+                "actor": "gateway",
+                "validator": {
+                    "name": "rp-ylx-device-session-v1",
+                    "version": "1",
+                    "build_sha256": hashlib.sha256(b"rp-ylx-device-session-v1").hexdigest(),
+                },
+                "manifest_sha256": manifest_sha256,
+                "verified_at": integrity["verified_at"],
+                "verdict": "usable",
+                "diagnostics": [],
+            },
+        }
 
     def _recording_snapshot(self) -> tuple[str, object | None, object | None]:
         if self._active is not None:
@@ -988,6 +1077,17 @@ class CaptureCoordinator:
                 error.message,
                 status=status,
                 retryable=error.retryable,
+            ) from error
+
+    def network_status(self) -> Mapping[str, object]:
+        try:
+            return collect_network_status()
+        except NetworkError as error:
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
             ) from error
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
@@ -1304,7 +1404,14 @@ class CaptureCoordinator:
                         status=HTTPStatus.CONFLICT,
                         retryable=True,
                     )
-                self._verified[plan.session_id] = sealed.manifest_sha256
+                with self._catalog_lock:
+                    self._verified[plan.session_id] = sealed.manifest_sha256
+                    self._session_summaries[plan.session_id] = self._session_summary(
+                        plan.session_id,
+                        sealed.manifest,
+                        sealed.manifest_bytes,
+                    )
+                    self._session_diagnostics.pop(plan.session_id, None)
                 self._active = None
                 self._active_plan = None
                 self._latest_imu = None
@@ -1682,87 +1789,15 @@ class CaptureCoordinator:
                 status=HTTPStatus.CONFLICT,
                 retryable=True,
             ) from error
-        admission = self._require_admission()
-        items: list[dict[str, object]] = []
-        diagnostics: list[dict[str, object]] = []
-        seen_sessions: set[str] = set()
-        for sessions_root in admission.catalog_roots:
-            for candidate in sorted(sessions_root.iterdir(), key=lambda path: path.name):
-                if (
-                    not candidate.is_dir()
-                    or candidate.name.endswith(".partial")
-                    or candidate.name in seen_sessions
-                ):
-                    continue
-                seen_sessions.add(candidate.name)
-                if candidate.name in self._retained and candidate.name not in self._verified:
-                    diagnostics.append(
-                        {
-                            "quarantine_id": str(uuid.uuid4()),
-                            "code": "manifest_invalid",
-                            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                            "message": "会话发布失败，未进入可下载 catalog",
-                        }
-                    )
-                    continue
-                try:
-                    manifest, manifest_payload = inspect_device_session_directory(candidate)
-                    take = manifest["take"]
-                    timing = manifest["time"]
-                    device = manifest["device"]
-                    if not all(isinstance(value, Mapping) for value in (take, timing, device)):
-                        raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
-                    if take_id is not None and take["take_id"] != take_id:
-                        continue
-                    total_bytes = manifest_artifact_bytes_total(
-                        manifest,
-                        manifest_bytes=manifest_payload,
-                        session_id=candidate.name,
-                        code="manifest_invalid",
-                    )
-                    manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-                    self._verified[candidate.name] = manifest_sha256
-                    items.append(
-                        {
-                            "session_id": manifest["session_id"],
-                            "producer_outcome": "sealed",
-                            "take_id": take["take_id"],
-                            "take_sequence": take["sequence"],
-                            "continuation_of": take["continuation_of"],
-                            "display_name": manifest["display_name"],
-                            "device": {
-                                "device_id": device["device_id"],
-                                "device_label": device["device_label"],
-                            },
-                            "started_at": timing["started_at"],
-                            "ended_at": timing["ended_at"],
-                            "duration_seconds": timing["duration_seconds"],
-                            "total_bytes": total_bytes,
-                            "verification": {
-                                "actor": "gateway",
-                                "validator": {
-                                    "name": "rp-ylx-device-session-v1",
-                                    "version": "1",
-                                    "build_sha256": hashlib.sha256(
-                                        b"rp-ylx-device-session-v1"
-                                    ).hexdigest(),
-                                },
-                                "manifest_sha256": manifest_sha256,
-                                "verified_at": manifest["integrity"]["verified_at"],
-                                "verdict": "usable",
-                                "diagnostics": [],
-                            },
-                        }
-                    )
-                except (OSError, DeviceRecordingError, KeyError, TypeError, ValueError) as error:
-                    diagnostics.append(
-                        {
-                            "quarantine_id": str(uuid.uuid4()),
-                            "code": "manifest_invalid",
-                            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                            "message": str(error)[:512],
-                        }
-                    )
+        self._require_admission()
+        self._catalog_sessions()
+        with self._catalog_lock:
+            items = [
+                copy.deepcopy(item)
+                for item in self._session_summaries.values()
+                if take_id is None or item["take_id"] == take_id
+            ]
+            diagnostics = copy.deepcopy(list(self._session_diagnostics.values()))
         items.sort(
             key=lambda item: (str(item["started_at"]), str(item["session_id"])),
             reverse=True,

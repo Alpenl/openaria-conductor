@@ -231,6 +231,7 @@ impl V4l2Io for SystemIo {
 struct ControlDevice {
     io: Arc<dyn V4l2Io>,
     fd: Option<RawFd>,
+    close_on_drop: bool,
 }
 
 impl ControlDevice {
@@ -242,7 +243,19 @@ impl ControlDevice {
         let fd = io
             .open(&path)
             .map_err(|error| CaptureError::io("camera_focus_open_failed", "open", error))?;
-        Ok(Self { io, fd: Some(fd) })
+        Ok(Self {
+            io,
+            fd: Some(fd),
+            close_on_drop: true,
+        })
+    }
+
+    fn borrowed(io: Arc<dyn V4l2Io>, fd: RawFd) -> Self {
+        Self {
+            io,
+            fd: Some(fd),
+            close_on_drop: false,
+        }
     }
 
     fn fd(&self) -> Result<RawFd, CaptureError> {
@@ -252,7 +265,9 @@ impl ControlDevice {
 
     fn close(&mut self) {
         if let Some(fd) = self.fd.take() {
-            let _ = self.io.close(fd);
+            if self.close_on_drop {
+                let _ = self.io.close(fd);
+            }
         }
     }
 
@@ -311,6 +326,72 @@ impl ControlDevice {
             .ioctl(self.fd()?, SET_CONTROL, &mut payload)
             .map_err(|error| CaptureError::io("camera_focus_set_failed", "VIDIOC_S_CTRL", error))
     }
+
+    fn focus_status(&self) -> Result<Option<FocusStatus>, CaptureError> {
+        let Some(focus) = self.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
+            return Ok(None);
+        };
+        let value = self.get_control(CID_FOCUS_ABSOLUTE)?;
+        let auto = self.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
+        let auto_enabled = if auto.is_some() {
+            Some(self.get_control(CID_FOCUS_AUTO)? != 0)
+        } else {
+            None
+        };
+        Ok(Some(FocusStatus {
+            value,
+            minimum: focus.minimum,
+            maximum: focus.maximum,
+            step: focus.step,
+            default_value: focus.default_value,
+            auto_supported: auto.is_some(),
+            auto_enabled,
+        }))
+    }
+
+    fn set_focus(
+        &self,
+        value: Option<i32>,
+        auto_enabled: Option<bool>,
+    ) -> Result<FocusStatus, CaptureError> {
+        let Some(focus) = self.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
+            return Err(CaptureError::new(
+                "camera_focus_unsupported",
+                "V4L2 device does not expose focus_absolute",
+            ));
+        };
+        let auto = self.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
+        if let Some(enabled) = auto_enabled {
+            if auto.is_none() {
+                return Err(CaptureError::new(
+                    "camera_focus_auto_unsupported",
+                    "V4L2 device does not expose focus_auto",
+                ));
+            }
+            self.set_control(CID_FOCUS_AUTO, i32::from(enabled))?;
+        }
+        if let Some(next) = value {
+            if next < focus.minimum
+                || next > focus.maximum
+                || (next - focus.minimum) % focus.step != 0
+            {
+                return Err(CaptureError::new(
+                    "invalid_camera_focus",
+                    format!(
+                        "focus value must be between {} and {} with step {}",
+                        focus.minimum, focus.maximum, focus.step
+                    ),
+                ));
+            }
+            if auto.is_some() && auto_enabled != Some(false) {
+                self.set_control(CID_FOCUS_AUTO, 0)?;
+            }
+            self.set_control(CID_FOCUS_ABSOLUTE, next)?;
+        }
+        self.focus_status()?.ok_or_else(|| {
+            CaptureError::new("camera_focus_unsupported", "focus control disappeared")
+        })
+    }
 }
 
 impl Drop for ControlDevice {
@@ -349,25 +430,7 @@ fn read_i64(payload: &[u8], offset: usize) -> i64 {
 
 pub(crate) fn focus_status(device: &str) -> Result<Option<FocusStatus>, CaptureError> {
     let control = ControlDevice::open(device)?;
-    let Some(focus) = control.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
-        return Ok(None);
-    };
-    let value = control.get_control(CID_FOCUS_ABSOLUTE)?;
-    let auto = control.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
-    let auto_enabled = if auto.is_some() {
-        Some(control.get_control(CID_FOCUS_AUTO)? != 0)
-    } else {
-        None
-    };
-    Ok(Some(FocusStatus {
-        value,
-        minimum: focus.minimum,
-        maximum: focus.maximum,
-        step: focus.step,
-        default_value: focus.default_value,
-        auto_supported: auto.is_some(),
-        auto_enabled,
-    }))
+    control.focus_status()
 }
 
 pub(crate) fn set_focus(
@@ -376,40 +439,7 @@ pub(crate) fn set_focus(
     auto_enabled: Option<bool>,
 ) -> Result<FocusStatus, CaptureError> {
     let control = ControlDevice::open(device)?;
-    let Some(focus) = control.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
-        return Err(CaptureError::new(
-            "camera_focus_unsupported",
-            "V4L2 device does not expose focus_absolute",
-        ));
-    };
-    let auto = control.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
-    if let Some(enabled) = auto_enabled {
-        if auto.is_none() {
-            return Err(CaptureError::new(
-                "camera_focus_auto_unsupported",
-                "V4L2 device does not expose focus_auto",
-            ));
-        }
-        control.set_control(CID_FOCUS_AUTO, i32::from(enabled))?;
-    }
-    if let Some(next) = value {
-        if next < focus.minimum || next > focus.maximum || (next - focus.minimum) % focus.step != 0
-        {
-            return Err(CaptureError::new(
-                "invalid_camera_focus",
-                format!(
-                    "focus value must be between {} and {} with step {}",
-                    focus.minimum, focus.maximum, focus.step
-                ),
-            ));
-        }
-        if auto.is_some() && auto_enabled != Some(false) {
-            control.set_control(CID_FOCUS_AUTO, 0)?;
-        }
-        control.set_control(CID_FOCUS_ABSOLUTE, next)?;
-    }
-    focus_status(device)?
-        .ok_or_else(|| CaptureError::new("camera_focus_unsupported", "focus control disappeared"))
+    control.set_focus(value, auto_enabled)
 }
 
 fn queue_payload(index: u32) -> [u8; 88] {
@@ -499,6 +529,18 @@ impl Capture {
     fn fd(&self) -> Result<RawFd, CaptureError> {
         self.fd
             .ok_or_else(|| CaptureError::new("invalid_state", "V4L2 capture is closed"))
+    }
+
+    pub(crate) fn focus_status(&self) -> Result<Option<FocusStatus>, CaptureError> {
+        ControlDevice::borrowed(Arc::clone(&self.io), self.fd()?).focus_status()
+    }
+
+    pub(crate) fn set_focus(
+        &self,
+        value: Option<i32>,
+        auto_enabled: Option<bool>,
+    ) -> Result<FocusStatus, CaptureError> {
+        ControlDevice::borrowed(Arc::clone(&self.io), self.fd()?).set_focus(value, auto_enabled)
     }
 
     fn call(
@@ -859,8 +901,11 @@ mod tests {
 
     struct FakeIo {
         calls: Mutex<Vec<c_ulong>>,
+        opened: Mutex<usize>,
         closed: Mutex<usize>,
         frames: Mutex<VecDeque<FakeFrame>>,
+        focus: Mutex<i32>,
+        auto_focus: Mutex<i32>,
     }
 
     type FakeFrame = (u32, u64, Vec<u8>, u32);
@@ -869,14 +914,18 @@ mod tests {
         fn new(frames: Vec<FakeFrame>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                opened: Mutex::new(0),
                 closed: Mutex::new(0),
                 frames: Mutex::new(frames.into()),
+                focus: Mutex::new(32),
+                auto_focus: Mutex::new(1),
             }
         }
     }
 
     impl V4l2Io for FakeIo {
         fn open(&self, _path: &CString) -> io::Result<RawFd> {
+            *self.opened.lock().unwrap() += 1;
             Ok(7)
         }
 
@@ -915,6 +964,43 @@ mod tests {
                     );
                 }
                 QUEUE_BUFFER | STREAM_ON | STREAM_OFF => {}
+                QUERY_CONTROL => {
+                    let id = read_u32(payload, 0);
+                    match id {
+                        CID_FOCUS_ABSOLUTE => {
+                            write_u32(payload, 4, CTRL_TYPE_INTEGER);
+                            write_i32(payload, 40, 0);
+                            write_i32(payload, 44, 255);
+                            write_i32(payload, 48, 1);
+                            write_i32(payload, 52, 32);
+                        }
+                        CID_FOCUS_AUTO => {
+                            write_u32(payload, 4, CTRL_TYPE_BOOLEAN);
+                            write_i32(payload, 40, 0);
+                            write_i32(payload, 44, 1);
+                            write_i32(payload, 48, 1);
+                            write_i32(payload, 52, 1);
+                        }
+                        _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                    }
+                }
+                GET_CONTROL => {
+                    let value = match read_u32(payload, 0) {
+                        CID_FOCUS_ABSOLUTE => *self.focus.lock().unwrap(),
+                        CID_FOCUS_AUTO => *self.auto_focus.lock().unwrap(),
+                        _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                    };
+                    write_i32(payload, 4, value);
+                }
+                SET_CONTROL => match read_u32(payload, 0) {
+                    CID_FOCUS_ABSOLUTE => {
+                        *self.focus.lock().unwrap() = read_i32(payload, 4);
+                    }
+                    CID_FOCUS_AUTO => {
+                        *self.auto_focus.lock().unwrap() = read_i32(payload, 4);
+                    }
+                    _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                },
                 _ => panic!("unexpected ioctl {request:#x}"),
             }
             Ok(())
@@ -992,6 +1078,26 @@ mod tests {
         assert!(calls.contains(&DEQUEUE_BUFFER));
         assert!(calls.contains(&QUEUE_BUFFER));
         assert!(calls.contains(&STREAM_OFF));
+    }
+
+    #[test]
+    fn active_capture_focus_reuses_the_capture_file_descriptor() {
+        let io = Arc::new(FakeIo::new(vec![]));
+        let mut capture =
+            Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
+        capture.start().unwrap();
+
+        let initial = capture.focus_status().unwrap().unwrap();
+        assert_eq!(initial.value, 32);
+        assert!(initial.auto_enabled.unwrap());
+        let updated = capture.set_focus(Some(64), Some(false)).unwrap();
+        assert_eq!(updated.value, 64);
+        assert_eq!(updated.auto_enabled, Some(false));
+        assert_eq!(*io.opened.lock().unwrap(), 1);
+        assert_eq!(*io.closed.lock().unwrap(), 0);
+
+        capture.close();
+        assert_eq!(*io.closed.lock().unwrap(), 1);
     }
 
     #[test]

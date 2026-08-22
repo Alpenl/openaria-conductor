@@ -896,6 +896,99 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         self.assertTrue(imu.closed.is_set())
         self.assertTrue(runtime.closed)
 
+    def test_native_continuous_sources_use_open_camera_for_focus_controls(self) -> None:
+        runtime = FakeNativeContinuousRuntime()
+        preview = SimpleNamespace(native_owner=object())
+        focus = {
+            "schema": "ylx.camera-focus.v1",
+            "value": 42,
+            "minimum": 0,
+            "maximum": 255,
+            "step": 1,
+            "default": 32,
+            "auto_supported": True,
+            "auto_enabled": False,
+        }
+        focus_commands: list[tuple[int | None, bool | None]] = []
+
+        def set_focus(
+            *,
+            value: int | None,
+            auto_enabled: bool | None,
+        ) -> dict[str, object]:
+            focus_commands.append((value, auto_enabled))
+            return {**focus, "value": value}
+
+        camera = SimpleNamespace(
+            close=lambda: None,
+            camera_focus_status=unittest.mock.Mock(return_value=focus),
+            set_camera_focus=unittest.mock.Mock(side_effect=set_focus),
+        )
+        sources = NativeContinuousCaptureSources(
+            "/dev/video0",
+            lambda: BlockingImu(),
+            CameraMode(3840, 1080, 60.0, "mjpg"),
+            preview=preview,
+            read_timeout=0.1,
+        )
+        try:
+            with (
+                patch("rp_ylx.recording.sources.create_native_camera", return_value=camera),
+                patch(
+                    "rp_ylx.recording.sources.create_native_continuous_capture_runtime",
+                    return_value=runtime,
+                ),
+            ):
+                sources.start_preview()
+                self.assertEqual(sources.camera_focus_status(), focus)
+                self.assertEqual(
+                    sources.set_camera_focus(value=64, auto_enabled=False),
+                    {**focus, "value": 64},
+                )
+            camera.camera_focus_status.assert_called_once_with()
+            camera.set_camera_focus.assert_called_once_with(
+                value=64,
+                auto_enabled=False,
+            )
+            self.assertEqual(focus_commands, [(64, False)])
+        finally:
+            sources.close()
+
+    def test_native_continuous_sources_treat_missing_v4l2_focus_as_unsupported(self) -> None:
+        runtime = FakeNativeContinuousRuntime()
+        camera = SimpleNamespace(
+            close=lambda: None,
+            camera_focus_status=unittest.mock.Mock(
+                side_effect=RuntimeError("camera_focus_unsupported: 相机没有可读取的焦距控制")
+            ),
+            set_camera_focus=unittest.mock.Mock(
+                side_effect=RuntimeError("camera_focus_unsupported: 相机没有可读取的焦距控制")
+            ),
+        )
+        sources = NativeContinuousCaptureSources(
+            "/dev/video0",
+            lambda: BlockingImu(),
+            CameraMode(3840, 1080, 60.0, "mjpg"),
+            preview=SimpleNamespace(native_owner=object()),
+            read_timeout=0.1,
+        )
+        try:
+            with (
+                patch("rp_ylx.recording.sources.create_native_camera", return_value=camera),
+                patch(
+                    "rp_ylx.recording.sources.create_native_continuous_capture_runtime",
+                    return_value=runtime,
+                ),
+            ):
+                sources.start_preview()
+                self.assertIsNone(sources.camera_focus_status())
+                with self.assertRaises(CameraError) as unsupported:
+                    sources.set_camera_focus(value=42)
+            self.assertEqual(unsupported.exception.code, "camera_focus_unsupported")
+            self.assertFalse(unsupported.exception.retryable)
+        finally:
+            sources.close()
+
     def test_native_continuous_sources_require_native_imu_by_default(self) -> None:
         imu = BlockingImu()
         runtime = FakeNativeContinuousRuntime()

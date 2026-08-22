@@ -48,6 +48,10 @@ WEB_CONTENT_SECURITY_POLICY = (
 )
 SUPPORTED_API_VERSIONS = frozenset({"v2", "v3", "v4"})
 CAMERA_FOCUS_API_VERSIONS = frozenset({"v4"})
+NETWORK_STATUS_API_VERSIONS = frozenset({"v4"})
+NETWORK_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]
+NETWORK_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+MDNS_TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
 def _valid_session_id(api_version: str, session_id: str) -> bool:
@@ -105,6 +109,8 @@ class DeviceProvider(Protocol):
     def camera_focus_status(self) -> Mapping[str, object] | None: ...
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult: ...
+
+    def network_status(self) -> Mapping[str, object]: ...
 
     def list_sessions(
         self, *, cursor: str | None, limit: int, take_id: str | None
@@ -416,6 +422,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         if len(parts) == 4 and parts[3] in {"device", "preview", "sessions"}:
             return ("GET", "OPTIONS")
+        if len(parts) == 4 and parts[2] in NETWORK_STATUS_API_VERSIONS and parts[3] == "network":
+            return ("GET", "OPTIONS")
         if len(parts) == 5 and parts[3] == "capture":
             if parts[4] in {"start", "stop"}:
                 return ("POST", "OPTIONS")
@@ -545,6 +553,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and parts[3:] == ["camera", "focus"]
         ):
             self._get_camera_focus()
+            return
+        if (
+            len(parts) == 4
+            and parts[1] == "api"
+            and parts[2] in NETWORK_STATUS_API_VERSIONS
+            and parts[3] == "network"
+        ):
+            self._get_network_status()
             return
         if (
             len(parts) == 4
@@ -727,6 +743,88 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._invalid_source_state("daemon camera focus 状态无效")
             return
         self._send_json(status, body, headers=headers)
+
+    @staticmethod
+    def _valid_network_status(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "format",
+            "capabilities",
+            "mdns",
+            "devices",
+        }:
+            return False
+        capabilities = value.get("capabilities")
+        mdns = value.get("mdns")
+        devices = value.get("devices")
+        if (
+            value.get("format") != "ylx.network-status.v0"
+            or not isinstance(capabilities, Mapping)
+            or set(capabilities) != {"modes", "wifi_interface", "ethernet_interface", "second_wifi"}
+            or capabilities.get("modes") != NETWORK_MODES
+            or not isinstance(capabilities.get("wifi_interface"), str)
+            or NETWORK_TOKEN.fullmatch(str(capabilities["wifi_interface"])) is None
+            or not isinstance(capabilities.get("ethernet_interface"), str)
+            or NETWORK_TOKEN.fullmatch(str(capabilities["ethernet_interface"])) is None
+            or type(capabilities.get("second_wifi")) is not bool
+            or not isinstance(mdns, Mapping)
+            or set(mdns) != {"hostname", "service", "aliases", "port"}
+            or not isinstance(mdns.get("hostname"), str)
+            or MDNS_TOKEN.fullmatch(str(mdns["hostname"])) is None
+            or not str(mdns["hostname"]).endswith(".local")
+            or not isinstance(mdns.get("service"), str)
+            or MDNS_TOKEN.fullmatch(str(mdns["service"])) is None
+            or not isinstance(mdns.get("aliases"), list)
+            or len(mdns["aliases"]) > 16
+            or any(
+                not isinstance(alias, str) or MDNS_TOKEN.fullmatch(alias) is None
+                for alias in mdns["aliases"]
+            )
+            or len(set(mdns["aliases"])) != len(mdns["aliases"])
+            or type(mdns.get("port")) is not int
+            or not 1 <= mdns["port"] <= 65535
+            or not isinstance(devices, list)
+            or len(devices) > 64
+        ):
+            return False
+        interfaces: set[str] = set()
+        for device in devices:
+            if (
+                not isinstance(device, Mapping)
+                or set(device) != {"interface", "type", "state"}
+                or not all(
+                    isinstance(device.get(key), str) for key in ("interface", "type", "state")
+                )
+                or any(
+                    NETWORK_TOKEN.fullmatch(str(device[key])) is None
+                    for key in ("interface", "type", "state")
+                )
+                or device["interface"] in interfaces
+            ):
+                return False
+            interfaces.add(str(device["interface"]))
+        return True
+
+    def _get_network_status(self) -> None:
+        if self._principal("getNetworkStatus") is None:
+            return
+        try:
+            status = self.server.provider.network_status()
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not self._valid_network_status(status):
+            self._invalid_source_state("daemon network 状态无效")
+            return
+        self._send_json(HTTPStatus.OK, status)
 
     def _capture_events(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("streamCaptureEvents") is None:

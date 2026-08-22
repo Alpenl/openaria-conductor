@@ -51,6 +51,7 @@ LAB_OPERATIONS = frozenset(
         "getCurrentSafeSwapReceipt",
         "getPreview",
         "getCameraFocus",
+        "getNetworkStatus",
         "setCameraFocus",
         "headSessionArtifact",
         "getSessionArtifact",
@@ -274,7 +275,7 @@ class CaptureEventPump:
         event_buffer: EventReplayBuffer,
         *,
         interval: float = 1.0,
-        progress_interval: float = 1.0,
+        progress_interval: float = 0.2,
     ) -> None:
         if interval <= 0 or progress_interval <= 0:
             raise ValueError("事件泵 interval 必须大于零")
@@ -295,7 +296,9 @@ class CaptureEventPump:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval):
+        while not self._stop.wait(
+            self._progress_interval if self._last_progress_key is not None else self._interval
+        ):
             now = time.monotonic()
             event = self._coordinator.capture_snapshot_event()
             source = (event["authority_epoch"], event["source_revision"])

@@ -15,7 +15,9 @@ performs reboot, network, power, partition, or service mutation.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -57,6 +59,59 @@ class HttpResult:
     payload: Any
     body: bytes
     latency_s: float
+
+
+class _EvidenceJournal:
+    """Append-only crash evidence for long acceptance runs."""
+
+    def __init__(self, path: Path, *, fsync_interval_seconds: float = 60.0) -> None:
+        self.path = path
+        self._fsync_interval_seconds = fsync_interval_seconds
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._next_fsync = time.monotonic() + max(0.0, fsync_interval_seconds)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = path.open("x", encoding="utf-8", newline="\n")
+
+    def append(self, kind: str, payload: Any) -> None:
+        with self._lock:
+            self._sequence += 1
+            record = {
+                "schema": "ylx.acceptance.live-projection-journal.v1",
+                "sequence": self._sequence,
+                "recorded_at": _utc_now(),
+                "kind": kind,
+                "payload": payload,
+            }
+            self._stream.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            self._stream.flush()
+            now = time.monotonic()
+            if self._fsync_interval_seconds <= 0 or now >= self._next_fsync:
+                os.fsync(self._stream.fileno())
+                self._next_fsync = now + max(0.0, self._fsync_interval_seconds)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._stream.closed:
+                return
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+            self._stream.close()
+
+    def __enter__(self) -> _EvidenceJournal:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 def _utc_now() -> str:
@@ -271,7 +326,13 @@ def _sse_monitor(
     *,
     reconnect_after_s: float,
     timeout: float = SSE_READ_TIMEOUT_SECONDS,
+    journal: _EvidenceJournal | None = None,
 ) -> None:
+    def emit(item: dict[str, Any]) -> None:
+        output.append(item)
+        if journal is not None:
+            journal.append("sse", item)
+
     last_event_id: str | None = None
     reconnect_done = False
     connected_at = time.monotonic()
@@ -286,7 +347,7 @@ def _sse_monitor(
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                output.append(
+                emit(
                     {
                         "kind": "connected",
                         "observed_at": _utc_now(),
@@ -299,7 +360,7 @@ def _sse_monitor(
                     if event is not None:
                         event["kind"] = "event"
                         event["observed_at"] = _utc_now()
-                        output.append(event)
+                        emit(event)
                         event_id = event.get("id")
                         if isinstance(event_id, str):
                             last_event_id = event_id
@@ -308,7 +369,7 @@ def _sse_monitor(
                         and last_event_id is not None
                         and time.monotonic() - connected_at >= reconnect_after_s
                     ):
-                        output.append(
+                        emit(
                             {
                                 "kind": "reconnect",
                                 "observed_at": _utc_now(),
@@ -321,7 +382,7 @@ def _sse_monitor(
                         continue
                 connected_at = time.monotonic()
         except Exception as exc:  # noqa: BLE001 - acceptance evidence should record failures.
-            output.append({"kind": "error", "observed_at": _utc_now(), "error": str(exc)})
+            emit({"kind": "error", "observed_at": _utc_now(), "error": str(exc)})
             stop.wait(min(1.0, timeout))
 
 
@@ -745,6 +806,7 @@ def _checks(
     reconciliation: dict[str, Any],
     range_probe: dict[str, Any],
     session_id: str | None = None,
+    stop_observation: dict[str, Any] | None = None,
 ) -> dict[str, bool]:
     first, last = _first_last_status(samples)
     first_progress = first.get("progress") if isinstance(first, dict) else None
@@ -776,6 +838,9 @@ def _checks(
     return {
         "device_commit_matches": expected_commit is None or device_commit == expected_commit,
         "preflight_idle": _active_recording(pre_status.payload) is None,
+        "stop_request_completed": isinstance(stop_observation, dict)
+        and stop_observation.get("request_error_type") is None
+        and stop_observation.get("idle_confirmed") is True,
         "status_samples_present": len(samples) >= expected_samples,
         "status_samples_healthy": len(valid_samples) == len(samples)
         and all(
@@ -857,6 +922,31 @@ def _imu_timestamp_advances(first: Any, last: Any) -> bool:
 
 
 def collect(args: argparse.Namespace) -> dict[str, Any]:
+    output = getattr(args, "output", None)
+    journal_path = (
+        output.with_name(f"{output.name}.journal.ndjson") if isinstance(output, Path) else None
+    )
+    journal = _EvidenceJournal(journal_path) if journal_path is not None else None
+    try:
+        return _collect(args, journal=journal)
+    except BaseException as exc:
+        if journal is not None:
+            with contextlib.suppress(Exception):
+                journal.append(
+                    "collector_error",
+                    {"type": type(exc).__name__, "message": str(exc)},
+                )
+        raise
+    finally:
+        if journal is not None:
+            journal.close()
+
+
+def _collect(
+    args: argparse.Namespace,
+    *,
+    journal: _EvidenceJournal | None,
+) -> dict[str, Any]:
     started_at = _utc_now()
     service_before = _service_status(args.service_name)
     mount = _data_mount_info(Path("/data"))
@@ -874,13 +964,18 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
     session_id: str | None = None
     stop_confirmed_idle = False
+    stop_observation: dict[str, Any] | None = None
+    cleanup_stop_observation: dict[str, Any] | None = None
     status_samples: list[dict[str, Any]] = []
     sse_events: list[dict[str, Any]] = []
     sse_stop = threading.Event()
     sse_thread = threading.Thread(
         target=_sse_monitor,
         args=(args.base_url, sse_stop, sse_events),
-        kwargs={"reconnect_after_s": args.sse_reconnect_after},
+        kwargs={
+            "reconnect_after_s": args.sse_reconnect_after,
+            "journal": journal,
+        },
         name="rp-ylx-live-projection-sse",
         daemon=True,
     )
@@ -912,33 +1007,28 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
             sample = _request(args.base_url, "GET", "/api/v3/capture/status", timeout=5)
-            status_samples.append(_status_sample(sample))
+            status_sample = _status_sample(sample)
+            status_samples.append(status_sample)
+            if journal is not None:
+                journal.append("status_sample", status_sample)
             time.sleep(args.sample_interval)
 
-        stop_result = _request(
+        stop_observation = _stop_and_wait(
             args.base_url,
-            "POST",
-            "/api/v3/capture/stop",
-            payload={"schema": "ylx.capture-stop.v2", "reason": "user"},
-            headers={"Idempotency-Key": f"live-projection-stop-{int(time.time())}"},
+            timeout_seconds=args.stop_timeout,
+            idempotency_key=f"live-projection-stop-{int(time.time())}",
         )
-        _require_status(stop_result, {200, 202, 204}, "capture stop")
-        _wait_for_idle(args.base_url, timeout_seconds=args.stop_timeout)
         stop_confirmed_idle = True
     finally:
         sse_stop.set()
         if sse_thread.is_alive():
             sse_thread.join(timeout=3.0)
         if session_id is not None and not stop_confirmed_idle:
-            cleanup = _request(
+            cleanup_stop_observation = _stop_and_wait(
                 args.base_url,
-                "POST",
-                "/api/v3/capture/stop",
-                payload={"schema": "ylx.capture-stop.v2", "reason": "user"},
-                headers={"Idempotency-Key": f"live-projection-cleanup-{int(time.time())}"},
+                timeout_seconds=args.stop_timeout,
+                idempotency_key=f"live-projection-cleanup-{int(time.time())}",
             )
-            _require_status(cleanup, {200, 202, 204}, "capture cleanup stop")
-            _wait_for_idle(args.base_url, timeout_seconds=args.stop_timeout)
 
     assert session_id is not None
     session_dir = args.recording_root / session_id
@@ -969,8 +1059,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         reconciliation=reconciliation,
         range_probe=range_probe,
         session_id=session_id,
+        stop_observation=stop_observation,
     )
-    return {
+    result = {
         "schema": SCHEMA,
         "started_at": started_at,
         "finished_at": _utc_now(),
@@ -986,6 +1077,11 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             "payload": device.payload,
         },
         "service": {"before": service_before, "after": service_after},
+        "stop": {
+            "primary": stop_observation,
+            "cleanup": cleanup_stop_observation,
+        },
+        "evidence_journal": str(journal.path) if journal is not None else None,
         "storage": {"mount": mount, "recording_root": str(args.recording_root)},
         "profile": {
             "api_security_profile": (
@@ -1016,6 +1112,49 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "reconciliation": reconciliation,
         "checks": checks,
         "ok": all(checks.values()),
+    }
+    if journal is not None:
+        journal.append(
+            "collector_result",
+            {
+                "ok": result["ok"],
+                "session_id": session_id,
+                "checks": checks,
+            },
+        )
+    return result
+
+
+def _stop_and_wait(
+    base_url: str,
+    *,
+    timeout_seconds: float,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    response: HttpResult | None = None
+    request_error: TimeoutError | urllib.error.URLError | None = None
+    try:
+        response = _request(
+            base_url,
+            "POST",
+            "/api/v3/capture/stop",
+            payload={"schema": "ylx.capture-stop.v2", "reason": "user"},
+            headers={"Idempotency-Key": idempotency_key},
+            timeout=timeout_seconds,
+        )
+        _require_status(response, {200, 202, 204}, "capture stop")
+    except (TimeoutError, urllib.error.URLError) as exc:
+        request_error = exc
+
+    _wait_for_idle(base_url, timeout_seconds=timeout_seconds)
+    return {
+        "request_http_status": response.status if response is not None else None,
+        "request_latency_s": response.latency_s if response is not None else None,
+        "request_error_type": type(request_error).__name__ if request_error is not None else None,
+        "request_error": str(request_error) if request_error is not None else None,
+        "idle_confirmed": True,
+        "elapsed_seconds": time.monotonic() - started,
     }
 
 

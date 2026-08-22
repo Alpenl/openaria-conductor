@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,47 @@ from scripts import rdk_live_projection_acceptance as harness
 
 
 class RdkLiveProjectionAcceptanceTest(unittest.TestCase):
+    def test_stop_and_wait_uses_configured_timeout_and_accepts_idle_after_timeout(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                harness, "_request", side_effect=TimeoutError("response timed out")
+            ) as request,
+            patch.object(harness, "_wait_for_idle") as wait_for_idle,
+        ):
+            result = harness._stop_and_wait(
+                "http://127.0.0.1:8080",
+                timeout_seconds=180.0,
+                idempotency_key="stop-test",
+            )
+
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.kwargs["timeout"], 180.0)
+        wait_for_idle.assert_called_once_with(
+            "http://127.0.0.1:8080",
+            timeout_seconds=180.0,
+        )
+        self.assertEqual(result["request_error_type"], "TimeoutError")
+        self.assertTrue(result["idle_confirmed"])
+
+    def test_evidence_journal_keeps_status_and_sse_records_as_valid_ndjson(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "acceptance.journal.ndjson"
+            with harness._EvidenceJournal(path, fsync_interval_seconds=0.0) as journal:
+                journal.append("status_sample", {"source_revision": 7})
+                journal.append("sse", {"kind": "event", "id": "8"})
+
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual([record["sequence"] for record in records], [1, 2])
+        self.assertEqual(
+            [record["kind"] for record in records],
+            ["status_sample", "sse"],
+        )
+        self.assertEqual(records[0]["payload"], {"source_revision": 7})
+        self.assertEqual(records[1]["payload"], {"kind": "event", "id": "8"})
+
     def test_parse_sse_block_preserves_same_revision_progress_payload(self) -> None:
         parsed = harness._parse_sse_block(
             [

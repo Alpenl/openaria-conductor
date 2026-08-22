@@ -231,6 +231,33 @@ impl NativeCameraStream {
         result.set_item("rejected", stats.rejected)?;
         Ok(result.unbind())
     }
+
+    fn camera_focus_status(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let stream = Arc::clone(&self.stream);
+        py.allow_threads(move || stream.focus_status())
+            .map_err(camera_error)?
+            .map(|status| focus_status_dict(py, status))
+            .transpose()
+    }
+
+    #[pyo3(signature = (value=None, auto_enabled=None))]
+    fn set_camera_focus(
+        &self,
+        py: Python<'_>,
+        value: Option<i32>,
+        auto_enabled: Option<bool>,
+    ) -> PyResult<Py<PyDict>> {
+        if value.is_none() && auto_enabled.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_camera_focus: value or auto_enabled is required",
+            ));
+        }
+        let stream = Arc::clone(&self.stream);
+        let status = py
+            .allow_threads(move || stream.set_focus(value, auto_enabled))
+            .map_err(camera_error)?;
+        focus_status_dict(py, status)
+    }
 }
 
 impl Drop for NativeCameraStream {

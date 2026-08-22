@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from rp_ylx.api.preview import LatestPreviewBuffer
-from rp_ylx.camera import CameraMode, FrameObservation, StereoFrame
+from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, decode_native_imu_observation
 from rp_ylx.native import (
     NativeCamera,
@@ -23,6 +23,8 @@ from rp_ylx.native import (
     create_native_continuous_capture_runtime,
     create_native_recording_frame_gate,
     create_native_recording_tap_state,
+    native_stream_camera_focus_status,
+    set_native_stream_camera_focus,
 )
 from rp_ylx.performance.metrics import PerformanceMetrics
 
@@ -734,6 +736,52 @@ class NativeContinuousCaptureSources:
                 raise RuntimeError("IMU 采集线程未能在关闭期限内退出")
         if tap.imu is not None:
             self._release_recording_imu(tap)
+
+    def _camera_for_control(self) -> NativeCamera:
+        self.start_preview()
+        with self._lock:
+            camera = self._camera
+        if camera is None:
+            raise RuntimeError("原生预览相机尚未启动")
+        return camera
+
+    def camera_focus_status(self) -> dict[str, object] | None:
+        try:
+            return native_stream_camera_focus_status(self._camera_for_control())
+        except NativeModuleError as error:
+            if error.code in {
+                "native_focus_unavailable",
+                "native_import_failed",
+                "native_dependency_missing",
+                "unsupported_native_abi",
+                "missing_native_capability",
+                "camera_focus_unsupported",
+            }:
+                return None
+            raise CameraError(error.code, error.message, retryable=True) from error
+
+    def set_camera_focus(
+        self,
+        *,
+        value: int | None = None,
+        auto_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        try:
+            return set_native_stream_camera_focus(
+                self._camera_for_control(),
+                value=value,
+                auto_enabled=auto_enabled,
+            )
+        except NativeModuleError as error:
+            retryable = error.code in {
+                "camera_focus_open_failed",
+                "camera_focus_get_failed",
+                "camera_focus_set_failed",
+                "camera_focus_query_failed",
+                "native_focus_status_failed",
+                "native_focus_set_failed",
+            }
+            raise CameraError(error.code, error.message, retryable=retryable) from error
 
     def close(self) -> None:
         with suppress(BaseException):

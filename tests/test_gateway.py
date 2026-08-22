@@ -111,6 +111,26 @@ DEVICE_V3 = {
     },
 }
 
+NETWORK_STATUS = {
+    "format": "ylx.network-status.v0",
+    "capabilities": {
+        "modes": ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"],
+        "wifi_interface": "wlan0",
+        "ethernet_interface": "eth0",
+        "second_wifi": False,
+    },
+    "mdns": {
+        "hostname": "rp-ylx.local",
+        "service": "_ylx-capture._tcp",
+        "aliases": ["_http._tcp"],
+        "port": 8080,
+    },
+    "devices": [
+        {"interface": "wlan0", "type": "wifi", "state": "connected"},
+        {"interface": "eth0", "type": "ethernet", "state": "disconnected"},
+    ],
+}
+
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
 NEXT_SESSION_ID = "01989f6a-2c02-7c3d-ae4f-5061728394a5"
 
@@ -359,6 +379,7 @@ class DeviceProvider:
         self.safe_swap: object | None = deepcopy(SAFE_SWAP_V3)
         self.status: object = deepcopy(CAPTURE_STATUS)
         self.focus: object | None = None
+        self.network: object = deepcopy(NETWORK_STATUS)
         self.live_imu: object | None = None
         self.stop_status = 204
         self.device_schema_override: str | None = None
@@ -395,6 +416,9 @@ class DeviceProvider:
 
     def camera_focus_status(self) -> object | None:
         return deepcopy(self.focus)
+
+    def network_status(self) -> object:
+        return deepcopy(self.network)
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
         if self.focus is None:
@@ -472,6 +496,7 @@ class GatewayHttpTest(unittest.TestCase):
                 "getCurrentSafeSwapReceipt": None,
                 "getCameraFocus": None,
                 "setCameraFocus": None,
+                "getNetworkStatus": None,
             },
         )
         denied = Principal("denied", permissions={})
@@ -996,6 +1021,30 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+
+    def test_network_status_is_v4_only_read_only_and_strictly_validated(self) -> None:
+        for version in ("v2", "v3"):
+            with self.subTest(version=version):
+                status, _, _ = self.request(f"/api/{version}/network", token="reader-token")
+                self.assertEqual(status, 404)
+
+        status, payload, headers = self.request("/api/v4/network", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), NETWORK_STATUS)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+        status, payload, _ = self.request(
+            "/api/v4/network",
+            token="reader-token",
+            body={"schema": "ylx.network-apply.v1", "mode": "hotspot"},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
+
+        self.server.provider.network = {**NETWORK_STATUS, "psk": "must-never-leak"}
+        status, payload, _ = self.request("/api/v4/network", token="reader-token")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
 
     def test_status_start_stop_and_device_are_major_specific_closed_wire_shapes(self) -> None:
         start = {

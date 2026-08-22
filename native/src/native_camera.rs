@@ -1,15 +1,16 @@
 use crate::bounded::{self, Consumer, Producer, QueueStats};
 use crate::turbojpeg::{TransformHandle, TurboJpegError};
-use crate::v4l2::{Capture, CaptureError};
+use crate::v4l2::{Capture, CaptureError, FocusStatus};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const PRODUCER_POLL: Duration = Duration::from_millis(50);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamError {
@@ -149,6 +150,7 @@ struct Resources {
     splitter: Option<TransformHandle>,
     width: i32,
     height: i32,
+    controls: Receiver<ControlCommand>,
 }
 
 impl Resources {
@@ -158,6 +160,15 @@ impl Resources {
             splitter.close();
         }
     }
+}
+
+enum ControlCommand {
+    FocusStatus(Sender<Result<Option<FocusStatus>, CaptureError>>),
+    SetFocus {
+        value: Option<i32>,
+        auto_enabled: Option<bool>,
+        response: Sender<Result<FocusStatus, CaptureError>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +190,7 @@ pub(crate) struct Stream {
     stop: Arc<AtomicBool>,
     producer: Producer<Frame>,
     consumer: Consumer<Frame>,
+    controls: Sender<ControlCommand>,
     terminal_error: Arc<Mutex<Option<StreamError>>>,
 }
 
@@ -207,6 +219,7 @@ impl Stream {
             None
         };
         let (producer, consumer) = bounded::channel(queue_capacity);
+        let (control_sender, control_receiver) = mpsc::channel();
         Ok(Self {
             lifecycle: Mutex::new(Lifecycle {
                 state: State::Open,
@@ -219,12 +232,14 @@ impl Stream {
                     height: i32::try_from(height).map_err(|_| {
                         StreamError::new("unsupported_mode", "capture height is too large")
                     })?,
+                    controls: control_receiver,
                 }),
                 worker: None,
             }),
             stop: Arc::new(AtomicBool::new(false)),
             producer,
             consumer,
+            controls: control_sender,
             terminal_error: Arc::new(Mutex::new(None)),
         })
     }
@@ -287,6 +302,92 @@ impl Stream {
                     ))
                 }
             }
+        }
+    }
+
+    pub(crate) fn focus_status(&self) -> Result<Option<FocusStatus>, StreamError> {
+        let lifecycle = self.lifecycle.lock().map_err(|_| {
+            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
+        })?;
+        match lifecycle.state {
+            State::Open | State::Stopped => lifecycle
+                .resources
+                .as_ref()
+                .ok_or_else(|| {
+                    StreamError::new("invalid_state", "native camera resources are missing")
+                })?
+                .capture
+                .focus_status()
+                .map_err(StreamError::from),
+            State::Running => {
+                drop(lifecycle);
+                let (response, result) = mpsc::channel();
+                self.controls
+                    .send(ControlCommand::FocusStatus(response))
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_failed",
+                            "native camera control channel is closed",
+                        )
+                    })?;
+                result
+                    .recv_timeout(CONTROL_TIMEOUT)
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_timeout",
+                            "native camera focus query timed out",
+                        )
+                    })?
+                    .map_err(StreamError::from)
+            }
+            State::Closed => Err(StreamError::new("invalid_state", "native camera is closed")),
+        }
+    }
+
+    pub(crate) fn set_focus(
+        &self,
+        value: Option<i32>,
+        auto_enabled: Option<bool>,
+    ) -> Result<FocusStatus, StreamError> {
+        let lifecycle = self.lifecycle.lock().map_err(|_| {
+            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
+        })?;
+        match lifecycle.state {
+            State::Open | State::Stopped => lifecycle
+                .resources
+                .as_ref()
+                .ok_or_else(|| {
+                    StreamError::new("invalid_state", "native camera resources are missing")
+                })?
+                .capture
+                .set_focus(value, auto_enabled)
+                .map_err(StreamError::from),
+            State::Running => {
+                drop(lifecycle);
+                let (response, result) = mpsc::channel();
+                self.controls
+                    .send(ControlCommand::SetFocus {
+                        value,
+                        auto_enabled,
+                        response,
+                    })
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_failed",
+                            "native camera control channel is closed",
+                        )
+                    })?;
+                result
+                    .recv_timeout(CONTROL_TIMEOUT)
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_timeout",
+                            "native camera focus update timed out",
+                        )
+                    })?
+                    .map_err(StreamError::from)
+            }
+            State::Closed => Err(StreamError::new("invalid_state", "native camera is closed")),
         }
     }
 
@@ -354,6 +455,7 @@ impl Stream {
     #[cfg(test)]
     pub(crate) fn test_idle(queue_capacity: usize) -> Self {
         let (producer, consumer) = bounded::channel(queue_capacity);
+        let (control_sender, _control_receiver) = mpsc::channel();
         Self {
             lifecycle: Mutex::new(Lifecycle {
                 state: State::Stopped,
@@ -363,6 +465,7 @@ impl Stream {
             stop: Arc::new(AtomicBool::new(false)),
             producer,
             consumer,
+            controls: control_sender,
             terminal_error: Arc::new(Mutex::new(None)),
         }
     }
@@ -382,6 +485,7 @@ fn run_producer(
 ) {
     let mut pending_rejected = 0_u64;
     while !stop.load(Ordering::Acquire) {
+        process_control_commands(resources);
         match resources.capture.wait(PRODUCER_POLL) {
             Ok(()) => {}
             Err(error) if error.code == "frame_timeout" => continue,
@@ -441,6 +545,24 @@ fn run_producer(
         match producer.try_push(frame) {
             Ok(()) => pending_rejected = 0,
             Err(frame) => pending_rejected = frame.application_dropped_before + 1,
+        }
+    }
+}
+
+fn process_control_commands(resources: &Resources) {
+    loop {
+        match resources.controls.try_recv() {
+            Ok(ControlCommand::FocusStatus(response)) => {
+                let _ = response.send(resources.capture.focus_status());
+            }
+            Ok(ControlCommand::SetFocus {
+                value,
+                auto_enabled,
+                response,
+            }) => {
+                let _ = response.send(resources.capture.set_focus(value, auto_enabled));
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
         }
     }
 }
