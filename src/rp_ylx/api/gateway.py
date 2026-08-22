@@ -35,21 +35,12 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
-from rp_ylx.web import WEB_ASSETS, read_asset
+from rp_ylx.web import WEB_ASSETS, EchoWebArtifactError, asset_content_type, read_asset
 
 MAX_BODY_BYTES = 64 * 1024
 UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 WEB_PATHS = {"/": "index.html", **{f"/{name}": name for name in WEB_ASSETS if name != "index.html"}}
-WEB_CONTENT_TYPES = {
-    "index.html": "text/html; charset=utf-8",
-    "styles.css": "text/css; charset=utf-8",
-    "app.js": "text/javascript; charset=utf-8",
-    "api-client.js": "text/javascript; charset=utf-8",
-    "state.js": "text/javascript; charset=utf-8",
-    "event-stream.js": "text/javascript; charset=utf-8",
-    "preview.js": "text/javascript; charset=utf-8",
-}
 WEB_CONTENT_SECURITY_POLICY = (
     "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; "
     "frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; "
@@ -280,7 +271,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _send_web_asset(self, name: str, *, head: bool = False) -> None:
         try:
             payload = read_asset(name)
-        except OSError:
+            content_type = asset_content_type(name)
+        except (EchoWebArtifactError, OSError, ValueError):
             self._problem(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "embedded_web_unavailable",
@@ -288,7 +280,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", WEB_CONTENT_TYPES[name])
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", WEB_CONTENT_SECURITY_POLICY)
