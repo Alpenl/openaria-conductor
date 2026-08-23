@@ -2,12 +2,12 @@
   "schema": "openaria.echo-web-artifacts.v1",
   "name": "openaria-echo-web",
   "version": "0.1.0",
-  "total_bytes": 90759,
+  "total_bytes": 90773,
   "files": [
     {
       "path": "app.js",
-      "bytes": 71099,
-      "sha256": "acc0576aebb6ea27a8e3eb38e366c2608d35605883413c561a0ad3c087ac81bf",
+      "bytes": 71113,
+      "sha256": "501bf4a7dad221db87f184b188e725a5d34332af209e0b3137dc62edd7fe296f",
       "content_type": "text/javascript; charset=utf-8"
     },
     {
