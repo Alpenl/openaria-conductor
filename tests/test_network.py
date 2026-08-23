@@ -33,6 +33,7 @@ class FakeNmcli:
         self.missing_default_modes: set[str] = set()
         self.reload_failures = 0
         self.static_address_override: str | None = None
+        self.timeouts: list[tuple[list[str], float]] = []
 
     def _load_profile(self, name: str) -> configparser.ConfigParser:
         if self.profile_dir is None:
@@ -53,8 +54,9 @@ class FakeNmcli:
         text: bool,
         timeout: float,
     ) -> subprocess.CompletedProcess[str]:
-        del check, capture_output, text, timeout
+        del check, capture_output, text
         self.commands.append(command)
+        self.timeouts.append((command, timeout))
         if command[-4:] == ["--fields", "DEVICE,TYPE,STATE", "device", "status"]:
             return subprocess.CompletedProcess(
                 command,
@@ -219,6 +221,21 @@ class NetworkCliTest(unittest.TestCase):
             code = main(arguments)
         rendered = output.getvalue() or error.getvalue()
         return code, json.loads(rendered), error.getvalue()
+
+    def assert_connection_up_deadlines(self, nmcli: FakeNmcli) -> None:
+        up_calls = [
+            (command, timeout)
+            for command, timeout in nmcli.timeouts
+            if "connection" in command and "up" in command
+        ]
+        self.assertGreater(len(up_calls), 0)
+        for command, timeout in up_calls:
+            wait_index = command.index("--wait")
+            self.assertEqual(
+                command[wait_index : wait_index + 2],
+                ["--wait", str(network_module.NETWORK_ACTIVATION_WAIT_SECONDS)],
+            )
+            self.assertEqual(timeout, network_module.NETWORK_ACTIVATION_TIMEOUT_SECONDS)
 
     def test_status_reports_fixed_rdk_x5_capabilities_and_mdns(self) -> None:
         code, result, error = self.run_cli(["network", "status"])
@@ -501,6 +518,7 @@ class NetworkCliTest(unittest.TestCase):
                     )
 
                 self.assertEqual(code, 0, error.getvalue())
+                self.assert_connection_up_deadlines(nmcli)
                 profile_path = next((case_root / "profiles").glob("*.nmconnection"))
                 profile = profile_path.read_text(encoding="utf-8")
                 for expected in expected_profile_lines:
@@ -942,6 +960,7 @@ method=disabled
         self.assertEqual(result["error"]["code"], "state_write_failed")
         self.assertEqual(result["recovery"], "lkg")
         self.assertEqual(nmcli.active["wlan0"], primary_profile)
+        self.assert_connection_up_deadlines(nmcli)
         self.assertEqual(lkg_path.read_bytes(), lkg_before)
         self.assertEqual(list((self.root / "profiles").glob(f"*{candidate}*")), [])
         journal = json.loads((self.root / "state" / "journal.json").read_text(encoding="utf-8"))
@@ -1455,6 +1474,7 @@ method=disabled
             },
         )
         self.assertEqual(nmcli.active["wlan0"], rescue_profile)
+        self.assert_connection_up_deadlines(nmcli)
         self.assertEqual(lkg_path.read_bytes(), lkg_before)
         self.assertNotIn("primary-secret", json.dumps(nmcli.commands))
 
