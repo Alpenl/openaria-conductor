@@ -16,6 +16,9 @@ UVC_GET_CUR = 0x81
 UVC_GET_LEN = 0x85
 UVC_CS_INTERFACE = 0x24
 UVC_EXTENSION_UNIT = 0x06
+GENERIC_XU_PAYLOAD_MAX = 256
+KNOWN_IMU_UNIT = 3
+DENIED_GET_CUR_SELECTORS = frozenset({(4, 10), (4, 15)})
 XU_GUID_BYTES = UUID(XU_GUID).bytes_le
 
 
@@ -46,6 +49,43 @@ OpenFile = Callable[[str, int], int]
 CloseFile = Callable[[int], None]
 Guid = str | bytes | UUID
 DiscoverUnit = Callable[[str | Path, Guid], int]
+
+
+def _is_get_request(query: int) -> bool:
+    return bool(query & 0x80)
+
+
+def _validate_control_query(unit: int, selector: int, query: int, size: int) -> None:
+    if not 1 <= unit <= 0xFF or not 1 <= selector <= 0xFF or not 0 <= query <= 0xFF:
+        raise ValueError("UVC XU unit, selector, and query must fit in one byte")
+    if size <= 0 or size > 0xFFFF:
+        raise ValueError("UVC XU query size is out of range")
+    if not _is_get_request(query):
+        raise ImuError("xu_query_denied", "UVC XU SET requests are disabled")
+    if query == UVC_GET_CUR and (unit, selector) in DENIED_GET_CUR_SELECTORS:
+        raise ImuError("xu_query_denied", "UVC XU GET_CUR is denied for this unit/selector")
+    if query == UVC_GET_CUR and (unit, selector) == (KNOWN_IMU_UNIT, XU_SELECTOR):
+        if size != PACKET_BYTES:
+            raise ImuError(
+                "xu_query_denied",
+                f"known IMU UVC XU GET_CUR must request exactly {PACKET_BYTES} bytes",
+            )
+        return
+    if size > GENERIC_XU_PAYLOAD_MAX:
+        raise ImuError(
+            "xu_query_denied",
+            f"unknown UVC XU payloads are limited to {GENERIC_XU_PAYLOAD_MAX} bytes",
+        )
+
+
+def _ioctl_failure(result: int) -> ImuError:
+    if result < 0:
+        error_number = ctypes.get_errno()
+        error_message = os.strerror(error_number) if error_number else "unknown errno"
+        message = f"UVC XU ioctl failed with errno {error_number}: {error_message}"
+    else:
+        message = f"UVC XU ioctl returned non-zero status {result}"
+    return ImuError("xu_query_failed", message)
 
 
 def _guid_bytes(guid: Guid) -> bytes:
@@ -131,9 +171,9 @@ def discover_uvc_xu_unit(
 
 
 def _linux_control_query(fd: int, unit: int, selector: int, query: int, size: int) -> bytes:
-    if size <= 0 or size > 0xFFFF:
-        raise ValueError("UVC XU query size is out of range")
+    _validate_control_query(unit, selector, query, size)
     buffer = (ctypes.c_uint8 * size)()
+    ctypes.memset(ctypes.addressof(buffer), 0, size)
     control = _UvcXuControlQuery(
         unit=unit,
         selector=selector,
@@ -142,9 +182,8 @@ def _linux_control_query(fd: int, unit: int, selector: int, query: int, size: in
         data=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint8)),
     )
     result = _LIBC.ioctl(fd, UVCIOC_CTRL_QUERY, ctypes.byref(control))
-    if result < 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
+    if result != 0:
+        raise _ioctl_failure(result)
     return bytes(buffer)
 
 
@@ -184,7 +223,7 @@ class UvcXuImuSource:
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
         self._fd = open_file(os.fspath(device), flags)
         try:
-            declared = self._query_control(self._fd, unit, selector, UVC_GET_LEN, 2)
+            declared = self._query(UVC_GET_LEN, 2, "xu_query_failed")
             if len(declared) != 2:
                 raise ImuError("xu_query_failed", "UVC GET_LEN did not return two bytes")
             packet_bytes = int.from_bytes(declared, "little")
@@ -210,6 +249,23 @@ class UvcXuImuSource:
     def unit_id(self) -> int:
         return self._unit
 
+    def _query(self, request: int, size: int, error_code: str) -> bytes:
+        _validate_control_query(self._unit, self._selector, request, size)
+        try:
+            return self._query_control(self._fd, self._unit, self._selector, request, size)
+        except OSError as exc:
+            if error_code == "disconnected":
+                raise ImuError("disconnected", f"IMU read failed: {exc}", retryable=True) from exc
+            raise ImuError(error_code, f"UVC XU query failed: {exc}") from exc
+        except ImuError as exc:
+            if error_code == "disconnected" and exc.code == "xu_query_failed":
+                raise ImuError(
+                    "disconnected",
+                    f"IMU read failed: {exc.message}",
+                    retryable=True,
+                ) from exc
+            raise
+
     def read_packet(self, timeout: float) -> ImuPacketRead:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
@@ -218,13 +274,7 @@ class UvcXuImuSource:
         deadline_ns = self._clock_ns() + int(timeout * 1_000_000_000)
         while True:
             host_read_start_ns = self._clock_ns()
-            payload = self._query_control(
-                self._fd,
-                self._unit,
-                self._selector,
-                UVC_GET_CUR,
-                PACKET_BYTES,
-            )
+            payload = self._query(UVC_GET_CUR, PACKET_BYTES, "disconnected")
             host_read_end_ns = self._clock_ns()
             if len(payload) != PACKET_BYTES:
                 raise ImuError(

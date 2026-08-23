@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import ctypes
+import errno
+import json
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import rp_ylx.imu.uvc_xu as uvc_xu
 from rp_ylx.imu import (
     ImuCollector,
     ImuError,
@@ -20,7 +25,7 @@ from rp_ylx.imu import (
     parse_uvc_extension_units,
 )
 from rp_ylx.imu.protocol import XU_GUID
-from rp_ylx.imu.uvc_xu import UVC_GET_CUR, UVC_GET_LEN, XU_GUID_BYTES
+from rp_ylx.imu.uvc_xu import UVC_GET_CUR, UVC_GET_LEN, UVCIOC_CTRL_QUERY, XU_GUID_BYTES
 
 ROOT = Path(__file__).resolve().parent
 
@@ -315,6 +320,28 @@ class NativeCollectorAdapterTest(unittest.TestCase):
 
 
 class UvcXuImuSourceTest(unittest.TestCase):
+    class FakeLibc:
+        def __init__(self, rc: int = 0, write: bytes = b"") -> None:
+            self.rc = rc
+            self.write = write
+            self.calls: list[tuple[int, int, int, int, int, int]] = []
+            self.initial_buffers: list[bytes] = []
+
+        def ioctl(self, fd: int, request: int, payload: object) -> int:
+            control = ctypes.cast(
+                payload,
+                ctypes.POINTER(uvc_xu._UvcXuControlQuery),
+            ).contents
+            self.calls.append(
+                (fd, request, control.unit, control.selector, control.query, control.size)
+            )
+            self.initial_buffers.append(ctypes.string_at(control.data, control.size))
+            if self.write:
+                ctypes.memmove(control.data, self.write, min(len(self.write), control.size))
+            if self.rc < 0:
+                ctypes.set_errno(errno.ENOTTY)
+            return self.rc
+
     def test_discovers_the_xu_unit_by_guid_from_usb_descriptors(self) -> None:
         extension = bytes([24, 0x24, 0x06, 7]) + XU_GUID_BYTES + bytes(4)
         descriptors = bytes([4, 4, 0, 0]) + extension
@@ -333,6 +360,93 @@ class UvcXuImuSourceTest(unittest.TestCase):
                 discover_uvc_xu_unit("/dev/video0", sys_root=root / "sys"),
                 7,
             )
+
+    def test_linux_control_query_accepts_only_exact_zero_ioctl_success(self) -> None:
+        payload = packet(0x123456)
+        fake = self.FakeLibc(rc=0, write=payload)
+        with patch.object(uvc_xu, "_LIBC", fake):
+            result = uvc_xu._linux_control_query(7, 3, 1, UVC_GET_CUR, len(payload))
+
+        self.assertEqual(result, payload)
+        self.assertEqual(fake.calls, [(7, UVCIOC_CTRL_QUERY, 3, 1, UVC_GET_CUR, len(payload))])
+        self.assertEqual(fake.initial_buffers, [b"\x00" * len(payload)])
+
+        for rc in (-1, 1):
+            with self.subTest(rc=rc):
+                sentinel = b"XU-SENTINEL-DO-NOT-LEAK!!!!"
+                fake = self.FakeLibc(rc=rc, write=sentinel)
+                with (
+                    patch.object(uvc_xu, "_LIBC", fake),
+                    self.assertRaises(ImuError) as raised,
+                ):
+                    uvc_xu._linux_control_query(
+                        7,
+                        3,
+                        1,
+                        UVC_GET_CUR,
+                        len(sentinel),
+                    )
+                self.assertEqual(raised.exception.code, "xu_query_failed")
+                self.assertIn("UVC XU ioctl", raised.exception.message)
+                self.assertNotIn(sentinel.decode(), str(raised.exception))
+                self.assertNotIn(sentinel.decode(), repr(raised.exception))
+                self.assertNotIn(
+                    sentinel.decode(),
+                    json.dumps(
+                        {
+                            "code": raised.exception.code,
+                            "message": raised.exception.message,
+                            "retryable": raised.exception.retryable,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+    def test_linux_control_query_rejects_unsafe_requests_before_ioctl(self) -> None:
+        fake = self.FakeLibc()
+        with patch.object(uvc_xu, "_LIBC", fake):
+            with self.assertRaises(ImuError) as oversized:
+                uvc_xu._linux_control_query(7, 4, 9, UVC_GET_CUR, 257)
+            with self.assertRaises(ImuError) as denylisted_10:
+                uvc_xu._linux_control_query(7, 4, 10, UVC_GET_CUR, 16)
+            with self.assertRaises(ImuError) as denylisted_15:
+                uvc_xu._linux_control_query(7, 4, 15, UVC_GET_CUR, 16)
+            with self.assertRaises(ImuError) as set_request:
+                uvc_xu._linux_control_query(7, 4, 9, 0x01, 1)
+            with self.assertRaises(ImuError) as wrong_imu_size:
+                uvc_xu._linux_control_query(7, 3, 1, UVC_GET_CUR, 28)
+
+        self.assertEqual(fake.calls, [])
+        for raised in (
+            oversized,
+            denylisted_10,
+            denylisted_15,
+            set_request,
+            wrong_imu_size,
+        ):
+            self.assertEqual(raised.exception.code, "xu_query_denied")
+
+    def test_uvc_imu_source_denies_unit_4_risky_get_cur_before_query(self) -> None:
+        calls: list[tuple[int, int, int, int, int]] = []
+
+        def query(fd: int, unit: int, selector: int, request: int, size: int) -> bytes:
+            calls.append((fd, unit, selector, request, size))
+            return (27).to_bytes(2, "little")
+
+        source = UvcXuImuSource(
+            "/dev/video-test",
+            unit=4,
+            selector=10,
+            query_control=query,
+            open_file=lambda path, flags: 7,
+            close_file=lambda fd: None,
+        )
+        with self.assertRaises(ImuError) as denied:
+            source.read_packet(1.0)
+        source.close()
+
+        self.assertEqual(denied.exception.code, "xu_query_denied")
+        self.assertEqual(calls, [(7, 4, 10, UVC_GET_LEN, 2)])
 
     def test_auto_unit_selection_uses_guid_discovery_callback(self) -> None:
         queried: list[tuple[int, int]] = []
