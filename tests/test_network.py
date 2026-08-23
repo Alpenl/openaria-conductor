@@ -83,6 +83,14 @@ class FakeNmcli:
                 self.scan_output,
                 "scan failed" if self.scan_returncode else "",
             )
+        if "--get-values" in command and "connection" in command and "show" in command:
+            field = command[command.index("--get-values") + 1]
+            name = command[command.index("id") + 1]
+            profile = self._load_profile(name)
+            if field == "802-11-wireless-security.key-mgmt":
+                value = profile.get("wifi-security", "key-mgmt", fallback="")
+                return subprocess.CompletedProcess(command, 0, f"{value}\n", "")
+            raise AssertionError(f"不支持的 NetworkManager profile 字段：{field}")
         if "connection" in command and "up" in command:
             name = command[command.index("id") + 1]
             interface = command[command.index("ifname") + 1]
@@ -269,6 +277,117 @@ class NetworkCliTest(unittest.TestCase):
                 ["--wait", str(network_module.NETWORK_ACTIVATION_WAIT_SECONDS)],
             )
             self.assertEqual(timeout, network_module.NETWORK_ACTIVATION_TIMEOUT_SECONDS)
+
+    def test_legacy_wpa2_lkg_without_security_is_verified_before_retry(self) -> None:
+        profile = "rp-ylx-wifi-client-0123456789ab"
+        profile_dir = self.root / "profiles"
+        profile_dir.mkdir()
+        profile_path = profile_dir / f"{profile}.nmconnection"
+        profile_path.write_bytes(
+            network_module._network_manager_profile(
+                profile,
+                {
+                    "mode": "wifi-client",
+                    "ssid": "Legacy LAN",
+                    "security": "wpa2-personal",
+                    "psk": "legacy-secret-123",
+                },
+            )
+        )
+        profile_path.chmod(0o600)
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        self.lkg_path("wlan0").write_text(
+            json.dumps(
+                {
+                    "format": "ylx.network-lkg.v0",
+                    "mode": "wifi-client",
+                    "interface": "wlan0",
+                    "profile": profile,
+                    "config": {"mode": "wifi-client", "ssid": "Legacy LAN"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.lkg_path("wlan0").chmod(0o600)
+        nmcli = FakeNmcli(profile_dir)
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+        ):
+            candidate = network_module.saved_network_candidate("wifi-client")
+            result = network_module.activate_network_candidate(candidate)
+
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["connection"], profile)
+        self.assertEqual(result["addresses"], ["192.168.50.20/24"])
+        self.assertIn("0.0.0.0/0", result["routes"][0])
+        self.assertEqual(
+            candidate["config"],
+            {
+                "mode": "wifi-client",
+                "ssid": "Legacy LAN",
+                "security": "wpa2-personal",
+            },
+        )
+        self.assertEqual(nmcli.active["wlan0"], profile)
+        self.assertEqual(
+            json.loads(self.lkg_path("wlan0").read_text(encoding="utf-8"))["config"],
+            {"mode": "wifi-client", "ssid": "Legacy LAN"},
+        )
+        self.assertNotIn("legacy-secret-123", json.dumps(candidate))
+        security_query = next(command for command in nmcli.commands if "--get-values" in command)
+        activation = next(
+            command for command in nmcli.commands if "connection" in command and "up" in command
+        )
+        self.assertLess(nmcli.commands.index(security_query), nmcli.commands.index(activation))
+
+    def test_legacy_wifi_lkg_rejects_unverified_security_without_activation(self) -> None:
+        profile = "rp-ylx-wifi-client-0123456789ab"
+        profile_dir = self.root / "profiles"
+        profile_dir.mkdir()
+        profile_path = profile_dir / f"{profile}.nmconnection"
+        profile_path.write_bytes(
+            network_module._network_manager_profile(
+                profile,
+                {
+                    "mode": "wifi-client",
+                    "ssid": "Legacy LAN",
+                    "security": "open",
+                },
+            )
+        )
+        profile_path.chmod(0o600)
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        self.lkg_path("wlan0").write_text(
+            json.dumps(
+                {
+                    "format": "ylx.network-lkg.v0",
+                    "mode": "wifi-client",
+                    "interface": "wlan0",
+                    "profile": profile,
+                    "config": {"mode": "wifi-client", "ssid": "Legacy LAN"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.lkg_path("wlan0").chmod(0o600)
+        nmcli = FakeNmcli(profile_dir)
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+            self.assertRaises(network_module.NetworkError) as raised,
+        ):
+            network_module.saved_network_candidate("wifi-client")
+
+        self.assertEqual(raised.exception.code, "state_invalid")
+        self.assertTrue(any("--get-values" in command for command in nmcli.commands))
+        self.assertFalse(
+            any("connection" in command and "up" in command for command in nmcli.commands)
+        )
 
     def test_status_reports_fixed_rdk_x5_capabilities_and_mdns(self) -> None:
         code, result, error = self.run_cli(["network", "status"])

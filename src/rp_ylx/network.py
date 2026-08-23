@@ -964,6 +964,23 @@ def activate_saved_network(mode: str) -> dict[str, Any]:
         }
 
 
+def _legacy_wifi_security(profile: str) -> str:
+    result = _run_nmcli(
+        [
+            "--get-values",
+            "802-11-wireless-security.key-mgmt",
+            "connection",
+            "show",
+            "id",
+            profile,
+        ],
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stdout.strip() != "wpa-psk":
+        raise NetworkError("state_invalid", "旧 Wi-Fi profile 安全类型无法验证")
+    return "wpa2-personal"
+
+
 def saved_network_candidate(mode: str) -> dict[str, Any]:
     """Project a secret-free retained candidate for an explicit retry transaction."""
 
@@ -973,12 +990,15 @@ def saved_network_candidate(mode: str) -> dict[str, Any]:
     _prepare_state_dir(state_dir)
     with _network_lock(state_dir):
         record = _saved_record_for_mode(state_dir, mode)
+        config = deepcopy(record["config"])
+        if mode == "wifi-client" and set(config) == {"mode", "ssid"}:
+            config["security"] = _legacy_wifi_security(str(record["profile"]))
         candidate = {
             "format": "ylx.network-candidate.v1",
             "mode": record["mode"],
             "interface": record["interface"],
             "profile": record["profile"],
-            "config": deepcopy(record["config"]),
+            "config": config,
         }
         return _validated_candidate(candidate)
 
