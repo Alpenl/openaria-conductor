@@ -30,6 +30,8 @@ MDNS_SERVICE_ALIASES = ["_http._tcp"]
 MDNS_PORT = 8080
 MDNS_ASSET_NAME = "rp-ylx.avahi"
 MDNS_SERVICE_FILENAME = "rp-ylx.service"
+NETWORK_ACTIVATION_WAIT_SECONDS = 10
+NETWORK_ACTIVATION_TIMEOUT_SECONDS = 12
 MAX_CONFIG_BYTES = 64 * 1024
 JOURNAL_FORMAT = "ylx.network-journal.v0"
 RESULT_FORMAT = "ylx.network-result.v0"
@@ -500,7 +502,19 @@ def _activate(
     gateway_required: bool = False,
 ) -> dict[str, Any]:
     interface = _interface(mode)
-    result = _run_nmcli(["--wait", "30", "connection", "up", "id", profile, "ifname", interface])
+    result = _run_nmcli(
+        [
+            "--wait",
+            str(NETWORK_ACTIVATION_WAIT_SECONDS),
+            "connection",
+            "up",
+            "id",
+            profile,
+            "ifname",
+            interface,
+        ],
+        timeout=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         raise _activation_error(result, mode)
     snapshot = _device_snapshot(interface)
@@ -550,7 +564,19 @@ def _activate_previous(journal: Mapping[str, Any], interface: str) -> None:
     profile = journal.get("previous_profile")
     if not isinstance(profile, str) or not profile:
         raise NetworkError("previous_profile_missing", "事务前网络连接不存在")
-    result = _run_nmcli(["--wait", "30", "connection", "up", "id", profile, "ifname", interface])
+    result = _run_nmcli(
+        [
+            "--wait",
+            str(NETWORK_ACTIVATION_WAIT_SECONDS),
+            "connection",
+            "up",
+            "id",
+            profile,
+            "ifname",
+            interface,
+        ],
+        timeout=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         raise NetworkError("previous_activation_failed", "无法恢复事务前网络连接")
     snapshot = _device_snapshot(interface)
