@@ -11,19 +11,31 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import socket
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, TextIO
 
 CONTROL_REQUEST_SCHEMA = "ylx.network-control-request.v1"
 CONTROL_RESPONSE_SCHEMA = "ylx.network-control-response.v1"
 MAX_CONTROL_REQUEST_BYTES = 64 * 1024
+MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
+CONTROL_SOCKET_PATH = Path("/run/rp-ylx/network-control.sock")
+CONTROL_SOCKET_TIMEOUT_SECONDS = 2.0
 NETWORK_MODES = frozenset({"hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"})
 MUTATION_OPERATIONS = frozenset({"apply", "retry", "forget"})
 SUPPORTED_OPERATIONS = MUTATION_OPERATIONS | {"health"}
 SECRET_FIELD_NAMES = frozenset({"password", "psk", "secret", "token"})
 NETWORK_CREDENTIAL_REF = re.compile(r"^cred-[A-Za-z0-9_.:-]+$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+
+class NetworkControlClientError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
 
 
 def _error_response(
@@ -237,3 +249,82 @@ def serve_stdio(*, stdin: TextIO | None = None, stdout: TextIO | None = None) ->
     stdout.write(json.dumps(response, ensure_ascii=False, sort_keys=True) + "\n")
     stdout.flush()
     return 0
+
+
+def _read_socket_response(client: socket.socket) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_CONTROL_RESPONSE_BYTES:
+            raise NetworkControlClientError(
+                "response_too_large",
+                "network-control response exceeded the size limit",
+            )
+        if b"\n" in chunk:
+            break
+    line, _, _ = b"".join(chunks).partition(b"\n")
+    return line
+
+
+def request_control(
+    operation: str,
+    *,
+    principal_id: str | None = None,
+    idempotency_key: str | None = None,
+    body: Mapping[str, object] | None = None,
+    socket_path: Path = CONTROL_SOCKET_PATH,
+    timeout_seconds: float = CONTROL_SOCKET_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, object] = {
+        "schema": CONTROL_REQUEST_SCHEMA,
+        "operation": operation,
+    }
+    if operation in MUTATION_OPERATIONS:
+        if principal_id is None or idempotency_key is None or body is None:
+            raise NetworkControlClientError(
+                "request_invalid",
+                "network-control mutation request is incomplete",
+            )
+        request.update(
+            {
+                "principal_id": principal_id,
+                "idempotency_key": idempotency_key,
+                "body": dict(body),
+            }
+        )
+    payload = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout_seconds)
+            client.connect(str(socket_path))
+            client.sendall(payload.encode("utf-8") + b"\n")
+            client.shutdown(socket.SHUT_WR)
+            rendered = _read_socket_response(client)
+    except OSError as exc:
+        raise NetworkControlClientError(
+            "network_controller_unavailable",
+            "network-control socket is unavailable",
+        ) from exc
+    try:
+        response = json.loads(rendered.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NetworkControlClientError(
+            "response_invalid",
+            "network-control response is not valid JSON",
+        ) from exc
+    if not isinstance(response, dict):
+        raise NetworkControlClientError(
+            "response_invalid",
+            "network-control response must be a JSON object",
+        )
+    if response.get("schema") != CONTROL_RESPONSE_SCHEMA:
+        raise NetworkControlClientError(
+            "response_invalid",
+            "network-control response schema is invalid",
+        )
+    return response

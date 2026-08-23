@@ -35,6 +35,8 @@ from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.network import NetworkError
 from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.network import network_status_v1 as project_network_status_v1
+from rp_ylx.network_control import NetworkControlClientError
+from rp_ylx.network_control import request_control as request_network_control
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -1108,17 +1110,35 @@ class CaptureCoordinator:
             retryable=True,
         )
 
+    def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
+        try:
+            response = request_network_control(
+                operation,
+                principal_id=command.principal_id,
+                idempotency_key=command.idempotency_key,
+                body=command.body,
+            )
+        except NetworkControlClientError as exc:
+            raise self._network_mutation_unavailable() from exc
+        if response.get("ok") is not True:
+            raise self._network_mutation_unavailable()
+        status = response.get("status")
+        if type(status) is not int:
+            raise self._network_mutation_unavailable()
+        return NetworkCommandResult(
+            status,
+            response.get("body"),
+            replayed=response.get("replayed") is True,
+        )
+
     def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult:
-        del command
-        raise self._network_mutation_unavailable()
+        return self._network_command("apply", command)
 
     def retry_network_transaction(self, command: NetworkCommand) -> NetworkCommandResult:
-        del command
-        raise self._network_mutation_unavailable()
+        return self._network_command("retry", command)
 
     def forget_network_client_profile(self, command: NetworkCommand) -> NetworkCommandResult:
-        del command
-        raise self._network_mutation_unavailable()
+        return self._network_command("forget", command)
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
         with self._lock:
