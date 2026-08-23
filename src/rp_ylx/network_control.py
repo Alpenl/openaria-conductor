@@ -672,30 +672,48 @@ class NetworkController:
             return
 
         latest = snapshot["transaction"]["latest"]
-        if isinstance(latest, Mapping) and latest.get("status") in {"rescued", "failed"}:
+        terminal_retry = isinstance(latest, Mapping) and latest.get("status") in {
+            "rescued",
+            "failed",
+        }
+        if terminal_retry and not new_boot:
             if not rescue_healthy:
                 with _network_operation_lock():
                     rescue_network()
             return
 
-        try:
-            with _network_operation_lock():
-                candidate = saved_network_candidate(mode)
-        except NetworkError:
-            if not rescue_healthy:
+        work = self._retained_retry_work(snapshot) if new_boot else None
+        if work is None:
+            try:
                 with _network_operation_lock():
-                    rescue_network()
-            return
-        work = {
-            "kind": "candidate",
-            "candidate": candidate,
-            "desired": deepcopy(desired),
-            "cleanup_work_ids": [],
-            "rescue_ready": rescue_healthy,
-        }
+                    candidate = saved_network_candidate(mode)
+            except NetworkError:
+                if not rescue_healthy:
+                    with _network_operation_lock():
+                        rescue_network()
+                return
+            cleanup_work_ids: list[str] = []
+            if terminal_retry:
+                source_id = str(latest["transaction_id"])
+                cleanup_work_ids.append(source_id)
+                try:
+                    source = self._state.work_for(source_id)
+                except NetworkStateError:
+                    pass
+                else:
+                    inherited = source.get("cleanup_work_ids", [])
+                    if isinstance(inherited, list):
+                        cleanup_work_ids.extend(item for item in inherited if isinstance(item, str))
+            work = {
+                "kind": "candidate",
+                "candidate": candidate,
+                "desired": deepcopy(desired),
+                "cleanup_work_ids": cleanup_work_ids,
+            }
+        work["rescue_ready"] = rescue_healthy
 
         transaction_id = self._accept_system_transaction(
-            desired=desired,
+            desired=work["desired"],
             work=work,
             reason="boot-reconcile",
             saved=bool(snapshot["saved"]),
