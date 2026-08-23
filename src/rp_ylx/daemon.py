@@ -786,7 +786,7 @@ def build_production_service(
         publisher_factory = mdns_publisher_factory or MdnsPublisher
         mdns_publisher = publisher_factory(
             config.port,
-            "https" if config.security_profile == "customer" else "http",
+            scheme="https" if config.security_profile == "customer" else "http",
         )
         mdns_publisher.start()
     except BaseException:

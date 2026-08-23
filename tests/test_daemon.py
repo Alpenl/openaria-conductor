@@ -273,7 +273,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 patch("rp_ylx.daemon.CaptureCoordinator", return_value=coordinator) as capture,
                 patch("rp_ylx.daemon.create_gateway_server", return_value=server) as gateway,
                 patch("rp_ylx.daemon.CaptureEventPump") as event_pump,
-                patch("rp_ylx.daemon.MdnsPublisher") as mdns_publisher,
+                patch("rp_ylx.daemon.MdnsPublisher", autospec=True) as mdns_publisher,
             ):
                 service = build_production_service(
                     config,
@@ -301,7 +301,7 @@ class ProductionDaemonTest(unittest.TestCase):
             event_buffer = gateway.call_args.kwargs["event_buffer"]
             event_pump.assert_called_once_with(coordinator, event_buffer)
             self.assertIs(service.event_pump, event_pump.return_value)
-            mdns_publisher.assert_called_once_with(config.port, "http")
+            mdns_publisher.assert_called_once_with(config.port, scheme="http")
             mdns_publisher.return_value.start.assert_called_once_with()
             self.assertIs(service.mdns_publisher, mdns_publisher.return_value)
 
