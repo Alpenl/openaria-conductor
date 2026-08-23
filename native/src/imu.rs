@@ -15,6 +15,9 @@ const UVC_GET_LEN: u8 = 0x85;
 const UVC_CS_INTERFACE: u8 = 0x24;
 const UVC_EXTENSION_UNIT: u8 = 0x06;
 const PACKET_BYTES: usize = 27;
+const GENERIC_XU_PAYLOAD_MAX: usize = 256;
+const KNOWN_IMU_UNIT: u8 = 3;
+const KNOWN_IMU_SELECTOR: u8 = 1;
 const SAMPLES_PER_PACKET: usize = 2;
 const DEVICE_TIMESTAMP_MODULUS: u64 = 1 << 24;
 const DEFAULT_STALE_POLL: Duration = Duration::from_millis(1);
@@ -385,6 +388,7 @@ impl State {
                 "UVC XU query size is out of range",
             ));
         }
+        validate_xu_query(self.unit, self.selector, request, size)?;
         let fd = self
             .fd
             .ok_or_else(|| ImuError::new("invalid_state", "IMU source is closed"))?;
@@ -397,7 +401,17 @@ impl State {
             data: buffer.as_mut_ptr(),
         };
         let result = unsafe { libc::ioctl(fd, uvc_ioctl_ctrl_query(), &mut query) };
-        if result < 0 {
+        if result != 0 {
+            if result > 0 {
+                let message = format!("UVC XU query returned non-zero status {result}");
+                if error_code == "disconnected" {
+                    return Err(ImuError::retryable(
+                        "disconnected",
+                        format!("IMU read failed: {message}"),
+                    ));
+                }
+                return Err(ImuError::new(error_code, message));
+            }
             let error = io::Error::last_os_error();
             if error_code == "disconnected" {
                 return Err(ImuError::retryable(
@@ -417,6 +431,41 @@ impl State {
             }
         }
     }
+}
+
+fn is_get_request(request: u8) -> bool {
+    request & 0x80 != 0
+}
+
+fn validate_xu_query(unit: u8, selector: u8, request: u8, size: usize) -> Result<(), ImuError> {
+    if !is_get_request(request) {
+        return Err(ImuError::new(
+            "xu_query_denied",
+            "UVC XU SET requests are disabled",
+        ));
+    }
+    if request == UVC_GET_CUR && unit == 4 && matches!(selector, 10 | 15) {
+        return Err(ImuError::new(
+            "xu_query_denied",
+            "UVC XU GET_CUR is denied for this unit/selector",
+        ));
+    }
+    if request == UVC_GET_CUR && unit == KNOWN_IMU_UNIT && selector == KNOWN_IMU_SELECTOR {
+        if size != PACKET_BYTES {
+            return Err(ImuError::new(
+                "xu_query_denied",
+                format!("known IMU UVC XU GET_CUR must request exactly {PACKET_BYTES} bytes"),
+            ));
+        }
+        return Ok(());
+    }
+    if size > GENERIC_XU_PAYLOAD_MAX {
+        return Err(ImuError::new(
+            "xu_query_denied",
+            format!("unknown UVC XU payloads are limited to {GENERIC_XU_PAYLOAD_MAX} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 fn open_device(device: &str) -> Result<RawFd, ImuError> {
@@ -767,7 +816,8 @@ pub(crate) fn available() -> bool {
 mod tests {
     use super::{
         DEVICE_TIMESTAMP_MODULUS, PACKET_BYTES, TimeSynchronizer, TimestampUnwrapper,
-        UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, XU_GUID_BYTES, decode_packet, find_uvc_xu_unit,
+        UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, UVC_GET_CUR, UVC_GET_LEN, XU_GUID_BYTES,
+        decode_packet, find_uvc_xu_unit, validate_xu_query,
     };
 
     fn packet(timestamp: u32, seed: i16) -> [u8; PACKET_BYTES] {
@@ -799,6 +849,35 @@ mod tests {
         let mut descriptors = vec![4, 4, 0, 0];
         descriptors.extend_from_slice(&extension);
         assert_eq!(find_uvc_xu_unit(&descriptors).unwrap(), 7);
+    }
+
+    #[test]
+    fn validates_fail_closed_xu_query_shape() {
+        assert!(validate_xu_query(3, 1, UVC_GET_CUR, PACKET_BYTES).is_ok());
+        assert!(validate_xu_query(3, 1, UVC_GET_LEN, 2).is_ok());
+
+        assert_eq!(
+            validate_xu_query(4, 9, 0x01, 1).unwrap_err().code,
+            "xu_query_denied"
+        );
+        assert_eq!(
+            validate_xu_query(4, 10, UVC_GET_CUR, 16).unwrap_err().code,
+            "xu_query_denied"
+        );
+        assert_eq!(
+            validate_xu_query(4, 15, UVC_GET_CUR, 16).unwrap_err().code,
+            "xu_query_denied"
+        );
+        assert_eq!(
+            validate_xu_query(4, 9, UVC_GET_CUR, 257).unwrap_err().code,
+            "xu_query_denied"
+        );
+        assert_eq!(
+            validate_xu_query(3, 1, UVC_GET_CUR, PACKET_BYTES + 1)
+                .unwrap_err()
+                .code,
+            "xu_query_denied"
+        );
     }
 
     #[test]
