@@ -1,0 +1,13 @@
+[Unit]
+Description=RP-YLX privileged network-control socket
+
+[Socket]
+ListenStream=/run/rp-ylx/network-control.sock
+SocketUser=rp-ylx
+SocketGroup=rp-ylx
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
