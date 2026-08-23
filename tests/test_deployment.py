@@ -165,9 +165,19 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx-data-volume.service"), self.commands)
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx.service"), self.commands)
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx-wifi-watchdog.timer"), self.commands)
+        self.assertNotIn(
+            ("systemctl", "enable", "--now", "rp-ylx-network-control.socket"),
+            self.commands,
+        )
         self.assertIn(("health-check",), self.commands)
         self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx.service").is_file())
         self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx-data-volume.service").is_file())
+        self.assertTrue(
+            (self.root / "usr/lib/systemd/system/rp-ylx-network-control.service").is_file()
+        )
+        self.assertTrue(
+            (self.root / "usr/lib/systemd/system/rp-ylx-network-control.socket").is_file()
+        )
         data_volume = self.root / "usr/local/sbin/rp-ylx-data-volume"
         self.assertTrue(data_volume.stat().st_mode & 0o100)
         watchdog = self.root / "usr/local/sbin/rp-ylx-wifi-watchdog"
@@ -751,6 +761,9 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertTrue(
             (isolated_root / "usr/lib/systemd/system/rp-ylx-data-volume.service").is_file()
         )
+        self.assertTrue(
+            (isolated_root / "usr/lib/systemd/system/rp-ylx-network-control.socket").is_file()
+        )
         self.assertTrue((isolated_root / "usr/local/sbin/rp-ylx-data-volume").is_file())
         self.assertTrue((isolated_root / "usr/local/sbin/rp-ylx-wifi-watchdog").is_file())
 
@@ -804,6 +817,29 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn('timeout "$NMCLI_TIMEOUT" nmcli connection up', watchdog)
         self.assertIn("automatic reboot is in cooldown", watchdog)
         self.assertIn("systemctl reboot", watchdog)
+
+    def test_network_control_socket_is_staged_as_root_only_fail_closed_boundary(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"
+        socket = (root / "rp-ylx-network-control.socket").read_text(encoding="utf-8")
+        service = (root / "rp-ylx-network-control.service").read_text(encoding="utf-8")
+
+        self.assertIn("ListenStream=/run/rp-ylx/network-control.sock", socket)
+        self.assertIn("SocketUser=rp-ylx", socket)
+        self.assertIn("SocketGroup=rp-ylx", socket)
+        self.assertIn("SocketMode=0600", socket)
+        self.assertIn("DirectoryMode=0755", socket)
+        self.assertIn("User=root", service)
+        self.assertIn("StandardInput=socket", service)
+        self.assertIn("StandardOutput=socket", service)
+        self.assertIn(
+            "ExecStart=/opt/rp-ylx/current/bin/rp-ylx network-control serve --stdio",
+            service,
+        )
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertNotIn("ReadWritePaths=", service)
+        self.assertNotIn("/etc/NetworkManager/system-connections", service)
+        self.assertNotIn("/var/lib/rp-ylx/network", service)
+        self.assertNotIn("rp-ylx serve", service)
 
     def test_wifi_watchdog_reboots_once_when_driver_reload_does_not_restore_gateway(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"

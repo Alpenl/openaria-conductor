@@ -57,6 +57,14 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         "usr/lib/systemd/system/rp-ylx-wifi-watchdog.timer",
         0o644,
     ),
+    "rp-ylx-network-control.service": (
+        "usr/lib/systemd/system/rp-ylx-network-control.service",
+        0o644,
+    ),
+    "rp-ylx-network-control.socket": (
+        "usr/lib/systemd/system/rp-ylx-network-control.socket",
+        0o644,
+    ),
     "rp-ylx-wifi-watchdog.default": ("etc/default/rp-ylx-wifi-watchdog", 0o644),
     "aic8800-rp-ylx.conf": ("etc/modprobe.d/aic8800-rp-ylx.conf", 0o644),
     "90-rp-ylx-wifi-powersave.conf": (

@@ -43,6 +43,7 @@ rp_ylx = [
 "rp_ylx.deploy" = [
   "*.avahi",
   "*.service",
+  "*.socket",
   "*.timer",
   "*.sysusers",
   "*.tmpfiles",

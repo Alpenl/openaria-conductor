@@ -103,6 +103,16 @@ def build_parser() -> argparse.ArgumentParser:
     network_apply.add_argument("--config", required=True, help="JSON 配置文件或 - 表示标准输入")
     network_subcommands.add_parser("rescue", help="激活已登记的本机救援热点")
     network_subcommands.add_parser("reconcile", help="恢复提交前中断的网络事务")
+    network_control = subcommands.add_parser("network-control", help="运行特权网络控制器")
+    network_control_subcommands = network_control.add_subparsers(dest="network_control_command")
+    network_control_serve = network_control_subcommands.add_parser(
+        "serve", help="处理一个 socket 激活的网络控制请求"
+    )
+    network_control_serve.add_argument(
+        "--stdio",
+        action="store_true",
+        help="从标准输入读取请求并向标准输出写入响应",
+    )
     benchmark = subcommands.add_parser("benchmark", help="运行统一数据面性能工作负载")
     benchmark.add_argument("kind", choices=["fixed_trace", "preview", "recording", "concurrent"])
     benchmark.add_argument("--duration", type=float, default=30.0, help="测量秒数")
@@ -361,6 +371,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _print_network_error(exc)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return 0
+        parser.print_help()
+        return 0
+    if args.command == "network-control":
+        if args.network_control_command == "serve" and args.stdio:
+            from rp_ylx.network_control import serve_stdio
+
+            return serve_stdio()
         parser.print_help()
         return 0
     if args.command == "validate":

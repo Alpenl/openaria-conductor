@@ -1,0 +1,20 @@
+[Unit]
+Description=RP-YLX privileged network-control worker
+Requires=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/rp-ylx/current/bin/rp-ylx network-control serve --stdio
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictSUIDSGID=yes
+LockPersonality=yes
