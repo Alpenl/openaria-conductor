@@ -617,6 +617,7 @@ Runner = Callable[[Sequence[str]], None]
 StageInstaller = Callable[[Bundle, Path], None]
 TlsMaterialGenerator = Callable[[Path, Path, str], None]
 GroupResolver = Callable[[str], int]
+UnitLoadStateReader = Callable[[str], str]
 
 
 def _group_gid(name: str) -> int:
@@ -631,6 +632,29 @@ def _run(arguments: Sequence[str]) -> None:
         subprocess.run(list(arguments), check=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as error:
         raise DeploymentError("command_failed", f"命令失败：{' '.join(arguments)}") from error
+
+
+def _systemd_unit_load_state(unit: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "show", "--property=LoadState", "--value", unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise DeploymentError(
+            "unit_state_query_failed",
+            f"无法查询 systemd unit 状态：{unit}",
+        ) from error
+    state = completed.stdout.strip()
+    if completed.returncode != 0 or not state or "\n" in state:
+        raise DeploymentError(
+            "unit_state_query_failed",
+            f"systemd unit 状态无效：{unit}",
+        )
+    return state
 
 
 def _launcher(module: str) -> bytes:
@@ -1066,6 +1090,7 @@ class ReleaseManager:
         health_checker: Callable[[], None] | None = None,
         tls_material_generator: TlsMaterialGenerator = _default_tls_material_generator,
         group_resolver: GroupResolver = _group_gid,
+        unit_load_state_reader: UnitLoadStateReader = _systemd_unit_load_state,
     ) -> None:
         self.install_root = install_root
         self.config_root = config_root
@@ -1085,6 +1110,7 @@ class ReleaseManager:
         self.health_checker = health_checker or self._wait_for_health
         self.tls_material_generator = tls_material_generator
         self.group_resolver = group_resolver
+        self.unit_load_state_reader = unit_load_state_reader
 
     def _require_target(self) -> None:
         self._require_platform()
@@ -2059,15 +2085,29 @@ class ReleaseManager:
             raise DeploymentError(code, f"{message}：{'; '.join(failures)}")
 
     def _quiesce_release_services(self) -> None:
+        try:
+            recover_load_state = self.unit_load_state_reader(RECOVER_SERVICE)
+        except DeploymentError as error:
+            raise DeploymentError(
+                "unit_quiesce_failed",
+                f"无法确认部署相关服务状态；拒绝切换 release：{RECOVER_SERVICE} ({error.code})",
+            ) from error
+        if not recover_load_state or "\n" in recover_load_state:
+            raise DeploymentError(
+                "unit_quiesce_failed",
+                f"无法确认部署相关服务状态；拒绝切换 release：{RECOVER_SERVICE}",
+            )
+        commands = [
+            ["systemctl", "disable", "--now", WATCHDOG_TIMER],
+            ["systemctl", "stop", WATCHDOG_SERVICE],
+            ["systemctl", "stop", "rp-ylx.service"],
+            ["systemctl", "stop", "rp-ylx-network-control.socket"],
+            ["systemctl", "stop", NETWORK_CONTROL_SERVICE],
+        ]
+        if recover_load_state != "not-found":
+            commands.append(["systemctl", "stop", RECOVER_SERVICE])
         self._run_unit_commands(
-            (
-                ["systemctl", "disable", "--now", WATCHDOG_TIMER],
-                ["systemctl", "stop", WATCHDOG_SERVICE],
-                ["systemctl", "stop", "rp-ylx.service"],
-                ["systemctl", "stop", "rp-ylx-network-control.socket"],
-                ["systemctl", "stop", NETWORK_CONTROL_SERVICE],
-                ["systemctl", "stop", RECOVER_SERVICE],
-            ),
+            commands,
             code="unit_quiesce_failed",
             message="无法确认部署相关服务全部停止；拒绝切换 release",
         )
