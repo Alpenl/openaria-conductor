@@ -1,3 +1,6 @@
 d /var/lib/rp-ylx 0750 rp-ylx rp-ylx -
 d /var/lib/rp-ylx-data-volume 0755 root root -
+d /var/lib/rp-ylx-network 0700 root root -
 d /etc/rp-ylx 0750 root rp-ylx -
+d /run/rp-ylx 0750 root rp-ylx -
+f /run/rp-ylx/network-operation.lock 0660 root rp-ylx -

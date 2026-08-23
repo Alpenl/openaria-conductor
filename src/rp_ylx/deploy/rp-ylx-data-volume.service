@@ -1,7 +1,8 @@
 [Unit]
 Description=RP-YLX /data internal recording volume
 DefaultDependencies=no
-After=local-fs.target
+Requires=rp-ylx-recover.service
+After=local-fs.target rp-ylx-recover.service
 Before=rp-ylx.service
 
 [Service]

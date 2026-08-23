@@ -3,10 +3,8 @@ set -eu
 
 TAG=rp-ylx-wifi-watchdog
 INTERFACE=${WIFI_INTERFACE:-wlan0}
-CONNECTION_UUID=${WIFI_CONNECTION_UUID:-}
 GATEWAY=${WIFI_GATEWAY:-}
 FAILURE_THRESHOLD=${WIFI_FAILURE_THRESHOLD:-3}
-RECONNECT_TIMEOUT=${WIFI_RECONNECT_TIMEOUT_SECONDS:-30}
 RELOAD_TIMEOUT=${WIFI_RELOAD_TIMEOUT_SECONDS:-60}
 NMCLI_TIMEOUT=${WIFI_NMCLI_TIMEOUT_SECONDS:-10}
 RECOVERY_COOLDOWN=${WIFI_RECOVERY_COOLDOWN_SECONDS:-900}
@@ -16,6 +14,8 @@ REBOOT_COOLDOWN=${WIFI_REBOOT_COOLDOWN_SECONDS:-21600}
 STATE_DIRECTORY=${STATE_DIRECTORY:-/var/lib/rp-ylx-wifi-watchdog}
 RUNTIME_DIRECTORY=${RUNTIME_DIRECTORY:-/run/rp-ylx-wifi-watchdog}
 SYS_CLASS_NET=${WIFI_SYS_CLASS_NET:-/sys/class/net}
+RP_YLX_COMMAND=${RP_YLX_COMMAND:-/opt/rp-ylx/current/bin/rp-ylx}
+NETWORK_OPERATION_LOCK=${RP_YLX_NETWORK_OPERATION_LOCK_PATH:-/run/rp-ylx/network-operation.lock}
 
 FAILURE_FILE=$RUNTIME_DIRECTORY/failures
 LOCK_FILE=$RUNTIME_DIRECTORY/lock
@@ -41,7 +41,6 @@ require_unsigned_integer()
 }
 
 require_unsigned_integer WIFI_FAILURE_THRESHOLD "$FAILURE_THRESHOLD"
-require_unsigned_integer WIFI_RECONNECT_TIMEOUT_SECONDS "$RECONNECT_TIMEOUT"
 require_unsigned_integer WIFI_RELOAD_TIMEOUT_SECONDS "$RELOAD_TIMEOUT"
 require_unsigned_integer WIFI_NMCLI_TIMEOUT_SECONDS "$NMCLI_TIMEOUT"
 require_unsigned_integer WIFI_RECOVERY_COOLDOWN_SECONDS "$RECOVERY_COOLDOWN"
@@ -53,6 +52,38 @@ exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     exit 0
 fi
+
+exec 8<>"$NETWORK_OPERATION_LOCK"
+if ! flock -n 8; then
+    log "network controller operation is active; deferring driver recovery"
+    exit 0
+fi
+
+desired_mode=$("$RP_YLX_COMMAND" network-control watchdog-mode 2>/dev/null || printf 'unknown')
+case "$desired_mode" in
+    wifi-client)
+        ;;
+    hotspot)
+        rm -f "$FAILURE_FILE"
+        log "desired hotspot mode does not require an upstream default route"
+        exit 0
+        ;;
+    ethernet-dhcp|ethernet-static)
+        rm -f "$FAILURE_FILE"
+        log "desired ethernet mode does not permit Wi-Fi recovery"
+        exit 0
+        ;;
+    defer)
+        rm -f "$FAILURE_FILE"
+        log "network transaction or rescue outcome requires watchdog to defer"
+        exit 0
+        ;;
+    *)
+        rm -f "$FAILURE_FILE"
+        log "desired network mode is unavailable; deferring Wi-Fi recovery"
+        exit 0
+        ;;
+esac
 
 read_failure_count()
 {
@@ -82,16 +113,6 @@ resolve_gateway()
     fi
     ip -4 route show default dev "$INTERFACE" 2>/dev/null \
         | awk '/^default / {print $3; exit}'
-}
-
-resolve_connection_uuid()
-{
-    if [ -n "$CONNECTION_UUID" ]; then
-        printf '%s\n' "$CONNECTION_UUID"
-        return
-    fi
-    timeout "$NMCLI_TIMEOUT" nmcli -g GENERAL.CON-UUID device show "$INTERFACE" 2>/dev/null \
-        | awk 'NF {print; exit}'
 }
 
 is_healthy()
@@ -154,26 +175,8 @@ mark_recovery()
     chmod 0600 "$LAST_RECOVERY_FILE"
 }
 
-reconnect_network_manager()
-{
-    uuid=$(resolve_connection_uuid)
-    if [ -z "$uuid" ]; then
-        log "cannot resolve the NetworkManager connection UUID for $INTERFACE"
-        return 1
-    fi
-    log "asking NetworkManager to reconnect $INTERFACE"
-    timeout "$NMCLI_TIMEOUT" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
-    sleep 2
-    timeout "$NMCLI_TIMEOUT" nmcli radio wifi on >/dev/null 2>&1 || true
-    timeout "$NMCLI_TIMEOUT" nmcli connection up uuid "$uuid" ifname "$INTERFACE" \
-        >/dev/null 2>&1 || true
-    iw dev "$INTERFACE" set power_save off >/dev/null 2>&1 || true
-    wait_until_healthy "$RECONNECT_TIMEOUT"
-}
-
 reload_driver()
 {
-    uuid=$(resolve_connection_uuid)
     log "reloading kernel module $DRIVER_MODULE for $INTERFACE"
     timeout "$NMCLI_TIMEOUT" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
     sleep 2
@@ -198,12 +201,28 @@ reload_driver()
     fi
 
     timeout "$NMCLI_TIMEOUT" nmcli radio wifi on >/dev/null 2>&1 || true
-    if [ -n "$uuid" ]; then
-        timeout "$NMCLI_TIMEOUT" nmcli connection up uuid "$uuid" ifname "$INTERFACE" \
-            >/dev/null 2>&1 || true
-    fi
     iw dev "$INTERFACE" set power_save off >/dev/null 2>&1 || true
     return 0
+}
+
+reconcile_after_driver_reload()
+{
+    flock -u 8
+    log "asking the authoritative network controller to reconcile after driver reload"
+    if ! systemctl restart rp-ylx-network-control.service; then
+        log "failed to restart the authoritative network controller"
+        return 1
+    fi
+    if wait_until_healthy "$RELOAD_TIMEOUT"; then
+        return 0
+    fi
+    post_recovery_mode=$("$RP_YLX_COMMAND" network-control watchdog-mode 2>/dev/null \
+        || printf 'unknown')
+    if [ "$post_recovery_mode" != wifi-client ]; then
+        log "network controller converged to a non-client rescue state"
+        return 0
+    fi
+    return 1
 }
 
 automatic_reboot_is_in_cooldown()
@@ -242,9 +261,9 @@ force_recovery()
         maybe_reboot_after_recovery_failure
         return 1
     fi
-    if wait_until_healthy "$RELOAD_TIMEOUT"; then
+    if reconcile_after_driver_reload; then
         write_failure_count 0
-        log "$INTERFACE recovered after reloading $DRIVER_MODULE"
+        log "$INTERFACE reconciled after reloading $DRIVER_MODULE"
         return 0
     fi
     write_failure_count 0
@@ -276,18 +295,13 @@ check_health()
 
     record_diagnostics
     mark_recovery
-    if reconnect_network_manager; then
-        write_failure_count 0
-        log "$INTERFACE recovered after the NetworkManager reconnect"
-        exit 0
-    fi
     if ! reload_driver; then
         maybe_reboot_after_recovery_failure
         exit 0
     fi
-    if wait_until_healthy "$RELOAD_TIMEOUT"; then
+    if reconcile_after_driver_reload; then
         write_failure_count 0
-        log "$INTERFACE recovered after reloading $DRIVER_MODULE"
+        log "$INTERFACE reconciled after reloading $DRIVER_MODULE"
         exit 0
     fi
 

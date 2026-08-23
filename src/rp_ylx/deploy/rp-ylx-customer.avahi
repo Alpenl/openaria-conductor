@@ -5,11 +5,11 @@
   <service>
     <type>_ylx-capture._tcp</type>
     <port>8080</port>
-    <txt-record>scheme=http</txt-record>
+    <txt-record>scheme=https</txt-record>
     <txt-record>api=/api/v4/device</txt-record>
   </service>
   <service>
-    <type>_http._tcp</type>
+    <type>_https._tcp</type>
     <port>8080</port>
   </service>
 </service-group>

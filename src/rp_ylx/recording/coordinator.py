@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import copy
+import errno
+import fcntl
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -27,12 +30,13 @@ from rp_ylx.api.gateway import (
     CaptureCommandResult,
     NetworkCommand,
     NetworkCommandResult,
+    NetworkCredentialCommand,
     ProviderError,
 )
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
-from rp_ylx.network import NetworkError
+from rp_ylx.network import NetworkError, network_operation_lock_path
 from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.network import network_status_v1 as project_network_status_v1
 from rp_ylx.network_control import NetworkControlClientError
@@ -381,6 +385,7 @@ class CaptureCoordinator:
         self._storage_cache: StorageStatus | None = None
         self._active: DeviceSessionRecorder | None = None
         self._active_plan: SessionPlan | None = None
+        self._network_operation_lease: int | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
         self._session_summaries: dict[str, dict[str, object]] = {}
@@ -1062,7 +1067,9 @@ class CaptureCoordinator:
                 "capture": admission is not None and writable and not self._released,
                 "preview": True,
                 "range_download": True,
-                "network_mutation": False,
+                "network_mutation": (
+                    security_profile == "customer" and self._network_controller_available()
+                ),
             },
             "storage": {
                 "volume_id": None if admission is None else admission.volume_id,
@@ -1088,40 +1095,270 @@ class CaptureCoordinator:
                 retryable=error.retryable,
             ) from error
 
+    @staticmethod
+    def _network_operation_lock_path() -> Path:
+        return network_operation_lock_path()
+
+    def _acquire_network_operation_lease(self) -> None:
+        if self._network_operation_lease is not None:
+            raise ProviderError(
+                "network_state_unavailable",
+                "录制网络互斥租约状态无效",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                retryable=True,
+            )
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                self._network_operation_lock_path(),
+                os.O_RDONLY
+                | os.O_CREAT
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o660,
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(errno.EINVAL, "network operation lock is not a regular file")
+            if metadata.st_uid == os.geteuid():
+                os.fchmod(descriptor, 0o660)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise ProviderError(
+                    "network_mutation_active",
+                    "网络事务执行期间不能开始录制",
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                ) from error
+            raise ProviderError(
+                "network_state_unavailable",
+                "无法取得录制网络互斥租约",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                retryable=True,
+            ) from error
+        self._network_operation_lease = descriptor
+
+    def _release_network_operation_lease(self) -> None:
+        descriptor = self._network_operation_lease
+        self._network_operation_lease = None
+        if descriptor is None:
+            return
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(descriptor)
+
     def network_status(self) -> Mapping[str, object]:
         try:
             legacy_status = collect_network_status()
             runtime = self._runtime_snapshot()
-            return project_network_status_v1(runtime, legacy_status=legacy_status)
+            status = project_network_status_v1(runtime, legacy_status=legacy_status)
         except NetworkError as error:
             raise ProviderError(
-                error.code,
-                error.message,
+                "network_status_unavailable",
+                "网络状态暂时不可用",
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
 
+        with self._lock:
+            capture_active = self._active is not None
+        if capture_active:
+            status = copy.deepcopy(status)
+            capability = status.get("mutation_capability")
+            if isinstance(capability, dict):
+                capability["enabled"] = False
+                capability["disabled_reason"] = "capture_active"
+        return status
+
     @staticmethod
-    def _network_mutation_unavailable() -> ProviderError:
-        return ProviderError(
-            "network_mutation_unavailable",
-            "网络写入控制器尚未启用",
-            status=HTTPStatus.SERVICE_UNAVAILABLE,
-            retryable=True,
+    def _network_controller_available() -> bool:
+        try:
+            response = request_network_control("health")
+        except NetworkControlClientError:
+            return False
+        capabilities = response.get("capabilities")
+        return (
+            response.get("ok") is True
+            and response.get("operation") == "health"
+            and isinstance(capabilities, Mapping)
+            and capabilities.get("mutation_enabled") is True
         )
 
-    def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
+    @staticmethod
+    def _network_mutation_unavailable(
+        reason: str = "controller_unavailable",
+        message: str = "网络写入控制器暂时不可用",
+    ) -> ProviderError:
+        return ProviderError(
+            "network_mutation_unavailable",
+            message,
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            retryable=True,
+            details={"reason": reason},
+        )
+
+    @staticmethod
+    def _network_provider_error(
+        response: Mapping[str, object],
+        *,
+        operation: str,
+        body: Mapping[str, object] | None = None,
+    ) -> ProviderError:
+        error = response.get("error")
+        controller_code = error.get("code") if isinstance(error, Mapping) else None
+        code = str(controller_code or "network_controller_unavailable")
+        mutation_operations = {"apply", "retry", "forget"}
+        if code == "idempotency_conflict" and operation in mutation_operations:
+            return ProviderError(
+                "idempotency_conflict",
+                "幂等键已经用于不同的网络请求",
+                status=HTTPStatus.CONFLICT,
+                details={
+                    "idempotency_scope": "network-mutation",
+                    "original_transaction_id": None,
+                },
+            )
+        if code == "transaction_not_found" and operation == "retry":
+            transaction_id = body.get("transaction_id") if isinstance(body, Mapping) else None
+            try:
+                parsed_transaction_id = uuid.UUID(str(transaction_id))
+            except (AttributeError, TypeError, ValueError):
+                parsed_transaction_id = None
+            if (
+                parsed_transaction_id is not None
+                and parsed_transaction_id.version == 7
+                and str(parsed_transaction_id) == transaction_id
+            ):
+                return ProviderError(
+                    "network_transaction_not_found",
+                    "指定的网络事务不存在",
+                    status=HTTPStatus.NOT_FOUND,
+                    details={"transaction_id": transaction_id},
+                )
+        if code in {"controller_busy", "recovery_required"}:
+            return CaptureCoordinator._network_mutation_unavailable(
+                "recovery_required",
+                "另一个网络事务仍在执行或等待恢复",
+            )
+        invalid_details: tuple[str, str] | None = None
+        if code == "transaction_not_retryable":
+            invalid_details = ("transaction_id", "active_state")
+        elif code == "credential_ref_invalid":
+            invalid_details = (
+                "desired.wifi_client.credential_ref",
+                "credential_ref_not_allowed",
+            )
+        elif code == "credential_ref_expired":
+            invalid_details = (
+                "desired.wifi_client.credential_ref",
+                "credential_ref_expired",
+            )
+        elif code == "inline_secret_rejected":
+            invalid_details = ("desired", "unsafe_secret_field")
+        elif code == "network_config_invalid":
+            invalid_details = ("desired.mode", "unsupported_mode")
+        elif code == "candidate_invalid":
+            desired = body.get("desired") if isinstance(body, Mapping) else None
+            mode = desired.get("mode") if isinstance(desired, Mapping) else None
+            invalid_details = (
+                ("desired.ethernet.static_ipv4", "invalid_static_ipv4")
+                if mode == "ethernet-static"
+                else ("desired.wifi_client", "security_mismatch")
+                if mode == "wifi-client"
+                else ("desired.mode", "unsupported_mode")
+            )
+        elif code == "credential_invalid" and operation != "credentials":
+            invalid_details = ("desired.wifi_client", "security_mismatch")
+        if invalid_details is not None and operation in {"apply", "retry"}:
+            return ProviderError(
+                "invalid_network_desired_state",
+                "网络目标状态或凭据引用无效",
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+                details={"field": invalid_details[0], "reason": invalid_details[1]},
+            )
+        if code == "credential_invalid" and operation == "credentials":
+            return ProviderError(
+                "invalid_request",
+                "网络凭据不符合要求",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        unavailable_reasons = {
+            "network_controller_not_enabled": "not_enabled",
+            "network_manager_unavailable": "network_manager_unavailable",
+            "rescue_ap_unavailable": "rescue_ap_not_validated",
+            "rescue_ap_not_validated": "rescue_ap_not_validated",
+            "concurrency_unsupported": "unsupported_concurrency",
+            "capture_active": "capture_active",
+        }
+        return CaptureCoordinator._network_mutation_unavailable(
+            unavailable_reasons.get(code, "controller_unavailable")
+        )
+
+    def scan_networks(self) -> Mapping[str, object]:
+        try:
+            response = request_network_control("scan")
+        except NetworkControlClientError as exc:
+            raise ProviderError(
+                "network_scan_unavailable",
+                "无线网络扫描暂时不可用",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from exc
+        if response.get("ok") is not True or response.get("status") != HTTPStatus.OK:
+            raise ProviderError(
+                "network_scan_unavailable",
+                "无线网络扫描暂时不可用",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=response.get("retryable") is True,
+            )
+        body = response.get("body")
+        if not isinstance(body, Mapping):
+            raise self._network_mutation_unavailable()
+        return body
+
+    def create_network_credential(self, command: NetworkCredentialCommand) -> Mapping[str, object]:
         try:
             response = request_network_control(
-                operation,
+                "create_credential",
                 principal_id=command.principal_id,
-                idempotency_key=command.idempotency_key,
-                body=command.body,
+                body={
+                    "schema": "ylx.network-credential-request.v1",
+                    "passphrase": command.passphrase,
+                },
             )
         except NetworkControlClientError as exc:
             raise self._network_mutation_unavailable() from exc
         if response.get("ok") is not True:
+            raise self._network_provider_error(response, operation="credentials")
+        body = response.get("body")
+        if response.get("status") != HTTPStatus.CREATED or not isinstance(body, Mapping):
             raise self._network_mutation_unavailable()
+        return body
+
+    def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
+        with getattr(self, "_lock", nullcontext()):
+            if getattr(self, "_active", None) is not None:
+                raise self._network_mutation_unavailable(
+                    "capture_active",
+                    "录制期间不能变更设备网络",
+                )
+            try:
+                response = request_network_control(
+                    operation,
+                    principal_id=command.principal_id,
+                    idempotency_key=command.idempotency_key,
+                    body=command.body,
+                )
+            except NetworkControlClientError as exc:
+                raise self._network_mutation_unavailable() from exc
+        if response.get("ok") is not True:
+            raise self._network_provider_error(response, operation=operation, body=command.body)
         status = response.get("status")
         if type(status) is not int:
             raise self._network_mutation_unavailable()
@@ -1177,8 +1414,10 @@ class CaptureCoordinator:
         except CameraError as error:
             if error.code in {"invalid_camera_focus", "invalid_focus_value"}:
                 status = HTTPStatus.BAD_REQUEST
-            elif error.code in {"camera_focus_unsupported", "camera_focus_auto_unsupported"}:
-                status = HTTPStatus.CONFLICT
+            elif error.code == "camera_focus_unsupported":
+                status = HTTPStatus.NOT_FOUND
+            elif error.code == "camera_focus_auto_unsupported":
+                status = HTTPStatus.UNPROCESSABLE_ENTITY
             elif error.retryable:
                 status = HTTPStatus.SERVICE_UNAVAILABLE
             else:
@@ -1230,6 +1469,46 @@ class CaptureCoordinator:
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
+        self._acquire_network_operation_lease()
+        try:
+            return self._start_capture_with_network_lease(body)
+        except BaseException:
+            if self._active is None:
+                self._release_network_operation_lease()
+            raise
+
+    def _start_capture_with_network_lease(self, body: Mapping[str, object]) -> CaptureCommandResult:
+        try:
+            network_response = request_network_control("status")
+        except NetworkControlClientError as error:
+            raise ProviderError(
+                "network_state_unavailable",
+                "无法确认网络事务为空闲状态",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                retryable=True,
+            ) from error
+        network_body = network_response.get("body")
+        transaction = network_body.get("transaction") if isinstance(network_body, Mapping) else None
+        if not (
+            network_response.get("ok") is True
+            and network_response.get("operation") == "status"
+            and network_response.get("status") == HTTPStatus.OK
+            and isinstance(transaction, Mapping)
+            and "current" in transaction
+        ):
+            raise ProviderError(
+                "network_state_unavailable",
+                "无法确认网络事务为空闲状态",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                retryable=True,
+            )
+        if transaction.get("current") is not None:
+            raise ProviderError(
+                "network_mutation_active",
+                "网络事务执行期间不能开始录制",
+                status=HTTPStatus.CONFLICT,
+                retryable=True,
+            )
         try:
             admission = self._require_admission()
         except DeviceRecordingError as error:
@@ -1481,11 +1760,14 @@ class CaptureCoordinator:
                     self._persist_local_state()
                     result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
                 self._remember_command(scope, command, result)
+                self._release_network_operation_lease()
                 return result
         finally:
             with self._stop_condition:
                 if self._stop_inflight == scope:
                     self._stop_inflight = None
+                if self._active is None:
+                    self._release_network_operation_lease()
                 self._stop_condition.notify_all()
 
     def _publish_safe_swap_command(self) -> CaptureCommandResult:
@@ -1528,6 +1810,8 @@ class CaptureCoordinator:
         self._active_plan = None
         self._latest_imu = None
         self._persist_local_state()
+        if self._stop_inflight is None:
+            self._release_network_operation_lease()
 
     def _local_failure_state(
         self,
@@ -1893,18 +2177,21 @@ class CaptureCoordinator:
                     self._sources.stop()
         self._preview.clear()
         with self._lock:
-            if self._active is not None:
-                self._active.abort()
-                state = self._active.current_recording_state
-                if state is not None and self._active_plan is not None:
-                    self._retained[self._active_plan.session_id] = {
-                        "generation_id": self._active_plan.generation_id,
-                        "recording_state": state,
-                    }
-                self._active = None
-                self._active_plan = None
-                self._latest_imu = None
-            self._persist_local_state()
+            try:
+                if self._active is not None:
+                    self._active.abort()
+                    state = self._active.current_recording_state
+                    if state is not None and self._active_plan is not None:
+                        self._retained[self._active_plan.session_id] = {
+                            "generation_id": self._active_plan.generation_id,
+                            "recording_state": state,
+                        }
+                    self._active = None
+                    self._active_plan = None
+                    self._latest_imu = None
+                self._persist_local_state()
+            finally:
+                self._release_network_operation_lease()
 
     def __enter__(self) -> CaptureCoordinator:
         return self

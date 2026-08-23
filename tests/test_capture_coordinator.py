@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 from unittest.mock import patch
 
-from rp_ylx.api import CaptureCommand, ProviderError
+from rp_ylx.api import CaptureCommand, NetworkCommand, ProviderError
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
@@ -30,8 +31,9 @@ from rp_ylx.api.events import (
     validate_session_list,
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
-from rp_ylx.camera import FrameObservation, StereoFrame
+from rp_ylx.camera import CameraError, FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.network_control import NetworkControlClientError
 from rp_ylx.recording import (
     CaptureCoordinator,
     CoordinatorConfig,
@@ -292,6 +294,23 @@ def command(key: str, body: dict[str, object]) -> CaptureCommand:
     return CaptureCommand("operator", key, body, canonical)
 
 
+def network_command(key: str, body: dict[str, object]) -> NetworkCommand:
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return NetworkCommand("operator", key, body, canonical)
+
+
+def idle_network_control(operation: str, **unused: object) -> dict[str, object]:
+    del unused
+    if operation == "status":
+        return {
+            "ok": True,
+            "operation": "status",
+            "status": 200,
+            "body": {"transaction": {"current": None}},
+        }
+    raise NetworkControlClientError("controller_unavailable", "network controller is unavailable")
+
+
 def start_command(
     key: str,
     *,
@@ -434,7 +453,13 @@ class CaptureCoordinatorTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.mountpoint = self.root / "volume"
         self.state_root = self.root / "state"
+        self.network_operation_lock_path = self.root / "network-operation.lock"
         self.mountpoint.mkdir()
+        self.environment_patcher = patch.dict(
+            os.environ,
+            {"RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.network_operation_lock_path)},
+        )
+        self.environment_patcher.start()
         self.volume_id = initialize_capture_volume(self.mountpoint)
         self.session_config = DeviceSessionConfig(
             device_id=str(uuid.uuid4()),
@@ -447,8 +472,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
             height=1080,
             sensor_fps=60.0,
         )
+        self.network_control_patcher = patch(
+            "rp_ylx.recording.coordinator.request_network_control",
+            side_effect=idle_network_control,
+        )
+        self.network_control_patcher.start()
 
     def tearDown(self) -> None:
+        self.network_control_patcher.stop()
+        self.environment_patcher.stop()
         self.temporary.cleanup()
 
     def coordinator(
@@ -483,6 +515,31 @@ class CaptureCoordinatorTest(unittest.TestCase):
         validate_capture_status(status)
         active = status["snapshot"]["active_recording"]
         return active["recording_state"]["session_id"]
+
+    def assert_network_operation_lock_available(self) -> None:
+        descriptor = os.open(
+            self.network_operation_lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o660,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def assert_network_operation_lock_held(self) -> None:
+        descriptor = os.open(
+            self.network_operation_lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o660,
+        )
+        try:
+            with self.assertRaises(OSError) as rejected:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn(rejected.exception.errno, {errno.EACCES, errno.EAGAIN})
+        finally:
+            os.close(descriptor)
 
     def seal_one(
         self,
@@ -530,6 +587,267 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator.start_capture(start_command(expected_code))
             self.assertEqual(rejected.exception.code, expected_code)
             self.assertEqual(rejected.exception.status, 409)
+        finally:
+            coordinator.close()
+
+    def test_capture_start_fails_closed_when_network_state_cannot_be_proven_idle(self) -> None:
+        failures: tuple[object, ...] = (
+            NetworkControlClientError("controller_unavailable", "offline"),
+            {"ok": False, "error": {"code": "controller_failure"}, "retryable": True},
+            {"ok": True, "operation": "status", "status": 200, "body": {}},
+        )
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=failure):
+                coordinator = self.coordinator()
+                try:
+                    effect = failure if isinstance(failure, BaseException) else None
+                    result = failure if isinstance(failure, dict) else None
+                    with (
+                        patch(
+                            "rp_ylx.recording.coordinator.request_network_control",
+                            side_effect=effect,
+                            return_value=result,
+                        ),
+                        self.assertRaises(ProviderError) as rejected,
+                    ):
+                        coordinator.start_capture(start_command(f"network-unknown-{index}"))
+                    self.assertEqual(rejected.exception.code, "network_state_unavailable")
+                    self.assertEqual(rejected.exception.status, 500)
+                    self.assertTrue(rejected.exception.retryable)
+                    self.assertEqual(
+                        coordinator.capture_status()["snapshot"]["device_state"],
+                        "idle",
+                    )
+                    self.assert_network_operation_lock_available()
+                finally:
+                    coordinator.close()
+
+    def test_capture_holds_network_operation_lease_from_idle_check_through_stop(self) -> None:
+        coordinator = self.coordinator()
+        status_checked = False
+
+        def idle_status_while_locked(operation: str, **unused: object) -> dict[str, object]:
+            nonlocal status_checked
+            del unused
+            self.assertEqual(operation, "status")
+            self.assert_network_operation_lock_held()
+            status_checked = True
+            return idle_network_control(operation)
+
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator.request_network_control",
+                side_effect=idle_status_while_locked,
+            ):
+                coordinator.start_capture(start_command("lease-lifecycle"))
+            self.assertTrue(status_checked)
+            self.assert_network_operation_lock_held()
+            self.assertTrue(coordinator.submit_frame(frame()))
+            coordinator.stop_capture(stop_command("lease-lifecycle-stop"))
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def test_capture_start_rejects_network_operation_lock_contention_without_querying_root(
+        self,
+    ) -> None:
+        descriptor = os.open(
+            self.network_operation_lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o660,
+        )
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        coordinator = self.coordinator()
+        try:
+            with (
+                patch(
+                    "rp_ylx.recording.coordinator.request_network_control",
+                    side_effect=AssertionError("root status must not be queried without the lease"),
+                ),
+                self.assertRaises(ProviderError) as rejected,
+            ):
+                coordinator.start_capture(start_command("lease-contended"))
+            self.assertEqual(rejected.exception.code, "network_mutation_active")
+            self.assertEqual(rejected.exception.status, 409)
+            self.assertTrue(rejected.exception.retryable)
+            self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "idle")
+        finally:
+            coordinator.close()
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def test_capture_start_rejects_an_active_network_transaction(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            with (
+                patch(
+                    "rp_ylx.recording.coordinator.request_network_control",
+                    return_value={
+                        "ok": True,
+                        "operation": "status",
+                        "status": 200,
+                        "body": {"transaction": {"current": {"transaction_id": "active"}}},
+                    },
+                ),
+                self.assertRaises(ProviderError) as rejected,
+            ):
+                coordinator.start_capture(start_command("network-active"))
+            self.assertEqual(rejected.exception.code, "network_mutation_active")
+            self.assertEqual(rejected.exception.status, 409)
+            self.assertTrue(rejected.exception.retryable)
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def test_network_controller_errors_are_mapped_to_openapi_typed_errors(self) -> None:
+        transaction_id = "0198d2a0-41a0-7b7a-a751-0e86a39d4db1"
+        apply_body = {
+            "schema": "ylx.network-apply-request.v1",
+            "desired": {
+                "mode": "wifi-client",
+                "wifi_client": {
+                    "ssid": "studio-wifi",
+                    "security": "wpa2-personal",
+                    "credential_ref": "cred-test",
+                },
+                "ethernet": None,
+            },
+        }
+        retry_body = {
+            "schema": "ylx.network-retry-request.v1",
+            "transaction_id": transaction_id,
+        }
+        cases = (
+            (
+                "apply",
+                apply_body,
+                "idempotency_conflict",
+                409,
+                "idempotency_conflict",
+                False,
+                {
+                    "idempotency_scope": "network-mutation",
+                    "original_transaction_id": None,
+                },
+            ),
+            (
+                "retry",
+                retry_body,
+                "transaction_not_found",
+                404,
+                "network_transaction_not_found",
+                False,
+                {"transaction_id": transaction_id},
+            ),
+            (
+                "apply",
+                apply_body,
+                "credential_ref_expired",
+                422,
+                "invalid_network_desired_state",
+                False,
+                {
+                    "field": "desired.wifi_client.credential_ref",
+                    "reason": "credential_ref_expired",
+                },
+            ),
+            (
+                "apply",
+                apply_body,
+                "inline_secret_rejected",
+                422,
+                "invalid_network_desired_state",
+                False,
+                {"field": "desired", "reason": "unsafe_secret_field"},
+            ),
+            (
+                "apply",
+                apply_body,
+                "controller_busy",
+                503,
+                "network_mutation_unavailable",
+                True,
+                {"reason": "recovery_required"},
+            ),
+            (
+                "apply",
+                apply_body,
+                "network_manager_unavailable",
+                503,
+                "network_mutation_unavailable",
+                True,
+                {"reason": "network_manager_unavailable"},
+            ),
+            (
+                "apply",
+                apply_body,
+                "capture_active",
+                503,
+                "network_mutation_unavailable",
+                True,
+                {"reason": "capture_active"},
+            ),
+        )
+        coordinator = self.coordinator()
+        try:
+            for index, (
+                operation,
+                body,
+                controller_code,
+                expected_status,
+                expected_code,
+                expected_retryable,
+                expected_details,
+            ) in enumerate(cases):
+                with self.subTest(controller_code=controller_code):
+                    with (
+                        patch(
+                            "rp_ylx.recording.coordinator.request_network_control",
+                            return_value={
+                                "ok": False,
+                                "operation": operation,
+                                "error": {"code": controller_code},
+                                "retryable": controller_code
+                                in {
+                                    "capture_active",
+                                    "controller_busy",
+                                    "network_manager_unavailable",
+                                },
+                            },
+                        ),
+                        self.assertRaises(ProviderError) as rejected,
+                    ):
+                        command_value = network_command(f"network-error-{index}", body)
+                        if operation == "retry":
+                            coordinator.retry_network_transaction(command_value)
+                        else:
+                            coordinator.apply_network_desired_state(command_value)
+                    self.assertEqual(rejected.exception.status, expected_status)
+                    self.assertEqual(rejected.exception.code, expected_code)
+                    self.assertEqual(rejected.exception.retryable, expected_retryable)
+                    self.assertEqual(rejected.exception.details, expected_details)
+        finally:
+            coordinator.close()
+
+    def test_active_capture_blocks_network_mutation_with_typed_unavailable_error(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("capture-before-network"))
+            body = {
+                "schema": "ylx.network-forget-request.v1",
+            }
+            with (
+                patch(
+                    "rp_ylx.recording.coordinator.request_network_control",
+                    side_effect=AssertionError("network controller must not be called"),
+                ),
+                self.assertRaises(ProviderError) as rejected,
+            ):
+                coordinator.forget_network_client_profile(network_command("blocked-network", body))
+            self.assertEqual(rejected.exception.status, 503)
+            self.assertEqual(rejected.exception.code, "network_mutation_unavailable")
+            self.assertTrue(rejected.exception.retryable)
+            self.assertEqual(rejected.exception.details, {"reason": "capture_active"})
         finally:
             coordinator.close()
 
@@ -1098,6 +1416,40 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 )
             self.assertEqual(invalid.exception.code, "invalid_camera_focus")
             self.assertEqual(invalid.exception.status, 400)
+        finally:
+            coordinator.close()
+
+    def test_camera_focus_capability_errors_match_the_v4_contract(self) -> None:
+        sources = FakeSources()
+        sources.focus = deepcopy(CAMERA_FOCUS_STATUS)
+        coordinator = self.coordinator(sources=sources)
+        try:
+            cases = (
+                ("camera_focus_unsupported", 404),
+                ("camera_focus_auto_unsupported", 422),
+            )
+            for index, (code, expected_status) in enumerate(cases):
+                with self.subTest(code=code):
+                    with (
+                        patch.object(
+                            sources,
+                            "set_camera_focus",
+                            side_effect=CameraError(code, "unsupported"),
+                        ),
+                        self.assertRaises(ProviderError) as rejected,
+                    ):
+                        coordinator.set_camera_focus(
+                            command(
+                                f"focus-capability-{index}",
+                                {
+                                    "schema": "ylx.camera-focus-set.v1",
+                                    "auto_enabled": True,
+                                },
+                            )
+                        )
+                    self.assertEqual(rejected.exception.code, code)
+                    self.assertEqual(rejected.exception.status, expected_status)
+                    self.assertFalse(rejected.exception.retryable)
         finally:
             coordinator.close()
 

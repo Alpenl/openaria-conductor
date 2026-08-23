@@ -49,6 +49,7 @@ x-ylx-security-profiles:
       - getPreview
       - getCameraFocus
       - getNetworkStatus
+      - scanNetworks
       - streamNetworkEvents
       - setCameraFocus
       - listSessions
@@ -478,6 +479,87 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /network/scan:
+    get:
+      tags: [Device]
+      operationId: scanNetworks
+      summary: Scan for nearby Wi-Fi networks without changing desired state
+      description: |
+        Returns one secret-free, device-authoritative scan snapshot. SSIDs are bounded
+        by the IEEE 802.11 32-byte UTF-8 limit; a hidden network has ssid=null and can
+        be configured by supplying a manual SSID to /network/apply. security and
+        credential_required are device observations and determine whether the client
+        must first exchange a passphrase through /network/credentials. This operation
+        has no saved-profile or desired-state side effects.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current closed Wi-Fi scan result
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkScanResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Wi-Fi scan is temporarily unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /network/credentials:
+    post:
+      tags: [Device]
+      operationId: createNetworkCredentialReference
+      summary: Exchange one passphrase for a short-lived opaque credential reference
+      description: |
+        The passphrase is a write-only, one-request input. The gateway passes it directly
+        to the privileged credential broker and must not place it in generic command
+        persistence, logs, errors, traces, events, receipts, or any other response. The
+        returned opaque credential_ref is single-use and expires no more than 120 seconds
+        after issuance. Open networks do not call this operation.
+      x-ylx-lab-access: customer-only
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCredentialRequest"
+      responses:
+        "201":
+          description: Short-lived one-use credential reference created
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkCredentialReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/NetworkMutationUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /network/events:
     get:
       tags: [Device]
@@ -517,7 +599,7 @@ paths:
               example: |
                 id: 208
                 event: transaction
-                data: {"schema":"ylx.network-event.v1","sse_delivery_id":"208","occurred_at":"2026-08-23T11:40:04+08:00","type":"transaction","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","data":{"schema":"ylx.network-transaction.v1","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","operation":"apply","status":"committed","stage":"committed","desired":{"mode":"wifi-client","wifi_client":{"ssid":"studio-wifi","credential_state":"stored"},"ethernet":null},"accepted_at":"2026-08-23T11:39:52+08:00","updated_at":"2026-08-23T11:40:04+08:00","rescue":{"ap_validated":true,"fallback_mode":"hotspot","failure_trigger_seconds":10},"error":null}}
+                data: {"schema":"ylx.network-event.v1","sse_delivery_id":"208","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":12,"occurred_at":"2026-08-23T11:40:04+08:00","type":"transaction","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","data":{"schema":"ylx.network-transaction.v1","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":12,"transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","operation":"apply","status":"committed","stage":"committed","desired":{"mode":"wifi-client","wifi_client":{"ssid":"studio-wifi","security":"wpa2-personal","credential_state":"stored"},"ethernet":null},"accepted_at":"2026-08-23T11:39:52+08:00","updated_at":"2026-08-23T11:40:04+08:00","deadline":null,"recovery_action":"reconnect_target_lan","rescue":{"ap_validated":true,"fallback_mode":"hotspot","failure_trigger_seconds":10},"error":null}}
 
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -532,7 +614,8 @@ paths:
       summary: Idempotently accept an async network desired-state change
       description: |
         Accepts a desired network state for asynchronous application. The request uses
-        an opaque credential_ref for Wi-Fi client credentials; inline passwords, PSKs,
+        an opaque credential_ref for protected Wi-Fi client credentials. Open networks
+        use security=open and omit credential_ref. Inline passwords, PSKs,
         passphrases, tokens, and secret values are not part of this contract and fail
         closed as unknown fields. The accepted transaction validates the rescue AP first,
         then applies and verifies the client or wired state. Exclusive client activation
@@ -1320,9 +1403,10 @@ components:
             network_mutation:
               type: boolean
               description: |
-                True when the customer-authenticated async /network/apply, /network/retry,
-                and /network/forget routes are wired for this runtime. Clients still read
-                NetworkStatus.mutation_capability before enabling controls.
+                True when the customer-authenticated /network/credentials ingress and
+                async /network/apply, /network/retry, and /network/forget routes are wired
+                for this runtime. Clients still read NetworkStatus.mutation_capability
+                before enabling controls.
         storage:
           type: object
           additionalProperties: false
@@ -1402,7 +1486,11 @@ components:
       additionalProperties: false
       required:
         - schema
+        - authority_epoch
+        - source_revision
         - observed_at
+        - saved
+        - verified
         - desired
         - observed
         - transaction
@@ -1411,9 +1499,22 @@ components:
       properties:
         schema:
           const: ylx.network-status.v1
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+          description: Network controller authority incarnation; changes after authority reset
+        source_revision:
+          type: integer
+          minimum: 0
+          description: Monotonic journal revision within authority_epoch; never an SSE delivery ID
         observed_at:
           type: string
           format: date-time
+        saved:
+          type: boolean
+          description: Whether a managed Wi-Fi client profile is durably saved without exposing its credential
+        verified:
+          type: boolean
+          description: Whether the saved Wi-Fi client profile has previously reached device-authoritative verification
         desired:
           $ref: "#/components/schemas/NetworkDesiredState"
         observed:
@@ -1424,6 +1525,16 @@ components:
           $ref: "#/components/schemas/NetworkMutationCapability"
         concurrency_capability:
           $ref: "#/components/schemas/NetworkConcurrencyCapability"
+      allOf:
+        - if:
+            required: [verified]
+            properties:
+              verified:
+                const: true
+          then:
+            properties:
+              saved:
+                const: true
       description: |
         Secret-free network status. It never contains Wi-Fi password, PSK,
         passphrase, bearer token, or raw credential material.
@@ -1464,12 +1575,16 @@ components:
     NetworkDesiredWifiClient:
       type: object
       additionalProperties: false
-      required: [ssid, credential_state]
+      required: [ssid, security, credential_state]
       properties:
         ssid:
           type: string
           minLength: 1
           maxLength: 32
+          x-ylx-max-utf8-bytes: 32
+          description: Wi-Fi SSID with a maximum encoded length of 32 UTF-8 bytes
+        security:
+          $ref: "#/components/schemas/NetworkWifiSecurity"
         credential_state:
           enum: [absent, pending_input, stored]
           description: Whether a credential exists; never the credential value.
@@ -1578,10 +1693,15 @@ components:
     NetworkMutationCapability:
       type: object
       additionalProperties: false
-      required: [enabled, operations, idempotency_key_required, secret_handling, active_state_policy]
+      required: [enabled, disabled_reason, operations, idempotency_key_required, secret_handling, active_state_policy]
       properties:
         enabled:
           type: boolean
+        disabled_reason:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkMutationDisabledReason"
+            - type: "null"
+          description: Typed reason mutation is disabled, or null only when enabled=true
         operations:
           type: array
           const: [apply, retry, forget]
@@ -1593,6 +1713,37 @@ components:
           const: opaque_credential_reference_only
         active_state_policy:
           const: idle_only
+      allOf:
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: true
+          then:
+            properties:
+              disabled_reason:
+                type: "null"
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+          then:
+            properties:
+              disabled_reason:
+                $ref: "#/components/schemas/NetworkMutationDisabledReason"
+    NetworkMutationDisabledReason:
+      type: string
+      enum:
+        - not_enabled
+        - auth_profile_unavailable
+        - controller_unavailable
+        - network_manager_unavailable
+        - rescue_ap_not_validated
+        - capture_active
+        - recovery_required
+        - maintenance_window_closed
+        - unsupported_concurrency
     NetworkConcurrencyCapability:
       type: object
       additionalProperties: false
@@ -1635,6 +1786,8 @@ components:
       additionalProperties: false
       required:
         - schema
+        - authority_epoch
+        - source_revision
         - transaction_id
         - operation
         - status
@@ -1642,11 +1795,18 @@ components:
         - desired
         - accepted_at
         - updated_at
+        - deadline
+        - recovery_action
         - rescue
         - error
       properties:
         schema:
           const: ylx.network-transaction.v1
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+        source_revision:
+          type: integer
+          minimum: 0
         transaction_id:
           $ref: "#/components/schemas/UuidV7"
         operation:
@@ -1656,10 +1816,12 @@ components:
         stage:
           enum:
             - accepted
-            - validating_rescue_ap
-            - applying_profile
-            - verifying_client
+            - prepared
+            - ap_ready
+            - activating
+            - verifying
             - committed
+            - falling_back
             - rescued
             - failed
             - forgetting
@@ -1672,6 +1834,14 @@ components:
         updated_at:
           type: string
           format: date-time
+        deadline:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkDeviceDeadline"
+            - type: "null"
+          description: Device-monotonic failure deadline while activation or health verification is active
+        recovery_action:
+          $ref: "#/components/schemas/NetworkRecoveryAction"
+          description: Device-authoritative next action; clients project it but never execute rollback themselves
         rescue:
           type: object
           additionalProperties: false
@@ -1687,6 +1857,31 @@ components:
           oneOf:
             - $ref: "#/components/schemas/NetworkTransactionError"
             - type: "null"
+    NetworkDeviceDeadline:
+      type: object
+      additionalProperties: false
+      required: [time_base, deadline_ns, remaining_seconds]
+      properties:
+        time_base:
+          const: device_monotonic
+        deadline_ns:
+          type: integer
+          minimum: 0
+          description: Absolute deadline in the device monotonic clock domain
+        remaining_seconds:
+          type: number
+          minimum: 0
+          maximum: 10
+          description: Device-computed remaining interval at transaction.updated_at
+    NetworkRecoveryAction:
+      type: string
+      enum:
+        - await_device
+        - reconnect_target_lan
+        - reconnect_rescue_ap
+        - retry
+        - service_required
+        - none
     NetworkTransactionError:
       type: object
       additionalProperties: false
@@ -1743,18 +1938,161 @@ components:
     NetworkApplyWifiClient:
       type: object
       additionalProperties: false
-      required: [ssid, credential_ref]
+      required: [ssid, security]
       properties:
         ssid:
           type: string
           minLength: 1
           maxLength: 32
+          x-ylx-max-utf8-bytes: 32
+          description: Scanned or manually entered SSID with a maximum encoded length of 32 UTF-8 bytes
+        security:
+          $ref: "#/components/schemas/NetworkWifiSecurity"
         credential_ref:
           type: string
           minLength: 1
           maxLength: 128
           pattern: '^cred-[A-Za-z0-9_.:-]+$'
-          description: Opaque reference to credential material captured outside this JSON payload.
+          description: Short-lived single-use opaque reference returned by POST /network/credentials.
+      allOf:
+        - if:
+            required: [security]
+            properties:
+              security:
+                const: open
+          then:
+            not:
+              required: [credential_ref]
+        - if:
+            required: [security]
+            properties:
+              security:
+                enum: [wpa2-personal, wpa3-personal, wpa2-wpa3-personal]
+          then:
+            required: [credential_ref]
+    NetworkWifiSecurity:
+      type: string
+      enum: [open, wpa2-personal, wpa3-personal, wpa2-wpa3-personal]
+    NetworkScanResult:
+      type: object
+      additionalProperties: false
+      required: [schema, authority_epoch, source_revision, scanned_at, networks]
+      properties:
+        schema:
+          const: ylx.network-scan.v1
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+        source_revision:
+          type: integer
+          minimum: 0
+        scanned_at:
+          type: string
+          format: date-time
+        networks:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/NetworkScanEntry"
+    NetworkScanEntry:
+      type: object
+      additionalProperties: false
+      required: [ssid, hidden, security, signal_dbm, credential_required]
+      properties:
+        ssid:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 32
+              x-ylx-max-utf8-bytes: 32
+            - type: "null"
+          description: UTF-8 SSID up to 32 encoded bytes, or null for a hidden network
+        hidden:
+          type: boolean
+        security:
+          $ref: "#/components/schemas/NetworkWifiSecurity"
+        signal_dbm:
+          type: integer
+          minimum: -127
+          maximum: 0
+        credential_required:
+          type: boolean
+      allOf:
+        - if:
+            required: [hidden]
+            properties:
+              hidden:
+                const: true
+          then:
+            properties:
+              ssid:
+                type: "null"
+        - if:
+            required: [hidden]
+            properties:
+              hidden:
+                const: false
+          then:
+            properties:
+              ssid:
+                type: string
+                minLength: 1
+                maxLength: 32
+                x-ylx-max-utf8-bytes: 32
+        - if:
+            required: [security]
+            properties:
+              security:
+                const: open
+          then:
+            properties:
+              credential_required:
+                const: false
+        - if:
+            required: [security]
+            properties:
+              security:
+                enum: [wpa2-personal, wpa3-personal, wpa2-wpa3-personal]
+          then:
+            properties:
+              credential_required:
+                const: true
+    NetworkCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [schema, passphrase]
+      properties:
+        schema:
+          const: ylx.network-credential-request.v1
+        passphrase:
+          type: string
+          minLength: 8
+          maxLength: 63
+          writeOnly: true
+          description: One-request credential input; it must never be persisted, logged, echoed, or emitted.
+    NetworkCredentialReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema, credential_ref, issued_at, expires_at, ttl_seconds, single_use]
+      properties:
+        schema:
+          const: ylx.network-credential-receipt.v1
+        credential_ref:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^cred-[A-Za-z0-9_.:-]+$'
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 120
+        single_use:
+          const: true
     NetworkRetryRequest:
       type: object
       additionalProperties: false
@@ -1786,13 +2124,19 @@ components:
     NetworkEvent:
       type: object
       additionalProperties: false
-      required: [schema, sse_delivery_id, occurred_at, type, transaction_id, data]
+      required: [schema, sse_delivery_id, authority_epoch, source_revision, occurred_at, type, transaction_id, data]
       properties:
         schema:
           const: ylx.network-event.v1
         sse_delivery_id:
           type: string
           pattern: '^[0-9]+$'
+          description: Transport replay identity; never a replacement for source_revision
+        authority_epoch:
+          $ref: "#/components/schemas/UuidV4"
+        source_revision:
+          type: integer
+          minimum: 0
         occurred_at:
           type: string
           format: date-time
@@ -2839,11 +3183,7 @@ components:
               required: [reason]
               properties:
                 reason:
-                  enum:
-                    - network_manager_unavailable
-                    - rescue_ap_not_validated
-                    - capture_active
-                    - unsupported_concurrency
+                  $ref: "#/components/schemas/NetworkMutationDisabledReason"
     InvalidNetworkDesiredStateError:
       type: object
       additionalProperties: false
@@ -2879,6 +3219,11 @@ components:
                 reason:
                   enum:
                     - missing_credential_ref
+                    - credential_ref_expired
+                    - credential_ref_already_used
+                    - credential_ref_not_allowed
+                    - security_mismatch
+                    - ssid_too_long
                     - unsupported_mode
                     - invalid_static_ipv4
                     - unsafe_secret_field

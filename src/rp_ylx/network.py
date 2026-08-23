@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -9,12 +10,15 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -24,6 +28,7 @@ from typing import Any, TextIO
 
 NETWORK_STATUS_FORMAT = "ylx.network-status.v0"
 SUPPORTED_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]
+WIFI_SECURITY = ["open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"]
 WIFI_INTERFACE = "wlan0"
 ETHERNET_INTERFACE = "eth0"
 MDNS_HOSTNAME = "rp-ylx.local"
@@ -31,7 +36,10 @@ MDNS_SERVICE = "_ylx-capture._tcp"
 MDNS_SERVICE_ALIASES = ["_http._tcp"]
 MDNS_PORT = 8080
 MDNS_ASSET_NAME = "rp-ylx.avahi"
+CUSTOMER_MDNS_ASSET_NAME = "rp-ylx-customer.avahi"
 MDNS_SERVICE_FILENAME = "rp-ylx.service"
+DEVICE_CONFIG_PATH = Path("/etc/rp-ylx/device.json")
+NETWORK_OPERATION_LOCK_PATH = Path("/run/rp-ylx/network-operation.lock")
 NETWORK_ACTIVATION_WAIT_SECONDS = 10
 NETWORK_ACTIVATION_TIMEOUT_SECONDS = 12
 MAX_CONFIG_BYTES = 64 * 1024
@@ -39,6 +47,7 @@ JOURNAL_FORMAT = "ylx.network-journal.v0"
 RESULT_FORMAT = "ylx.network-result.v0"
 LKG_FORMAT = "ylx.network-lkg.v0"
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+FALLBACK_NETWORK_AUTHORITY_EPOCH = str(uuid.uuid4())
 
 
 class NetworkError(RuntimeError):
@@ -127,7 +136,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise _config_error("mode 必须是受支持的网络模式")
     allowed: set[str]
     normalized: dict[str, Any] = {"mode": mode}
-    if mode in {"hotspot", "wifi-client"}:
+    if mode == "hotspot":
         allowed = {"mode", "ssid", "psk"}
         ssid = _text_field(config, "ssid")
         psk = _text_field(config, "psk")
@@ -136,6 +145,23 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if not 8 <= len(psk.encode("utf-8")) <= 63:
             raise _config_error("Wi-Fi 密码必须为 8 至 63 字节")
         normalized.update({"ssid": ssid, "psk": psk})
+    elif mode == "wifi-client":
+        allowed = {"mode", "ssid", "security", "psk"}
+        ssid = _text_field(config, "ssid")
+        if len(ssid.encode("utf-8")) > 32:
+            raise _config_error("SSID 必须为 1 至 32 字节")
+        security = config.get("security", "wpa2-personal")
+        if security not in WIFI_SECURITY:
+            raise _config_error("security 必须是受支持的 Wi-Fi 安全类型")
+        normalized.update({"ssid": ssid, "security": security})
+        if security == "open":
+            if "psk" in config:
+                raise _config_error("开放 Wi-Fi 不能包含密码")
+        else:
+            psk = _text_field(config, "psk")
+            if not 8 <= len(psk.encode("utf-8")) <= 63:
+                raise _config_error("Wi-Fi 密码必须为 8 至 63 字节")
+            normalized["psk"] = psk
     elif mode == "ethernet-dhcp":
         allowed = {"mode"}
     else:
@@ -144,6 +170,8 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
             address = ipaddress.IPv4Interface(_text_field(config, "address"))
         except ValueError as exc:
             raise _config_error("address 必须是有效 IPv4 CIDR") from exc
+        if not _usable_ipv4_addresses([str(address)]):
+            raise _config_error("address 必须是可用的非 link-local IPv4 主机地址")
         if address.network.overlaps(ipaddress.IPv4Network("10.42.0.0/24")):
             raise _config_error("有线静态地址不能与热点网段重叠")
         normalized["address"] = str(address)
@@ -174,7 +202,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _state_dir() -> Path:
-    return Path(os.environ.get("RP_YLX_NETWORK_STATE_DIR", "/var/lib/rp-ylx/network"))
+    return Path(os.environ.get("RP_YLX_NETWORK_STATE_DIR", "/var/lib/rp-ylx-network"))
 
 
 def _profile_dir() -> Path:
@@ -263,6 +291,93 @@ def _network_lock(state_dir: Path) -> Iterator[None]:
         if descriptor >= 0:
             os.close(descriptor)
         raise NetworkError("state_lock_failed", "无法锁定网络配置状态") from exc
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def network_operation_lock_path() -> Path:
+    return Path(
+        os.environ.get("RP_YLX_NETWORK_OPERATION_LOCK_PATH", str(NETWORK_OPERATION_LOCK_PATH))
+    ).absolute()
+
+
+@contextmanager
+def network_operation_lease(*, blocking: bool = True) -> Iterator[None]:
+    """Hold the cross-process lease shared by capture and root network mutation."""
+
+    path = network_operation_lock_path()
+    try:
+        path.parent.mkdir(mode=0o770, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise NetworkError("operation_lock_failed", "无法创建网络控制锁目录") from exc
+    with _OPERATION_LOCKS_GUARD:
+        process_lock = _OPERATION_LOCKS.setdefault(path, threading.RLock())
+    acquired = process_lock.acquire(blocking=blocking)
+    if not acquired:
+        raise NetworkError("capture_active", "录制期间不能修改网络")
+    held_paths = getattr(_OPERATION_LOCK_LOCAL, "held_paths", None)
+    if held_paths is None:
+        held_paths = set()
+        _OPERATION_LOCK_LOCAL.held_paths = held_paths
+    try:
+        if path in held_paths:
+            yield
+            return
+        with _file_operation_lock(path, blocking=blocking):
+            held_paths.add(path)
+            try:
+                yield
+            finally:
+                held_paths.remove(path)
+    finally:
+        process_lock.release()
+
+
+@contextmanager
+def _network_operation_lock(
+    state_dir: Path | None = None,
+    *,
+    blocking: bool = True,
+) -> Iterator[None]:
+    del state_dir
+    with network_operation_lease(blocking=blocking):
+        yield
+
+
+_OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCKS: dict[Path, threading.RLock] = {}
+_OPERATION_LOCK_LOCAL = threading.local()
+
+
+@contextmanager
+def _file_operation_lock(path: Path, *, blocking: bool) -> Iterator[None]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o660,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("network operation lock is not a regular file")
+        if metadata.st_uid == os.geteuid():
+            os.fchmod(descriptor, 0o660)
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(descriptor, flags)
+    except BlockingIOError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise NetworkError("capture_active", "录制期间不能修改网络") from exc
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+            raise NetworkError("capture_active", "录制期间不能修改网络") from exc
+        raise NetworkError("operation_lock_failed", "无法锁定网络控制操作") from exc
     try:
         yield
     finally:
@@ -362,9 +477,13 @@ def _desired_state_from_config(config: Mapping[str, Any] | None) -> dict[str, An
     ethernet = None
     if mode == "wifi-client":
         ssid = config.get("ssid")
+        security = config.get("security", "wpa2-personal")
+        if security not in WIFI_SECURITY:
+            security = "wpa2-personal"
         wifi_client = {
             "ssid": ssid if isinstance(ssid, str) and ssid else "",
-            "credential_state": "stored",
+            "security": security,
+            "credential_state": "absent" if security == "open" else "stored",
         }
     elif mode == "ethernet-dhcp":
         ethernet = {"addressing": "dhcp", "static_ipv4": None}
@@ -394,6 +513,30 @@ def _desired_state_from_disk(state_dir: Path) -> dict[str, Any]:
         if isinstance(config, Mapping):
             return _desired_state_from_config(config)
     return _desired_state_from_config(None)
+
+
+def _fallback_saved_state(state_dir: Path) -> tuple[bool, bool]:
+    lkg = _read_json(_lkg_path(state_dir, WIFI_INTERFACE))
+    saved = lkg is not None and lkg.get("mode") == "wifi-client"
+    return saved, saved
+
+
+def _controller_status_projection() -> dict[str, Any] | None:
+    from rp_ylx.network_control import (  # noqa: PLC0415
+        NetworkControlClientError,
+        _seal_response,
+        request_control,
+    )
+
+    try:
+        response = request_control("status")
+    except NetworkControlClientError:
+        return None
+    sealed = _seal_response(response)
+    if sealed.get("ok") is not True or sealed.get("operation") != "status":
+        return None
+    body = sealed.get("body")
+    return deepcopy(dict(body)) if isinstance(body, Mapping) else None
 
 
 def _network_observed_state(
@@ -429,22 +572,45 @@ def network_status_v1(
     if not isinstance(observed_at, str) or not observed_at:
         observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     state_dir = _state_dir()
-    return {
-        "schema": "ylx.network-status.v1",
-        "observed_at": observed_at,
-        "desired": _desired_state_from_disk(state_dir),
-        "observed": _network_observed_state(runtime, status),
-        "transaction": {
-            "current": None,
-            "latest": None,
-        },
-        "mutation_capability": {
+    controller = _controller_status_projection()
+    if controller is None:
+        try:
+            saved, verified = _fallback_saved_state(state_dir)
+            desired = _desired_state_from_disk(state_dir)
+        except NetworkError:
+            saved = False
+            verified = False
+            desired = _desired_state_from_config(None)
+        authority_epoch = FALLBACK_NETWORK_AUTHORITY_EPOCH
+        source_revision = 0
+        transaction = {"current": None, "latest": None}
+        mutation_capability = {
             "enabled": False,
+            "disabled_reason": "controller_unavailable",
             "operations": ["apply", "retry", "forget"],
             "idempotency_key_required": True,
             "secret_handling": "opaque_credential_reference_only",
             "active_state_policy": "idle_only",
-        },
+        }
+    else:
+        authority_epoch = controller["authority_epoch"]
+        source_revision = controller["source_revision"]
+        saved = controller["saved"]
+        verified = controller["verified"]
+        desired = controller["desired"]
+        transaction = controller["transaction"]
+        mutation_capability = controller["capability"]
+    return {
+        "schema": "ylx.network-status.v1",
+        "authority_epoch": authority_epoch,
+        "source_revision": source_revision,
+        "observed_at": observed_at,
+        "saved": saved,
+        "verified": verified,
+        "desired": desired,
+        "observed": _network_observed_state(runtime, status),
+        "transaction": transaction,
+        "mutation_capability": mutation_capability,
         "concurrency_capability": {
             "rescue_ap_required": True,
             "same_phy_ap_sta": "unverified",
@@ -489,7 +655,7 @@ def _network_manager_profile(name: str, config: Mapping[str, Any]) -> bytes:
         f"uuid={profile_uuid}",
         f"type={'wifi' if interface == WIFI_INTERFACE else 'ethernet'}",
         f"interface-name={interface}",
-        "autoconnect=true",
+        f"autoconnect={'false' if mode == 'wifi-client' else 'true'}",
         f"autoconnect-priority={priority}",
         "",
     ]
@@ -500,12 +666,19 @@ def _network_manager_profile(name: str, config: Mapping[str, Any]) -> bytes:
                 f"mode={'ap' if mode == 'hotspot' else 'infrastructure'}",
                 f"ssid={_keyfile_string(config['ssid'])}",
                 "",
-                "[wifi-security]",
-                "key-mgmt=wpa-psk",
-                f"psk={_keyfile_string(config['psk'])}",
-                "",
             ]
         )
+        security = "wpa2-personal" if mode == "hotspot" else config.get("security")
+        if security != "open":
+            key_management = "sae" if security == "wpa3-personal" else "wpa-psk"
+            lines.extend(
+                [
+                    "[wifi-security]",
+                    f"key-mgmt={key_management}",
+                    f"psk={_keyfile_string(config['psk'])}",
+                    "",
+                ]
+            )
     lines.append("[ipv4]")
     if mode == "hotspot":
         lines.extend(
@@ -530,17 +703,328 @@ def _network_manager_profile(name: str, config: Mapping[str, Any]) -> bytes:
     return "\n".join(lines).encode()
 
 
+def _public_rescue_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    profile = _valid_saved_profile(record.get("profile"))
+    config = record.get("config")
+    if (
+        record.get("mode") != "hotspot"
+        or record.get("interface") != WIFI_INTERFACE
+        or profile is None
+        or not isinstance(config, Mapping)
+        or set(config) != {"mode", "ssid"}
+        or config.get("mode") != "hotspot"
+        or not isinstance(config.get("ssid"), str)
+    ):
+        raise NetworkError("state_invalid", "救援热点状态无效")
+    profile_path = _profile_dir() / f"{profile}.nmconnection"
+    try:
+        metadata = profile_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise NetworkError("profile_missing", "救援热点 NetworkManager profile 不存在") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise NetworkError("profile_permissions", "救援热点 NetworkManager profile 权限无效")
+    return deepcopy(dict(record))
+
+
+def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
+    """Create the per-device rescue AP without persisting its WPA2 secret in state."""
+
+    if (
+        not isinstance(device_id, str)
+        or not device_id
+        or len(device_id.encode("utf-8")) > 256
+        or any(ord(character) < 32 for character in device_id)
+    ):
+        raise NetworkError("device_id_invalid", "设备身份无效", exit_code=2)
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        rescue_path = state_dir / "rescue.json"
+        existing = _read_json(rescue_path)
+        if existing is not None:
+            return _public_rescue_record(existing)
+
+        digest = hashlib.sha256(device_id.encode()).hexdigest()
+        profile = f"rp-ylx-hotspot-rescue-{digest[:12]}"
+        config = {
+            "mode": "hotspot",
+            "ssid": f"OpenAria-{digest[:8].upper()}",
+            "psk": secrets.token_urlsafe(24),
+        }
+        profile_path = _profile_dir() / f"{profile}.nmconnection"
+        record = {
+            "format": "ylx.network-rescue.v1",
+            "device_id_sha256": digest,
+            "mode": "hotspot",
+            "interface": WIFI_INTERFACE,
+            "profile": profile,
+            "config": _safe_config(config),
+        }
+        try:
+            _write_atomic(profile_path, _network_manager_profile(profile, config), 0o600)
+            _write_atomic(_avahi_dir() / MDNS_SERVICE_FILENAME, _avahi_service(), 0o644)
+            reload_result = _run_nmcli(["connection", "reload"], timeout=10)
+            if reload_result.returncode != 0:
+                raise NetworkError("reload_failed", "NetworkManager 无法加载救援热点")
+            _write_json(rescue_path, record)
+        except (NetworkError, OSError):
+            with suppress(OSError):
+                profile_path.unlink()
+                _fsync_directory(profile_path.parent)
+            raise
+        return _public_rescue_record(record)
+
+
+def _validated_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    if set(candidate) != {"format", "mode", "interface", "profile", "config"}:
+        raise NetworkError("candidate_invalid", "候选网络配置无效")
+    mode = candidate.get("mode")
+    profile = _valid_saved_profile(candidate.get("profile"))
+    config = candidate.get("config")
+    if (
+        candidate.get("format") != "ylx.network-candidate.v1"
+        or mode not in SUPPORTED_MODES
+        or candidate.get("interface") != _interface(str(mode))
+        or profile is None
+        or not profile.startswith(f"rp-ylx-{mode}-")
+        or not isinstance(config, Mapping)
+        or "psk" in config
+        or config.get("mode") != mode
+    ):
+        raise NetworkError("candidate_invalid", "候选网络配置无效")
+    if mode == "wifi-client":
+        security = config.get("security")
+        ssid = config.get("ssid")
+        if (
+            set(config) != {"mode", "ssid", "security"}
+            or security not in WIFI_SECURITY
+            or not isinstance(ssid, str)
+            or not 1 <= len(ssid.encode("utf-8")) <= 32
+            or any(ord(character) < 32 for character in ssid)
+        ):
+            raise NetworkError("candidate_invalid", "候选网络配置无效")
+    elif (
+        mode == "ethernet-dhcp"
+        and set(config) != {"mode"}
+        or mode == "ethernet-static"
+        and set(config)
+        not in (
+            {"mode", "address", "dns"},
+            {"mode", "address", "gateway", "dns"},
+        )
+    ):
+        raise NetworkError("candidate_invalid", "候选网络配置无效")
+    profile_path = _profile_dir() / f"{profile}.nmconnection"
+    try:
+        metadata = profile_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise NetworkError("profile_missing", "候选 NetworkManager profile 不存在") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise NetworkError("profile_permissions", "候选 NetworkManager profile 权限无效")
+    return deepcopy(dict(candidate))
+
+
+def prepare_network_candidate(transaction_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Materialize a non-autoconnecting candidate before publishing its accepted receipt."""
+
+    if REQUEST_ID_PATTERN.fullmatch(transaction_id) is None:
+        raise NetworkError("request_id_invalid", "transaction-id 格式无效", exit_code=2)
+    normalized = _validate_config(config)
+    mode = str(normalized["mode"])
+    if mode == "hotspot":
+        raise NetworkError("candidate_invalid", "热点模式必须使用设备救援 profile", exit_code=2)
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        profile = _profile_name(transaction_id, mode)
+        profile_path = _profile_dir() / f"{profile}.nmconnection"
+        candidate = {
+            "format": "ylx.network-candidate.v1",
+            "mode": mode,
+            "interface": _interface(mode),
+            "profile": profile,
+            "config": _safe_config(normalized),
+        }
+        try:
+            _write_atomic(profile_path, _network_manager_profile(profile, normalized), 0o600)
+            _write_atomic(_avahi_dir() / MDNS_SERVICE_FILENAME, _avahi_service(), 0o644)
+            reload_result = _run_nmcli(["connection", "reload"], timeout=10)
+            if reload_result.returncode != 0:
+                raise NetworkError("reload_failed", "NetworkManager 无法加载候选连接")
+        except (NetworkError, OSError):
+            with suppress(OSError):
+                profile_path.unlink()
+                _fsync_directory(profile_path.parent)
+            raise
+        return _validated_candidate(candidate)
+
+
+def activate_network_candidate(
+    candidate: Mapping[str, Any],
+    *,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> dict[str, Any]:
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        validated = _validated_candidate(candidate)
+        config = validated["config"]
+        expected_address = config.get("address")
+        return _activate(
+            str(validated["profile"]),
+            str(validated["mode"]),
+            expected_address=expected_address if isinstance(expected_address, str) else None,
+            gateway_required="gateway" in config,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        )
+
+
+def commit_network_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        validated = _validated_candidate(candidate)
+        lkg = {
+            "format": LKG_FORMAT,
+            "mode": validated["mode"],
+            "interface": validated["interface"],
+            "profile": validated["profile"],
+            "config": validated["config"],
+        }
+        try:
+            _write_json(_lkg_path(state_dir, str(validated["interface"])), lkg)
+            cleanup = _unreferenced_profiles(state_dir, str(validated["interface"]))
+            if cleanup:
+                _prune_profiles(cleanup)
+        except OSError as exc:
+            raise NetworkError(
+                "commit_pending",
+                "候选网络连接已激活但 LKG 尚未持久化",
+                recovery="reconcile",
+            ) from exc
+        return deepcopy(lkg)
+
+
+def discard_network_candidate(candidate: Mapping[str, Any]) -> None:
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        validated = _validated_candidate(candidate)
+        _remove_candidate(_profile_dir() / f"{validated['profile']}.nmconnection")
+
+
+def _saved_record_for_mode(state_dir: Path, mode: str) -> dict[str, Any]:
+    if mode == "hotspot":
+        record = _read_json(state_dir / "rescue.json")
+    elif mode in SUPPORTED_MODES:
+        record = _read_json(_lkg_path(state_dir, _interface(mode)))
+    else:
+        raise NetworkError("network_config_invalid", "目标网络模式无效", exit_code=2)
+    if not isinstance(record, Mapping) or record.get("mode") != mode:
+        raise NetworkError("saved_network_missing", "没有可恢复的已验证网络配置")
+    profile = _valid_saved_profile(record.get("profile"))
+    config = record.get("config")
+    if (
+        profile is None
+        or record.get("interface") != _interface(mode)
+        or not isinstance(config, Mapping)
+        or config.get("mode") != mode
+    ):
+        raise NetworkError("state_invalid", "已保存的网络配置无效")
+    return deepcopy(dict(record))
+
+
+def saved_network_is_healthy(mode: str) -> bool:
+    """Read whether the saved target is already active without changing NetworkManager."""
+
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_lock(state_dir):
+        record = _saved_record_for_mode(state_dir, mode)
+        snapshot = _device_snapshot(_interface(mode))
+        return _health_reason(record, snapshot) is None
+
+
+def activate_saved_network(mode: str) -> dict[str, Any]:
+    """Activate one previously verified target; the persisted record never contains its secret."""
+
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        record = _saved_record_for_mode(state_dir, mode)
+        _activate_saved(record, interface=_interface(mode))
+        return {
+            "format": RESULT_FORMAT,
+            "ok": True,
+            "action": "restore-saved",
+            "mode": mode,
+            "recovery": "lkg",
+        }
+
+
+def saved_network_candidate(mode: str) -> dict[str, Any]:
+    """Project a secret-free retained candidate for an explicit retry transaction."""
+
+    if mode == "hotspot":
+        raise NetworkError("candidate_invalid", "救援热点不使用 client candidate")
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_lock(state_dir):
+        record = _saved_record_for_mode(state_dir, mode)
+        candidate = {
+            "format": "ylx.network-candidate.v1",
+            "mode": record["mode"],
+            "interface": record["interface"],
+            "profile": record["profile"],
+            "config": deepcopy(record["config"]),
+        }
+        return _validated_candidate(candidate)
+
+
+def _device_config_path() -> Path:
+    return Path(os.environ.get("RP_YLX_DEVICE_CONFIG_PATH", str(DEVICE_CONFIG_PATH)))
+
+
+def _configured_mdns_asset() -> str | None:
+    path = _device_config_path()
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NetworkError("mdns_config_invalid", "无法读取设备安全配置") from exc
+    if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 64 * 1024:
+        raise NetworkError("mdns_config_invalid", "设备安全配置文件无效")
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise NetworkError("mdns_config_invalid", "设备安全配置不可解析") from exc
+    security = value.get("security") if isinstance(value, Mapping) else None
+    profile = security.get("profile") if isinstance(security, Mapping) else None
+    if profile == "lab":
+        return MDNS_ASSET_NAME
+    if profile == "customer" and all(
+        isinstance(security.get(field), str) and bool(security[field])
+        for field in ("tls_certificate_file", "tls_private_key_file")
+    ):
+        return CUSTOMER_MDNS_ASSET_NAME
+    raise NetworkError("mdns_config_invalid", "设备安全配置缺少有效的 mDNS/TLS 模式")
+
+
 def _avahi_service() -> bytes:
     """读取随包发布的 mDNS service 定义。
 
-    同一份资产由安装器在首次安装时铺到 `/etc/avahi/services/`，因此默认安装无需先执行一次
-    network apply 就已经广播；这里在每次 apply 时重写，用于自愈被删除或被改坏的文件。两条
-    路径共用 `deploy/rp-ylx.avahi`，避免端口或服务类型出现两份真相。
+    安装器首次安装时会按设备安全配置铺设 HTTP 或 HTTPS 资产。网络事务重写时读取同一份
+    `device.json` 权威配置，避免 Customer 设备在切换网络后把发现协议降级为 HTTP。没有生产
+    配置的独立 CLI/测试环境继续使用兼容的 HTTP 资产。
     """
-    packaged = Path(__file__).parent / "deploy" / MDNS_ASSET_NAME
+    asset_name = _configured_mdns_asset() or MDNS_ASSET_NAME
+    packaged = Path(__file__).parent / "deploy" / asset_name
     if packaged.is_file():
         return packaged.read_bytes()
-    return resource_files("rp_ylx.deploy").joinpath(MDNS_ASSET_NAME).read_bytes()
+    return resource_files("rp_ylx.deploy").joinpath(asset_name).read_bytes()
 
 
 def _run_nmcli(arguments: list[str], *, timeout: float = 35) -> subprocess.CompletedProcess[str]:
@@ -558,7 +1042,132 @@ def _run_nmcli(arguments: list[str], *, timeout: float = 35) -> subprocess.Compl
         raise NetworkError("network_manager_unavailable", "NetworkManager 不可用") from exc
 
 
-def _device_snapshot(interface: str) -> dict[str, Any]:
+def _split_nmcli_terse(line: str) -> list[str] | None:
+    fields: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in line:
+        if escaped:
+            current.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    if escaped:
+        return None
+    fields.append("".join(current))
+    return fields
+
+
+def _scan_security(value: str) -> str | None:
+    normalized = value.strip().upper()
+    if not normalized or normalized == "--":
+        return "open"
+    if any(marker in normalized for marker in ("802.1X", "ENTERPRISE", "EAP", "WEP")):
+        return None
+    has_wpa3 = "WPA3" in normalized or "SAE" in normalized
+    has_wpa2 = "WPA2" in normalized or "WPA1" in normalized or normalized == "WPA"
+    if has_wpa2 and has_wpa3:
+        return "wpa2-wpa3-personal"
+    if has_wpa3:
+        return "wpa3-personal"
+    if has_wpa2:
+        return "wpa2-personal"
+    return None
+
+
+def scan_wifi_networks() -> list[dict[str, Any]]:
+    """Return a closed, credential-free projection of NetworkManager scan results."""
+
+    result = _run_nmcli(
+        [
+            "--terse",
+            "--escape",
+            "yes",
+            "--fields",
+            "SSID,SECURITY,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            WIFI_INTERFACE,
+            "--rescan",
+            "yes",
+        ],
+        timeout=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise NetworkError("network_scan_failed", "无法扫描 Wi-Fi 网络")
+    strongest: dict[tuple[str | None, str], dict[str, Any]] = {}
+    for line in result.stdout.splitlines():
+        fields = _split_nmcli_terse(line)
+        if fields is None or len(fields) != 3:
+            continue
+        ssid_value, raw_security, raw_signal = fields
+        security = _scan_security(raw_security)
+        try:
+            signal_percent = int(raw_signal)
+        except ValueError:
+            continue
+        hidden = not ssid_value
+        ssid: str | None = None if hidden else ssid_value
+        if (
+            security is None
+            or not 0 <= signal_percent <= 100
+            or ssid is not None
+            and (
+                not 1 <= len(ssid.encode("utf-8")) <= 32
+                or any(ord(character) < 32 for character in ssid)
+            )
+        ):
+            continue
+        entry = {
+            "ssid": ssid,
+            "hidden": hidden,
+            "security": security,
+            "signal_dbm": round(signal_percent / 2 - 100),
+            "credential_required": security != "open",
+        }
+        key = (ssid, security)
+        previous = strongest.get(key)
+        if previous is None or entry["signal_dbm"] > previous["signal_dbm"]:
+            strongest[key] = entry
+    return sorted(
+        strongest.values(),
+        key=lambda entry: (
+            -int(entry["signal_dbm"]),
+            entry["ssid"] is None,
+            str(entry["ssid"] or ""),
+            str(entry["security"]),
+        ),
+    )[:256]
+
+
+def _deadline_timeout(
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int],
+    maximum_seconds: float,
+) -> float:
+    remaining_ns = deadline_ns - monotonic_ns()
+    if remaining_ns <= 0:
+        raise NetworkError("network_timeout", "网络激活超过十秒期限")
+    return min(maximum_seconds, remaining_ns / 1_000_000_000)
+
+
+def _device_snapshot(
+    interface: str,
+    *,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> dict[str, Any]:
+    clock = monotonic_ns or time.monotonic_ns
+    timeout = (
+        10 if deadline_ns is None else _deadline_timeout(deadline_ns, clock, maximum_seconds=10)
+    )
     result = _run_nmcli(
         [
             "--terse",
@@ -570,8 +1179,10 @@ def _device_snapshot(interface: str) -> dict[str, Any]:
             "show",
             interface,
         ],
-        timeout=10,
+        timeout=timeout,
     )
+    if deadline_ns is not None:
+        _deadline_timeout(deadline_ns, clock, maximum_seconds=10)
     if result.returncode != 0:
         raise NetworkError("interface_unavailable", f"网络接口 {interface} 不可用")
     values: dict[str, list[str]] = {}
@@ -602,6 +1213,29 @@ def _has_default_route(routes: object) -> bool:
     )
 
 
+def _usable_ipv4_addresses(addresses: object) -> list[str]:
+    if not isinstance(addresses, list):
+        return []
+    usable: list[str] = []
+    for value in addresses:
+        if not isinstance(value, str):
+            continue
+        try:
+            interface = ipaddress.IPv4Interface(value)
+        except ValueError:
+            continue
+        address = interface.ip
+        if (
+            address.is_link_local
+            or address.is_loopback
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            continue
+        usable.append(value)
+    return usable
+
+
 def _activation_error(result: subprocess.CompletedProcess[str], mode: str) -> NetworkError:
     evidence = result.stderr.lower()
     if mode == "wifi-client" and any(
@@ -619,8 +1253,20 @@ def _activate(
     *,
     expected_address: str | None = None,
     gateway_required: bool = False,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
 ) -> dict[str, Any]:
     interface = _interface(mode)
+    clock = monotonic_ns or time.monotonic_ns
+    timeout = (
+        NETWORK_ACTIVATION_TIMEOUT_SECONDS
+        if deadline_ns is None
+        else _deadline_timeout(
+            deadline_ns,
+            clock,
+            maximum_seconds=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+        )
+    )
     result = _run_nmcli(
         [
             "--wait",
@@ -632,18 +1278,26 @@ def _activate(
             "ifname",
             interface,
         ],
-        timeout=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
+    if deadline_ns is not None:
+        _deadline_timeout(deadline_ns, clock, maximum_seconds=NETWORK_ACTIVATION_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise _activation_error(result, mode)
-    snapshot = _device_snapshot(interface)
+    snapshot = _device_snapshot(
+        interface,
+        deadline_ns=deadline_ns,
+        monotonic_ns=clock,
+    )
+    if deadline_ns is not None:
+        _deadline_timeout(deadline_ns, clock, maximum_seconds=10)
     if not snapshot["connected"] or snapshot["connection"] != profile:
         raise NetworkError("activation_unverified", "NetworkManager 未确认目标连接")
     if mode == "hotspot":
         if "10.42.0.1/24" not in snapshot["addresses"]:
             raise NetworkError("hotspot_address_missing", "热点管理地址未生效")
     elif mode in {"wifi-client", "ethernet-dhcp"}:
-        if not snapshot["addresses"]:
+        if not _usable_ipv4_addresses(snapshot["addresses"]):
             raise NetworkError("dhcp_timeout", "未在期限内获得 DHCP 地址")
         if not _has_default_route(snapshot["routes"]):
             raise NetworkError("default_route_missing", "默认路由未生效")
@@ -654,7 +1308,13 @@ def _activate(
     return snapshot
 
 
-def _activate_saved(record: Mapping[str, Any], *, interface: str | None = None) -> None:
+def _activate_saved(
+    record: Mapping[str, Any],
+    *,
+    interface: str | None = None,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> None:
     profile = _valid_saved_profile(record.get("profile"))
     mode = record.get("mode")
     if profile is None or mode not in SUPPORTED_MODES:
@@ -676,6 +1336,8 @@ def _activate_saved(record: Mapping[str, Any], *, interface: str | None = None) 
         str(mode),
         expected_address=expected_address if isinstance(expected_address, str) else None,
         gateway_required=gateway_required,
+        deadline_ns=deadline_ns,
+        monotonic_ns=monotonic_ns,
     )
 
 
@@ -947,6 +1609,31 @@ def _prune_profiles(profile_names: list[str]) -> None:
         raise NetworkError("reload_failed", "NetworkManager 无法清理旧连接")
 
 
+def cleanup_orphan_network_candidates(retained_profiles: set[str]) -> list[str]:
+    """Remove managed client profiles that are not referenced by LKG or durable work."""
+
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        referenced = set(retained_profiles)
+        referenced.update(_referenced_profiles(state_dir, WIFI_INTERFACE))
+        referenced.update(_referenced_profiles(state_dir, ETHERNET_INTERFACE))
+        orphaned = sorted(
+            path.name
+            for path in _profile_dir().glob("rp-ylx-*.nmconnection")
+            if re.fullmatch(
+                r"rp-ylx-(?:wifi-client|ethernet-dhcp|ethernet-static)-[0-9a-f]{12}"
+                r"\.nmconnection",
+                path.name,
+            )
+            is not None
+            and path.stem not in referenced
+        )
+        if orphaned:
+            _prune_profiles(orphaned)
+        return orphaned
+
+
 def _settle_commit(
     state_dir: Path,
     journal_path: Path,
@@ -1080,7 +1767,7 @@ def _health_reason(record: Mapping[str, Any], snapshot: Mapping[str, Any]) -> st
     if mode == "hotspot":
         return None if "10.42.0.1/24" in addresses else "hotspot_address_missing"
     if mode in {"wifi-client", "ethernet-dhcp"}:
-        if not addresses:
+        if not _usable_ipv4_addresses(addresses):
             return "dhcp_timeout"
         return None if _has_default_route(routes) else "default_route_missing"
     expected_address = config.get("address")
@@ -1091,12 +1778,22 @@ def _health_reason(record: Mapping[str, Any], snapshot: Mapping[str, Any]) -> st
     return None
 
 
-def _activate_rescue(state_dir: Path) -> dict[str, Any]:
+def _activate_rescue(
+    state_dir: Path,
+    *,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> dict[str, Any]:
     rescue = _read_json(state_dir / "rescue.json")
     if rescue is None:
         raise NetworkError("rescue_unconfigured", "设备尚未登记救援热点")
     try:
-        _activate_saved(rescue, interface=WIFI_INTERFACE)
+        _activate_saved(
+            rescue,
+            interface=WIFI_INTERFACE,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        )
     except NetworkError as exc:
         raise NetworkError("rescue_failed", "无法激活救援热点") from exc
     return {
@@ -1108,11 +1805,122 @@ def _activate_rescue(state_dir: Path) -> dict[str, Any]:
     }
 
 
-def rescue_network() -> dict[str, Any]:
+def rescue_network(
+    *,
+    deadline_ns: int | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> dict[str, Any]:
     state_dir = _state_dir()
     _prepare_state_dir(state_dir)
-    with _network_lock(state_dir):
-        return _activate_rescue(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        return _activate_rescue(
+            state_dir,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        )
+
+
+def forget_network_client_profiles() -> dict[str, Any]:
+    """Validate rescue, then durably remove every managed Wi-Fi client profile."""
+
+    state_dir = _state_dir()
+    _prepare_state_dir(state_dir)
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
+        _activate_rescue(state_dir)
+        profile_dir = _profile_dir()
+        client_paths = sorted(profile_dir.glob("rp-ylx-wifi-client-*.nmconnection"))
+        quarantine_paths = sorted(profile_dir.glob(".rp-ylx-wifi-client-*.nmconnection.forget"))
+        staged: list[tuple[Path, Path]] = []
+        state_records: dict[Path, Mapping[str, Any]] = {}
+        try:
+            for quarantine in quarantine_paths:
+                match = re.fullmatch(
+                    r"\.(rp-ylx-wifi-client-[0-9a-f]{12}\.nmconnection)\.forget",
+                    quarantine.name,
+                )
+                if match is None:
+                    raise NetworkError("profile_invalid", "Wi-Fi client 隔离文件名称无效")
+                original = profile_dir / match.group(1)
+                if original.exists():
+                    raise NetworkError("cleanup_pending", "Wi-Fi client 清理状态冲突")
+                metadata = quarantine.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+                    raise NetworkError("profile_permissions", "Wi-Fi client 隔离文件权限无效")
+                staged.append((original, quarantine))
+            for path in client_paths:
+                if (
+                    re.fullmatch(r"rp-ylx-wifi-client-[0-9a-f]{12}\.nmconnection", path.name)
+                    is None
+                ):
+                    raise NetworkError("profile_invalid", "Wi-Fi client profile 名称无效")
+                metadata = path.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+                    raise NetworkError("profile_permissions", "Wi-Fi client profile 权限无效")
+                quarantine = profile_dir / f".{path.name}.forget"
+                if quarantine.exists():
+                    raise NetworkError("cleanup_pending", "存在未完成的 Wi-Fi profile 清理")
+                os.replace(path, quarantine)
+                staged.append((path, quarantine))
+            if staged:
+                _fsync_directory(profile_dir)
+                reload_result = _run_nmcli(["connection", "reload"], timeout=10)
+                if reload_result.returncode != 0:
+                    raise NetworkError("reload_failed", "NetworkManager 无法忘记 Wi-Fi client")
+
+            lkg_path = _lkg_path(state_dir, WIFI_INTERFACE)
+            lkg = _read_json(lkg_path)
+            if lkg is not None:
+                state_records[lkg_path] = lkg
+                lkg_path.unlink()
+            journal_path = state_dir / "journal.json"
+            journal = _read_json(journal_path)
+            if journal is not None and journal.get("mode") == "wifi-client":
+                state_records[journal_path] = journal
+                journal_path.unlink()
+            if state_records:
+                _fsync_directory(state_dir)
+
+            for _, quarantine in staged:
+                quarantine.unlink()
+            if staged:
+                _fsync_directory(profile_dir)
+        except (NetworkError, OSError) as exc:
+            rollback_failed = False
+            for original, quarantine in reversed(staged):
+                if not quarantine.exists():
+                    rollback_failed = True
+                    continue
+                try:
+                    os.replace(quarantine, original)
+                except OSError:
+                    rollback_failed = True
+            for path, record in state_records.items():
+                try:
+                    _write_json(path, record)
+                except OSError:
+                    rollback_failed = True
+            try:
+                _fsync_directory(profile_dir)
+                reload_result = _run_nmcli(["connection", "reload"], timeout=10)
+                rollback_failed = rollback_failed or reload_result.returncode != 0
+            except (NetworkError, OSError):
+                rollback_failed = True
+            if rollback_failed:
+                raise NetworkError(
+                    "cleanup_pending",
+                    "Wi-Fi client 清理需要再次执行",
+                    recovery="reconcile",
+                ) from exc
+            if isinstance(exc, NetworkError):
+                raise
+            raise NetworkError("state_write_failed", "无法忘记 Wi-Fi client") from exc
+        return {
+            "format": RESULT_FORMAT,
+            "ok": True,
+            "action": "forget",
+            "mode": "hotspot",
+            "removed_profiles": [original.name for original, _ in staged],
+        }
 
 
 def _reconcile_lkg(state_dir: Path) -> dict[str, Any]:
@@ -1221,7 +2029,7 @@ def _reconcile_locked(state_dir: Path) -> dict[str, Any]:
 def reconcile_network() -> dict[str, Any]:
     state_dir = _state_dir()
     _prepare_state_dir(state_dir)
-    with _network_lock(state_dir):
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
         return _reconcile_locked(state_dir)
 
 
@@ -1236,7 +2044,7 @@ def apply_network(
     config = _validate_config(_read_config(config_source, stdin))
     state_dir = _state_dir()
     _prepare_state_dir(state_dir)
-    with _network_lock(state_dir):
+    with _network_operation_lock(state_dir), _network_lock(state_dir):
         return _apply_network_locked(state_dir, request_id, config)
 
 

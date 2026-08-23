@@ -113,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="从标准输入读取请求并向标准输出写入响应",
     )
+    network_control_subcommands.add_parser(
+        "desired-mode",
+        help="输出 root 网络控制器的无秘密 desired mode",
+    )
+    network_control_subcommands.add_parser(
+        "watchdog-mode",
+        help="输出 driver watchdog 是否可执行 Wi-Fi 恢复",
+    )
     benchmark = subcommands.add_parser("benchmark", help="运行统一数据面性能工作负载")
     benchmark.add_argument("kind", choices=["fixed_trace", "preview", "recording", "concurrent"])
     benchmark.add_argument("--duration", type=float, default=30.0, help="测量秒数")
@@ -378,6 +386,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             from rp_ylx.network_control import serve_stdio
 
             return serve_stdio()
+        if args.network_control_command in {"desired-mode", "watchdog-mode"}:
+            from rp_ylx.network_control import NetworkControlClientError, request_control
+
+            try:
+                response = request_control("status")
+            except NetworkControlClientError as exc:
+                print(exc.code, file=sys.stderr)
+                return 1
+            body = response.get("body")
+            desired = body.get("desired") if isinstance(body, dict) else None
+            mode = desired.get("mode") if isinstance(desired, dict) else None
+            if response.get("ok") is not True or mode not in {
+                "hotspot",
+                "wifi-client",
+                "ethernet-dhcp",
+                "ethernet-static",
+            }:
+                print("network_controller_status_invalid", file=sys.stderr)
+                return 1
+            if args.network_control_command == "watchdog-mode" and mode == "wifi-client":
+                transaction = body.get("transaction")
+                if not isinstance(transaction, dict) or set(transaction) != {
+                    "current",
+                    "latest",
+                }:
+                    print("network_controller_status_invalid", file=sys.stderr)
+                    return 1
+                latest = transaction.get("latest")
+                if transaction.get("current") is not None or (
+                    isinstance(latest, dict) and latest.get("status") in {"rescued", "failed"}
+                ):
+                    mode = "defer"
+            print(mode)
+            return 0
         parser.print_help()
         return 0
     if args.command == "validate":
