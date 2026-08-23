@@ -1844,6 +1844,219 @@ class NetworkControllerCoreTest(unittest.TestCase):
         self.assertEqual(status["transaction"]["latest"]["status"], "committed")
         self.assertEqual(status["transaction"]["latest"]["operation"], "retry")
 
+    def test_reboot_retries_rescued_client_without_same_boot_retry_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot_id_path = root / "boot-id"
+            boot_id_path.write_text("11111111-1111-4111-8111-111111111111\n", encoding="utf-8")
+            environment = {
+                "RP_YLX_NETWORK_STATE_DIR": str(root / "state"),
+                "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
+                "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
+                "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
+            }
+            from tests.test_network import FakeNmcli
+
+            nmcli = FakeNmcli(root / "profiles")
+            nmcli.fail_modes["wifi-client"] = "Secrets were required, but not provided"
+            credentials = NetworkCredentialStore(token_factory=lambda: "reboot-credential")
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+            ):
+                first = NetworkController(
+                    device_id="device-reboot-retry",
+                    credential_store=credentials,
+                    require_root=False,
+                    health_poll_seconds=3600,
+                )
+                try:
+                    credential_ref = self._create_credential(first, "reboot-secret-123")
+                    accepted = self._apply_protected_wifi(
+                        first,
+                        credential_ref,
+                        idempotency_key="reboot-retry-apply",
+                    )
+                    original_id = accepted["body"]["transaction"]["transaction_id"]
+                    self.assertTrue(first.wait_for_idle(timeout=2))
+                    rescued = first.handle(
+                        {"schema": "ylx.network-control-request.v1", "operation": "status"}
+                    )["body"]
+                    rescue_profile = json.loads(
+                        (root / "state/rescue.json").read_text(encoding="utf-8")
+                    )["profile"]
+                    candidate_profile = next(
+                        (root / "profiles").glob("*wifi-client*.nmconnection")
+                    ).stem
+                finally:
+                    first.close()
+
+                self.assertEqual(rescued["transaction"]["latest"]["status"], "rescued")
+                self.assertEqual(nmcli.active["wlan0"], rescue_profile)
+                nmcli.fail_modes.clear()
+                nmcli.commands.clear()
+
+                restarted = NetworkController(
+                    device_id="device-reboot-retry",
+                    start_worker=False,
+                    require_root=False,
+                )
+                try:
+                    same_boot = restarted.handle(
+                        {"schema": "ylx.network-control-request.v1", "operation": "status"}
+                    )["body"]
+                    same_boot_activations = [
+                        command[command.index("id") + 1]
+                        for command in nmcli.commands
+                        if "connection" in command and "up" in command
+                    ]
+                finally:
+                    restarted.close()
+
+                self.assertEqual(same_boot["transaction"]["latest"]["transaction_id"], original_id)
+                self.assertNotIn(candidate_profile, same_boot_activations)
+                self.assertEqual(nmcli.active["wlan0"], rescue_profile)
+
+                boot_id_path.write_text(
+                    "22222222-2222-4222-8222-222222222222\n",
+                    encoding="utf-8",
+                )
+                nmcli.commands.clear()
+                rebooted = NetworkController(
+                    device_id="device-reboot-retry",
+                    start_worker=False,
+                    require_root=False,
+                )
+                try:
+                    after_reboot = rebooted.handle(
+                        {"schema": "ylx.network-control-request.v1", "operation": "status"}
+                    )["body"]
+                    reboot_activations = [
+                        command[command.index("id") + 1]
+                        for command in nmcli.commands
+                        if "connection" in command and "up" in command
+                    ]
+                    with self.assertRaises(NetworkStateError):
+                        rebooted._state.work_for(str(original_id))
+                finally:
+                    rebooted.close()
+
+            persisted = (root / "state/controller-state.json").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(len(reboot_activations), 2)
+        self.assertEqual(reboot_activations[0], rescue_profile)
+        self.assertEqual(reboot_activations[-1], candidate_profile)
+        self.assertEqual(after_reboot["transaction"]["latest"]["status"], "committed")
+        self.assertEqual(after_reboot["transaction"]["latest"]["operation"], "retry")
+        self.assertNotEqual(after_reboot["transaction"]["latest"]["transaction_id"], original_id)
+        self.assertNotIn("reboot-secret-123", persisted)
+
+    def test_reboot_rebuilds_missing_retry_candidate_from_legacy_lkg(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boot_id_path = root / "boot-id"
+            boot_id_path.write_text("11111111-1111-4111-8111-111111111111\n", encoding="utf-8")
+            environment = {
+                "RP_YLX_NETWORK_STATE_DIR": str(root / "state"),
+                "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
+                "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
+                "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
+            }
+            from tests.test_network import FakeNmcli
+
+            nmcli = FakeNmcli(root / "profiles")
+            credentials = NetworkCredentialStore(token_factory=lambda: "legacy-reboot-credential")
+            clock = {"now": 0}
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+            ):
+                first = NetworkController(
+                    device_id="device-legacy-reboot-retry",
+                    credential_store=credentials,
+                    require_root=False,
+                    health_poll_seconds=3600,
+                    monotonic_ns=lambda: clock["now"],
+                )
+                try:
+                    credential_ref = self._create_credential(first, "legacy-reboot-secret-123")
+                    accepted = self._apply_protected_wifi(
+                        first,
+                        credential_ref,
+                        idempotency_key="legacy-reboot-apply",
+                    )
+                    self.assertTrue(accepted["ok"])
+                    self.assertTrue(first.wait_for_idle(timeout=2))
+                    profile_path = next((root / "profiles").glob("*wifi-client*.nmconnection"))
+                    profile_bytes = profile_path.read_bytes()
+
+                    profile_path.unlink()
+                    nmcli.active["wlan0"] = ""
+                    nmcli.addresses["wlan0"] = ""
+                    nmcli.routes["wlan0"] = ""
+                    clock["now"] = 1_000_000_000
+                    first._monitor_once()
+                    clock["now"] = 11_000_000_000
+                    first._monitor_once()
+                    self.assertTrue(first.wait_for_idle(timeout=2))
+                    rescued = first.handle(
+                        {"schema": "ylx.network-control-request.v1", "operation": "status"}
+                    )["body"]
+                    failed_id = rescued["transaction"]["latest"]["transaction_id"]
+                    failed_work = first._state.work_for(str(failed_id))
+                finally:
+                    first.close()
+
+                self.assertEqual(rescued["transaction"]["latest"]["status"], "rescued")
+                self.assertEqual(
+                    rescued["transaction"]["latest"]["error"]["code"],
+                    "network_manager_unavailable",
+                )
+                self.assertNotIn("candidate", failed_work)
+
+                profile_path.write_bytes(profile_bytes)
+                profile_path.chmod(0o600)
+                lkg_path = root / "state/lkg-wlan0.json"
+                lkg = json.loads(lkg_path.read_text(encoding="utf-8"))
+                lkg["config"] = {"mode": "wifi-client", "ssid": "Field LAN"}
+                lkg_path.write_text(json.dumps(lkg), encoding="utf-8")
+                lkg_path.chmod(0o600)
+                boot_id_path.write_text(
+                    "22222222-2222-4222-8222-222222222222\n",
+                    encoding="utf-8",
+                )
+                nmcli.commands.clear()
+
+                rebooted = NetworkController(
+                    device_id="device-legacy-reboot-retry",
+                    start_worker=False,
+                    require_root=False,
+                )
+                try:
+                    restored = rebooted.handle(
+                        {"schema": "ylx.network-control-request.v1", "operation": "status"}
+                    )["body"]
+                    with self.assertRaises(NetworkStateError):
+                        rebooted._state.work_for(str(failed_id))
+                finally:
+                    rebooted.close()
+
+            persisted = (root / "state/controller-state.json").read_text(encoding="utf-8")
+
+        security_query = next(command for command in nmcli.commands if "--get-values" in command)
+        activation = next(
+            command
+            for command in nmcli.commands
+            if "connection" in command
+            and "up" in command
+            and command[command.index("id") + 1] == profile_path.stem
+        )
+        self.assertLess(nmcli.commands.index(security_query), nmcli.commands.index(activation))
+        self.assertEqual(restored["transaction"]["latest"]["status"], "committed")
+        self.assertEqual(restored["transaction"]["latest"]["operation"], "retry")
+        self.assertEqual(nmcli.active["wlan0"], profile_path.stem)
+        self.assertNotIn("legacy-reboot-secret-123", persisted)
+
 
 class NetworkControlTest(unittest.TestCase):
     def setUp(self) -> None:
