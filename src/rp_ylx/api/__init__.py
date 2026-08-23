@@ -4,6 +4,8 @@ from rp_ylx.api.gateway import (
     CaptureCommand,
     CaptureCommandResult,
     GatewayServer,
+    NetworkCommand,
+    NetworkCommandResult,
     ProviderError,
     create_gateway_server,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "CommandResult",
     "GatewayServer",
     "MockDevice",
+    "NetworkCommand",
+    "NetworkCommandResult",
     "Principal",
     "ProviderError",
     "SecurityPolicy",

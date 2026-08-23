@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import re
 import uuid
@@ -48,10 +49,49 @@ WEB_CONTENT_SECURITY_POLICY = (
 )
 SUPPORTED_API_VERSIONS = frozenset({"v2", "v3", "v4"})
 CAMERA_FOCUS_API_VERSIONS = frozenset({"v4"})
-NETWORK_STATUS_API_VERSIONS = frozenset({"v4"})
+NETWORK_API_VERSIONS = frozenset({"v4"})
 NETWORK_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]
+NETWORK_MUTATION_OPERATIONS = ["apply", "retry", "forget"]
 NETWORK_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 MDNS_TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+NETWORK_CREDENTIAL_REF = re.compile(r"^cred-[A-Za-z0-9_.:-]+$")
+NETWORK_INTERFACE_STATES = frozenset(
+    {
+        "disabled",
+        "disconnected",
+        "starting",
+        "connecting",
+        "connected",
+        "active",
+        "degraded",
+        "failed",
+        "unavailable",
+    }
+)
+NETWORK_TRANSACTION_STATUSES = frozenset({"accepted", "running", "committed", "rescued", "failed"})
+NETWORK_TRANSACTION_STAGES = frozenset(
+    {
+        "accepted",
+        "validating_rescue_ap",
+        "applying_profile",
+        "verifying_client",
+        "committed",
+        "rescued",
+        "failed",
+        "forgetting",
+        "forgotten",
+    }
+)
+NETWORK_TRANSACTION_ERROR_CODES = frozenset(
+    {
+        "rescue_ap_unavailable",
+        "credential_rejected",
+        "dhcp_timeout",
+        "route_lost",
+        "network_manager_unavailable",
+        "concurrency_unsupported",
+    }
+)
 
 
 def _valid_session_id(api_version: str, session_id: str) -> bool:
@@ -70,6 +110,21 @@ class CaptureCommand:
 
 @dataclass(frozen=True, slots=True)
 class CaptureCommandResult:
+    status: int
+    body: object | None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkCommand:
+    principal_id: str
+    idempotency_key: str
+    body: Mapping[str, object]
+    canonical_body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkCommandResult:
     status: int
     body: object | None
     replayed: bool = False
@@ -111,6 +166,12 @@ class DeviceProvider(Protocol):
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult: ...
 
     def network_status(self) -> Mapping[str, object]: ...
+
+    def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult: ...
+
+    def retry_network_transaction(self, command: NetworkCommand) -> NetworkCommandResult: ...
+
+    def forget_network_client_profile(self, command: NetworkCommand) -> NetworkCommandResult: ...
 
     def list_sessions(
         self, *, cursor: str | None, limit: int, take_id: str | None
@@ -422,8 +483,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         if len(parts) == 4 and parts[3] in {"device", "preview", "sessions"}:
             return ("GET", "OPTIONS")
-        if len(parts) == 4 and parts[2] in NETWORK_STATUS_API_VERSIONS and parts[3] == "network":
+        if len(parts) == 4 and parts[2] in NETWORK_API_VERSIONS and parts[3] == "network":
             return ("GET", "OPTIONS")
+        if (
+            len(parts) == 5
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "events"]
+        ):
+            return ("GET", "OPTIONS")
+        if (
+            len(parts) == 5
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3] == "network"
+            and parts[4] in NETWORK_MUTATION_OPERATIONS
+        ):
+            return ("POST", "OPTIONS")
         if len(parts) == 5 and parts[3] == "capture":
             if parts[4] in {"start", "stop"}:
                 return ("POST", "OPTIONS")
@@ -453,7 +527,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parts = path.split("/")
         if method == "POST":
             headers.extend(("Content-Type", "Idempotency-Key", "X-CSRF-Token"))
-        elif len(parts) == 5 and parts[3:] == ["capture", "events"]:
+        elif len(parts) == 5 and parts[3:] in (["capture", "events"], ["network", "events"]):
             headers.append("Last-Event-ID")
         elif self._artifact_route(parts) is not None:
             headers.extend(("If-Range", "Range"))
@@ -557,10 +631,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if (
             len(parts) == 4
             and parts[1] == "api"
-            and parts[2] in NETWORK_STATUS_API_VERSIONS
+            and parts[2] in NETWORK_API_VERSIONS
             and parts[3] == "network"
         ):
             self._get_network_status()
+            return
+        if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "events"]
+        ):
+            self._network_events()
             return
         if (
             len(parts) == 4
@@ -638,6 +720,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and parts[3:] == ["camera", "focus"]
         ):
             self._camera_focus_command()
+            return
+        if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3] == "network"
+            and parts[4] in NETWORK_MUTATION_OPERATIONS
+        ):
+            self._network_command(parts[4])
             return
         self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
 
@@ -747,47 +838,192 @@ class GatewayHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _valid_network_status(value: object) -> bool:
         if not isinstance(value, Mapping) or set(value) != {
-            "format",
-            "capabilities",
-            "mdns",
-            "devices",
+            "schema",
+            "observed_at",
+            "desired",
+            "observed",
+            "transaction",
+            "mutation_capability",
+            "concurrency_capability",
         }:
             return False
-        capabilities = value.get("capabilities")
-        mdns = value.get("mdns")
-        devices = value.get("devices")
-        if (
-            value.get("format") != "ylx.network-status.v0"
-            or not isinstance(capabilities, Mapping)
-            or set(capabilities) != {"modes", "wifi_interface", "ethernet_interface", "second_wifi"}
-            or capabilities.get("modes") != NETWORK_MODES
-            or not isinstance(capabilities.get("wifi_interface"), str)
-            or NETWORK_TOKEN.fullmatch(str(capabilities["wifi_interface"])) is None
-            or not isinstance(capabilities.get("ethernet_interface"), str)
-            or NETWORK_TOKEN.fullmatch(str(capabilities["ethernet_interface"])) is None
-            or type(capabilities.get("second_wifi")) is not bool
-            or not isinstance(mdns, Mapping)
-            or set(mdns) != {"hostname", "service", "aliases", "port"}
-            or not isinstance(mdns.get("hostname"), str)
-            or MDNS_TOKEN.fullmatch(str(mdns["hostname"])) is None
-            or not str(mdns["hostname"]).endswith(".local")
-            or not isinstance(mdns.get("service"), str)
-            or MDNS_TOKEN.fullmatch(str(mdns["service"])) is None
-            or not isinstance(mdns.get("aliases"), list)
-            or len(mdns["aliases"]) > 16
-            or any(
-                not isinstance(alias, str) or MDNS_TOKEN.fullmatch(alias) is None
-                for alias in mdns["aliases"]
+        return (
+            value.get("schema") == "ylx.network-status.v1"
+            and isinstance(value.get("observed_at"), str)
+            and GatewayHandler._valid_network_desired_state(value.get("desired"))
+            and GatewayHandler._valid_network_observed_state(value.get("observed"))
+            and GatewayHandler._valid_network_transaction_window(value.get("transaction"))
+            and GatewayHandler._valid_network_mutation_capability(value.get("mutation_capability"))
+            and GatewayHandler._valid_network_concurrency_capability(
+                value.get("concurrency_capability")
             )
-            or len(set(mdns["aliases"])) != len(mdns["aliases"])
-            or type(mdns.get("port")) is not int
-            or not 1 <= mdns["port"] <= 65535
-            or not isinstance(devices, list)
-            or len(devices) > 64
+        )
+
+    @staticmethod
+    def _valid_ipv4(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            ipaddress.IPv4Address(value)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _valid_network_static_ipv4(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "address",
+            "prefix_length",
+            "gateway",
+            "dns",
+        }:
+            return False
+        dns = value.get("dns")
+        return (
+            GatewayHandler._valid_ipv4(value.get("address"))
+            and type(value.get("prefix_length")) is int
+            and 1 <= value["prefix_length"] <= 32
+            and (value.get("gateway") is None or GatewayHandler._valid_ipv4(value.get("gateway")))
+            and isinstance(dns, list)
+            and len(dns) <= 3
+            and all(GatewayHandler._valid_ipv4(item) for item in dns)
+            and len(set(dns)) == len(dns)
+        )
+
+    @staticmethod
+    def _valid_network_ethernet(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"addressing", "static_ipv4"}:
+            return False
+        addressing = value.get("addressing")
+        static = value.get("static_ipv4")
+        return (
+            addressing == "dhcp"
+            and static is None
+            or addressing == "static"
+            and GatewayHandler._valid_network_static_ipv4(static)
+        )
+
+    @staticmethod
+    def _valid_network_desired_wifi_client(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"ssid", "credential_state"}:
+            return False
+        ssid = value.get("ssid")
+        return (
+            isinstance(ssid, str)
+            and 1 <= len(ssid.encode("utf-8")) <= 32
+            and value.get("credential_state") in {"absent", "pending_input", "stored"}
+        )
+
+    @staticmethod
+    def _valid_network_desired_state(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"mode", "wifi_client", "ethernet"}:
+            return False
+        mode = value.get("mode")
+        wifi = value.get("wifi_client")
+        ethernet = value.get("ethernet")
+        if mode not in NETWORK_MODES:
+            return False
+        if wifi is not None and not GatewayHandler._valid_network_desired_wifi_client(wifi):
+            return False
+        if ethernet is not None and not GatewayHandler._valid_network_ethernet(ethernet):
+            return False
+        return not (
+            mode == "wifi-client" and wifi is None or mode == "ethernet-static" and ethernet is None
+        )
+
+    @staticmethod
+    def _valid_network_apply_wifi_client(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"ssid", "credential_ref"}:
+            return False
+        ssid = value.get("ssid")
+        credential_ref = value.get("credential_ref")
+        return (
+            isinstance(ssid, str)
+            and 1 <= len(ssid.encode("utf-8")) <= 32
+            and isinstance(credential_ref, str)
+            and 1 <= len(credential_ref) <= 128
+            and NETWORK_CREDENTIAL_REF.fullmatch(credential_ref) is not None
+        )
+
+    @staticmethod
+    def _valid_network_apply_desired_state(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"mode", "wifi_client", "ethernet"}:
+            return False
+        mode = value.get("mode")
+        wifi = value.get("wifi_client")
+        ethernet = value.get("ethernet")
+        if mode not in NETWORK_MODES:
+            return False
+        if mode == "wifi-client":
+            if not GatewayHandler._valid_network_apply_wifi_client(wifi):
+                return False
+        elif wifi is not None:
+            return False
+        if ethernet is not None and not GatewayHandler._valid_network_ethernet(ethernet):
+            return False
+        return not (mode == "ethernet-static" and ethernet is None)
+
+    @staticmethod
+    def _valid_network_interface(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "state",
+            "interface",
+            "addresses",
+            "peer_or_ssid",
+        }:
+            return False
+        state = value.get("state")
+        interface = value.get("interface")
+        addresses = value.get("addresses")
+        peer_or_ssid = value.get("peer_or_ssid")
+        if (
+            state not in NETWORK_INTERFACE_STATES
+            or (interface is not None and not isinstance(interface, str))
+            or (isinstance(interface, str) and NETWORK_TOKEN.fullmatch(interface) is None)
+            or not isinstance(addresses, list)
+            or any(not isinstance(address, str) or not address for address in addresses)
+            or len(set(addresses)) != len(addresses)
+            or (peer_or_ssid is not None and not isinstance(peer_or_ssid, str))
+            or (isinstance(peer_or_ssid, str) and not 1 <= len(peer_or_ssid) <= 128)
         ):
             return False
+        return not (
+            state in {"connected", "active", "degraded"} and (interface is None or not addresses)
+        )
+
+    @staticmethod
+    def _valid_network_mdns(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "hostname",
+            "service",
+            "aliases",
+            "port",
+        }:
+            return False
+        aliases = value.get("aliases")
+        return (
+            isinstance(value.get("hostname"), str)
+            and MDNS_TOKEN.fullmatch(str(value["hostname"])) is not None
+            and str(value["hostname"]).endswith(".local")
+            and isinstance(value.get("service"), str)
+            and MDNS_TOKEN.fullmatch(str(value["service"])) is not None
+            and isinstance(aliases, list)
+            and len(aliases) <= 16
+            and all(
+                isinstance(alias, str) and MDNS_TOKEN.fullmatch(alias) is not None
+                for alias in aliases
+            )
+            and len(set(aliases)) == len(aliases)
+            and type(value.get("port")) is int
+            and 1 <= value["port"] <= 65535
+        )
+
+    @staticmethod
+    def _valid_network_devices(value: object) -> bool:
+        if not isinstance(value, list) or len(value) > 64:
+            return False
         interfaces: set[str] = set()
-        for device in devices:
+        for device in value:
             if (
                 not isinstance(device, Mapping)
                 or set(device) != {"interface", "type", "state"}
@@ -803,6 +1039,137 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return False
             interfaces.add(str(device["interface"]))
         return True
+
+    @staticmethod
+    def _valid_network_observed_state(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "ap",
+            "wifi_client",
+            "wired",
+            "default_route",
+            "mdns",
+            "devices",
+        }:
+            return False
+        return (
+            GatewayHandler._valid_network_interface(value.get("ap"))
+            and GatewayHandler._valid_network_interface(value.get("wifi_client"))
+            and GatewayHandler._valid_network_interface(value.get("wired"))
+            and value.get("default_route") in {"wifi_client", "wired", "none"}
+            and GatewayHandler._valid_network_mdns(value.get("mdns"))
+            and GatewayHandler._valid_network_devices(value.get("devices"))
+        )
+
+    @staticmethod
+    def _valid_network_mutation_capability(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value)
+            == {
+                "enabled",
+                "operations",
+                "idempotency_key_required",
+                "secret_handling",
+                "active_state_policy",
+            }
+            and type(value.get("enabled")) is bool
+            and value.get("operations") == NETWORK_MUTATION_OPERATIONS
+            and value.get("idempotency_key_required") is True
+            and value.get("secret_handling") == "opaque_credential_reference_only"
+            and value.get("active_state_policy") == "idle_only"
+        )
+
+    @staticmethod
+    def _valid_network_concurrency_capability(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value)
+            == {
+                "rescue_ap_required",
+                "same_phy_ap_sta",
+                "exclusive_client_failure_timeout_seconds",
+                "max_managed_interfaces",
+                "max_ap_interfaces",
+            }
+            and value.get("rescue_ap_required") is True
+            and value.get("same_phy_ap_sta") in {"supported", "unsupported", "unverified"}
+            and value.get("exclusive_client_failure_timeout_seconds") == 10
+            and type(value.get("max_managed_interfaces")) is int
+            and 0 <= value["max_managed_interfaces"] <= 8
+            and type(value.get("max_ap_interfaces")) is int
+            and 0 <= value["max_ap_interfaces"] <= 8
+        )
+
+    @staticmethod
+    def _valid_network_transaction_error(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value) == {"code", "message", "retryable"}
+            and value.get("code") in NETWORK_TRANSACTION_ERROR_CODES
+            and isinstance(value.get("message"), str)
+            and 1 <= len(value["message"]) <= 512
+            and type(value.get("retryable")) is bool
+        )
+
+    @staticmethod
+    def _valid_network_transaction(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema",
+            "transaction_id",
+            "operation",
+            "status",
+            "stage",
+            "desired",
+            "accepted_at",
+            "updated_at",
+            "rescue",
+            "error",
+        }:
+            return False
+        rescue = value.get("rescue")
+        error = value.get("error")
+        return (
+            value.get("schema") == "ylx.network-transaction.v1"
+            and isinstance(value.get("transaction_id"), str)
+            and UUID_V7.fullmatch(str(value["transaction_id"])) is not None
+            and value.get("operation") in NETWORK_MUTATION_OPERATIONS
+            and value.get("status") in NETWORK_TRANSACTION_STATUSES
+            and value.get("stage") in NETWORK_TRANSACTION_STAGES
+            and GatewayHandler._valid_network_desired_state(value.get("desired"))
+            and isinstance(value.get("accepted_at"), str)
+            and isinstance(value.get("updated_at"), str)
+            and isinstance(rescue, Mapping)
+            and set(rescue) == {"ap_validated", "fallback_mode", "failure_trigger_seconds"}
+            and type(rescue.get("ap_validated")) is bool
+            and rescue.get("fallback_mode") == "hotspot"
+            and rescue.get("failure_trigger_seconds") == 10
+            and (error is None or GatewayHandler._valid_network_transaction_error(error))
+        )
+
+    @staticmethod
+    def _valid_network_transaction_window(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value) == {"current", "latest"}
+            and (
+                value.get("current") is None
+                or GatewayHandler._valid_network_transaction(value.get("current"))
+            )
+            and (
+                value.get("latest") is None
+                or GatewayHandler._valid_network_transaction(value.get("latest"))
+            )
+        )
+
+    @staticmethod
+    def _valid_network_receipt(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value) == {"schema", "accepted_at", "transaction"}
+            and value.get("schema") == "ylx.network-transaction-receipt.v1"
+            and isinstance(value.get("accepted_at"), str)
+            and GatewayHandler._valid_network_transaction(value.get("transaction"))
+        )
 
     def _get_network_status(self) -> None:
         if self._principal("getNetworkStatus") is None:
@@ -825,6 +1192,64 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._invalid_source_state("daemon network 状态无效")
             return
         self._send_json(HTTPStatus.OK, status)
+
+    def _network_events(self) -> None:
+        if self._principal("streamNetworkEvents") is None:
+            return
+        parsed = urlsplit(self.path)
+        if parsed.query:
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "SSE 不接受查询参数")
+            return
+        last_event_id, last_event_id_is_single = self._single_header("Last-Event-ID")
+        if not last_event_id_is_single or (
+            last_event_id is not None and not last_event_id.isdecimal()
+        ):
+            self._problem(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "Last-Event-ID 必须是十进制 delivery ID",
+            )
+            return
+        try:
+            status = self.server.provider.network_status()
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                headers={"YLX-Error-Code": error.code},
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not self._valid_network_status(status):
+            self._invalid_source_state("daemon network 状态无效")
+            return
+        delivery_id = 1 if last_event_id is None else int(last_event_id) + 1
+        event = {
+            "schema": "ylx.network-event.v1",
+            "sse_delivery_id": str(delivery_id),
+            "occurred_at": status["observed_at"],
+            "type": "snapshot",
+            "transaction_id": None,
+            "data": status,
+        }
+        payload = (
+            f"id: {delivery_id}\n"
+            "event: snapshot\n"
+            f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        ).encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _capture_events(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("streamCaptureEvents") is None:
@@ -1318,6 +1743,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return False
         return not (has_auto and type(body["auto_enabled"]) is not bool)
 
+    @staticmethod
+    def _validate_network_body(operation: str, body: Mapping[str, object]) -> bool:
+        if operation == "apply":
+            return (
+                set(body) == {"schema", "desired"}
+                and body.get("schema") == "ylx.network-apply-request.v1"
+                and GatewayHandler._valid_network_apply_desired_state(body.get("desired"))
+            )
+        if operation == "retry":
+            return (
+                set(body) == {"schema", "transaction_id"}
+                and body.get("schema") == "ylx.network-retry-request.v1"
+                and isinstance(body.get("transaction_id"), str)
+                and UUID_V7.fullmatch(str(body["transaction_id"])) is not None
+            )
+        return set(body) == {"schema"} and body.get("schema") == "ylx.network-forget-request.v1"
+
     def _command_principal(
         self,
         operation_id: str,
@@ -1430,6 +1872,53 @@ class GatewayHandler(BaseHTTPRequestHandler):
             HTTPStatus.INTERNAL_SERVER_ERROR,
             "invalid_source_state",
             "daemon camera focus command 响应无效",
+        )
+
+    def _network_command(self, operation: str) -> None:
+        operation_id = {
+            "apply": "applyNetworkDesiredState",
+            "retry": "retryNetworkTransaction",
+            "forget": "forgetNetworkClientProfile",
+        }[operation]
+        command_identity = self._command_principal(operation_id)
+        if command_identity is None:
+            return
+        principal, key = command_identity
+        body = self._read_json()
+        if body is None:
+            return
+        if not self._validate_network_body(operation, body):
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不符合网络命令契约")
+            return
+        canonical = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        command = NetworkCommand(principal.principal_id, key, body, canonical)
+        try:
+            if operation == "apply":
+                result = self.server.provider.apply_network_desired_state(command)
+            elif operation == "retry":
+                result = self.server.provider.retry_network_transaction(command)
+            else:
+                result = self.server.provider.forget_network_client_profile(command)
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                headers={"YLX-Error-Code": error.code},
+                details=error.details,
+            )
+            return
+        headers = {"Idempotency-Replayed": "true"} if result.replayed else None
+        if result.status == HTTPStatus.ACCEPTED and self._valid_network_receipt(result.body):
+            self._send_json(result.status, result.body, headers=headers)
+            return
+        self._problem(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid_source_state",
+            "daemon network command 响应无效",
         )
 
 

@@ -278,6 +278,74 @@ class NetworkCliTest(unittest.TestCase):
         self.assertTrue(result["capabilities"]["second_wifi"])
         self.assertEqual(result["capabilities"]["wifi_interface"], "wlan0")
 
+    def test_status_v1_projects_runtime_state_and_disables_mutation(self) -> None:
+        runtime = {
+            "observed_at": "2026-08-23T12:58:00+08:00",
+            "network": {
+                "ap": {
+                    "state": "disabled",
+                    "interface": "wlan0",
+                    "addresses": [],
+                    "peer_or_ssid": None,
+                },
+                "wifi_client": {
+                    "state": "connected",
+                    "interface": "wlan0",
+                    "addresses": ["192.168.110.36/24"],
+                    "peer_or_ssid": "studio-wifi",
+                },
+                "wired": {
+                    "state": "disconnected",
+                    "interface": "eth0",
+                    "addresses": [],
+                    "peer_or_ssid": None,
+                },
+                "default_route": "wifi_client",
+            },
+        }
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        self.lkg_path("wlan0").write_text(
+            json.dumps(
+                {
+                    "format": "ylx.network-lkg.v0",
+                    "mode": "wifi-client",
+                    "interface": "wlan0",
+                    "profile": "rp-ylx-wifi-client-0123456789ab",
+                    "config": {
+                        "mode": "wifi-client",
+                        "ssid": "studio-wifi",
+                        "psk": "must-not-leak",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=FakeNmcli(self.root / "profiles")),
+        ):
+            status = network_module.network_status_v1(runtime)
+
+        self.assertEqual(status["schema"], "ylx.network-status.v1")
+        self.assertEqual(status["desired"]["mode"], "wifi-client")
+        self.assertEqual(
+            status["desired"]["wifi_client"],
+            {"ssid": "studio-wifi", "credential_state": "stored"},
+        )
+        self.assertEqual(status["observed"]["default_route"], "wifi_client")
+        self.assertEqual(status["observed"]["mdns"]["hostname"], "rp-ylx.local")
+        self.assertFalse(status["mutation_capability"]["enabled"])
+        self.assertEqual(status["mutation_capability"]["operations"], ["apply", "retry", "forget"])
+        self.assertEqual(status["concurrency_capability"]["same_phy_ap_sta"], "unverified")
+        self.assertEqual(
+            status["concurrency_capability"]["exclusive_client_failure_timeout_seconds"],
+            network_module.NETWORK_ACTIVATION_WAIT_SECONDS,
+        )
+        self.assertNotIn("must-not-leak", json.dumps(status, ensure_ascii=False))
+        self.assertNotIn("psk", json.dumps(status, ensure_ascii=False).lower())
+
     def test_status_reports_a_stable_error_when_network_manager_is_missing(self) -> None:
         with patch(
             "rp_ylx.network.subprocess.run",

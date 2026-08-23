@@ -16,6 +16,8 @@ import tempfile
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from copy import deepcopy
+from datetime import UTC, datetime
 from importlib.resources import files as resource_files
 from pathlib import Path
 from typing import Any, TextIO
@@ -334,6 +336,123 @@ def _lkg_path(state_dir: Path, interface: str) -> Path:
 
 def _safe_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in config.items() if key != "psk"}
+
+
+def _network_static_ipv4(config: Mapping[str, Any]) -> dict[str, Any]:
+    interface = ipaddress.IPv4Interface(str(config["address"]))
+    gateway = config.get("gateway")
+    dns = config.get("dns", [])
+    return {
+        "address": str(interface.ip),
+        "prefix_length": interface.network.prefixlen,
+        "gateway": str(gateway) if isinstance(gateway, str) else None,
+        "dns": [str(item) for item in dns] if isinstance(dns, list) else [],
+    }
+
+
+def _desired_state_from_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    if config is None or config.get("mode") not in SUPPORTED_MODES:
+        return {
+            "mode": "hotspot",
+            "wifi_client": None,
+            "ethernet": None,
+        }
+    mode = str(config["mode"])
+    wifi_client = None
+    ethernet = None
+    if mode == "wifi-client":
+        ssid = config.get("ssid")
+        wifi_client = {
+            "ssid": ssid if isinstance(ssid, str) and ssid else "",
+            "credential_state": "stored",
+        }
+    elif mode == "ethernet-dhcp":
+        ethernet = {"addressing": "dhcp", "static_ipv4": None}
+    elif mode == "ethernet-static":
+        try:
+            static_ipv4 = _network_static_ipv4(config)
+        except (KeyError, ValueError):
+            static_ipv4 = None
+        ethernet = {"addressing": "static", "static_ipv4": static_ipv4}
+    return {
+        "mode": mode,
+        "wifi_client": wifi_client,
+        "ethernet": ethernet,
+    }
+
+
+def _desired_state_from_disk(state_dir: Path) -> dict[str, Any]:
+    for path in (
+        _lkg_path(state_dir, WIFI_INTERFACE),
+        _lkg_path(state_dir, ETHERNET_INTERFACE),
+        state_dir / "rescue.json",
+    ):
+        record = _read_json(path)
+        if record is None:
+            continue
+        config = record.get("config")
+        if isinstance(config, Mapping):
+            return _desired_state_from_config(config)
+    return _desired_state_from_config(None)
+
+
+def _network_observed_state(
+    runtime: Mapping[str, Any],
+    legacy_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    network = runtime.get("network")
+    if not isinstance(network, Mapping):
+        raise NetworkError("runtime_network_unavailable", "无法读取运行时网络状态")
+    mdns = legacy_status.get("mdns")
+    devices = legacy_status.get("devices")
+    if not isinstance(mdns, Mapping) or not isinstance(devices, list):
+        raise NetworkError("network_status_failed", "NetworkManager 状态无效")
+    observed = deepcopy(dict(network))
+    observed["mdns"] = deepcopy(dict(mdns))
+    observed["devices"] = deepcopy(devices)
+    return observed
+
+
+def network_status_v1(
+    runtime: Mapping[str, Any],
+    *,
+    legacy_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the v4 Device API network status without enabling mutation."""
+
+    status = network_status() if legacy_status is None else legacy_status
+    capabilities = status.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        raise NetworkError("network_status_failed", "NetworkManager 状态无效")
+    second_wifi = capabilities.get("second_wifi") is True
+    observed_at = runtime.get("observed_at")
+    if not isinstance(observed_at, str) or not observed_at:
+        observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    state_dir = _state_dir()
+    return {
+        "schema": "ylx.network-status.v1",
+        "observed_at": observed_at,
+        "desired": _desired_state_from_disk(state_dir),
+        "observed": _network_observed_state(runtime, status),
+        "transaction": {
+            "current": None,
+            "latest": None,
+        },
+        "mutation_capability": {
+            "enabled": False,
+            "operations": ["apply", "retry", "forget"],
+            "idempotency_key_required": True,
+            "secret_handling": "opaque_credential_reference_only",
+            "active_state_policy": "idle_only",
+        },
+        "concurrency_capability": {
+            "rescue_ap_required": True,
+            "same_phy_ap_sta": "unverified",
+            "exclusive_client_failure_timeout_seconds": NETWORK_ACTIVATION_WAIT_SECONDS,
+            "max_managed_interfaces": 2 if second_wifi else 1,
+            "max_ap_interfaces": 1,
+        },
+    }
 
 
 def _profile_name(request_id: str, mode: str) -> str:

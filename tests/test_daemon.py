@@ -25,6 +25,13 @@ from rp_ylx.native import NativeCapabilities
 
 
 class ProductionDaemonTest(unittest.TestCase):
+    def test_lab_profile_allows_network_reads_but_not_mutations(self) -> None:
+        self.assertIn("getNetworkStatus", LAB_OPERATIONS)
+        self.assertIn("streamNetworkEvents", LAB_OPERATIONS)
+        self.assertNotIn("applyNetworkDesiredState", LAB_OPERATIONS)
+        self.assertNotIn("retryNetworkTransaction", LAB_OPERATIONS)
+        self.assertNotIn("forgetNetworkClientProfile", LAB_OPERATIONS)
+
     def config(self, root: Path) -> ProductionConfig:
         return ProductionConfig(
             host="127.0.0.1",

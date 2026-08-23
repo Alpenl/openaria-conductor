@@ -13,6 +13,8 @@ from rp_ylx.api import (
     AuditEvent,
     CaptureCommand,
     CaptureCommandResult,
+    NetworkCommand,
+    NetworkCommandResult,
     Principal,
     ProviderError,
     SecurityPolicy,
@@ -112,23 +114,91 @@ DEVICE_V3 = {
 }
 
 NETWORK_STATUS = {
-    "format": "ylx.network-status.v0",
-    "capabilities": {
-        "modes": ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"],
-        "wifi_interface": "wlan0",
-        "ethernet_interface": "eth0",
-        "second_wifi": False,
+    "schema": "ylx.network-status.v1",
+    "observed_at": "2026-08-23T12:58:00+08:00",
+    "desired": {
+        "mode": "wifi-client",
+        "wifi_client": {
+            "ssid": "studio-wifi",
+            "credential_state": "stored",
+        },
+        "ethernet": None,
     },
-    "mdns": {
-        "hostname": "rp-ylx.local",
-        "service": "_ylx-capture._tcp",
-        "aliases": ["_http._tcp"],
-        "port": 8080,
+    "observed": {
+        "ap": {
+            "state": "disabled",
+            "interface": "wlan0",
+            "addresses": [],
+            "peer_or_ssid": None,
+        },
+        "wifi_client": {
+            "state": "connected",
+            "interface": "wlan0",
+            "addresses": ["192.168.110.36/24"],
+            "peer_or_ssid": "studio-wifi",
+        },
+        "wired": {
+            "state": "disconnected",
+            "interface": "eth0",
+            "addresses": [],
+            "peer_or_ssid": None,
+        },
+        "default_route": "wifi_client",
+        "mdns": {
+            "hostname": "rp-ylx.local",
+            "service": "_ylx-capture._tcp",
+            "aliases": ["_http._tcp"],
+            "port": 8080,
+        },
+        "devices": [
+            {"interface": "wlan0", "type": "wifi", "state": "connected"},
+            {"interface": "eth0", "type": "ethernet", "state": "disconnected"},
+        ],
     },
-    "devices": [
-        {"interface": "wlan0", "type": "wifi", "state": "connected"},
-        {"interface": "eth0", "type": "ethernet", "state": "disconnected"},
-    ],
+    "transaction": {"current": None, "latest": None},
+    "mutation_capability": {
+        "enabled": False,
+        "operations": ["apply", "retry", "forget"],
+        "idempotency_key_required": True,
+        "secret_handling": "opaque_credential_reference_only",
+        "active_state_policy": "idle_only",
+    },
+    "concurrency_capability": {
+        "rescue_ap_required": True,
+        "same_phy_ap_sta": "unverified",
+        "exclusive_client_failure_timeout_seconds": 10,
+        "max_managed_interfaces": 1,
+        "max_ap_interfaces": 1,
+    },
+}
+
+NETWORK_TRANSACTION_ID = "0198d2a0-41a0-7b7a-a751-0e86a39d4db1"
+NETWORK_RECEIPT = {
+    "schema": "ylx.network-transaction-receipt.v1",
+    "accepted_at": "2026-08-23T12:58:03+08:00",
+    "transaction": {
+        "schema": "ylx.network-transaction.v1",
+        "transaction_id": NETWORK_TRANSACTION_ID,
+        "operation": "apply",
+        "status": "accepted",
+        "stage": "accepted",
+        "desired": {
+            "mode": "wifi-client",
+            "wifi_client": {
+                "ssid": "studio-wifi",
+                "credential_state": "pending_input",
+            },
+            "ethernet": None,
+        },
+        "accepted_at": "2026-08-23T12:58:03+08:00",
+        "updated_at": "2026-08-23T12:58:03+08:00",
+        "rescue": {
+            "ap_validated": False,
+            "fallback_mode": "hotspot",
+            "failure_trigger_seconds": 10,
+        },
+        "error": None,
+    },
 }
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
@@ -380,6 +450,8 @@ class DeviceProvider:
         self.status: object = deepcopy(CAPTURE_STATUS)
         self.focus: object | None = None
         self.network: object = deepcopy(NETWORK_STATUS)
+        self.network_commands: list[tuple[str, NetworkCommand]] = []
+        self.network_results: dict[str, NetworkCommandResult] = {}
         self.live_imu: object | None = None
         self.stop_status = 204
         self.device_schema_override: str | None = None
@@ -419,6 +491,27 @@ class DeviceProvider:
 
     def network_status(self) -> object:
         return deepcopy(self.network)
+
+    def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
+        self.network_commands.append((operation, command))
+        result = self.network_results.get(operation)
+        if result is None:
+            raise ProviderError(
+                "network_mutation_unavailable",
+                "网络写入控制器尚未启用",
+                status=503,
+                retryable=True,
+            )
+        return NetworkCommandResult(result.status, deepcopy(result.body), result.replayed)
+
+    def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult:
+        return self._network_command("apply", command)
+
+    def retry_network_transaction(self, command: NetworkCommand) -> NetworkCommandResult:
+        return self._network_command("retry", command)
+
+    def forget_network_client_profile(self, command: NetworkCommand) -> NetworkCommandResult:
+        return self._network_command("forget", command)
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
         if self.focus is None:
@@ -497,6 +590,10 @@ class GatewayHttpTest(unittest.TestCase):
                 "getCameraFocus": None,
                 "setCameraFocus": None,
                 "getNetworkStatus": None,
+                "streamNetworkEvents": None,
+                "applyNetworkDesiredState": None,
+                "retryNetworkTransaction": None,
+                "forgetNetworkClientProfile": None,
             },
         )
         denied = Principal("denied", permissions={})
@@ -1022,10 +1119,12 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
 
-    def test_network_status_is_v4_only_read_only_and_strictly_validated(self) -> None:
+    def test_network_status_and_events_are_v4_only_and_strictly_validated(self) -> None:
         for version in ("v2", "v3"):
             with self.subTest(version=version):
                 status, _, _ = self.request(f"/api/{version}/network", token="reader-token")
+                self.assertEqual(status, 404)
+                status, _, _ = self.request(f"/api/{version}/network/events", token="reader-token")
                 self.assertEqual(status, 404)
 
         status, payload, headers = self.request("/api/v4/network", token="reader-token")
@@ -1036,7 +1135,7 @@ class GatewayHttpTest(unittest.TestCase):
         status, payload, _ = self.request(
             "/api/v4/network",
             token="reader-token",
-            body={"schema": "ylx.network-apply.v1", "mode": "hotspot"},
+            body={"schema": "ylx.network-apply-request.v1", "desired": NETWORK_STATUS["desired"]},
         )
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
@@ -1045,6 +1144,189 @@ class GatewayHttpTest(unittest.TestCase):
         status, payload, _ = self.request("/api/v4/network", token="reader-token")
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+        self.server.provider.network = deepcopy(NETWORK_STATUS)
+
+        status, payload, headers = self.request(
+            "/api/v4/network/events",
+            token="reader-token",
+            headers={"Last-Event-ID": "40"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn(b"id: 41\n", payload)
+        self.assertIn(b"event: snapshot\n", payload)
+        data_line = next(line for line in payload.splitlines() if line.startswith(b"data: "))
+        event = json.loads(data_line.removeprefix(b"data: "))
+        self.assertEqual(event["schema"], "ylx.network-event.v1")
+        self.assertEqual(event["sse_delivery_id"], "41")
+        self.assertEqual(event["type"], "snapshot")
+        self.assertIsNone(event["transaction_id"])
+        self.assertEqual(event["data"], NETWORK_STATUS)
+
+        status, payload, _ = self.request(
+            "/api/v4/network/events",
+            token="reader-token",
+            headers={"Last-Event-ID": "bad-cursor"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+
+    def test_network_mutation_routes_fail_closed_before_side_effects(self) -> None:
+        apply_body = {
+            "schema": "ylx.network-apply-request.v1",
+            "desired": {
+                "mode": "wifi-client",
+                "wifi_client": {
+                    "ssid": "studio-wifi",
+                    "credential_ref": "cred-setup-token-001",
+                },
+                "ethernet": None,
+            },
+        }
+        headers = {"Origin": self.base, "Idempotency-Key": "network-apply-1"}
+
+        status, payload, response_headers = self.request(
+            "/api/v4/network/apply",
+            token="reader-token",
+            headers=headers,
+            body=apply_body,
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(payload)["error"]["code"], "network_mutation_unavailable")
+        self.assertEqual(response_headers["YLX-Error-Code"], "network_mutation_unavailable")
+        self.assertEqual(len(self.server.provider.network_commands), 1)
+
+        self.server.provider.network_commands.clear()
+        for path, body in (
+            (
+                "/api/v4/network/retry",
+                {
+                    "schema": "ylx.network-retry-request.v1",
+                    "transaction_id": NETWORK_TRANSACTION_ID,
+                },
+            ),
+            ("/api/v4/network/forget", {"schema": "ylx.network-forget-request.v1"}),
+        ):
+            with self.subTest(path=path):
+                status, payload, _ = self.request(
+                    path,
+                    token="reader-token",
+                    headers={"Origin": self.base, "Idempotency-Key": f"{path.rsplit('/', 1)[1]}-1"},
+                    body=body,
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(
+                    json.loads(payload)["error"]["code"], "network_mutation_unavailable"
+                )
+        self.assertEqual(
+            [operation for operation, _ in self.server.provider.network_commands],
+            ["retry", "forget"],
+        )
+
+        self.server.provider.network_commands.clear()
+        status, payload, _ = self.request(
+            "/api/v4/network/apply",
+            token="reader-token",
+            headers={"Origin": self.base},
+            body=apply_body,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+        self.assertEqual(self.server.provider.network_commands, [])
+
+        status, payload, _ = self.request(
+            "/api/v4/network/apply",
+            token="reader-token",
+            headers={"Origin": self.base, "Idempotency-Key": "network-secret"},
+            body={
+                "schema": "ylx.network-apply-request.v1",
+                "desired": {
+                    "mode": "wifi-client",
+                    "wifi_client": {
+                        "ssid": "studio-wifi",
+                        "credential_ref": "cred-setup-token-001",
+                        "psk": "must-not-pass",
+                    },
+                    "ethernet": None,
+                },
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+        self.assertEqual(self.server.provider.network_commands, [])
+
+        status, payload, _ = self.request(
+            "/api/v4/network/apply",
+            token="denied-token",
+            headers=headers,
+            body=apply_body,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "forbidden")
+        self.assertEqual(self.server.provider.network_commands, [])
+
+        lab_provider = DeviceProvider()
+        lab_server = create_gateway_server(
+            "127.0.0.1",
+            0,
+            lab_provider,
+            security=SecurityPolicy.lab(
+                allowed_operations={"getNetworkStatus", "streamNetworkEvents"},
+                allowed_origins={self.base},
+            ),
+        )
+        lab_thread = threading.Thread(target=lab_server.serve_forever, daemon=True)
+        lab_thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", lab_server.server_port, timeout=2)
+            try:
+                body = json.dumps(apply_body).encode()
+                connection.request(
+                    "POST",
+                    "/api/v4/network/apply",
+                    body=body,
+                    headers={
+                        "Origin": self.base,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": "lab-network-apply",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                self.assertEqual(json.loads(response.read())["error"]["code"], "forbidden")
+                self.assertEqual(lab_provider.network_commands, [])
+            finally:
+                connection.close()
+        finally:
+            lab_server.shutdown()
+            lab_server.server_close()
+            lab_thread.join(timeout=2)
+
+    def test_network_mutation_accepts_valid_provider_receipts_and_replay_header(self) -> None:
+        self.server.provider.network_results["apply"] = NetworkCommandResult(
+            202, NETWORK_RECEIPT, replayed=True
+        )
+
+        status, payload, headers = self.request(
+            "/api/v4/network/apply",
+            token="reader-token",
+            headers={"Origin": self.base, "Idempotency-Key": "network-accepted"},
+            body={
+                "schema": "ylx.network-apply-request.v1",
+                "desired": {
+                    "mode": "wifi-client",
+                    "wifi_client": {
+                        "ssid": "studio-wifi",
+                        "credential_ref": "cred-setup-token-001",
+                    },
+                    "ethernet": None,
+                },
+            },
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(payload), NETWORK_RECEIPT)
+        self.assertEqual(headers["Idempotency-Replayed"], "true")
 
     def test_status_start_stop_and_device_are_major_specific_closed_wire_shapes(self) -> None:
         start = {
@@ -1326,6 +1608,18 @@ class GatewayHttpTest(unittest.TestCase):
             ),
             (
                 "/api/v4/camera/focus",
+                "POST",
+                "authorization, content-type, idempotency-key, x-csrf-token",
+                {"authorization", "content-type", "idempotency-key", "x-csrf-token"},
+            ),
+            (
+                "/api/v4/network/events",
+                "GET",
+                "authorization, last-event-id",
+                {"authorization", "last-event-id"},
+            ),
+            (
+                "/api/v4/network/apply",
                 "POST",
                 "authorization, content-type, idempotency-key, x-csrf-token",
                 {"authorization", "content-type", "idempotency-key", "x-csrf-token"},
