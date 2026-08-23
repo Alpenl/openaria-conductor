@@ -34,6 +34,7 @@ from rp_ylx.deployment import (
     _launcher,
     _sha256,
     _system_launcher,
+    _systemd_unit_load_state,
     _write_atomic,
     load_bundle,
     normalize_runtime_archive,
@@ -155,6 +156,7 @@ class ReleaseManagerTest(unittest.TestCase):
             health_checker=lambda: self.commands.append(("health-check",)),
             group_resolver=lambda name: os.getgid(),
             tls_material_generator=self.tls_material_generator,
+            unit_load_state_reader=lambda unit: "loaded",
         )
 
     def seed_lab_config(self, manager: ReleaseManager) -> None:
@@ -162,6 +164,48 @@ class ReleaseManagerTest(unittest.TestCase):
         config = manager._default_device_config()
         config["security"] = {"profile": "lab", "isolated_network": True}
         _write_atomic(self.config_root / "device.json", config)
+
+    def test_systemd_unit_load_state_returns_closed_systemd_value(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["systemctl"],
+            0,
+            stdout="not-found\n",
+            stderr="",
+        )
+        with patch("rp_ylx.deployment.subprocess.run", return_value=completed) as run:
+            self.assertEqual(_systemd_unit_load_state("rp-ylx-recover.service"), "not-found")
+
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "show",
+                "--property=LoadState",
+                "--value",
+                "rp-ylx-recover.service",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_systemd_unit_load_state_rejects_failed_or_ambiguous_query(self) -> None:
+        for completed in (
+            subprocess.CompletedProcess(["systemctl"], 1, stdout="", stderr="failed"),
+            subprocess.CompletedProcess(
+                ["systemctl"],
+                0,
+                stdout="loaded\nnot-found\n",
+                stderr="",
+            ),
+        ):
+            with (
+                self.subTest(returncode=completed.returncode, stdout=completed.stdout),
+                patch("rp_ylx.deployment.subprocess.run", return_value=completed),
+                self.assertRaises(DeploymentError) as rejected,
+            ):
+                _systemd_unit_load_state("rp-ylx-recover.service")
+            self.assertEqual(rejected.exception.code, "unit_state_query_failed")
 
     def test_clean_and_repeated_install_preserve_identity_and_enable_boot(self) -> None:
         manager = self.manager()
@@ -1025,6 +1069,48 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIsNone(manager.status()["previous"])
         self.assertEqual(service_asset.read_bytes(), asset_before)
         self.assertNotIn(("systemd-sysusers",), self.commands)
+
+    def test_upgrade_skips_only_recover_stop_when_old_release_does_not_have_unit(self) -> None:
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+        recover_asset = self.root / DEPLOYMENT_ASSETS["rp-ylx-recover.service"][0]
+        recover_asset.unlink()
+        queried: list[str] = []
+        manager.unit_load_state_reader = lambda unit: queried.append(unit) or "not-found"
+        self.commands.clear()
+
+        manager.install(self.bundle("b"))
+
+        self.assertEqual(queried, ["rp-ylx-recover.service"])
+        self.assertEqual(
+            self.commands[:5],
+            [
+                ("systemctl", "disable", "--now", "rp-ylx-wifi-watchdog.timer"),
+                ("systemctl", "stop", "rp-ylx-wifi-watchdog.service"),
+                ("systemctl", "stop", "rp-ylx.service"),
+                ("systemctl", "stop", "rp-ylx-network-control.socket"),
+                ("systemctl", "stop", "rp-ylx-network-control.service"),
+            ],
+        )
+        self.assertNotIn(("systemctl", "stop", "rp-ylx-recover.service"), self.commands)
+        self.assertTrue(recover_asset.is_file())
+        self.assertEqual(manager.status()["current"], self.commit("b"))
+        self.assertEqual(manager.status()["previous"], self.commit("a"))
+
+    def test_upgrade_rejects_invalid_optional_unit_load_state_before_stopping_services(
+        self,
+    ) -> None:
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+        manager.unit_load_state_reader = lambda unit: ""
+        self.commands.clear()
+
+        with self.assertRaises(DeploymentError) as rejected:
+            manager.install(self.bundle("b"))
+
+        self.assertEqual(rejected.exception.code, "unit_quiesce_failed")
+        self.assertEqual(self.commands, [])
+        self.assertEqual(manager.status()["current"], self.commit("a"))
 
     def test_upgrade_quiesces_first_and_health_failure_restores_old_release(self) -> None:
         manager = self.manager()
