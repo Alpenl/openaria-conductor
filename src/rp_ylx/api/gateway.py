@@ -6,12 +6,16 @@ import hmac
 import ipaddress
 import json
 import re
+import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, RLock
 from typing import Protocol
 from urllib.parse import parse_qs, urlsplit
 
@@ -52,9 +56,11 @@ CAMERA_FOCUS_API_VERSIONS = frozenset({"v4"})
 NETWORK_API_VERSIONS = frozenset({"v4"})
 NETWORK_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]
 NETWORK_MUTATION_OPERATIONS = ["apply", "retry", "forget"]
+NETWORK_WIFI_SECURITY = frozenset({"open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"})
 NETWORK_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 MDNS_TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 NETWORK_CREDENTIAL_REF = re.compile(r"^cred-[A-Za-z0-9_.:-]+$")
+HTTP_CONTENT_LENGTH = re.compile(r"^(?:0|[1-9][0-9]*)$")
 NETWORK_INTERFACE_STATES = frozenset(
     {
         "disabled",
@@ -72,16 +78,68 @@ NETWORK_TRANSACTION_STATUSES = frozenset({"accepted", "running", "committed", "r
 NETWORK_TRANSACTION_STAGES = frozenset(
     {
         "accepted",
-        "validating_rescue_ap",
-        "applying_profile",
-        "verifying_client",
+        "prepared",
+        "ap_ready",
+        "activating",
+        "verifying",
         "committed",
+        "falling_back",
         "rescued",
         "failed",
         "forgetting",
         "forgotten",
     }
 )
+NETWORK_RECOVERY_ACTIONS = frozenset(
+    {
+        "await_device",
+        "reconnect_target_lan",
+        "reconnect_rescue_ap",
+        "retry",
+        "service_required",
+        "none",
+    }
+)
+NETWORK_MUTATION_DISABLED_REASONS = frozenset(
+    {
+        "not_enabled",
+        "auth_profile_unavailable",
+        "controller_unavailable",
+        "network_manager_unavailable",
+        "rescue_ap_not_validated",
+        "capture_active",
+        "recovery_required",
+        "maintenance_window_closed",
+        "unsupported_concurrency",
+    }
+)
+INVALID_NETWORK_DESIRED_STATE_REASONS = frozenset(
+    {
+        "missing_credential_ref",
+        "credential_ref_expired",
+        "credential_ref_already_used",
+        "credential_ref_not_allowed",
+        "security_mismatch",
+        "ssid_too_long",
+        "unsupported_mode",
+        "invalid_static_ipv4",
+        "unsafe_secret_field",
+        "active_state",
+    }
+)
+NETWORK_STAGE_STATUSES = {
+    "accepted": "accepted",
+    "prepared": "running",
+    "ap_ready": "running",
+    "activating": "running",
+    "verifying": "running",
+    "committed": "committed",
+    "falling_back": "running",
+    "rescued": "rescued",
+    "failed": "failed",
+    "forgetting": "running",
+    "forgotten": "committed",
+}
 NETWORK_TRANSACTION_ERROR_CODES = frozenset(
     {
         "rescue_ap_unavailable",
@@ -130,6 +188,12 @@ class NetworkCommandResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class NetworkCredentialCommand:
+    principal_id: str
+    passphrase: str
+
+
 class ProviderError(RuntimeError):
     def __init__(
         self,
@@ -166,6 +230,12 @@ class DeviceProvider(Protocol):
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult: ...
 
     def network_status(self) -> Mapping[str, object]: ...
+
+    def scan_networks(self) -> Mapping[str, object]: ...
+
+    def create_network_credential(
+        self, command: NetworkCredentialCommand
+    ) -> Mapping[str, object]: ...
 
     def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult: ...
 
@@ -222,6 +292,171 @@ class PreviewResponse(Protocol):
     content_length: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class _NetworkSseEvent:
+    delivery_id: int
+    source_event: Mapping[str, object]
+
+    def encode(self) -> bytes:
+        delivery_id = str(self.delivery_id)
+        payload = {
+            "schema": "ylx.network-event.v1",
+            "sse_delivery_id": delivery_id,
+            **self.source_event,
+        }
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return (f"id: {delivery_id}\nevent: {self.source_event['type']}\ndata: {data}\n\n").encode()
+
+
+class _NetworkEventReplayBuffer:
+    """Assign server-wide delivery IDs and retain bounded network SSE replay."""
+
+    def __init__(self, capacity: int = 128, *, initial_delivery_id: int | None = None) -> None:
+        if capacity < 1:
+            raise ValueError("capacity 必须大于零")
+        if initial_delivery_id is not None and (
+            type(initial_delivery_id) is not int or initial_delivery_id < 1
+        ):
+            raise ValueError("initial_delivery_id 必须是正整数")
+        self._events: deque[_NetworkSseEvent] = deque(maxlen=capacity)
+        self._next_delivery_id = initial_delivery_id or uuid.uuid4().int
+        self._last_status: dict[str, object] | None = None
+        self._retired_authority_epochs: set[str] = set()
+        self._lock = RLock()
+
+    def replay(
+        self, cursor: int | None, status: Mapping[str, object]
+    ) -> tuple[_NetworkSseEvent, ...]:
+        with self._lock:
+            if cursor is None:
+                return (self._publish_snapshot_locked(status),)
+            buffered = tuple(self._events)
+            if not self._contains_cursor(buffered, cursor):
+                return (self._publish_snapshot_locked(status, after_cursor=cursor),)
+            self._observe_locked(status)
+            return self._events_after_locked(cursor)
+
+    def observe(self, status: Mapping[str, object]) -> None:
+        with self._lock:
+            self._observe_locked(status)
+
+    def events_after(
+        self, cursor: int, status: Mapping[str, object]
+    ) -> tuple[_NetworkSseEvent, ...]:
+        with self._lock:
+            buffered = tuple(self._events)
+            if not self._contains_cursor(buffered, cursor):
+                return (self._publish_snapshot_locked(status, after_cursor=cursor),)
+            self._observe_locked(status)
+            return self._events_after_locked(cursor)
+
+    @staticmethod
+    def _contains_cursor(events: tuple[_NetworkSseEvent, ...], cursor: int) -> bool:
+        return any(event.delivery_id == cursor for event in events)
+
+    def _events_after_locked(self, cursor: int) -> tuple[_NetworkSseEvent, ...]:
+        return tuple(event for event in self._events if event.delivery_id > cursor)
+
+    def _observe_locked(self, status: Mapping[str, object]) -> None:
+        relation = self._status_relation_locked(status)
+        if relation in {"same", "stale"}:
+            return
+        self._publish_locked(
+            status,
+            force_snapshot=relation in {"new_authority", "projection"},
+        )
+
+    def _status_relation_locked(self, status: Mapping[str, object]) -> str:
+        if self._last_status is None:
+            return "new"
+        authority_epoch = str(status["authority_epoch"])
+        source_revision = int(status["source_revision"])
+        last_authority_epoch = str(self._last_status["authority_epoch"])
+        last_source_revision = int(self._last_status["source_revision"])
+        if authority_epoch == last_authority_epoch:
+            if source_revision < last_source_revision:
+                return "stale"
+            if source_revision > last_source_revision:
+                return "new"
+            projection_fields = (
+                "saved",
+                "verified",
+                "desired",
+                "observed",
+                "transaction",
+                "mutation_capability",
+                "concurrency_capability",
+            )
+            if any(
+                status.get(field) != self._last_status.get(field) for field in projection_fields
+            ):
+                return "projection"
+            return "same"
+        if authority_epoch in self._retired_authority_epochs:
+            return "stale"
+        return "new_authority"
+
+    def _publish_snapshot_locked(
+        self,
+        status: Mapping[str, object],
+        *,
+        after_cursor: int | None = None,
+    ) -> _NetworkSseEvent:
+        relation = self._status_relation_locked(status)
+        selected_status: Mapping[str, object]
+        if relation in {"same", "stale"} and self._last_status is not None:
+            selected_status = self._last_status
+        else:
+            selected_status = status
+        if after_cursor is not None and self._next_delivery_id <= after_cursor:
+            self._next_delivery_id = after_cursor + 1
+        return self._publish_locked(selected_status, force_snapshot=True)
+
+    def _publish_locked(
+        self, status: Mapping[str, object], *, force_snapshot: bool
+    ) -> _NetworkSseEvent:
+        copied_status = deepcopy(dict(status))
+        transaction: object = None
+        if not force_snapshot:
+            transactions = copied_status.get("transaction")
+            if isinstance(transactions, Mapping):
+                transaction = transactions.get("current") or transactions.get("latest")
+            if not (
+                isinstance(transaction, Mapping)
+                and transaction.get("authority_epoch") == copied_status["authority_epoch"]
+                and transaction.get("source_revision") == copied_status["source_revision"]
+            ):
+                transaction = None
+        if isinstance(transaction, Mapping):
+            source_event = {
+                "authority_epoch": copied_status["authority_epoch"],
+                "source_revision": copied_status["source_revision"],
+                "occurred_at": transaction["updated_at"],
+                "type": "transaction",
+                "transaction_id": transaction["transaction_id"],
+                "data": deepcopy(dict(transaction)),
+            }
+        else:
+            source_event = {
+                "authority_epoch": copied_status["authority_epoch"],
+                "source_revision": copied_status["source_revision"],
+                "occurred_at": copied_status["observed_at"],
+                "type": "snapshot",
+                "transaction_id": None,
+                "data": copied_status,
+            }
+        event = _NetworkSseEvent(self._next_delivery_id, source_event)
+        self._next_delivery_id += 1
+        self._events.append(event)
+        if self._last_status is not None:
+            previous_authority = str(self._last_status["authority_epoch"])
+            current_authority = str(copied_status["authority_epoch"])
+            if previous_authority != current_authority:
+                self._retired_authority_epochs.add(previous_authority)
+        self._last_status = copied_status
+        return event
+
+
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -233,20 +468,27 @@ class GatewayServer(ThreadingHTTPServer):
         audit_sink: Callable[[AuditEvent], None] | None,
         event_buffer: EventReplayBuffer,
         sse_heartbeat_seconds: float = 15.0,
+        network_sse_poll_seconds: float = 0.25,
         max_sse_connections: int = 4,
         max_preview_streams: int = 2,
+        external_scheme: str = "http",
     ) -> None:
-        if sse_heartbeat_seconds <= 0:
-            raise ValueError("sse_heartbeat_seconds 必须大于零")
+        if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
+            raise ValueError("SSE 心跳和轮询间隔必须大于零")
         if max_sse_connections < 1 or max_preview_streams < 1:
             raise ValueError("长连接并发上限必须大于零")
+        if external_scheme not in {"http", "https"}:
+            raise ValueError("external_scheme 必须是 http 或 https")
         self.provider = provider
         self.security = security
         self.audit_sink = audit_sink or (lambda event: None)
         self.event_buffer = event_buffer
+        self.network_event_buffer = _NetworkEventReplayBuffer()
         self.sse_heartbeat_seconds = sse_heartbeat_seconds
+        self.network_sse_poll_seconds = network_sse_poll_seconds
         self.sse_slots = BoundedSemaphore(max_sse_connections)
         self.preview_stream_slots = BoundedSemaphore(max_preview_streams)
+        self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
 
 
@@ -279,7 +521,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return False
         parsed = urlsplit(origin)
         return (
-            parsed.scheme == "http"
+            parsed.scheme == self.server.external_scheme
             and parsed.netloc.casefold() == host.casefold()
             and not parsed.path
             and not parsed.query
@@ -315,6 +557,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self._cors_headers()
         self.end_headers()
         if self.command != "HEAD":
@@ -332,6 +576,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self._cors_headers()
         self.end_headers()
 
@@ -434,6 +680,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
         )
 
+    def _close_if_request_body_is_unread(self) -> None:
+        content_length = getattr(self, "_request_content_length", None)
+        if self.command in {"POST", "PUT", "PATCH"} or content_length not in {None, 0}:
+            self.close_connection = True
+
     def _principal(self, operation_id: str, resource_id: str | None = None) -> Principal | None:
         origin, origin_is_single = self._single_header("Origin")
         if not origin_is_single or (
@@ -442,6 +693,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and origin not in self.server.security.allowed_origins
         ):
             self._audit(operation_id, resource_id, "origin_forbidden")
+            self._close_if_request_body_is_unread()
             if self.command == "HEAD":
                 self._send_empty(HTTPStatus.FORBIDDEN)
             else:
@@ -453,6 +705,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
         if principal is None:
             self._audit(operation_id, resource_id, "unauthorized")
+            self._close_if_request_body_is_unread()
             headers = {"WWW-Authenticate": "Bearer"}
             if self.command == "HEAD":
                 self._send_empty(HTTPStatus.UNAUTHORIZED, headers=headers)
@@ -466,6 +719,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         if not principal.permits(operation_id, resource_id):
             self._audit(operation_id, resource_id, "forbidden", principal)
+            self._close_if_request_body_is_unread()
             if self.command == "HEAD":
                 self._send_empty(HTTPStatus.FORBIDDEN)
             else:
@@ -474,8 +728,58 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._audit(operation_id, resource_id, "allowed", principal)
         return principal
 
-    def _begin_request(self) -> None:
+    def _begin_request(self, *, body_allowed: bool) -> bool:
         self._request_id = str(uuid.uuid4())
+        self._request_content_length: int | None = None
+        transfer_encodings = self.headers.get_all("Transfer-Encoding", failobj=[])
+        content_lengths = self.headers.get_all("Content-Length", failobj=[])
+        if transfer_encodings:
+            self.close_connection = True
+            self._problem(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "Transfer-Encoding 请求正文不受支持",
+            )
+            return False
+        if len(content_lengths) > 1:
+            self.close_connection = True
+            self._problem(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "Content-Length 只能出现一次",
+            )
+            return False
+        if content_lengths:
+            content_length_value = content_lengths[0].strip()
+            if HTTP_CONTENT_LENGTH.fullmatch(content_length_value) is None or len(
+                content_length_value
+            ) > len(str(MAX_BODY_BYTES)):
+                self.close_connection = True
+                self._problem(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    "Content-Length 格式无效",
+                )
+                return False
+            content_length = int(content_length_value)
+            if content_length > MAX_BODY_BYTES:
+                self.close_connection = True
+                self._problem(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    "请求体大小无效",
+                )
+                return False
+            self._request_content_length = content_length
+            if not body_allowed and content_length != 0:
+                self.close_connection = True
+                self._problem(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    "该请求方法不接受请求体",
+                )
+                return False
+        return True
 
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
         parts = path.split("/")
@@ -485,6 +789,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return ("GET", "OPTIONS")
         if len(parts) == 4 and parts[2] in NETWORK_API_VERSIONS and parts[3] == "network":
             return ("GET", "OPTIONS")
+        if (
+            len(parts) == 5
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "scan"]
+        ):
+            return ("GET", "OPTIONS")
+        if (
+            len(parts) == 5
+            and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "credentials"]
+        ):
+            return ("POST", "OPTIONS")
         if (
             len(parts) == 5
             and parts[2] in NETWORK_API_VERSIONS
@@ -526,7 +842,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         headers = ["Authorization"]
         parts = path.split("/")
         if method == "POST":
-            headers.extend(("Content-Type", "Idempotency-Key", "X-CSRF-Token"))
+            headers.extend(("Content-Type", "X-CSRF-Token"))
+            if parts[3:] != ["network", "credentials"]:
+                headers.append("Idempotency-Key")
         elif len(parts) == 5 and parts[3:] in (["capture", "events"], ["network", "events"]):
             headers.append("Last-Event-ID")
         elif self._artifact_route(parts) is not None:
@@ -534,7 +852,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return tuple(headers)
 
     def do_OPTIONS(self) -> None:
-        self._begin_request()
+        if not self._begin_request(body_allowed=False):
+            return
         methods = self._route_methods(urlsplit(self.path).path)
         if methods is None:
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
@@ -580,7 +899,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:
-        self._begin_request()
+        if not self._begin_request(body_allowed=False):
+            return
         parsed = urlsplit(self.path)
         path = parsed.path
         web_asset = WEB_PATHS.get(path)
@@ -640,6 +960,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             len(parts) == 5
             and parts[1] == "api"
             and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "scan"]
+        ):
+            self._get_network_scan()
+            return
+        if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] in NETWORK_API_VERSIONS
             and parts[3:] == ["network", "events"]
         ):
             self._network_events()
@@ -687,7 +1015,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
 
     def do_HEAD(self) -> None:
-        self._begin_request()
+        if not self._begin_request(body_allowed=False):
+            return
         path = urlsplit(self.path).path
         web_asset = WEB_PATHS.get(path)
         if web_asset is not None:
@@ -701,7 +1030,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
 
     def do_POST(self) -> None:
-        self._begin_request()
+        if not self._begin_request(body_allowed=True):
+            return
         path = urlsplit(self.path).path
         parts = path.split("/")
         if (
@@ -725,12 +1055,46 @@ class GatewayHandler(BaseHTTPRequestHandler):
             len(parts) == 5
             and parts[1] == "api"
             and parts[2] in NETWORK_API_VERSIONS
+            and parts[3:] == ["network", "credentials"]
+        ):
+            self._create_network_credential()
+            return
+        if (
+            len(parts) == 5
+            and parts[1] == "api"
+            and parts[2] in NETWORK_API_VERSIONS
             and parts[3] == "network"
             and parts[4] in NETWORK_MUTATION_OPERATIONS
         ):
             self._network_command(parts[4])
             return
+        self._close_if_request_body_is_unread()
         self._problem(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")
+
+    def _unsupported_body_method(self) -> None:
+        if not self._begin_request(body_allowed=True):
+            return
+        self._close_if_request_body_is_unread()
+        self._problem(
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "接口不允许该请求方法",
+        )
+
+    def do_PUT(self) -> None:
+        self._unsupported_body_method()
+
+    def do_PATCH(self) -> None:
+        self._unsupported_body_method()
+
+    def do_DELETE(self) -> None:
+        if not self._begin_request(body_allowed=False):
+            return
+        self._problem(
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "接口不允许该请求方法",
+        )
 
     def _get_device(self, api_version: str) -> None:
         if self._principal("getDevice") is None:
@@ -839,7 +1203,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _valid_network_status(value: object) -> bool:
         if not isinstance(value, Mapping) or set(value) != {
             "schema",
+            "authority_epoch",
+            "source_revision",
             "observed_at",
+            "saved",
+            "verified",
             "desired",
             "observed",
             "transaction",
@@ -847,17 +1215,59 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "concurrency_capability",
         }:
             return False
+        transaction = value.get("transaction")
+        transactions = (
+            []
+            if not isinstance(transaction, Mapping)
+            else [transaction.get("current"), transaction.get("latest")]
+        )
         return (
             value.get("schema") == "ylx.network-status.v1"
-            and isinstance(value.get("observed_at"), str)
+            and GatewayHandler._valid_uuid4(value.get("authority_epoch"))
+            and type(value.get("source_revision")) is int
+            and value["source_revision"] >= 0
+            and GatewayHandler._valid_datetime(value.get("observed_at"))
+            and type(value.get("saved")) is bool
+            and type(value.get("verified")) is bool
+            and (not value["verified"] or value["saved"])
             and GatewayHandler._valid_network_desired_state(value.get("desired"))
             and GatewayHandler._valid_network_observed_state(value.get("observed"))
-            and GatewayHandler._valid_network_transaction_window(value.get("transaction"))
+            and GatewayHandler._valid_network_transaction_window(transaction)
+            and all(
+                item is None
+                or item["authority_epoch"] == value["authority_epoch"]
+                and item["source_revision"] <= value["source_revision"]
+                for item in transactions
+            )
+            and (
+                transaction.get("current") is None
+                or transaction["current"]["status"] in {"accepted", "running"}
+            )
             and GatewayHandler._valid_network_mutation_capability(value.get("mutation_capability"))
             and GatewayHandler._valid_network_concurrency_capability(
                 value.get("concurrency_capability")
             )
         )
+
+    @staticmethod
+    def _valid_uuid4(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError:
+            return False
+        return parsed.version == 4 and str(parsed) == value.lower()
+
+    @staticmethod
+    def _valid_datetime(value: object) -> bool:
+        if not isinstance(value, str) or not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return parsed.tzinfo is not None
 
     @staticmethod
     def _valid_ipv4(value: object) -> bool:
@@ -905,13 +1315,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _valid_network_desired_wifi_client(value: object) -> bool:
-        if not isinstance(value, Mapping) or set(value) != {"ssid", "credential_state"}:
+        if not isinstance(value, Mapping) or set(value) != {
+            "ssid",
+            "security",
+            "credential_state",
+        }:
             return False
         ssid = value.get("ssid")
+        security = value.get("security")
+        credential_state = value.get("credential_state")
         return (
             isinstance(ssid, str)
             and 1 <= len(ssid.encode("utf-8")) <= 32
-            and value.get("credential_state") in {"absent", "pending_input", "stored"}
+            and security in NETWORK_WIFI_SECURITY
+            and credential_state in {"absent", "pending_input", "stored"}
+            and (security == "open") == (credential_state == "absent")
         )
 
     @staticmethod
@@ -933,16 +1351,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _valid_network_apply_wifi_client(value: object) -> bool:
-        if not isinstance(value, Mapping) or set(value) != {"ssid", "credential_ref"}:
+        if not isinstance(value, Mapping) or not {"ssid", "security"}.issubset(value):
+            return False
+        security = value.get("security")
+        expected_keys = (
+            {"ssid", "security"} if security == "open" else {"ssid", "security", "credential_ref"}
+        )
+        if set(value) != expected_keys or security not in NETWORK_WIFI_SECURITY:
             return False
         ssid = value.get("ssid")
         credential_ref = value.get("credential_ref")
         return (
             isinstance(ssid, str)
             and 1 <= len(ssid.encode("utf-8")) <= 32
-            and isinstance(credential_ref, str)
-            and 1 <= len(credential_ref) <= 128
-            and NETWORK_CREDENTIAL_REF.fullmatch(credential_ref) is not None
+            and (
+                security == "open"
+                or isinstance(credential_ref, str)
+                and 1 <= len(credential_ref) <= 128
+                and NETWORK_CREDENTIAL_REF.fullmatch(credential_ref) is not None
+            )
         )
 
     @staticmethod
@@ -1062,17 +1489,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _valid_network_mutation_capability(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "enabled",
+            "disabled_reason",
+            "operations",
+            "idempotency_key_required",
+            "secret_handling",
+            "active_state_policy",
+        }:
+            return False
+        enabled = value.get("enabled")
+        disabled_reason = value.get("disabled_reason")
         return (
-            isinstance(value, Mapping)
-            and set(value)
-            == {
-                "enabled",
-                "operations",
-                "idempotency_key_required",
-                "secret_handling",
-                "active_state_policy",
-            }
-            and type(value.get("enabled")) is bool
+            type(enabled) is bool
+            and (
+                disabled_reason is None
+                if enabled
+                else disabled_reason in NETWORK_MUTATION_DISABLED_REASONS
+            )
             and value.get("operations") == NETWORK_MUTATION_OPERATIONS
             and value.get("idempotency_key_required") is True
             and value.get("secret_handling") == "opaque_credential_reference_only"
@@ -1115,6 +1549,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _valid_network_transaction(value: object) -> bool:
         if not isinstance(value, Mapping) or set(value) != {
             "schema",
+            "authority_epoch",
+            "source_revision",
             "transaction_id",
             "operation",
             "status",
@@ -1122,28 +1558,59 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "desired",
             "accepted_at",
             "updated_at",
+            "deadline",
+            "recovery_action",
             "rescue",
             "error",
         }:
             return False
         rescue = value.get("rescue")
         error = value.get("error")
-        return (
+        deadline = value.get("deadline")
+        status = value.get("status")
+        stage = value.get("stage")
+        valid_deadline = deadline is None or (
+            isinstance(deadline, Mapping)
+            and set(deadline) == {"time_base", "deadline_ns", "remaining_seconds"}
+            and deadline.get("time_base") == "device_monotonic"
+            and type(deadline.get("deadline_ns")) is int
+            and deadline["deadline_ns"] >= 0
+            and isinstance(deadline.get("remaining_seconds"), (int, float))
+            and not isinstance(deadline.get("remaining_seconds"), bool)
+            and 0 <= deadline["remaining_seconds"] <= 10
+        )
+        valid = (
             value.get("schema") == "ylx.network-transaction.v1"
+            and GatewayHandler._valid_uuid4(value.get("authority_epoch"))
+            and type(value.get("source_revision")) is int
+            and value["source_revision"] >= 0
             and isinstance(value.get("transaction_id"), str)
             and UUID_V7.fullmatch(str(value["transaction_id"])) is not None
             and value.get("operation") in NETWORK_MUTATION_OPERATIONS
-            and value.get("status") in NETWORK_TRANSACTION_STATUSES
-            and value.get("stage") in NETWORK_TRANSACTION_STAGES
+            and status in NETWORK_TRANSACTION_STATUSES
+            and stage in NETWORK_TRANSACTION_STAGES
+            and NETWORK_STAGE_STATUSES.get(str(stage)) == status
             and GatewayHandler._valid_network_desired_state(value.get("desired"))
-            and isinstance(value.get("accepted_at"), str)
-            and isinstance(value.get("updated_at"), str)
+            and GatewayHandler._valid_datetime(value.get("accepted_at"))
+            and GatewayHandler._valid_datetime(value.get("updated_at"))
+            and valid_deadline
+            and value.get("recovery_action") in NETWORK_RECOVERY_ACTIONS
             and isinstance(rescue, Mapping)
             and set(rescue) == {"ap_validated", "fallback_mode", "failure_trigger_seconds"}
             and type(rescue.get("ap_validated")) is bool
             and rescue.get("fallback_mode") == "hotspot"
             and rescue.get("failure_trigger_seconds") == 10
             and (error is None or GatewayHandler._valid_network_transaction_error(error))
+        )
+        if not valid:
+            return False
+        terminal = status in {"committed", "rescued", "failed"}
+        return not (
+            (status in {"accepted", "running", "committed"} and error is not None)
+            or (status in {"rescued", "failed"} and error is None)
+            or (terminal and deadline is not None)
+            or (stage in {"activating", "verifying"} and deadline is None)
+            or (status == "rescued" and value.get("recovery_action") != "reconnect_rescue_ap")
         )
 
     @staticmethod
@@ -1167,23 +1634,189 @@ class GatewayHandler(BaseHTTPRequestHandler):
             isinstance(value, Mapping)
             and set(value) == {"schema", "accepted_at", "transaction"}
             and value.get("schema") == "ylx.network-transaction-receipt.v1"
-            and isinstance(value.get("accepted_at"), str)
+            and GatewayHandler._valid_datetime(value.get("accepted_at"))
             and GatewayHandler._valid_network_transaction(value.get("transaction"))
+            and value["transaction"]["status"] == "accepted"
+            and value.get("accepted_at") == value["transaction"]["accepted_at"]
+        )
+
+    @staticmethod
+    def _valid_network_scan(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema",
+            "authority_epoch",
+            "source_revision",
+            "scanned_at",
+            "networks",
+        }:
+            return False
+        networks = value.get("networks")
+        if not isinstance(networks, list) or len(networks) > 256:
+            return False
+        for entry in networks:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "ssid",
+                "hidden",
+                "security",
+                "signal_dbm",
+                "credential_required",
+            }:
+                return False
+            ssid = entry.get("ssid")
+            hidden = entry.get("hidden")
+            security = entry.get("security")
+            signal = entry.get("signal_dbm")
+            if (
+                type(hidden) is not bool
+                or security not in NETWORK_WIFI_SECURITY
+                or type(signal) is not int
+                or not -127 <= signal <= 0
+                or type(entry.get("credential_required")) is not bool
+                or entry["credential_required"] != (security != "open")
+                or hidden
+                and ssid is not None
+                or not hidden
+                and (not isinstance(ssid, str) or not 1 <= len(ssid.encode("utf-8")) <= 32)
+            ):
+                return False
+        return (
+            value.get("schema") == "ylx.network-scan.v1"
+            and GatewayHandler._valid_uuid4(value.get("authority_epoch"))
+            and type(value.get("source_revision")) is int
+            and value["source_revision"] >= 0
+            and GatewayHandler._valid_datetime(value.get("scanned_at"))
+        )
+
+    @staticmethod
+    def _valid_network_credential_receipt(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema",
+            "credential_ref",
+            "issued_at",
+            "expires_at",
+            "ttl_seconds",
+            "single_use",
+        }:
+            return False
+        issued_at = value.get("issued_at")
+        expires_at = value.get("expires_at")
+        if not (
+            value.get("schema") == "ylx.network-credential-receipt.v1"
+            and isinstance(value.get("credential_ref"), str)
+            and 1 <= len(value["credential_ref"]) <= 128
+            and NETWORK_CREDENTIAL_REF.fullmatch(value["credential_ref"]) is not None
+            and GatewayHandler._valid_datetime(issued_at)
+            and GatewayHandler._valid_datetime(expires_at)
+            and type(value.get("ttl_seconds")) is int
+            and 1 <= value["ttl_seconds"] <= 120
+            and value.get("single_use") is True
+        ):
+            return False
+        issued = datetime.fromisoformat(str(issued_at).replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        return (expires - issued).total_seconds() == value["ttl_seconds"]
+
+    def _network_status_for_security(self, value: Mapping[str, object]) -> Mapping[str, object]:
+        if self.server.security.profile != "lab":
+            return value
+        projected = deepcopy(dict(value))
+        capability = projected.get("mutation_capability")
+        if isinstance(capability, dict):
+            capability["enabled"] = False
+            capability["disabled_reason"] = "auth_profile_unavailable"
+        return projected
+
+    @staticmethod
+    def _valid_network_provider_error(error: ProviderError, *, operation: str) -> bool:
+        if not isinstance(error.message, str) or not 1 <= len(error.message) <= 1024:
+            return False
+        details = error.details
+        read_errors = {
+            "status": ("network_status_unavailable", "网络状态暂时不可用"),
+            "scan": ("network_scan_unavailable", "无线网络扫描暂时不可用"),
+        }
+        expected_read_error = read_errors.get(operation)
+        if expected_read_error is not None:
+            return (
+                (error.code, error.message) == expected_read_error
+                and error.status == HTTPStatus.SERVICE_UNAVAILABLE
+                and error.retryable is True
+                and details is None
+            )
+        if error.code == "network_mutation_unavailable":
+            return (
+                error.status == HTTPStatus.SERVICE_UNAVAILABLE
+                and error.retryable is True
+                and isinstance(details, Mapping)
+                and set(details) == {"reason"}
+                and details.get("reason") in NETWORK_MUTATION_DISABLED_REASONS
+            )
+        if error.code == "idempotency_conflict":
+            original_transaction_id = (
+                details.get("original_transaction_id") if isinstance(details, Mapping) else None
+            )
+            return (
+                operation in NETWORK_MUTATION_OPERATIONS
+                and error.status == HTTPStatus.CONFLICT
+                and error.retryable is False
+                and isinstance(details, Mapping)
+                and set(details) == {"idempotency_scope", "original_transaction_id"}
+                and details.get("idempotency_scope") == "network-mutation"
+                and (
+                    original_transaction_id is None
+                    or isinstance(original_transaction_id, str)
+                    and UUID_V7.fullmatch(original_transaction_id) is not None
+                )
+            )
+        if error.code == "invalid_network_desired_state":
+            return (
+                operation in {"apply", "retry"}
+                and error.status == HTTPStatus.UNPROCESSABLE_ENTITY
+                and error.retryable is False
+                and isinstance(details, Mapping)
+                and set(details) == {"field", "reason"}
+                and isinstance(details.get("field"), str)
+                and 1 <= len(details["field"]) <= 128
+                and details.get("reason") in INVALID_NETWORK_DESIRED_STATE_REASONS
+            )
+        if error.code == "network_transaction_not_found":
+            transaction_id = details.get("transaction_id") if isinstance(details, Mapping) else None
+            return (
+                operation == "retry"
+                and error.status == HTTPStatus.NOT_FOUND
+                and error.retryable is False
+                and isinstance(details, Mapping)
+                and set(details) == {"transaction_id"}
+                and isinstance(transaction_id, str)
+                and UUID_V7.fullmatch(transaction_id) is not None
+            )
+        return (
+            operation == "credentials"
+            and error.code == "invalid_request"
+            and error.status == HTTPStatus.BAD_REQUEST
+            and error.retryable is False
+        )
+
+    def _send_network_provider_error(self, error: ProviderError, *, operation: str) -> None:
+        if not self._valid_network_provider_error(error, operation=operation):
+            self._invalid_source_state("daemon network error 响应无效")
+            return
+        self._problem(
+            error.status,
+            error.code,
+            error.message,
+            retryable=error.retryable,
+            headers={"YLX-Error-Code": error.code},
+            details=error.details,
         )
 
     def _get_network_status(self) -> None:
         if self._principal("getNetworkStatus") is None:
             return
         try:
-            status = self.server.provider.network_status()
+            status = self._network_status_for_security(self.server.provider.network_status())
         except ProviderError as error:
-            self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                details=error.details,
-            )
+            self._send_network_provider_error(error, operation="status")
             return
         except Exception:
             self._provider_failure()
@@ -1192,6 +1825,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._invalid_source_state("daemon network 状态无效")
             return
         self._send_json(HTTPStatus.OK, status)
+
+    def _get_network_scan(self) -> None:
+        if self._principal("scanNetworks") is None:
+            return
+        try:
+            body = self.server.provider.scan_networks()
+        except ProviderError as error:
+            self._send_network_provider_error(error, operation="scan")
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not self._valid_network_scan(body):
+            self._invalid_source_state("daemon network scan 无效")
+            return
+        self._send_json(HTTPStatus.OK, body)
 
     def _network_events(self) -> None:
         if self._principal("streamNetworkEvents") is None:
@@ -1202,7 +1851,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         last_event_id, last_event_id_is_single = self._single_header("Last-Event-ID")
         if not last_event_id_is_single or (
-            last_event_id is not None and not last_event_id.isdecimal()
+            last_event_id is not None
+            and (re.fullmatch(r"[0-9]+", last_event_id) is None or len(last_event_id) > 128)
         ):
             self._problem(
                 HTTPStatus.BAD_REQUEST,
@@ -1210,46 +1860,76 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "Last-Event-ID 必须是十进制 delivery ID",
             )
             return
-        try:
-            status = self.server.provider.network_status()
-        except ProviderError as error:
+        if not self.server.sse_slots.acquire(blocking=False):
             self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                headers={"YLX-Error-Code": error.code},
-                details=error.details,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "stream_capacity_exhausted",
+                "SSE 连接数已达设备上限",
+                retryable=True,
             )
             return
-        except Exception:
-            self._provider_failure()
-            return
-        if not self._valid_network_status(status):
-            self._invalid_source_state("daemon network 状态无效")
-            return
-        delivery_id = 1 if last_event_id is None else int(last_event_id) + 1
-        event = {
-            "schema": "ylx.network-event.v1",
-            "sse_delivery_id": str(delivery_id),
-            "occurred_at": status["observed_at"],
-            "type": "snapshot",
-            "transaction_id": None,
-            "data": status,
-        }
-        payload = (
-            f"id: {delivery_id}\n"
-            "event: snapshot\n"
-            f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
-        ).encode()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            try:
+                status = self._network_status_for_security(self.server.provider.network_status())
+            except ProviderError as error:
+                self._send_network_provider_error(error, operation="status")
+                return
+            except Exception:
+                self._provider_failure()
+                return
+            if not self._valid_network_status(status):
+                self._invalid_source_state("daemon network 状态无效")
+                return
+            cursor = None if last_event_id is None else int(last_event_id)
+            events = self.server.network_event_buffer.replay(cursor, status)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "keep-alive")
+            self._cors_headers()
+            self.end_headers()
+            try:
+                for event in events:
+                    self.wfile.write(event.encode())
+                self.wfile.flush()
+                if events:
+                    cursor = events[-1].delivery_id
+                if cursor is None:
+                    return
+                heartbeat_at = time.monotonic() + self.server.sse_heartbeat_seconds
+                while True:
+                    now = time.monotonic()
+                    time.sleep(
+                        min(
+                            self.server.network_sse_poll_seconds,
+                            max(0.0, heartbeat_at - now),
+                        )
+                    )
+                    try:
+                        status = self._network_status_for_security(
+                            self.server.provider.network_status()
+                        )
+                    except Exception:
+                        return
+                    if not self._valid_network_status(status):
+                        return
+                    delivered = self.server.network_event_buffer.events_after(cursor, status)
+                    if delivered:
+                        for event in delivered:
+                            self.wfile.write(event.encode())
+                        cursor = delivered[-1].delivery_id
+                        heartbeat_at = time.monotonic() + self.server.sse_heartbeat_seconds
+                    elif time.monotonic() >= heartbeat_at:
+                        self.wfile.write(heartbeat_comment())
+                        heartbeat_at = time.monotonic() + self.server.sse_heartbeat_seconds
+                    else:
+                        continue
+                    self.wfile.flush()
+            except OSError:
+                return
+        finally:
+            self.server.sse_slots.release()
 
     def _capture_events(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("streamCaptureEvents") is None:
@@ -1663,29 +2343,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> Mapping[str, object] | None:
         content_type_value, content_type_is_single = self._single_header("Content-Type")
-        content_length_value, content_length_is_single = self._single_header("Content-Length")
-        if not content_type_is_single or not content_length_is_single:
+        if not content_type_is_single:
+            self._close_if_request_body_is_unread()
             self._problem(
                 HTTPStatus.BAD_REQUEST,
                 "invalid_request",
-                "Content-Type 和 Content-Length 只能分别出现一次",
+                "Content-Type 只能出现一次",
             )
             return None
         content_type = (content_type_value or "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
+            self._close_if_request_body_is_unread()
             self._problem(
                 HTTPStatus.BAD_REQUEST, "invalid_request", "Content-Type 必须是 application/json"
             )
             return None
-        try:
-            length = int(content_length_value or "0")
-        except ValueError:
-            length = -1
-        if length <= 0 or length > MAX_BODY_BYTES:
+        length = getattr(self, "_request_content_length", None)
+        if length is None or length <= 0:
+            self._close_if_request_body_is_unread()
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体大小无效")
             return None
         try:
-            body = json.loads(self.rfile.read(length))
+            payload = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体读取失败")
+            return None
+        if len(payload) != length:
+            self.close_connection = True
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体长度不完整")
+            return None
+        try:
+            body = json.loads(payload)
         except (UnicodeError, json.JSONDecodeError):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不是有效 JSON")
             return None
@@ -1760,23 +2449,37 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
         return set(body) == {"schema"} and body.get("schema") == "ylx.network-forget-request.v1"
 
+    def _write_principal(self, operation_id: str) -> Principal | None:
+        principal = self._principal(operation_id)
+        if principal is None:
+            return None
+        origin, origin_is_single = self._single_header("Origin")
+        if self.server.security.profile == "customer" and (not origin_is_single or origin is None):
+            self._audit(operation_id, None, "origin_forbidden", principal)
+            self._close_if_request_body_is_unread()
+            self._problem(HTTPStatus.FORBIDDEN, "origin_forbidden", "客户写请求必须提供单一 Origin")
+            return None
+        csrf_token = self.server.security.csrf_token
+        csrf_value, csrf_is_single = self._single_header("X-CSRF-Token")
+        csrf_required = self.server.security.profile == "customer" or (
+            origin is not None and not self._is_same_gateway_origin(origin)
+        )
+        if not csrf_is_single or (
+            csrf_required
+            and (csrf_token is None or not hmac.compare_digest(csrf_value or "", csrf_token))
+        ):
+            self._audit(operation_id, None, "csrf_forbidden", principal)
+            self._close_if_request_body_is_unread()
+            self._problem(HTTPStatus.FORBIDDEN, "csrf_forbidden", "CSRF token 缺失或无效")
+            return None
+        return principal
+
     def _command_principal(
         self,
         operation_id: str,
     ) -> tuple[Principal, str] | None:
-        principal = self._principal(operation_id)
+        principal = self._write_principal(operation_id)
         if principal is None:
-            return None
-        origin, _ = self._single_header("Origin")
-        csrf_token = self.server.security.csrf_token
-        csrf_value, csrf_is_single = self._single_header("X-CSRF-Token")
-        if not csrf_is_single or (
-            origin
-            and not self._is_same_gateway_origin(origin)
-            and (csrf_token is None or not hmac.compare_digest(csrf_value or "", csrf_token))
-        ):
-            self._audit(operation_id, None, "csrf_forbidden", principal)
-            self._problem(HTTPStatus.FORBIDDEN, "csrf_forbidden", "CSRF token 缺失或无效")
             return None
         key, key_is_single = self._single_header("Idempotency-Key")
         if (
@@ -1785,9 +2488,47 @@ class GatewayHandler(BaseHTTPRequestHandler):
             or not 1 <= len(key) <= 128
             or any(character == " " or not 0x21 <= ord(character) <= 0x7E for character in key)
         ):
+            self._close_if_request_body_is_unread()
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "Idempotency-Key 无效")
             return None
         return principal, key
+
+    def _create_network_credential(self) -> None:
+        principal = self._write_principal("createNetworkCredentialReference")
+        if principal is None:
+            return
+        body = self._read_json()
+        if body is None:
+            return
+        passphrase = body.get("passphrase") if isinstance(body, Mapping) else None
+        if not (
+            isinstance(body, Mapping)
+            and set(body) == {"schema", "passphrase"}
+            and body.get("schema") == "ylx.network-credential-request.v1"
+            and isinstance(passphrase, str)
+            and 8 <= len(passphrase.encode("utf-8")) <= 63
+            and not any(ord(character) < 32 for character in passphrase)
+        ):
+            self._problem(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "请求体不符合网络凭据契约",
+            )
+            return
+        try:
+            receipt = self.server.provider.create_network_credential(
+                NetworkCredentialCommand(principal.principal_id, passphrase)
+            )
+        except ProviderError as error:
+            self._send_network_provider_error(error, operation="credentials")
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not self._valid_network_credential_receipt(receipt):
+            self._invalid_source_state("daemon network credential 响应无效")
+            return
+        self._send_json(HTTPStatus.CREATED, receipt)
 
     def _capture_command(self, api_version: str, operation: str) -> None:
         operation_id = "startCapture" if operation == "start" else "stopCapture"
@@ -1902,14 +2643,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 result = self.server.provider.forget_network_client_profile(command)
         except ProviderError as error:
-            self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                headers={"YLX-Error-Code": error.code},
-                details=error.details,
-            )
+            self._send_network_provider_error(error, operation=operation)
             return
         headers = {"Idempotency-Replayed": "true"} if result.replayed else None
         if result.status == HTTPStatus.ACCEPTED and self._valid_network_receipt(result.body):
@@ -1931,8 +2665,10 @@ def create_gateway_server(
     audit_sink: Callable[[AuditEvent], None] | None = None,
     event_buffer: EventReplayBuffer | None = None,
     sse_heartbeat_seconds: float = 15.0,
+    network_sse_poll_seconds: float = 0.25,
     max_sse_connections: int = 4,
     max_preview_streams: int = 2,
+    external_scheme: str = "http",
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -1941,6 +2677,8 @@ def create_gateway_server(
         audit_sink,
         event_buffer or EventReplayBuffer(),
         sse_heartbeat_seconds,
+        network_sse_poll_seconds,
         max_sse_connections,
         max_preview_streams,
+        external_scheme,
     )

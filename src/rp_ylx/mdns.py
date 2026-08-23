@@ -15,6 +15,7 @@ from rp_ylx.runtime import collect_linux_runtime
 
 MDNS_HOSTNAME = "rp-ylx.local."
 MDNS_SERVICE_TYPES = ("_ylx-capture._tcp.local.", "_http._tcp.local.")
+CUSTOMER_MDNS_SERVICE_TYPES = ("_ylx-capture._tcp.local.", "_https._tcp.local.")
 
 
 class ZeroconfResponder(Protocol):
@@ -72,17 +73,22 @@ def _default_responder(addresses: tuple[str, ...]) -> ZeroconfResponder:
     return Zeroconf(interfaces=list(addresses), ip_version=IPVersion.V4Only)
 
 
-def _service_infos(port: int, addresses: tuple[str, ...]) -> tuple[ServiceInfo, ...]:
+def _service_infos(
+    port: int,
+    addresses: tuple[str, ...],
+    scheme: str,
+) -> tuple[ServiceInfo, ...]:
+    service_types = CUSTOMER_MDNS_SERVICE_TYPES if scheme == "https" else MDNS_SERVICE_TYPES
     return tuple(
         ServiceInfo(
             service_type,
             f"RP-YLX.{service_type}",
             port=port,
-            properties={"path": "/"},
+            properties={"path": "/", "scheme": scheme, "api": "/api/v4/device"},
             server=MDNS_HOSTNAME,
             parsed_addresses=list(addresses),
         )
-        for service_type in MDNS_SERVICE_TYPES
+        for service_type in service_types
     )
 
 
@@ -93,14 +99,16 @@ class MdnsPublisher:
         self,
         port: int,
         *,
+        scheme: str = "http",
         address_provider: AddressProvider = runtime_ipv4_addresses,
         responder_factory: ResponderFactory = _default_responder,
         interval: float = 2.0,
         logger: logging.Logger | None = None,
     ) -> None:
-        if not 1 <= port <= 65535 or interval <= 0:
+        if not 1 <= port <= 65535 or interval <= 0 or scheme not in {"http", "https"}:
             raise ValueError("mDNS port and interval must be positive")
         self._port = port
+        self._scheme = scheme
         self._address_provider = address_provider
         self._responder_factory = responder_factory
         self._interval = interval
@@ -137,7 +145,7 @@ class MdnsPublisher:
         responder = self._responder_factory(addresses)
         registered: list[ServiceInfo] = []
         try:
-            for service in _service_infos(self._port, addresses):
+            for service in _service_infos(self._port, addresses, self._scheme):
                 responder.register_service(service, allow_name_change=True)
                 registered.append(service)
         except Exception:
@@ -176,4 +184,10 @@ class MdnsPublisher:
         self._thread = None
 
 
-__all__ = ["MDNS_HOSTNAME", "MDNS_SERVICE_TYPES", "MdnsPublisher", "runtime_ipv4_addresses"]
+__all__ = [
+    "CUSTOMER_MDNS_SERVICE_TYPES",
+    "MDNS_HOSTNAME",
+    "MDNS_SERVICE_TYPES",
+    "MdnsPublisher",
+    "runtime_ipv4_addresses",
+]

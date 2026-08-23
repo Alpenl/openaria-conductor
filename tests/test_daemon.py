@@ -13,10 +13,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rp_ylx.daemon import (
+    CUSTOMER_OPERATIONS,
     LAB_OPERATIONS,
     CaptureEventPump,
     ProductionConfig,
     ProductionConfigError,
+    _enable_customer_tls,
+    _security_policy,
     build_production_service,
     load_production_config,
 )
@@ -27,10 +30,14 @@ from rp_ylx.native import NativeCapabilities
 class ProductionDaemonTest(unittest.TestCase):
     def test_lab_profile_allows_network_reads_but_not_mutations(self) -> None:
         self.assertIn("getNetworkStatus", LAB_OPERATIONS)
+        self.assertIn("scanNetworks", LAB_OPERATIONS)
         self.assertIn("streamNetworkEvents", LAB_OPERATIONS)
+        self.assertNotIn("createNetworkCredentialReference", LAB_OPERATIONS)
         self.assertNotIn("applyNetworkDesiredState", LAB_OPERATIONS)
         self.assertNotIn("retryNetworkTransaction", LAB_OPERATIONS)
         self.assertNotIn("forgetNetworkClientProfile", LAB_OPERATIONS)
+        self.assertIn("createNetworkCredentialReference", CUSTOMER_OPERATIONS)
+        self.assertIn("applyNetworkDesiredState", CUSTOMER_OPERATIONS)
 
     def config(self, root: Path) -> ProductionConfig:
         return ProductionConfig(
@@ -82,6 +89,116 @@ class ProductionDaemonTest(unittest.TestCase):
             with self.assertRaises(ProductionConfigError):
                 load_production_config(path)
 
+    def test_customer_profile_reads_a_locked_token_file_and_grants_network_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = self.config(root)
+            token = "0123456789abcdef0123456789abcdef0123456789abcdef"
+            token_path = root / "customer.token"
+            token_path.write_text(token + "\n", encoding="ascii")
+            token_path.chmod(0o640)
+            certificate_path = root / "device.crt"
+            certificate_path.write_text("certificate", encoding="ascii")
+            certificate_path.chmod(0o644)
+            private_key_path = root / "device.key"
+            private_key_path.write_text("private-key", encoding="ascii")
+            private_key_path.chmod(0o640)
+            path = root / "device.json"
+            value = {
+                "schema": "ylx.production-config.v1",
+                "listen": {"host": base.host, "port": base.port},
+                "camera": {
+                    "device": str(base.camera_device),
+                    "width": base.width,
+                    "height": base.height,
+                    "fps": base.fps,
+                    "data_plane": "rust",
+                },
+                "storage": {
+                    "mountpoint": str(base.mountpoint),
+                    "minimum_available_bytes": 0,
+                    "minimum_available_inodes": 0,
+                },
+                "state_root": str(base.state_root),
+                "device": {
+                    "device_id": base.device_id,
+                    "device_label": base.device_label,
+                    "hardware_fingerprint": base.hardware_fingerprint,
+                },
+                "security": {
+                    "profile": "customer",
+                    "isolated_network": True,
+                    "bearer_token_file": str(token_path),
+                    "tls_certificate_file": str(certificate_path),
+                    "tls_private_key_file": str(private_key_path),
+                    "principal_id": "device-owner",
+                },
+            }
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+            config = load_production_config(path)
+            self.assertEqual(config.security_profile, "customer")
+            self.assertEqual(config.bearer_token_file, token_path)
+            self.assertEqual(config.tls_certificate_file, certificate_path)
+            self.assertEqual(config.tls_private_key_file, private_key_path)
+            policy = _security_policy(config)
+            principal = policy.authenticate(f"Bearer {token}")
+            self.assertIsNotNone(principal)
+            self.assertEqual(policy.csrf_token, token)
+            assert principal is not None
+            self.assertTrue(principal.permits("createNetworkCredentialReference"))
+            self.assertTrue(principal.permits("applyNetworkDesiredState"))
+
+            value["security"]["unexpected"] = True
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaises(ProductionConfigError):
+                load_production_config(path)
+            del value["security"]["unexpected"]
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+            token_path.chmod(0o644)
+            with self.assertRaisesRegex(ProductionConfigError, "权限"):
+                _security_policy(config)
+
+            private_key_path.chmod(0o644)
+            with self.assertRaisesRegex(ProductionConfigError, "TLS 私钥权限"):
+                _enable_customer_tls(Mock(socket=Mock()), config)
+
+    def test_customer_profile_wraps_gateway_socket_with_tls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certificate_path = root / "device.crt"
+            certificate_path.write_text("certificate", encoding="ascii")
+            certificate_path.chmod(0o644)
+            private_key_path = root / "device.key"
+            private_key_path.write_text("private-key", encoding="ascii")
+            private_key_path.chmod(0o640)
+            config = replace(
+                self.config(root),
+                security_profile="customer",
+                bearer_token_file=root / "customer.token",
+                tls_certificate_file=certificate_path,
+                tls_private_key_file=private_key_path,
+            )
+            original_socket = Mock()
+            server = Mock(socket=original_socket)
+            wrapped = Mock()
+            context = Mock()
+            context.wrap_socket.return_value = wrapped
+
+            with patch("rp_ylx.daemon.ssl.SSLContext", return_value=context):
+                _enable_customer_tls(server, config)
+
+            context.load_cert_chain.assert_called_once_with(
+                certfile=str(certificate_path),
+                keyfile=str(private_key_path),
+            )
+            context.wrap_socket.assert_called_once_with(
+                original_socket,
+                server_side=True,
+            )
+            self.assertIs(server.socket, wrapped)
+
     def test_default_installed_lab_profile_is_reachable_from_device_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -96,9 +213,11 @@ class ProductionDaemonTest(unittest.TestCase):
                 executable_finder=lambda name: f"/usr/bin/{name}",
                 runner=lambda command: None,
                 health_checker=lambda: None,
+                group_resolver=lambda name: root.stat().st_gid,
             )
             manager._ensure_layout()
             manager._install_assets()
+            manager._ensure_device_config()
             config = load_production_config(root / "etc/rp-ylx/device.json")
             self.assertEqual(config.host, "0.0.0.0")
             self.assertTrue(config.isolated_network)
@@ -178,10 +297,11 @@ class ProductionDaemonTest(unittest.TestCase):
             security = gateway.call_args.kwargs["security"]
             self.assertEqual(security.profile, "lab")
             self.assertEqual(set(security.lab_principal.permissions), set(LAB_OPERATIONS))
+            self.assertEqual(gateway.call_args.kwargs["external_scheme"], "http")
             event_buffer = gateway.call_args.kwargs["event_buffer"]
             event_pump.assert_called_once_with(coordinator, event_buffer)
             self.assertIs(service.event_pump, event_pump.return_value)
-            mdns_publisher.assert_called_once_with(config.port)
+            mdns_publisher.assert_called_once_with(config.port, "http")
             mdns_publisher.return_value.start.assert_called_once_with()
             self.assertIs(service.mdns_publisher, mdns_publisher.return_value)
 
@@ -224,6 +344,23 @@ class ProductionDaemonTest(unittest.TestCase):
             source = Mock(open_handle_count=0)
             source.camera_focus_status.return_value = None
             mdns_publisher = Mock()
+            lock_path_patch = patch(
+                "rp_ylx.recording.coordinator.network_operation_lock_path",
+                return_value=root / "network-operation.lock",
+            )
+            controller_patch = patch(
+                "rp_ylx.recording.coordinator.request_network_control",
+                return_value={
+                    "ok": True,
+                    "operation": "status",
+                    "status": 200,
+                    "body": {"transaction": {"current": None}},
+                },
+            )
+            lock_path_patch.start()
+            controller_patch.start()
+            self.addCleanup(lock_path_patch.stop)
+            self.addCleanup(controller_patch.stop)
             with (
                 patch("rp_ylx.daemon.__commit__", "a" * 40),
                 patch("rp_ylx.daemon.stable_id_for_device", return_value="camera-stable"),
@@ -280,8 +417,8 @@ class ProductionDaemonTest(unittest.TestCase):
                     },
                 )
                 response = connection.getresponse()
-                self.assertEqual(response.status, 409)
                 problem = json.loads(response.read())
+                self.assertEqual(response.status, 409, problem)
                 self.assertEqual(problem["error"]["code"], "volume_not_mounted")
                 self.assertTrue(problem["error"]["retryable"])
 

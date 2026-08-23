@@ -8,7 +8,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts import rdk_camera_focus_negative_evidence as evidence
 
@@ -709,6 +709,86 @@ auto_exposure 0x009a0901 (menu) : min=0 max=3 default=3 value=3 (Aperture Priori
                 runtime.query_get(7, 4, 9, evidence.UVC_GET_CUR, 257)
 
         self.assertEqual(fake.calls, 0)
+
+    def test_authenticated_health_probe_rejects_plaintext_http(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "customer.token"
+            token_path.write_text("x" * 48 + "\n", encoding="ascii")
+            token_path.chmod(0o640)
+
+            with self.assertRaises(evidence.EvidenceError) as raised:
+                evidence.SystemRuntime(
+                    base_url="http://127.0.0.1:8080",
+                    bearer_token_file=token_path,
+                )
+
+        self.assertEqual(raised.exception.code, "authenticated_http_forbidden")
+
+    def test_authenticated_https_health_probe_uses_explicit_ca_and_private_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = "customer-token-" + "x" * 32
+            token_path = root / "customer.token"
+            token_path.write_text(token + "\n", encoding="ascii")
+            token_path.chmod(0o640)
+            ca_path = root / "device.crt"
+            ca_path.write_text("certificate", encoding="ascii")
+            context = MagicMock()
+            response = MagicMock()
+            response.__enter__.return_value.status = 200
+            response.__enter__.return_value.read.return_value = json.dumps(
+                {
+                    "schema": "ylx.capture-status.v4",
+                    "snapshot": {
+                        "schema": "ylx.capture-snapshot-event.v4",
+                        "device_state": "idle",
+                        "active_recording": None,
+                    },
+                }
+            ).encode()
+            with (
+                patch(
+                    "scripts.rdk_camera_focus_negative_evidence.ssl.create_default_context",
+                    return_value=context,
+                ) as create_context,
+                patch(
+                    "scripts.rdk_camera_focus_negative_evidence.request.urlopen",
+                    return_value=response,
+                ) as urlopen,
+            ):
+                runtime = evidence.SystemRuntime(
+                    base_url="https://127.0.0.1:8080",
+                    ca_certificate=ca_path,
+                    bearer_token_file=token_path,
+                )
+                status = runtime._capture_status()
+
+            create_context.assert_called_once_with(cafile=str(ca_path))
+            probe = urlopen.call_args.args[0]
+            self.assertEqual(probe.get_header("Authorization"), f"Bearer {token}")
+            self.assertIs(urlopen.call_args.kwargs["context"], context)
+            self.assertEqual(status["http_status"], 200)
+            self.assertEqual(status["device_state"], "idle")
+
+    def test_evidence_configuration_redacts_health_credentials_and_paths(self) -> None:
+        token_path = Path("/run/private/customer-token-sentinel")
+        ca_path = Path("/run/private/device-ca-sentinel")
+        report = evidence._initial_report(
+            evidence.CollectionConfig(
+                output=Path("/tmp/evidence.json"),
+                expected_commit=EXPECTED_COMMIT,
+                base_url="https://127.0.0.1:8080",
+                ca_certificate=ca_path,
+                bearer_token_file=token_path,
+            ),
+            "2026-08-23T00:00:00Z",
+        )
+        rendered = json.dumps(report, sort_keys=True)
+
+        self.assertTrue(report["configuration"]["health_authenticated"])
+        self.assertEqual(report["configuration"]["health_transport"], "https")
+        self.assertNotIn(str(token_path), rendered)
+        self.assertNotIn(str(ca_path), rendered)
 
     def test_command_allowlist_has_read_only_v4l2_enumeration_only(self) -> None:
         allowed = evidence.SystemRuntime._command_allowed

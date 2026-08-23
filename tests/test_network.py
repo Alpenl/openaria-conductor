@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import ctypes
 import ctypes.util
+import fcntl
 import hashlib
 import io
 import json
@@ -10,7 +11,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -25,13 +28,17 @@ class FakeNmcli:
         self.devices = "wlan0:wifi:connected\neth0:ethernet:disconnected\n"
         self.status_returncode = 0
         self.status_stderr = ""
+        self.scan_output = ""
+        self.scan_returncode = 0
         self.profile_dir = profile_dir
         self.active = {"wlan0": "", "eth0": ""}
         self.addresses = {"wlan0": "", "eth0": ""}
         self.routes = {"wlan0": "", "eth0": ""}
         self.fail_modes: dict[str, str] = {}
+        self.timeout_modes: set[str] = set()
         self.missing_default_modes: set[str] = set()
         self.reload_failures = 0
+        self.dhcp_address_override: str | None = None
         self.static_address_override: str | None = None
         self.timeouts: list[tuple[list[str], float]] = []
 
@@ -69,20 +76,33 @@ class FakeNmcli:
                 self.reload_failures -= 1
                 return subprocess.CompletedProcess(command, 1, "", "reload failed")
             return subprocess.CompletedProcess(command, 0, "", "")
+        if "wifi" in command and "list" in command:
+            return subprocess.CompletedProcess(
+                command,
+                self.scan_returncode,
+                self.scan_output,
+                "scan failed" if self.scan_returncode else "",
+            )
         if "connection" in command and "up" in command:
             name = command[command.index("id") + 1]
             interface = command[command.index("ifname") + 1]
             profile = self._load_profile(name)
             mode = next(
-                (candidate for candidate in self.fail_modes if f"-{candidate}-" in name),
+                (
+                    candidate
+                    for candidate in set(self.fail_modes) | self.timeout_modes
+                    if f"-{candidate}-" in name
+                ),
                 None,
             )
+            if mode in self.timeout_modes:
+                raise subprocess.TimeoutExpired(command, timeout)
             if mode is not None:
                 return subprocess.CompletedProcess(command, 4, "", self.fail_modes[mode])
             self.active[interface] = name
             method = profile["ipv4"]["method"]
             if method == "auto":
-                self.addresses[interface] = "192.168.50.20/24"
+                self.addresses[interface] = self.dhcp_address_override or "192.168.50.20/24"
                 applied_mode = next(
                     (
                         candidate
@@ -192,9 +212,22 @@ class NetworkCliTest(unittest.TestCase):
             "RP_YLX_NETWORK_STATE_DIR": str(self.root / "state"),
             "RP_YLX_NM_PROFILE_DIR": str(self.root / "profiles"),
             "RP_YLX_AVAHI_SERVICE_DIR": str(self.root / "avahi"),
+            "RP_YLX_DEVICE_CONFIG_PATH": str(self.root / "device.json"),
+            "RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.root / "run" / "network-operation.lock"),
         }
+        self._operation_environment = patch.dict(
+            os.environ,
+            {
+                "RP_YLX_NETWORK_OPERATION_LOCK_PATH": self.environment[
+                    "RP_YLX_NETWORK_OPERATION_LOCK_PATH"
+                ]
+            },
+            clear=False,
+        )
+        self._operation_environment.start()
 
     def tearDown(self) -> None:
+        self._operation_environment.stop()
         self.temporary.cleanup()
 
     def lkg_path(self, interface: str, *, root: Path | None = None) -> Path:
@@ -329,14 +362,23 @@ class NetworkCliTest(unittest.TestCase):
             status = network_module.network_status_v1(runtime)
 
         self.assertEqual(status["schema"], "ylx.network-status.v1")
+        self.assertEqual(uuid.UUID(status["authority_epoch"]).version, 4)
+        self.assertEqual(status["source_revision"], 0)
+        self.assertTrue(status["saved"])
+        self.assertTrue(status["verified"])
         self.assertEqual(status["desired"]["mode"], "wifi-client")
         self.assertEqual(
             status["desired"]["wifi_client"],
-            {"ssid": "studio-wifi", "credential_state": "stored"},
+            {
+                "ssid": "studio-wifi",
+                "security": "wpa2-personal",
+                "credential_state": "stored",
+            },
         )
         self.assertEqual(status["observed"]["default_route"], "wifi_client")
         self.assertEqual(status["observed"]["mdns"]["hostname"], "rp-ylx.local")
         self.assertFalse(status["mutation_capability"]["enabled"])
+        self.assertEqual(status["mutation_capability"]["disabled_reason"], "controller_unavailable")
         self.assertEqual(status["mutation_capability"]["operations"], ["apply", "retry", "forget"])
         self.assertEqual(status["concurrency_capability"]["same_phy_ap_sta"], "unverified")
         self.assertEqual(
@@ -345,6 +387,110 @@ class NetworkCliTest(unittest.TestCase):
         )
         self.assertNotIn("must-not-leak", json.dumps(status, ensure_ascii=False))
         self.assertNotIn("psk", json.dumps(status, ensure_ascii=False).lower())
+
+    def test_status_v1_projects_authoritative_controller_transaction(self) -> None:
+        authority_epoch = "b9c5daed-6146-4a0e-8ab4-03aa65722720"
+        desired = {
+            "mode": "wifi-client",
+            "wifi_client": {
+                "ssid": "Field LAN",
+                "security": "wpa2-personal",
+                "credential_state": "pending_input",
+            },
+            "ethernet": None,
+        }
+        transaction = {
+            "schema": "ylx.network-transaction.v1",
+            "authority_epoch": authority_epoch,
+            "source_revision": 8,
+            "transaction_id": "0198d2a0-41a0-7b7a-a751-0e86a39d4db1",
+            "operation": "apply",
+            "status": "accepted",
+            "stage": "accepted",
+            "desired": desired,
+            "accepted_at": "2026-08-23T12:57:00Z",
+            "updated_at": "2026-08-23T12:57:00Z",
+            "deadline": None,
+            "recovery_action": "await_device",
+            "rescue": {
+                "ap_validated": False,
+                "fallback_mode": "hotspot",
+                "failure_trigger_seconds": 10,
+            },
+            "error": None,
+        }
+        capability = {
+            "enabled": True,
+            "disabled_reason": None,
+            "operations": ["apply", "retry", "forget"],
+            "idempotency_key_required": True,
+            "secret_handling": "opaque_credential_reference_only",
+            "active_state_policy": "idle_only",
+        }
+        controller_response = {
+            "schema": "ylx.network-control-response.v1",
+            "ok": True,
+            "operation": "status",
+            "status": 200,
+            "body": {
+                "schema": "ylx.network-controller-status.v1",
+                "authority_epoch": authority_epoch,
+                "source_revision": 8,
+                "saved": True,
+                "verified": False,
+                "desired": desired,
+                "transaction": {"current": transaction, "latest": None},
+                "capability": capability,
+            },
+        }
+        runtime = {
+            "observed_at": "2026-08-23T12:58:00Z",
+            "network": {
+                "ap": {
+                    "state": "connected",
+                    "interface": "wlan0",
+                    "addresses": ["10.42.0.1/24"],
+                    "peer_or_ssid": "OpenAria",
+                },
+                "wifi_client": {
+                    "state": "disconnected",
+                    "interface": "wlan0",
+                    "addresses": [],
+                    "peer_or_ssid": None,
+                },
+                "wired": {
+                    "state": "disconnected",
+                    "interface": "eth0",
+                    "addresses": [],
+                    "peer_or_ssid": None,
+                },
+                "default_route": "none",
+            },
+        }
+        legacy = {
+            "capabilities": {"second_wifi": False},
+            "mdns": {
+                "hostname": "rp-ylx.local",
+                "service": "_ylx-capture._tcp",
+                "aliases": ["_http._tcp"],
+                "port": 8080,
+            },
+            "devices": [],
+        }
+
+        with patch(
+            "rp_ylx.network_control.request_control",
+            return_value=controller_response,
+        ):
+            status = network_module.network_status_v1(runtime, legacy_status=legacy)
+
+        self.assertEqual(status["authority_epoch"], authority_epoch)
+        self.assertEqual(status["source_revision"], 8)
+        self.assertTrue(status["saved"])
+        self.assertFalse(status["verified"])
+        self.assertEqual(status["desired"], desired)
+        self.assertEqual(status["transaction"]["current"], transaction)
+        self.assertEqual(status["mutation_capability"], capability)
 
     def test_status_reports_a_stable_error_when_network_manager_is_missing(self) -> None:
         with patch(
@@ -373,6 +519,97 @@ class NetworkCliTest(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(result["error"]["code"], "network_status_failed")
         self.assertNotIn(nmcli.status_stderr, error)
+
+    def test_controller_creates_one_secret_safe_rescue_ap_per_device(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        rescue_secret = "random-rescue-secret-1234"
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+            patch("rp_ylx.network.secrets.token_urlsafe", return_value=rescue_secret) as random_psk,
+        ):
+            first = network_module.ensure_rescue_ap("device-serial-001")
+            second = network_module.ensure_rescue_ap("device-serial-001")
+
+        self.assertEqual(first, second)
+        random_psk.assert_called_once()
+        self.assertEqual(first["mode"], "hotspot")
+        self.assertEqual(first["interface"], "wlan0")
+        self.assertNotIn("psk", first)
+        self.assertNotIn(rescue_secret, json.dumps(first))
+
+        rescue_path = self.root / "state" / "rescue.json"
+        rescue = json.loads(rescue_path.read_text(encoding="utf-8"))
+        self.assertEqual(rescue_path.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("psk", rescue["config"])
+        self.assertNotIn(rescue_secret, json.dumps(rescue))
+
+        profile_path = self.root / "profiles" / f"{rescue['profile']}.nmconnection"
+        self.assertEqual(profile_path.stat().st_mode & 0o777, 0o600)
+        profile = profile_path.read_text(encoding="utf-8")
+        self.assertIn("mode=ap", profile)
+        self.assertIn(f"psk={rescue_secret}", profile)
+        self.assertIn("autoconnect=true", profile)
+
+        persisted = b"\n".join(
+            path.read_bytes() for path in (self.root / "state").rglob("*") if path.is_file()
+        )
+        self.assertNotIn(rescue_secret.encode(), persisted)
+
+    def test_wifi_client_profile_never_autoconnects_outside_controller(self) -> None:
+        code, _, error = self.run_cli(
+            ["network", "apply", "--request-id", "client-no-autoconnect", "--config", "-"],
+            stdin='{"mode":"wifi-client","ssid":"Field LAN","psk":"client-secret"}',
+        )
+
+        self.assertEqual(code, 0, error)
+        profile_path = next((self.root / "profiles").glob("*wifi-client*.nmconnection"))
+        profile = profile_path.read_text(encoding="utf-8")
+        self.assertIn("autoconnect=false", profile)
+        self.assertNotIn("autoconnect=true", profile)
+
+    def test_scan_redacts_and_normalizes_closed_results(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        nmcli.scan_output = (
+            "Field\\:LAN:WPA2:80\nField\\:LAN:WPA2:45\nGuest::60\n:WPA3:40\nCorp:WPA2 802.1X:95\n"
+        )
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+        ):
+            networks = network_module.scan_wifi_networks()
+
+        self.assertEqual(
+            networks,
+            [
+                {
+                    "ssid": "Field:LAN",
+                    "hidden": False,
+                    "security": "wpa2-personal",
+                    "signal_dbm": -60,
+                    "credential_required": True,
+                },
+                {
+                    "ssid": "Guest",
+                    "hidden": False,
+                    "security": "open",
+                    "signal_dbm": -70,
+                    "credential_required": False,
+                },
+                {
+                    "ssid": None,
+                    "hidden": True,
+                    "security": "wpa3-personal",
+                    "signal_dbm": -80,
+                    "credential_required": True,
+                },
+            ],
+        )
+        rendered = json.dumps(networks)
+        self.assertNotIn("BSSID", rendered)
+        self.assertNotIn("802.1X", rendered)
 
     def test_apply_rejects_invalid_or_overexposed_config_without_side_effects(self) -> None:
         cases = [
@@ -529,6 +766,46 @@ class NetworkCliTest(unittest.TestCase):
         self.assertIn("_ylx-capture._tcp", rendered_service)
         self.assertIn("_http._tcp", rendered_service)
         self.assertEqual(rendered_service.count("<port>8080</port>"), 2)
+
+    def test_customer_network_apply_preserves_https_mdns(self) -> None:
+        (self.root / "device.json").write_text(
+            json.dumps(
+                {
+                    "security": {
+                        "profile": "customer",
+                        "tls_certificate_file": "/etc/rp-ylx/tls/device.crt",
+                        "tls_private_key_file": "/etc/rp-ylx/tls/device.key",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, _, error = self.run_cli(
+            ["network", "apply", "--request-id", "customer-wired", "--config", "-"],
+            stdin='{ "mode": "ethernet-dhcp" }',
+        )
+
+        self.assertEqual(code, 0, error)
+        rendered_service = (self.root / "avahi" / "rp-ylx.service").read_text(encoding="utf-8")
+        self.assertIn("_https._tcp", rendered_service)
+        self.assertIn("<txt-record>scheme=https</txt-record>", rendered_service)
+        self.assertNotIn("_http._tcp", rendered_service)
+
+    def test_customer_network_apply_rejects_incomplete_tls_mdns_config(self) -> None:
+        (self.root / "device.json").write_text(
+            json.dumps({"security": {"profile": "customer"}}),
+            encoding="utf-8",
+        )
+
+        code, result, error = self.run_cli(
+            ["network", "apply", "--request-id", "customer-invalid", "--config", "-"],
+            stdin='{ "mode": "ethernet-dhcp" }',
+        )
+
+        self.assertEqual(code, 3, error)
+        self.assertEqual(result["error"]["code"], "mdns_config_invalid")
+        self.assertFalse((self.root / "avahi" / "rp-ylx.service").exists())
 
     def test_apply_supports_four_modes_without_leaking_psk(self) -> None:
         cases = [
@@ -1554,6 +1831,28 @@ method=disabled
         self.assertEqual(result["error"]["code"], "rescue_unconfigured")
         self.assertEqual(nmcli.commands, [])
 
+    def test_forget_resumes_a_profile_quarantined_before_power_loss(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+        ):
+            network_module.ensure_rescue_ap("forget-power-loss-device")
+            profile_name = "rp-ylx-wifi-client-deadbeef1234.nmconnection"
+            quarantine = self.root / "profiles" / f".{profile_name}.forget"
+            quarantine.write_text("psk=power-loss-secret\n", encoding="utf-8")
+            quarantine.chmod(0o600)
+
+            result = network_module.forget_network_client_profiles()
+
+        self.assertEqual(result["removed_profiles"], [profile_name])
+        self.assertFalse(quarantine.exists())
+        self.assertFalse((self.root / "profiles" / profile_name).exists())
+        self.assertGreaterEqual(nmcli.commands.count(["nmcli", "connection", "reload"]), 2)
+        for path in self.root.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"power-loss-secret", path.read_bytes(), path)
+
     def test_reconcile_discards_an_uncommitted_active_candidate_after_power_loss(self) -> None:
         nmcli = FakeNmcli(self.root / "profiles")
         code, _, error = self.run_cli(
@@ -1777,6 +2076,56 @@ method=disabled
         self.assertEqual(result["reason"], "default_route_missing")
         self.assertEqual(nmcli.active["eth0"], profile)
         self.assertIn("dst = 0.0.0.0/0", nmcli.routes["eth0"])
+
+    def test_rescue_mutation_waits_for_shared_operation_lock(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        started = threading.Event()
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def rescue() -> None:
+            started.set()
+            try:
+                network_module.rescue_network()
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        with (
+            patch.dict(os.environ, self.environment, clear=False),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+        ):
+            network_module.ensure_rescue_ap("operation-lock-device")
+            with network_module._network_operation_lock():
+                thread = threading.Thread(target=rescue)
+                thread.start()
+                self.assertTrue(started.wait(timeout=1))
+                self.assertFalse(completed.wait(timeout=0.05))
+            self.assertTrue(completed.wait(timeout=1))
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_operation_lease_contends_with_external_flock(self) -> None:
+        path = network_module.network_operation_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+        try:
+            os.fchmod(descriptor, 0o660)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.assertRaises(network_module.NetworkError) as busy,
+                network_module.network_operation_lease(blocking=False),
+            ):
+                pass
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(busy.exception.code, "capture_active")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o660)
 
 
 if __name__ == "__main__":

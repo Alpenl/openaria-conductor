@@ -1,11 +1,12 @@
 [Unit]
 Description=RP-YLX RDK X5 Wi-Fi health and recovery check
-After=NetworkManager.service network.target
-Wants=NetworkManager.service
+After=NetworkManager.service network.target rp-ylx-network-control.socket rp-ylx-network-control.service
+Wants=NetworkManager.service rp-ylx-network-control.socket
 
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/default/rp-ylx-wifi-watchdog
+Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
 ExecStart=/usr/local/sbin/rp-ylx-wifi-watchdog check
 StateDirectory=rp-ylx-wifi-watchdog
 RuntimeDirectory=rp-ylx-wifi-watchdog
@@ -13,9 +14,15 @@ RuntimeDirectoryPreserve=yes
 TimeoutStartSec=5min
 Nice=10
 IOSchedulingClass=idle
-NoNewPrivileges=no
+NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
+ReadWritePaths=/run/rp-ylx/network-operation.lock
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT CAP_SYS_MODULE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT CAP_SYS_MODULE
 RestrictSUIDSGID=yes
 LockPersonality=yes

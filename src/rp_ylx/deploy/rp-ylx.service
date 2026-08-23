@@ -1,6 +1,7 @@
 [Unit]
 Description=RP-YLX RDK X5 capture service
-After=rp-ylx-data-volume.service network-online.target NetworkManager.service
+Requires=rp-ylx-recover.service rp-ylx-network-control.socket rp-ylx-network-control.service
+After=rp-ylx-data-volume.service rp-ylx-recover.service rp-ylx-network-control.socket rp-ylx-network-control.service network-online.target NetworkManager.service
 Wants=rp-ylx-data-volume.service network-online.target
 
 [Service]
@@ -9,7 +10,7 @@ User=rp-ylx
 Group=rp-ylx
 # vpu/jpu/vps carry codec nodes; misc carries the RDK X5 ION allocator.
 SupplementaryGroups=video vpu jpu vps misc
-ExecStartPre=+/usr/local/sbin/rp-ylx-deploy recover
+Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
 ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve --config /etc/rp-ylx/device.json
 Restart=on-failure
 RestartSec=2s
@@ -21,6 +22,7 @@ ProtectSystem=full
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ReadWritePaths=/run/rp-ylx/network-operation.lock
 RestrictSUIDSGID=yes
 LockPersonality=yes
 

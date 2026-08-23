@@ -1,20 +1,38 @@
 [Unit]
 Description=RP-YLX privileged network-control worker
-Requires=NetworkManager.service
-After=NetworkManager.service
+Requires=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
+After=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
+Before=rp-ylx.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120s
 User=root
 Group=root
-ExecStart=/opt/rp-ylx/current/bin/rp-ylx network-control serve --stdio
+Environment=RP_YLX_NETWORK_STATE_DIR=/var/lib/rp-ylx-network
+Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
+ExecStart=/usr/local/sbin/rp-ylx-deploy network-control-launch
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
+Restart=on-failure
+RestartSec=2s
 UMask=0077
-NoNewPrivileges=no
+NoNewPrivileges=yes
+PrivateDevices=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
+ReadWritePaths=/var/lib/rp-ylx-network
+ReadWritePaths=/etc/NetworkManager/system-connections
+ReadWritePaths=/etc/avahi/services
+ReadWritePaths=/run/rp-ylx/network-operation.lock
 RestrictSUIDSGID=yes
 LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=

@@ -15,11 +15,13 @@ from rp_ylx.api import (
     CaptureCommandResult,
     NetworkCommand,
     NetworkCommandResult,
+    NetworkCredentialCommand,
     Principal,
     ProviderError,
     SecurityPolicy,
     create_gateway_server,
 )
+from rp_ylx.api.gateway import _NetworkEventReplayBuffer
 from rp_ylx.web import read_asset
 
 WEB_ASSET_EXPECTATIONS = {
@@ -115,11 +117,16 @@ DEVICE_V3 = {
 
 NETWORK_STATUS = {
     "schema": "ylx.network-status.v1",
+    "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "source_revision": 12,
     "observed_at": "2026-08-23T12:58:00+08:00",
+    "saved": True,
+    "verified": True,
     "desired": {
         "mode": "wifi-client",
         "wifi_client": {
             "ssid": "studio-wifi",
+            "security": "wpa2-personal",
             "credential_state": "stored",
         },
         "ethernet": None,
@@ -158,6 +165,7 @@ NETWORK_STATUS = {
     "transaction": {"current": None, "latest": None},
     "mutation_capability": {
         "enabled": False,
+        "disabled_reason": "not_enabled",
         "operations": ["apply", "retry", "forget"],
         "idempotency_key_required": True,
         "secret_handling": "opaque_credential_reference_only",
@@ -178,6 +186,8 @@ NETWORK_RECEIPT = {
     "accepted_at": "2026-08-23T12:58:03+08:00",
     "transaction": {
         "schema": "ylx.network-transaction.v1",
+        "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "source_revision": 13,
         "transaction_id": NETWORK_TRANSACTION_ID,
         "operation": "apply",
         "status": "accepted",
@@ -186,12 +196,15 @@ NETWORK_RECEIPT = {
             "mode": "wifi-client",
             "wifi_client": {
                 "ssid": "studio-wifi",
+                "security": "wpa2-personal",
                 "credential_state": "pending_input",
             },
             "ethernet": None,
         },
         "accepted_at": "2026-08-23T12:58:03+08:00",
         "updated_at": "2026-08-23T12:58:03+08:00",
+        "deadline": None,
+        "recovery_action": "await_device",
         "rescue": {
             "ap_validated": False,
             "fallback_mode": "hotspot",
@@ -199,6 +212,38 @@ NETWORK_RECEIPT = {
         },
         "error": None,
     },
+}
+
+NETWORK_SCAN = {
+    "schema": "ylx.network-scan.v1",
+    "authority_epoch": NETWORK_STATUS["authority_epoch"],
+    "source_revision": NETWORK_STATUS["source_revision"],
+    "scanned_at": "2026-08-23T12:58:01+08:00",
+    "networks": [
+        {
+            "ssid": "studio-wifi",
+            "hidden": False,
+            "security": "wpa2-personal",
+            "signal_dbm": -46,
+            "credential_required": True,
+        },
+        {
+            "ssid": None,
+            "hidden": True,
+            "security": "open",
+            "signal_dbm": -72,
+            "credential_required": False,
+        },
+    ],
+}
+
+NETWORK_CREDENTIAL_RECEIPT = {
+    "schema": "ylx.network-credential-receipt.v1",
+    "credential_ref": "cred-setup-token-001",
+    "issued_at": "2026-08-23T12:58:02+08:00",
+    "expires_at": "2026-08-23T13:00:02+08:00",
+    "ttl_seconds": 120,
+    "single_use": True,
 }
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
@@ -450,8 +495,14 @@ class DeviceProvider:
         self.status: object = deepcopy(CAPTURE_STATUS)
         self.focus: object | None = None
         self.network: object = deepcopy(NETWORK_STATUS)
+        self.network_scan: object = deepcopy(NETWORK_SCAN)
+        self.network_status_error: ProviderError | None = None
+        self.network_scan_error: ProviderError | None = None
+        self.network_credentials: list[NetworkCredentialCommand] = []
+        self.network_credential_result: object = deepcopy(NETWORK_CREDENTIAL_RECEIPT)
         self.network_commands: list[tuple[str, NetworkCommand]] = []
         self.network_results: dict[str, NetworkCommandResult] = {}
+        self.network_errors: dict[str, ProviderError] = {}
         self.live_imu: object | None = None
         self.stop_status = 204
         self.device_schema_override: str | None = None
@@ -490,10 +541,23 @@ class DeviceProvider:
         return deepcopy(self.focus)
 
     def network_status(self) -> object:
+        if self.network_status_error is not None:
+            raise self.network_status_error
         return deepcopy(self.network)
+
+    def scan_networks(self) -> object:
+        if self.network_scan_error is not None:
+            raise self.network_scan_error
+        return deepcopy(self.network_scan)
+
+    def create_network_credential(self, command: NetworkCredentialCommand) -> object:
+        self.network_credentials.append(command)
+        return deepcopy(self.network_credential_result)
 
     def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
         self.network_commands.append((operation, command))
+        if operation in self.network_errors:
+            raise self.network_errors[operation]
         result = self.network_results.get(operation)
         if result is None:
             raise ProviderError(
@@ -501,6 +565,7 @@ class DeviceProvider:
                 "网络写入控制器尚未启用",
                 status=503,
                 retryable=True,
+                details={"reason": "not_enabled"},
             )
         return NetworkCommandResult(result.status, deepcopy(result.body), result.replayed)
 
@@ -590,6 +655,8 @@ class GatewayHttpTest(unittest.TestCase):
                 "getCameraFocus": None,
                 "setCameraFocus": None,
                 "getNetworkStatus": None,
+                "scanNetworks": None,
+                "createNetworkCredentialReference": None,
                 "streamNetworkEvents": None,
                 "applyNetworkDesiredState": None,
                 "retryNetworkTransaction": None,
@@ -628,6 +695,8 @@ class GatewayHttpTest(unittest.TestCase):
         if body is not None:
             data = json.dumps(body).encode()
             request_headers.setdefault("Content-Type", "application/json")
+            if token is not None and request_headers.get("Origin") == self.base:
+                request_headers.setdefault("X-CSRF-Token", "browser-csrf-token")
         request = Request(self.base + path, headers=request_headers, data=data, method=method)
         try:
             with urlopen(request, timeout=2) as response:
@@ -652,6 +721,25 @@ class GatewayHttpTest(unittest.TestCase):
             return response.status, response.read(), response.headers
         finally:
             connection.close()
+
+    @staticmethod
+    def read_sse_event(response: http.client.HTTPResponse) -> bytes:
+        lines: list[bytes] = []
+        while True:
+            line = response.readline()
+            if not line:
+                raise AssertionError("SSE 连接在完整事件前关闭")
+            lines.append(line)
+            if line in {b"\n", b"\r\n"}:
+                return b"".join(lines)
+
+    @staticmethod
+    def decode_sse_event(payload: bytes) -> tuple[int, dict[str, object]]:
+        delivery_line = next(line for line in payload.splitlines() if line.startswith(b"id: "))
+        data_line = next(line for line in payload.splitlines() if line.startswith(b"data: "))
+        return int(delivery_line.removeprefix(b"id: ")), json.loads(
+            data_line.removeprefix(b"data: ")
+        )
 
     def test_embedded_web_is_anonymous_same_origin_and_closed_to_unknown_paths(self) -> None:
         for path, (name, content_type) in WEB_ASSET_EXPECTATIONS.items():
@@ -699,12 +787,13 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(headers["Content-Type"], "application/problem+json")
                 self.assertIsNotNone(headers["Content-Length"])
 
-    def test_embedded_web_same_origin_command_does_not_need_a_second_secret(self) -> None:
+    def test_embedded_web_same_origin_command_requires_explicit_csrf(self) -> None:
         status, payload, headers = self.request(
             "/api/v3/capture/start",
             token="reader-token",
             headers={
                 "Origin": self.base,
+                "X-CSRF-Token": "browser-csrf-token",
                 "Idempotency-Key": "embedded-web-start",
             },
             body={
@@ -724,12 +813,114 @@ class GatewayHttpTest(unittest.TestCase):
             token="reader-token",
             headers={
                 "Origin": self.base,
+                "X-CSRF-Token": "browser-csrf-token",
                 "Idempotency-Key": "embedded-web-stop",
             },
             body={"schema": "ylx.capture-stop.v2", "reason": "user"},
         )
         self.assertEqual(status, 204)
         self.assertEqual(payload, b"")
+
+        status, payload, _ = self.request(
+            "/api/v3/capture/start",
+            token="reader-token",
+            headers={
+                "Origin": self.base,
+                "X-CSRF-Token": "",
+                "Idempotency-Key": "embedded-web-missing-csrf",
+            },
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "production",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "csrf_forbidden")
+
+        status, payload, _ = self.request(
+            "/api/v3/capture/start",
+            token="reader-token",
+            headers={
+                "X-CSRF-Token": "browser-csrf-token",
+                "Idempotency-Key": "embedded-web-missing-origin",
+            },
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "production",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "origin_forbidden")
+
+    def test_same_origin_scheme_comes_only_from_trusted_server_configuration(self) -> None:
+        status, _, _ = self.request(
+            "/api/v3/capture/start",
+            token="reader-token",
+            headers={
+                "Origin": self.base,
+                "X-CSRF-Token": "browser-csrf-token",
+                "X-Forwarded-Proto": "https",
+                "Idempotency-Key": "trusted-http-scheme",
+            },
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "production",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 202)
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.server = create_gateway_server(
+            "127.0.0.1",
+            0,
+            DeviceProvider(),
+            security=self.policy,
+            external_scheme="https",
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        https_origin = f"https://127.0.0.1:{self.server.server_port}"
+        http_origin = f"http://127.0.0.1:{self.server.server_port}"
+
+        status, _, _ = self.request(
+            "/api/v3/capture/start",
+            token="reader-token",
+            headers={
+                "Origin": https_origin,
+                "X-CSRF-Token": "browser-csrf-token",
+                "X-Forwarded-Proto": "http",
+                "Idempotency-Key": "trusted-https-scheme",
+            },
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "production",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 202)
+
+        status, payload, _ = self.request(
+            "/api/v3/capture/start",
+            token="reader-token",
+            headers={
+                "Origin": http_origin,
+                "X-Forwarded-Proto": "https",
+                "Idempotency-Key": "forged-forwarded-scheme",
+            },
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "production",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(payload)["error"]["code"], "origin_forbidden")
 
     def test_customer_authenticates_and_authorizes_each_versioned_device_resource(self) -> None:
         for path in ("/api/v2/device", "/api/v3/device", "/api/v4/device"):
@@ -884,7 +1075,7 @@ class GatewayHttpTest(unittest.TestCase):
         )
         for name, value, expected_status, expected_code in cases:
             with self.subTest(header=name):
-                status, payload, _ = self.raw_request(
+                status, payload, response_headers = self.raw_request(
                     "POST",
                     "/api/v3/capture/start",
                     (*common, (name, value)),
@@ -893,6 +1084,60 @@ class GatewayHttpTest(unittest.TestCase):
 
                 self.assertEqual(status, expected_status)
                 self.assertEqual(json.loads(payload)["error"]["code"], expected_code)
+                self.assertEqual(response_headers["Connection"], "close")
+
+    def test_ambiguous_or_illegal_http_request_framing_fails_closed(self) -> None:
+        body = b"{}"
+        common = (
+            ("Authorization", "Bearer reader-token"),
+            ("Origin", self.base),
+            ("Idempotency-Key", "framing-test"),
+            ("Content-Type", "application/json"),
+        )
+        cases = (
+            (("Transfer-Encoding", "chunked"),),
+            (("Transfer-Encoding", "identity"), ("Content-Length", str(len(body)))),
+            (("Content-Length", "02"),),
+            (("Content-Length", "+2"),),
+            (("Content-Length", "2, 2"),),
+            (("Content-Length", "65537"),),
+        )
+        for extra_headers in cases:
+            with self.subTest(extra_headers=extra_headers):
+                status, payload, response_headers = self.raw_request(
+                    "POST",
+                    "/api/v3/capture/start",
+                    (*common, *extra_headers),
+                    body,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+                self.assertEqual(response_headers["Connection"], "close")
+                self.assertEqual(self.server.provider.commands, {})
+
+    def test_bodyless_methods_and_unread_unknown_bodies_fail_closed(self) -> None:
+        for method, path, expected_status in (
+            ("GET", "/api/v3/device", 400),
+            ("HEAD", "/api/v3/device", 400),
+            ("OPTIONS", "/api/v3/device", 400),
+            ("POST", "/api/v3/unknown", 404),
+            ("PUT", "/api/v3/device", 405),
+        ):
+            with self.subTest(method=method, path=path):
+                status, payload, response_headers = self.raw_request(
+                    method,
+                    path,
+                    (
+                        ("Authorization", "Bearer reader-token"),
+                        ("Content-Length", "2"),
+                        ("Content-Type", "application/json"),
+                    ),
+                    b"{}",
+                )
+                self.assertEqual(status, expected_status)
+                if method != "HEAD":
+                    self.assertEqual(json.loads(payload)["schema"], "ylx.api-error.v2")
+                self.assertEqual(response_headers["Connection"], "close")
 
     def test_lab_profile_origin_and_audit_are_enforced_before_the_handler(self) -> None:
         self.server.shutdown()
@@ -1146,22 +1391,84 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
         self.server.provider.network = deepcopy(NETWORK_STATUS)
 
-        status, payload, headers = self.request(
-            "/api/v4/network/events",
-            token="reader-token",
-            headers={"Last-Event-ID": "40"},
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        try:
+            connection.request(
+                "GET",
+                "/api/v4/network/events",
+                headers={"Authorization": "Bearer reader-token"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "text/event-stream")
+            self.assertEqual(response.headers["Connection"], "keep-alive")
+            self.assertIsNone(response.headers["Content-Length"])
+
+            payload = self.read_sse_event(response)
+            self.assertIn(b"event: snapshot\n", payload)
+            initial_delivery_id, event = self.decode_sse_event(payload)
+            self.assertEqual(event["schema"], "ylx.network-event.v1")
+            self.assertEqual(event["sse_delivery_id"], str(initial_delivery_id))
+            self.assertEqual(event["type"], "snapshot")
+            self.assertIsNone(event["transaction_id"])
+            self.assertEqual(event["data"], NETWORK_STATUS)
+
+            changed = deepcopy(NETWORK_STATUS)
+            changed["source_revision"] = 13
+            changed["observed_at"] = "2026-08-23T12:58:01+08:00"
+            self.server.provider.network = changed
+            payload = self.read_sse_event(response)
+            changed_delivery_id, changed_event = self.decode_sse_event(payload)
+            self.assertEqual(changed_delivery_id, initial_delivery_id + 1)
+            self.assertEqual(changed_event["sse_delivery_id"], str(changed_delivery_id))
+            self.assertEqual(changed_event["data"], changed)
+        finally:
+            connection.close()
+
+        replay_connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_port, timeout=2
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(headers["Content-Type"], "text/event-stream")
-        self.assertIn(b"id: 41\n", payload)
-        self.assertIn(b"event: snapshot\n", payload)
-        data_line = next(line for line in payload.splitlines() if line.startswith(b"data: "))
-        event = json.loads(data_line.removeprefix(b"data: "))
-        self.assertEqual(event["schema"], "ylx.network-event.v1")
-        self.assertEqual(event["sse_delivery_id"], "41")
-        self.assertEqual(event["type"], "snapshot")
-        self.assertIsNone(event["transaction_id"])
-        self.assertEqual(event["data"], NETWORK_STATUS)
+        try:
+            replay_connection.request(
+                "GET",
+                "/api/v4/network/events",
+                headers={
+                    "Authorization": "Bearer reader-token",
+                    "Last-Event-ID": str(initial_delivery_id),
+                },
+            )
+            replay_response = replay_connection.getresponse()
+            self.assertEqual(replay_response.status, 200)
+            replayed = self.read_sse_event(replay_response)
+            replayed_delivery_id, _ = self.decode_sse_event(replayed)
+            self.assertEqual(replayed_delivery_id, changed_delivery_id)
+        finally:
+            replay_connection.close()
+
+        latest_connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_port, timeout=2
+        )
+        try:
+            latest_connection.request(
+                "GET",
+                "/api/v4/network/events",
+                headers={
+                    "Authorization": "Bearer reader-token",
+                    "Last-Event-ID": str(changed_delivery_id),
+                },
+            )
+            latest_response = latest_connection.getresponse()
+            self.assertEqual(latest_response.status, 200)
+            next_status = deepcopy(changed)
+            next_status["source_revision"] = 14
+            next_status["observed_at"] = "2026-08-23T12:58:02+08:00"
+            self.server.provider.network = next_status
+            next_payload = self.read_sse_event(latest_response)
+            next_delivery_id, next_event = self.decode_sse_event(next_payload)
+            self.assertEqual(next_delivery_id, changed_delivery_id + 1)
+            self.assertEqual(next_event["data"], next_status)
+        finally:
+            latest_connection.close()
 
         status, payload, _ = self.request(
             "/api/v4/network/events",
@@ -1171,6 +1478,157 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
 
+    def test_network_sse_rejects_revision_regressions_and_emits_projection_changes(self) -> None:
+        buffer = _NetworkEventReplayBuffer(initial_delivery_id=100)
+        initial = buffer.replay(None, NETWORK_STATUS)[0]
+        advanced = deepcopy(NETWORK_STATUS)
+        advanced["source_revision"] = 13
+        advanced["observed_at"] = "2026-08-23T12:58:01+08:00"
+        buffer.observe(advanced)
+
+        regressed = deepcopy(NETWORK_STATUS)
+        regressed["source_revision"] = 11
+        regressed["observed_at"] = "2026-08-23T12:58:02+08:00"
+        delivered = buffer.events_after(initial.delivery_id, regressed)
+        self.assertEqual([event.source_event["source_revision"] for event in delivered], [13])
+
+        observed_projection = deepcopy(advanced)
+        observed_projection["observed_at"] = "2026-08-23T12:58:03+08:00"
+        observed_projection["observed"]["wifi_client"]["addresses"] = ["192.0.2.37/24"]
+        observed_events = buffer.events_after(delivered[-1].delivery_id, observed_projection)
+        self.assertEqual(len(observed_events), 1)
+        self.assertEqual(observed_events[0].source_event["type"], "snapshot")
+        self.assertEqual(observed_events[0].source_event["data"], observed_projection)
+
+        timestamp_only = deepcopy(observed_projection)
+        timestamp_only["observed_at"] = "2026-08-23T12:58:04+08:00"
+        self.assertFalse(buffer.events_after(observed_events[-1].delivery_id, timestamp_only))
+
+        projected = deepcopy(timestamp_only)
+        projected["mutation_capability"] = {
+            "enabled": False,
+            "disabled_reason": "capture_active",
+            "rescue_ap_required": True,
+            "rescue_ap_validated": True,
+            "operations": ["apply", "retry", "forget"],
+        }
+        projected_events = buffer.events_after(observed_events[-1].delivery_id, projected)
+        self.assertEqual(len(projected_events), 1)
+        self.assertEqual(projected_events[0].source_event["type"], "snapshot")
+        self.assertEqual(projected_events[0].source_event["data"], projected)
+
+    def test_network_sse_restart_forces_resync_even_when_delivery_id_would_collide(self) -> None:
+        before_restart = _NetworkEventReplayBuffer(initial_delivery_id=100)
+        old_event = before_restart.replay(None, NETWORK_STATUS)[0]
+        after_restart = _NetworkEventReplayBuffer(initial_delivery_id=old_event.delivery_id)
+
+        resync = after_restart.replay(old_event.delivery_id, NETWORK_STATUS)
+
+        self.assertEqual(len(resync), 1)
+        self.assertEqual(resync[0].source_event["type"], "snapshot")
+        self.assertGreater(resync[0].delivery_id, old_event.delivery_id)
+
+    def test_network_scan_and_transient_credentials_follow_v4_security_contract(self) -> None:
+        status, payload, headers = self.request(
+            "/api/v4/network/scan",
+            token="reader-token",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), NETWORK_SCAN)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+        status, _, _ = self.request("/api/v3/network/scan", token="reader-token")
+        self.assertEqual(status, 404)
+
+        passphrase = "one-request-secret"
+        status, payload, headers = self.request(
+            "/api/v4/network/credentials",
+            token="reader-token",
+            headers={"Origin": self.base},
+            body={
+                "schema": "ylx.network-credential-request.v1",
+                "passphrase": passphrase,
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(payload), NETWORK_CREDENTIAL_RECEIPT)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertNotIn(passphrase.encode(), payload)
+        self.assertEqual(len(self.server.provider.network_credentials), 1)
+        self.assertEqual(self.server.provider.network_credentials[0].principal_id, "reader")
+        self.assertEqual(self.server.provider.network_credentials[0].passphrase, passphrase)
+
+        self.server.provider.network_credentials.clear()
+        status, payload, _ = self.request(
+            "/api/v4/network/credentials",
+            token="reader-token",
+            headers={"Origin": self.base},
+            body={
+                "schema": "ylx.network-credential-request.v1",
+                "passphrase": "short",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+        self.assertEqual(self.server.provider.network_credentials, [])
+
+        self.server.provider.network_scan = {**NETWORK_SCAN, "password": "must-not-leak"}
+        status, payload, _ = self.request("/api/v4/network/scan", token="reader-token")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+    def test_network_read_errors_are_closed_and_unknown_provider_errors_do_not_leak(self) -> None:
+        cases = (
+            (
+                "/api/v4/network",
+                "network_status_error",
+                "network_status_unavailable",
+                "网络状态暂时不可用",
+            ),
+            (
+                "/api/v4/network/events",
+                "network_status_error",
+                "network_status_unavailable",
+                "网络状态暂时不可用",
+            ),
+            (
+                "/api/v4/network/scan",
+                "network_scan_error",
+                "network_scan_unavailable",
+                "无线网络扫描暂时不可用",
+            ),
+        )
+        for path, attribute, code, message in cases:
+            with self.subTest(path=path, kind="valid"):
+                setattr(
+                    self.server.provider,
+                    attribute,
+                    ProviderError(code, message, status=503, retryable=True),
+                )
+                status, payload, headers = self.request(path, token="reader-token")
+                self.assertEqual(status, 503)
+                self.assertEqual(json.loads(payload)["error"]["code"], code)
+                self.assertEqual(headers["YLX-Error-Code"], code)
+
+            with self.subTest(path=path, kind="unknown"):
+                setattr(
+                    self.server.provider,
+                    attribute,
+                    ProviderError(
+                        "unexpected_network_error",
+                        "must-not-leak-provider-detail",
+                        status=503,
+                        retryable=True,
+                    ),
+                )
+                status, payload, headers = self.request(path, token="reader-token")
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+                self.assertNotIn(b"must-not-leak-provider-detail", payload)
+                self.assertIsNone(headers["YLX-Error-Code"])
+
+            setattr(self.server.provider, attribute, None)
+
     def test_network_mutation_routes_fail_closed_before_side_effects(self) -> None:
         apply_body = {
             "schema": "ylx.network-apply-request.v1",
@@ -1178,6 +1636,7 @@ class GatewayHttpTest(unittest.TestCase):
                 "mode": "wifi-client",
                 "wifi_client": {
                     "ssid": "studio-wifi",
+                    "security": "wpa2-personal",
                     "credential_ref": "cred-setup-token-001",
                 },
                 "ethernet": None,
@@ -1192,7 +1651,10 @@ class GatewayHttpTest(unittest.TestCase):
             body=apply_body,
         )
         self.assertEqual(status, 503)
-        self.assertEqual(json.loads(payload)["error"]["code"], "network_mutation_unavailable")
+        unavailable = json.loads(payload)["error"]
+        self.assertEqual(unavailable["code"], "network_mutation_unavailable")
+        self.assertTrue(unavailable["retryable"])
+        self.assertEqual(unavailable["details"], {"reason": "not_enabled"})
         self.assertEqual(response_headers["YLX-Error-Code"], "network_mutation_unavailable")
         self.assertEqual(len(self.server.provider.network_commands), 1)
 
@@ -1224,6 +1686,24 @@ class GatewayHttpTest(unittest.TestCase):
         )
 
         self.server.provider.network_commands.clear()
+        self.server.provider.network_errors["apply"] = ProviderError(
+            "network_mutation_unavailable",
+            "malformed typed error",
+            status=503,
+            retryable=True,
+        )
+        status, payload, response_headers = self.request(
+            "/api/v4/network/apply",
+            token="reader-token",
+            headers={"Origin": self.base, "Idempotency-Key": "malformed-network-error"},
+            body=apply_body,
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+        self.assertIsNone(response_headers["YLX-Error-Code"])
+        self.server.provider.network_errors.clear()
+
+        self.server.provider.network_commands.clear()
         status, payload, _ = self.request(
             "/api/v4/network/apply",
             token="reader-token",
@@ -1244,6 +1724,7 @@ class GatewayHttpTest(unittest.TestCase):
                     "mode": "wifi-client",
                     "wifi_client": {
                         "ssid": "studio-wifi",
+                        "security": "wpa2-personal",
                         "credential_ref": "cred-setup-token-001",
                         "psk": "must-not-pass",
                     },
@@ -1271,7 +1752,7 @@ class GatewayHttpTest(unittest.TestCase):
             0,
             lab_provider,
             security=SecurityPolicy.lab(
-                allowed_operations={"getNetworkStatus", "streamNetworkEvents"},
+                allowed_operations={"getNetworkStatus", "scanNetworks", "streamNetworkEvents"},
                 allowed_origins={self.base},
             ),
         )
@@ -1280,6 +1761,41 @@ class GatewayHttpTest(unittest.TestCase):
         try:
             connection = http.client.HTTPConnection("127.0.0.1", lab_server.server_port, timeout=2)
             try:
+                connection.request("GET", "/api/v4/network")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                lab_status = json.loads(response.read())
+                self.assertFalse(lab_status["mutation_capability"]["enabled"])
+                self.assertEqual(
+                    lab_status["mutation_capability"]["disabled_reason"],
+                    "auth_profile_unavailable",
+                )
+
+                connection.request("GET", "/api/v4/network/scan")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read()), NETWORK_SCAN)
+
+                credential_body = json.dumps(
+                    {
+                        "schema": "ylx.network-credential-request.v1",
+                        "passphrase": "must-not-reach-provider",
+                    }
+                ).encode()
+                connection.request(
+                    "POST",
+                    "/api/v4/network/credentials",
+                    body=credential_body,
+                    headers={
+                        "Origin": self.base,
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                self.assertEqual(json.loads(response.read())["error"]["code"], "forbidden")
+                self.assertEqual(lab_provider.network_credentials, [])
+
                 body = json.dumps(apply_body).encode()
                 connection.request(
                     "POST",
@@ -1317,6 +1833,7 @@ class GatewayHttpTest(unittest.TestCase):
                     "mode": "wifi-client",
                     "wifi_client": {
                         "ssid": "studio-wifi",
+                        "security": "wpa2-personal",
                         "credential_ref": "cred-setup-token-001",
                     },
                     "ethernet": None,
@@ -1617,6 +2134,18 @@ class GatewayHttpTest(unittest.TestCase):
                 "GET",
                 "authorization, last-event-id",
                 {"authorization", "last-event-id"},
+            ),
+            (
+                "/api/v4/network/scan",
+                "GET",
+                "authorization",
+                {"authorization"},
+            ),
+            (
+                "/api/v4/network/credentials",
+                "POST",
+                "authorization, content-type, x-csrf-token",
+                {"authorization", "content-type", "x-csrf-token"},
             ),
             (
                 "/api/v4/network/apply",

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import signal
+import ssl
+import stat
 import threading
 import time
 import uuid
@@ -17,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from rp_ylx import __commit__, __version__
-from rp_ylx.api import AuditEvent, SecurityPolicy, create_gateway_server
+from rp_ylx.api import AuditEvent, Principal, SecurityPolicy, create_gateway_server
 from rp_ylx.api.events import EventReplayBuffer
 from rp_ylx.api.preview import LatestPreviewBuffer
 from rp_ylx.camera import (
@@ -52,12 +55,21 @@ LAB_OPERATIONS = frozenset(
         "getPreview",
         "getCameraFocus",
         "getNetworkStatus",
+        "scanNetworks",
         "streamNetworkEvents",
         "setCameraFocus",
         "headSessionArtifact",
         "getSessionArtifact",
         "startCapture",
         "stopCapture",
+    }
+)
+CUSTOMER_OPERATIONS = LAB_OPERATIONS | frozenset(
+    {
+        "createNetworkCredentialReference",
+        "applyNetworkDesiredState",
+        "retryNetworkTransaction",
+        "forgetNetworkClientProfile",
     }
 )
 
@@ -80,6 +92,11 @@ class ProductionConfig:
     device_label: str
     hardware_fingerprint: str
     isolated_network: bool
+    security_profile: str = "lab"
+    bearer_token_file: Path | None = None
+    tls_certificate_file: Path | None = None
+    tls_private_key_file: Path | None = None
+    principal_id: str = "device-owner"
     data_plane: str = "rust"
     width: int = 3840
     height: int = 1080
@@ -121,6 +138,31 @@ class ProductionConfig:
             or not self.hardware_fingerprint.startswith("sha256:")
             or any(
                 character not in "0123456789abcdef" for character in self.hardware_fingerprint[7:]
+            )
+            or self.security_profile not in {"customer", "lab"}
+            or (
+                self.security_profile == "lab"
+                and any(
+                    path is not None
+                    for path in (
+                        self.bearer_token_file,
+                        self.tls_certificate_file,
+                        self.tls_private_key_file,
+                    )
+                )
+            )
+            or (
+                self.security_profile == "customer"
+                and (
+                    self.bearer_token_file is None
+                    or not self.bearer_token_file.is_absolute()
+                    or self.tls_certificate_file is None
+                    or not self.tls_certificate_file.is_absolute()
+                    or self.tls_private_key_file is None
+                    or not self.tls_private_key_file.is_absolute()
+                    or not 1 <= len(self.principal_id) <= 128
+                    or any(not 0x21 <= ord(character) <= 0x7E for character in self.principal_id)
+                )
             )
             or self.width <= 0
             or self.width % 2
@@ -178,6 +220,29 @@ def load_production_config(path: str | Path) -> ProductionConfig:
     device = value["device"]
     security = value["security"]
     audio = value.get("audio")
+    security_profile = security.get("profile") if isinstance(security, dict) else None
+    security_valid = (
+        isinstance(security, dict)
+        and type(security.get("isolated_network")) is bool
+        and (
+            security_profile == "lab"
+            and set(security) == {"profile", "isolated_network"}
+            or security_profile == "customer"
+            and set(security)
+            == {
+                "profile",
+                "isolated_network",
+                "bearer_token_file",
+                "tls_certificate_file",
+                "tls_private_key_file",
+                "principal_id",
+            }
+            and isinstance(security.get("bearer_token_file"), str)
+            and isinstance(security.get("tls_certificate_file"), str)
+            and isinstance(security.get("tls_private_key_file"), str)
+            and isinstance(security.get("principal_id"), str)
+        )
+    )
     if (
         value["schema"] != PRODUCTION_CONFIG_SCHEMA
         or not all(isinstance(item, dict) for item in (listen, camera, storage, device, security))
@@ -195,9 +260,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         or (audio is not None and type(audio.get("enabled")) is not bool)
         or set(storage) != {"mountpoint", "minimum_available_bytes", "minimum_available_inodes"}
         or set(device) != {"device_id", "device_label", "hardware_fingerprint"}
-        or set(security) != {"profile", "isolated_network"}
-        or security.get("profile") != "lab"
-        or type(security.get("isolated_network")) is not bool
+        or not security_valid
     ):
         raise ProductionConfigError("生产配置结构无效")
     try:
@@ -211,6 +274,19 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             device_label=str(device["device_label"]),
             hardware_fingerprint=str(device["hardware_fingerprint"]),
             isolated_network=security["isolated_network"],
+            security_profile=str(security_profile),
+            bearer_token_file=(
+                None if security_profile == "lab" else Path(str(security["bearer_token_file"]))
+            ),
+            tls_certificate_file=(
+                None if security_profile == "lab" else Path(str(security["tls_certificate_file"]))
+            ),
+            tls_private_key_file=(
+                None if security_profile == "lab" else Path(str(security["tls_private_key_file"]))
+            ),
+            principal_id=(
+                "device-owner" if security_profile == "lab" else str(security["principal_id"])
+            ),
             data_plane=str(camera.get("data_plane", "rust")),
             width=_integer(camera["width"], "camera.width"),
             height=_integer(camera["height"], "camera.height"),
@@ -233,6 +309,89 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         )
     except KeyError as error:
         raise ProductionConfigError(f"生产配置缺少字段：{error}") from error
+
+
+def _read_bearer_token(path: Path) -> str:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ProductionConfigError("Bearer token 文件必须是普通文件且不能是符号链接")
+            if metadata.st_mode & 0o027:
+                raise ProductionConfigError("Bearer token 文件权限必须禁止组写入和其他用户访问")
+            raw = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+    except ProductionConfigError:
+        raise
+    except OSError as error:
+        raise ProductionConfigError("无法读取 Bearer token 文件") from error
+    if len(raw) > 4096:
+        raise ProductionConfigError("Bearer token 文件过大")
+    try:
+        token = raw.rstrip(b"\r\n").decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ProductionConfigError("Bearer token 必须是 ASCII") from error
+    if (
+        not 32 <= len(token) <= 512
+        or any(not 0x21 <= ord(character) <= 0x7E for character in token)
+        or raw.rstrip(b"\r\n") != raw.removesuffix(b"\n").removesuffix(b"\r")
+    ):
+        raise ProductionConfigError("Bearer token 格式无效")
+    return token
+
+
+def _security_policy(config: ProductionConfig) -> SecurityPolicy:
+    if config.security_profile == "lab":
+        return SecurityPolicy.lab(allowed_operations=LAB_OPERATIONS)
+    assert config.bearer_token_file is not None
+    token = _read_bearer_token(config.bearer_token_file)
+    principal = Principal(
+        config.principal_id,
+        permissions={operation: None for operation in CUSTOMER_OPERATIONS},
+    )
+    return SecurityPolicy.customer(tokens={token: principal}, csrf_token=token)
+
+
+def _validate_tls_file(path: Path, *, private: bool) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise ProductionConfigError("无法读取 TLS 文件") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ProductionConfigError("TLS 文件必须是普通文件且不能是符号链接")
+    if private and metadata.st_mode & 0o027:
+        raise ProductionConfigError("TLS 私钥权限必须禁止组写入和其他用户访问")
+
+
+def _enable_customer_tls(server: Any, config: ProductionConfig) -> None:
+    if config.security_profile != "customer":
+        return
+    assert config.tls_certificate_file is not None
+    assert config.tls_private_key_file is not None
+    _validate_tls_file(config.tls_certificate_file, private=False)
+    _validate_tls_file(config.tls_private_key_file, private=True)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(
+            certfile=str(config.tls_certificate_file),
+            keyfile=str(config.tls_private_key_file),
+        )
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    except (OSError, ssl.SSLError) as error:
+        raise ProductionConfigError("无法启用 Customer TLS") from error
 
 
 def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
@@ -404,7 +563,7 @@ def build_production_service(
     camera_backend_factory: Callable[[], object] | None = None,
     imu_source_factory: Callable[[Path], object] | None = None,
     mount_checker: Callable[[Path], bool] | None = None,
-    mdns_publisher_factory: Callable[[int], MdnsPublisher] | None = None,
+    mdns_publisher_factory: Callable[[int, str], MdnsPublisher] | None = None,
 ) -> ProductionService:
     if __commit__ == "unknown" or len(__commit__) != 40:
         raise ProductionConfigError("生产服务必须从带精确提交身份的安装包启动")
@@ -611,7 +770,7 @@ def build_production_service(
             sources=sources,
             metrics=metrics,
         )
-        security = SecurityPolicy.lab(allowed_operations=LAB_OPERATIONS)
+        security = _security_policy(config)
         event_buffer = EventReplayBuffer()
         server = create_gateway_server(
             config.host,
@@ -620,10 +779,15 @@ def build_production_service(
             security=security,
             audit_sink=_audit_sink(config.state_root / "api-audit.ndjson"),
             event_buffer=event_buffer,
+            external_scheme="https" if config.security_profile == "customer" else "http",
         )
+        _enable_customer_tls(server, config)
         event_pump = CaptureEventPump(coordinator, event_buffer)
         publisher_factory = mdns_publisher_factory or MdnsPublisher
-        mdns_publisher = publisher_factory(config.port)
+        mdns_publisher = publisher_factory(
+            config.port,
+            "https" if config.security_profile == "customer" else "http",
+        )
         mdns_publisher.start()
     except BaseException:
         if mdns_publisher is not None:

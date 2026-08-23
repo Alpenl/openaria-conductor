@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "3d419ab5b86ac48306db92cd08a0806c2dc8168b12d4e8d4e643bfa24b7e8e84",
-        "bytes": 103_455,
+        "sha256": "75f380e09a17972f65b6e64848be9754e7b730f88aa53bd7f3899f4b24e4da63",
+        "bytes": 115_169,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -89,6 +89,8 @@ ROUTE_GOLDENS = {
     "v4": COMMON_ROUTE_GOLDEN
     | {
         ("/network", "get", "getNetworkStatus"),
+        ("/network/scan", "get", "scanNetworks"),
+        ("/network/credentials", "post", "createNetworkCredentialReference"),
         ("/network/events", "get", "streamNetworkEvents"),
         ("/network/apply", "post", "applyNetworkDesiredState"),
         ("/network/retry", "post", "retryNetworkTransaction"),
@@ -420,7 +422,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
         security = SecurityPolicy.customer(
             tokens={"wire-token": Principal("wire-reader", permissions=operations)},
             allowed_origins=set(),
-            csrf_token=None,
+            csrf_token="wire-token",
         )
         self.server = create_gateway_server("127.0.0.1", 0, _WireProvider(), security=security)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -445,6 +447,8 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
             headers["Authorization"] = f"Bearer {token}"
         if body is not None:
             headers["Content-Type"] = "application/json"
+            headers["Origin"] = self.base_url
+            headers["X-CSRF-Token"] = "wire-token"
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         request = Request(self.base_url + path, headers=headers, data=body)

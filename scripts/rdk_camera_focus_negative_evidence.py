@@ -19,6 +19,7 @@ import json
 import os
 import re
 import signal
+import ssl
 import stat
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib import error, request
+from urllib.parse import urlsplit
 from uuid import UUID
 
 UTC = timezone.utc  # noqa: UP017 - the deployed RDK system Python may be 3.10.
@@ -171,6 +173,9 @@ class CollectionConfig:
     expected_commit: str
     device: str = DEFAULT_DEVICE
     watchdog_seconds: float = 30.0
+    base_url: str = DEFAULT_BASE_URL
+    ca_certificate: Path | None = None
+    bearer_token_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -573,6 +578,39 @@ class _CommandResult:
     error_code: str | None
 
 
+def _read_private_ascii(path: Path) -> str:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o027:
+            raise EvidenceError("credential_file_permissions", phase="configuration")
+        raw = os.read(descriptor, 4097)
+    except EvidenceError:
+        raise
+    except OSError as exc:
+        raise EvidenceError("credential_file_unavailable", phase="configuration") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > 4096:
+        raise EvidenceError("credential_file_too_large", phase="configuration")
+    try:
+        value = raw.rstrip(b"\r\n").decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise EvidenceError("credential_file_invalid", phase="configuration") from exc
+    if (
+        not 32 <= len(value) <= 512
+        or any(not 0x21 <= ord(character) <= 0x7E for character in value)
+        or raw.rstrip(b"\r\n") != raw.removesuffix(b"\n").removesuffix(b"\r")
+    ):
+        raise EvidenceError("credential_file_invalid", phase="configuration")
+    return value
+
+
 class SystemRuntime:
     def __init__(
         self,
@@ -580,10 +618,40 @@ class SystemRuntime:
         sys_root: Path = Path("/sys"),
         dev_root: Path = Path("/dev"),
         base_url: str = DEFAULT_BASE_URL,
+        ca_certificate: Path | None = None,
+        bearer_token_file: Path | None = None,
     ) -> None:
         self.sys_root = sys_root
         self.dev_root = dev_root
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise EvidenceError("health_url_not_allowed", phase="configuration")
+        if bearer_token_file is not None and parsed.scheme != "https":
+            raise EvidenceError("authenticated_http_forbidden", phase="configuration")
+        if parsed.scheme == "https" and ca_certificate is None:
+            raise EvidenceError("tls_ca_required", phase="configuration")
         self.base_url = base_url.rstrip("/")
+        self._authorization = (
+            None
+            if bearer_token_file is None
+            else f"Bearer {_read_private_ascii(bearer_token_file)}"
+        )
+        try:
+            self._ssl_context = (
+                None
+                if ca_certificate is None
+                else ssl.create_default_context(cafile=str(ca_certificate))
+            )
+        except (OSError, ssl.SSLError) as exc:
+            raise EvidenceError("tls_ca_unavailable", phase="configuration") from exc
 
     def now(self) -> str:
         return _utc_now()
@@ -630,16 +698,19 @@ class SystemRuntime:
         return _CommandResult(completed.returncode, stdout, None)
 
     def _capture_status(self) -> dict[str, Any]:
+        headers = {"Accept": "application/json"}
+        if self._authorization is not None:
+            headers["Authorization"] = self._authorization
         probe = request.Request(
             f"{self.base_url}/api/v4/capture/status",
-            headers={"Accept": "application/json"},
+            headers=headers,
             method="GET",
         )
         status: int | None = None
         body: bytes = b""
         error_code: str | None = None
         try:
-            with request.urlopen(probe, timeout=3.0) as response:
+            with request.urlopen(probe, timeout=3.0, context=self._ssl_context) as response:
                 status = response.status
                 body = response.read(MAX_HTTP_BYTES + 1)
         except error.HTTPError as exc:
@@ -1618,6 +1689,7 @@ def _post_checks(
 
 
 def _initial_report(config: CollectionConfig, now: str) -> dict[str, Any]:
+    health_url = urlsplit(config.base_url)
     return {
         "schema": SCHEMA,
         "collector": {
@@ -1633,6 +1705,8 @@ def _initial_report(config: CollectionConfig, now: str) -> dict[str, Any]:
             "expected_commit": config.expected_commit,
             "query_node": config.device,
             "watchdog_seconds": config.watchdog_seconds,
+            "health_transport": health_url.scheme,
+            "health_authenticated": config.bearer_token_file is not None,
         },
         "read_only_contract": {
             "uvc_query_codes": {
@@ -1708,7 +1782,11 @@ def collect_evidence(
     runtime: Runtime | None = None,
     writer: AtomicCheckpoint | None = None,
 ) -> dict[str, Any]:
-    runtime = runtime or SystemRuntime()
+    runtime = runtime or SystemRuntime(
+        base_url=config.base_url,
+        ca_certificate=config.ca_certificate,
+        bearer_token_file=config.bearer_token_file,
+    )
     writer = writer or AtomicCheckpoint(config.output)
     report = _initial_report(config, runtime.now())
 
@@ -1918,6 +1996,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--watchdog-seconds", type=float, default=30.0)
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--ca-certificate", type=Path)
+    parser.add_argument("--bearer-token-file", type=Path)
     return parser
 
 
@@ -1928,6 +2009,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--device must match /dev/videoN")
     if not 1.0 <= args.watchdog_seconds <= 300.0:
         raise SystemExit("--watchdog-seconds must be between 1 and 300")
+    try:
+        SystemRuntime(
+            base_url=args.base_url,
+            ca_certificate=args.ca_certificate,
+            bearer_token_file=args.bearer_token_file,
+        )
+    except EvidenceError as exc:
+        raise SystemExit(f"invalid health transport: {exc.code}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1938,6 +2027,9 @@ def main(argv: list[str] | None = None) -> int:
         expected_commit=args.expected_commit,
         device=args.device,
         watchdog_seconds=args.watchdog_seconds,
+        base_url=args.base_url,
+        ca_certificate=args.ca_certificate,
+        bearer_token_file=args.bearer_token_file,
     )
     try:
         report = collect_evidence(config)

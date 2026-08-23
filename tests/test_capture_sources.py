@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -557,6 +558,21 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.environment_patcher = patch.dict(
+            os.environ,
+            {"RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.root / "network-operation.lock")},
+        )
+        self.environment_patcher.start()
+        self.network_control_patcher = patch(
+            "rp_ylx.recording.coordinator.request_network_control",
+            return_value={
+                "ok": True,
+                "operation": "status",
+                "status": 200,
+                "body": {"transaction": {"current": None}},
+            },
+        )
+        self.network_control_patcher.start()
         self.volume = self.root / "volume"
         self.volume.mkdir()
         initialize_capture_volume(self.volume)
@@ -579,6 +595,8 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.network_control_patcher.stop()
+        self.environment_patcher.stop()
         self.temporary.cleanup()
 
     def start(self, coordinator: CaptureCoordinator, *, key: str) -> str:

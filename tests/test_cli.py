@@ -14,6 +14,7 @@ from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
 from rp_ylx.cli import build_parser, main
 from rp_ylx.hardware import HardwareSmokeError
 from rp_ylx.native import NativeCapabilities
+from rp_ylx.network_control import NetworkControlClientError
 from rp_ylx.performance import BenchmarkError
 from rp_ylx.recording import (
     DeviceSessionConfig,
@@ -117,6 +118,62 @@ class CliTest(unittest.TestCase):
         rendered = json.loads(error.getvalue())
         self.assertEqual(rendered["error"]["code"], "service_start_failed")
         self.assertNotIn("Traceback", error.getvalue())
+
+    def test_network_control_desired_mode_is_secret_free_and_fails_closed(self) -> None:
+        output = io.StringIO()
+        with (
+            patch(
+                "rp_ylx.network_control.request_control",
+                return_value={
+                    "schema": "ylx.network-control-response.v1",
+                    "ok": True,
+                    "operation": "status",
+                    "status": 200,
+                    "body": {"desired": {"mode": "hotspot"}},
+                },
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(["network-control", "desired-mode"]), 0)
+        self.assertEqual(output.getvalue(), "hotspot\n")
+
+        error = io.StringIO()
+        with (
+            patch(
+                "rp_ylx.network_control.request_control",
+                side_effect=NetworkControlClientError("unavailable", "socket missing"),
+            ),
+            redirect_stderr(error),
+        ):
+            self.assertEqual(main(["network-control", "desired-mode"]), 1)
+        self.assertEqual(error.getvalue(), "unavailable\n")
+
+    def test_network_control_watchdog_mode_defers_active_and_rescued_transactions(self) -> None:
+        base = {
+            "schema": "ylx.network-control-response.v1",
+            "ok": True,
+            "operation": "status",
+            "status": 200,
+            "body": {
+                "desired": {"mode": "wifi-client"},
+                "transaction": {"current": None, "latest": {"status": "committed"}},
+            },
+        }
+        for transaction, expected in (
+            ({"current": None, "latest": {"status": "committed"}}, "wifi-client\n"),
+            ({"current": {"status": "running"}, "latest": None}, "defer\n"),
+            ({"current": None, "latest": {"status": "rescued"}}, "defer\n"),
+            ({"current": None, "latest": {"status": "failed"}}, "defer\n"),
+        ):
+            with self.subTest(expected=expected, transaction=transaction):
+                response = {**base, "body": {**base["body"], "transaction": transaction}}
+                output = io.StringIO()
+                with (
+                    patch("rp_ylx.network_control.request_control", return_value=response),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(main(["network-control", "watchdog-mode"]), 0)
+                self.assertEqual(output.getvalue(), expected)
 
     def test_volume_init_is_explicit_and_machine_readable(self) -> None:
         output = io.StringIO()

@@ -4,7 +4,13 @@ import time
 import unittest
 from unittest.mock import patch
 
-from rp_ylx.mdns import MDNS_HOSTNAME, MDNS_SERVICE_TYPES, MdnsPublisher, runtime_ipv4_addresses
+from rp_ylx.mdns import (
+    CUSTOMER_MDNS_SERVICE_TYPES,
+    MDNS_HOSTNAME,
+    MDNS_SERVICE_TYPES,
+    MdnsPublisher,
+    runtime_ipv4_addresses,
+)
 
 
 class FakeResponder:
@@ -63,6 +69,8 @@ class MdnsPublisherTest(unittest.TestCase):
                 self.assertEqual(service.server, MDNS_HOSTNAME)
                 self.assertEqual(service.port, 8080)
                 self.assertEqual(service.parsed_addresses(), ["198.51.100.36"])
+                self.assertEqual(service.properties[b"scheme"], b"http")
+                self.assertEqual(service.properties[b"api"], b"/api/v4/device")
                 self.assertEqual(options, {"allow_name_change": True})
 
             current[0] = ("198.51.100.37",)
@@ -74,6 +82,33 @@ class MdnsPublisherTest(unittest.TestCase):
             current[0] = ()
             self._wait_for(lambda: responders[1].closed)
             self.assertEqual(len(responders[1].unregistered), 2)
+        finally:
+            publisher.close()
+
+    def test_customer_publisher_advertises_https_without_http_alias(self) -> None:
+        responders: list[FakeResponder] = []
+
+        def factory(addresses: tuple[str, ...]) -> FakeResponder:
+            responder = FakeResponder(addresses)
+            responders.append(responder)
+            return responder
+
+        publisher = MdnsPublisher(
+            8080,
+            scheme="https",
+            address_provider=lambda: ("198.51.100.36",),
+            responder_factory=factory,
+            interval=0.01,
+        )
+        publisher.start()
+        try:
+            self._wait_for(lambda: len(responders) == 1)
+            services = [service for service, _ in responders[0].registered]
+            self.assertEqual(
+                {service.type for service in services}, set(CUSTOMER_MDNS_SERVICE_TYPES)
+            )
+            self.assertNotIn("_http._tcp.local.", {service.type for service in services})
+            self.assertTrue(all(service.properties[b"scheme"] == b"https" for service in services))
         finally:
             publisher.close()
 
