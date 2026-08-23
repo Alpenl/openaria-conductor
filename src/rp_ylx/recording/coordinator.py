@@ -22,12 +22,19 @@ from rp_ylx.api.downloads import (
     DirectorySessionStore,
 )
 from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
-from rp_ylx.api.gateway import CaptureCommand, CaptureCommandResult, ProviderError
+from rp_ylx.api.gateway import (
+    CaptureCommand,
+    CaptureCommandResult,
+    NetworkCommand,
+    NetworkCommandResult,
+    ProviderError,
+)
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.network import NetworkError
 from rp_ylx.network import network_status as collect_network_status
+from rp_ylx.network import network_status_v1 as project_network_status_v1
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -1081,7 +1088,9 @@ class CaptureCoordinator:
 
     def network_status(self) -> Mapping[str, object]:
         try:
-            return collect_network_status()
+            legacy_status = collect_network_status()
+            runtime = self._runtime_snapshot()
+            return project_network_status_v1(runtime, legacy_status=legacy_status)
         except NetworkError as error:
             raise ProviderError(
                 error.code,
@@ -1089,6 +1098,27 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
+
+    @staticmethod
+    def _network_mutation_unavailable() -> ProviderError:
+        return ProviderError(
+            "network_mutation_unavailable",
+            "网络写入控制器尚未启用",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            retryable=True,
+        )
+
+    def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult:
+        del command
+        raise self._network_mutation_unavailable()
+
+    def retry_network_transaction(self, command: NetworkCommand) -> NetworkCommandResult:
+        del command
+        raise self._network_mutation_unavailable()
+
+    def forget_network_client_profile(self, command: NetworkCommand) -> NetworkCommandResult:
+        del command
+        raise self._network_mutation_unavailable()
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
         with self._lock:

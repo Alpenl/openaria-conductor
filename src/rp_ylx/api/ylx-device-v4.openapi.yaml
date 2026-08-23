@@ -26,7 +26,7 @@ x-ylx-security-profiles:
     standard_openapi_security: bearer-only-authority
     description: Every operation requires a customer-issued bearer token.
     destructive_mutation: not-enabled
-    network_mutation: not-enabled
+    network_mutation: enabled-idempotent-async
   lab:
     authentication: none
     standard_openapi_resolution: explicit-lab-profile-artifact-required
@@ -49,6 +49,7 @@ x-ylx-security-profiles:
       - getPreview
       - getCameraFocus
       - getNetworkStatus
+      - streamNetworkEvents
       - setCameraFocus
       - listSessions
       - getSession
@@ -444,18 +445,18 @@ paths:
     get:
       tags: [Device]
       operationId: getNetworkStatus
-      summary: Read NetworkManager capabilities, device states, and mDNS coordinates
+      summary: Read desired, observed, capability, and transaction network state
       description: |
-        This resource is read-only and has no NetworkManager side effects. The supported
-        mode inventory does not imply that network mutation is currently enabled; clients
-        continue to use DeviceDescriptor.capabilities.network_mutation as the write gate.
-        No Wi-Fi secret, saved profile, credential, or mutation receipt is returned.
+        This resource has no NetworkManager side effects. It separates the saved desired
+        network intent, current observed NetworkManager/mDNS state, current/latest async
+        mutation transaction, mutation capability, and concurrency capability. It never
+        returns a Wi-Fi secret, credential value, PSK, password, or bearer credential.
       x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
       responses:
         "200":
-          description: Current read-only network status
+          description: Current network status, safe for polling and recovery after SSE loss
           headers:
             Cache-Control:
               schema:
@@ -477,6 +478,190 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /network/events:
+    get:
+      tags: [Device]
+      operationId: streamNetworkEvents
+      summary: Stream network status and transaction changes through Server-Sent Events
+      description: |
+        SSE id values and NetworkEvent.sse_delivery_id are the same decimal transport
+        delivery sequence. Clients reconnect with Last-Event-ID; the server first emits
+        a snapshot when the requested delivery ID is no longer in its bounded replay
+        buffer. Event names are snapshot and transaction. Each data field is one compact
+        JSON NetworkEvent. Heartbeats are SSE comments and do not advance delivery IDs.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      x-sse-data-schema:
+        $ref: "#/components/schemas/NetworkEvent"
+      parameters:
+        - $ref: "#/components/parameters/LastEventId"
+      responses:
+        "200":
+          description: Open SSE stream; reconnect using the most recently processed id field
+          headers:
+            Cache-Control:
+              description: SSE responses are never cached
+              schema:
+                type: string
+                const: no-cache
+            X-Accel-Buffering:
+              description: Reverse proxies must not buffer the stream
+              schema:
+                type: string
+                const: "no"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                id: 208
+                event: transaction
+                data: {"schema":"ylx.network-event.v1","sse_delivery_id":"208","occurred_at":"2026-08-23T11:40:04+08:00","type":"transaction","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","data":{"schema":"ylx.network-transaction.v1","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","operation":"apply","status":"committed","stage":"committed","desired":{"mode":"wifi-client","wifi_client":{"ssid":"studio-wifi","credential_state":"stored"},"ethernet":null},"accepted_at":"2026-08-23T11:39:52+08:00","updated_at":"2026-08-23T11:40:04+08:00","rescue":{"ap_validated":true,"fallback_mode":"hotspot","failure_trigger_seconds":10},"error":null}}
+
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /network/apply:
+    post:
+      tags: [Device]
+      operationId: applyNetworkDesiredState
+      summary: Idempotently accept an async network desired-state change
+      description: |
+        Accepts a desired network state for asynchronous application. The request uses
+        an opaque credential_ref for Wi-Fi client credentials; inline passwords, PSKs,
+        passphrases, tokens, and secret values are not part of this contract and fail
+        closed as unknown fields. The accepted transaction validates the rescue AP first,
+        then applies and verifies the client or wired state. Exclusive client activation
+        has a device-monotonic 10-second failure trigger and falls back to the rescue AP
+        while retaining desired=wifi-client for retry.
+      x-ylx-lab-access: customer-only
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkApplyRequest"
+      responses:
+        "202":
+          description: Network mutation accepted; follow status or network SSE for transaction progress
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTransactionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/NetworkIdempotencyConflict"
+        "422":
+          $ref: "#/components/responses/InvalidNetworkDesiredState"
+        "503":
+          $ref: "#/components/responses/NetworkMutationUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /network/retry:
+    post:
+      tags: [Device]
+      operationId: retryNetworkTransaction
+      summary: Idempotently retry a retained network transaction
+      description: |
+        Re-runs a retained rescued or failed network transaction by transaction_id,
+        preserving its desired state and rescue policy. Replaying the same
+        Idempotency-Key with the same request returns the original accepted receipt;
+        reusing it with different request data returns the typed idempotency conflict.
+      x-ylx-lab-access: customer-only
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkRetryRequest"
+      responses:
+        "202":
+          description: Network retry accepted
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTransactionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NetworkTransactionNotFound"
+        "409":
+          $ref: "#/components/responses/NetworkIdempotencyConflict"
+        "422":
+          $ref: "#/components/responses/InvalidNetworkDesiredState"
+        "503":
+          $ref: "#/components/responses/NetworkMutationUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /network/forget:
+    post:
+      tags: [Device]
+      operationId: forgetNetworkClientProfile
+      summary: Idempotently forget the saved Wi-Fi client profile
+      description: |
+        Erases the saved Wi-Fi client profile and credential material, commits
+        desired=hotspot, and makes later boots AP-only until a new apply transaction is
+        accepted. The response never echoes deleted credential material.
+      x-ylx-lab-access: customer-only
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkForgetRequest"
+      responses:
+        "202":
+          description: Forget transaction accepted
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkTransactionReceipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/NetworkIdempotencyConflict"
+        "503":
+          $ref: "#/components/responses/NetworkMutationUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /sessions:
     get:
       tags: [Sessions]
@@ -920,6 +1105,54 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/InvalidCameraFocusError"
+    NetworkMutationUnavailable:
+      description: Network mutation is temporarily unavailable before NetworkManager side effects start
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: network_mutation_unavailable
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/NetworkMutationUnavailableError"
+    InvalidNetworkDesiredState:
+      description: Requested network desired state is well formed but rejected by admission policy
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: invalid_network_desired_state
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/InvalidNetworkDesiredStateError"
+    NetworkIdempotencyConflict:
+      description: Idempotency-Key was reused with a different network mutation request
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: idempotency_conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/NetworkIdempotencyConflictError"
+    NetworkTransactionNotFound:
+      description: Requested retained network transaction does not exist
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: network_transaction_not_found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/NetworkTransactionNotFoundError"
     SessionNotVerified:
       description: |
         The sealed session or artifact exists, but the gateway has no current usable
@@ -1085,8 +1318,11 @@ components:
             range_download:
               const: true
             network_mutation:
-              const: false
-              description: Network mutation is not exposed by this contract; DX-05 owns any future product route.
+              type: boolean
+              description: |
+                True when the customer-authenticated async /network/apply, /network/retry,
+                and /network/forget routes are wired for this runtime. Clients still read
+                NetworkStatus.mutation_capability before enabling controls.
         storage:
           type: object
           additionalProperties: false
@@ -1164,68 +1400,433 @@ components:
     NetworkStatus:
       type: object
       additionalProperties: false
-      required: [format, capabilities, mdns, devices]
+      required:
+        - schema
+        - observed_at
+        - desired
+        - observed
+        - transaction
+        - mutation_capability
+        - concurrency_capability
       properties:
-        format:
+        schema:
+          const: ylx.network-status.v1
+        observed_at:
           type: string
-          const: ylx.network-status.v0
-        capabilities:
-          type: object
-          additionalProperties: false
-          required: [modes, wifi_interface, ethernet_interface, second_wifi]
-          properties:
-            modes:
-              type: array
-              const: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
-              items:
-                enum: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
-            wifi_interface:
-              type: string
-              pattern: '^[A-Za-z0-9_.:-]{1,64}$'
-            ethernet_interface:
-              type: string
-              pattern: '^[A-Za-z0-9_.:-]{1,64}$'
-            second_wifi:
-              type: boolean
+          format: date-time
+        desired:
+          $ref: "#/components/schemas/NetworkDesiredState"
+        observed:
+          $ref: "#/components/schemas/NetworkObservedState"
+        transaction:
+          $ref: "#/components/schemas/NetworkTransactionWindow"
+        mutation_capability:
+          $ref: "#/components/schemas/NetworkMutationCapability"
+        concurrency_capability:
+          $ref: "#/components/schemas/NetworkConcurrencyCapability"
+      description: |
+        Secret-free network status. It never contains Wi-Fi password, PSK,
+        passphrase, bearer token, or raw credential material.
+    NetworkDesiredState:
+      type: object
+      additionalProperties: false
+      required: [mode, wifi_client, ethernet]
+      properties:
+        mode:
+          enum: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
+        wifi_client:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkDesiredWifiClient"
+            - type: "null"
+        ethernet:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkDesiredEthernet"
+            - type: "null"
+      allOf:
+        - if:
+            required: [mode]
+            properties:
+              mode:
+                const: wifi-client
+          then:
+            properties:
+              wifi_client:
+                $ref: "#/components/schemas/NetworkDesiredWifiClient"
+        - if:
+            required: [mode]
+            properties:
+              mode:
+                const: ethernet-static
+          then:
+            properties:
+              ethernet:
+                $ref: "#/components/schemas/NetworkDesiredEthernet"
+    NetworkDesiredWifiClient:
+      type: object
+      additionalProperties: false
+      required: [ssid, credential_state]
+      properties:
+        ssid:
+          type: string
+          minLength: 1
+          maxLength: 32
+        credential_state:
+          enum: [absent, pending_input, stored]
+          description: Whether a credential exists; never the credential value.
+    NetworkDesiredEthernet:
+      type: object
+      additionalProperties: false
+      required: [addressing, static_ipv4]
+      properties:
+        addressing:
+          enum: [dhcp, static]
+        static_ipv4:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkStaticIpv4"
+            - type: "null"
+      allOf:
+        - if:
+            required: [addressing]
+            properties:
+              addressing:
+                const: static
+          then:
+            properties:
+              static_ipv4:
+                $ref: "#/components/schemas/NetworkStaticIpv4"
+    NetworkStaticIpv4:
+      type: object
+      additionalProperties: false
+      required: [address, prefix_length, gateway, dns]
+      properties:
+        address:
+          type: string
+          format: ipv4
+        prefix_length:
+          type: integer
+          minimum: 1
+          maximum: 32
+        gateway:
+          oneOf:
+            - type: string
+              format: ipv4
+            - type: "null"
+        dns:
+          type: array
+          maxItems: 3
+          uniqueItems: true
+          items:
+            type: string
+            format: ipv4
+    NetworkObservedState:
+      type: object
+      additionalProperties: false
+      required: [ap, wifi_client, wired, default_route, mdns, devices]
+      properties:
+        ap:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        wifi_client:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        wired:
+          $ref: "#/components/schemas/NetworkInterfaceStatus"
+        default_route:
+          enum: [wifi_client, wired, none]
+          description: Interface class currently owning the default route
         mdns:
-          type: object
-          additionalProperties: false
-          required: [hostname, service, aliases, port]
-          properties:
-            hostname:
-              type: string
-              pattern: '^[A-Za-z0-9_.-]{1,122}\.local$'
-            service:
-              type: string
-              pattern: '^[A-Za-z0-9_.-]{1,128}$'
-            aliases:
-              type: array
-              maxItems: 16
-              uniqueItems: true
-              items:
-                type: string
-                pattern: '^[A-Za-z0-9_.-]{1,128}$'
-            port:
-              type: integer
-              minimum: 1
-              maximum: 65535
+          $ref: "#/components/schemas/NetworkMdnsStatus"
         devices:
           type: array
           maxItems: 64
           items:
-            type: object
-            additionalProperties: false
-            required: [interface, type, state]
+            $ref: "#/components/schemas/NetworkDeviceStatus"
+    NetworkMdnsStatus:
+      type: object
+      additionalProperties: false
+      required: [hostname, service, aliases, port]
+      properties:
+        hostname:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,122}\.local$'
+        service:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,128}$'
+        aliases:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[A-Za-z0-9_.-]{1,128}$'
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+    NetworkDeviceStatus:
+      type: object
+      additionalProperties: false
+      required: [interface, type, state]
+      properties:
+        interface:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+        type:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+        state:
+          type: string
+          pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+    NetworkMutationCapability:
+      type: object
+      additionalProperties: false
+      required: [enabled, operations, idempotency_key_required, secret_handling, active_state_policy]
+      properties:
+        enabled:
+          type: boolean
+        operations:
+          type: array
+          const: [apply, retry, forget]
+          items:
+            enum: [apply, retry, forget]
+        idempotency_key_required:
+          const: true
+        secret_handling:
+          const: opaque_credential_reference_only
+        active_state_policy:
+          const: idle_only
+    NetworkConcurrencyCapability:
+      type: object
+      additionalProperties: false
+      required:
+        - rescue_ap_required
+        - same_phy_ap_sta
+        - exclusive_client_failure_timeout_seconds
+        - max_managed_interfaces
+        - max_ap_interfaces
+      properties:
+        rescue_ap_required:
+          const: true
+        same_phy_ap_sta:
+          enum: [supported, unsupported, unverified]
+        exclusive_client_failure_timeout_seconds:
+          const: 10
+        max_managed_interfaces:
+          type: integer
+          minimum: 0
+          maximum: 8
+        max_ap_interfaces:
+          type: integer
+          minimum: 0
+          maximum: 8
+    NetworkTransactionWindow:
+      type: object
+      additionalProperties: false
+      required: [current, latest]
+      properties:
+        current:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkTransaction"
+            - type: "null"
+        latest:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkTransaction"
+            - type: "null"
+    NetworkTransaction:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - transaction_id
+        - operation
+        - status
+        - stage
+        - desired
+        - accepted_at
+        - updated_at
+        - rescue
+        - error
+      properties:
+        schema:
+          const: ylx.network-transaction.v1
+        transaction_id:
+          $ref: "#/components/schemas/UuidV7"
+        operation:
+          enum: [apply, retry, forget]
+        status:
+          enum: [accepted, running, committed, rescued, failed]
+        stage:
+          enum:
+            - accepted
+            - validating_rescue_ap
+            - applying_profile
+            - verifying_client
+            - committed
+            - rescued
+            - failed
+            - forgetting
+            - forgotten
+        desired:
+          $ref: "#/components/schemas/NetworkDesiredState"
+        accepted_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        rescue:
+          type: object
+          additionalProperties: false
+          required: [ap_validated, fallback_mode, failure_trigger_seconds]
+          properties:
+            ap_validated:
+              type: boolean
+            fallback_mode:
+              const: hotspot
+            failure_trigger_seconds:
+              const: 10
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkTransactionError"
+            - type: "null"
+    NetworkTransactionError:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code:
+          enum:
+            - rescue_ap_unavailable
+            - credential_rejected
+            - dhcp_timeout
+            - route_lost
+            - network_manager_unavailable
+            - concurrency_unsupported
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+        retryable:
+          type: boolean
+    NetworkApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [schema, desired]
+      properties:
+        schema:
+          const: ylx.network-apply-request.v1
+        desired:
+          $ref: "#/components/schemas/NetworkApplyDesiredState"
+    NetworkApplyDesiredState:
+      type: object
+      additionalProperties: false
+      required: [mode, wifi_client, ethernet]
+      properties:
+        mode:
+          enum: [hotspot, wifi-client, ethernet-dhcp, ethernet-static]
+        wifi_client:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkApplyWifiClient"
+            - type: "null"
+        ethernet:
+          oneOf:
+            - $ref: "#/components/schemas/NetworkDesiredEthernet"
+            - type: "null"
+      allOf:
+        - if:
+            required: [mode]
             properties:
-              interface:
-                type: string
-                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+              mode:
+                const: wifi-client
+          then:
+            properties:
+              wifi_client:
+                $ref: "#/components/schemas/NetworkApplyWifiClient"
+    NetworkApplyWifiClient:
+      type: object
+      additionalProperties: false
+      required: [ssid, credential_ref]
+      properties:
+        ssid:
+          type: string
+          minLength: 1
+          maxLength: 32
+        credential_ref:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^cred-[A-Za-z0-9_.:-]+$'
+          description: Opaque reference to credential material captured outside this JSON payload.
+    NetworkRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [schema, transaction_id]
+      properties:
+        schema:
+          const: ylx.network-retry-request.v1
+        transaction_id:
+          $ref: "#/components/schemas/UuidV7"
+    NetworkForgetRequest:
+      type: object
+      additionalProperties: false
+      required: [schema]
+      properties:
+        schema:
+          const: ylx.network-forget-request.v1
+    NetworkTransactionReceipt:
+      type: object
+      additionalProperties: false
+      required: [schema, accepted_at, transaction]
+      properties:
+        schema:
+          const: ylx.network-transaction-receipt.v1
+        accepted_at:
+          type: string
+          format: date-time
+        transaction:
+          $ref: "#/components/schemas/NetworkTransaction"
+    NetworkEvent:
+      type: object
+      additionalProperties: false
+      required: [schema, sse_delivery_id, occurred_at, type, transaction_id, data]
+      properties:
+        schema:
+          const: ylx.network-event.v1
+        sse_delivery_id:
+          type: string
+          pattern: '^[0-9]+$'
+        occurred_at:
+          type: string
+          format: date-time
+        type:
+          enum: [snapshot, transaction]
+        transaction_id:
+          oneOf:
+            - $ref: "#/components/schemas/UuidV7"
+            - type: "null"
+        data:
+          type: object
+      allOf:
+        - if:
+            required: [type]
+            properties:
               type:
-                type: string
-                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
-              state:
-                type: string
-                pattern: '^[A-Za-z0-9_.:-]{1,64}$'
+                const: snapshot
+          then:
+            properties:
+              transaction_id:
+                type: "null"
+              data:
+                $ref: "#/components/schemas/NetworkStatus"
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: transaction
+          then:
+            properties:
+              transaction_id:
+                $ref: "#/components/schemas/UuidV7"
+              data:
+                $ref: "#/components/schemas/NetworkTransaction"
     NetworkInterfaceStatus:
       type: object
       additionalProperties: false
@@ -2209,3 +2810,140 @@ components:
             details:
               type: object
               additionalProperties: true
+    NetworkMutationUnavailableError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: network_mutation_unavailable
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: true
+            details:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason:
+                  enum:
+                    - network_manager_unavailable
+                    - rescue_ap_not_validated
+                    - capture_active
+                    - unsupported_concurrency
+    InvalidNetworkDesiredStateError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: invalid_network_desired_state
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: false
+            details:
+              type: object
+              additionalProperties: false
+              required: [field, reason]
+              properties:
+                field:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                reason:
+                  enum:
+                    - missing_credential_ref
+                    - unsupported_mode
+                    - invalid_static_ipv4
+                    - unsafe_secret_field
+                    - active_state
+    NetworkIdempotencyConflictError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: idempotency_conflict
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: false
+            details:
+              type: object
+              additionalProperties: false
+              required: [idempotency_scope, original_transaction_id]
+              properties:
+                idempotency_scope:
+                  const: network-mutation
+                original_transaction_id:
+                  oneOf:
+                    - $ref: "#/components/schemas/UuidV7"
+                    - type: "null"
+    NetworkTransactionNotFoundError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: network_transaction_not_found
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: false
+            details:
+              type: object
+              additionalProperties: false
+              required: [transaction_id]
+              properties:
+                transaction_id:
+                  $ref: "#/components/schemas/UuidV7"

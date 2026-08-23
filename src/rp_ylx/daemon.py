@@ -52,6 +52,7 @@ LAB_OPERATIONS = frozenset(
         "getPreview",
         "getCameraFocus",
         "getNetworkStatus",
+        "streamNetworkEvents",
         "setCameraFocus",
         "headSessionArtifact",
         "getSessionArtifact",
