@@ -43,6 +43,7 @@ from rp_ylx.network_state import (
     valid_desired_state,
     valid_transaction,
 )
+from rp_ylx.operational_logging import operational_logger
 
 CONTROL_REQUEST_SCHEMA = "ylx.network-control-request.v1"
 CONTROL_RESPONSE_SCHEMA = "ylx.network-control-response.v1"
@@ -53,6 +54,7 @@ CONTROL_SOCKET_TIMEOUT_SECONDS = 2.0
 NETWORK_HEALTH_POLL_SECONDS = 1.0
 NETWORK_HEALTH_FAILURE_SECONDS = 10.0
 NETWORK_RESCUE_REACHABILITY_SECONDS = 15.0
+NETWORK_MONITOR_ERROR_LOG_INTERVAL_SECONDS = 60.0
 NETWORK_MODES = frozenset({"hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"})
 MUTATION_OPERATIONS = frozenset({"apply", "retry", "forget"})
 ROOT_OPERATIONS = frozenset({"create_credential", "health", "scan", "status"})
@@ -62,6 +64,7 @@ RESPONSE_SECRET_FIELD_NAMES = SECRET_FIELD_NAMES | {"credential", "passphrase"}
 NETWORK_CREDENTIAL_REF = re.compile(r"^cred-[A-Za-z0-9_.:-]+$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 WIFI_SECURITY = frozenset({"open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"})
+_OPERATIONAL_LOG = operational_logger("network-control")
 
 
 class NetworkControlClientError(RuntimeError):
@@ -576,6 +579,10 @@ class NetworkController:
         self._monotonic_ns = monotonic_ns or time.monotonic_ns
         self._health_failure_started_ns: int | None = None
         self._health_fallback_latched = False
+        self._monitor_error_type: str | None = None
+        self._monitor_error_code: str | None = None
+        self._monitor_error_last_logged_ns: int | None = None
+        self._monitor_error_suppressed = 0
         self._closed = False
         self._defer_execution_until_response = defer_execution_until_response
         self._boot_reconcile()
@@ -583,6 +590,94 @@ class NetworkController:
             cleanup_orphan_network_candidates(self._state.retained_profiles())
         if start_worker:
             self.start()
+        snapshot = self._state.snapshot()
+        _OPERATIONAL_LOG.event(
+            "network_controller_started",
+            desired_mode=str(snapshot["desired"]["mode"]),
+            saved=bool(snapshot["saved"]),
+            verified=bool(snapshot["verified"]),
+            active_transaction=isinstance(snapshot["transaction"]["current"], Mapping),
+            worker_enabled=start_worker,
+            poll_seconds=self._health_poll_seconds,
+        )
+
+    @staticmethod
+    def _error_code(error: BaseException, fallback: str) -> str:
+        code = getattr(error, "code", fallback)
+        return code if isinstance(code, str) else fallback
+
+    def _log_transaction_accepted(
+        self,
+        operation: str,
+        receipt: Mapping[str, Any],
+        *,
+        replayed: bool,
+        reason: str | None = None,
+    ) -> None:
+        transaction = receipt.get("transaction")
+        if not isinstance(transaction, Mapping):
+            return
+        context: dict[str, object] = {
+            "operation": operation,
+            "transaction_id": transaction.get("transaction_id"),
+            "replayed": replayed,
+        }
+        desired = transaction.get("desired")
+        if isinstance(desired, Mapping):
+            context["desired_mode"] = desired.get("mode")
+        if type(transaction.get("source_revision")) is int:
+            context["source_revision"] = transaction["source_revision"]
+        if reason is not None:
+            context["reason"] = reason
+        _OPERATIONAL_LOG.event("network_transaction_accepted", **context)
+
+    def _transition(
+        self,
+        transaction_id: str,
+        *,
+        status: str,
+        stage: str,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        transaction = self._state.transition(
+            transaction_id,
+            status=status,
+            stage=stage,
+            **changes,
+        )
+        context: dict[str, object] = {
+            "transaction_id": transaction_id,
+            "status": status,
+            "stage": stage,
+            "recovery_action": transaction.get("recovery_action"),
+        }
+        if type(transaction.get("source_revision")) is int:
+            context["source_revision"] = transaction["source_revision"]
+        rescue = transaction.get("rescue")
+        if isinstance(rescue, Mapping) and type(rescue.get("ap_validated")) is bool:
+            context["ap_validated"] = rescue["ap_validated"]
+        desired = transaction.get("desired")
+        if isinstance(desired, Mapping):
+            context["desired_mode"] = desired.get("mode")
+        error = transaction.get("error")
+        if isinstance(error, Mapping) and isinstance(error.get("code"), str):
+            context["error_code"] = error["code"]
+        level = "error" if status == "failed" else "warning" if status == "rescued" else "info"
+        _OPERATIONAL_LOG.event("network_transaction_transition", level=level, **context)
+        return transaction
+
+    def _log_control_failure(self, response: Mapping[str, Any]) -> None:
+        if response.get("ok") is not False:
+            return
+        error = response.get("error")
+        context: dict[str, object] = {}
+        if isinstance(response.get("operation"), str):
+            context["operation"] = response["operation"]
+        if isinstance(error, Mapping) and isinstance(error.get("code"), str):
+            context["error_code"] = error["code"]
+        if type(response.get("retryable")) is bool:
+            context["retryable"] = response["retryable"]
+        _OPERATIONAL_LOG.event("network_control_request_rejected", level="warning", **context)
 
     def _accept_system_transaction(
         self,
@@ -615,6 +710,12 @@ class NetworkController:
             publish_desired=True,
             saved=saved,
             verified=verified,
+        )
+        self._log_transaction_accepted(
+            "retry",
+            receipt,
+            replayed=replayed,
+            reason=reason,
         )
         if replayed:
             transaction = receipt.get("transaction")
@@ -651,24 +752,58 @@ class NetworkController:
         desired = snapshot["desired"]
         mode = str(desired["mode"])
         new_boot = self._state.boot_requires_rescue(self._boot_id)
+        _OPERATIONAL_LOG.event(
+            "network_boot_reconcile_started",
+            desired_mode=mode,
+            new_boot=new_boot,
+            active_transaction=isinstance(current, Mapping),
+            saved=bool(snapshot["saved"]),
+            verified=bool(snapshot["verified"]),
+        )
         rescue_healthy = False
         if new_boot:
             with _network_operation_lock():
                 rescue_network()
                 self._state.mark_boot_rescue_validated(self._boot_id)
             rescue_healthy = True
+            _OPERATIONAL_LOG.event(
+                "network_boot_rescue_validated",
+                desired_mode=mode,
+                outcome="rescue_ap_ready",
+            )
         if isinstance(current, Mapping):
+            _OPERATIONAL_LOG.event(
+                "network_boot_reconcile_completed",
+                desired_mode=mode,
+                outcome="active_transaction_retained",
+            )
             return
         try:
             with _network_operation_lock():
                 if saved_network_is_healthy(mode):
+                    _OPERATIONAL_LOG.event(
+                        "network_boot_reconcile_completed",
+                        desired_mode=mode,
+                        outcome="saved_network_healthy",
+                    )
                     return
-        except NetworkError:
-            pass
+        except NetworkError as error:
+            if mode != "hotspot":
+                _OPERATIONAL_LOG.event(
+                    "network_boot_health_check_failed",
+                    level="warning",
+                    desired_mode=mode,
+                    error_code=error.code,
+                )
         if mode == "hotspot":
             if not rescue_healthy:
                 with _network_operation_lock():
                     rescue_network()
+            _OPERATIONAL_LOG.event(
+                "network_boot_reconcile_completed",
+                desired_mode=mode,
+                outcome="rescue_ap_active",
+            )
             return
 
         latest = snapshot["transaction"]["latest"]
@@ -680,6 +815,11 @@ class NetworkController:
             if not rescue_healthy:
                 with _network_operation_lock():
                     rescue_network()
+            _OPERATIONAL_LOG.event(
+                "network_boot_reconcile_completed",
+                desired_mode=mode,
+                outcome="terminal_outcome_retained",
+            )
             return
 
         work = self._retained_retry_work(snapshot) if new_boot else None
@@ -687,10 +827,17 @@ class NetworkController:
             try:
                 with _network_operation_lock():
                     candidate = saved_network_candidate(mode)
-            except NetworkError:
+            except NetworkError as error:
                 if not rescue_healthy:
                     with _network_operation_lock():
                         rescue_network()
+                _OPERATIONAL_LOG.event(
+                    "network_boot_reconcile_completed",
+                    level="warning",
+                    desired_mode=mode,
+                    outcome="saved_candidate_unavailable",
+                    error_code=error.code,
+                )
                 return
             cleanup_work_ids: list[str] = []
             if terminal_retry:
@@ -718,6 +865,12 @@ class NetworkController:
             reason="boot-reconcile",
             saved=bool(snapshot["saved"]),
             verified=bool(snapshot["verified"]),
+        )
+        _OPERATIONAL_LOG.event(
+            "network_boot_reconcile_completed",
+            desired_mode=mode,
+            outcome="retry_submitted",
+            transaction_id=transaction_id,
         )
         self._execute(transaction_id)
 
@@ -762,6 +915,7 @@ class NetworkController:
             self._queue.put(None)
             thread.join()
         self._credentials.clear()
+        _OPERATIONAL_LOG.event("network_controller_stopped", outcome="closed")
 
     def wait_for_idle(self, *, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -822,6 +976,7 @@ class NetworkController:
             self._health_failure_started_ns = None
             self._health_fallback_latched = False
             return
+        health_error_code: str | None = None
         try:
             with _network_operation_lock(blocking=False):
                 healthy = saved_network_is_healthy(mode)
@@ -830,9 +985,17 @@ class NetworkController:
                 self._health_failure_started_ns = None
                 return
             healthy = False
+            health_error_code = exc.code
         if healthy:
+            was_degraded = self._health_failure_started_ns is not None
             self._health_failure_started_ns = None
             self._health_fallback_latched = False
+            if was_degraded:
+                _OPERATIONAL_LOG.event(
+                    "network_health_recovered",
+                    desired_mode=mode,
+                    outcome="saved_network_healthy",
+                )
             return
         latest = transaction["latest"]
         if (
@@ -845,6 +1008,17 @@ class NetworkController:
         observed_ns = self._monotonic_ns() if now_ns is None else now_ns
         if self._health_failure_started_ns is None:
             self._health_failure_started_ns = observed_ns
+            context: dict[str, object] = {
+                "desired_mode": mode,
+                "grace_seconds": self._health_failure_seconds,
+            }
+            if health_error_code is not None:
+                context["error_code"] = health_error_code
+            _OPERATIONAL_LOG.event(
+                "network_health_degraded",
+                level="warning",
+                **context,
+            )
             return
         elapsed = (observed_ns - self._health_failure_started_ns) / 1_000_000_000
         if elapsed < self._health_failure_seconds:
@@ -902,6 +1076,53 @@ class NetworkController:
             self._health_failure_started_ns = None
             self._enqueue(transaction_id)
 
+    def _record_monitor_failure(self, error: BaseException) -> None:
+        observed_ns = self._monotonic_ns()
+        exception_type = type(error).__name__
+        error_code = self._error_code(error, "network_health_monitor_failed")
+        interval_ns = int(NETWORK_MONITOR_ERROR_LOG_INTERVAL_SECONDS * 1_000_000_000)
+        should_log = (
+            exception_type != self._monitor_error_type
+            or error_code != self._monitor_error_code
+            or self._monitor_error_last_logged_ns is None
+            or observed_ns - self._monitor_error_last_logged_ns >= interval_ns
+        )
+        if not should_log:
+            self._monitor_error_suppressed += 1
+            return
+        context: dict[str, object] = {
+            "exception_type": exception_type,
+            "error_code": error_code,
+        }
+        if self._monitor_error_suppressed:
+            context["suppressed_count"] = self._monitor_error_suppressed
+        _OPERATIONAL_LOG.event(
+            "network_health_monitor_failed",
+            level="warning",
+            **context,
+        )
+        self._monitor_error_type = exception_type
+        self._monitor_error_code = error_code
+        self._monitor_error_last_logged_ns = observed_ns
+        self._monitor_error_suppressed = 0
+
+    def _record_monitor_recovered(self) -> None:
+        if self._monitor_error_type is None:
+            return
+        context: dict[str, object] = {"exception_type": self._monitor_error_type}
+        if self._monitor_error_code is not None:
+            context["error_code"] = self._monitor_error_code
+        if self._monitor_error_suppressed:
+            context["suppressed_count"] = self._monitor_error_suppressed
+        _OPERATIONAL_LOG.event(
+            "network_health_monitor_recovered",
+            **context,
+        )
+        self._monitor_error_type = None
+        self._monitor_error_code = None
+        self._monitor_error_last_logged_ns = None
+        self._monitor_error_suppressed = 0
+
     def _monitor_loop(self) -> None:
         while not self._monitor_stop.wait(self._health_poll_seconds):
             try:
@@ -914,8 +1135,10 @@ class NetworkController:
                 RuntimeError,
                 TypeError,
                 ValueError,
-            ):
+            ) as error:
+                self._record_monitor_failure(error)
                 continue
+            self._record_monitor_recovered()
 
     def _worker_loop(self) -> None:
         while True:
@@ -925,7 +1148,14 @@ class NetworkController:
                 return
             try:
                 self._execute(transaction_id)
-            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+                _OPERATIONAL_LOG.event(
+                    "network_transaction_worker_failed",
+                    level="error",
+                    transaction_id=transaction_id,
+                    exception_type=type(error).__name__,
+                    error_code=self._error_code(error, "network_manager_unavailable"),
+                )
                 self._fallback_transaction(
                     transaction_id,
                     NetworkError("network_manager_unavailable", "网络控制器执行失败"),
@@ -973,23 +1203,25 @@ class NetworkController:
         rescue_deadline_ns: int | None = None,
     ) -> None:
         with suppress(NetworkStateError):
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="running",
                 stage="falling_back",
                 updated_at=_now(),
                 recovery_action="await_device",
             )
+        rescue_error_code: str | None = None
         try:
             rescue_network(
                 deadline_ns=rescue_deadline_ns,
                 monotonic_ns=self._monotonic_ns if rescue_deadline_ns is not None else None,
             )
             recovered = True
-        except NetworkError:
+        except NetworkError as rescue_error:
             recovered = False
+            rescue_error_code = rescue_error.code
         try:
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="rescued" if recovered else "failed",
                 stage="rescued" if recovered else "failed",
@@ -999,7 +1231,27 @@ class NetworkController:
                 recovery_action=("reconnect_rescue_ap" if recovered else "service_required"),
                 retain_work=True,
             )
-        except NetworkStateError:
+            if rescue_error_code is not None:
+                _OPERATIONAL_LOG.event(
+                    "network_rescue_failed",
+                    level="error",
+                    transaction_id=transaction_id,
+                    fallback_error_code=error.code,
+                    rescue_error_code=rescue_error_code,
+                )
+        except NetworkStateError as state_error:
+            context: dict[str, object] = {
+                "transaction_id": transaction_id,
+                "error_code": state_error.code,
+                "fallback_error_code": error.code,
+            }
+            if rescue_error_code is not None:
+                context["rescue_error_code"] = rescue_error_code
+            _OPERATIONAL_LOG.event(
+                "network_transaction_fallback_state_failed",
+                level="error",
+                **context,
+            )
             return
 
     def _execute_forget(self, transaction_id: str, work: Mapping[str, Any]) -> None:
@@ -1007,7 +1259,7 @@ class NetworkController:
         if not isinstance(desired, Mapping):
             desired = {"mode": "hotspot", "wifi_client": None, "ethernet": None}
         try:
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="running",
                 stage="forgetting",
@@ -1016,7 +1268,7 @@ class NetworkController:
             )
             forget_network_client_profiles()
             self._credentials.clear()
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="committed",
                 stage="forgotten",
@@ -1070,7 +1322,7 @@ class NetworkController:
         rescue_deadline_ns: int | None = None
         try:
             rescue_deadline_ns = self._rescue_deadline(work)
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="running",
                 stage="prepared",
@@ -1083,7 +1335,7 @@ class NetworkController:
                     deadline_ns=rescue_deadline_ns,
                     monotonic_ns=(self._monotonic_ns if rescue_deadline_ns is not None else None),
                 )
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="running",
                 stage="ap_ready",
@@ -1099,7 +1351,7 @@ class NetworkController:
                         "message": "the verified client remained unhealthy for ten seconds",
                         "retryable": True,
                     }
-                self._state.transition(
+                self._transition(
                     transaction_id,
                     status="running",
                     stage="falling_back",
@@ -1109,7 +1361,7 @@ class NetworkController:
                     publish_desired=True,
                     recovery_action="await_device",
                 )
-                self._state.transition(
+                self._transition(
                     transaction_id,
                     status="rescued",
                     stage="rescued",
@@ -1133,7 +1385,7 @@ class NetworkController:
                     "deadline_ns": deadline_ns,
                     "remaining_seconds": 10,
                 }
-                self._state.transition(
+                self._transition(
                     transaction_id,
                     status="running",
                     stage="activating",
@@ -1153,7 +1405,7 @@ class NetworkController:
                     0.0,
                     min(10.0, (deadline_ns - observed_ns) / 1_000_000_000),
                 )
-                self._state.transition(
+                self._transition(
                     transaction_id,
                     status="running",
                     stage="verifying",
@@ -1171,7 +1423,7 @@ class NetworkController:
                 if isinstance(cleanup_work, list)
                 else ()
             )
-            self._state.transition(
+            self._transition(
                 transaction_id,
                 status="committed",
                 stage="committed",
@@ -1271,6 +1523,7 @@ class NetworkController:
                 request_fingerprint=fingerprint,
             )
             if replay is not None:
+                self._log_transaction_accepted("apply", replay, replayed=True)
                 return {
                     "schema": CONTROL_RESPONSE_SCHEMA,
                     "ok": True,
@@ -1339,6 +1592,7 @@ class NetworkController:
                     with suppress(NetworkError, OSError), _network_operation_lock():
                         discard_network_candidate(candidate)
                 raise
+            self._log_transaction_accepted("apply", receipt, replayed=replayed)
             self._schedule(transaction_id)
         return {
             "schema": CONTROL_RESPONSE_SCHEMA,
@@ -1365,6 +1619,7 @@ class NetworkController:
                 request_fingerprint=fingerprint,
             )
             if replay is not None:
+                self._log_transaction_accepted("retry", replay, replayed=True)
                 return {
                     "schema": CONTROL_RESPONSE_SCHEMA,
                     "ok": True,
@@ -1436,6 +1691,7 @@ class NetworkController:
                 saved=snapshot["saved"],
                 verified=snapshot["verified"],
             )
+            self._log_transaction_accepted("retry", receipt, replayed=replayed)
             self._schedule(transaction_id)
         return {
             "schema": CONTROL_RESPONSE_SCHEMA,
@@ -1462,6 +1718,7 @@ class NetworkController:
                 request_fingerprint=fingerprint,
             )
             if replay is not None:
+                self._log_transaction_accepted("forget", replay, replayed=True)
                 return {
                     "schema": CONTROL_RESPONSE_SCHEMA,
                     "ok": True,
@@ -1494,6 +1751,7 @@ class NetworkController:
                 saved=snapshot["saved"],
                 verified=snapshot["verified"],
             )
+            self._log_transaction_accepted("forget", receipt, replayed=replayed)
             self._schedule(transaction_id)
         return {
             "schema": CONTROL_RESPONSE_SCHEMA,
@@ -1570,6 +1828,12 @@ class NetworkController:
             issued = datetime.now(UTC)
             credential_ref = self._credentials.create(str(body["passphrase"]))
             ttl_seconds = int(self._credentials.ttl_seconds)
+            _OPERATIONAL_LOG.event(
+                "network_credential_issued",
+                operation="create_credential",
+                outcome="issued",
+                ttl_seconds=ttl_seconds,
+            )
             return {
                 "schema": CONTROL_RESPONSE_SCHEMA,
                 "ok": True,
@@ -1665,7 +1929,9 @@ def handle_control_request(
                 operation=str(operation),
                 retryable=True,
             )
-        return _seal_response(response)
+        sealed = _seal_response(response)
+        controller._log_control_failure(sealed)
+        return sealed
     if operation == "health":
         return {
             "schema": CONTROL_RESPONSE_SCHEMA,
@@ -1740,7 +2006,15 @@ def _serve_socket(
     while max_connections is None or served < max_connections:
         try:
             connection, _ = listener.accept()
-        except OSError:
+        except OSError as error:
+            _OPERATIONAL_LOG.event(
+                "network_control_listener_stopped",
+                level="warning",
+                transport="socket",
+                connections_served=served,
+                error_code="listener_accept_failed",
+                exception_type=type(error).__name__,
+            )
             return 0
         with connection:
             connection.settimeout(CONTROL_SOCKET_TIMEOUT_SECONDS)
@@ -1750,14 +2024,28 @@ def _serve_socket(
                 if isinstance(payload, dict)
                 else handle_control_payload(payload, controller=controller)
             )
+            if isinstance(payload, dict) and controller is not None:
+                controller._log_control_failure(response)
             try:
                 connection.sendall(_render_response(response).encode("utf-8"))
-            except OSError:
-                pass
+            except OSError as error:
+                _OPERATIONAL_LOG.event(
+                    "network_control_response_write_failed",
+                    level="warning",
+                    transport="socket",
+                    error_code="response_write_failed",
+                    exception_type=type(error).__name__,
+                )
             else:
                 if controller is not None:
                     controller.release_response(response)
         served += 1
+    _OPERATIONAL_LOG.event(
+        "network_control_listener_stopped",
+        transport="socket",
+        connections_served=served,
+        outcome="connection_limit_reached",
+    )
     return 0
 
 
@@ -1808,16 +2096,26 @@ def serve_stdio(
     owns_controller = controller is None
     if controller is None:
         controller = NetworkController(defer_execution_until_response=True)
+    transport = "stdio"
     try:
         _notify_ready()
         listener = _listening_socket(stdin)
         if listener is not None:
+            transport = "socket"
+            _OPERATIONAL_LOG.event(
+                "network_control_server_ready",
+                transport=transport,
+            )
             with listener:
                 return _serve_socket(
                     listener,
                     controller,
                     max_connections=max_connections,
                 )
+        _OPERATIONAL_LOG.event(
+            "network_control_server_ready",
+            transport=transport,
+        )
         handled = 0
         while max_connections is None or handled < max_connections:
             payload = stdin.readline(MAX_CONTROL_REQUEST_BYTES + 2)
@@ -1825,15 +2123,36 @@ def serve_stdio(
                 break
             response = handle_control_payload(payload, controller=controller)
             rendered = _render_response(response)
-            if stdout.write(rendered) != len(rendered):
-                raise OSError("network-control response was not fully written")
-            stdout.flush()
+            try:
+                if stdout.write(rendered) != len(rendered):
+                    raise OSError("network-control response was not fully written")
+                stdout.flush()
+            except OSError as error:
+                _OPERATIONAL_LOG.event(
+                    "network_control_response_write_failed",
+                    level="error",
+                    transport=transport,
+                    error_code="response_write_failed",
+                    exception_type=type(error).__name__,
+                )
+                raise
             controller.release_response(response)
             handled += 1
+        _OPERATIONAL_LOG.event(
+            "network_control_listener_stopped",
+            transport=transport,
+            connections_served=handled,
+            outcome="input_closed",
+        )
         return 0
     finally:
         if owns_controller:
             controller.close()
+        _OPERATIONAL_LOG.event(
+            "network_control_server_stopped",
+            transport=transport,
+            outcome="closed",
+        )
 
 
 def _read_socket_response(client: socket.socket) -> bytes:

@@ -15,6 +15,7 @@ from rp_ylx.cli import build_parser, main
 from rp_ylx.hardware import HardwareSmokeError
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.network_control import NetworkControlClientError
+from rp_ylx.operational_logging import reset_operational_logging
 from rp_ylx.performance import BenchmarkError
 from rp_ylx.recording import (
     DeviceSessionConfig,
@@ -26,6 +27,9 @@ from rp_ylx.recording import (
 
 
 class CliTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        reset_operational_logging()
+
     def produce_v1(self, root: Path) -> Path:
         session_id = uuid7()
         revision = 0

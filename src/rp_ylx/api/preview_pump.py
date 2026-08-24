@@ -9,7 +9,10 @@ from typing import Protocol
 
 from rp_ylx.api.mock_device import MockDevice
 from rp_ylx.camera.models import CameraMode, FrameObservation
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
+
+_OPERATIONAL_LOG = operational_logger("camera-preview")
 
 
 class PreviewController(Protocol):
@@ -60,7 +63,7 @@ class CameraPreviewPump:
         self._stable_id = stable_id
         self._read_timeout = read_timeout
         self._on_error = on_error
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = logger
         self._thread_name = thread_name
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -118,16 +121,26 @@ class CameraPreviewPump:
             try:
                 self._controller.close()
             except BaseException as close_error:
-                self._logger.error("关闭启动失败的相机时出错：%s", close_error)
+                self._log_failure(
+                    "camera_preview_start_cleanup_failed",
+                    close_error,
+                    "关闭启动失败的相机时出错：%s",
+                )
             with self._lock:
                 self._state = "failed"
                 self._error = exc
+            self._log_failure(
+                "camera_preview_start_failed",
+                exc,
+                "硬件预览相机启动失败：%s",
+            )
             raise
 
         thread = threading.Thread(target=self._run, name=self._thread_name, daemon=False)
         with self._lock:
             self._thread = thread
             self._state = "running"
+        _OPERATIONAL_LOG.event("camera_preview_started", outcome="running")
         try:
             thread.start()
         except BaseException as exc:
@@ -135,11 +148,20 @@ class CameraPreviewPump:
             try:
                 self._controller.close()
             except BaseException as close_error:
-                self._logger.error("启动预览线程失败后关闭相机时出错：%s", close_error)
+                self._log_failure(
+                    "camera_preview_thread_cleanup_failed",
+                    close_error,
+                    "启动预览线程失败后关闭相机时出错：%s",
+                )
             with self._lock:
                 self._state = "failed"
                 self._error = exc
                 self._thread = None
+            self._log_failure(
+                "camera_preview_thread_start_failed",
+                exc,
+                "硬件预览线程启动失败：%s",
+            )
             raise
 
     def join(self, timeout: float | None = None) -> None:
@@ -163,6 +185,11 @@ class CameraPreviewPump:
                 with self._lock:
                     if self._state == "new":
                         self._state = "stopped"
+            _OPERATIONAL_LOG.event(
+                "camera_preview_stopped",
+                outcome="closed",
+                frames_published=self.frames_published,
+            )
             return
 
         thread.join(timeout)
@@ -179,6 +206,11 @@ class CameraPreviewPump:
         with self._lock:
             if self._state == "running":
                 self._state = "stopped"
+        _OPERATIONAL_LOG.event(
+            "camera_preview_stopped",
+            outcome="closed",
+            frames_published=self.frames_published,
+        )
 
     close = stop
 
@@ -233,16 +265,39 @@ class CameraPreviewPump:
             self._state = "failed"
         if not report:
             return
-        self._logger.error("硬件预览相机采集失败：%s", error)
+        self._log_failure(
+            "camera_preview_capture_failed",
+            error,
+            "硬件预览相机采集失败：%s",
+        )
         try:
             self._device.set_fault("hardware_unavailable", f"相机预览采集失败：{error}")
         except BaseException as fault_error:
-            self._logger.error("记录相机故障状态时出错：%s", fault_error)
+            self._log_failure(
+                "camera_preview_fault_record_failed",
+                fault_error,
+                "记录相机故障状态时出错：%s",
+            )
         if self._on_error is not None:
             try:
                 self._on_error(error)
             except BaseException as callback_error:
-                self._logger.error("相机故障回调失败：%s", callback_error)
+                self._log_failure(
+                    "camera_preview_error_callback_failed",
+                    callback_error,
+                    "相机故障回调失败：%s",
+                )
+
+    def _log_failure(self, event: str, error: BaseException, message: str) -> None:
+        if self._logger is not None:
+            self._logger.error(message, error)
+        code = getattr(error, "code", event)
+        _OPERATIONAL_LOG.event(
+            event,
+            level="error",
+            error_code=code if isinstance(code, str) else event,
+            exception_type=type(error).__name__,
+        )
 
     def _release_controller(self) -> None:
         try:

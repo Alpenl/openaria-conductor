@@ -69,6 +69,8 @@ uv build
 录制写盘、背压和失败目录语义见 [有界录制管道](docs/recording-pipeline.md)。
 RDK X5 的固定硬件事实、短录制步骤和证据边界见 [RDK X5 基线](docs/rdk-x5-baseline.md)。
 RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援](docs/networking.md)。
+结构化 journald 事件、隐私边界和 API 审计记录见
+[运行日志](docs/operational-logging.md)。
 测量驱动的 Rust 数据面范围、性能闸门和当前证据边界见
 [RDK X5 Rust 性能重写基线](docs/rust-performance-rewrite.md)。
 

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:api-audit-event:v1",
+  "title": "RP-YLX API authorization audit event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "recorded_at",
+    "request_id",
+    "principal_id",
+    "operation_id",
+    "resource_id",
+    "outcome"
+  ],
+  "properties": {
+    "schema": {"const": "ylx.api-audit-event.v1"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "principal_id": {"type": ["string", "null"], "maxLength": 128},
+    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "resource_id": {"type": ["string", "null"], "maxLength": 512},
+    "outcome": {"type": "string", "minLength": 1, "maxLength": 128}
+  }
+}
