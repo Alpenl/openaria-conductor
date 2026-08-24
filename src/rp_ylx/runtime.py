@@ -11,6 +11,7 @@ from pathlib import Path
 
 _SIOCGIFADDR = 0x8915
 _SIOCGIFNETMASK = 0x891B
+_HOTSPOT_ADDRESS = "10.42.0.1/24"
 
 
 def _ipv4_addresses(interface: str) -> list[str]:
@@ -121,7 +122,24 @@ def collect_linux_runtime(
 
     wifi_status = _interface_status(wifi, net_root, ipv4_lookup)
     wired_status = _interface_status(wired, net_root, ipv4_lookup)
-    if default_interface in wifi_interfaces:
+    wifi_is_ap = _HOTSPOT_ADDRESS in wifi_status["addresses"]
+    if wifi_is_ap:
+        ap_status = {**wifi_status, "state": "active"}
+        wifi_status = {
+            "state": "disconnected",
+            "interface": wifi,
+            "addresses": [],
+            "peer_or_ssid": None,
+        }
+        if default_interface in wired_interfaces:
+            default_route = "wired"
+            connection_method = (
+                "ethernet_lan" if wired_status["state"] == "connected" else "offline"
+            )
+        else:
+            default_route = "none"
+            connection_method = "wifi_ap"
+    elif default_interface in wifi_interfaces:
         default_route = "wifi_client"
         connection_method = "wifi_client" if wifi_status["state"] == "connected" else "offline"
         ap_status = {

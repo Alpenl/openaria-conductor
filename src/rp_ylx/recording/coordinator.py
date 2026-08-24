@@ -39,7 +39,7 @@ from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.network import NetworkError, network_operation_lock_path
 from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.network import network_status_v1 as project_network_status_v1
-from rp_ylx.network_control import NetworkControlClientError
+from rp_ylx.network_control import CONTROL_RESPONSE_TIMEOUT_SECONDS, NetworkControlClientError
 from rp_ylx.network_control import request_control as request_network_control
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
@@ -61,7 +61,6 @@ VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
 LIVE_IMU_STALE_SECONDS = 2.0
-NETWORK_SCAN_CONTROL_TIMEOUT_SECONDS = 15.0
 
 
 class _Representation(Protocol):
@@ -1337,7 +1336,7 @@ class CaptureCoordinator:
         try:
             response = request_network_control(
                 "scan",
-                timeout_seconds=NETWORK_SCAN_CONTROL_TIMEOUT_SECONDS,
+                timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
             )
         except NetworkControlClientError as exc:
             raise ProviderError(
@@ -1367,6 +1366,7 @@ class CaptureCoordinator:
                     "schema": "ylx.network-credential-request.v1",
                     "passphrase": command.passphrase,
                 },
+                timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
             )
         except NetworkControlClientError as exc:
             raise self._network_mutation_unavailable() from exc
@@ -1390,6 +1390,7 @@ class CaptureCoordinator:
                     principal_id=command.principal_id,
                     idempotency_key=command.idempotency_key,
                     body=command.body,
+                    timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
                 )
             except NetworkControlClientError as exc:
                 raise self._network_mutation_unavailable() from exc
