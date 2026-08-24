@@ -600,7 +600,7 @@ class NetworkCliTest(unittest.TestCase):
         with patch(
             "rp_ylx.network_control.request_control",
             return_value=controller_response,
-        ):
+        ) as request:
             status = network_module.network_status_v1(runtime, legacy_status=legacy)
 
         self.assertEqual(status["authority_epoch"], authority_epoch)
@@ -610,6 +610,7 @@ class NetworkCliTest(unittest.TestCase):
         self.assertEqual(status["desired"], desired)
         self.assertEqual(status["transaction"]["current"], transaction)
         self.assertEqual(status["mutation_capability"], capability)
+        request.assert_called_once_with("status", timeout_seconds=15.0)
 
     def test_status_reports_a_stable_error_when_network_manager_is_missing(self) -> None:
         with patch(

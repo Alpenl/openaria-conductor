@@ -2616,6 +2616,7 @@ class NetworkControlTest(unittest.TestCase):
             principal_id="customer",
             idempotency_key="idem-1",
             body=command.body,
+            timeout_seconds=15.0,
         )
 
     def test_coordinator_maps_root_controller_transport_failure_to_fail_closed(self) -> None:
@@ -2734,6 +2735,7 @@ class NetworkControlTest(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].kwargs, {"timeout_seconds": 15.0})
         self.assertEqual(request.call_args_list[1].args, ("create_credential",))
         self.assertEqual(request.call_args_list[1].kwargs["principal_id"], "customer")
+        self.assertEqual(request.call_args_list[1].kwargs["timeout_seconds"], 15.0)
         self.assertEqual(
             request.call_args_list[1].kwargs["body"],
             {

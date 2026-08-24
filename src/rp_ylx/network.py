@@ -523,13 +523,17 @@ def _fallback_saved_state(state_dir: Path) -> tuple[bool, bool]:
 
 def _controller_status_projection() -> dict[str, Any] | None:
     from rp_ylx.network_control import (  # noqa: PLC0415
+        CONTROL_RESPONSE_TIMEOUT_SECONDS,
         NetworkControlClientError,
         _seal_response,
         request_control,
     )
 
     try:
-        response = request_control("status")
+        response = request_control(
+            "status",
+            timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
+        )
     except NetworkControlClientError:
         return None
     sealed = _seal_response(response)

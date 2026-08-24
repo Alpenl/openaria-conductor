@@ -76,6 +76,42 @@ class LinuxRuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(runtime["network"]["wired"]["addresses"], ["10.0.0.2/24"])
         self.assertEqual(runtime["temperature_celsius"], 52.0)
 
+    def test_reports_active_hotspot_while_ethernet_owns_default_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            net_root = root / "net"
+            wlan = net_root / "wlan0"
+            wlan.mkdir(parents=True)
+            (wlan / "operstate").write_text("up\n", encoding="ascii")
+            (wlan / "wireless").mkdir()
+            eth = net_root / "eth0"
+            eth.mkdir()
+            (eth / "operstate").write_text("up\n", encoding="ascii")
+            route = root / "route"
+            route.write_text(
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n"
+                "eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\n",
+                encoding="ascii",
+            )
+
+            runtime = collect_linux_runtime(
+                net_root=net_root,
+                route_path=route,
+                thermal_paths=(),
+                ipv4_lookup=lambda name: (
+                    ["10.42.0.1/24"] if name == "wlan0" else ["192.168.127.10/24"]
+                ),
+            )
+
+        self.assertEqual(runtime["connection_method"], "ethernet_lan")
+        self.assertEqual(runtime["network"]["default_route"], "wired")
+        self.assertEqual(runtime["network"]["ap"]["state"], "active")
+        self.assertEqual(runtime["network"]["ap"]["interface"], "wlan0")
+        self.assertEqual(runtime["network"]["ap"]["addresses"], ["10.42.0.1/24"])
+        self.assertEqual(runtime["network"]["wifi_client"]["state"], "disconnected")
+        self.assertEqual(runtime["network"]["wifi_client"]["addresses"], [])
+        self.assertEqual(runtime["network"]["wired"]["state"], "connected")
+
 
 if __name__ == "__main__":
     unittest.main()
