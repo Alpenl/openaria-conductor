@@ -9,6 +9,9 @@ Before=rp-ylx.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/rp-ylx-data-volume ensure
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rp-ylx-data-volume
 
 [Install]
 WantedBy=multi-user.target

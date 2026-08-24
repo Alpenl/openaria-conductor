@@ -12,10 +12,12 @@ User=root
 Group=root
 Environment=RP_YLX_NETWORK_STATE_DIR=/var/lib/rp-ylx-network
 Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/local/sbin/rp-ylx-deploy network-control-launch
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
+SyslogIdentifier=rp-ylx-network-control
 Restart=on-failure
 RestartSec=2s
 UMask=0077

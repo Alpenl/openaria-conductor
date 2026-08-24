@@ -33,6 +33,7 @@ from rp_ylx.cli_helpers import stable_id_for_device
 from rp_ylx.imu import ImuCollector, NativeImuCollector
 from rp_ylx.mdns import MdnsPublisher
 from rp_ylx.native import NativeModuleError, native_capabilities
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import (
     CaptureCoordinator,
@@ -72,6 +73,7 @@ CUSTOMER_OPERATIONS = LAB_OPERATIONS | frozenset(
         "forgetNetworkClientProfile",
     }
 )
+_OPERATIONAL_LOG = operational_logger("production-service")
 
 
 class ProductionConfigError(ValueError):
@@ -399,6 +401,8 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
 
     def write(event: AuditEvent) -> None:
         value = {
+            "schema": "ylx.api-audit-event.v1",
+            "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "request_id": event.request_id,
             "principal_id": event.principal_id,
             "operation_id": event.operation_id,
@@ -406,8 +410,24 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
             "outcome": event.outcome,
         }
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-        with lock, path.open("ab", buffering=0) as stream:
-            stream.write(payload)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with lock:
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("API audit target is not a regular file")
+                if metadata.st_mode & 0o777 != 0o600:
+                    os.fchmod(descriptor, 0o600)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("API audit record was not fully written")
+                    remaining = remaining[written:]
+            finally:
+                os.close(descriptor)
 
     return write
 
@@ -810,12 +830,35 @@ def build_production_service(
 
 
 def run_production_service(config_path: str | Path) -> None:
-    config = load_production_config(config_path)
-    service = build_production_service(config)
+    started_ns = time.monotonic_ns()
+    _OPERATIONAL_LOG.event("production_service_starting")
+    try:
+        config = load_production_config(config_path)
+        service = build_production_service(config)
+    except BaseException as error:
+        code = getattr(error, "code", "service_start_failed")
+        _OPERATIONAL_LOG.event(
+            "production_service_start_failed",
+            level="error",
+            error_code=code if isinstance(code, str) else "service_start_failed",
+            exception_type=type(error).__name__,
+            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+        )
+        raise
+    _OPERATIONAL_LOG.event(
+        "production_service_ready",
+        security_profile=config.security_profile,
+        data_plane=config.data_plane,
+        port=config.port,
+        duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+    )
     previous: dict[int, Any] = {}
+    stop_signal: str | None = None
 
     def stop(signum: int, frame: object) -> None:
-        del signum, frame
+        nonlocal stop_signal
+        del frame
+        stop_signal = signal.Signals(signum).name
         raise KeyboardInterrupt
 
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -824,9 +867,25 @@ def run_production_service(config_path: str | Path) -> None:
         with suppress(KeyboardInterrupt):
             service.server.serve_forever()
     finally:
-        service.close()
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        context: dict[str, object] = {"outcome": "shutdown_requested"}
+        if stop_signal is not None:
+            context["signal"] = stop_signal
+        _OPERATIONAL_LOG.event("production_service_stopping", **context)
+        try:
+            service.close()
+        except BaseException as error:
+            code = getattr(error, "code", "service_shutdown_failed")
+            _OPERATIONAL_LOG.event(
+                "production_service_shutdown_failed",
+                level="error",
+                error_code=code if isinstance(code, str) else "service_shutdown_failed",
+                exception_type=type(error).__name__,
+            )
+            raise
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+        _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
 
 
 def default_device_identity(seed: bytes) -> Mapping[str, str]:

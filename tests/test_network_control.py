@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -27,6 +27,7 @@ from rp_ylx.network_control import (
 )
 from rp_ylx.network_credentials import NetworkCredentialError, NetworkCredentialStore
 from rp_ylx.network_state import NetworkStateError, NetworkStateStore
+from rp_ylx.operational_logging import reset_operational_logging
 from rp_ylx.recording.coordinator import CaptureCoordinator
 
 
@@ -2413,6 +2414,8 @@ class NetworkControlTest(unittest.TestCase):
 
     def test_cli_network_control_serve_stdio(self) -> None:
         output = io.StringIO()
+        error = io.StringIO()
+        self.addCleanup(reset_operational_logging)
         controller = Mock()
         controller._handle_validated.return_value = {
             "schema": "ylx.network-control-response.v1",
@@ -2437,6 +2440,7 @@ class NetworkControlTest(unittest.TestCase):
                 ),
             ),
             patch("rp_ylx.network_control.NetworkController", return_value=controller),
+            redirect_stderr(error),
             redirect_stdout(output),
         ):
             code = main(["network-control", "serve", "--stdio"])

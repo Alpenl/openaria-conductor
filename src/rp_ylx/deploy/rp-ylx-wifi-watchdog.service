@@ -8,6 +8,9 @@ Type=oneshot
 EnvironmentFile=-/etc/default/rp-ylx-wifi-watchdog
 Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
 ExecStart=/usr/local/sbin/rp-ylx-wifi-watchdog check
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rp-ylx-wifi-watchdog
 StateDirectory=rp-ylx-wifi-watchdog
 RuntimeDirectory=rp-ylx-wifi-watchdog
 RuntimeDirectoryPreserve=yes

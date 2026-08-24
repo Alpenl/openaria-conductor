@@ -22,7 +22,10 @@ from rp_ylx.network import (
     reconcile_network,
     rescue_network,
 )
+from rp_ylx.operational_logging import configure_operational_logging, operational_logger
 from rp_ylx.validation import PublicValidationError, validate_public_session
+
+_OPERATIONAL_LOG = operational_logger("cli")
 
 
 def _print_network_error(exc: NetworkError) -> int:
@@ -307,6 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from rp_ylx.daemon import ProductionConfigError, run_production_service
         from rp_ylx.recording import DeviceRecordingError
 
+        configure_operational_logging()
         try:
             run_production_service(args.config)
         except (
@@ -385,7 +389,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.network_control_command == "serve" and args.stdio:
             from rp_ylx.network_control import serve_stdio
 
-            return serve_stdio()
+            configure_operational_logging()
+            try:
+                return serve_stdio()
+            except (NetworkError, OSError, RuntimeError, ValueError) as exc:
+                code = getattr(exc, "code", "network_control_process_failed")
+                _OPERATIONAL_LOG.event(
+                    "network_control_process_failed",
+                    level="error",
+                    error_code=(
+                        code if isinstance(code, str) else "network_control_process_failed"
+                    ),
+                    exception_type=type(exc).__name__,
+                    exit_code=2,
+                )
+                return 2
         if args.network_control_command in {"desired-mode", "watchdog-mode"}:
             from rp_ylx.network_control import NetworkControlClientError, request_control
 

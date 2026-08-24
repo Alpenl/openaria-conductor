@@ -11,11 +11,13 @@ from typing import Protocol
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.runtime import collect_linux_runtime
 
 MDNS_HOSTNAME = "rp-ylx.local."
 MDNS_SERVICE_TYPES = ("_ylx-capture._tcp.local.", "_http._tcp.local.")
 CUSTOMER_MDNS_SERVICE_TYPES = ("_ylx-capture._tcp.local.", "_https._tcp.local.")
+_OPERATIONAL_LOG = operational_logger("mdns")
 
 
 class ZeroconfResponder(Protocol):
@@ -112,26 +114,66 @@ class MdnsPublisher:
         self._address_provider = address_provider
         self._responder_factory = responder_factory
         self._interval = interval
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = logger
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._addresses: tuple[str, ...] = ()
         self._responder: ZeroconfResponder | None = None
         self._services: tuple[ServiceInfo, ...] = ()
+        self._failure_type: str | None = None
+        self._suppressed_failures = 0
 
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("mDNS publisher has already been started")
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="rp-ylx-mdns", daemon=False)
+        _OPERATIONAL_LOG.event(
+            "mdns_publisher_started",
+            port=self._port,
+            scheme=self._scheme,
+        )
         self._thread.start()
+
+    def _record_failure(self, error: BaseException) -> None:
+        exception_type = type(error).__name__
+        if exception_type == self._failure_type:
+            self._suppressed_failures += 1
+            return
+        if self._logger is not None:
+            self._logger.error("mDNS publication failed: %s", error)
+        code = getattr(error, "code", "mdns_publication_failed")
+        _OPERATIONAL_LOG.event(
+            "mdns_publication_failed",
+            level="warning",
+            error_code=code if isinstance(code, str) else "mdns_publication_failed",
+            exception_type=exception_type,
+            suppressed_count=self._suppressed_failures,
+        )
+        self._failure_type = exception_type
+        self._suppressed_failures = 0
+
+    def _record_recovered(self) -> None:
+        if self._failure_type is None:
+            return
+        if self._logger is not None:
+            self._logger.info("mDNS publication recovered")
+        _OPERATIONAL_LOG.event(
+            "mdns_publication_recovered",
+            exception_type=self._failure_type,
+            suppressed_count=self._suppressed_failures,
+        )
+        self._failure_type = None
+        self._suppressed_failures = 0
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 self._reconcile()
             except Exception as error:
-                self._logger.error("mDNS publication failed: %s", error)
+                self._record_failure(error)
+            else:
+                self._record_recovered()
             self._stop.wait(self._interval)
         self._unpublish()
 
@@ -158,6 +200,12 @@ class MdnsPublisher:
         self._addresses = addresses
         self._responder = responder
         self._services = tuple(registered)
+        _OPERATIONAL_LOG.event(
+            "mdns_publication_ready",
+            port=self._port,
+            scheme=self._scheme,
+            address_count=len(addresses),
+        )
 
     def _unpublish(self) -> None:
         responder, services = self._responder, self._services
@@ -182,6 +230,7 @@ class MdnsPublisher:
         if thread.is_alive():
             raise RuntimeError("mDNS publisher did not stop before its deadline")
         self._thread = None
+        _OPERATIONAL_LOG.event("mdns_publisher_stopped", outcome="closed")
 
 
 __all__ = [

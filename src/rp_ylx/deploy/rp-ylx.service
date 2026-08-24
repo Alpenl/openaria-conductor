@@ -11,7 +11,11 @@ Group=rp-ylx
 # vpu/jpu/vps carry codec nodes; misc carries the RDK X5 ION allocator.
 SupplementaryGroups=video vpu jpu vps misc
 Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve --config /etc/rp-ylx/device.json
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rp-ylx
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=30s
