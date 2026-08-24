@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import re
+import sys
 import time
 import uuid
 from collections import deque
@@ -490,6 +491,11 @@ class GatewayServer(ThreadingHTTPServer):
         self.preview_stream_slots = BoundedSemaphore(max_preview_streams)
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class GatewayHandler(BaseHTTPRequestHandler):

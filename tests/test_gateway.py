@@ -5,7 +5,9 @@ import http.client
 import json
 import threading
 import unittest
+from contextlib import redirect_stderr
 from copy import deepcopy
+from io import StringIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -690,6 +692,17 @@ class GatewayHttpTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_expected_client_disconnect_does_not_emit_server_traceback(self) -> None:
+        for error in (BrokenPipeError("closed"), ConnectionResetError("reset")):
+            with self.subTest(error=type(error).__name__):
+                stderr = StringIO()
+                with redirect_stderr(stderr):
+                    try:
+                        raise error
+                    except (BrokenPipeError, ConnectionResetError):
+                        self.server.handle_error(object(), ("127.0.0.1", 12345))
+                self.assertEqual(stderr.getvalue(), "")
 
     def request(
         self,
