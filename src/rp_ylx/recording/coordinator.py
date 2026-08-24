@@ -61,6 +61,7 @@ VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
 LIVE_IMU_STALE_SECONDS = 2.0
+NETWORK_SCAN_CONTROL_TIMEOUT_SECONDS = 15.0
 
 
 class _Representation(Protocol):
@@ -1334,7 +1335,10 @@ class CaptureCoordinator:
 
     def scan_networks(self) -> Mapping[str, object]:
         try:
-            response = request_network_control("scan")
+            response = request_network_control(
+                "scan",
+                timeout_seconds=NETWORK_SCAN_CONTROL_TIMEOUT_SECONDS,
+            )
         except NetworkControlClientError as exc:
             raise ProviderError(
                 "network_scan_unavailable",

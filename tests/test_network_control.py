@@ -2731,6 +2731,7 @@ class NetworkControlTest(unittest.TestCase):
             )
 
         self.assertEqual(request.call_args_list[0].args, ("scan",))
+        self.assertEqual(request.call_args_list[0].kwargs, {"timeout_seconds": 15.0})
         self.assertEqual(request.call_args_list[1].args, ("create_credential",))
         self.assertEqual(request.call_args_list[1].kwargs["principal_id"], "customer")
         self.assertEqual(
