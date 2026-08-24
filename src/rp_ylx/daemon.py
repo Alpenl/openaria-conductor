@@ -58,6 +58,10 @@ LAB_OPERATIONS = frozenset(
         "getNetworkStatus",
         "scanNetworks",
         "streamNetworkEvents",
+        "createNetworkCredentialReference",
+        "applyNetworkDesiredState",
+        "retryNetworkTransaction",
+        "forgetNetworkClientProfile",
         "setCameraFocus",
         "headSessionArtifact",
         "getSessionArtifact",
@@ -65,14 +69,7 @@ LAB_OPERATIONS = frozenset(
         "stopCapture",
     }
 )
-CUSTOMER_OPERATIONS = LAB_OPERATIONS | frozenset(
-    {
-        "createNetworkCredentialReference",
-        "applyNetworkDesiredState",
-        "retryNetworkTransaction",
-        "forgetNetworkClientProfile",
-    }
-)
+CUSTOMER_OPERATIONS = LAB_OPERATIONS
 _OPERATIONAL_LOG = operational_logger("production-service")
 
 

@@ -1716,16 +1716,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
         expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
         return (expires - issued).total_seconds() == value["ttl_seconds"]
 
-    def _network_status_for_security(self, value: Mapping[str, object]) -> Mapping[str, object]:
-        if self.server.security.profile != "lab":
-            return value
-        projected = deepcopy(dict(value))
-        capability = projected.get("mutation_capability")
-        if isinstance(capability, dict):
-            capability["enabled"] = False
-            capability["disabled_reason"] = "auth_profile_unavailable"
-        return projected
-
     @staticmethod
     def _valid_network_provider_error(error: ProviderError, *, operation: str) -> bool:
         if not isinstance(error.message, str) or not 1 <= len(error.message) <= 1024:
@@ -1825,7 +1815,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self._principal("getNetworkStatus") is None:
             return
         try:
-            status = self._network_status_for_security(self.server.provider.network_status())
+            status = self.server.provider.network_status()
         except ProviderError as error:
             self._send_network_provider_error(error, operation="status")
             return
@@ -1881,7 +1871,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         try:
             try:
-                status = self._network_status_for_security(self.server.provider.network_status())
+                status = self.server.provider.network_status()
             except ProviderError as error:
                 self._send_network_provider_error(error, operation="status")
                 return
@@ -1918,9 +1908,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         )
                     )
                     try:
-                        status = self._network_status_for_security(
-                            self.server.provider.network_status()
-                        )
+                        status = self.server.provider.network_status()
                     except Exception:
                         return
                     if not self._valid_network_status(status):

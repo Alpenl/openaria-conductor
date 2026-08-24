@@ -1100,9 +1100,7 @@ class CaptureCoordinator:
                 "capture": admission is not None and writable and not self._released,
                 "preview": True,
                 "range_download": True,
-                "network_mutation": (
-                    security_profile == "customer" and self._network_controller_available()
-                ),
+                "network_mutation": (api_version == "v4" and self._network_controller_available()),
             },
             "storage": {
                 "volume_id": None if admission is None else admission.volume_id,

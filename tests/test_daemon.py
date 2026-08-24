@@ -55,16 +55,15 @@ PRODUCTION_NATIVE_FEATURES = (
 
 
 class ProductionDaemonTest(unittest.TestCase):
-    def test_lab_profile_allows_network_reads_but_not_mutations(self) -> None:
+    def test_lab_profile_allows_trusted_internal_network_control(self) -> None:
         self.assertIn("getNetworkStatus", LAB_OPERATIONS)
         self.assertIn("scanNetworks", LAB_OPERATIONS)
         self.assertIn("streamNetworkEvents", LAB_OPERATIONS)
-        self.assertNotIn("createNetworkCredentialReference", LAB_OPERATIONS)
-        self.assertNotIn("applyNetworkDesiredState", LAB_OPERATIONS)
-        self.assertNotIn("retryNetworkTransaction", LAB_OPERATIONS)
-        self.assertNotIn("forgetNetworkClientProfile", LAB_OPERATIONS)
-        self.assertIn("createNetworkCredentialReference", CUSTOMER_OPERATIONS)
-        self.assertIn("applyNetworkDesiredState", CUSTOMER_OPERATIONS)
+        self.assertIn("createNetworkCredentialReference", LAB_OPERATIONS)
+        self.assertIn("applyNetworkDesiredState", LAB_OPERATIONS)
+        self.assertIn("retryNetworkTransaction", LAB_OPERATIONS)
+        self.assertIn("forgetNetworkClientProfile", LAB_OPERATIONS)
+        self.assertEqual(CUSTOMER_OPERATIONS, LAB_OPERATIONS)
 
     def config(self, root: Path) -> ProductionConfig:
         return ProductionConfig(
@@ -595,7 +594,8 @@ class ProductionDaemonTest(unittest.TestCase):
 
     def test_missing_camera_does_not_block_native_control_plane_startup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            config = self.config(Path(directory))
+            root = Path(directory)
+            config = replace(self.config(root), camera_device=root / "missing-video0")
             sources = Mock()
             sources.start_preview.side_effect = RuntimeError(
                 "open_failed: No such file or directory"
