@@ -19,6 +19,8 @@ from rp_ylx.api.gateway import NetworkCommand, NetworkCredentialCommand, Provide
 from rp_ylx.cli import main
 from rp_ylx.network_control import (
     CONTROL_RESPONSE_SCHEMA,
+    CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    CONTROL_SOCKET_TIMEOUT_SECONDS,
     NetworkControlClientError,
     NetworkController,
     handle_control_payload,
@@ -2074,6 +2076,12 @@ class NetworkControlTest(unittest.TestCase):
         self._operation_environment.stop()
         self._operation_directory.cleanup()
 
+    def test_control_response_deadline_covers_root_scan_and_queue_margin(self) -> None:
+        self.assertGreaterEqual(
+            CONTROL_RESPONSE_TIMEOUT_SECONDS,
+            network_module.NETWORK_ACTIVATION_TIMEOUT_SECONDS + 4 * CONTROL_SOCKET_TIMEOUT_SECONDS,
+        )
+
     def _serve_once(self, socket_path: Path, response: bytes | None = None) -> threading.Thread:
         ready = threading.Event()
 
@@ -2616,7 +2624,7 @@ class NetworkControlTest(unittest.TestCase):
             principal_id="customer",
             idempotency_key="idem-1",
             body=command.body,
-            timeout_seconds=15.0,
+            timeout_seconds=20.0,
         )
 
     def test_coordinator_maps_root_controller_transport_failure_to_fail_closed(self) -> None:
@@ -2732,10 +2740,10 @@ class NetworkControlTest(unittest.TestCase):
             )
 
         self.assertEqual(request.call_args_list[0].args, ("scan",))
-        self.assertEqual(request.call_args_list[0].kwargs, {"timeout_seconds": 15.0})
+        self.assertEqual(request.call_args_list[0].kwargs, {"timeout_seconds": 20.0})
         self.assertEqual(request.call_args_list[1].args, ("create_credential",))
         self.assertEqual(request.call_args_list[1].kwargs["principal_id"], "customer")
-        self.assertEqual(request.call_args_list[1].kwargs["timeout_seconds"], 15.0)
+        self.assertEqual(request.call_args_list[1].kwargs["timeout_seconds"], 20.0)
         self.assertEqual(
             request.call_args_list[1].kwargs["body"],
             {

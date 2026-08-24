@@ -610,7 +610,7 @@ class NetworkCliTest(unittest.TestCase):
         self.assertEqual(status["desired"], desired)
         self.assertEqual(status["transaction"]["current"], transaction)
         self.assertEqual(status["mutation_capability"], capability)
-        request.assert_called_once_with("status", timeout_seconds=15.0)
+        request.assert_called_once_with("status", timeout_seconds=20.0)
 
     def test_status_reports_a_stable_error_when_network_manager_is_missing(self) -> None:
         with patch(
