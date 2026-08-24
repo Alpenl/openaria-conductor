@@ -555,6 +555,31 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_v4_network_mutation_capability_follows_controller_for_both_profiles(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            with patch.object(coordinator, "_network_controller_available", return_value=True):
+                for security_profile in ("lab", "customer"):
+                    with self.subTest(api_version="v4", security_profile=security_profile):
+                        descriptor = coordinator.device_descriptor("v4", security_profile)
+                        self.assertTrue(descriptor["capabilities"]["network_mutation"])
+                        validate_device_descriptor(
+                            descriptor,
+                            api_version="v4",
+                            security_profile=security_profile,
+                        )
+
+                    with self.subTest(api_version="v3", security_profile=security_profile):
+                        descriptor = coordinator.device_descriptor("v3", security_profile)
+                        self.assertFalse(descriptor["capabilities"]["network_mutation"])
+                        validate_device_descriptor(
+                            descriptor,
+                            api_version="v3",
+                            security_profile=security_profile,
+                        )
+        finally:
+            coordinator.close()
+
     def active_session_id(self, coordinator: CaptureCoordinator) -> str:
         status = coordinator.capture_status()
         validate_capture_status(status)

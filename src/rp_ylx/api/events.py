@@ -363,7 +363,7 @@ def validate_device_descriptor(
         raise InvalidSourceEvent("device descriptor 身份或版本无效")
     _validate_device_identity(descriptor["device"])
     _validate_build(descriptor["build"])
-    _validate_capabilities(descriptor["capabilities"])
+    _validate_capabilities(descriptor["capabilities"], api_version=api_version)
     _validate_device_storage(descriptor["storage"])
     _validate_runtime(descriptor["runtime"], api_version=api_version)
 
@@ -671,7 +671,7 @@ def _validate_build(value: object) -> None:
         raise InvalidSourceEvent("device build 无效")
 
 
-def _validate_capabilities(value: object) -> None:
+def _validate_capabilities(value: object, *, api_version: str) -> None:
     if not isinstance(value, Mapping) or set(value) != {
         "capture",
         "preview",
@@ -683,7 +683,8 @@ def _validate_capabilities(value: object) -> None:
         type(value["capture"]) is not bool
         or type(value["preview"]) is not bool
         or value["range_download"] is not True
-        or value["network_mutation"] is not False
+        or type(value["network_mutation"]) is not bool
+        or (api_version != "v4" and value["network_mutation"] is not False)
     ):
         raise InvalidSourceEvent("device capabilities 无效")
 

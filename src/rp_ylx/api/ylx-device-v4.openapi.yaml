@@ -30,15 +30,16 @@ x-ylx-security-profiles:
   lab:
     authentication: none
     standard_openapi_resolution: explicit-lab-profile-artifact-required
-    deployment_constraint: isolated-device-only
+    deployment_constraint: trusted-internal-network-only
     description: |
       The listed operations are unauthenticated only on an explicitly selected,
-      physically isolated lab deployment. The standard OpenAPI security clauses remain
+      trusted internal-network deployment. The standard OpenAPI security clauses remain
       bearer-only and authoritative for Customer; a Lab deployment requires a separately
       resolved, immutable profile artifact plus runtime verification for exactly the
-      allowed operation IDs below. Destructive and network mutations are not routed in
-      this profile; any implementation-private matching route MUST reject with 403 before
-      reaching its handler.
+      allowed operation IDs below. The listed network mutations retain write-only
+      credentials, closed request schemas, idempotency, asynchronous transactions, and
+      rescue fallback. Destructive mutations and any other implementation-private
+      mutation route MUST reject with 403 before reaching its handler.
     allowed_operation_ids:
       - getDevice
       - getCaptureStatus
@@ -51,6 +52,10 @@ x-ylx-security-profiles:
       - getNetworkStatus
       - scanNetworks
       - streamNetworkEvents
+      - createNetworkCredentialReference
+      - applyNetworkDesiredState
+      - retryNetworkTransaction
+      - forgetNetworkClientProfile
       - setCameraFocus
       - listSessions
       - getSession
@@ -58,7 +63,7 @@ x-ylx-security-profiles:
       - getSessionArtifact
       - headSessionArtifact
     destructive_mutation: unreachable-or-403
-    network_mutation: unreachable-or-403
+    network_mutation: enabled-idempotent-async
 paths:
   /device:
     get:
@@ -543,7 +548,7 @@ paths:
         persistence, logs, errors, traces, events, receipts, or any other response. The
         returned opaque credential_ref is single-use and expires no more than 120 seconds
         after issuance. Open networks do not call this operation.
-      x-ylx-lab-access: customer-only
+      x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
       requestBody:
@@ -635,7 +640,7 @@ paths:
         then applies and verifies the client or wired state. Exclusive client activation
         has a device-monotonic 10-second failure trigger and falls back to the rescue AP
         while retaining desired=wifi-client for retry.
-      x-ylx-lab-access: customer-only
+      x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
       parameters:
@@ -680,7 +685,7 @@ paths:
         preserving its desired state and rescue policy. Replaying the same
         Idempotency-Key with the same request returns the original accepted receipt;
         reusing it with different request data returns the typed idempotency conflict.
-      x-ylx-lab-access: customer-only
+      x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
       parameters:
@@ -726,7 +731,7 @@ paths:
         Erases the saved Wi-Fi client profile and credential material, commits
         desired=hotspot, and makes later boots AP-only until a new apply transaction is
         accepted. The response never echoes deleted credential material.
-      x-ylx-lab-access: customer-only
+      x-ylx-lab-access: allowed
       security:
         - bearerAuth: []
       parameters:

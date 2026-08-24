@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "796bf198d8dce26872cbe1c832706eacfe105d1e7713712fc7aead3570dcd428",
-        "bytes": 117_484,
+        "sha256": "b74654c9e36d7d1b49bf6c13b3f712d25b6f38847e32b09662b0c3bcc57cc1f4",
+        "bytes": 117_734,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",

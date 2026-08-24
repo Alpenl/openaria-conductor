@@ -1797,18 +1797,42 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "forbidden")
         self.assertEqual(self.server.provider.network_commands, [])
 
+    def test_lab_profile_exposes_controller_capability_and_allows_network_mutations(self) -> None:
         lab_provider = DeviceProvider()
+        lab_provider.network["mutation_capability"] = {
+            **lab_provider.network["mutation_capability"],
+            "enabled": True,
+            "disabled_reason": None,
+        }
+        for operation in ("apply", "retry", "forget"):
+            receipt = deepcopy(NETWORK_RECEIPT)
+            receipt["transaction"]["operation"] = operation
+            if operation == "forget":
+                receipt["transaction"]["desired"] = {
+                    "mode": "hotspot",
+                    "wifi_client": None,
+                    "ethernet": None,
+                }
+            lab_provider.network_results[operation] = NetworkCommandResult(202, receipt)
+
+        allowed_operations = {
+            "getNetworkStatus",
+            "scanNetworks",
+            "streamNetworkEvents",
+            "createNetworkCredentialReference",
+            "applyNetworkDesiredState",
+            "retryNetworkTransaction",
+            "forgetNetworkClientProfile",
+        }
         lab_server = create_gateway_server(
             "127.0.0.1",
             0,
             lab_provider,
-            security=SecurityPolicy.lab(
-                allowed_operations={"getNetworkStatus", "scanNetworks", "streamNetworkEvents"},
-                allowed_origins={self.base},
-            ),
+            security=SecurityPolicy.lab(allowed_operations=allowed_operations),
         )
         lab_thread = threading.Thread(target=lab_server.serve_forever, daemon=True)
         lab_thread.start()
+        lab_base = f"http://127.0.0.1:{lab_server.server_port}"
         try:
             connection = http.client.HTTPConnection("127.0.0.1", lab_server.server_port, timeout=2)
             try:
@@ -1816,52 +1840,82 @@ class GatewayHttpTest(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 lab_status = json.loads(response.read())
-                self.assertFalse(lab_status["mutation_capability"]["enabled"])
-                self.assertEqual(
-                    lab_status["mutation_capability"]["disabled_reason"],
-                    "auth_profile_unavailable",
-                )
-
-                connection.request("GET", "/api/v4/network/scan")
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read()), NETWORK_SCAN)
+                self.assertTrue(lab_status["mutation_capability"]["enabled"])
+                self.assertIsNone(lab_status["mutation_capability"]["disabled_reason"])
 
                 credential_body = json.dumps(
                     {
                         "schema": "ylx.network-credential-request.v1",
-                        "passphrase": "must-not-reach-provider",
+                        "passphrase": "trusted-lab-passphrase",
                     }
                 ).encode()
                 connection.request(
                     "POST",
                     "/api/v4/network/credentials",
                     body=credential_body,
-                    headers={
-                        "Origin": self.base,
-                        "Content-Type": "application/json",
-                    },
+                    headers={"Origin": lab_base, "Content-Type": "application/json"},
                 )
                 response = connection.getresponse()
-                self.assertEqual(response.status, 403)
-                self.assertEqual(json.loads(response.read())["error"]["code"], "forbidden")
-                self.assertEqual(lab_provider.network_credentials, [])
+                self.assertEqual(response.status, 201)
+                self.assertEqual(json.loads(response.read()), NETWORK_CREDENTIAL_RECEIPT)
 
-                body = json.dumps(apply_body).encode()
-                connection.request(
-                    "POST",
-                    "/api/v4/network/apply",
-                    body=body,
-                    headers={
-                        "Origin": self.base,
-                        "Content-Type": "application/json",
-                        "Idempotency-Key": "lab-network-apply",
-                    },
+                requests = (
+                    (
+                        "apply",
+                        {
+                            "schema": "ylx.network-apply-request.v1",
+                            "desired": {
+                                "mode": "wifi-client",
+                                "wifi_client": {
+                                    "ssid": "studio-wifi",
+                                    "security": "wpa2-personal",
+                                    "credential_ref": "cred-setup-token-001",
+                                },
+                                "ethernet": None,
+                            },
+                        },
+                    ),
+                    (
+                        "retry",
+                        {
+                            "schema": "ylx.network-retry-request.v1",
+                            "transaction_id": NETWORK_TRANSACTION_ID,
+                        },
+                    ),
+                    ("forget", {"schema": "ylx.network-forget-request.v1"}),
                 )
-                response = connection.getresponse()
-                self.assertEqual(response.status, 403)
-                self.assertEqual(json.loads(response.read())["error"]["code"], "forbidden")
-                self.assertEqual(lab_provider.network_commands, [])
+                for operation, request_body in requests:
+                    connection.request(
+                        "POST",
+                        f"/api/v4/network/{operation}",
+                        body=json.dumps(request_body).encode(),
+                        headers={
+                            "Origin": lab_base,
+                            "Content-Type": "application/json",
+                            "Idempotency-Key": f"lab-network-{operation}",
+                        },
+                    )
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 202)
+                    self.assertEqual(
+                        json.loads(response.read())["transaction"]["operation"], operation
+                    )
+
+                self.assertEqual(len(lab_provider.network_credentials), 1)
+                self.assertEqual(
+                    lab_provider.network_credentials[0].principal_id,
+                    "isolated-lab-device",
+                )
+                self.assertEqual(
+                    [operation for operation, _ in lab_provider.network_commands],
+                    ["apply", "retry", "forget"],
+                )
+                self.assertTrue(
+                    all(
+                        command.principal_id == "isolated-lab-device"
+                        for _, command in lab_provider.network_commands
+                    )
+                )
             finally:
                 connection.close()
         finally:
