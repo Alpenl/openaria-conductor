@@ -1810,6 +1810,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
             details=error.details,
         )
 
+    def _send_camera_provider_error(self, error: ProviderError) -> None:
+        headers = {"YLX-Error-Code": error.code} if error.code == "camera_not_connected" else None
+        self._problem(
+            error.status,
+            error.code,
+            error.message,
+            retryable=error.retryable,
+            headers=headers,
+            details=error.details,
+        )
+
     def _get_network_status(self) -> None:
         if self._principal("getNetworkStatus") is None:
             return
@@ -2131,13 +2142,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             status = self.server.provider.camera_focus_status()
         except ProviderError as error:
-            self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                details=error.details,
-            )
+            self._send_camera_provider_error(error)
             return
         except Exception:
             self._provider_failure()
@@ -2194,7 +2199,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
                 return
             except ProviderError as error:
-                self._problem(error.status, error.code, error.message, retryable=error.retryable)
+                self._send_camera_provider_error(error)
                 return
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", response.content_type)
@@ -2553,13 +2558,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 else self.server.provider.stop_capture(command)
             )
         except ProviderError as error:
-            self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                details=error.details,
-            )
+            self._send_camera_provider_error(error)
             return
         headers = {"Idempotency-Replayed": "true"} if result.replayed else None
         if operation == "stop" and result.status == HTTPStatus.NO_CONTENT and result.body is None:
@@ -2597,13 +2596,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             result = self.server.provider.set_camera_focus(command)
         except ProviderError as error:
-            self._problem(
-                error.status,
-                error.code,
-                error.message,
-                retryable=error.retryable,
-                details=error.details,
-            )
+            self._send_camera_provider_error(error)
             return
         headers = {"Idempotency-Replayed": "true"} if result.replayed else None
         if result.status == HTTPStatus.OK:

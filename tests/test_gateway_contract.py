@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "75f380e09a17972f65b6e64848be9754e7b730f88aa53bd7f3899f4b24e4da63",
-        "bytes": 115_169,
+        "sha256": "796bf198d8dce26872cbe1c832706eacfe105d1e7713712fc7aead3570dcd428",
+        "bytes": 117_484,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -130,6 +130,7 @@ STATUS_WIRE_V4 = (
     b'"addresses":[],"peer_or_ssid":null},"wired":{"state":"connected",'
     b'"interface":"eth0","addresses":["192.0.2.24/24"],'
     b'"peer_or_ssid":null},"default_route":"wired"},"live_imu":null,'
+    b'"camera":{"schema":"ylx.camera-connection.v1","state":"connected"},'
     b'"camera_focus":null}}}'
 )
 STATUS_WIRE_BY_VERSION = {
@@ -189,6 +190,10 @@ DEVICE_COMMON = {
             "default_route": "wired",
         },
         "live_imu": None,
+        "camera": {
+            "schema": "ylx.camera-connection.v1",
+            "state": "connected",
+        },
         "camera_focus": None,
     },
 }
@@ -199,6 +204,7 @@ def _device_common_for_api(api_version: str) -> dict[str, object]:
     if api_version in {"v2", "v3"}:
         runtime = common["runtime"]
         assert isinstance(runtime, dict)
+        runtime.pop("camera", None)
         runtime.pop("camera_focus", None)
     return common
 
@@ -377,6 +383,10 @@ class _WireProvider:
                         "default_route": "wired",
                     },
                     "live_imu": None,
+                    "camera": {
+                        "schema": "ylx.camera-connection.v1",
+                        "state": "connected",
+                    },
                     "camera_focus": None,
                 },
             },

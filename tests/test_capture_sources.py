@@ -972,6 +972,59 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         finally:
             sources.close()
 
+    def test_native_continuous_sources_rebuild_terminal_preview_after_hotplug(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            device = Path(directory) / "video0"
+            preview = SimpleNamespace(native_owner=object())
+            first_runtime = FakeNativeContinuousRuntime()
+            second_runtime = FakeNativeContinuousRuntime()
+            first_camera = unittest.mock.Mock()
+            second_camera = unittest.mock.Mock()
+            sources = NativeContinuousCaptureSources(
+                str(device),
+                lambda: BlockingImu(),
+                CameraMode(3840, 1080, 60.0, "mjpg"),
+                preview=preview,
+                read_timeout=0.1,
+            )
+            try:
+                self.assertEqual(
+                    sources.camera_connection_status()["state"],
+                    "disconnected",
+                )
+                device.touch()
+                self.assertEqual(
+                    sources.camera_connection_status()["state"],
+                    "connected",
+                )
+                with (
+                    patch(
+                        "rp_ylx.recording.sources.create_native_camera",
+                        side_effect=(first_camera, second_camera),
+                    ) as create_camera,
+                    patch(
+                        "rp_ylx.recording.sources.create_native_continuous_capture_runtime",
+                        side_effect=(first_runtime, second_runtime),
+                    ),
+                ):
+                    sources.start_preview()
+                    first_runtime.preview_started = False
+                    device.unlink()
+                    self.assertEqual(
+                        sources.camera_connection_status()["state"],
+                        "disconnected",
+                    )
+                    device.touch()
+                    sources.start_preview()
+
+                self.assertEqual(create_camera.call_count, 2)
+                self.assertTrue(first_runtime.closed)
+                first_camera.close.assert_called_once_with()
+                self.assertTrue(second_runtime.preview_started)
+                self.assertEqual(sources.open_handle_count, 1)
+            finally:
+                sources.close()
+
     def test_native_continuous_sources_treat_missing_v4l2_focus_as_unsupported(self) -> None:
         runtime = FakeNativeContinuousRuntime()
         camera = SimpleNamespace(

@@ -73,6 +73,10 @@ SNAPSHOT_SOURCE_EVENT = {
                 "default_route": "wired",
             },
             "live_imu": None,
+            "camera": {
+                "schema": "ylx.camera-connection.v1",
+                "state": "connected",
+            },
             "camera_focus": None,
         },
     },
@@ -95,6 +99,7 @@ def _snapshot_source_event_for_api(
     assert isinstance(runtime, dict)
     if api_version in {"v2", "v3"}:
         runtime["live_imu"] = None
+        runtime.pop("camera", None)
         runtime.pop("camera_focus", None)
     return projected
 

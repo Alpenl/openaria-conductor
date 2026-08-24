@@ -58,6 +58,7 @@ RUNTIME_SOURCE_KEYS = frozenset(
         "temperature_celsius",
         "network",
         "live_imu",
+        "camera",
         "camera_focus",
     }
 )
@@ -817,6 +818,7 @@ def _project_snapshot_data(data: dict[str, object], *, api_version: str) -> None
 def _project_runtime(runtime: dict[str, object], *, api_version: str) -> None:
     if api_version in LEGACY_DEVICE_API_VERSIONS:
         runtime["live_imu"] = None
+        runtime.pop("camera", None)
         runtime.pop("camera_focus", None)
 
 
@@ -858,6 +860,8 @@ def _validate_runtime(value: object, *, api_version: str = SOURCE_API_VERSION) -
         raise InvalidSourceEvent("v2/v3 runtime live_imu 必须是 null")
     if api_version not in LEGACY_DEVICE_API_VERSIONS and value["live_imu"] is not None:
         _validate_live_imu(value["live_imu"])
+    if api_version not in LEGACY_DEVICE_API_VERSIONS:
+        _validate_camera_connection(value["camera"])
     if "camera_focus" in value and value["camera_focus"] is not None:
         _validate_camera_focus(value["camera_focus"])
 
@@ -907,6 +911,16 @@ def _validate_camera_focus(value: object) -> None:
         or (not value["auto_supported"] and value["auto_enabled"] is not None)
     ):
         raise InvalidSourceEvent("camera focus 无效")
+
+
+def _validate_camera_connection(value: object) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema", "state"}
+        or value.get("schema") != "ylx.camera-connection.v1"
+        or value.get("state") not in {"connected", "disconnected"}
+    ):
+        raise InvalidSourceEvent("camera connection status 无效")
 
 
 def _validate_network(value: object) -> None:

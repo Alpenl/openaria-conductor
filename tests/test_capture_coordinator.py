@@ -132,6 +132,13 @@ class FakeSources:
         self.submit_frame: object | None = None
         self.submit_imu: object | None = None
         self.focus: dict[str, object] | None = None
+        self.camera_state = "connected"
+
+    def camera_connection_status(self) -> dict[str, object]:
+        return {
+            "schema": "ylx.camera-connection.v1",
+            "state": self.camera_state,
+        }
 
     def start(
         self,
@@ -509,6 +516,44 @@ class CaptureCoordinatorTest(unittest.TestCase):
             sources=sources,  # type: ignore[arg-type]
             before_write=before_write,  # type: ignore[arg-type]
         )
+
+    def test_disconnected_camera_is_reported_and_rejected_before_capture_side_effects(
+        self,
+    ) -> None:
+        sources = FakeSources()
+        sources.camera_state = "disconnected"
+        coordinator = self.coordinator(sources=sources)
+        try:
+            descriptor = coordinator.device_descriptor("v4", "lab")
+            self.assertEqual(
+                descriptor["runtime"]["camera"],
+                {
+                    "schema": "ylx.camera-connection.v1",
+                    "state": "disconnected",
+                },
+            )
+            self.assertTrue(descriptor["capabilities"]["capture"])
+            self.assertTrue(descriptor["capabilities"]["preview"])
+            self.assertEqual(
+                coordinator.capture_status()["snapshot"]["runtime"]["camera"],
+                descriptor["runtime"]["camera"],
+            )
+
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.start_capture(start_command("camera-disconnected"))
+            self.assertEqual(rejected.exception.code, "camera_not_connected")
+            self.assertEqual(rejected.exception.status, 503)
+            self.assertTrue(rejected.exception.retryable)
+            self.assertIsNone(sources.mode)
+            sessions_root = self.mountpoint / "sessions"
+            self.assertTrue(not sessions_root.exists() or not any(sessions_root.iterdir()))
+
+            with self.assertRaises(ProviderError) as preview:
+                coordinator.latest_preview(fps=None, accept="image/jpeg")
+            self.assertEqual(preview.exception.code, "camera_not_connected")
+            self.assertEqual(preview.exception.status, 503)
+        finally:
+            coordinator.close()
 
     def active_session_id(self, coordinator: CaptureCoordinator) -> str:
         status = coordinator.capture_status()

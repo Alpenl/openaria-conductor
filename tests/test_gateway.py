@@ -111,6 +111,10 @@ DEVICE_V3 = {
             "default_route": "wired",
         },
         "live_imu": None,
+        "camera": {
+            "schema": "ylx.camera-connection.v1",
+            "state": "connected",
+        },
         "camera_focus": None,
     },
 }
@@ -301,6 +305,7 @@ def _runtime_for_api(runtime: dict[str, object], api_version: str) -> dict[str, 
     projected = deepcopy(runtime)
     if api_version in {"v2", "v3"}:
         projected["live_imu"] = None
+        projected.pop("camera", None)
         projected.pop("camera_focus", None)
     return projected
 
@@ -503,6 +508,7 @@ class DeviceProvider:
         self.network_commands: list[tuple[str, NetworkCommand]] = []
         self.network_results: dict[str, NetworkCommandResult] = {}
         self.network_errors: dict[str, ProviderError] = {}
+        self.camera_error: ProviderError | None = None
         self.live_imu: object | None = None
         self.stop_status = 204
         self.device_schema_override: str | None = None
@@ -531,6 +537,8 @@ class DeviceProvider:
         return status
 
     def start_capture(self, command: CaptureCommand) -> CaptureCommandResult:
+        if self.camera_error is not None:
+            raise self.camera_error
         return self._command("start", command, status=202, body=self.status)
 
     def stop_capture(self, command: CaptureCommand) -> CaptureCommandResult:
@@ -538,6 +546,8 @@ class DeviceProvider:
         return self._command("stop", command, status=self.stop_status, body=body)
 
     def camera_focus_status(self) -> object | None:
+        if self.camera_error is not None:
+            raise self.camera_error
         return deepcopy(self.focus)
 
     def network_status(self) -> object:
@@ -579,6 +589,8 @@ class DeviceProvider:
         return self._network_command("forget", command)
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
+        if self.camera_error is not None:
+            raise self.camera_error
         if self.focus is None:
             raise ProviderError(
                 "camera_focus_unsupported",
@@ -1363,6 +1375,45 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
+
+    def test_disconnected_camera_errors_are_typed_for_capture_and_focus(self) -> None:
+        self.server.provider.camera_error = ProviderError(
+            "camera_not_connected",
+            "相机未接入",
+            status=503,
+            retryable=True,
+        )
+        requests = (
+            ("/api/v4/camera/focus", None, None),
+            (
+                "/api/v4/camera/focus",
+                {"Origin": self.base, "Idempotency-Key": "camera-disconnected-focus"},
+                {"schema": "ylx.camera-focus-set.v1", "value": 64},
+            ),
+            (
+                "/api/v4/capture/start",
+                {"Origin": self.base, "Idempotency-Key": "camera-disconnected-capture"},
+                {
+                    "schema": "ylx.capture-start.v2",
+                    "mode": "production",
+                    "take": {"kind": "new"},
+                },
+            ),
+        )
+
+        for path, headers, body in requests:
+            with self.subTest(path=path, method="GET" if body is None else "POST"):
+                status, payload, response_headers = self.request(
+                    path,
+                    token="reader-token",
+                    headers=headers,
+                    body=body,
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(response_headers["YLX-Error-Code"], "camera_not_connected")
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["code"], "camera_not_connected")
+                self.assertTrue(error["retryable"])
 
     def test_network_status_and_events_are_v4_only_and_strictly_validated(self) -> None:
         for version in ("v2", "v3"):

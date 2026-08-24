@@ -715,8 +715,6 @@ def build_production_service(
             return V4L2DiscoveryBackend(stream_factory=v4l2_production_stream_factory)
 
         camera_backend_factory = production_backend
-    selector = CameraController(camera_backend_factory())
-    stable_id = stable_id_for_device(selector, config.camera_device)
     preview = LatestPreviewBuffer(stream_fps=15)
     metrics = PerformanceMetrics()
     if imu_source_factory is None:
@@ -739,6 +737,8 @@ def build_production_service(
             metrics=metrics,
         )
     else:
+        selector = CameraController(camera_backend_factory())
+        stable_id = stable_id_for_device(selector, config.camera_device)
         sources = ContinuousCaptureSources(
             lambda: CameraController(camera_backend_factory()),
             imu_factory,
@@ -753,8 +753,19 @@ def build_production_service(
     event_pump = None
     mdns_publisher = None
     try:
-        with suppress(BaseException):
+        try:
             sources.start_preview()
+        except BaseException as error:
+            code = getattr(error, "code", "camera_preview_unavailable")
+            if not config.camera_device.exists():
+                code = "camera_not_connected"
+            _OPERATIONAL_LOG.event(
+                "camera_preview_degraded",
+                level="warning",
+                error_code=code if isinstance(code, str) else "camera_preview_unavailable",
+                exception_type=type(error).__name__,
+                retryable=True,
+            )
         config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         session_config = DeviceSessionConfig(
             device_id=config.device_id,
