@@ -983,13 +983,20 @@ class NetworkController:
         health_error_code: str | None = None
         try:
             with _network_operation_lock(blocking=False):
-                healthy = saved_network_is_healthy(mode)
+                # The read-only health probe below must not block interactive requests.
+                pass
         except NetworkError as exc:
             if exc.code == "capture_active":
                 self._health_failure_started_ns = None
                 return
             healthy = False
             health_error_code = exc.code
+        else:
+            try:
+                healthy = saved_network_is_healthy(mode)
+            except NetworkError as exc:
+                healthy = False
+                health_error_code = exc.code
         if healthy:
             was_degraded = self._health_failure_started_ns is not None
             self._health_failure_started_ns = None
