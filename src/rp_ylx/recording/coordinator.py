@@ -33,7 +33,7 @@ from rp_ylx.api.gateway import (
     NetworkCredentialCommand,
     ProviderError,
 )
-from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
+from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.network import NetworkError, network_operation_lock_path
@@ -97,6 +97,8 @@ class CaptureSources(Protocol):
     ) -> None: ...
 
     def stop(self) -> None: ...
+
+    def camera_connection_status(self) -> dict[str, object]: ...
 
     def camera_focus_status(self) -> dict[str, object] | None: ...
 
@@ -980,13 +982,44 @@ class CaptureCoordinator:
                 raise CameraError("camera_focus_unavailable", str(exc), retryable=True) from exc
             return None
 
+    def _camera_connection_status(self) -> dict[str, object]:
+        status_reader = getattr(getattr(self, "_sources", None), "camera_connection_status", None)
+        if not callable(status_reader):
+            return {"schema": "ylx.camera-connection.v1", "state": "connected"}
+        status = status_reader()
+        if (
+            not isinstance(status, Mapping)
+            or set(status) != {"schema", "state"}
+            or status.get("schema") != "ylx.camera-connection.v1"
+            or status.get("state") not in {"connected", "disconnected"}
+        ):
+            raise RuntimeError("camera connection status 无效")
+        return dict(status)
+
+    @staticmethod
+    def _camera_not_connected() -> ProviderError:
+        return ProviderError(
+            "camera_not_connected",
+            "相机未接入",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            retryable=True,
+        )
+
+    def _require_camera_connected(self) -> None:
+        if self._camera_connection_status()["state"] != "connected":
+            raise self._camera_not_connected()
+
     def _runtime_snapshot(self) -> Mapping[str, object]:
         runtime = dict(copy.deepcopy(self._runtime()))
+        camera = self._camera_connection_status()
         latest = self._latest_imu_sample()
         runtime["live_imu"] = (
             None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
         )
-        runtime["camera_focus"] = self._camera_focus_status()
+        runtime["camera"] = camera
+        runtime["camera_focus"] = (
+            None if camera["state"] == "disconnected" else self._camera_focus_status()
+        )
         return runtime
 
     def _snapshot(self) -> Mapping[str, object]:
@@ -1084,6 +1117,7 @@ class CaptureCoordinator:
         return projected
 
     def camera_focus_status(self) -> dict[str, object] | None:
+        self._require_camera_connected()
         try:
             return self._camera_focus_status(raise_errors=True)
         except CameraError as error:
@@ -1386,6 +1420,7 @@ class CaptureCoordinator:
             )
 
     def _set_camera_focus(self, body: Mapping[str, object]) -> dict[str, object]:
+        self._require_camera_connected()
         value = body.get("value")
         auto_enabled = body.get("auto_enabled")
         if value is None and auto_enabled is None:
@@ -1469,6 +1504,7 @@ class CaptureCoordinator:
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
+        self._require_camera_connected()
         self._acquire_network_operation_lease()
         try:
             return self._start_capture_with_network_lease(body)
@@ -2160,11 +2196,35 @@ class CaptureCoordinator:
         }
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
+        self._require_camera_connected()
         start_preview = getattr(self._sources, "start_preview", None)
-        if callable(start_preview):
-            with suppress(BaseException):
+        try:
+            if callable(start_preview):
                 start_preview()
-        return self._preview.latest_preview(fps=fps, accept=accept)
+            return self._preview.latest_preview(fps=fps, accept=accept)
+        except PreviewFrameUnavailable as error:
+            if self._camera_connection_status()["state"] == "disconnected":
+                raise self._camera_not_connected() from error
+            raise
+        except CameraError as error:
+            if self._camera_connection_status()["state"] == "disconnected":
+                raise self._camera_not_connected() from error
+            status = HTTPStatus.SERVICE_UNAVAILABLE if error.retryable else HTTPStatus.CONFLICT
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=status,
+                retryable=error.retryable,
+            ) from error
+        except Exception as error:
+            if self._camera_connection_status()["state"] == "disconnected":
+                raise self._camera_not_connected() from error
+            raise ProviderError(
+                "preview_unavailable",
+                str(error) or "当前没有可用的预览帧",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from error
 
     def close(self) -> None:
         if self._sources is not None:

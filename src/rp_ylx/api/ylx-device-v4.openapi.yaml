@@ -149,6 +149,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/CameraNotConnected"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
         "500":
@@ -361,7 +363,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
-          description: No preview frame is currently available
+          description: |
+            No preview frame is currently available. A physically absent configured
+            camera returns camera_not_connected with retryable=true; an attached camera
+            that has not produced a frame returns preview_unavailable.
+          headers:
+            YLX-Error-Code:
+              required: false
+              schema:
+                enum: [camera_not_connected, preview_unavailable]
           content:
             application/problem+json:
               schema:
@@ -396,6 +406,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/CameraFocusUnsupported"
+        "503":
+          $ref: "#/components/responses/CameraNotConnected"
         "500":
           $ref: "#/components/responses/InternalError"
     post:
@@ -440,6 +452,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/InvalidCameraFocus"
+        "503":
+          $ref: "#/components/responses/CameraNotConnected"
         "500":
           $ref: "#/components/responses/InternalError"
   /network:
@@ -1176,6 +1190,18 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/CameraFocusUnsupportedError"
+    CameraNotConnected:
+      description: The configured physical camera is not connected to the device
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: camera_not_connected
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/CameraNotConnectedError"
     InvalidCameraFocus:
       description: Requested focus value or auto toggle is outside the exposed V4L2 control range/capability
       headers:
@@ -1441,7 +1467,7 @@ components:
     DeviceRuntimeStatus:
       type: object
       additionalProperties: false
-      required: [observed_at, connection_method, temperature_celsius, network, live_imu, camera_focus]
+      required: [observed_at, connection_method, temperature_celsius, network, live_imu, camera, camera_focus]
       properties:
         observed_at:
           type: string
@@ -1462,11 +1488,26 @@ components:
             - $ref: "#/components/schemas/LiveImuObservation"
             - type: "null"
           description: Latest non-stale live sample, or null when no active session sample is available
+        camera:
+          $ref: "#/components/schemas/CameraConnectionStatus"
         camera_focus:
           oneOf:
             - $ref: "#/components/schemas/CameraFocusStatus"
             - type: "null"
           description: Latest focus control status, or null when focus_absolute is not exposed
+    CameraConnectionStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, state]
+      properties:
+        schema:
+          const: ylx.camera-connection.v1
+        state:
+          enum: [connected, disconnected]
+          description: |
+            connected means the configured camera device node is currently present;
+            disconnected means camera-dependent commands must fail with the typed,
+            retryable camera_not_connected problem while the control plane stays available.
     NetworkRuntimeStatus:
       type: object
       additionalProperties: false
@@ -3125,6 +3166,32 @@ components:
               format: uuid
             retryable:
               const: false
+            details:
+              type: object
+              additionalProperties: true
+    CameraNotConnectedError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable]
+          properties:
+            code:
+              const: camera_not_connected
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: true
             details:
               type: object
               additionalProperties: true

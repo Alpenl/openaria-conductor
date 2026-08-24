@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from rp_ylx.api.preview import LatestPreviewBuffer
@@ -400,47 +401,81 @@ class NativeContinuousCaptureSources:
             return latest()
         return None
 
+    def camera_connection_status(self) -> dict[str, object]:
+        return {
+            "schema": "ylx.camera-connection.v1",
+            "state": "connected" if Path(self._device).exists() else "disconnected",
+        }
+
     def start_preview(self) -> None:
+        stale_runtime: NativeContinuousCaptureRuntime | None = None
+        stale_camera: NativeCamera | None = None
         with self._lock:
-            if self._runtime is not None:
-                return
+            runtime = self._runtime
+            if runtime is not None:
+                try:
+                    running = runtime.snapshot().get("running") is True
+                except BaseException:
+                    running = False
+                if running or self._recording is not None:
+                    return
+                stale_runtime = runtime
+                stale_camera = self._camera
+                self._runtime = None
+                self._camera = None
+                self._open_handles -= 1
+        if stale_runtime is not None:
+            with suppress(BaseException):
+                stale_runtime.close(self._read_timeout + 1.0)
+        if stale_camera is not None:
+            with suppress(BaseException):
+                stale_camera.close()
         native_preview = self._preview.native_owner
         if native_preview is None:
             raise RuntimeError("正式连续采集需要 Rust preview buffer")
         rounded_fps = round(self._camera_mode.fps)
-        camera = create_native_camera(
-            self._device,
-            self._camera_mode.width,
-            self._camera_mode.height,
-            rounded_fps,
-            self._camera_mode.encoding,
-            buffer_count=self._buffer_count,
-            queue_capacity=self._queue_capacity,
-            split_eyes=False,
-        )
-        if self._metrics is None:
-            runtime = create_native_continuous_capture_runtime(
-                camera,
-                native_preview,
-                self._frame_decimation,
-                read_timeout_seconds=self._read_timeout,
-            )
-        else:
-            runtime = create_native_continuous_capture_runtime(
-                camera,
-                native_preview,
-                self._frame_decimation,
-                read_timeout_seconds=self._read_timeout,
-                metrics=self._metrics.native_owner,
-            )
+        camera: NativeCamera | None = None
+        runtime = None
         try:
+            camera = create_native_camera(
+                self._device,
+                self._camera_mode.width,
+                self._camera_mode.height,
+                rounded_fps,
+                self._camera_mode.encoding,
+                buffer_count=self._buffer_count,
+                queue_capacity=self._queue_capacity,
+                split_eyes=False,
+            )
+            if self._metrics is None:
+                runtime = create_native_continuous_capture_runtime(
+                    camera,
+                    native_preview,
+                    self._frame_decimation,
+                    read_timeout_seconds=self._read_timeout,
+                )
+            else:
+                runtime = create_native_continuous_capture_runtime(
+                    camera,
+                    native_preview,
+                    self._frame_decimation,
+                    read_timeout_seconds=self._read_timeout,
+                    metrics=self._metrics.native_owner,
+                )
             runtime.start_preview()
-        except BaseException:
-            with suppress(BaseException):
-                runtime.close(self._read_timeout + 1.0)
-            with suppress(BaseException):
-                camera.close()
+        except BaseException as error:
+            if runtime is not None:
+                with suppress(BaseException):
+                    runtime.close(self._read_timeout + 1.0)
+            if camera is not None:
+                with suppress(BaseException):
+                    camera.close()
+            code = str(getattr(error, "code", "camera_preview_unavailable"))
+            message = str(getattr(error, "message", error)) or code
+            with self._lock:
+                self._last_preview_error = (code, message)
             raise
+        assert camera is not None and runtime is not None
         with self._lock:
             if self._runtime is not None:
                 with suppress(BaseException):

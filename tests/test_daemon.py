@@ -26,6 +26,33 @@ from rp_ylx.daemon import (
 from rp_ylx.deployment import ReleaseManager
 from rp_ylx.native import NativeCapabilities
 
+PRODUCTION_NATIVE_FEATURES = (
+    "capability_probe",
+    "native_camera",
+    "camera_frame_validator",
+    "native_audio",
+    "native_timeline",
+    "native_imu",
+    "recording_codec",
+    "recording_sink",
+    "recording_imu_batch",
+    "active_take_writer",
+    "recording_frame_gate",
+    "capture_fanout",
+    "continuous_capture_runtime",
+    "continuous_capture_raw_sink",
+    "continuous_capture_split_sink",
+    "recording_event_queue",
+    "artifact_finalize",
+    "stereo_encoder_events",
+    "stereo_encoder_pipe",
+    "session_io",
+    "device_session_artifacts",
+    "device_session_finalizer",
+    "preview_buffer",
+    "performance_metrics",
+)
+
 
 class ProductionDaemonTest(unittest.TestCase):
     def test_lab_profile_allows_network_reads_but_not_mutations(self) -> None:
@@ -342,6 +369,10 @@ class ProductionDaemonTest(unittest.TestCase):
                 port = listener.getsockname()[1]
             config = replace(self.config(root), port=port)
             source = Mock(open_handle_count=0)
+            source.camera_connection_status.return_value = {
+                "schema": "ylx.camera-connection.v1",
+                "state": "connected",
+            }
             source.camera_focus_status.return_value = None
             mdns_publisher = Mock()
             lock_path_patch = patch(
@@ -561,6 +592,56 @@ class ProductionDaemonTest(unittest.TestCase):
                 self.assertRaises(ProductionConfigError),
             ):
                 build_production_service(config)
+
+    def test_missing_camera_does_not_block_native_control_plane_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            sources = Mock()
+            sources.start_preview.side_effect = RuntimeError(
+                "open_failed: No such file or directory"
+            )
+            coordinator = Mock()
+            server = Mock()
+            event_pump = Mock()
+            mdns_publisher = Mock()
+            operational_log = Mock()
+            with (
+                patch("rp_ylx.daemon.__commit__", "a" * 40),
+                patch("rp_ylx.daemon._OPERATIONAL_LOG", operational_log),
+                patch(
+                    "rp_ylx.daemon.native_capabilities",
+                    return_value=NativeCapabilities(
+                        True,
+                        "0.1.0",
+                        4,
+                        PRODUCTION_NATIVE_FEATURES,
+                    ),
+                ),
+                patch("rp_ylx.daemon.stable_id_for_device") as stable_id,
+                patch(
+                    "rp_ylx.daemon.NativeContinuousCaptureSources",
+                    return_value=sources,
+                ),
+                patch("rp_ylx.daemon.CaptureCoordinator", return_value=coordinator),
+                patch("rp_ylx.daemon.create_gateway_server", return_value=server),
+                patch("rp_ylx.daemon.CaptureEventPump", return_value=event_pump),
+                patch("rp_ylx.daemon.MdnsPublisher", return_value=mdns_publisher),
+            ):
+                service = build_production_service(config)
+            try:
+                stable_id.assert_not_called()
+                sources.start_preview.assert_called_once_with()
+                mdns_publisher.start.assert_called_once_with()
+                self.assertIs(service.server, server)
+                operational_log.event.assert_called_once_with(
+                    "camera_preview_degraded",
+                    level="warning",
+                    error_code="camera_not_connected",
+                    exception_type="RuntimeError",
+                    retryable=True,
+                )
+            finally:
+                service.close()
 
     def test_missing_native_camera_fails_before_production_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

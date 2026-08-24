@@ -187,6 +187,28 @@ class GatewayPreviewHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "preview_unavailable")
         self.assertTrue(json.loads(payload)["error"]["retryable"])
 
+    def test_disconnected_camera_has_typed_retryable_preview_error(self) -> None:
+        self.provider.error = ProviderError(
+            "camera_not_connected",
+            "相机未接入",
+            status=503,
+            retryable=True,
+        )
+
+        status, payload, headers = self.request("/api/v4/preview")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["YLX-Error-Code"], "camera_not_connected")
+        self.assertEqual(
+            json.loads(payload)["error"],
+            {
+                "code": "camera_not_connected",
+                "message": "相机未接入",
+                "request_id": json.loads(payload)["error"]["request_id"],
+                "retryable": True,
+            },
+        )
+
     def test_finite_multipart_stream_has_exact_framing_and_connection_delimiting(self) -> None:
         self.provider.response = PreviewResponse(
             "multipart/x-mixed-replace; boundary=ylx-preview",
