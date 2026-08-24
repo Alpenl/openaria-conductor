@@ -1420,6 +1420,76 @@ class NetworkControllerCoreTest(unittest.TestCase):
             applied["body"]["transaction"]["transaction_id"],
         )
 
+    def test_slow_health_probe_does_not_reject_network_requests_as_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = {
+                "RP_YLX_NETWORK_STATE_DIR": str(root / "state"),
+                "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
+                "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
+            }
+            from tests.test_network import FakeNmcli
+
+            nmcli = FakeNmcli(root / "profiles")
+            probe_started = threading.Event()
+            release_probe = threading.Event()
+
+            def slow_health_probe(mode: str) -> bool:
+                self.assertEqual(mode, "wifi-client")
+                probe_started.set()
+                if not release_probe.wait(timeout=2):
+                    raise TimeoutError("health probe was not released")
+                return True
+
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+            ):
+                controller = NetworkController(
+                    device_id="device-slow-health",
+                    require_root=False,
+                    health_poll_seconds=3600,
+                )
+                monitor: threading.Thread | None = None
+                try:
+                    initial = self._apply_open_wifi(
+                        controller,
+                        idempotency_key="slow-health-setup",
+                    )
+                    self.assertTrue(initial["ok"], initial)
+                    self.assertTrue(controller.wait_for_idle(timeout=2))
+                    with patch(
+                        "rp_ylx.network_control.saved_network_is_healthy",
+                        side_effect=slow_health_probe,
+                    ):
+                        monitor = threading.Thread(target=controller._monitor_once)
+                        monitor.start()
+                        self.assertTrue(probe_started.wait(timeout=1))
+                        scanned = controller.handle(
+                            {
+                                "schema": "ylx.network-control-request.v1",
+                                "operation": "scan",
+                            }
+                        )
+                        applied = self._apply_open_wifi(
+                            controller,
+                            idempotency_key="slow-health-apply",
+                            ssid="Field LAN",
+                        )
+                        release_probe.set()
+                        monitor.join(timeout=2)
+                        self.assertTrue(controller.wait_for_idle(timeout=2))
+                finally:
+                    release_probe.set()
+                    if monitor is not None:
+                        monitor.join(timeout=2)
+                    controller.close()
+
+        self.assertIsNotNone(monitor)
+        self.assertFalse(monitor.is_alive())
+        self.assertTrue(scanned["ok"], scanned)
+        self.assertTrue(applied["ok"], applied)
+
     def test_scan_returns_only_redacted_contract_fields_and_advances_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
