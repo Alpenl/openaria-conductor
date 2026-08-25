@@ -65,6 +65,13 @@ uv run python scripts/check.py
 uv build
 ```
 
+## 设备接入
+
+- 救援热点名称：`OpenAria-XXXXXXXX`，后缀由设备身份生成并在该设备上保持不变。
+- 救援热点公共密码：`12345678`。
+- SSH 管理账号：`OpenAria`。
+- SSH 管理密码：`123456`。
+
 `status` 在没有相机和 IMU 的电脑上也能正常运行，并明确报告硬件尚未探测。
 录制写盘、背压和失败目录语义见 [有界录制管道](docs/recording-pipeline.md)。
 RDK X5 的固定硬件事实、短录制步骤和证据边界见 [RDK X5 基线](docs/rdk-x5-baseline.md)。

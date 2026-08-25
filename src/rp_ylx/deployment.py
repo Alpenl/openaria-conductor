@@ -81,6 +81,7 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         "usr/lib/systemd/system/rp-ylx-data-volume.service",
         0o644,
     ),
+    "rp-ylx-device-login": ("usr/local/sbin/rp-ylx-device-login", 0o700),
     "rp-ylx.sysusers": ("usr/lib/sysusers.d/rp-ylx.conf", 0o644),
     "rp-ylx.tmpfiles": ("usr/lib/tmpfiles.d/rp-ylx.conf", 0o644),
     "rp-ylx-wifi-watchdog": ("usr/local/sbin/rp-ylx-wifi-watchdog", 0o755),
@@ -1128,6 +1129,10 @@ class ReleaseManager:
             "openssl",
             "make",
             "cc",
+            "getent",
+            "useradd",
+            "usermod",
+            "chage",
         )
         missing = [
             command for command in required_commands if self.executable_finder(command) is None
@@ -2211,6 +2216,7 @@ class ReleaseManager:
             self._install_assets()
             self.runner(["systemd-sysusers"])
             self.runner(["systemd-tmpfiles", "--create", "rp-ylx.conf"])
+            self.runner(["/usr/local/sbin/rp-ylx-device-login"])
             if old_current is not None:
                 self._snapshot_device_config(old_current)
             self._migrate_legacy_network_state()

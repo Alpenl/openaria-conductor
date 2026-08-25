@@ -50,6 +50,7 @@ rp_ylx = [
   "*.conf",
   "*.default",
   "rp-ylx-data-volume",
+  "rp-ylx-device-login",
   "rp-ylx-wifi-watchdog",
 ]
 # Echo / Web 制品：托管集合由内部 assets.json 声明，打包时必须整份带上。

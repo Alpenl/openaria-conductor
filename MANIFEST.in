@@ -4,4 +4,4 @@ recursive-include native *.rs *.toml
 recursive-include contracts/golden *.json
 include src/rp_ylx/web/assets.json
 recursive-include src/rp_ylx/web *.html *.css *.js
-recursive-include src/rp_ylx/deploy *.avahi *.conf *.default *.service *.socket *.sysusers *.timer *.tmpfiles rp-ylx-data-volume rp-ylx-wifi-watchdog
+recursive-include src/rp_ylx/deploy *.avahi *.conf *.default *.service *.socket *.sysusers *.timer *.tmpfiles rp-ylx-data-volume rp-ylx-device-login rp-ylx-wifi-watchdog

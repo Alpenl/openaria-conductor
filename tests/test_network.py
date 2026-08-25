@@ -640,42 +640,95 @@ class NetworkCliTest(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "network_status_failed")
         self.assertNotIn(nmcli.status_stderr, error)
 
-    def test_controller_creates_one_secret_safe_rescue_ap_per_device(self) -> None:
+    def test_controller_creates_one_public_password_rescue_ap_per_device(self) -> None:
         nmcli = FakeNmcli(self.root / "profiles")
-        rescue_secret = "random-rescue-secret-1234"
 
         with (
             patch.dict(os.environ, self.environment, clear=False),
             patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
-            patch("rp_ylx.network.secrets.token_urlsafe", return_value=rescue_secret) as random_psk,
         ):
             first = network_module.ensure_rescue_ap("device-serial-001")
             second = network_module.ensure_rescue_ap("device-serial-001")
 
         self.assertEqual(first, second)
-        random_psk.assert_called_once()
         self.assertEqual(first["mode"], "hotspot")
         self.assertEqual(first["interface"], "wlan0")
         self.assertNotIn("psk", first)
-        self.assertNotIn(rescue_secret, json.dumps(first))
 
         rescue_path = self.root / "state" / "rescue.json"
         rescue = json.loads(rescue_path.read_text(encoding="utf-8"))
         self.assertEqual(rescue_path.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("psk", rescue["config"])
-        self.assertNotIn(rescue_secret, json.dumps(rescue))
 
         profile_path = self.root / "profiles" / f"{rescue['profile']}.nmconnection"
         self.assertEqual(profile_path.stat().st_mode & 0o777, 0o600)
         profile = profile_path.read_text(encoding="utf-8")
         self.assertIn("mode=ap", profile)
-        self.assertIn(f"psk={rescue_secret}", profile)
+        self.assertIn(f"psk={network_module.PUBLIC_RESCUE_AP_PSK}", profile)
         self.assertIn("autoconnect=true", profile)
 
         persisted = b"\n".join(
             path.read_bytes() for path in (self.root / "state").rglob("*") if path.is_file()
         )
-        self.assertNotIn(rescue_secret.encode(), persisted)
+        self.assertNotIn(network_module.PUBLIC_RESCUE_AP_PSK.encode(), persisted)
+        self.assertEqual(
+            sum(command[-2:] == ["connection", "reload"] for command in nmcli.commands),
+            1,
+        )
+
+    def test_controller_migrates_existing_rescue_ap_to_public_password(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        environment = patch.dict(os.environ, self.environment, clear=False)
+        subprocess_run = patch("rp_ylx.network.subprocess.run", side_effect=nmcli)
+        with environment, subprocess_run:
+            rescue = network_module.ensure_rescue_ap("device-serial-001")
+            profile_path = self.root / "profiles" / f"{rescue['profile']}.nmconnection"
+            legacy_password = "legacy-random-password"
+            profile_path.write_text(
+                profile_path.read_text(encoding="utf-8").replace(
+                    network_module.PUBLIC_RESCUE_AP_PSK,
+                    legacy_password,
+                ),
+                encoding="utf-8",
+            )
+
+            migrated = network_module.ensure_rescue_ap("device-serial-001")
+
+        self.assertEqual(migrated, rescue)
+        profile = profile_path.read_text(encoding="utf-8")
+        self.assertIn(f"psk={network_module.PUBLIC_RESCUE_AP_PSK}", profile)
+        self.assertNotIn(legacy_password, profile)
+        self.assertEqual(profile_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            sum(command[-2:] == ["connection", "reload"] for command in nmcli.commands),
+            2,
+        )
+
+    def test_rescue_password_migration_restores_profile_when_reload_fails(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        environment = patch.dict(os.environ, self.environment, clear=False)
+        subprocess_run = patch("rp_ylx.network.subprocess.run", side_effect=nmcli)
+        with environment, subprocess_run:
+            rescue = network_module.ensure_rescue_ap("device-serial-001")
+            profile_path = self.root / "profiles" / f"{rescue['profile']}.nmconnection"
+            legacy_password = "legacy-random-password"
+            legacy_profile = profile_path.read_text(encoding="utf-8").replace(
+                network_module.PUBLIC_RESCUE_AP_PSK,
+                legacy_password,
+            )
+            profile_path.write_text(legacy_profile, encoding="utf-8")
+            nmcli.reload_failures = 1
+
+            with self.assertRaises(network_module.NetworkError) as rejected:
+                network_module.ensure_rescue_ap("device-serial-001")
+
+        self.assertEqual(rejected.exception.code, "reload_failed")
+        self.assertEqual(profile_path.read_text(encoding="utf-8"), legacy_profile)
+        self.assertEqual(profile_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            sum(command[-2:] == ["connection", "reload"] for command in nmcli.commands),
+            3,
+        )
 
     def test_wifi_client_profile_never_autoconnects_outside_controller(self) -> None:
         code, _, error = self.run_cli(
