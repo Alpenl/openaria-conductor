@@ -1673,6 +1673,9 @@ class NetworkController:
                 else []
             )
             retry_work = deepcopy(source_work)
+            # Rescue readiness and monotonic deadlines belong to the old execution.
+            retry_work.pop("rescue_ready", None)
+            retry_work.pop("rescue_deadline", None)
             if retry_work.get("kind") == "fallback":
                 candidate = retry_work.get("candidate")
                 if not isinstance(candidate, Mapping):

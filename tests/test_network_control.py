@@ -1694,7 +1694,7 @@ class NetworkControllerCoreTest(unittest.TestCase):
         self.assertEqual(len(client_profiles), 1)
         self.assertTrue(lkg_exists)
 
-    def test_verified_client_health_uses_ten_second_fallback_and_explicit_retry(self) -> None:
+    def test_verified_client_health_allows_retry_after_rescue_deadline_expires(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = {
@@ -1781,6 +1781,7 @@ class NetworkControllerCoreTest(unittest.TestCase):
                     )["profile"]
                     self.assertEqual(nmcli.active["wlan0"], rescue_profile)
 
+                    clock["now"] = 30_000_000_000
                     retried = controller.handle(
                         {
                             "schema": "ylx.network-control-request.v1",
