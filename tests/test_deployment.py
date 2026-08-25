@@ -241,6 +241,10 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx-data-volume.service"), self.commands)
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx.service"), self.commands)
         self.assertIn(("systemctl", "enable", "--now", "rp-ylx-wifi-watchdog.timer"), self.commands)
+        self.assertEqual(
+            self.commands.count(("/usr/local/sbin/rp-ylx-device-login",)),
+            2,
+        )
         self.assertIn(
             ("systemctl", "enable", "--now", "rp-ylx-network-control.socket"),
             self.commands,
@@ -268,6 +272,8 @@ class ReleaseManagerTest(unittest.TestCase):
         )
         data_volume = self.root / "usr/local/sbin/rp-ylx-data-volume"
         self.assertTrue(data_volume.stat().st_mode & 0o100)
+        device_login = self.root / "usr/local/sbin/rp-ylx-device-login"
+        self.assertEqual(device_login.stat().st_mode & 0o777, 0o700)
         watchdog = self.root / "usr/local/sbin/rp-ylx-wifi-watchdog"
         self.assertTrue(watchdog.stat().st_mode & 0o100)
         self.assertTrue((self.root / "usr/lib/systemd/system/rp-ylx-wifi-watchdog.timer").is_file())
@@ -1712,6 +1718,20 @@ class ReleaseManagerTest(unittest.TestCase):
             "f /run/rp-ylx/network-operation.lock 0660 root rp-ylx -",
             tmpfiles,
         )
+
+    def test_device_login_asset_provisions_fixed_administrator(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"
+        script = root / "rp-ylx-device-login"
+        syntax = subprocess.run(
+            ["sh", "-n", str(script)], check=False, capture_output=True, text=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("LOGIN_USER=OpenAria", content)
+        self.assertIn("useradd --badname --create-home", content)
+        self.assertIn("usermod --append --groups sudo", content)
+        self.assertIn("usermod --password", content)
+        self.assertIn("chage --maxdays -1 --expiredate -1", content)
 
     def test_wifi_watchdog_assets_are_syntactically_valid_and_safely_wired(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src/rp_ylx/deploy"

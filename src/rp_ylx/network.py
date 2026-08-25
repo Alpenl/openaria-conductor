@@ -10,7 +10,6 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import stat
 import subprocess
 import sys
@@ -48,6 +47,7 @@ RESULT_FORMAT = "ylx.network-result.v0"
 LKG_FORMAT = "ylx.network-lkg.v0"
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 FALLBACK_NETWORK_AUTHORITY_EPOCH = str(uuid.uuid4())
+PUBLIC_RESCUE_AP_PSK = "12345678"
 
 
 class NetworkError(RuntimeError):
@@ -730,8 +730,45 @@ def _public_rescue_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return deepcopy(dict(record))
 
 
+def _migrate_rescue_profile_password(record: Mapping[str, Any]) -> None:
+    profile = str(record["profile"])
+    profile_path = _profile_dir() / f"{profile}.nmconnection"
+    config = {
+        "mode": "hotspot",
+        "ssid": str(record["config"]["ssid"]),
+        "psk": PUBLIC_RESCUE_AP_PSK,
+    }
+    expected = _network_manager_profile(profile, config)
+    try:
+        previous = profile_path.read_bytes()
+    except OSError as exc:
+        raise NetworkError("profile_unreadable", "救援热点 NetworkManager profile 不可读") from exc
+    if previous == expected:
+        return
+
+    try:
+        _write_atomic(profile_path, expected, 0o600)
+        reload_result = _run_nmcli(["connection", "reload"], timeout=10)
+        if reload_result.returncode != 0:
+            raise NetworkError("reload_failed", "NetworkManager 无法加载固定救援热点")
+    except (NetworkError, OSError) as exc:
+        try:
+            _write_atomic(profile_path, previous, 0o600)
+            restore_result = _run_nmcli(["connection", "reload"], timeout=10)
+            if restore_result.returncode != 0:
+                raise NetworkError("reload_failed", "NetworkManager 无法恢复原救援热点")
+        except (NetworkError, OSError) as restore_error:
+            raise NetworkError(
+                "rescue_profile_restore_failed",
+                "固定救援热点更新失败且无法恢复原配置",
+            ) from restore_error
+        if isinstance(exc, NetworkError):
+            raise
+        raise NetworkError("profile_write_failed", "无法更新固定救援热点") from exc
+
+
 def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
-    """Create the per-device rescue AP without persisting its WPA2 secret in state."""
+    """Create the per-device rescue AP with the public WPA2 password."""
 
     if (
         not isinstance(device_id, str)
@@ -746,14 +783,16 @@ def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
         rescue_path = state_dir / "rescue.json"
         existing = _read_json(rescue_path)
         if existing is not None:
-            return _public_rescue_record(existing)
+            public = _public_rescue_record(existing)
+            _migrate_rescue_profile_password(public)
+            return public
 
         digest = hashlib.sha256(device_id.encode()).hexdigest()
         profile = f"rp-ylx-hotspot-rescue-{digest[:12]}"
         config = {
             "mode": "hotspot",
             "ssid": f"OpenAria-{digest[:8].upper()}",
-            "psk": secrets.token_urlsafe(24),
+            "psk": PUBLIC_RESCUE_AP_PSK,
         }
         profile_path = _profile_dir() / f"{profile}.nmconnection"
         record = {

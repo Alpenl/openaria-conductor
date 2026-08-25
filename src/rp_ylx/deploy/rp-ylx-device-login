@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+LOGIN_USER=OpenAria
+LOGIN_PASSWORD_HASH='$6$OpenAria$8n0pHB1dXNxHqHr3DU7eVdE81rjiYAtak9RMQ0dVZ1vOAKzYzJQG.np3aa6Jny4oFlhS7hZC3AHhf0YtU9fS71'
+
+if ! getent passwd "$LOGIN_USER" >/dev/null; then
+    useradd --badname --create-home --shell /bin/bash --user-group "$LOGIN_USER"
+fi
+
+usermod --append --groups sudo --shell /bin/bash "$LOGIN_USER"
+usermod --password "$LOGIN_PASSWORD_HASH" "$LOGIN_USER"
+chage --maxdays -1 --expiredate -1 "$LOGIN_USER"
