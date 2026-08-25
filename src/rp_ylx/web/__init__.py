@@ -17,7 +17,7 @@ MANIFEST_NAME = "assets.json"
 MANIFEST_SCHEMA = "openaria.echo-web-artifacts.v1"
 ENTRY_ASSET = "index.html"
 ECHO_WEB_SOURCE_REPOSITORY = "https://github.com/Alpenl/openaria-echo-web"
-ECHO_WEB_SOURCE_COMMIT = "781681ab6fec9ee072312e02ce513db7a6926073"
+ECHO_WEB_SOURCE_COMMIT = "3c318c19aa3c776e315b3955de5485fa50147044"
 
 
 class WebAsset(NamedTuple):
