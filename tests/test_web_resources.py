@@ -34,7 +34,7 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
     def test_release_and_source_identity_are_pinned(self) -> None:
         self.assertEqual(echo_web_release(), ("openaria-echo-web", "0.1.0"))
         self.assertEqual(echo_web_source(), (ECHO_WEB_SOURCE_REPOSITORY, ECHO_WEB_SOURCE_COMMIT))
-        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "65b14d8d4f4e71402e9ea35261c05c4fa9bbfca9")
+        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "781681ab6fec9ee072312e02ce513db7a6926073")
 
     def test_every_asset_matches_its_declared_size_digest_and_content_type(self) -> None:
         for name, asset in web_assets().items():

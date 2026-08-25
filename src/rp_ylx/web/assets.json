@@ -2,12 +2,12 @@
   "schema": "openaria.echo-web-artifacts.v1",
   "name": "openaria-echo-web",
   "version": "0.1.0",
-  "total_bytes": 118294,
+  "total_bytes": 125330,
   "files": [
     {
       "path": "app.js",
-      "bytes": 96301,
-      "sha256": "9961f11a436c645ab3d35cfffbfcd77ab456bbc7469830f56dcecce63f3c3d5d",
+      "bytes": 98804,
+      "sha256": "de5624affdfa35dbb049f5468c83553c73c1c050cc8b844a92651978eebfb998",
       "content_type": "text/javascript; charset=utf-8"
     },
     {
@@ -18,8 +18,8 @@
     },
     {
       "path": "styles.css",
-      "bytes": 21539,
-      "sha256": "80c0d651c9d79f658d32b4e4c333d1c8339377c4098d7b8865fca359f6b739ae",
+      "bytes": 26072,
+      "sha256": "092d83aaa1a63bc126cc60df80d0c9d6d312533cd3a39eb7e34e2c5fd3fad741",
       "content_type": "text/css; charset=utf-8"
     }
   ]

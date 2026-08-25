@@ -191,13 +191,13 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "65b14d8d4f4e71402e9ea35261c05c4fa9bbfca9",
+                        "source_commit": "781681ab6fec9ee072312e02ce513db7a6926073",
                         "assets": {
                             "app.js": {
-                                "bytes": 96301,
+                                "bytes": 98804,
                                 "content_type": "text/javascript; charset=utf-8",
                                 "sha256": (
-                                    "9961f11a436c645ab3d35cfffbfcd77ab456bbc7469830f56dcecce63f3c3d5d"
+                                    "de5624affdfa35dbb049f5468c83553c73c1c050cc8b844a92651978eebfb998"
                                 ),
                             },
                             "index.html": {
@@ -208,10 +208,10 @@ class InstalledWheelTest(unittest.TestCase):
                                 ),
                             },
                             "styles.css": {
-                                "bytes": 21539,
+                                "bytes": 26072,
                                 "content_type": "text/css; charset=utf-8",
                                 "sha256": (
-                                    "80c0d651c9d79f658d32b4e4c333d1c8339377c4098d7b8865fca359f6b739ae"
+                                    "092d83aaa1a63bc126cc60df80d0c9d6d312533cd3a39eb7e34e2c5fd3fad741"
                                 ),
                             },
                         },
