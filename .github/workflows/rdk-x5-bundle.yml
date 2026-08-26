@@ -40,9 +40,9 @@ jobs:
       RDK_RUNTIME_SHA256: 9142c12dd3559eaac58a18d8905b99a293979d5e5a1b4fb5cf4cebbf82ef6f33
       RDK_WHEEL: dist-aarch64/rp_ylx-0.1.0-cp311-abi3-manylinux_2_28_aarch64.whl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: 安装 Rust aarch64 target
         run: |
@@ -121,7 +121,7 @@ jobs:
           print(bundle.commit)
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rp-ylx-rdk-x5-${{ github.sha }}
           path: dist-rdk-x5/
