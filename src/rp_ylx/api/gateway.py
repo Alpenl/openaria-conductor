@@ -41,7 +41,13 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
-from rp_ylx.web import WEB_ASSETS, EchoWebArtifactError, asset_content_type, read_asset
+from rp_ylx.web import (
+    WEB_ASSETS,
+    EchoWebArtifactError,
+    assert_compatible_web_device_api,
+    asset_content_type,
+    read_asset,
+)
 
 MAX_BODY_BYTES = 64 * 1024
 UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
@@ -53,6 +59,7 @@ WEB_CONTENT_SECURITY_POLICY = (
     "script-src 'self'; style-src 'self'"
 )
 SUPPORTED_API_VERSIONS = frozenset({"v2", "v3", "v4"})
+assert_compatible_web_device_api(SUPPORTED_API_VERSIONS)
 CAMERA_FOCUS_API_VERSIONS = frozenset({"v4"})
 NETWORK_API_VERSIONS = frozenset({"v4"})
 NETWORK_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import tempfile
 import unittest
@@ -8,15 +9,19 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
+import rp_ylx.api.gateway as gateway_module
 import rp_ylx.web as web_module
+from rp_ylx.api.gateway import SUPPORTED_API_VERSIONS
 from rp_ylx.web import (
     ECHO_WEB_SOURCE_COMMIT,
     ECHO_WEB_SOURCE_REPOSITORY,
     ENTRY_ASSET,
     WEB_ASSETS,
     EchoWebArtifactError,
+    assert_compatible_web_device_api,
     asset_content_type,
     echo_web_release,
+    echo_web_required_device_api_major,
     echo_web_source,
     read_asset,
     web_assets,
@@ -34,7 +39,65 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
     def test_release_and_source_identity_are_pinned(self) -> None:
         self.assertEqual(echo_web_release(), ("openaria-echo-web", "0.1.0"))
         self.assertEqual(echo_web_source(), (ECHO_WEB_SOURCE_REPOSITORY, ECHO_WEB_SOURCE_COMMIT))
-        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "3c318c19aa3c776e315b3955de5485fa50147044")
+        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "f68ab115a1e63ed107f21a290f8a900218d18a4c")
+
+    def test_manifest_requires_a_device_api_major_provided_by_the_gateway(self) -> None:
+        self.assertEqual(echo_web_required_device_api_major(), 4)
+        assert_compatible_web_device_api(SUPPORTED_API_VERSIONS)
+
+    def test_legacy_v1_manifest_remains_readable(self) -> None:
+        def use_v1_manifest(root: Path) -> None:
+            manifest = json.loads((root / "assets.json").read_text(encoding="utf-8"))
+            manifest["schema"] = "openaria.echo-web-artifacts.v1"
+            manifest.pop("compatibility", None)
+            (root / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        def assert_v1_is_compatible() -> None:
+            self.assertIsNone(echo_web_required_device_api_major())
+            assert_compatible_web_device_api(frozenset())
+
+        self._with_artifact_root(use_v1_manifest, assert_v1_is_compatible)
+
+    def test_incompatible_device_api_major_fails_closed_with_a_stable_code(self) -> None:
+        with self.assertRaises(EchoWebArtifactError) as raised:
+            assert_compatible_web_device_api(frozenset({"v2", "v3"}))
+
+        self.assertEqual(raised.exception.code, "echo_web_device_api_incompatible")
+
+    def test_gateway_startup_fails_closed_on_an_incompatible_embedded_artifact(self) -> None:
+        try:
+            with (
+                mock.patch.object(
+                    web_module, "echo_web_required_device_api_major", return_value=999
+                ),
+                self.assertRaises(EchoWebArtifactError) as raised,
+            ):
+                importlib.reload(gateway_module)
+        finally:
+            importlib.reload(gateway_module)
+
+        self.assertEqual(raised.exception.code, "echo_web_device_api_incompatible")
+
+    def test_v2_manifest_missing_required_major_fails_closed(self) -> None:
+        def remove_required_major(root: Path) -> None:
+            manifest = json.loads((root / "assets.json").read_text(encoding="utf-8"))
+            del manifest["compatibility"]["device_api"]["required_major"]
+            (root / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        self._with_artifact_root(remove_required_major, self._assert_manifest_fails_closed)
+
+    def test_unknown_device_api_major_fails_closed(self) -> None:
+        def require_unknown_major(root: Path) -> None:
+            manifest = json.loads((root / "assets.json").read_text(encoding="utf-8"))
+            manifest["compatibility"]["device_api"]["required_major"] = 999
+            (root / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        def assert_unknown_major_is_incompatible() -> None:
+            with self.assertRaises(EchoWebArtifactError) as raised:
+                assert_compatible_web_device_api(SUPPORTED_API_VERSIONS)
+            self.assertEqual(raised.exception.code, "echo_web_device_api_incompatible")
+
+        self._with_artifact_root(require_unknown_major, assert_unknown_major_is_incompatible)
 
     def test_every_asset_matches_its_declared_size_digest_and_content_type(self) -> None:
         for name, asset in web_assets().items():
