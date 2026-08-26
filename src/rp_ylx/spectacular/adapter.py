@@ -26,9 +26,19 @@ VideoAuthority = Literal["legacy_raw", "device_session"]
 
 
 @dataclass(frozen=True, slots=True)
+class CaptureVideoSegment:
+    index: int
+    start_frame: int
+    end_frame: int
+    left_path: Path
+    right_path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class CaptureVideo:
     authority: VideoAuthority
-    path: Path
+    path: Path | None = None
+    segments: tuple[CaptureVideoSegment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,8 +208,8 @@ def _normalize_device_frames(
     records: list[dict[str, Any]],
     *,
     session_id: str,
-    video_bytes: int,
     frame_decimation: int,
+    segments: tuple[CaptureVideoSegment, ...],
 ) -> tuple[dict[str, Any], ...]:
     expected_keys = {
         "schema",
@@ -207,11 +217,10 @@ def _normalize_device_frames(
         "frame",
         "source_sequence",
         "host_monotonic_ns",
-        "video_offset",
-        "video_bytes",
+        "segment_index",
+        "segment_frame",
     }
     normalized: list[dict[str, Any]] = []
-    expected_offset = 0
     previous_host = -1
     previous_source: int | None = None
     for index, record in enumerate(records):
@@ -225,11 +234,22 @@ def _normalize_device_frames(
             f"frame[{index}].source_sequence",
         )
         host = _integer(record["host_monotonic_ns"], f"frame[{index}].host_monotonic_ns")
-        offset = _integer(record["video_offset"], f"frame[{index}].video_offset")
-        size = _integer(record["video_bytes"], f"frame[{index}].video_bytes", minimum=1)
-        if frame != index or offset != expected_offset or host <= previous_host:
+        segment_index = _integer(record["segment_index"], f"frame[{index}].segment_index")
+        segment_frame = _integer(record["segment_frame"], f"frame[{index}].segment_frame")
+        if frame != index or host <= previous_host:
             raise CaptureValidationError(
-                f"Device Session frame {index} order, offset, or host timestamp is invalid"
+                f"Device Session frame {index} order or host timestamp is invalid"
+            )
+        if segment_index >= len(segments):
+            raise CaptureValidationError(f"Device Session frame {index} segment is out of range")
+        segment = segments[segment_index]
+        if not segment.start_frame <= frame < segment.end_frame:
+            raise CaptureValidationError(
+                f"Device Session frame {index} is outside its declared segment"
+            )
+        if segment_frame != frame - segment.start_frame:
+            raise CaptureValidationError(
+                f"Device Session frame {index} segment-local index is invalid"
             )
         if previous_source is not None and source_sequence != previous_source + frame_decimation:
             raise CaptureValidationError(
@@ -242,17 +262,16 @@ def _normalize_device_frames(
                 "frame_index": frame,
                 "uvc_sequence": source_sequence,
                 "callback_monotonic_ns": host,
-                "jpeg_offset": offset,
-                "jpeg_bytes": size,
+                "segment_index": segment_index,
+                "segment_frame": segment_frame,
                 "source": dict(record),
             }
         )
-        expected_offset += size
         previous_host = host
         previous_source = source_sequence
-    if expected_offset != video_bytes:
+    if segments[0].start_frame != 0 or segments[-1].end_frame != len(records):
         raise CaptureValidationError(
-            "Device Session frame index does not cover the raw video bytes"
+            "Device Session frame index does not cover the declared video segments"
         )
     return tuple(normalized)
 
@@ -380,10 +399,10 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     if manifest.get("capture_mode") != "calibration":
         raise CaptureValidationError("Spectacular only accepts calibration Device Sessions")
     video = _mapping(manifest.get("video"), "Device Session video")
-    if video.get("layout") != "raw-side-by-side":
-        raise CaptureValidationError("calibration Device Session must use raw-side-by-side video")
-    if video.get("codec") != "mjpeg" or video.get("continuous") is not True:
-        raise CaptureValidationError("calibration Device Session raw video encoding is invalid")
+    if video.get("layout") != "split-eyes":
+        raise CaptureValidationError("calibration Device Session must use split-eyes video")
+    if video.get("codec") != "h264" or video.get("container") != "mp4":
+        raise CaptureValidationError("calibration Device Session segmented video is invalid")
     frames_block = _mapping(manifest.get("frames"), "Device Session frames")
     imu_block = _mapping(manifest.get("imu"), "Device Session IMU")
     camera = _mapping(manifest.get("camera"), "Device Session camera")
@@ -398,16 +417,6 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     session_id = manifest.get("session_id")
     if not isinstance(session_id, str):
         raise CaptureValidationError("Device Session has no session_id")
-    descriptors = (
-        (video.get("artifact"), "video.raw-side-by-side", "raw video", False),
-        (frames_block.get("artifact"), "frames.index", "frame index", False),
-        (imu_block.get("artifact"), "imu.samples", "IMU samples", False),
-    )
-    roles = [_mapping(value, label).get("role") for value, _, label, _ in descriptors]
-    if roles != ["video.raw-side-by-side", "frames.index", "imu.samples"]:
-        raise CaptureValidationError(
-            "Device Session required calibration artifact roles are invalid"
-        )
     try:
         validated = validate_device_session_directory(root, expected_session_id=session_id)
     except DeviceRecordingError as error:
@@ -416,13 +425,41 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
         ) from error
     if dict(validated) != manifest:
         raise CaptureValidationError("Device Session manifest changed during validation")
-    video_descriptor, video_path = _artifact(
-        root,
-        video["artifact"],
-        role="video.raw-side-by-side",
-        media_type="video/x-motion-jpeg",
-        label="raw video",
-    )
+    raw_segments = video.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise CaptureValidationError("Device Session has no split-eye video segments")
+    segments: list[CaptureVideoSegment] = []
+    expected_start = 0
+    for expected_index, raw_segment in enumerate(raw_segments):
+        segment = _mapping(raw_segment, f"video segment {expected_index}")
+        index = _integer(segment.get("index"), f"video segment {expected_index}.index")
+        start_frame = _integer(
+            segment.get("start_frame"), f"video segment {expected_index}.start_frame"
+        )
+        end_frame = _integer(
+            segment.get("end_frame"), f"video segment {expected_index}.end_frame", minimum=1
+        )
+        if index != expected_index or start_frame != expected_start or end_frame <= start_frame:
+            raise CaptureValidationError(
+                "Device Session video segment frame domain is not contiguous"
+            )
+        artifacts = _mapping(segment.get("artifacts"), f"video segment {expected_index}.artifacts")
+        _, left_path = _artifact(
+            root,
+            artifacts.get("left"),
+            role="video.left",
+            media_type="video/mp4",
+            label=f"video segment {expected_index} left",
+        )
+        _, right_path = _artifact(
+            root,
+            artifacts.get("right"),
+            role="video.right",
+            media_type="video/mp4",
+            label=f"video segment {expected_index} right",
+        )
+        segments.append(CaptureVideoSegment(index, start_frame, end_frame, left_path, right_path))
+        expected_start = end_frame
     _, frames_path = _artifact(
         root,
         frames_block["artifact"],
@@ -442,8 +479,8 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     frames = _normalize_device_frames(
         frame_records,
         session_id=session_id,
-        video_bytes=_integer(video_descriptor["bytes"], "raw video.bytes", minimum=1),
         frame_decimation=frame_decimation,
+        segments=tuple(segments),
     )
     imu_samples = _normalize_device_imu(imu_records, session_id=session_id)
     if len(frames) != _integer(frames_block.get("count"), "frames.count", minimum=1):
@@ -453,7 +490,7 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     width = _integer(camera.get("width"), "camera.width", minimum=2)
     eye_width = _integer(camera.get("eye_width"), "camera.eye_width", minimum=1)
     if width != eye_width * 2:
-        raise CaptureValidationError("raw-side-by-side camera width must equal two eye widths")
+        raise CaptureValidationError("stereo camera width must equal two eye widths")
     return LoadedCapture(
         root=root,
         source_schema=schema,
@@ -461,7 +498,7 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
         manifest=manifest,
         frames=frames,
         imu_samples=imu_samples,
-        video=CaptureVideo("device_session", video_path),
+        video=CaptureVideo("device_session", segments=tuple(segments)),
         fps=_number(camera.get("nominal_fps"), "camera.nominal_fps", positive=True),
         width=width,
         eye_width=eye_width,
@@ -596,4 +633,4 @@ def artifact_roles(capture: LoadedCapture) -> tuple[str, ...]:
 
     if capture.source_schema == "ylx.stereo_imu.raw.v2":
         return ("legacy.video", "legacy.frames", "legacy.imu")
-    return ("video.raw-side-by-side", "frames.index", "imu.samples")
+    return ("video.left", "video.right", "frames.index", "imu.samples")

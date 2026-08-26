@@ -70,8 +70,7 @@ CAPTURE_SNAPSHOT_SCHEMA_V4 = "ylx.capture-snapshot-event.v4"
 CAPTURE_ACTIVE_STATES = frozenset({"recording", "finalizing", "encoding", "verifying"})
 CALIBRATION_CAPTURE_DISABLED_REASONS = frozenset(
     {
-        "raw_side_by_side_required",
-        "native_raw_sink_unavailable",
+        "capture_source_unsupported",
         "storage_unavailable",
         "hardware_unavailable",
         "maintenance_or_capture_busy",
@@ -715,7 +714,7 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
     if (
         type(supported) is not bool
         or type(enabled) is not bool
-        or calibration["required_video_layout"] != "raw-side-by-side"
+        or calibration["required_video_layout"] != "split-eyes"
         or (enabled and (supported is not True or reason is not None))
         or (
             not enabled

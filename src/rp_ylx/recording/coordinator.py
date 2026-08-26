@@ -62,8 +62,7 @@ SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
 LIVE_IMU_STALE_SECONDS = 2.0
 CALIBRATION_CAPTURE_DISABLED_REASONS = {
-    "raw_side_by_side_required",
-    "native_raw_sink_unavailable",
+    "capture_source_unsupported",
     "storage_unavailable",
     "hardware_unavailable",
     "maintenance_or_capture_busy",
@@ -1037,7 +1036,7 @@ class CaptureCoordinator:
         supported = self._calibration_source_supported()
         reason: str | None = None
         if not supported:
-            reason = "native_raw_sink_unavailable"
+            reason = "capture_source_unsupported"
         elif self._active is not None:
             reason = "maintenance_or_capture_busy"
         elif self._camera_connection_status()["state"] != "connected":
@@ -1048,7 +1047,7 @@ class CaptureCoordinator:
             "supported": supported,
             "enabled": reason is None,
             "disabled_reason": reason,
-            "required_video_layout": "raw-side-by-side",
+            "required_video_layout": "split-eyes",
         }
 
     @staticmethod
@@ -1057,7 +1056,7 @@ class CaptureCoordinator:
             raise RuntimeError("标定录制禁用原因无效")
         return ProviderError(
             "calibration_unavailable",
-            "当前采集源不能生成标定所需的原始双目会话",
+            "当前采集源不能生成标定所需的分眼 H.264 分段会话",
             status=HTTPStatus.SERVICE_UNAVAILABLE,
             retryable=False,
             details={"reason": reason},
@@ -1568,7 +1567,7 @@ class CaptureCoordinator:
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
         if body.get("mode") == "calibration" and not self._calibration_source_supported():
-            raise self._calibration_unavailable("native_raw_sink_unavailable")
+            raise self._calibration_unavailable("capture_source_unsupported")
         self._require_camera_connected()
         self._acquire_network_operation_lease()
         try:
@@ -1675,7 +1674,7 @@ class CaptureCoordinator:
         if plan.capture_mode == "calibration":
             session_config = replace(
                 session_config,
-                video_layout="raw-side-by-side",
+                video_layout="split-eyes",
                 audio_enabled=False,
             )
         recorder = DeviceSessionRecorder(

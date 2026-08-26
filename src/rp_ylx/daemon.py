@@ -168,7 +168,7 @@ class ProductionConfig:
             or self.height <= 0
             or self.fps <= 0
             or self.frame_decimation <= 0
-            or self.video_layout not in {"split-eyes", "raw-side-by-side"}
+            or self.video_layout != "split-eyes"
             or self.video_bitrate_kbps <= 0
             or self.segment_seconds <= 0
             or type(self.audio_enabled) is not bool

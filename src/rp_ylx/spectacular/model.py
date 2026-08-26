@@ -18,18 +18,23 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
     origin_ns = min(timing.frame_times_ns[0], timing.imu_times_ns[0])
     frames = []
     for record, time_ns in zip(capture.frames, timing.frame_times_ns, strict=True):
-        frames.append(
-            {
-                "frame_index": record["frame_index"],
-                "source_sequence": record["uvc_sequence"],
-                "time_seconds": (time_ns - origin_ns) / 1e9,
-                "jpeg": {
-                    "offset": record["jpeg_offset"],
-                    "bytes": record["jpeg_bytes"],
-                },
-                "source": dict(record.get("source", {})),
+        mapped_frame = {
+            "frame_index": record["frame_index"],
+            "source_sequence": record["uvc_sequence"],
+            "time_seconds": (time_ns - origin_ns) / 1e9,
+            "source": dict(record.get("source", {})),
+        }
+        if capture.source_schema == "ylx.device-session.v2":
+            mapped_frame["segment"] = {
+                "index": record["segment_index"],
+                "frame": record["segment_frame"],
             }
-        )
+        else:
+            mapped_frame["jpeg"] = {
+                "offset": record["jpeg_offset"],
+                "bytes": record["jpeg_bytes"],
+            }
+        frames.append(mapped_frame)
 
     imu_samples = []
     for record, time_ns in zip(capture.imu_samples, timing.imu_times_ns, strict=True):
@@ -45,15 +50,31 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             mapped["packet_sequence"] = record["packet_sequence"]
         imu_samples.append(mapped)
 
-    return {
-        "schema": "rp-ylx.spectacular.model-input.v1",
-        "source": {
-            "schema": capture.source_schema,
-            "session_id": capture.session_id,
-            "capture_mode": capture.manifest.get("capture_mode", "legacy-calibration"),
-            "artifact_roles": list(artifact_roles(capture)),
-        },
-        "video": {
+    if capture.source_schema == "ylx.device-session.v2":
+        video = {
+            "authority": capture.video.authority,
+            "layout": "split-eyes",
+            "codec": "h264",
+            "container": "mp4",
+            "segments": [
+                {
+                    "index": segment.index,
+                    "start_frame": segment.start_frame,
+                    "end_frame": segment.end_frame,
+                    "left_path": segment.left_path.relative_to(capture.root).as_posix(),
+                    "right_path": segment.right_path.relative_to(capture.root).as_posix(),
+                }
+                for segment in capture.video.segments
+            ],
+            "width": capture.width,
+            "eye_width": capture.eye_width,
+            "height": capture.height,
+            "fps": capture.fps,
+        }
+        model_schema = "rp-ylx.spectacular.model-input.v2"
+    else:
+        assert capture.video.path is not None
+        video = {
             "authority": capture.video.authority,
             "path": capture.video.path.relative_to(capture.root).as_posix(),
             "layout": "raw-side-by-side",
@@ -61,7 +82,18 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             "eye_width": capture.eye_width,
             "height": capture.height,
             "fps": capture.fps,
+        }
+        model_schema = "rp-ylx.spectacular.model-input.v1"
+
+    return {
+        "schema": model_schema,
+        "source": {
+            "schema": capture.source_schema,
+            "session_id": capture.session_id,
+            "capture_mode": capture.manifest.get("capture_mode", "legacy-calibration"),
+            "artifact_roles": list(artifact_roles(capture)),
         },
+        "video": video,
         "time_origin_monotonic_ns": origin_ns,
         "frames": frames,
         "imu_samples": imu_samples,

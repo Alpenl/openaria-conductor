@@ -80,6 +80,13 @@ class ProductionDaemonTest(unittest.TestCase):
             minimum_available_inodes=0,
         )
 
+    def test_production_config_rejects_obsolete_raw_sbs_writer(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaises(ProductionConfigError),
+        ):
+            replace(self.config(Path(directory)), video_layout="raw-side-by-side")
+
     def test_load_config_is_strict_and_requires_explicit_isolated_lab(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

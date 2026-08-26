@@ -322,7 +322,7 @@ def _device_for_api(api_version: str) -> dict[str, object]:
             "supported": True,
             "enabled": True,
             "disabled_reason": None,
-            "required_video_layout": "raw-side-by-side",
+            "required_video_layout": "split-eyes",
         }
     return device
 
@@ -535,7 +535,7 @@ class DeviceProvider:
                 "supported": True,
                 "enabled": True,
                 "disabled_reason": None,
-                "required_video_layout": "raw-side-by-side",
+                "required_video_layout": "split-eyes",
             }
         if self.device_schema_override is not None:
             descriptor["schema"] = self.device_schema_override
@@ -1445,10 +1445,10 @@ class GatewayHttpTest(unittest.TestCase):
     def test_calibration_unavailable_error_is_typed_for_capture(self) -> None:
         self.server.provider.camera_error = ProviderError(
             "calibration_unavailable",
-            "当前采集源不能生成标定所需的原始双目会话",
+            "当前采集源不能生成标定所需的分眼 H.264 分段会话",
             status=503,
             retryable=False,
-            details={"reason": "native_raw_sink_unavailable"},
+            details={"reason": "capture_source_unsupported"},
         )
         status, payload, response_headers = self.request(
             "/api/v4/capture/start",
@@ -1466,10 +1466,10 @@ class GatewayHttpTest(unittest.TestCase):
             json.loads(payload)["error"],
             {
                 "code": "calibration_unavailable",
-                "message": "当前采集源不能生成标定所需的原始双目会话",
+                "message": "当前采集源不能生成标定所需的分眼 H.264 分段会话",
                 "request_id": json.loads(payload)["error"]["request_id"],
                 "retryable": False,
-                "details": {"reason": "native_raw_sink_unavailable"},
+                "details": {"reason": "capture_source_unsupported"},
             },
         )
 

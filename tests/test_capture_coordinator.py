@@ -481,6 +481,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
             height=1080,
             sensor_fps=60.0,
         )
+        self.encoder_patcher = patch(
+            "rp_ylx.recording.device_session.StereoEncoderProcess",
+            FakeSplitEyeEncoder,
+        )
+        self.encoder_patcher.start()
         self.network_control_patcher = patch(
             "rp_ylx.recording.coordinator.request_network_control",
             side_effect=idle_network_control,
@@ -489,6 +494,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.network_control_patcher.stop()
+        self.encoder_patcher.stop()
         self.environment_patcher.stop()
         self.temporary.cleanup()
 
@@ -542,7 +548,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     "supported": True,
                     "enabled": False,
                     "disabled_reason": "hardware_unavailable",
-                    "required_video_layout": "raw-side-by-side",
+                    "required_video_layout": "split-eyes",
                 },
             )
             self.assertEqual(
@@ -580,7 +586,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                                 "supported": True,
                                 "enabled": True,
                                 "disabled_reason": None,
-                                "required_video_layout": "raw-side-by-side",
+                                "required_video_layout": "split-eyes",
                             },
                         )
                         validate_device_descriptor(
@@ -1065,7 +1071,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(manifest["schema"], "ylx.device-session.v2")
             self.assertEqual(manifest["imu"]["coordinate_frame"], "raw_device_axes")
             self.assertEqual(manifest["audio"]["state"], "not_recorded")
-            self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
+            self.assertEqual(manifest["video"]["layout"], "split-eyes")
             self.assertEqual(manifest["frames"]["count"], 1)
             self.assertEqual(manifest["camera"]["nominal_fps"], 60.0)
             self.assertAlmostEqual(
@@ -1089,10 +1095,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(json.loads(manifest_bytes)["session_id"], session_id)
             finally:
                 manifest_handle.close()
-            video = manifest["video"]["artifact"]
+            video = manifest["video"]["segments"][0]["artifacts"]["left"]
             artifact = coordinator.open_verified_artifact(session_id, video["artifact_id"], "v3")
             try:
-                self.assertEqual(artifact.read(), JPEG)
+                self.assertEqual(artifact.read(), (session / video["path"]).read_bytes())
             finally:
                 artifact.close()
         finally:
@@ -1123,10 +1129,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
             finally:
                 manifest_handle.close()
 
-            video = manifest["video"]["artifact"]
+            video = manifest["video"]["segments"][0]["artifacts"]["left"]
             artifact = restarted.open_verified_artifact(session_id, video["artifact_id"], "v3")
             try:
-                self.assertEqual(artifact.read(), JPEG)
+                self.assertEqual(artifact.read(), (legacy / video["path"]).read_bytes())
             finally:
                 artifact.close()
         finally:
@@ -1592,7 +1598,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         release_writer = threading.Event()
 
         def slow_writer(role: str, payload: bytes) -> None:
-            if role == "video.raw-side-by-side" and payload:
+            if role == "frames.index" and payload:
                 writer_blocked.set()
                 if not release_writer.wait(timeout=2):
                     raise TimeoutError("test did not release writer")
@@ -1719,8 +1725,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 {
                     "supported": False,
                     "enabled": False,
-                    "disabled_reason": "native_raw_sink_unavailable",
-                    "required_video_layout": "raw-side-by-side",
+                    "disabled_reason": "capture_source_unsupported",
+                    "required_video_layout": "split-eyes",
                 },
             )
             with self.assertRaises(ProviderError) as rejected:
@@ -1730,7 +1736,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertFalse(rejected.exception.retryable)
             self.assertEqual(
                 rejected.exception.details,
-                {"reason": "native_raw_sink_unavailable"},
+                {"reason": "capture_source_unsupported"},
             )
             self.assertIsNone(sources.mode)
             self.assert_network_operation_lock_available()
@@ -1844,7 +1850,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
         )
         expected_bytes = sum(
-            int(manifest[section]["artifact"]["bytes"]) for section in ("video", "imu", "frames")
+            int(artifact["bytes"]) for artifact in iter_device_session_v1_artifacts(manifest)
         )
         self.assertEqual(listed["items"][0]["total_bytes"], expected_bytes)
 
@@ -2089,15 +2095,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session = self.mountpoint / "recordings" / session_id
             manifest = validate_device_session_directory(session)
             self.assertEqual(manifest["capture_mode"], "calibration")
-            self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
-            self.assertEqual(
-                (
-                    manifest["video"]["artifact"]["role"],
-                    manifest["frames"]["artifact"]["role"],
-                    manifest["imu"]["artifact"]["role"],
-                ),
-                ("video.raw-side-by-side", "frames.index", "imu.samples"),
-            )
+            self.assertEqual(manifest["video"]["layout"], "split-eyes")
+            self.assertEqual(manifest["video"]["codec"], "h264")
+            self.assertEqual(manifest["video"]["container"], "mp4")
+            self.assertGreaterEqual(len(manifest["video"]["segments"]), 1)
+            self.assertEqual(manifest["frames"]["artifact"]["role"], "frames.index")
+            self.assertEqual(manifest["imu"]["artifact"]["role"], "imu.samples")
+            for segment in manifest["video"]["segments"]:
+                self.assertEqual(segment["artifacts"]["left"]["role"], "video.left")
+                self.assertEqual(segment["artifacts"]["right"]["role"], "video.right")
             self.assertEqual(manifest["audio"]["state"], "not_recorded")
             digest = hashlib.sha256((session / "manifest.json").read_bytes()).hexdigest()
             with (
@@ -2130,7 +2136,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(sources.generation_id, coordinator.generation_id)
             self.assertTrue(callable(sources.submit_frame))
             self.assertTrue(callable(sources.submit_imu))
-            self.assertEqual(coordinator.open_handle_count, 6)
+            self.assertEqual(coordinator.open_handle_count, 7)
             sources.submit_frame(frame())  # type: ignore[operator]
             coordinator.stop_capture(stop_command("sources-stop"))
             self.assertEqual(sources.open_handle_count, 0)
@@ -2140,7 +2146,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def test_enospc_never_publishes_a_success_manifest(self) -> None:
         def disk_full(role: str, payload: bytes) -> None:
-            if role == "video.raw-side-by-side" and payload:
+            if role == "frames.index" and payload:
                 raise OSError(errno.ENOSPC, "模拟磁盘写满")
 
         coordinator = self.coordinator(before_write=disk_full)
@@ -2166,13 +2172,13 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_short_write_flush_and_fsync_cannot_publish_a_v1_session(self) -> None:
+    def test_short_write_flush_and_fsync_cannot_publish_a_v2_session(self) -> None:
         cases = (
-            ("data-short", "raw-sbs.mjpeg", "short_write"),
+            ("data-short", "frames.ndjson", "short_write"),
             ("manifest-short", "manifest.json", "short_write"),
-            ("data-flush", "raw-sbs.mjpeg", "flush"),
+            ("data-flush", "frames.ndjson", "flush"),
             ("manifest-flush", "manifest.json", "flush"),
-            ("data-fsync", "raw-sbs.mjpeg", "fsync"),
+            ("data-fsync", "frames.ndjson", "fsync"),
             ("manifest-fsync", "manifest.json", "fsync"),
         )
 
@@ -2290,7 +2296,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session_id = self.seal_one(first, prefix="digest")
         finally:
             first.close()
-        video = self.mountpoint / "recordings" / session_id / "video/raw-sbs.mjpeg"
+        video = next((self.mountpoint / "recordings" / session_id / "video").glob("left_*.mp4"))
         video.write_bytes(b"tampered")
 
         restarted = self.coordinator()
@@ -2313,7 +2319,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 return
             tampered = True
             active = next((self.mountpoint / "recordings").glob("*.partial"))
-            (active / "video/raw-sbs.mjpeg").write_bytes(b"\xff\xd8tampered-content\xff\xd9")
+            next((active / "video").glob("left_*.mp4")).write_bytes(b"tampered-content")
 
         coordinator = self.coordinator(before_write=change_after_digest)
         try:
@@ -2343,7 +2349,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             real_rename(source, target)
             target_path = Path(target)  # type: ignore[arg-type]
             if target_path.parent == self.mountpoint / "recordings":
-                video = target_path / "video/raw-sbs.mjpeg"
+                video = next((target_path / "video").glob("left_*.mp4"))
                 payload = bytearray(video.read_bytes())
                 payload[2] ^= 1
                 video.write_bytes(payload)
