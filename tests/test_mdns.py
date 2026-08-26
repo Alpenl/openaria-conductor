@@ -85,6 +85,39 @@ class MdnsPublisherTest(unittest.TestCase):
         finally:
             publisher.close()
 
+    def test_publisher_scopes_service_addresses_to_each_network_interface(self) -> None:
+        responders: list[FakeResponder] = []
+
+        def factory(addresses: tuple[str, ...]) -> FakeResponder:
+            responder = FakeResponder(addresses)
+            responders.append(responder)
+            return responder
+
+        publisher = MdnsPublisher(
+            8080,
+            address_provider=lambda: ("192.168.110.36", "192.168.127.10"),
+            responder_factory=factory,
+            interval=0.01,
+        )
+        publisher.start()
+        try:
+            self._wait_for(lambda: len(responders) == 2)
+            self.assertEqual(
+                [responder.addresses for responder in responders],
+                [("192.168.110.36",), ("192.168.127.10",)],
+            )
+            for responder in responders:
+                self.assertEqual(len(responder.registered), len(MDNS_SERVICE_TYPES))
+                for service, _ in responder.registered:
+                    self.assertEqual(service.parsed_addresses(), list(responder.addresses))
+        finally:
+            publisher.close()
+
+        self.assertTrue(all(responder.closed for responder in responders))
+        self.assertTrue(
+            all(len(responder.unregistered) == len(MDNS_SERVICE_TYPES) for responder in responders)
+        )
+
     def test_customer_publisher_advertises_https_without_http_alias(self) -> None:
         responders: list[FakeResponder] = []
 
