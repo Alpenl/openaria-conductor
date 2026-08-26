@@ -533,15 +533,22 @@ impl Runtime {
                 "stop timeout must be positive",
             ));
         }
-        self.request_imu_stop()?;
-        let state = self.shared.state.lock().map_err(|_| {
+        let (inflight, imu) = self.begin_recording_stop()?;
+
+        // Close the frame gate before collector shutdown can block.  This
+        // prevents frames arriving during IMU cleanup from entering a session
+        // that is already stopping.
+        self.imu_stop.store(true, Ordering::Release);
+        if let Some(imu) = imu {
+            imu.close();
+        }
+
+        let mut state = self.shared.state.lock().map_err(|_| {
             RuntimeError::new(
                 "capture_runtime_poisoned",
                 "capture runtime state mutex is poisoned",
             )
         })?;
-        let mut state = state;
-        let inflight = state.fanout.start_stopping();
         if inflight == 0 {
             state.recording = None;
             self.shared.changed.notify_all();
@@ -570,6 +577,19 @@ impl Runtime {
         drop(state);
         self.stop_imu_worker(timeout)?;
         Ok(snapshot)
+    }
+
+    fn begin_recording_stop(&self) -> Result<(u64, Option<Arc<Collector>>), RuntimeError> {
+        let mut state = self.shared.state.lock().map_err(|_| {
+            RuntimeError::new(
+                "capture_runtime_poisoned",
+                "capture runtime state mutex is poisoned",
+            )
+        })?;
+        let imu = state.recording.as_ref().and_then(RecordingTarget::imu);
+        let inflight = state.fanout.start_stopping();
+        self.shared.changed.notify_all();
+        Ok((inflight, imu))
     }
 
     pub(crate) fn close(&self, timeout: Duration) -> Result<RuntimeSnapshot, RuntimeError> {
@@ -1415,6 +1435,44 @@ mod tests {
                 runtime.imu_worker.lock().unwrap().is_none(),
                 "stop_recording must clear a completed IMU worker even when no frames are inflight",
             );
+        });
+    }
+
+    #[test]
+    fn begin_recording_stop_closes_frame_gate_before_resource_cleanup() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let runtime = Runtime::new(
+                Arc::new(Stream::test_idle(1)),
+                Arc::new(LatestBuffer::new(30).unwrap()),
+                1,
+                Duration::from_millis(10),
+                None,
+            )
+            .unwrap();
+            let submit_frame = PyBytes::new(py, b"submit-frame").into_any().unbind();
+            let on_failure = PyBytes::new(py, b"on-failure").into_any().unbind();
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                state.running = true;
+                state.fanout.start_recording().unwrap();
+                state.recording = Some(RecordingTarget::Callbacks(RecordingCallbacks {
+                    submit_frame,
+                    on_failure,
+                    imu: None,
+                }));
+            }
+            let (inflight, imu) = runtime.begin_recording_stop().unwrap();
+            assert_eq!(inflight, 0);
+            assert!(imu.is_none());
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                assert!(state.recording.is_some());
+                let fanout = state.fanout.snapshot();
+                assert!(!fanout.recording_active);
+                assert!(!fanout.recording_present);
+                state.recording = None;
+            }
         });
     }
 }

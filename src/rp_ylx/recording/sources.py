@@ -545,6 +545,11 @@ class NativeContinuousCaptureSources:
             self._recording = tap
             self._open_handles += 1
         try:
+            # A recording failure closes the Python tap immediately, while the
+            # native IMU worker is joined by stop_recording.  Normalize the
+            # runtime before installing the next native recording target so a
+            # failed session cannot poison the first retry.
+            runtime.stop_recording(self._read_timeout + 1.0)
             if native_raw_targets is not None:
                 active_take, sink = native_raw_targets
                 if native_imu is None:

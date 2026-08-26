@@ -1155,6 +1155,104 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         self.assertTrue(imu.closed)
         self.assertTrue(runtime.closed)
 
+    def test_native_continuous_sources_reap_failed_native_worker_before_retry(self) -> None:
+        class NativeOnlyImu:
+            def __init__(self) -> None:
+                self.native_owner = object()
+                self.closed = False
+
+            def read(self, *, timeout: float) -> ImuObservation:
+                del timeout
+                raise AssertionError("direct native IMU path must not use Python read loop")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class StaleWorkerRuntime(FakeNativeContinuousRuntime):
+            def __init__(self) -> None:
+                super().__init__()
+                self.worker_active = False
+
+            def start_recording_raw_sink(
+                self,
+                active_take: object,
+                sink: object,
+                on_failure: object,
+                imu: object | None = None,
+                imu_timeout_seconds: float = 1.0,
+            ) -> dict[str, object]:
+                if self.worker_active:
+                    raise RuntimeError("capture runtime IMU worker is already running")
+                self.worker_active = True
+                return super().start_recording_raw_sink(
+                    active_take,
+                    sink,
+                    on_failure,
+                    imu,
+                    imu_timeout_seconds,
+                )
+
+            def stop_recording(self, timeout_seconds: float = 3.0) -> dict[str, object]:
+                self.worker_active = False
+                self.active_take = None
+                self.sink = None
+                return super().stop_recording(timeout_seconds)
+
+        runtime = StaleWorkerRuntime()
+        imus: list[NativeOnlyImu] = []
+        failures: list[tuple[str, str]] = []
+
+        def imu_factory() -> NativeOnlyImu:
+            imu = NativeOnlyImu()
+            imus.append(imu)
+            return imu
+
+        sources = NativeContinuousCaptureSources(
+            "/dev/video0",
+            imu_factory,
+            CameraMode(3840, 1080, 60.0, "mjpg"),
+            preview=SimpleNamespace(native_owner=object()),
+            read_timeout=0.1,
+        )
+        recorder = SimpleNamespace(native_raw_sink_targets=lambda: (object(), object()))
+        try:
+            with (
+                patch("rp_ylx.recording.sources.create_native_camera", return_value=object()),
+                patch(
+                    "rp_ylx.recording.sources.create_native_continuous_capture_runtime",
+                    return_value=runtime,
+                ),
+            ):
+                sources.start(
+                    mode="calibration",
+                    generation_id=str(uuid.uuid4()),
+                    submit_frame=lambda observation: True,
+                    submit_imu=lambda observation: True,
+                    on_failure=lambda code, message: failures.append((code, message)),
+                    native_recorder=recorder,
+                )
+                runtime.fail("source_sequence_gap", "source frame sequence has a gap")
+
+                sources.start(
+                    mode="calibration",
+                    generation_id=str(uuid.uuid4()),
+                    submit_frame=lambda observation: True,
+                    submit_imu=lambda observation: True,
+                    on_failure=lambda code, message: failures.append((code, message)),
+                    native_recorder=recorder,
+                )
+
+            self.assertEqual(
+                failures,
+                [("source_sequence_gap", "source frame sequence has a gap")],
+            )
+            self.assertEqual(len(imus), 2)
+            self.assertTrue(imus[0].closed)
+            self.assertFalse(imus[1].closed)
+            self.assertTrue(runtime.worker_active)
+        finally:
+            sources.close()
+
     def test_native_continuous_sources_can_record_directly_to_split_sink(self) -> None:
         class NativeOnlyImu:
             def __init__(self) -> None:
