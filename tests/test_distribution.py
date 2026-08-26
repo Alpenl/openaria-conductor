@@ -143,9 +143,11 @@ class InstalledWheelTest(unittest.TestCase):
                                 "import hashlib, json; "
                                 "from rp_ylx.web import "
                                 "ECHO_WEB_SOURCE_COMMIT, asset_content_type, "
-                                "read_asset, web_assets; "
+                                "echo_web_required_device_api_major, read_asset, web_assets; "
                                 "payload={"
                                 "'source_commit': ECHO_WEB_SOURCE_COMMIT, "
+                                "'required_device_api_major': "
+                                "echo_web_required_device_api_major(), "
                                 "'assets': {"
                                 "name: {"
                                 "'bytes': len(read_asset(name)), "
@@ -191,7 +193,8 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "3c318c19aa3c776e315b3955de5485fa50147044",
+                        "source_commit": "f68ab115a1e63ed107f21a290f8a900218d18a4c",
+                        "required_device_api_major": 4,
                         "assets": {
                             "app.js": {
                                 "bytes": 98834,

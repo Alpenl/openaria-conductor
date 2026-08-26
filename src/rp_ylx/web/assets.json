@@ -1,7 +1,12 @@
 {
-  "schema": "openaria.echo-web-artifacts.v1",
+  "schema": "openaria.echo-web-artifacts.v2",
   "name": "openaria-echo-web",
   "version": "0.1.0",
+  "compatibility": {
+    "device_api": {
+      "required_major": 4
+    }
+  },
   "total_bytes": 125360,
   "files": [
     {
