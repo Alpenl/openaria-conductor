@@ -125,6 +125,8 @@ def _path_open_fault(injection: _RecordingFaultInjection) -> object:
 
 
 class FakeSources:
+    supports_calibration_capture = True
+
     def __init__(self) -> None:
         self.open_handle_count = 0
         self.mode: str | None = None
@@ -535,6 +537,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertTrue(descriptor["capabilities"]["capture"])
             self.assertTrue(descriptor["capabilities"]["preview"])
             self.assertEqual(
+                descriptor["capabilities"]["calibration_capture"],
+                {
+                    "supported": True,
+                    "enabled": False,
+                    "disabled_reason": "hardware_unavailable",
+                    "required_video_layout": "raw-side-by-side",
+                },
+            )
+            self.assertEqual(
                 coordinator.capture_status()["snapshot"]["runtime"]["camera"],
                 descriptor["runtime"]["camera"],
             )
@@ -563,6 +574,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     with self.subTest(api_version="v4", security_profile=security_profile):
                         descriptor = coordinator.device_descriptor("v4", security_profile)
                         self.assertTrue(descriptor["capabilities"]["network_mutation"])
+                        self.assertEqual(
+                            descriptor["capabilities"]["calibration_capture"],
+                            {
+                                "supported": True,
+                                "enabled": True,
+                                "disabled_reason": None,
+                                "required_video_layout": "raw-side-by-side",
+                            },
+                        )
                         validate_device_descriptor(
                             descriptor,
                             api_version="v4",
@@ -572,6 +592,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     with self.subTest(api_version="v3", security_profile=security_profile):
                         descriptor = coordinator.device_descriptor("v3", security_profile)
                         self.assertFalse(descriptor["capabilities"]["network_mutation"])
+                        self.assertNotIn("calibration_capture", descriptor["capabilities"])
                         validate_device_descriptor(
                             descriptor,
                             api_version="v3",
@@ -1664,6 +1685,37 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_unsupported_calibration_is_rejected_before_capture_side_effects(self) -> None:
+        sources = FakeSources()
+        sources.supports_calibration_capture = False
+        coordinator = self.coordinator(sources=sources)
+        try:
+            descriptor = coordinator.device_descriptor("v4", "lab")
+            self.assertEqual(
+                descriptor["capabilities"]["calibration_capture"],
+                {
+                    "supported": False,
+                    "enabled": False,
+                    "disabled_reason": "native_raw_sink_unavailable",
+                    "required_video_layout": "raw-side-by-side",
+                },
+            )
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.start_capture(start_command("unsupported-cal", mode="calibration"))
+            self.assertEqual(rejected.exception.code, "calibration_unavailable")
+            self.assertEqual(rejected.exception.status, 503)
+            self.assertFalse(rejected.exception.retryable)
+            self.assertEqual(
+                rejected.exception.details,
+                {"reason": "native_raw_sink_unavailable"},
+            )
+            self.assertIsNone(sources.mode)
+            self.assert_network_operation_lock_available()
+            sessions_root = self.mountpoint / "recordings"
+            self.assertTrue(not sessions_root.exists() or not any(sessions_root.iterdir()))
+        finally:
+            coordinator.close()
+
     def test_recording_progress_checkpoints_and_revision_survives_restart(self) -> None:
         coordinator = self.coordinator(checkpoint_interval=0)
         coordinator.start_capture(start_command("checkpoint-start"))
@@ -1998,12 +2050,32 @@ class CaptureCoordinatorTest(unittest.TestCase):
             restarted.close()
 
     def test_calibration_output_uses_the_same_python_read_contract(self) -> None:
-        coordinator = self.coordinator()
+        split_config = replace(self.session_config, video_layout="split-eyes")
+        coordinator = CaptureCoordinator(
+            CoordinatorConfig(
+                self.mountpoint,
+                self.state_root,
+                split_config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            ),
+            mount_checker=lambda path: path == self.mountpoint.resolve(),
+        )
         try:
             session_id = self.seal_one(coordinator, prefix="cal", mode="calibration")
             session = self.mountpoint / "recordings" / session_id
             manifest = validate_device_session_directory(session)
             self.assertEqual(manifest["capture_mode"], "calibration")
+            self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
+            self.assertEqual(
+                (
+                    manifest["video"]["artifact"]["role"],
+                    manifest["frames"]["artifact"]["role"],
+                    manifest["imu"]["artifact"]["role"],
+                ),
+                ("video.raw-side-by-side", "frames.index", "imu.samples"),
+            )
+            self.assertEqual(manifest["audio"]["state"], "not_recorded")
             digest = hashlib.sha256((session / "manifest.json").read_bytes()).hexdigest()
             with (
                 DirectorySessionStore(

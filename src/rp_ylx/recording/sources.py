@@ -72,6 +72,8 @@ def _native_bool(value: object, name: str) -> bool:
 class ThreadedCaptureSources:
     """每次录制创建并释放一组真实相机/IMU 来源。"""
 
+    supports_calibration_capture = True
+
     def __init__(
         self,
         camera_factory: Callable[[], CaptureCamera],
@@ -336,6 +338,7 @@ class NativeContinuousCaptureSources:
     """生产路径：Rust 拥有连续相机采集、preview 和录制 fanout。"""
 
     keeps_preview_after_stop = True
+    supports_calibration_capture = True
 
     def __init__(
         self,
@@ -498,7 +501,11 @@ class NativeContinuousCaptureSources:
         on_failure: Callable[[str, str], None],
         native_recorder: object | None = None,
     ) -> None:
-        del mode
+        if mode not in {"production", "calibration"}:
+            raise RuntimeError("采集模式无效")
+        native_raw_targets = self._native_raw_sink_targets(native_recorder)
+        if mode == "calibration" and native_raw_targets is None:
+            raise RuntimeError("标定录制要求原生 raw-side-by-side sink")
         self.start_preview()
         imu = self._imu_factory()
         native_imu = getattr(imu, "native_owner", None)
@@ -538,7 +545,6 @@ class NativeContinuousCaptureSources:
             self._recording = tap
             self._open_handles += 1
         try:
-            native_raw_targets = self._native_raw_sink_targets(native_recorder)
             if native_raw_targets is not None:
                 active_take, sink = native_raw_targets
                 if native_imu is None:
@@ -558,6 +564,8 @@ class NativeContinuousCaptureSources:
                         self._read_timeout,
                     )
                 return
+            if mode == "calibration":
+                raise RuntimeError("标定录制禁止回退到非 raw-side-by-side 路径")
             native_split_targets = self._native_split_sink_targets(native_recorder)
             if native_split_targets is not None:
                 active_take, sink, encoder, segment_planner, started_monotonic_ns = (
@@ -860,6 +868,7 @@ class ContinuousCaptureSources:
     """保持相机常开用于预览，录制时只挂接落盘回调。"""
 
     keeps_preview_after_stop = True
+    supports_calibration_capture = True
 
     def __init__(
         self,

@@ -26,6 +26,7 @@ from rp_ylx.api.downloads import (
     parse_single_range,
 )
 from rp_ylx.api.events import (
+    CALIBRATION_CAPTURE_DISABLED_REASONS,
     EventReplayBuffer,
     InvalidEventCursor,
     InvalidSourceEvent,
@@ -1814,7 +1815,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
 
     def _send_camera_provider_error(self, error: ProviderError) -> None:
-        headers = {"YLX-Error-Code": error.code} if error.code == "camera_not_connected" else None
+        if error.code == "calibration_unavailable":
+            details = error.details
+            if (
+                error.status != HTTPStatus.SERVICE_UNAVAILABLE
+                or not isinstance(details, Mapping)
+                or set(details) != {"reason"}
+                or details.get("reason") not in CALIBRATION_CAPTURE_DISABLED_REASONS
+            ):
+                self._invalid_source_state("daemon calibration_unavailable 响应无效")
+                return
+        headers = (
+            {"YLX-Error-Code": error.code}
+            if error.code in {"camera_not_connected", "calibration_unavailable"}
+            else None
+        )
         self._problem(
             error.status,
             error.code,

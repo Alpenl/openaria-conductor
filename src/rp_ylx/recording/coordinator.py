@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -61,6 +61,13 @@ VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
 LIVE_IMU_STALE_SECONDS = 2.0
+CALIBRATION_CAPTURE_DISABLED_REASONS = {
+    "raw_side_by_side_required",
+    "native_raw_sink_unavailable",
+    "storage_unavailable",
+    "hardware_unavailable",
+    "maintenance_or_capture_busy",
+}
 
 
 class _Representation(Protocol):
@@ -82,6 +89,9 @@ class _Representation(Protocol):
 
 
 class CaptureSources(Protocol):
+    @property
+    def supports_calibration_capture(self) -> bool: ...
+
     @property
     def open_handle_count(self) -> int: ...
 
@@ -1009,6 +1019,46 @@ class CaptureCoordinator:
         if self._camera_connection_status()["state"] != "connected":
             raise self._camera_not_connected()
 
+    def _calibration_source_supported(self) -> bool:
+        if self._sources is None:
+            return True
+        return getattr(self._sources, "supports_calibration_capture", False) is True
+
+    def _calibration_capture_capability(
+        self,
+        *,
+        admission: VolumeAdmission | None,
+        writable: bool,
+    ) -> dict[str, object]:
+        supported = self._calibration_source_supported()
+        reason: str | None = None
+        if not supported:
+            reason = "native_raw_sink_unavailable"
+        elif self._active is not None:
+            reason = "maintenance_or_capture_busy"
+        elif self._camera_connection_status()["state"] != "connected":
+            reason = "hardware_unavailable"
+        elif admission is None or not writable or self._released:
+            reason = "storage_unavailable"
+        return {
+            "supported": supported,
+            "enabled": reason is None,
+            "disabled_reason": reason,
+            "required_video_layout": "raw-side-by-side",
+        }
+
+    @staticmethod
+    def _calibration_unavailable(reason: str) -> ProviderError:
+        if reason not in CALIBRATION_CAPTURE_DISABLED_REASONS:
+            raise RuntimeError("标定录制禁用原因无效")
+        return ProviderError(
+            "calibration_unavailable",
+            "当前采集源不能生成标定所需的原始双目会话",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            retryable=False,
+            details={"reason": reason},
+        )
+
     def _runtime_snapshot(self) -> Mapping[str, object]:
         runtime = dict(copy.deepcopy(self._runtime()))
         camera = self._camera_connection_status()
@@ -1082,6 +1132,17 @@ class CaptureCoordinator:
             available_bytes = 0
             writable = False
         commit = self._config.session.commit
+        capabilities: dict[str, object] = {
+            "capture": admission is not None and writable and not self._released,
+            "preview": True,
+            "range_download": True,
+            "network_mutation": (api_version == "v4" and self._network_controller_available()),
+        }
+        if api_version == "v4":
+            capabilities["calibration_capture"] = self._calibration_capture_capability(
+                admission=admission,
+                writable=writable,
+            )
         descriptor = {
             "schema": f"ylx.device.{api_version}",
             "device": {
@@ -1096,12 +1157,7 @@ class CaptureCoordinator:
                 "build_id": f"rp-ylx-{commit[:12]}",
             },
             "security_profile": security_profile,
-            "capabilities": {
-                "capture": admission is not None and writable and not self._released,
-                "preview": True,
-                "range_download": True,
-                "network_mutation": (api_version == "v4" and self._network_controller_available()),
-            },
+            "capabilities": capabilities,
             "storage": {
                 "volume_id": None if admission is None else admission.volume_id,
                 "total_bytes": total_bytes,
@@ -1507,6 +1563,8 @@ class CaptureCoordinator:
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
+        if body.get("mode") == "calibration" and not self._calibration_source_supported():
+            raise self._calibration_unavailable("native_raw_sink_unavailable")
         self._require_camera_connected()
         self._acquire_network_operation_lease()
         try:
@@ -1609,9 +1667,16 @@ class CaptureCoordinator:
             take_sequence=take_sequence,
             continuation_of=None if continuation_of is None else str(continuation_of),
         )
+        session_config = self._config.session
+        if plan.capture_mode == "calibration":
+            session_config = replace(
+                session_config,
+                video_layout="raw-side-by-side",
+                audio_enabled=False,
+            )
         recorder = DeviceSessionRecorder(
             admission.sessions_root,
-            self._config.session,
+            session_config,
             plan,
             authority_epoch=self._authority_epoch,
             allocate_revision=self._next_revision,
