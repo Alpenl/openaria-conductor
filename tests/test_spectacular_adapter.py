@@ -257,6 +257,23 @@ class SpectacularAdapterTest(unittest.TestCase):
 
         self.assertEqual(timing.frames[0]["uvc_sequence"], 1 << 32)
 
+    def test_device_session_allows_bounded_imu_control_read_jitter(self) -> None:
+        def delay_middle_packet(records: list[dict[str, object]]) -> None:
+            for record in records:
+                if record["packet_sequence"] != 1:
+                    continue
+                for key in ("host_read_start_ns", "host_read_end_ns", "host_monotonic_ns"):
+                    record[key] = int(record[key]) + 7_000_000
+
+        _rewrite_artifact(self.session, "imu", delay_middle_packet)
+
+        timing = analyze_capture(self.session)
+
+        self.assertGreater(timing.imu_clock.residual_p95_ms, 5.0)
+        self.assertLess(timing.imu_clock.residual_p95_ms, 10.0)
+        with self.assertRaisesRegex(CaptureValidationError, "IMU packet host timing p95"):
+            analyze_capture(self.session, max_imu_residual_p95_ms=5.0)
+
     def test_legacy_raw_capture_routes_through_compatibility_adapter(self) -> None:
         legacy = _make_legacy_capture(self.root)
         timing = analyze_capture(legacy)

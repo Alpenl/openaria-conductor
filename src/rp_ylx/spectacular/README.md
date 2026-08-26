@@ -21,6 +21,11 @@ frame clock uses the contiguous `frame` recording domain. IMU `sequence`,
 sample's `source`; raw axes and the reconstructed monotonic sample time are also mapped
 to the model-facing fields. No mapping is inferred from a coincidentally similar name.
 
+Timing validation remains fail-closed while accounting for the two different host
+paths: video callback timing has a 5 ms p95 residual limit, while USB control-read IMU
+packet timing has a 10 ms p95 residual limit and a separate 10 ms p95 read-duration
+limit. The IMU residual limit remains below one 60 Hz packet period.
+
 Run the same acceptance boundary used by downstream calibration code with:
 
 ```console
