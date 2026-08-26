@@ -37,6 +37,7 @@ class ZeroconfResponder(Protocol):
 
 AddressProvider = Callable[[], tuple[str, ...]]
 ResponderFactory = Callable[[tuple[str, ...]], ZeroconfResponder]
+Publication = tuple[ZeroconfResponder, tuple[ServiceInfo, ...]]
 
 
 def runtime_ipv4_addresses() -> tuple[str, ...]:
@@ -118,8 +119,7 @@ class MdnsPublisher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._addresses: tuple[str, ...] = ()
-        self._responder: ZeroconfResponder | None = None
-        self._services: tuple[ServiceInfo, ...] = ()
+        self._publications: tuple[Publication, ...] = ()
         self._failure_type: str | None = None
         self._suppressed_failures = 0
 
@@ -179,27 +179,30 @@ class MdnsPublisher:
 
     def _reconcile(self) -> None:
         addresses = self._address_provider()
-        if addresses == self._addresses and self._responder is not None:
+        if addresses == self._addresses and self._publications:
             return
         self._unpublish()
         if not addresses:
             return
-        responder = self._responder_factory(addresses)
-        registered: list[ServiceInfo] = []
+        publications: list[Publication] = []
         try:
-            for service in _service_infos(self._port, addresses, self._scheme):
-                responder.register_service(service, allow_name_change=True)
-                registered.append(service)
+            for address in addresses:
+                responder = self._responder_factory((address,))
+                registered: list[ServiceInfo] = []
+                try:
+                    for service in _service_infos(self._port, (address,), self._scheme):
+                        responder.register_service(service, allow_name_change=True)
+                        registered.append(service)
+                except Exception:
+                    self._close_publication((responder, tuple(registered)))
+                    raise
+                publications.append((responder, tuple(registered)))
         except Exception:
-            for service in reversed(registered):
-                with suppress(Exception):
-                    responder.unregister_service(service)
-            with suppress(Exception):
-                responder.close()
+            for publication in reversed(publications):
+                self._close_publication(publication)
             raise
         self._addresses = addresses
-        self._responder = responder
-        self._services = tuple(registered)
+        self._publications = tuple(publications)
         _OPERATIONAL_LOG.event(
             "mdns_publication_ready",
             port=self._port,
@@ -207,18 +210,21 @@ class MdnsPublisher:
             address_count=len(addresses),
         )
 
-    def _unpublish(self) -> None:
-        responder, services = self._responder, self._services
-        self._addresses = ()
-        self._responder = None
-        self._services = ()
-        if responder is None:
-            return
+    @staticmethod
+    def _close_publication(publication: Publication) -> None:
+        responder, services = publication
         for service in reversed(services):
             with suppress(Exception):
                 responder.unregister_service(service)
         with suppress(Exception):
             responder.close()
+
+    def _unpublish(self) -> None:
+        publications = self._publications
+        self._addresses = ()
+        self._publications = ()
+        for publication in reversed(publications):
+            self._close_publication(publication)
 
     def close(self) -> None:
         self._stop.set()
