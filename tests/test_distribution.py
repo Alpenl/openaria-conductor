@@ -193,14 +193,14 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "f68ab115a1e63ed107f21a290f8a900218d18a4c",
+                        "source_commit": "9bd95ed6d65b016e44ce9635f4fd8a5b925719a9",
                         "required_device_api_major": 4,
                         "assets": {
                             "app.js": {
-                                "bytes": 98834,
+                                "bytes": 100250,
                                 "content_type": "text/javascript; charset=utf-8",
                                 "sha256": (
-                                    "cb5cb885f9fa450e728f4012f0b4a902c01eebec127246e636b31c1af66dd2fc"
+                                    "471138d0f72f73e761654a9fe7be07f9a822db2b79d0488705abc8b404ce763b"
                                 ),
                             },
                             "index.html": {

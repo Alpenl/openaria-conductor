@@ -317,6 +317,13 @@ def _device_for_api(api_version: str) -> dict[str, object]:
     device["schema"] = f"ylx.device.{api_version}"
     device["api_version"] = f"{api_version.removeprefix('v')}.0"
     device["runtime"] = _runtime_for_api(device["runtime"], api_version)
+    if api_version == "v4":
+        device["capabilities"]["calibration_capture"] = {
+            "supported": True,
+            "enabled": True,
+            "disabled_reason": None,
+            "required_video_layout": "raw-side-by-side",
+        }
     return device
 
 
@@ -523,6 +530,13 @@ class DeviceProvider:
         descriptor["security_profile"] = security_profile
         descriptor["runtime"]["camera_focus"] = deepcopy(self.focus)
         descriptor["runtime"]["live_imu"] = deepcopy(self.live_imu)
+        if api_version == "v4":
+            descriptor["capabilities"]["calibration_capture"] = {
+                "supported": True,
+                "enabled": True,
+                "disabled_reason": None,
+                "required_video_layout": "raw-side-by-side",
+            }
         if self.device_schema_override is not None:
             descriptor["schema"] = self.device_schema_override
         descriptor.update(deepcopy(self.device_extra))
@@ -1427,6 +1441,37 @@ class GatewayHttpTest(unittest.TestCase):
                 error = json.loads(payload)["error"]
                 self.assertEqual(error["code"], "camera_not_connected")
                 self.assertTrue(error["retryable"])
+
+    def test_calibration_unavailable_error_is_typed_for_capture(self) -> None:
+        self.server.provider.camera_error = ProviderError(
+            "calibration_unavailable",
+            "当前采集源不能生成标定所需的原始双目会话",
+            status=503,
+            retryable=False,
+            details={"reason": "native_raw_sink_unavailable"},
+        )
+        status, payload, response_headers = self.request(
+            "/api/v4/capture/start",
+            token="reader-token",
+            headers={"Origin": self.base, "Idempotency-Key": "calibration-unavailable"},
+            body={
+                "schema": "ylx.capture-start.v2",
+                "mode": "calibration",
+                "take": {"kind": "new"},
+            },
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(response_headers["YLX-Error-Code"], "calibration_unavailable")
+        self.assertEqual(
+            json.loads(payload)["error"],
+            {
+                "code": "calibration_unavailable",
+                "message": "当前采集源不能生成标定所需的原始双目会话",
+                "request_id": json.loads(payload)["error"]["request_id"],
+                "retryable": False,
+                "details": {"reason": "native_raw_sink_unavailable"},
+            },
+        )
 
     def test_network_status_and_events_are_v4_only_and_strictly_validated(self) -> None:
         for version in ("v2", "v3"):

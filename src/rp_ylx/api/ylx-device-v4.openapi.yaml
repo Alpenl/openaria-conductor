@@ -155,7 +155,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/CameraNotConnected"
+          $ref: "#/components/responses/CaptureStartUnavailable"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
         "500":
@@ -1207,6 +1207,20 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/CameraNotConnectedError"
+    CaptureStartUnavailable:
+      description: Camera or calibration-specific prerequisites are unavailable before capture side effects start
+      headers:
+        YLX-Error-Code:
+          required: true
+          schema:
+            type: string
+            enum: [camera_not_connected, calibration_unavailable]
+      content:
+        application/problem+json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/CameraNotConnectedError"
+              - $ref: "#/components/schemas/CalibrationUnavailableError"
     InvalidCameraFocus:
       description: Requested focus value or auto toggle is outside the exposed V4L2 control range/capability
       headers:
@@ -1423,7 +1437,7 @@ components:
         capabilities:
           type: object
           additionalProperties: false
-          required: [capture, preview, range_download, network_mutation]
+          required: [capture, preview, range_download, network_mutation, calibration_capture]
           properties:
             capture:
               type: boolean
@@ -1438,6 +1452,8 @@ components:
                 async /network/apply, /network/retry, and /network/forget routes are wired
                 for this runtime. Clients still read NetworkStatus.mutation_capability
                 before enabling controls.
+            calibration_capture:
+              $ref: "#/components/schemas/CalibrationCaptureCapability"
         storage:
           type: object
           additionalProperties: false
@@ -1513,6 +1529,52 @@ components:
             connected means the configured camera device node is currently present;
             disconnected means camera-dependent commands must fail with the typed,
             retryable camera_not_connected problem while the control plane stays available.
+    CalibrationCaptureCapability:
+      type: object
+      additionalProperties: false
+      required: [supported, enabled, disabled_reason, required_video_layout]
+      properties:
+        supported:
+          type: boolean
+          description: This build and configured capture source can produce the required raw calibration artifacts
+        enabled:
+          type: boolean
+          description: Calibration capture can be admitted at the observed device state
+        disabled_reason:
+          oneOf:
+            - $ref: "#/components/schemas/CalibrationCaptureDisabledReason"
+            - type: "null"
+        required_video_layout:
+          const: raw-side-by-side
+      allOf:
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: true
+          then:
+            properties:
+              supported:
+                const: true
+              disabled_reason:
+                type: "null"
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+          then:
+            properties:
+              disabled_reason:
+                $ref: "#/components/schemas/CalibrationCaptureDisabledReason"
+    CalibrationCaptureDisabledReason:
+      type: string
+      enum:
+        - raw_side_by_side_required
+        - native_raw_sink_unavailable
+        - storage_unavailable
+        - hardware_unavailable
+        - maintenance_or_capture_busy
     NetworkRuntimeStatus:
       type: object
       additionalProperties: false
@@ -3200,6 +3262,36 @@ components:
             details:
               type: object
               additionalProperties: true
+    CalibrationUnavailableError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: calibration_unavailable
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              type: boolean
+            details:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason:
+                  $ref: "#/components/schemas/CalibrationCaptureDisabledReason"
     InvalidCameraFocusError:
       type: object
       additionalProperties: false

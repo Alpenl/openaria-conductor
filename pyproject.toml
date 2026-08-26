@@ -23,6 +23,7 @@ dev = ["ruff>=0.12,<1"]
 [project.scripts]
 rp-ylx = "rp_ylx.cli:main"
 rp-ylx-deploy = "rp_ylx.deployment:main"
+rp-ylx-spectacular-check = "rp_ylx.spectacular.check_cli:main"
 
 [tool.setuptools.package-dir]
 "" = "src"

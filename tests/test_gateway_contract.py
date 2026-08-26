@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "b74654c9e36d7d1b49bf6c13b3f712d25b6f38847e32b09662b0c3bcc57cc1f4",
-        "bytes": 117_734,
+        "sha256": "2063909abe8363272d72371992de8dfb14b0d0c70333867eae9b97d83dd9054a",
+        "bytes": 120_790,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -206,6 +206,15 @@ def _device_common_for_api(api_version: str) -> dict[str, object]:
         assert isinstance(runtime, dict)
         runtime.pop("camera", None)
         runtime.pop("camera_focus", None)
+    else:
+        capabilities = common["capabilities"]
+        assert isinstance(capabilities, dict)
+        capabilities["calibration_capture"] = {
+            "supported": True,
+            "enabled": True,
+            "disabled_reason": None,
+            "required_video_layout": "raw-side-by-side",
+        }
     return common
 
 
@@ -342,7 +351,7 @@ class _WireProvider:
         version = f"{api_version.removeprefix('v')}.0"
         return {
             "schema": f"ylx.device.{api_version}",
-            **deepcopy(DEVICE_COMMON),
+            **_device_common_for_api(api_version),
             "api_version": version,
             "security_profile": security_profile,
         }

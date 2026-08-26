@@ -555,6 +555,11 @@ def native_imu_observation(sequence: int = 0) -> dict[str, object]:
 
 
 class ThreadedCaptureSourcesTest(unittest.TestCase):
+    def test_all_raw_sources_declare_calibration_support(self) -> None:
+        self.assertTrue(ThreadedCaptureSources.supports_calibration_capture)
+        self.assertTrue(ContinuousCaptureSources.supports_calibration_capture)
+        self.assertTrue(NativeContinuousCaptureSources.supports_calibration_capture)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -1221,6 +1226,41 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         self.assertFalse(submitted_imu)
         self.assertTrue(imu.closed)
         self.assertTrue(runtime.closed)
+
+    def test_native_continuous_sources_never_route_calibration_to_split_sink(self) -> None:
+        imu_factory_calls: list[bool] = []
+        recorder = SimpleNamespace(
+            native_raw_sink_targets=lambda: None,
+            native_split_sink_targets=lambda: (
+                object(),
+                object(),
+                object(),
+                object(),
+                123_456_789,
+            ),
+        )
+        sources = NativeContinuousCaptureSources(
+            "/dev/video0",
+            lambda: imu_factory_calls.append(True),  # type: ignore[arg-type,func-returns-value]
+            CameraMode(3840, 1080, 60.0, "mjpg"),
+            preview=SimpleNamespace(native_owner=object()),
+            read_timeout=0.1,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "raw-side-by-side"):
+                sources.start(
+                    mode="calibration",
+                    generation_id=str(uuid.uuid4()),
+                    submit_frame=lambda observation: True,
+                    submit_imu=lambda observation: True,
+                    on_failure=lambda code, message: None,
+                    native_recorder=recorder,
+                )
+        finally:
+            sources.close()
+
+        self.assertFalse(imu_factory_calls)
+        self.assertEqual(sources.open_handle_count, 0)
 
     def test_native_continuous_sources_pass_metrics_owner_to_runtime(self) -> None:
         runtime = FakeNativeContinuousRuntime()

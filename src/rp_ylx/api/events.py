@@ -68,6 +68,15 @@ CAPTURE_STATUS_SCHEMA_V4 = "ylx.capture-status.v4"
 CAPTURE_SNAPSHOT_SCHEMA_V2 = "ylx.capture-snapshot-event.v2"
 CAPTURE_SNAPSHOT_SCHEMA_V4 = "ylx.capture-snapshot-event.v4"
 CAPTURE_ACTIVE_STATES = frozenset({"recording", "finalizing", "encoding", "verifying"})
+CALIBRATION_CAPTURE_DISABLED_REASONS = frozenset(
+    {
+        "raw_side_by_side_required",
+        "native_raw_sink_unavailable",
+        "storage_unavailable",
+        "hardware_unavailable",
+        "maintenance_or_capture_busy",
+    }
+)
 CAPTURE_DEVICE_STATES = frozenset({"idle", *CAPTURE_ACTIVE_STATES, "blocked"})
 CAPTURE_TERMINAL_STATES = frozenset({"recoverable", "failed", "abandoned"})
 CAPTURE_RECORDING_STATES = frozenset({*CAPTURE_ACTIVE_STATES, *CAPTURE_TERMINAL_STATES})
@@ -672,12 +681,15 @@ def _validate_build(value: object) -> None:
 
 
 def _validate_capabilities(value: object, *, api_version: str) -> None:
-    if not isinstance(value, Mapping) or set(value) != {
+    expected = {
         "capture",
         "preview",
         "range_download",
         "network_mutation",
-    }:
+    }
+    if api_version == "v4":
+        expected.add("calibration_capture")
+    if not isinstance(value, Mapping) or set(value) != expected:
         raise InvalidSourceEvent("device capabilities 必须是闭合对象")
     if (
         type(value["capture"]) is not bool
@@ -687,6 +699,30 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
         or (api_version != "v4" and value["network_mutation"] is not False)
     ):
         raise InvalidSourceEvent("device capabilities 无效")
+    if api_version != "v4":
+        return
+    calibration = value["calibration_capture"]
+    if not isinstance(calibration, Mapping) or set(calibration) != {
+        "supported",
+        "enabled",
+        "disabled_reason",
+        "required_video_layout",
+    }:
+        raise InvalidSourceEvent("calibration_capture capability 必须是闭合对象")
+    supported = calibration["supported"]
+    enabled = calibration["enabled"]
+    reason = calibration["disabled_reason"]
+    if (
+        type(supported) is not bool
+        or type(enabled) is not bool
+        or calibration["required_video_layout"] != "raw-side-by-side"
+        or (enabled and (supported is not True or reason is not None))
+        or (
+            not enabled
+            and (not isinstance(reason, str) or reason not in CALIBRATION_CAPTURE_DISABLED_REASONS)
+        )
+    ):
+        raise InvalidSourceEvent("calibration_capture capability 无效")
 
 
 def _validate_device_storage(value: object) -> None:
