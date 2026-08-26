@@ -107,6 +107,7 @@ class InstalledWheelTest(unittest.TestCase):
                 )
                 python = virtual_environment / "bin" / "python"
                 executable = virtual_environment / "bin" / "rp-ylx"
+                spectacular = virtual_environment / "bin" / "rp-ylx-spectacular-check"
                 subprocess.run(
                     [uv, "pip", "install", "--python", str(python), str(wheel)],
                     cwd=external_root,
@@ -124,6 +125,14 @@ class InstalledWheelTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ).stdout.strip()
+                spectacular_help = subprocess.run(
+                    [str(spectacular), "--help"],
+                    cwd=external_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
                 status = json.loads(
                     subprocess.run(
                         [str(executable), "status"],
@@ -183,6 +192,7 @@ class InstalledWheelTest(unittest.TestCase):
                 )
 
                 self.assertEqual(version, f"rp-ylx 0.1.0 ({expected_commit})")
+                self.assertIn("usage: rp-ylx-spectacular-check", spectacular_help)
                 self.assertEqual(status["commit"], expected_commit)
                 self.assertEqual(status["native"]["adapter"], "rust")
                 self.assertTrue(status["native"]["module_available"])

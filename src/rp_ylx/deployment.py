@@ -1034,7 +1034,12 @@ def _install_stage(bundle: Bundle, stage: Path) -> None:
             site_packages,
             max_bytes=MAX_UNPACKED_BYTES - unpacked_bytes,
         )
-    for name, module in (("rp-ylx", "rp_ylx"), ("rp-ylx-deploy", "rp_ylx.deployment")):
+    launchers = (
+        ("rp-ylx", "rp_ylx"),
+        ("rp-ylx-deploy", "rp_ylx.deployment"),
+        ("rp-ylx-spectacular-check", "rp_ylx.spectacular.check_cli"),
+    )
+    for name, module in launchers:
         launcher = bin_directory / name
         launcher.write_bytes(_launcher(module))
         launcher.chmod(0o755)
