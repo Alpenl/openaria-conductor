@@ -37,39 +37,49 @@ class ZeroconfResponder(Protocol):
 
 AddressProvider = Callable[[], tuple[str, ...]]
 ResponderFactory = Callable[[tuple[str, ...]], ZeroconfResponder]
-Publication = tuple[ZeroconfResponder, tuple[ServiceInfo, ...]]
+
+
+def _supported_ipv4_addresses(status: object) -> tuple[str, ...]:
+    if not isinstance(status, Mapping):
+        return ()
+    candidates = status.get("addresses")
+    if not isinstance(candidates, list):
+        return ()
+    discovered: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        try:
+            address = ipaddress.ip_address(candidate.partition("/")[0])
+        except ValueError:
+            continue
+        normalized = str(address)
+        if (
+            address.version == 4
+            and not address.is_loopback
+            and not address.is_link_local
+            and not address.is_unspecified
+            and normalized not in discovered
+        ):
+            discovered.append(normalized)
+    return tuple(discovered)
 
 
 def runtime_ipv4_addresses() -> tuple[str, ...]:
-    """Return supported device-network IPv4 addresses, without loopback or link-local values."""
+    """Return one reachable IPv4 address for the fixed device hostname."""
 
     runtime = collect_linux_runtime()
     network = runtime.get("network")
     if not isinstance(network, Mapping):
         return ()
-    discovered: set[str] = set()
-    for name in ("ap", "wifi_client", "wired"):
-        status = network.get(name)
-        if not isinstance(status, Mapping):
-            continue
-        addresses = status.get("addresses")
-        if not isinstance(addresses, list):
-            continue
-        for candidate in addresses:
-            if not isinstance(candidate, str):
-                continue
-            try:
-                address = ipaddress.ip_address(candidate.partition("/")[0])
-            except ValueError:
-                continue
-            if (
-                address.version == 4
-                and not address.is_loopback
-                and not address.is_link_local
-                and not address.is_unspecified
-            ):
-                discovered.add(str(address))
-    return tuple(sorted(discovered))
+    default_route = network.get("default_route")
+    names = [default_route] if default_route in {"wifi_client", "wired"} else []
+    names.extend(name for name in ("ap", "wifi_client", "wired") if name not in names)
+    for name in names:
+        addresses = _supported_ipv4_addresses(network.get(name))
+        if addresses:
+            return addresses[:1]
+    return ()
 
 
 def _default_responder(addresses: tuple[str, ...]) -> ZeroconfResponder:
@@ -119,7 +129,8 @@ class MdnsPublisher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._addresses: tuple[str, ...] = ()
-        self._publications: tuple[Publication, ...] = ()
+        self._responder: ZeroconfResponder | None = None
+        self._services: tuple[ServiceInfo, ...] = ()
         self._failure_type: str | None = None
         self._suppressed_failures = 0
 
@@ -179,30 +190,27 @@ class MdnsPublisher:
 
     def _reconcile(self) -> None:
         addresses = self._address_provider()
-        if addresses == self._addresses and self._publications:
+        if addresses == self._addresses and self._responder is not None:
             return
         self._unpublish()
         if not addresses:
             return
-        publications: list[Publication] = []
+        responder = self._responder_factory(addresses)
+        registered: list[ServiceInfo] = []
         try:
-            for address in addresses:
-                responder = self._responder_factory((address,))
-                registered: list[ServiceInfo] = []
-                try:
-                    for service in _service_infos(self._port, (address,), self._scheme):
-                        responder.register_service(service, allow_name_change=True)
-                        registered.append(service)
-                except Exception:
-                    self._close_publication((responder, tuple(registered)))
-                    raise
-                publications.append((responder, tuple(registered)))
+            for service in _service_infos(self._port, addresses, self._scheme):
+                responder.register_service(service, allow_name_change=True)
+                registered.append(service)
         except Exception:
-            for publication in reversed(publications):
-                self._close_publication(publication)
+            for service in reversed(registered):
+                with suppress(Exception):
+                    responder.unregister_service(service)
+            with suppress(Exception):
+                responder.close()
             raise
         self._addresses = addresses
-        self._publications = tuple(publications)
+        self._responder = responder
+        self._services = tuple(registered)
         _OPERATIONAL_LOG.event(
             "mdns_publication_ready",
             port=self._port,
@@ -210,21 +218,18 @@ class MdnsPublisher:
             address_count=len(addresses),
         )
 
-    @staticmethod
-    def _close_publication(publication: Publication) -> None:
-        responder, services = publication
+    def _unpublish(self) -> None:
+        responder, services = self._responder, self._services
+        self._addresses = ()
+        self._responder = None
+        self._services = ()
+        if responder is None:
+            return
         for service in reversed(services):
             with suppress(Exception):
                 responder.unregister_service(service)
         with suppress(Exception):
             responder.close()
-
-    def _unpublish(self) -> None:
-        publications = self._publications
-        self._addresses = ()
-        self._publications = ()
-        for publication in reversed(publications):
-            self._close_publication(publication)
 
     def close(self) -> None:
         self._stop.set()
