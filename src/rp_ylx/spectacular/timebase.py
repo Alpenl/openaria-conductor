@@ -313,6 +313,7 @@ def _analyze_capture(
     imu_rate_hz: float,
     max_rate_error_ppm: float,
     max_residual_p95_ms: float,
+    max_imu_residual_p95_ms: float,
     max_imu_read_p95_ms: float,
 ) -> CaptureTiming:
     if imu_rate_hz <= 0:
@@ -345,7 +346,7 @@ def _analyze_capture(
         imu_rate_hz / capture.imu_samples_per_packet,
         "IMU packet",
         max_rate_error_ppm,
-        max_residual_p95_ms,
+        max_imu_residual_p95_ms,
     )
     read_duration_ms = [
         (int(record["host_read_end_ns"]) - int(record["host_read_start_ns"])) / 1e6
@@ -394,6 +395,7 @@ def analyze_capture(
     imu_rate_hz: float = 120.0,
     max_rate_error_ppm: float = 20_000.0,
     max_residual_p95_ms: float = 5.0,
+    max_imu_residual_p95_ms: float = 10.0,
     max_imu_read_p95_ms: float = 10.0,
 ) -> CaptureTiming:
     """Validate capture integrity and reconstruct one monotonic calibration timeline."""
@@ -404,6 +406,7 @@ def analyze_capture(
             imu_rate_hz=imu_rate_hz,
             max_rate_error_ppm=max_rate_error_ppm,
             max_residual_p95_ms=max_residual_p95_ms,
+            max_imu_residual_p95_ms=max_imu_residual_p95_ms,
             max_imu_read_p95_ms=max_imu_read_p95_ms,
         )
     except CaptureValidationError:
