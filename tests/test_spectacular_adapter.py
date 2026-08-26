@@ -36,7 +36,7 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode()
 
 
-def _make_device_session(root: Path) -> Path:
+def _make_device_session(root: Path, *, frame_decimation: int = 1) -> Path:
     revision = 0
 
     def allocate_revision() -> int:
@@ -56,7 +56,8 @@ def _make_device_session(root: Path) -> Path:
             commit="b" * 40,
             width=3840,
             height=1080,
-            sensor_fps=30.0,
+            sensor_fps=30.0 * frame_decimation,
+            frame_decimation=frame_decimation,
             video_layout="raw-side-by-side",
             audio_enabled=False,
         ),
@@ -81,7 +82,7 @@ def _make_device_session(root: Path) -> Path:
         assert recorder.submit_frame(
             FrameObservation(
                 StereoFrame(
-                    source_sequence=sequence,
+                    source_sequence=sequence * frame_decimation,
                     host_monotonic_ns=1_000_000_000 + sequence * 33_333_333,
                     left=b"",
                     right=b"",
@@ -234,6 +235,27 @@ class SpectacularAdapterTest(unittest.TestCase):
         self.assertEqual(result["model_input"]["frames"], 4)
         self.assertEqual(len(result["model_input"]["sha256"]), 64)
         self.assertEqual(check_capture(self.session)["model_input"], result["model_input"])
+
+    def test_device_session_accepts_declared_frame_decimation(self) -> None:
+        session = _make_device_session(self.root, frame_decimation=2)
+
+        timing = analyze_capture(session)
+        model = build_model_input(timing)
+
+        self.assertEqual(model["frames"][2]["frame_index"], 2)
+        self.assertEqual(model["frames"][2]["source_sequence"], 4)
+        self.assertEqual(timing.frame_clock.expected_rate_hz, 30.0)
+
+    def test_device_session_accepts_unwrapped_source_sequence(self) -> None:
+        def move_past_u32(records: list[dict[str, object]]) -> None:
+            for record in records:
+                record["source_sequence"] = int(record["source_sequence"]) + (1 << 32)
+
+        _rewrite_artifact(self.session, "frames", move_past_u32)
+
+        timing = analyze_capture(self.session)
+
+        self.assertEqual(timing.frames[0]["uvc_sequence"], 1 << 32)
 
     def test_legacy_raw_capture_routes_through_compatibility_adapter(self) -> None:
         legacy = _make_legacy_capture(self.root)

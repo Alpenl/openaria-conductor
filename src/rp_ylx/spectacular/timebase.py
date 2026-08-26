@@ -318,9 +318,15 @@ def _analyze_capture(
     if imu_rate_hz <= 0:
         raise CaptureValidationError("IMU rate must be positive")
     capture = load_capture(capture_dir)
-    frame_sequences = _unwrap_contiguous(
-        [int(frame["uvc_sequence"]) for frame in capture.frames], 32, "video frame"
-    )
+    if capture.source_schema == "ylx.device-session.v2":
+        # Device Session source sequences advance by the declared frame
+        # decimation. The adapter validates that exact relationship; the
+        # contiguous recording domain is the clock-fit counter.
+        frame_sequences = [int(frame["frame_index"]) for frame in capture.frames]
+    else:
+        frame_sequences = _unwrap_contiguous(
+            [int(frame["uvc_sequence"]) for frame in capture.frames], 32, "video frame"
+        )
     frame_hosts = [int(frame["callback_monotonic_ns"]) for frame in capture.frames]
     frame_times, frame_clock = _fit_clock(
         frame_sequences,

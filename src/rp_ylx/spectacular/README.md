@@ -14,7 +14,9 @@ single-file MP4, embedded audio, or separately recorded audio.
 
 The Device Session mapping is explicit: frame `frame`, `source_sequence`, and
 `host_monotonic_ns` become the model frame index, source sequence, and fitted frame
-time. IMU `sequence`, `packet_sequence`, `sample_index`, `device_timestamp_raw`,
+time. The source sequence must advance by the declared `frame_decimation`; the fitted
+frame clock uses the contiguous `frame` recording domain. IMU `sequence`,
+`packet_sequence`, `sample_index`, `device_timestamp_raw`,
 `device_ticks`, all three host timestamps, `raw`, and `sync` are retained under each
 sample's `source`; raw axes and the reconstructed monotonic sample time are also mapped
 to the model-facing fields. No mapping is inferred from a coincidentally similar name.

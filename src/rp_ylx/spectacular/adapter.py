@@ -199,6 +199,7 @@ def _normalize_device_frames(
     *,
     session_id: str,
     video_bytes: int,
+    frame_decimation: int,
 ) -> tuple[dict[str, Any], ...]:
     expected_keys = {
         "schema",
@@ -212,6 +213,7 @@ def _normalize_device_frames(
     normalized: list[dict[str, Any]] = []
     expected_offset = 0
     previous_host = -1
+    previous_source: int | None = None
     for index, record in enumerate(records):
         if set(record) != expected_keys:
             raise CaptureValidationError(f"Device Session frame {index} is not a closed record")
@@ -221,7 +223,6 @@ def _normalize_device_frames(
         source_sequence = _integer(
             record["source_sequence"],
             f"frame[{index}].source_sequence",
-            maximum=(1 << 32) - 1,
         )
         host = _integer(record["host_monotonic_ns"], f"frame[{index}].host_monotonic_ns")
         offset = _integer(record["video_offset"], f"frame[{index}].video_offset")
@@ -229,6 +230,12 @@ def _normalize_device_frames(
         if frame != index or offset != expected_offset or host <= previous_host:
             raise CaptureValidationError(
                 f"Device Session frame {index} order, offset, or host timestamp is invalid"
+            )
+        if previous_source is not None and source_sequence != previous_source + frame_decimation:
+            raise CaptureValidationError(
+                f"Device Session source sequence gap or regression at record {index}: "
+                f"{previous_source} -> {source_sequence}; expected declared "
+                f"frame_decimation {frame_decimation}"
             )
         normalized.append(
             {
@@ -242,6 +249,7 @@ def _normalize_device_frames(
         )
         expected_offset += size
         previous_host = host
+        previous_source = source_sequence
     if expected_offset != video_bytes:
         raise CaptureValidationError(
             "Device Session frame index does not cover the raw video bytes"
@@ -378,6 +386,10 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
         raise CaptureValidationError("calibration Device Session raw video encoding is invalid")
     frames_block = _mapping(manifest.get("frames"), "Device Session frames")
     imu_block = _mapping(manifest.get("imu"), "Device Session IMU")
+    camera = _mapping(manifest.get("camera"), "Device Session camera")
+    frame_decimation = _integer(
+        camera.get("frame_decimation"), "camera.frame_decimation", minimum=1
+    )
     audio = _mapping(manifest.get("audio"), "Device Session audio")
     if audio.get("state") != "not_recorded":
         raise CaptureValidationError(
@@ -431,13 +443,13 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
         frame_records,
         session_id=session_id,
         video_bytes=_integer(video_descriptor["bytes"], "raw video.bytes", minimum=1),
+        frame_decimation=frame_decimation,
     )
     imu_samples = _normalize_device_imu(imu_records, session_id=session_id)
     if len(frames) != _integer(frames_block.get("count"), "frames.count", minimum=1):
         raise CaptureValidationError("Device Session frame count differs from the manifest")
     if len(imu_samples) != _integer(imu_block.get("sample_count"), "imu.sample_count", minimum=1):
         raise CaptureValidationError("Device Session IMU count differs from the manifest")
-    camera = _mapping(manifest.get("camera"), "Device Session camera")
     width = _integer(camera.get("width"), "camera.width", minimum=2)
     eye_width = _integer(camera.get("eye_width"), "camera.eye_width", minimum=1)
     if width != eye_width * 2:
