@@ -31,6 +31,7 @@ from rp_ylx.deployment import (
     _default_tls_material_generator,
     _extract_runtime,
     _extract_wheel,
+    _install_stage,
     _launcher,
     _sha256,
     _system_launcher,
@@ -752,6 +753,26 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn("/opt/rp-ylx/previous/runtime/bin/python3", deployment)
         self.assertNotIn("/usr/bin/python3", application)
         self.assertNotIn("/usr/bin/python3", deployment)
+
+    def test_install_stage_materializes_all_product_console_scripts(self) -> None:
+        stage = self.root / "release-stage"
+        stage.mkdir()
+
+        _install_stage(load_bundle(self.bundle("a")), stage)
+
+        expected = {
+            "rp-ylx": "rp_ylx",
+            "rp-ylx-deploy": "rp_ylx.deployment",
+            "rp-ylx-spectacular-check": "rp_ylx.spectacular.check_cli",
+        }
+        for name, module in expected.items():
+            with self.subTest(command=name):
+                launcher = stage / "bin" / name
+                self.assertTrue(launcher.is_file())
+                self.assertTrue(launcher.stat().st_mode & 0o111)
+                payload = launcher.read_text(encoding="utf-8")
+                self.assertIn("$RELEASE_ROOT/runtime/bin/python3", payload)
+                self.assertIn(f" -m {module} ", payload)
 
     def test_network_control_launcher_execs_current_protocol_release(self) -> None:
         commit = self.commit("a")
