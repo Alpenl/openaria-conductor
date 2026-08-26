@@ -1536,7 +1536,7 @@ components:
       properties:
         supported:
           type: boolean
-          description: This build and configured capture source can produce the required raw calibration artifacts
+          description: This build and configured capture source can produce segmented split-eye H.264 MP4 calibration artifacts
         enabled:
           type: boolean
           description: Calibration capture can be admitted at the observed device state
@@ -1545,7 +1545,7 @@ components:
             - $ref: "#/components/schemas/CalibrationCaptureDisabledReason"
             - type: "null"
         required_video_layout:
-          const: raw-side-by-side
+          const: split-eyes
       allOf:
         - if:
             required: [enabled]
@@ -1570,8 +1570,7 @@ components:
     CalibrationCaptureDisabledReason:
       type: string
       enum:
-        - raw_side_by_side_required
-        - native_raw_sink_unavailable
+        - capture_source_unsupported
         - storage_unavailable
         - hardware_unavailable
         - maintenance_or_capture_busy

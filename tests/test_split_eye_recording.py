@@ -687,17 +687,9 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertFalse((sealed.path / "capture.json").exists())
             validate_device_session_manifest(sealed.manifest)
 
-    def test_raw_sbs_direct_native_sink_can_be_sealed_without_python_frame_queue(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            revision = 0
-
-            def allocate_revision() -> int:
-                nonlocal revision
-                revision += 1
-                return revision
-
-            config = DeviceSessionConfig(
+    def test_device_session_config_rejects_raw_sbs_writer(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Device Session"):
+            DeviceSessionConfig(
                 device_id=str(uuid.uuid4()),
                 device_label="YLX-12AB34CD",
                 hardware_fingerprint="sha256:" + "a" * 64,
@@ -707,84 +699,22 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 width=3840,
                 height=1080,
                 sensor_fps=60.0,
-                frame_decimation=1,
                 video_layout="raw-side-by-side",
-                segment_seconds=self.segment_seconds,
             )
-            recorder = DeviceSessionRecorder(
-                root,
-                config,
-                SessionPlan(
-                    session_id=uuid7(),
-                    volume_id=str(uuid.uuid4()),
-                    generation_id=str(uuid.uuid4()),
-                    capture_mode="production",
-                    display_name="raw direct fixture",
-                    take_id=uuid7(),
-                    take_sequence=1,
-                    continuation_of=None,
-                ),
-                authority_epoch=str(uuid.uuid4()),
-                allocate_revision=allocate_revision,
-                storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
-                checkpoint_interval=0.0,
-            )
-            try:
-                recorder.start()
-            except DeviceRecordingError as error:
-                if error.code.startswith("native_"):
-                    self.skipTest(f"native recording sink unavailable: {error}")
-                raise
-            targets = recorder.native_raw_sink_targets()
-            if targets is None:
-                self.skipTest("native raw sink targets unavailable")
-            active_take, sink = targets
-            reserved = active_take.reserve_frame(0, 1_000_000, 0)
-            record_sequence = reserved["record_sequence"]
-            written = sink.write_raw_frame(record_sequence, 0, 1_000_000, FRAME)
-            active_take.finish_frame(record_sequence, 0, 1_000_000, written["bytes_written"])
-
-            sealed = recorder.stop()
-
-            manifest = sealed.manifest
-            self.assertEqual(manifest["video"]["layout"], "raw-side-by-side")
-            self.assertEqual(manifest["frames"]["count"], 1)
-            self.assertEqual(manifest["imu"]["sample_count"], 0)
-            self.assertEqual(manifest["integrity"]["dropped_frames"], 0)
-            validate_device_session_manifest(manifest)
-            validate_device_session_directory(sealed.path)
 
     def test_native_direct_sink_live_counters_update_without_new_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            revision = 0
             active_take: FakeLiveNativeActiveTake | None = None
             sink = FakeLiveNativeRecordingSink()
-
-            def allocate_revision() -> int:
-                nonlocal revision
-                revision += 1
-                return revision
+            planner = FakeNativeSegmentPlanner(3)
+            native_encoder = object()
 
             def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
                 nonlocal active_take
                 active_take = FakeLiveNativeActiveTake(session_id)
                 return active_take
 
-            config = DeviceSessionConfig(
-                device_id=str(uuid.uuid4()),
-                device_label="YLX-12AB34CD",
-                hardware_fingerprint="sha256:" + "a" * 64,
-                platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
-                software_version="0.5.0",
-                commit="b" * 40,
-                width=3840,
-                height=1080,
-                sensor_fps=60.0,
-                frame_decimation=1,
-                video_layout="raw-side-by-side",
-                segment_seconds=self.segment_seconds,
-            )
             with (
                 patch(
                     "rp_ylx.recording.device_session.create_native_recording_event_queue",
@@ -798,28 +728,15 @@ class SplitEyeRecordingTest(unittest.TestCase):
                     "rp_ylx.recording.device_session.create_native_recording_sink",
                     return_value=sink,
                 ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
+                    return_value=planner,
+                ),
             ):
-                recorder = DeviceSessionRecorder(
-                    root,
-                    config,
-                    SessionPlan(
-                        session_id=uuid7(),
-                        volume_id=str(uuid.uuid4()),
-                        generation_id=str(uuid.uuid4()),
-                        capture_mode="production",
-                        display_name="raw direct live fixture",
-                        take_id=uuid7(),
-                        take_sequence=1,
-                        continuation_of=None,
-                    ),
-                    authority_epoch=str(uuid.uuid4()),
-                    allocate_revision=allocate_revision,
-                    storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
-                    checkpoint_interval=0.0,
-                )
+                recorder, _, _ = self.build(root, native_owner=native_encoder)
                 try:
                     recorder.start()
-                    targets = recorder.native_raw_sink_targets()
+                    targets = recorder.native_split_sink_targets()
                     self.assertIsNotNone(targets)
                     assert active_take is not None
                     initial = recorder.current_recording_state
@@ -845,34 +762,16 @@ class SplitEyeRecordingTest(unittest.TestCase):
     def test_native_direct_live_progress_uses_sink_snapshot_tuple_as_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            revision = 0
             active_take: FakeLiveNativeActiveTake | None = None
             sink = FakeLiveNativeRecordingSink()
-
-            def allocate_revision() -> int:
-                nonlocal revision
-                revision += 1
-                return revision
+            planner = FakeNativeSegmentPlanner(3)
+            native_encoder = object()
 
             def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
                 nonlocal active_take
                 active_take = FakeLiveNativeActiveTake(session_id)
                 return active_take
 
-            config = DeviceSessionConfig(
-                device_id=str(uuid.uuid4()),
-                device_label="YLX-12AB34CD",
-                hardware_fingerprint="sha256:" + "a" * 64,
-                platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
-                software_version="0.5.0",
-                commit="b" * 40,
-                width=3840,
-                height=1080,
-                sensor_fps=60.0,
-                frame_decimation=1,
-                video_layout="raw-side-by-side",
-                segment_seconds=self.segment_seconds,
-            )
             with (
                 patch(
                     "rp_ylx.recording.device_session.create_native_recording_event_queue",
@@ -886,28 +785,15 @@ class SplitEyeRecordingTest(unittest.TestCase):
                     "rp_ylx.recording.device_session.create_native_recording_sink",
                     return_value=sink,
                 ),
+                patch(
+                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
+                    return_value=planner,
+                ),
             ):
-                recorder = DeviceSessionRecorder(
-                    root,
-                    config,
-                    SessionPlan(
-                        session_id=uuid7(),
-                        volume_id=str(uuid.uuid4()),
-                        generation_id=str(uuid.uuid4()),
-                        capture_mode="production",
-                        display_name="raw direct owner fixture",
-                        take_id=uuid7(),
-                        take_sequence=1,
-                        continuation_of=None,
-                    ),
-                    authority_epoch=str(uuid.uuid4()),
-                    allocate_revision=allocate_revision,
-                    storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
-                    checkpoint_interval=0.0,
-                )
+                recorder, _, _ = self.build(root, native_owner=native_encoder)
                 try:
                     recorder.start()
-                    self.assertIsNotNone(recorder.native_raw_sink_targets())
+                    self.assertIsNotNone(recorder.native_split_sink_targets())
                     assert active_take is not None
                     initial = recorder.current_recording_state
                     assert initial is not None

@@ -24,6 +24,60 @@ from rp_ylx.recording import (
     StorageStatus,
     uuid7,
 )
+from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
+
+
+class _SplitEyeFixtureEncoder:
+    """Write one deterministic split-eye segment for CLI contract tests."""
+
+    def __init__(self, out_dir: Path) -> None:
+        self._out_dir = out_dir
+        self._submitted = 0
+        self._segments: list[ClosedSegment] = []
+        self._started = False
+
+    @property
+    def segments(self) -> tuple[ClosedSegment, ...]:
+        return tuple(self._segments)
+
+    @property
+    def submitted_frames(self) -> int:
+        return self._submitted
+
+    def start(self) -> None:
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._started = True
+
+    def submit(self, jpeg: bytes) -> None:
+        del jpeg
+        if not self._started:
+            raise StereoEncoderError("invalid_state", "fixture encoder is not started")
+        self._submitted += 1
+
+    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
+        del timeout
+        if self._submitted and not self._segments:
+            artifacts: dict[str, tuple[str, int]] = {}
+            for eye in ("left", "right"):
+                name = f"{eye}_00000.mp4"
+                payload = f"cli-{eye}-segment".encode() * 8
+                (self._out_dir / name).write_bytes(payload)
+                artifacts[eye] = (f"video/{name}", len(payload))
+            self._segments.append(
+                ClosedSegment(
+                    index=0,
+                    start_frame=0,
+                    end_frame=self._submitted,
+                    left_path=artifacts["left"][0],
+                    left_bytes=artifacts["left"][1],
+                    right_path=artifacts["right"][0],
+                    right_bytes=artifacts["right"][1],
+                )
+            )
+        return self.segments
+
+    def abort(self) -> None:
+        return
 
 
 class CliTest(unittest.TestCase):
@@ -65,6 +119,7 @@ class CliTest(unittest.TestCase):
             authority_epoch=str(uuid.uuid4()),
             allocate_revision=allocate_revision,
             storage_status=lambda: StorageStatus(1024 * 1024, True),
+            encoder_factory=lambda partial: _SplitEyeFixtureEncoder(partial / "video"),
         )
         recorder.start()
         recorder.submit_frame(
@@ -348,8 +403,8 @@ class CliTest(unittest.TestCase):
             root = Path(directory)
             session = self.produce_v1(root)
             manifest = json.loads((session / "manifest.json").read_bytes())
-            artifact = session / manifest["video"]["artifact"]["path"]
-            outside = root / "outside.mjpeg"
+            artifact = session / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
+            outside = root / "outside.mp4"
             artifact.replace(outside)
             artifact.symlink_to(outside)
             with redirect_stderr(error):

@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "2063909abe8363272d72371992de8dfb14b0d0c70333867eae9b97d83dd9054a",
-        "bytes": 120_790,
+        "sha256": "f1185da08f50857d1f231701d14dfc42ab5cf3f6abce65d5d6d5c90510a52210",
+        "bytes": 120_760,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -53,7 +53,7 @@ SCHEMA_GOLDENS = {
         "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
     ),
     "ylx-device-session-v2.schema.json": (
-        "8dc6096981f3fc50f9b4418000431955e0ba9424c7c0257cd2e129251a6a715b"
+        "7de77a092152cb68d57fc9e46dcc3024fe521dbcf5961999cf0ac887186a59c8"
     ),
     "ylx-recording-state-v1.schema.json": (
         "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"
@@ -213,7 +213,7 @@ def _device_common_for_api(api_version: str) -> dict[str, object]:
             "supported": True,
             "enabled": True,
             "disabled_reason": None,
-            "required_video_layout": "raw-side-by-side",
+            "required_video_layout": "split-eyes",
         }
     return common
 

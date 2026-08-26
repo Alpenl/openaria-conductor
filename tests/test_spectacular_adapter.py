@@ -20,6 +20,7 @@ from rp_ylx.recording import (
     StorageStatus,
     uuid7,
 )
+from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 from rp_ylx.spectacular import (
     CaptureValidationError,
     analyze_capture,
@@ -30,6 +31,66 @@ from rp_ylx.spectacular import (
 from rp_ylx.spectacular.check_cli import main as check_main
 
 JPEG = b"\xff\xd8spectacular-raw-sbs\xff\xd9"
+
+
+class FakeSplitEyeEncoder:
+    def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
+        del unused
+        self._out_dir = out_dir
+        self._segment_frames = segment_frames
+        self._segments: list[ClosedSegment] = []
+        self._submitted = 0
+        self._started = False
+
+    @property
+    def segments(self) -> tuple[ClosedSegment, ...]:
+        return tuple(self._segments)
+
+    @property
+    def submitted_frames(self) -> int:
+        return self._submitted
+
+    def start(self) -> None:
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._started = True
+
+    def submit(self, jpeg: bytes) -> None:
+        del jpeg
+        if not self._started:
+            raise StereoEncoderError("invalid_state", "fake encoder is not started")
+        self._submitted += 1
+        if self._submitted % self._segment_frames == 0:
+            self._close(self._submitted - self._segment_frames, self._submitted)
+
+    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
+        del timeout
+        closed = len(self._segments) * self._segment_frames
+        if closed < self._submitted:
+            self._close(closed, self._submitted)
+        return self.segments
+
+    def abort(self) -> None:
+        return
+
+    def _close(self, start_frame: int, end_frame: int) -> None:
+        index = len(self._segments)
+        artifacts: dict[str, tuple[str, int]] = {}
+        for eye in ("left", "right"):
+            name = f"{eye}_{index:05d}.mp4"
+            payload = f"{eye}-{index}-{start_frame}-{end_frame}".encode() * 8
+            (self._out_dir / name).write_bytes(payload)
+            artifacts[eye] = (f"video/{name}", len(payload))
+        self._segments.append(
+            ClosedSegment(
+                index=index,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                left_path=artifacts["left"][0],
+                left_bytes=artifacts["left"][1],
+                right_path=artifacts["right"][0],
+                right_bytes=artifacts["right"][1],
+            )
+        )
 
 
 def _json_bytes(value: object) -> bytes:
@@ -58,7 +119,8 @@ def _make_device_session(root: Path, *, frame_decimation: int = 1) -> Path:
             height=1080,
             sensor_fps=30.0 * frame_decimation,
             frame_decimation=frame_decimation,
-            video_layout="raw-side-by-side",
+            video_layout="split-eyes",
+            segment_seconds=0.1,
             audio_enabled=False,
         ),
         SessionPlan(
@@ -76,6 +138,10 @@ def _make_device_session(root: Path, *, frame_decimation: int = 1) -> Path:
         storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
         checkpoint_interval=0.0,
         before_write=lambda _role, _payload: None,
+        encoder_factory=lambda partial: FakeSplitEyeEncoder(
+            partial / "video",
+            segment_frames=3,
+        ),
     )
     recorder.start()
     for sequence in range(4):
@@ -219,12 +285,33 @@ class SpectacularAdapterTest(unittest.TestCase):
         self.assertEqual(model["source"]["capture_mode"], "calibration")
         self.assertEqual(
             model["source"]["artifact_roles"],
-            ["video.raw-side-by-side", "frames.index", "imu.samples"],
+            ["video.left", "video.right", "frames.index", "imu.samples"],
         )
-        self.assertEqual(model["video"]["path"], "video/raw-sbs.mjpeg")
+        self.assertEqual(model["schema"], "rp-ylx.spectacular.model-input.v2")
+        self.assertEqual(model["video"]["layout"], "split-eyes")
+        self.assertEqual(
+            model["video"]["segments"],
+            [
+                {
+                    "index": 0,
+                    "start_frame": 0,
+                    "end_frame": 3,
+                    "left_path": "video/left_00000.mp4",
+                    "right_path": "video/right_00000.mp4",
+                },
+                {
+                    "index": 1,
+                    "start_frame": 3,
+                    "end_frame": 4,
+                    "left_path": "video/left_00001.mp4",
+                    "right_path": "video/right_00001.mp4",
+                },
+            ],
+        )
         self.assertEqual(model["video"]["width"], 3840)
         self.assertEqual(model["frames"][2]["source_sequence"], 2)
-        self.assertEqual(model["frames"][2]["jpeg"], {"offset": len(JPEG) * 2, "bytes": len(JPEG)})
+        self.assertEqual(model["frames"][2]["segment"], {"index": 0, "frame": 2})
+        self.assertNotIn("jpeg", model["frames"][2])
         self.assertEqual(model["imu_samples"][3]["packet_sequence"], 1)
         self.assertEqual(model["imu_samples"][3]["accelerometer_raw"], [2, 2, 3])
         self.assertEqual(model["imu_samples"][3]["source"]["device_ticks"], 2_000)
@@ -281,6 +368,7 @@ class SpectacularAdapterTest(unittest.TestCase):
 
         self.assertEqual(timing.capture.source_schema, "ylx.stereo_imu.raw.v2")
         self.assertEqual(model["video"]["authority"], "legacy_raw")
+        self.assertEqual(model["schema"], "rp-ylx.spectacular.model-input.v1")
         self.assertEqual(model["source"]["capture_mode"], "legacy-calibration")
         self.assertEqual(len(model["frames"]), 3)
         self.assertEqual(len(model["imu_samples"]), 6)
@@ -299,18 +387,19 @@ class SpectacularAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(CaptureValidationError, "only accepts calibration"):
             load_capture(self.session)
 
-    def test_rejects_non_raw_layout_and_audio_artifact(self) -> None:
+    def test_rejects_non_split_layout_and_audio_artifact(self) -> None:
         manifest = _manifest(self.session)
-        manifest["video"]["layout"] = "split-eyes"  # type: ignore[index]
+        manifest["video"]["layout"] = "raw-side-by-side"  # type: ignore[index]
         _write_manifest(self.session, manifest)
-        with self.assertRaisesRegex(CaptureValidationError, "raw-side-by-side"):
+        with self.assertRaisesRegex(CaptureValidationError, "split-eyes"):
             load_capture(self.session)
 
-        manifest["video"]["layout"] = "raw-side-by-side"  # type: ignore[index]
+        manifest = _manifest(_make_device_session(self.root))
+        audio_session = self.root / str(manifest["session_id"])
         manifest["audio"]["state"] = "recorded"  # type: ignore[index]
-        _write_manifest(self.session, manifest)
+        _write_manifest(audio_session, manifest)
         with self.assertRaisesRegex(CaptureValidationError, "must not depend on an audio"):
-            load_capture(self.session)
+            load_capture(audio_session)
 
     def test_rejects_unknown_schema_and_wrong_artifact_role(self) -> None:
         manifest = _manifest(self.session)
@@ -320,9 +409,9 @@ class SpectacularAdapterTest(unittest.TestCase):
             load_capture(self.session)
 
         manifest["schema"] = "ylx.device-session.v2"
-        manifest["video"]["artifact"]["role"] = "video.left"  # type: ignore[index]
+        manifest["video"]["segments"][0]["artifacts"]["left"]["role"] = "video.right"  # type: ignore[index]
         _write_manifest(self.session, manifest)
-        with self.assertRaisesRegex(CaptureValidationError, "artifact roles"):
+        with self.assertRaisesRegex(CaptureValidationError, "integrity validation failed"):
             load_capture(self.session)
 
     def test_rejects_duplicate_keys_and_non_finite_json_numbers(self) -> None:
@@ -350,7 +439,7 @@ class SpectacularAdapterTest(unittest.TestCase):
             load_capture(self.session)
 
     def test_rejects_missing_or_digest_mismatched_artifact(self) -> None:
-        video = self.session / "video/raw-sbs.mjpeg"
+        video = self.session / "video/left_00000.mp4"
         video.write_bytes(video.read_bytes() + b"tamper")
         with self.assertRaisesRegex(CaptureValidationError, "integrity validation failed"):
             load_capture(self.session)

@@ -91,7 +91,7 @@ class DeviceSessionConfig:
     max_drop_fraction: float = 0.0
     drop_window_seconds: float = 1.0
     max_dropped_frames_per_window: int = 0
-    video_layout: str = "raw-side-by-side"
+    video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
     segment_seconds: float = 30.0
     audio_enabled: bool = False
@@ -133,7 +133,7 @@ class DeviceSessionConfig:
             or self.max_drop_fraction != 0
             or self.drop_window_seconds != 1.0
             or self.max_dropped_frames_per_window != 0
-            or self.video_layout not in {"split-eyes", "raw-side-by-side"}
+            or self.video_layout != "split-eyes"
             or self.video_bitrate_kbps <= 0
             or self.segment_seconds <= 0
             or type(self.audio_enabled) is not bool

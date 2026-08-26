@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:ylx:schema:device-session:v2",
   "title": "YLX Sealed Device Session Manifest v2",
-  "description": "Device Session v2 keeps v1 sealed video/take/integrity semantics, corrects raw IMU axes to raw_device_axes, and adds a closed explicit audio state. Audio segment duration is a product/config decision, not a schema constant.",
+  "description": "Device Session v2 fixes the current writer profile to rolling split-eye H.264 MP4 segments, corrects raw IMU axes to raw_device_axes, and adds a closed explicit audio state. Legacy raw-side-by-side input remains a v1/legacy-reader concern. Audio segment duration is a product/config decision, not a schema constant.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -74,12 +74,7 @@
     },
     "take": {"$ref": "#/$defs/take"},
     "camera": {"$ref": "#/$defs/camera"},
-    "video": {
-      "oneOf": [
-        {"$ref": "#/$defs/splitEyesVideo"},
-        {"$ref": "#/$defs/rawSideBySideVideo"}
-      ]
-    },
+    "video": {"$ref": "#/$defs/splitEyesVideo"},
     "imu": {
       "type": "object",
       "additionalProperties": false,
@@ -282,27 +277,6 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/stereoSegment"}
-        }
-      }
-    },
-    "rawSideBySideVideo": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["layout", "codec", "continuous", "artifact"],
-      "properties": {
-        "layout": {"const": "raw-side-by-side"},
-        "codec": {"const": "mjpeg"},
-        "continuous": {"const": true},
-        "artifact": {
-          "allOf": [
-            {"$ref": "#/$defs/artifact"},
-            {
-              "properties": {
-                "role": {"const": "video.raw-side-by-side"},
-                "media_type": {"const": "video/x-motion-jpeg"}
-              }
-            }
-          ]
         }
       }
     },

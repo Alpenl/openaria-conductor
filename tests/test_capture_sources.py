@@ -36,8 +36,69 @@ from rp_ylx.recording import (
     initialize_capture_volume,
     validate_device_session_directory,
 )
+from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 
 JPEG = b"\xff\xd8threaded-sbs\xff\xd9"
+
+
+class FakeSplitEyeEncoder:
+    def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
+        del unused
+        self._out_dir = out_dir
+        self._segment_frames = segment_frames
+        self._segments: list[ClosedSegment] = []
+        self._submitted = 0
+        self._started = False
+
+    @property
+    def segments(self) -> tuple[ClosedSegment, ...]:
+        return tuple(self._segments)
+
+    @property
+    def submitted_frames(self) -> int:
+        return self._submitted
+
+    def start(self) -> None:
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._started = True
+
+    def submit(self, jpeg: bytes) -> None:
+        del jpeg
+        if not self._started:
+            raise StereoEncoderError("invalid_state", "fake encoder is not started")
+        self._submitted += 1
+        if self._submitted % self._segment_frames == 0:
+            self._close(self._submitted - self._segment_frames, self._submitted)
+
+    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
+        del timeout
+        closed = len(self._segments) * self._segment_frames
+        if closed < self._submitted:
+            self._close(closed, self._submitted)
+        return self.segments
+
+    def abort(self) -> None:
+        return
+
+    def _close(self, start_frame: int, end_frame: int) -> None:
+        index = len(self._segments)
+        artifacts: dict[str, tuple[str, int]] = {}
+        for eye in ("left", "right"):
+            name = f"{eye}_{index:05d}.mp4"
+            payload = f"{eye}-{index}-{start_frame}-{end_frame}".encode() * 8
+            (self._out_dir / name).write_bytes(payload)
+            artifacts[eye] = (f"video/{name}", len(payload))
+        self._segments.append(
+            ClosedSegment(
+                index=index,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                left_path=artifacts["left"][0],
+                left_bytes=artifacts["left"][1],
+                right_path=artifacts["right"][0],
+                right_bytes=artifacts["right"][1],
+            )
+        )
 
 
 class BlockingCamera:
@@ -578,6 +639,11 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
             },
         )
         self.network_control_patcher.start()
+        self.encoder_patcher = patch(
+            "rp_ylx.recording.device_session.StereoEncoderProcess",
+            FakeSplitEyeEncoder,
+        )
+        self.encoder_patcher.start()
         self.volume = self.root / "volume"
         self.volume.mkdir()
         initialize_capture_volume(self.volume)
@@ -600,6 +666,7 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.encoder_patcher.stop()
         self.network_control_patcher.stop()
         self.environment_patcher.stop()
         self.temporary.cleanup()
@@ -1098,62 +1165,31 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         self.assertTrue(imu.closed.is_set())
         self.assertEqual(sources.open_handle_count, 0)
 
-    def test_native_continuous_sources_can_record_directly_to_raw_sink(self) -> None:
-        class NativeOnlyImu:
-            def __init__(self) -> None:
-                self.native_owner = object()
-                self.closed = False
-
-            def read(self, *, timeout: float) -> ImuObservation:
-                del timeout
-                raise AssertionError("direct native IMU path must not use Python read loop")
-
-            def close(self) -> None:
-                self.closed = True
-
-        active_take = object()
-        sink = object()
-        recorder = SimpleNamespace(native_raw_sink_targets=lambda: (active_take, sink))
-        imu = NativeOnlyImu()
-        runtime = FakeNativeContinuousRuntime()
-        preview = SimpleNamespace(native_owner=object())
-        submitted: list[FrameObservation] = []
-        submitted_imu: list[ImuObservation] = []
+    def test_native_continuous_sources_reject_raw_only_calibration_recorder(self) -> None:
+        imu_factory_calls: list[bool] = []
+        recorder = SimpleNamespace(native_raw_sink_targets=lambda: (object(), object()))
         sources = NativeContinuousCaptureSources(
             "/dev/video0",
-            lambda: imu,
+            lambda: imu_factory_calls.append(True),  # type: ignore[arg-type,func-returns-value]
             CameraMode(3840, 1080, 60.0, "mjpg"),
-            preview=preview,
+            preview=SimpleNamespace(native_owner=object()),
             read_timeout=0.1,
         )
         try:
-            with (
-                patch("rp_ylx.recording.sources.create_native_camera", return_value=object()),
-                patch(
-                    "rp_ylx.recording.sources.create_native_continuous_capture_runtime",
-                    return_value=runtime,
-                ),
-            ):
+            with self.assertRaisesRegex(RuntimeError, "split-eyes"):
                 sources.start(
-                    mode="production",
+                    mode="calibration",
                     generation_id=str(uuid.uuid4()),
-                    submit_frame=lambda observation: submitted.append(observation) or True,
-                    submit_imu=lambda observation: submitted_imu.append(observation) or True,
+                    submit_frame=lambda observation: True,
+                    submit_imu=lambda observation: True,
                     on_failure=lambda code, message: None,
                     native_recorder=recorder,
                 )
-            self.assertIs(runtime.active_take, active_take)
-            self.assertIs(runtime.sink, sink)
-            self.assertIs(runtime.imu, imu.native_owner)
-            self.assertIsNone(runtime.submit_frame)
-            self.assertIsNone(runtime.submit_imu)
         finally:
             sources.close()
 
-        self.assertFalse(submitted)
-        self.assertFalse(submitted_imu)
-        self.assertTrue(imu.closed)
-        self.assertTrue(runtime.closed)
+        self.assertFalse(imu_factory_calls)
+        self.assertEqual(sources.open_handle_count, 0)
 
     def test_native_continuous_sources_reap_failed_native_worker_before_retry(self) -> None:
         class NativeOnlyImu:
@@ -1173,10 +1209,13 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
                 super().__init__()
                 self.worker_active = False
 
-            def start_recording_raw_sink(
+            def start_recording_split_sink(
                 self,
                 active_take: object,
                 sink: object,
+                encoder: object,
+                segment_planner: object,
+                recording_start_monotonic_ns: int,
                 on_failure: object,
                 imu: object | None = None,
                 imu_timeout_seconds: float = 1.0,
@@ -1184,9 +1223,12 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
                 if self.worker_active:
                     raise RuntimeError("capture runtime IMU worker is already running")
                 self.worker_active = True
-                return super().start_recording_raw_sink(
+                return super().start_recording_split_sink(
                     active_take,
                     sink,
+                    encoder,
+                    segment_planner,
+                    recording_start_monotonic_ns,
                     on_failure,
                     imu,
                     imu_timeout_seconds,
@@ -1214,7 +1256,15 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
             preview=SimpleNamespace(native_owner=object()),
             read_timeout=0.1,
         )
-        recorder = SimpleNamespace(native_raw_sink_targets=lambda: (object(), object()))
+        recorder = SimpleNamespace(
+            native_split_sink_targets=lambda: (
+                object(),
+                object(),
+                object(),
+                object(),
+                123_456_789,
+            )
+        )
         try:
             with (
                 patch("rp_ylx.recording.sources.create_native_camera", return_value=object()),
@@ -1253,7 +1303,7 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         finally:
             sources.close()
 
-    def test_native_continuous_sources_can_record_directly_to_split_sink(self) -> None:
+    def test_native_continuous_sources_route_calibration_to_split_sink(self) -> None:
         class NativeOnlyImu:
             def __init__(self) -> None:
                 self.native_owner = object()
@@ -1302,7 +1352,7 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
                 ),
             ):
                 sources.start(
-                    mode="production",
+                    mode="calibration",
                     generation_id=str(uuid.uuid4()),
                     submit_frame=lambda observation: submitted.append(observation) or True,
                     submit_imu=lambda observation: submitted_imu.append(observation) or True,
@@ -1325,16 +1375,15 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
         self.assertTrue(imu.closed)
         self.assertTrue(runtime.closed)
 
-    def test_native_continuous_sources_never_route_calibration_to_split_sink(self) -> None:
+    def test_native_continuous_sources_reject_invalid_split_sink_start_time(self) -> None:
         imu_factory_calls: list[bool] = []
         recorder = SimpleNamespace(
-            native_raw_sink_targets=lambda: None,
             native_split_sink_targets=lambda: (
                 object(),
                 object(),
                 object(),
                 object(),
-                123_456_789,
+                0,
             ),
         )
         sources = NativeContinuousCaptureSources(
@@ -1345,7 +1394,7 @@ class ThreadedCaptureSourcesTest(unittest.TestCase):
             read_timeout=0.1,
         )
         try:
-            with self.assertRaisesRegex(RuntimeError, "raw-side-by-side"):
+            with self.assertRaisesRegex(RuntimeError, "起始时间"):
                 sources.start(
                     mode="calibration",
                     generation_id=str(uuid.uuid4()),

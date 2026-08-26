@@ -163,14 +163,29 @@ class PerformanceBenchmarkTest(unittest.TestCase):
             def stop(self) -> object:
                 self.state = "sealed"
                 artifact = {
-                    "role": "video.raw-side-by-side",
-                    "path": "video/raw-sbs.mjpeg",
-                    "media_type": "video/x-motion-jpeg",
-                    "bytes": 100,
+                    "artifact_id": "0" * 64,
+                    "role": "video.left",
+                    "path": "video/left_00000.mp4",
+                    "media_type": "video/mp4",
+                    "bytes": 50,
                     "sha256": "0" * 64,
                 }
                 manifest = {
-                    "video": {"layout": "raw-side-by-side", "artifact": artifact},
+                    "video": {
+                        "layout": "split-eyes",
+                        "segments": [
+                            {
+                                "artifacts": {
+                                    "left": artifact,
+                                    "right": {
+                                        **artifact,
+                                        "role": "video.right",
+                                        "path": "video/right_00000.mp4",
+                                    },
+                                }
+                            }
+                        ],
+                    },
                     "frames": {
                         "count": 42,
                         "artifact": {**artifact, "role": "frames.index", "bytes": 7},
