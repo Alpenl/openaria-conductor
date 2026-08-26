@@ -886,7 +886,11 @@ class CaptureCoordinator:
         retained = None
         for candidate in reversed(self._retained.values()):
             state = candidate.get("recording_state")
-            if isinstance(state, Mapping) and state.get("authority_epoch") == self._authority_epoch:
+            if (
+                isinstance(state, Mapping)
+                and state.get("authority_epoch") == self._authority_epoch
+                and state.get("state_revision") == self._revision
+            ):
                 retained = copy.deepcopy(candidate)
                 break
         return "idle", None, retained

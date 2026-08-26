@@ -1564,6 +1564,29 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_later_success_hides_stale_retained_failure_without_revision_regression(
+        self,
+    ) -> None:
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("failed-before-success"))
+            failed_session_id = self.active_session_id(coordinator)
+            with self.assertRaises(DeviceRecordingError):
+                coordinator.submit_frame(frame(3, dropped_before=2))
+            failed_status = coordinator.capture_status()
+            failed_revision = failed_status["source_revision"]
+            self.assertIsNotNone(failed_status["snapshot"]["retained_unsuccessful"])
+
+            self.seal_one(coordinator, prefix="success-after-failure")
+            status = coordinator.capture_status()
+
+            validate_capture_status(status)
+            self.assertGreater(status["source_revision"], failed_revision)
+            self.assertIsNone(status["snapshot"]["retained_unsuccessful"])
+            self.assertIsNotNone(coordinator.retained_unsuccessful_outcome(failed_session_id))
+        finally:
+            coordinator.close()
+
     def test_writer_drop_exceeding_lossless_policy_never_seals(self) -> None:
         writer_blocked = threading.Event()
         release_writer = threading.Event()
