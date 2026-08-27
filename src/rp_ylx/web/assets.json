@@ -7,12 +7,12 @@
       "required_major": 4
     }
   },
-  "total_bytes": 126657,
+  "total_bytes": 122243,
   "files": [
     {
       "path": "app.js",
-      "bytes": 100131,
-      "sha256": "89bacdf82a95443f37cc5908874d6a9ce771c0c31b5d2b2fd22ad03ee18ed346",
+      "bytes": 96194,
+      "sha256": "c5085a7d230e1b6042b05b6ab13bea792b93fdec9ca8990b26633e82c2dde6b9",
       "content_type": "text/javascript; charset=utf-8"
     },
     {
@@ -23,8 +23,8 @@
     },
     {
       "path": "styles.css",
-      "bytes": 26072,
-      "sha256": "092d83aaa1a63bc126cc60df80d0c9d6d312533cd3a39eb7e34e2c5fd3fad741",
+      "bytes": 25595,
+      "sha256": "0b30beec7b4e4d4a189f5550917da47f8adf9fb8592ad7872242a440ef609a22",
       "content_type": "text/css; charset=utf-8"
     }
   ]
