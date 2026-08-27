@@ -7,10 +7,16 @@ Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 �
 浏览器控制端由 [Open Aria Echo / Web](https://github.com/Alpenl/openaria-echo-web)
 独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
 
+[Score D-049](https://github.com/mirrorbloom/openaria-score/blob/main/docs/DECISIONS.md#d-049-fixed-storage-and-lan-only-delivery-removable-and-interruption-workflows-retired)
+规定当前 0.5 产品只向部署配置的固定 `/data` 写入，并只通过 LAN 交付已正常封存的会话。
+真实 TF `p3`、可移除介质、ENOSPC/inode 耗尽验证、安全换盘，以及意外掉电、进程或操作
+中断后的恢复都不是当前产品能力或发布门槛。仓库中保留的相关路由、schema 和测试仅用于冻结
+兼容性，当前 UI 不调用或展示它们。
+
 ## 用户文档
 
 - [设备使用指南](docs/user-guide.md)：从开机、进入页面到录制、封存、下载和正常关机。
-- [网络连接与救援指南](docs/networking.md)：Wi-Fi、设备热点、固定地址、SSH 和失联恢复。
+- [网络连接与救援指南](docs/networking.md)：Wi-Fi、设备热点、固定地址、SSH 和正常网络回退。
 
 热点模式下，Web 管理页面的固定入口是 `http://10.42.0.1:8080/`。
 
@@ -27,8 +33,8 @@ Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 �
 
 ## 项目边界
 
-Conductor 负责设备端采集以及写入 RDK X5 存储设备的录制会话。PC 端会话管理、批量数据处理和
-最终结果展示不属于本项目。
+Conductor 负责设备端采集以及写入部署配置的固定 `/data` 根目录。PC 端会话管理、批量数据
+处理和最终结果展示不属于本项目。
 
 录制正确性不能依赖预览客户端是否在线。预览、日志和控制通信不得暗中改变采集格式，
 也不得降低录制可靠性。
@@ -47,7 +53,7 @@ Conductor 负责设备端采集以及写入 RDK X5 存储设备的录制会话�
 1. 硬件访问与确定性的设备发现。
 2. 双目视频帧和 IMU 数据采集。
 3. 时间戳、同步和数据丢失检测。
-4. 会话生命周期、磁盘布局、封存和故障恢复。
+4. 固定存储上的会话生命周期、正常停止、校验和封存。
 5. 设备控制接口与有资源上限的实时预览传输。
 6. RDK X5 端打包、服务管理、运行观测和真机测试。
 
