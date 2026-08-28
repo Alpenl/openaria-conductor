@@ -318,6 +318,15 @@ def _device_for_api(api_version: str) -> dict[str, object]:
     device["api_version"] = f"{api_version.removeprefix('v')}.0"
     device["runtime"] = _runtime_for_api(device["runtime"], api_version)
     if api_version == "v4":
+        device["capabilities"].update(
+            {
+                "session_list": True,
+                "session_detail": True,
+                "artifact_download": True,
+                "capture_status": True,
+                "session_deletion": False,
+            }
+        )
         device["capabilities"]["calibration_capture"] = {
             "supported": True,
             "enabled": True,
@@ -382,6 +391,11 @@ SESSION_LIST = {
         }
     ],
     "next_cursor": None,
+}
+SESSION_LIST_V4 = {
+    **deepcopy(SESSION_LIST),
+    "schema": "ylx.session-list.v3",
+    "catalog_revision": "sha256:" + "c" * 64,
 }
 
 MANIFEST_BYTES = b'{ "schema": "ylx.device-session.v1", "sealed": true }\n'
@@ -502,6 +516,18 @@ class MemoryRepresentation:
         yield self.payload[offset:end]
 
 
+class FaultingManifestRepresentation(MemoryRepresentation):
+    def iter_chunks(
+        self,
+        offset: int = 0,
+        length: int | None = None,
+        *,
+        chunk_size: int = 1024 * 1024,
+    ) -> object:
+        del offset, length, chunk_size
+        raise OSError("manifest source read failed")
+
+
 class DeviceProvider:
     def __init__(self) -> None:
         self.commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
@@ -519,6 +545,8 @@ class DeviceProvider:
         self.network_errors: dict[str, ProviderError] = {}
         self.camera_error: ProviderError | None = None
         self.live_imu: object | None = None
+        self.manifest_representation: object | None = None
+        self.list_error: ProviderError | None = None
         self.stop_status = 204
         self.device_schema_override: str | None = None
         self.device_extra: dict[str, object] = {}
@@ -531,6 +559,15 @@ class DeviceProvider:
         descriptor["runtime"]["camera_focus"] = deepcopy(self.focus)
         descriptor["runtime"]["live_imu"] = deepcopy(self.live_imu)
         if api_version == "v4":
+            descriptor["capabilities"].update(
+                {
+                    "session_list": True,
+                    "session_detail": True,
+                    "artifact_download": True,
+                    "capture_status": True,
+                    "session_deletion": False,
+                }
+            )
             descriptor["capabilities"]["calibration_capture"] = {
                 "supported": True,
                 "enabled": True,
@@ -629,16 +666,25 @@ class DeviceProvider:
         return result
 
     def list_sessions(
-        self, *, cursor: str | None, limit: int, take_id: str | None
+        self,
+        *,
+        cursor: str | None,
+        limit: int,
+        take_id: str | None,
+        api_version: str,
     ) -> dict[str, object]:
         self.last_list_query = (cursor, limit, take_id)
-        return deepcopy(SESSION_LIST)
+        if self.list_error is not None:
+            raise self.list_error
+        return deepcopy(SESSION_LIST_V4 if api_version == "v4" else SESSION_LIST)
 
     def open_manifest(self, session_id: str, api_version: str) -> MemoryRepresentation:
         if api_version not in {"v2", "v3", "v4"}:
             raise AssertionError("gateway 传递了未知 API 版本")
         if session_id != SESSION_ID:
             raise ProviderError("not_found", "会话不存在", status=404)
+        if self.manifest_representation is not None:
+            return self.manifest_representation  # type: ignore[return-value]
         return MemoryRepresentation(MANIFEST_BYTES)
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
@@ -1026,6 +1072,25 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(runtime["live_imu"], RAW_LIVE_IMU)
                 self.assertEqual(runtime["live_imu"]["clock"]["time_base"], "host_monotonic")
 
+    def test_v4_active_recording_is_authoritative_when_live_imu_is_null(self) -> None:
+        active = _active_capture_status()
+        runtime = active["snapshot"]["runtime"]
+        self.assertIsNone(runtime["live_imu"])
+        self.server.provider.status = active
+
+        status, payload, _ = self.request(
+            "/api/v4/capture/status",
+            token="reader-token",
+        )
+        self.assertEqual(status, 200)
+        resource = json.loads(payload)
+        self.assertEqual(resource["snapshot"]["device_state"], "recording")
+        self.assertEqual(
+            resource["snapshot"]["active_recording"]["recording_state"]["session_id"],
+            SESSION_ID,
+        )
+        self.assertIsNone(resource["snapshot"]["runtime"]["live_imu"])
+
     def test_v4_capture_status_rejects_live_imu_without_matching_active_session(self) -> None:
         idle_with_live_imu = deepcopy(CAPTURE_STATUS)
         idle_with_live_imu["snapshot"]["runtime"]["live_imu"] = deepcopy(RAW_LIVE_IMU)
@@ -1211,7 +1276,44 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(headers["Access-Control-Allow-Origin"], "http://127.0.0.1:4173")
         self.assertEqual(headers["Vary"], "Origin")
 
-        self.assertEqual([event.outcome for event in audit], ["origin_forbidden", "allowed"])
+        status, payload, _ = self.request(
+            "/api/v4/device",
+            headers={"Origin": "http://127.0.0.1:4173"},
+        )
+        self.assertEqual(status, 200)
+        capabilities = json.loads(payload)["capabilities"]
+        self.assertEqual(
+            {
+                name: capabilities[name]
+                for name in (
+                    "session_list",
+                    "session_detail",
+                    "artifact_download",
+                    "capture_status",
+                    "session_deletion",
+                )
+            },
+            {
+                "session_list": True,
+                "session_detail": True,
+                "artifact_download": True,
+                "capture_status": True,
+                "session_deletion": False,
+            },
+        )
+
+        status, payload, _ = self.request(
+            f"/api/v4/sessions/{SESSION_ID}",
+            headers={"Origin": "http://127.0.0.1:4173"},
+            method="DELETE",
+        )
+        self.assertEqual(status, 405)
+        self.assertEqual(json.loads(payload)["error"]["code"], "method_not_allowed")
+
+        self.assertEqual(
+            [event.outcome for event in audit],
+            ["origin_forbidden", "allowed", "allowed"],
+        )
         self.assertEqual(audit[-1].principal_id, "isolated-lab-device")
         self.assertEqual(audit[-1].operation_id, "getDevice")
         self.assertNotIn("token", repr(audit))
@@ -2185,6 +2287,28 @@ class GatewayHttpTest(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(json.loads(payload)["error"]["code"], "invalid_request")
 
+        status, payload, _ = self.request("/api/v4/sessions", token="reader-token")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), SESSION_LIST_V4)
+
+        current_revision = "sha256:" + "e" * 64
+        self.server.provider.list_error = ProviderError(
+            "catalog_changed",
+            "会话目录已变化，请从第一页重新加载",
+            status=409,
+            retryable=True,
+            details={"catalog_revision": current_revision},
+        )
+        status, payload, _ = self.request(
+            "/api/v4/sessions?cursor=opaque-old-page",
+            token="reader-token",
+        )
+        self.assertEqual(status, 409)
+        error = json.loads(payload)["error"]
+        self.assertEqual(error["code"], "catalog_changed")
+        self.assertTrue(error["retryable"])
+        self.assertEqual(error["details"]["catalog_revision"], current_revision)
+
     def test_manifest_outcome_and_safe_swap_are_exact_persisted_resources(self) -> None:
         status, manifest, headers = self.request(
             f"/api/v3/sessions/{SESSION_ID}", token="reader-token"
@@ -2194,6 +2318,9 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "application/json")
         self.assertEqual(headers["ETag"], f'"{MANIFEST_DIGEST}"')
         self.assertEqual(headers["YLX-Manifest-SHA256"], MANIFEST_DIGEST)
+        self.assertEqual(headers.get_all("ETag"), [f'"{MANIFEST_DIGEST}"'])
+        self.assertEqual(headers.get_all("YLX-Manifest-SHA256"), [MANIFEST_DIGEST])
+        self.assertEqual(hashlib.sha256(manifest).hexdigest(), MANIFEST_DIGEST)
 
         status, payload, _ = self.request(
             f"/api/v3/sessions/{SESSION_ID}/unsuccessful-outcome", token="reader-token"
@@ -2204,6 +2331,7 @@ class GatewayHttpTest(unittest.TestCase):
         status, payload, _ = self.request("/api/v3/capture/safe-swap", token="reader-token")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), SAFE_SWAP_V3)
+
         self.assertNotIn("handle_audit", json.loads(payload)["receipt"])
 
         status, payload, _ = self.request("/api/v4/capture/safe-swap", token="reader-token")
@@ -2242,6 +2370,38 @@ class GatewayHttpTest(unittest.TestCase):
         status, payload, _ = self.request("/api/v2/capture/safe-swap", token="reader-token")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
+
+    def test_manifest_representation_metadata_and_body_mismatch_fail_closed(self) -> None:
+        missing_etag = MemoryRepresentation(MANIFEST_BYTES)
+        del missing_etag.etag
+        malformed_etag = MemoryRepresentation(MANIFEST_BYTES)
+        malformed_etag.etag = '"not-a-sha256"'
+        body_changed = MemoryRepresentation(MANIFEST_BYTES + b"changed")
+        body_changed.etag = f'"{MANIFEST_DIGEST}"'
+        wrong_length = MemoryRepresentation(MANIFEST_BYTES)
+        wrong_length.size += 1
+        oversized = MemoryRepresentation(MANIFEST_BYTES)
+        oversized.size = 8 * 1024 * 1024 + 1
+        read_failed = FaultingManifestRepresentation(MANIFEST_BYTES)
+
+        for label, representation in (
+            ("missing-etag", missing_etag),
+            ("malformed-etag", malformed_etag),
+            ("body-changed", body_changed),
+            ("wrong-length", wrong_length),
+            ("oversized", oversized),
+            ("read-failed", read_failed),
+        ):
+            with self.subTest(label=label):
+                self.server.provider.manifest_representation = representation
+                status, payload, headers = self.request(
+                    f"/api/v4/sessions/{SESSION_ID}",
+                    token="reader-token",
+                )
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+                self.assertIsNone(headers["ETag"])
+                self.assertIsNone(headers["YLX-Manifest-SHA256"])
 
     def test_cors_preflight_is_limited_to_known_routes_and_origins(self) -> None:
         headers = {

@@ -286,6 +286,7 @@ class FakeSplitEyeEncoder:
 class FakeNativeSessionIo:
     def __init__(self) -> None:
         self.artifact_calls: list[tuple[str, list[str]]] = []
+        self.verify_calls: list[tuple[int, int, str]] = []
 
     def device_session_v1_artifacts(
         self,
@@ -296,6 +297,18 @@ class FakeNativeSessionIo:
         artifacts = list(iter_device_session_v1_artifacts(decoded))
         self.artifact_calls.append((session_id, [str(item["path"]) for item in artifacts]))
         return artifacts
+
+    def verify_fd(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> dict[str, object]:
+        self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
+        payload = os.pread(descriptor, expected_bytes + 1, 0)
+        if len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
+            raise ValueError("native fixture verification mismatch")
+        return {}
 
 
 def command(key: str, body: dict[str, object]) -> CaptureCommand:
@@ -1157,6 +1170,243 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_v4_catalog_cursor_pages_items_and_quarantine_as_one_snapshot(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            source_session_id = self.seal_one(coordinator, prefix="catalog-v3-source")
+            source = deepcopy(coordinator._session_summaries[source_session_id])
+            take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
+            summaries: dict[str, dict[str, object]] = {}
+            for index in range(203):
+                session_id = f"01989f{index:02x}-0000-7000-8000-{index:012x}"
+                item = deepcopy(source)
+                item["session_id"] = session_id
+                item["take_id"] = take_id
+                item["started_at"] = f"2026-08-08T02:{index // 60:02d}:{index % 60:02d}Z"
+                item["ended_at"] = item["started_at"]
+                item["verification"]["manifest_sha256"] = f"{index + 1:064x}"
+                summaries[session_id] = item
+            diagnostics = {
+                "bad-a": {
+                    "quarantine_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "code": "manifest_unreadable",
+                    "observed_at": "2026-08-08T02:30:00Z",
+                    "message": "会话清单无法安全读取",
+                },
+                "bad-b": {
+                    "quarantine_id": "550e8400-e29b-41d4-a716-446655440001",
+                    "code": "manifest_invalid",
+                    "observed_at": "2026-08-08T02:30:01Z",
+                    "message": "会话清单或 artifact 描述不符合 Device Session 合同",
+                },
+            }
+            with coordinator._catalog_lock:
+                coordinator._session_summaries = summaries
+                coordinator._session_diagnostics = diagnostics
+
+            with patch.object(coordinator, "_catalog_sessions", return_value=None):
+                for limit in (1, 50, 51, 200):
+                    with self.subTest(limit=limit):
+                        cursor = None
+                        catalog_revision = None
+                        identities: list[str] = []
+                        while True:
+                            page = coordinator.list_sessions(
+                                cursor=cursor,
+                                limit=limit,
+                                take_id=None,
+                                api_version="v4",
+                            )
+                            validate_session_list(
+                                page,
+                                limit=limit,
+                                take_id=None,
+                                api_version="v4",
+                            )
+                            catalog_revision = catalog_revision or page["catalog_revision"]
+                            self.assertEqual(page["catalog_revision"], catalog_revision)
+                            identities.extend(
+                                f"session:{item['session_id']}" for item in page["items"]
+                            )
+                            identities.extend(
+                                f"diagnostic:{item['quarantine_id']}"
+                                for item in page["diagnostics"]
+                            )
+                            cursor = page["next_cursor"]
+                            if cursor is None:
+                                break
+                            self.assertNotIn(cursor, summaries)
+                        self.assertEqual(len(identities), 205)
+                        self.assertEqual(len(set(identities)), 205)
+
+                first = coordinator.list_sessions(
+                    cursor=None,
+                    limit=1,
+                    take_id=None,
+                    api_version="v4",
+                )
+                cursor = first["next_cursor"]
+                self.assertIsInstance(cursor, str)
+                changed = next(iter(summaries.values()))
+                changed["verification"]["manifest_sha256"] = "f" * 64
+                with self.assertRaises(ProviderError) as rejected:
+                    coordinator.list_sessions(
+                        cursor=cursor,
+                        limit=1,
+                        take_id=None,
+                        api_version="v4",
+                    )
+                self.assertEqual(rejected.exception.code, "catalog_changed")
+                self.assertEqual(rejected.exception.status, 409)
+                self.assertTrue(rejected.exception.retryable)
+
+                with self.assertRaises(ProviderError) as wrong_filter:
+                    coordinator.list_sessions(
+                        cursor=first["next_cursor"],
+                        limit=1,
+                        take_id=take_id,
+                        api_version="v4",
+                    )
+                self.assertEqual(wrong_filter.exception.code, "invalid_cursor")
+        finally:
+            coordinator.close()
+
+    def test_v4_quarantine_only_catalog_is_fully_pageable(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            diagnostics = {
+                f"bad-{index}": {
+                    "quarantine_id": f"550e8400-e29b-41d4-a716-{index:012x}",
+                    "code": "manifest_invalid",
+                    "observed_at": f"2026-08-08T02:30:0{index}Z",
+                    "message": "会话清单或 artifact 描述不符合 Device Session 合同",
+                }
+                for index in range(3)
+            }
+            with coordinator._catalog_lock:
+                coordinator._session_summaries = {}
+                coordinator._session_diagnostics = diagnostics
+            with patch.object(coordinator, "_catalog_sessions", return_value=None):
+                cursor = None
+                seen: list[str] = []
+                revisions: set[str] = set()
+                while True:
+                    page = coordinator.list_sessions(
+                        cursor=cursor,
+                        limit=1,
+                        take_id=None,
+                        api_version="v4",
+                    )
+                    revisions.add(page["catalog_revision"])
+                    self.assertEqual(page["items"], [])
+                    self.assertEqual(len(page["diagnostics"]), 1)
+                    seen.append(page["diagnostics"][0]["quarantine_id"])
+                    cursor = page["next_cursor"]
+                    if cursor is None:
+                        break
+                self.assertEqual(len(seen), 3)
+                self.assertEqual(len(set(seen)), 3)
+                self.assertEqual(len(revisions), 1)
+        finally:
+            coordinator.close()
+
+    def test_v4_quarantine_diagnostics_are_stable_categorized_and_safe(self) -> None:
+        cases = (
+            (OSError("cannot read /secret/device/manifest.json"), "manifest_unreadable"),
+            (
+                DeviceRecordingError(
+                    "manifest_invalid",
+                    "manifest schema unsupported at /secret/device/manifest.json",
+                ),
+                "unsupported_schema",
+            ),
+            (
+                DeviceRecordingError(
+                    "manifest_invalid",
+                    "manifest sealed 必须为 true at /secret/device/manifest.json",
+                ),
+                "manifest_not_sealed",
+            ),
+            (
+                DeviceRecordingError(
+                    "manifest_invalid",
+                    "manifest session identity leaked from /secret/device/manifest.json",
+                ),
+                "manifest_invalid",
+            ),
+        )
+        expected_codes = {
+            "manifest_unreadable",
+            "unsupported_schema",
+            "manifest_not_sealed",
+            "manifest_invalid",
+        }
+
+        diagnostics = [
+            CaptureCoordinator._session_diagnostic("opaque-candidate", error) for error, _ in cases
+        ]
+        self.assertEqual(
+            {diagnostic["code"] for diagnostic in diagnostics},
+            expected_codes,
+        )
+        for diagnostic, (_, expected_code) in zip(diagnostics, cases, strict=True):
+            self.assertEqual(diagnostic["code"], expected_code)
+            self.assertNotIn("/secret", diagnostic["message"])
+        repeated = [
+            CaptureCoordinator._session_diagnostic("opaque-candidate", error) for error, _ in cases
+        ]
+        self.assertEqual(
+            [diagnostic["quarantine_id"] for diagnostic in diagnostics],
+            [diagnostic["quarantine_id"] for diagnostic in repeated],
+        )
+
+    def test_v4_real_unknown_and_unsealed_manifests_are_separate_quarantine_codes(
+        self,
+    ) -> None:
+        first = self.coordinator()
+        try:
+            unsealed_session_id = self.seal_one(first, prefix="quarantine-unsealed")
+        finally:
+            first.close()
+
+        manifest_path = self.mountpoint / "recordings" / unsealed_session_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["sealed"] = False
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        unknown_session_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
+        unknown_directory = self.mountpoint / "recordings" / unknown_session_id
+        unknown_directory.mkdir()
+        (unknown_directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema": "ylx.device-session.v999",
+                    "session_id": unknown_session_id,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        restarted = self.coordinator()
+        try:
+            page = restarted.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            validate_session_list(page, limit=50, take_id=None, api_version="v4")
+            self.assertEqual(page["items"], [])
+            self.assertEqual(
+                {diagnostic["code"] for diagnostic in page["diagnostics"]},
+                {"manifest_not_sealed", "unsupported_schema"},
+            )
+        finally:
+            restarted.close()
+
     def test_list_sessions_reuses_startup_catalog_instead_of_reinspecting_artifacts(self) -> None:
         first = self.coordinator()
         try:
@@ -1809,27 +2059,42 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_seal_does_not_rescan_artifact_bytes(self) -> None:
+    def test_seal_independently_verifies_artifact_bytes_before_usable_verdict(self) -> None:
         coordinator = self.coordinator()
         try:
             coordinator.start_capture(start_command("incremental-digest-start"))
             coordinator.submit_frame(frame())
-            with (
-                patch(
-                    "rp_ylx.recording.device_session._digest",
-                    side_effect=AssertionError("seal rescanned an artifact"),
-                ),
-                patch(
-                    "rp_ylx.recording.coordinator.validate_device_session_directory",
-                    side_effect=AssertionError("coordinator repeated full validation"),
-                ),
-            ):
+            with patch(
+                "rp_ylx.recording.coordinator.validate_device_session_directory",
+                wraps=validate_device_session_directory,
+            ) as verify:
                 result = coordinator.stop_capture(stop_command("incremental-digest-stop"))
             self.assertEqual(result.status, 202)
+            self.assertEqual(verify.call_count, 1)
+            listed = coordinator.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            self.assertEqual(listed["items"][0]["verification"]["verdict"], "usable")
+            session_id = listed["items"][0]["session_id"]
+            manifest = json.loads(
+                (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+            )
+            verification = listed["items"][0]["verification"]
+            self.assertEqual(
+                verification["validator"]["name"],
+                "openaria-conductor-device-session-v2-integrity",
+            )
+            self.assertNotEqual(
+                verification["verified_at"],
+                manifest["integrity"]["verified_at"],
+            )
         finally:
             coordinator.close()
 
-    def test_catalog_and_list_do_not_read_artifact_contents(self) -> None:
+    def test_catalog_verifies_artifact_contents_once_then_reuses_verdict_for_lists(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="lightweight-catalog")
@@ -1838,11 +2103,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
         with patch(
             "rp_ylx.recording.coordinator.validate_device_session_directory",
-            side_effect=AssertionError("catalog/list performed full artifact validation"),
-        ):
+            wraps=validate_device_session_directory,
+        ) as verify:
             restarted = self.coordinator()
             try:
+                startup_verifications = verify.call_count
+                self.assertGreater(startup_verifications, 0)
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                self.assertEqual(verify.call_count, startup_verifications)
             finally:
                 restarted.close()
         self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
@@ -1853,6 +2122,91 @@ class CaptureCoordinatorTest(unittest.TestCase):
             int(artifact["bytes"]) for artifact in iter_device_session_v1_artifacts(manifest)
         )
         self.assertEqual(listed["items"][0]["total_bytes"], expected_bytes)
+
+    def test_catalog_marks_content_digest_mismatch_unusable_before_download(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="gateway-integrity")
+        finally:
+            first.close()
+
+        session = self.mountpoint / "recordings" / session_id
+        manifest = json.loads((session / "manifest.json").read_bytes())
+        video = manifest["video"]["segments"][0]["artifacts"]["left"]
+        artifact_path = session / video["path"]
+        payload = bytearray(artifact_path.read_bytes())
+        payload[0] ^= 0x01
+        artifact_path.write_bytes(payload)
+
+        restarted = self.coordinator()
+        try:
+            listed = restarted.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            verification = listed["items"][0]["verification"]
+            self.assertEqual(verification["verdict"], "unusable")
+            self.assertEqual(
+                verification["diagnostics"],
+                [
+                    {
+                        "code": "artifact_digest_mismatch",
+                        "summary": "artifact 内容 SHA-256 与清单声明不一致",
+                    }
+                ],
+            )
+            with self.assertRaises(ArtifactAccessError) as blocked:
+                restarted.open_verified_artifact(
+                    session_id,
+                    video["artifact_id"],
+                    "v4",
+                )
+            self.assertEqual(blocked.exception.code, "not_verified")
+        finally:
+            restarted.close()
+
+    def test_cached_usable_same_size_tamper_is_rejected_before_direct_download(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="cached-direct-download")
+            before = coordinator.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            self.assertEqual(before["items"][0]["verification"]["verdict"], "usable")
+
+            session = self.mountpoint / "recordings" / session_id
+            manifest = json.loads((session / "manifest.json").read_bytes())
+            video = manifest["video"]["segments"][0]["artifacts"]["left"]
+            artifact_path = session / video["path"]
+            payload = bytearray(artifact_path.read_bytes())
+            payload[0] ^= 0x01
+            artifact_path.write_bytes(payload)
+
+            # No intervening list call: the download entry point itself must
+            # invalidate the old usable snapshot before it opens the bytes.
+            with self.assertRaises(ArtifactAccessError) as blocked:
+                coordinator.open_verified_artifact(session_id, video["artifact_id"], "v4")
+            self.assertEqual(blocked.exception.code, "not_verified")
+
+            after = coordinator.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            self.assertNotEqual(after["catalog_revision"], before["catalog_revision"])
+            self.assertEqual(after["items"][0]["verification"]["verdict"], "unusable")
+            self.assertEqual(
+                after["items"][0]["verification"]["diagnostics"][0]["code"],
+                "artifact_digest_mismatch",
+            )
+        finally:
+            coordinator.close()
 
     def test_list_sessions_uses_native_artifact_scan_for_total_bytes(self) -> None:
         first = self.coordinator()

@@ -27,6 +27,12 @@ x-ylx-security-profiles:
     description: Every operation requires a customer-issued bearer token.
     destructive_mutation: not-enabled
     network_mutation: enabled-idempotent-async
+    session_capabilities:
+      session_list: true
+      session_detail: true
+      artifact_download: true
+      capture_status: true
+      session_deletion: false
   lab:
     authentication: none
     standard_openapi_resolution: explicit-lab-profile-artifact-required
@@ -64,6 +70,12 @@ x-ylx-security-profiles:
       - headSessionArtifact
     destructive_mutation: unreachable-or-403
     network_mutation: enabled-idempotent-async
+    session_capabilities:
+      session_list: true
+      session_detail: true
+      artifact_download: true
+      capture_status: true
+      session_deletion: false
 paths:
   /device:
     get:
@@ -776,6 +788,11 @@ paths:
         - name: cursor
           in: query
           required: false
+          description: |
+            Opaque continuation token returned by this endpoint. It binds the complete
+            catalog_revision and the exact take_id filter. Clients MUST NOT decode or
+            synthesize it. A token for a changed catalog returns catalog_changed (409);
+            a token used with another filter is invalid_cursor (400).
           schema:
             type: string
             minLength: 1
@@ -806,7 +823,8 @@ paths:
             summary fields. The opaque cursor advances across both collections, and the
             limit counts items plus diagnostics, so a quarantined candidate cannot cause
             an empty-page loop. verification is null when no current verdict exists;
-            listing a candidate never grants artifact download or export.
+            listing a candidate never grants artifact download or export. Every page
+            reached from one cursor chain carries the same catalog_revision.
           content:
             application/json:
               schema:
@@ -817,6 +835,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/CatalogChanged"
         "500":
           $ref: "#/components/responses/InternalError"
   /sessions/{session_id}:
@@ -1183,6 +1203,15 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    CatalogChanged:
+      description: |
+        The cursor belongs to an older complete catalog revision. The client discards
+        accumulated pages and starts a fresh request without cursor. The error code is
+        catalog_changed and details.catalog_revision contains the current revision.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/CatalogChangedError"
     CameraFocusUnsupported:
       description: Device does not expose V4L2 focus_absolute and cannot report or set camera focus
       headers:
@@ -1437,7 +1466,17 @@ components:
         capabilities:
           type: object
           additionalProperties: false
-          required: [capture, preview, range_download, network_mutation, calibration_capture]
+          required:
+            - capture
+            - preview
+            - range_download
+            - network_mutation
+            - session_list
+            - session_detail
+            - artifact_download
+            - capture_status
+            - session_deletion
+            - calibration_capture
           properties:
             capture:
               type: boolean
@@ -1452,6 +1491,21 @@ components:
                 async /network/apply, /network/retry, and /network/forget routes are wired
                 for this runtime. Clients still read NetworkStatus.mutation_capability
                 before enabling controls.
+            session_list:
+              const: true
+              description: GET /sessions is available for the negotiated profile.
+            session_detail:
+              const: true
+              description: Exact stored manifest bytes are available from GET /sessions/{session_id}.
+            artifact_download:
+              const: true
+              description: Verified artifacts support GET, HEAD, and Range when the current verdict is usable.
+            capture_status:
+              const: true
+              description: GET /capture/status is authoritative even when optional live_imu telemetry is null.
+            session_deletion:
+              const: false
+              description: Device API v4 exposes no session deletion route in Customer or Lab profile.
             calibration_capture:
               $ref: "#/components/schemas/CalibrationCaptureCapability"
         storage:
@@ -3060,9 +3114,7 @@ components:
         diagnostics:
           type: array
           items:
-            type: string
-            minLength: 1
-            maxLength: 512
+            $ref: "#/components/schemas/GatewayVerificationDiagnostic"
       allOf:
         - if:
             required: [verdict]
@@ -3073,13 +3125,32 @@ components:
             properties:
               diagnostics:
                 minItems: 1
+    GatewayVerificationDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, summary]
+      properties:
+        code:
+          enum: [artifact_digest_mismatch, artifact_invalid, manifest_invalid, verification_failed]
+          description: Stable gateway-local verification failure category.
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Stable human-safe summary without filesystem paths or secret material.
     SessionList:
       type: object
       additionalProperties: false
-      required: [schema, items, diagnostics, next_cursor]
+      required: [schema, catalog_revision, items, diagnostics, next_cursor]
       properties:
         schema:
-          const: ylx.session-list.v2
+          const: ylx.session-list.v3
+        catalog_revision:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: |
+            Domain-separated SHA-256 over the complete, unpaginated, canonical
+            newest-first catalog, including item verification and quarantine diagnostics.
         items:
           type: array
           items:
@@ -3144,6 +3215,37 @@ components:
               type: object
               description: Explicit error-code extension bag. Consumers ignore unknown keys only here.
               additionalProperties: true
+    CatalogChangedError:
+      type: object
+      additionalProperties: false
+      required: [schema, error]
+      properties:
+        schema:
+          const: ylx.api-error.v2
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              const: catalog_changed
+            message:
+              type: string
+              minLength: 1
+              maxLength: 1024
+            request_id:
+              type: string
+              format: uuid
+            retryable:
+              const: true
+            details:
+              type: object
+              additionalProperties: false
+              required: [catalog_revision]
+              properties:
+                catalog_revision:
+                  type: string
+                  pattern: '^sha256:[0-9a-f]{64}$'
     SessionNotVerifiedError:
       type: object
       additionalProperties: false

@@ -104,6 +104,14 @@ UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 DIAGNOSTIC_CODE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+GATEWAY_VERIFICATION_DIAGNOSTIC_CODES = frozenset(
+    {
+        "artifact_digest_mismatch",
+        "artifact_invalid",
+        "manifest_invalid",
+        "verification_failed",
+    }
+)
 INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
 RFC3339_DATE_TIME = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
@@ -381,22 +389,39 @@ def validate_session_list(
     *,
     limit: int,
     take_id: str | None,
+    api_version: str = "v3",
 ) -> None:
     """验证 provider 返回的闭合会话页。"""
 
     _validate_finite_json(resource)
-    if not isinstance(resource, Mapping) or set(resource) != {
+    expected = {
         "schema",
         "items",
         "diagnostics",
         "next_cursor",
-    }:
+    }
+    if api_version == "v4":
+        expected.add("catalog_revision")
+    if (
+        api_version not in SUPPORTED_DEVICE_API_VERSIONS
+        or not isinstance(resource, Mapping)
+        or set(resource) != expected
+    ):
         raise InvalidSourceEvent("session list 必须是闭合对象")
     items = resource["items"]
     diagnostics = resource["diagnostics"]
     next_cursor = resource["next_cursor"]
+    expected_schema = "ylx.session-list.v3" if api_version == "v4" else "ylx.session-list.v2"
+    catalog_revision = resource.get("catalog_revision")
     if (
-        resource["schema"] != "ylx.session-list.v2"
+        resource["schema"] != expected_schema
+        or (
+            api_version == "v4"
+            and (
+                not isinstance(catalog_revision, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", catalog_revision) is None
+            )
+        )
         or not isinstance(items, list)
         or not isinstance(diagnostics, list)
         or len(items) + len(diagnostics) > limit
@@ -404,7 +429,7 @@ def validate_session_list(
     ):
         raise InvalidSourceEvent("session list 基础字段无效")
     for item in items:
-        _validate_session_summary(item, take_id=take_id)
+        _validate_session_summary(item, take_id=take_id, api_version=api_version)
     if len({item["session_id"] for item in items}) != len(items):
         raise InvalidSourceEvent("session list 不得重复会话")
     order = [(_date_time_value(item["started_at"]), item["session_id"]) for item in items]
@@ -687,7 +712,16 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
         "network_mutation",
     }
     if api_version == "v4":
-        expected.add("calibration_capture")
+        expected.update(
+            {
+                "calibration_capture",
+                "session_list",
+                "session_detail",
+                "artifact_download",
+                "capture_status",
+                "session_deletion",
+            }
+        )
     if not isinstance(value, Mapping) or set(value) != expected:
         raise InvalidSourceEvent("device capabilities 必须是闭合对象")
     if (
@@ -696,6 +730,16 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
         or value["range_download"] is not True
         or type(value["network_mutation"]) is not bool
         or (api_version != "v4" and value["network_mutation"] is not False)
+        or (
+            api_version == "v4"
+            and (
+                value["session_list"] is not True
+                or value["session_detail"] is not True
+                or value["artifact_download"] is not True
+                or value["capture_status"] is not True
+                or value["session_deletion"] is not False
+            )
+        )
     ):
         raise InvalidSourceEvent("device capabilities 无效")
     if api_version != "v4":
@@ -747,7 +791,12 @@ def _validate_device_storage(value: object) -> None:
         raise InvalidSourceEvent("device storage 无效")
 
 
-def _validate_session_summary(value: object, *, take_id: str | None) -> None:
+def _validate_session_summary(
+    value: object,
+    *,
+    take_id: str | None,
+    api_version: str,
+) -> None:
     if not isinstance(value, Mapping) or set(value) != {
         "session_id",
         "producer_outcome",
@@ -786,10 +835,10 @@ def _validate_session_summary(value: object, *, take_id: str | None) -> None:
     _validate_device_identity(value["device"])
     verification = value["verification"]
     if verification is not None:
-        _validate_gateway_verification(verification)
+        _validate_gateway_verification(verification, api_version=api_version)
 
 
-def _validate_gateway_verification(value: object) -> None:
+def _validate_gateway_verification(value: object, *, api_version: str) -> None:
     if not isinstance(value, Mapping) or set(value) != {
         "actor",
         "validator",
@@ -812,10 +861,20 @@ def _validate_gateway_verification(value: object) -> None:
         or not _date_time(value["verified_at"])
         or not _is_enum(value["verdict"], {"usable", "unusable"})
         or not isinstance(diagnostics, list)
-        or any(not _bounded_string(item, 512) for item in diagnostics)
         or (value["verdict"] == "unusable" and not diagnostics)
     ):
         raise InvalidSourceEvent("gateway verification 无效")
+    if api_version == "v4":
+        if any(
+            not isinstance(item, Mapping)
+            or set(item) != {"code", "summary"}
+            or not _is_enum(item.get("code"), GATEWAY_VERIFICATION_DIAGNOSTIC_CODES)
+            or not _bounded_string(item.get("summary"), 512)
+            for item in diagnostics
+        ):
+            raise InvalidSourceEvent("gateway verification diagnostics 无效")
+    elif any(not _bounded_string(item, 512) for item in diagnostics):
+        raise InvalidSourceEvent("gateway verification diagnostics 无效")
 
 
 def _validate_session_discovery_diagnostic(value: object) -> None:

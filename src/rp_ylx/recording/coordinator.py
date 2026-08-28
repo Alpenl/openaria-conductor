@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import stat
@@ -23,6 +26,7 @@ from typing import Protocol
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
+    iter_device_session_v1_artifacts,
 )
 from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
 from rp_ylx.api.gateway import (
@@ -67,6 +71,154 @@ CALIBRATION_CAPTURE_DISABLED_REASONS = {
     "hardware_unavailable",
     "maintenance_or_capture_busy",
 }
+SESSION_CATALOG_REVISION_DOMAIN = b"ylx.session-list.v3.catalog-revision\x00"
+SESSION_CURSOR_DOMAIN = b"ylx.session-list.v3.cursor\x00"
+SESSION_CURSOR_SCHEMA = "ylx.session-list.cursor.v1"
+SESSION_DIAGNOSTIC_SUMMARIES = {
+    "manifest_unreadable": "会话清单无法安全读取",
+    "unsupported_schema": "会话清单 schema 不受当前 Device API 支持",
+    "manifest_invalid": "会话清单或 artifact 描述不符合 Device Session 合同",
+    "manifest_not_sealed": "会话尚未形成可下载的 sealed 清单",
+}
+GATEWAY_VERIFICATION_DIAGNOSTICS = {
+    "digest_mismatch": (
+        "artifact_digest_mismatch",
+        "artifact 内容 SHA-256 与清单声明不一致",
+    ),
+    "artifact_invalid": (
+        "artifact_invalid",
+        "artifact 类型、大小或稳定身份与清单声明不一致",
+    ),
+    "manifest_invalid": (
+        "manifest_invalid",
+        "manifest 内容不符合 Device Session 合同",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedSessionSnapshot:
+    manifest_sha256: str
+    manifest_identity: tuple[int, int, int, int, int, int, int]
+    artifact_identities: tuple[tuple[str, tuple[int, int, int, int, int, int, int]], ...]
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _locked_file_identity(representation: object) -> tuple[int, int, int, int, int, int, int]:
+    descriptor = getattr(representation, "_descriptor", None)
+    if type(descriptor) is not int:
+        raise DeviceRecordingError("artifact_invalid", "安全读取句柄缺少文件描述符")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise DeviceRecordingError("artifact_invalid", "会话对象不是独占普通文件")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _stable_quarantine_id(candidate_identity: str, code: str) -> str:
+    digest = bytearray(
+        hashlib.sha256(
+            b"ylx.session-list.v3.quarantine-id\x00"
+            + candidate_identity.encode("utf-8", errors="surrogatepass")
+            + b"\x00"
+            + code.encode("ascii")
+        ).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def _session_catalog_revision(
+    items: list[dict[str, object]],
+    diagnostics: list[dict[str, object]],
+) -> str:
+    material = {
+        "schema": "ylx.session-catalog-revision-input.v1",
+        "entries": [
+            *({"kind": "session", "value": item} for item in items),
+            *({"kind": "diagnostic", "value": diagnostic} for diagnostic in diagnostics),
+        ],
+    }
+    digest = hashlib.sha256(
+        SESSION_CATALOG_REVISION_DOMAIN + _canonical_json_bytes(material)
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _encode_session_cursor(
+    *,
+    catalog_revision: str,
+    take_id: str | None,
+    offset: int,
+) -> str:
+    payload = _canonical_json_bytes(
+        {
+            "schema": SESSION_CURSOR_SCHEMA,
+            "catalog_revision": catalog_revision,
+            "take_id": take_id,
+            "offset": offset,
+        }
+    )
+    signature = hashlib.sha256(SESSION_CURSOR_DOMAIN + payload).digest()
+    return base64.urlsafe_b64encode(payload + signature).rstrip(b"=").decode("ascii")
+
+
+def _decode_session_cursor(cursor: str) -> Mapping[str, object]:
+    if len(cursor) > 2048:
+        raise ProviderError("invalid_cursor", "会话游标无效", status=HTTPStatus.BAD_REQUEST)
+    try:
+        encoded = cursor.encode("ascii")
+        padding = b"=" * ((4 - len(encoded) % 4) % 4)
+        decoded = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if len(decoded) <= 32:
+            raise ValueError("cursor payload is empty")
+        payload, signature = decoded[:-32], decoded[-32:]
+        expected = hashlib.sha256(SESSION_CURSOR_DOMAIN + payload).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("cursor signature mismatch")
+        value = json.loads(payload)
+        if _canonical_json_bytes(value) != payload:
+            raise ValueError("cursor payload is not canonical")
+    except (
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ProviderError(
+            "invalid_cursor",
+            "会话游标无效",
+            status=HTTPStatus.BAD_REQUEST,
+        ) from error
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema", "catalog_revision", "take_id", "offset"}
+        or value.get("schema") != SESSION_CURSOR_SCHEMA
+        or not isinstance(value.get("catalog_revision"), str)
+        or (value.get("take_id") is not None and not isinstance(value.get("take_id"), str))
+        or type(value.get("offset")) is not int
+        or int(value["offset"]) <= 0
+    ):
+        raise ProviderError("invalid_cursor", "会话游标无效", status=HTTPStatus.BAD_REQUEST)
+    return value
 
 
 class _Representation(Protocol):
@@ -399,6 +551,8 @@ class CaptureCoordinator:
         self._network_operation_lease: int | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
+        self._session_snapshots: dict[str, _VerifiedSessionSnapshot] = {}
+        self._pending_session_verification: set[str] = set()
         self._session_summaries: dict[str, dict[str, object]] = {}
         self._session_diagnostics: dict[str, dict[str, object]] = {}
         self._latest_imu: _LatestImuReceipt | None = None
@@ -765,9 +919,137 @@ class CaptureCoordinator:
             "recording_state": settled,
         }
 
-    def _catalog_sessions(self) -> None:
+    def _verify_exact_session_payload(
+        self,
+        session_path: Path,
+        session_id: str,
+        manifest: Mapping[str, object],
+        manifest_payload: bytes,
+    ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
         admission = self._require_admission()
-        # Sealed directories are immutable; rescan names for arrivals/removals but inspect once.
+        store = _MultiRootSessionStore(
+            admission.catalog_roots,
+            verified_manifests={session_id: manifest_sha256},
+        )
+        try:
+            try:
+                descriptors = list(iter_device_session_v1_artifacts(manifest))
+            except ArtifactAccessError as error:
+                raise DeviceRecordingError("manifest_invalid", error.message) from error
+            seen_artifact_ids: set[str] = set()
+            for descriptor in descriptors:
+                artifact_id = descriptor.get("artifact_id")
+                if not isinstance(artifact_id, str) or artifact_id in seen_artifact_ids:
+                    raise DeviceRecordingError(
+                        "manifest_invalid",
+                        "manifest artifact 描述符无效",
+                    )
+                seen_artifact_ids.add(artifact_id)
+
+            def snapshot() -> _VerifiedSessionSnapshot:
+                try:
+                    with store.open_manifest(session_id, "v4") as locked_manifest:
+                        if locked_manifest.read() != manifest_payload:
+                            raise DeviceRecordingError(
+                                "verification_changed",
+                                "manifest 在独立校验期间发生变化",
+                            )
+                        manifest_identity = _locked_file_identity(locked_manifest)
+                except ArtifactAccessError as error:
+                    raise DeviceRecordingError(
+                        "verification_changed",
+                        "manifest 在独立校验期间发生变化",
+                    ) from error
+
+                artifact_identities: list[tuple[str, tuple[int, int, int, int, int, int, int]]] = []
+                for descriptor in descriptors:
+                    artifact_id = str(descriptor["artifact_id"])
+                    try:
+                        with store.open_verified_artifact(
+                            session_id,
+                            artifact_id,
+                            "v4",
+                        ) as artifact:
+                            identity = _locked_file_identity(artifact)
+                    except ArtifactAccessError as error:
+                        raise DeviceRecordingError(
+                            "verification_changed",
+                            "artifact 在独立校验期间发生变化",
+                        ) from error
+                    artifact_identities.append((artifact_id, identity))
+                return _VerifiedSessionSnapshot(
+                    manifest_sha256=manifest_sha256,
+                    manifest_identity=manifest_identity,
+                    artifact_identities=tuple(artifact_identities),
+                )
+
+            before = snapshot()
+            verification_error: DeviceRecordingError | None = None
+            try:
+                validated_manifest = validate_device_session_directory(
+                    session_path,
+                    expected_session_id=session_id,
+                )
+            except DeviceRecordingError as error:
+                if error.code != "digest_mismatch":
+                    raise
+                verification_error = error
+                validated_manifest = manifest
+            if validated_manifest != manifest:
+                raise DeviceRecordingError(
+                    "verification_changed",
+                    "manifest 在独立校验期间发生变化",
+                )
+            after = snapshot()
+            if before != after:
+                raise DeviceRecordingError(
+                    "verification_changed",
+                    "会话在独立校验期间发生变化",
+                )
+            return after, verification_error
+        finally:
+            store.close()
+
+    def _session_snapshot_is_current(
+        self,
+        session_id: str,
+        snapshot: _VerifiedSessionSnapshot,
+    ) -> bool:
+        admission = self._require_admission()
+        store = _MultiRootSessionStore(
+            admission.catalog_roots,
+            verified_manifests={session_id: snapshot.manifest_sha256},
+        )
+        try:
+            with store.open_manifest(session_id, "v4") as manifest:
+                if (
+                    hashlib.sha256(manifest.read()).hexdigest() != snapshot.manifest_sha256
+                    or _locked_file_identity(manifest) != snapshot.manifest_identity
+                ):
+                    return False
+            for artifact_id, expected_identity in snapshot.artifact_identities:
+                with store.open_verified_artifact(session_id, artifact_id, "v4") as artifact:
+                    if _locked_file_identity(artifact) != expected_identity:
+                        return False
+            return True
+        except (ArtifactAccessError, DeviceRecordingError, OSError):
+            return False
+        finally:
+            store.close()
+
+    def _invalidate_session_verification(self, session_id: str) -> None:
+        self._verified.pop(session_id, None)
+        self._session_snapshots.pop(session_id, None)
+        summary = self._session_summaries.get(session_id)
+        if summary is not None:
+            summary["verification"] = None
+        self._pending_session_verification.add(session_id)
+
+    def _catalog_sessions(self, *, revalidate_pending: bool = True) -> None:
+        admission = self._require_admission()
+        # Identity checks keep steady-state pages cheap while invalidating any broken
+        # immutability assumption before a cached verdict can be reused.
         with self._catalog_lock:
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
@@ -779,24 +1061,87 @@ class CaptureCoordinator:
                     ):
                         continue
                     discovered.add(candidate.name)
+                    session_id = candidate.name
+                    summary = self._session_summaries.get(session_id)
+                    snapshot = self._session_snapshots.get(session_id)
+                    if summary is not None and snapshot is not None:
+                        if self._session_snapshot_is_current(session_id, snapshot):
+                            continue
+                        self._invalidate_session_verification(session_id)
+                        try:
+                            manifest, payload = inspect_device_session_directory(candidate)
+                            self._session_summaries[session_id] = self._session_summary(
+                                session_id,
+                                manifest,
+                                payload,
+                                verification_current=False,
+                            )
+                            self._session_diagnostics.pop(session_id, None)
+                        except (
+                            OSError,
+                            DeviceRecordingError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                        ) as error:
+                            self._session_summaries.pop(session_id, None)
+                            self._pending_session_verification.discard(session_id)
+                            self._session_diagnostics[session_id] = self._session_diagnostic(
+                                session_id,
+                                error,
+                            )
+                        continue
+
                     if (
-                        candidate.name in self._session_summaries
-                        or candidate.name in self._session_diagnostics
+                        summary is not None
+                        and session_id in self._pending_session_verification
+                        and not revalidate_pending
                     ):
                         continue
                     if candidate.name in self._retained and candidate.name not in self._verified:
-                        self._session_diagnostics[candidate.name] = self._session_diagnostic(
-                            "会话发布失败，未进入可下载 catalog"
-                        )
+                        if candidate.name not in self._session_diagnostics:
+                            self._session_diagnostics[candidate.name] = self._session_diagnostic(
+                                candidate.name, "会话发布失败，未进入可下载 catalog"
+                            )
                         continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
-                        self._session_summaries[candidate.name] = self._session_summary(
-                            candidate.name,
+                        try:
+                            verified_snapshot, verification_error = (
+                                self._verify_exact_session_payload(
+                                    candidate,
+                                    session_id,
+                                    manifest,
+                                    payload,
+                                )
+                            )
+                        except DeviceRecordingError as error:
+                            if error.code != "verification_changed":
+                                raise
+                            self._session_summaries[session_id] = self._session_summary(
+                                session_id,
+                                manifest,
+                                payload,
+                                verification_current=False,
+                            )
+                            self._verified.pop(session_id, None)
+                            self._session_snapshots.pop(session_id, None)
+                            self._pending_session_verification.add(session_id)
+                            self._session_diagnostics.pop(session_id, None)
+                            continue
+                        self._session_summaries[session_id] = self._session_summary(
+                            session_id,
                             manifest,
                             payload,
+                            verification_error=verification_error,
                         )
-                        self._verified[candidate.name] = hashlib.sha256(payload).hexdigest()
+                        self._session_snapshots[session_id] = verified_snapshot
+                        self._pending_session_verification.discard(session_id)
+                        self._session_diagnostics.pop(session_id, None)
+                        if verification_error is None:
+                            self._verified[session_id] = verified_snapshot.manifest_sha256
+                        else:
+                            self._verified.pop(session_id, None)
                     except (
                         OSError,
                         DeviceRecordingError,
@@ -804,28 +1149,87 @@ class CaptureCoordinator:
                         TypeError,
                         ValueError,
                     ) as error:
-                        self._session_diagnostics[candidate.name] = self._session_diagnostic(error)
+                        self._session_summaries.pop(session_id, None)
+                        self._verified.pop(session_id, None)
+                        self._session_snapshots.pop(session_id, None)
+                        self._pending_session_verification.discard(session_id)
+                        diagnostic = self._session_diagnostic(session_id, error)
+                        current_diagnostic = self._session_diagnostics.get(session_id)
+                        if (
+                            current_diagnostic is not None
+                            and current_diagnostic.get("code") == diagnostic["code"]
+                        ):
+                            diagnostic = current_diagnostic
+                        self._session_diagnostics[session_id] = diagnostic
 
             for session_id in set(self._session_summaries) - discovered:
                 self._session_summaries.pop(session_id, None)
                 self._verified.pop(session_id, None)
+                self._session_snapshots.pop(session_id, None)
+                self._pending_session_verification.discard(session_id)
             for session_id in set(self._session_diagnostics) - discovered:
                 self._session_diagnostics.pop(session_id, None)
 
     @staticmethod
-    def _session_diagnostic(error: object) -> dict[str, object]:
+    def _session_diagnostic(candidate_identity: str, error: object) -> dict[str, object]:
+        code = "manifest_invalid"
+        if isinstance(error, OSError):
+            code = "manifest_unreadable"
+        elif isinstance(error, DeviceRecordingError):
+            text = f"{error.code} {error.message}".lower()
+            cause = error.__cause__
+            schema_error = getattr(cause, "__cause__", None)
+            schema_path = tuple(getattr(schema_error, "absolute_path", ()))
+            if any(
+                marker in text
+                for marker in (
+                    "no such file",
+                    "not found",
+                    "expecting value",
+                    "expecting property",
+                    "utf-8",
+                    "无法安全打开",
+                    "无法读取",
+                    "超过允许大小",
+                )
+            ):
+                code = "manifest_unreadable"
+            elif any(
+                marker in text
+                for marker in (
+                    "unsupported schema",
+                    "unknown schema",
+                    "schema unsupported",
+                    "schema unknown",
+                    "不支持的 schema",
+                    "不是支持的 device-session",
+                    "未知 schema",
+                )
+            ):
+                code = "unsupported_schema"
+            elif schema_path == ("sealed",) or (
+                "sealed" in text
+                and any(
+                    marker in text
+                    for marker in ("false", "unsealed", "未封存", "尚未", "必须为 true")
+                )
+            ):
+                code = "manifest_not_sealed"
         return {
-            "quarantine_id": str(uuid.uuid4()),
-            "code": "manifest_invalid",
+            "quarantine_id": _stable_quarantine_id(candidate_identity, code),
+            "code": code,
             "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "message": str(error)[:512],
+            "message": SESSION_DIAGNOSTIC_SUMMARIES[code],
         }
 
-    @staticmethod
     def _session_summary(
+        self,
         session_id: str,
         manifest: Mapping[str, object],
         manifest_payload: bytes,
+        *,
+        verification_error: DeviceRecordingError | None = None,
+        verification_current: bool = True,
     ) -> dict[str, object]:
         take = manifest["take"]
         timing = manifest["time"]
@@ -834,6 +1238,35 @@ class CaptureCoordinator:
         if not all(isinstance(value, Mapping) for value in (take, timing, device, integrity)):
             raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
         manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        validator_name = "openaria-conductor-device-session-v2-integrity"
+        validator_version = "1"
+        validator_build_sha256 = hashlib.sha256(
+            (f"{validator_name}\x00{validator_version}\x00{self._config.session.commit}").encode()
+        ).hexdigest()
+        diagnostics: list[dict[str, str]] = []
+        if verification_error is not None:
+            code, summary = GATEWAY_VERIFICATION_DIAGNOSTICS.get(
+                verification_error.code,
+                (
+                    "verification_failed",
+                    "gateway 无法确认 artifact 内容与 sealed 清单一致",
+                ),
+            )
+            diagnostics.append({"code": code, "summary": summary})
+        verification: dict[str, object] | None = None
+        if verification_current:
+            verification = {
+                "actor": "gateway",
+                "validator": {
+                    "name": validator_name,
+                    "version": validator_version,
+                    "build_sha256": validator_build_sha256,
+                },
+                "manifest_sha256": manifest_sha256,
+                "verified_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "verdict": "usable" if verification_error is None else "unusable",
+                "diagnostics": diagnostics,
+            }
         return {
             "session_id": manifest["session_id"],
             "producer_outcome": "sealed",
@@ -854,18 +1287,7 @@ class CaptureCoordinator:
                 session_id=session_id,
                 code="manifest_invalid",
             ),
-            "verification": {
-                "actor": "gateway",
-                "validator": {
-                    "name": "rp-ylx-device-session-v1",
-                    "version": "1",
-                    "build_sha256": hashlib.sha256(b"rp-ylx-device-session-v1").hexdigest(),
-                },
-                "manifest_sha256": manifest_sha256,
-                "verified_at": integrity["verified_at"],
-                "verdict": "usable",
-                "diagnostics": [],
-            },
+            "verification": verification,
         }
 
     def _recording_snapshot(self) -> tuple[str, object | None, object | None]:
@@ -1142,6 +1564,15 @@ class CaptureCoordinator:
             "network_mutation": (api_version == "v4" and self._network_controller_available()),
         }
         if api_version == "v4":
+            capabilities.update(
+                {
+                    "session_list": True,
+                    "session_detail": True,
+                    "artifact_download": True,
+                    "capture_status": True,
+                    "session_deletion": False,
+                }
+            )
             capabilities["calibration_capture"] = self._calibration_capture_capability(
                 admission=admission,
                 writable=writable,
@@ -1832,6 +2263,19 @@ class CaptureCoordinator:
                     error.code, error.message, status=HTTPStatus.CONFLICT
                 ) from error
 
+            verified_snapshot: _VerifiedSessionSnapshot | None = None
+            verification_error: DeviceRecordingError | None = None
+            verification_current = True
+            try:
+                verified_snapshot, verification_error = self._verify_exact_session_payload(
+                    self._require_admission().sessions_root / plan.session_id,
+                    plan.session_id,
+                    sealed.manifest,
+                    sealed.manifest_bytes,
+                )
+            except DeviceRecordingError:
+                verification_current = False
+
             with self._lock:
                 if self._active is not recorder:
                     raise ProviderError(
@@ -1841,12 +2285,23 @@ class CaptureCoordinator:
                         retryable=True,
                     )
                 with self._catalog_lock:
-                    self._verified[plan.session_id] = sealed.manifest_sha256
                     self._session_summaries[plan.session_id] = self._session_summary(
                         plan.session_id,
                         sealed.manifest,
                         sealed.manifest_bytes,
+                        verification_error=verification_error,
+                        verification_current=verification_current,
                     )
+                    if verified_snapshot is not None:
+                        self._session_snapshots[plan.session_id] = verified_snapshot
+                        self._pending_session_verification.discard(plan.session_id)
+                    else:
+                        self._session_snapshots.pop(plan.session_id, None)
+                        self._pending_session_verification.add(plan.session_id)
+                    if verified_snapshot is not None and verification_error is None:
+                        self._verified[plan.session_id] = verified_snapshot.manifest_sha256
+                    else:
+                        self._verified.pop(plan.session_id, None)
                     self._session_diagnostics.pop(plan.session_id, None)
                 self._active = None
                 self._active_plan = None
@@ -2179,10 +2634,39 @@ class CaptureCoordinator:
             store.close()
 
     def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
+        # A caller may download without listing first. Refresh only file
+        # identities here so a same-size replacement cannot reuse a cached
+        # usable verdict; full digest revalidation is deferred to the next
+        # catalog refresh and the current download fails closed.
+        self._catalog_sessions(revalidate_pending=False)
+        with self._catalog_lock:
+            snapshot = self._session_snapshots.get(session_id)
+            if snapshot is None or self._verified.get(session_id) != snapshot.manifest_sha256:
+                raise ArtifactAccessError(
+                    "not_verified",
+                    "会话验证快照不存在或已失效",
+                    reason="absent",
+                )
+            expected_identities = dict(snapshot.artifact_identities)
+
         release = self._acquire_representation()
         store = self._open_store()
         try:
             representation = store.open_verified_artifact(session_id, artifact_id, api_version)
+            expected_identity = expected_identities.get(artifact_id)
+            if (
+                expected_identity is None
+                or _locked_file_identity(representation) != expected_identity
+            ):
+                representation.close()
+                with self._catalog_lock:
+                    if self._session_snapshots.get(session_id) == snapshot:
+                        self._invalidate_session_verification(session_id)
+                raise ArtifactAccessError(
+                    "not_verified",
+                    "artifact 与独立验证快照不匹配",
+                    reason="stale",
+                )
             return _TrackedRepresentation(representation, release)
         except Exception:
             release()
@@ -2220,6 +2704,7 @@ class CaptureCoordinator:
         cursor: str | None,
         limit: int,
         take_id: str | None,
+        api_version: str = "v3",
     ) -> Mapping[str, object]:
         try:
             self._check_generation(force=True)
@@ -2233,38 +2718,107 @@ class CaptureCoordinator:
         self._require_admission()
         self._catalog_sessions()
         with self._catalog_lock:
-            items = [
-                copy.deepcopy(item)
-                for item in self._session_summaries.values()
-                if take_id is None or item["take_id"] == take_id
-            ]
+            all_items = [copy.deepcopy(item) for item in self._session_summaries.values()]
             diagnostics = copy.deepcopy(list(self._session_diagnostics.values()))
-        items.sort(
-            key=lambda item: (str(item["started_at"]), str(item["session_id"])),
-            reverse=True,
-        )
-        combined: list[tuple[str, dict[str, object]]] = [
-            (str(item["session_id"]), item) for item in items
-        ]
-        start = 0
-        if cursor is not None:
-            positions = [index for index, (key, _) in enumerate(combined) if key == cursor]
-            if not positions:
-                raise ProviderError("invalid_cursor", "会话游标无效", status=400)
-            start = positions[0] + 1
-        selected_items = [item for _, item in combined[start : start + limit]]
-        remaining = limit - len(selected_items)
-        selected_diagnostics = diagnostics[:remaining]
-        consumed = start + len(selected_items)
-        next_cursor = None
-        if consumed < len(combined) and selected_items:
-            next_cursor = str(selected_items[-1]["session_id"])
-        return {
-            "schema": "ylx.session-list.v2",
-            "items": selected_items,
-            "diagnostics": selected_diagnostics,
-            "next_cursor": next_cursor,
-        }
+            all_items.sort(
+                key=lambda item: (str(item["started_at"]), str(item["session_id"])),
+                reverse=True,
+            )
+
+            if api_version != "v4":
+                items = [
+                    item for item in all_items if take_id is None or item["take_id"] == take_id
+                ]
+                for item in items:
+                    verification = item.get("verification")
+                    if isinstance(verification, dict):
+                        raw_diagnostics = verification.get("diagnostics")
+                        if isinstance(raw_diagnostics, list):
+                            verification["diagnostics"] = [
+                                diagnostic["summary"]
+                                for diagnostic in raw_diagnostics
+                                if isinstance(diagnostic, Mapping)
+                                and isinstance(diagnostic.get("summary"), str)
+                            ]
+                combined: list[tuple[str, dict[str, object]]] = [
+                    (str(item["session_id"]), item) for item in items
+                ]
+                start = 0
+                if cursor is not None:
+                    positions = [index for index, (key, _) in enumerate(combined) if key == cursor]
+                    if not positions:
+                        raise ProviderError(
+                            "invalid_cursor",
+                            "会话游标无效",
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                    start = positions[0] + 1
+                selected_items = [item for _, item in combined[start : start + limit]]
+                remaining = limit - len(selected_items)
+                selected_diagnostics = diagnostics[:remaining]
+                consumed = start + len(selected_items)
+                next_cursor = None
+                if consumed < len(combined) and selected_items:
+                    next_cursor = str(selected_items[-1]["session_id"])
+                return {
+                    "schema": "ylx.session-list.v2",
+                    "items": selected_items,
+                    "diagnostics": selected_diagnostics,
+                    "next_cursor": next_cursor,
+                }
+
+            diagnostics.sort(key=lambda item: str(item["quarantine_id"]))
+            catalog_revision = _session_catalog_revision(all_items, diagnostics)
+            items = [item for item in all_items if take_id is None or item["take_id"] == take_id]
+            ordered: list[tuple[str, dict[str, object]]] = [
+                *(("item", item) for item in items),
+                *(("diagnostic", diagnostic) for diagnostic in diagnostics),
+            ]
+            start = 0
+            if cursor is not None:
+                decoded = _decode_session_cursor(cursor)
+                if decoded["take_id"] != take_id:
+                    raise ProviderError(
+                        "invalid_cursor",
+                        "会话游标与当前筛选条件不匹配",
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                if decoded["catalog_revision"] != catalog_revision:
+                    raise ProviderError(
+                        "catalog_changed",
+                        "会话目录已变化，请从第一页重新加载",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                        details={"catalog_revision": catalog_revision},
+                    )
+                start = int(decoded["offset"])
+                if start >= len(ordered):
+                    raise ProviderError(
+                        "invalid_cursor",
+                        "会话游标位置无效",
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+
+            selected = ordered[start : start + limit]
+            selected_items = [value for kind, value in selected if kind == "item"]
+            selected_diagnostics = [value for kind, value in selected if kind == "diagnostic"]
+            consumed = start + len(selected)
+            next_cursor = (
+                _encode_session_cursor(
+                    catalog_revision=catalog_revision,
+                    take_id=take_id,
+                    offset=consumed,
+                )
+                if consumed < len(ordered)
+                else None
+            )
+            return {
+                "schema": "ylx.session-list.v3",
+                "catalog_revision": catalog_revision,
+                "items": selected_items,
+                "diagnostics": selected_diagnostics,
+                "next_cursor": next_cursor,
+            }
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
         self._require_camera_connected()
