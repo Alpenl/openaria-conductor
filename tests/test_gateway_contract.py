@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "f1185da08f50857d1f231701d14dfc42ab5cf3f6abce65d5d6d5c90510a52210",
-        "bytes": 120_760,
+        "sha256": "b6f3c677c038e55c03581c587973811b0aa2dc91cfb8b602a95128fbac225827",
+        "bytes": 124_739,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -138,9 +138,19 @@ STATUS_WIRE_BY_VERSION = {
     "v3": STATUS_WIRE_LEGACY,
     "v4": STATUS_WIRE_V4,
 }
-SESSION_LIST_WIRE = (
+SESSION_LIST_WIRE_LEGACY = (
     b'{"schema":"ylx.session-list.v2","items":[],"diagnostics":[],"next_cursor":null}'
 )
+SESSION_LIST_WIRE_V4 = (
+    b'{"schema":"ylx.session-list.v3","catalog_revision":"sha256:'
+    + b"e93b24b9cf11a625d18d43f2506b68116376a019c549c55dbdd5d99747fcd9ef"
+    + b'","items":[],"diagnostics":[],"next_cursor":null}'
+)
+SESSION_LIST_WIRE_BY_VERSION = {
+    "v2": SESSION_LIST_WIRE_LEGACY,
+    "v3": SESSION_LIST_WIRE_LEGACY,
+    "v4": SESSION_LIST_WIRE_V4,
+}
 DEVICE_COMMON = {
     "device": {
         "device_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -209,6 +219,15 @@ def _device_common_for_api(api_version: str) -> dict[str, object]:
     else:
         capabilities = common["capabilities"]
         assert isinstance(capabilities, dict)
+        capabilities.update(
+            {
+                "session_list": True,
+                "session_detail": True,
+                "artifact_download": True,
+                "capture_status": True,
+                "session_deletion": False,
+            }
+        )
         capabilities["calibration_capture"] = {
             "supported": True,
             "enabled": True,
@@ -410,11 +429,27 @@ class _WireProvider:
         return CaptureCommandResult(204, None)
 
     def list_sessions(
-        self, *, cursor: str | None, limit: int, take_id: str | None
+        self,
+        *,
+        cursor: str | None,
+        limit: int,
+        take_id: str | None,
+        api_version: str,
     ) -> dict[str, object]:
         del cursor, limit, take_id
-        return {
+        legacy = {
             "schema": "ylx.session-list.v2",
+            "items": [],
+            "diagnostics": [],
+            "next_cursor": None,
+        }
+        if api_version != "v4":
+            return legacy
+        return {
+            "schema": "ylx.session-list.v3",
+            "catalog_revision": (
+                "sha256:e93b24b9cf11a625d18d43f2506b68116376a019c549c55dbdd5d99747fcd9ef"
+            ),
             "items": [],
             "diagnostics": [],
             "next_cursor": None,
@@ -546,7 +581,7 @@ class GatewayV2WireGoldenTest(unittest.TestCase):
 
             with self.subTest(version=version, resource="session-list"):
                 status, payload, _ = self.request(f"/api/{version}/sessions")
-                self.assertEqual((status, payload), (200, SESSION_LIST_WIRE))
+                self.assertEqual((status, payload), (200, SESSION_LIST_WIRE_BY_VERSION[version]))
 
             with self.subTest(version=version, resource="manifest"):
                 status, payload, headers = self.request(f"/api/{version}/sessions/{SESSION_ID}")

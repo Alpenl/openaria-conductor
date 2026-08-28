@@ -829,6 +829,99 @@ class GatewayEventHttpTest(unittest.TestCase):
                 take_id=None,
             )
 
+    def test_v4_session_list_verification_diagnostics_are_closed_and_fail_closed(self) -> None:
+        item = {
+            "session_id": "01989f6b-2c00-7a1b-8c2d-3e4f50617283",
+            "producer_outcome": "sealed",
+            "take_id": "01989f69-f000-7c3d-ae4f-5061728394a5",
+            "take_sequence": 1,
+            "continuation_of": None,
+            "display_name": "unusable session",
+            "device": {
+                "device_id": "550e8400-e29b-41d4-a716-446655440000",
+                "device_label": "YLX-30D5872D",
+            },
+            "started_at": "2026-08-08T02:26:00Z",
+            "ended_at": "2026-08-08T02:26:01Z",
+            "duration_seconds": 1.0,
+            "total_bytes": 1,
+            "verification": {
+                "actor": "gateway",
+                "validator": {
+                    "name": "openaria-conductor-device-session-v2-integrity",
+                    "version": "1",
+                    "build_sha256": "a" * 64,
+                },
+                "manifest_sha256": "b" * 64,
+                "verified_at": "2026-08-08T02:26:02Z",
+                "verdict": "unusable",
+                "diagnostics": [
+                    {
+                        "code": "artifact_digest_mismatch",
+                        "summary": "artifact 内容 SHA-256 与清单声明不一致",
+                    }
+                ],
+            },
+        }
+        resource = {
+            "schema": "ylx.session-list.v3",
+            "catalog_revision": "sha256:" + "c" * 64,
+            "items": [item],
+            "diagnostics": [],
+            "next_cursor": "opaque-next-page",
+        }
+        validate_session_list(
+            resource,
+            limit=1,
+            take_id=None,
+            api_version="v4",
+        )
+
+        missing = deepcopy(item)
+        missing["verification"] = None
+        validate_session_list(
+            {**resource, "items": [missing], "next_cursor": None},
+            limit=1,
+            take_id=None,
+            api_version="v4",
+        )
+
+        for invalid_verification in (
+            {**deepcopy(item["verification"]), "verdict": "unknown"},
+            {**deepcopy(item["verification"]), "diagnostics": ["legacy string"]},
+            {
+                **deepcopy(item["verification"]),
+                "diagnostics": [{"code": "artifact_digest_mismatch", "summary": "/data/x"}],
+                "unexpected": True,
+            },
+        ):
+            invalid_item = deepcopy(item)
+            invalid_item["verification"] = invalid_verification
+            with (
+                self.subTest(verification=invalid_verification),
+                self.assertRaises(InvalidSourceEvent),
+            ):
+                validate_session_list(
+                    {**resource, "items": [invalid_item]},
+                    limit=1,
+                    take_id=None,
+                    api_version="v4",
+                )
+
+        legacy_item = deepcopy(item)
+        legacy_item["verification"]["diagnostics"] = ["artifact 内容 SHA-256 与清单声明不一致"]
+        validate_session_list(
+            {
+                "schema": "ylx.session-list.v2",
+                "items": [legacy_item],
+                "diagnostics": [],
+                "next_cursor": None,
+            },
+            limit=1,
+            take_id=None,
+            api_version="v3",
+        )
+
     def test_every_source_event_data_is_closed_before_delivery_id_assignment(self) -> None:
         buffer = EventReplayBuffer()
         for source_event in (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -51,8 +52,10 @@ from rp_ylx.web import (
 )
 
 MAX_BODY_BYTES = 64 * 1024
+MAX_MANIFEST_RESPONSE_BYTES = 8 * 1024 * 1024
 UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+QUOTED_SHA256 = re.compile(r'^"([0-9a-f]{64})"$')
 WEB_PATHS = {"/": "index.html", **{f"/{name}": name for name in WEB_ASSETS if name != "index.html"}}
 WEB_CONTENT_SECURITY_POLICY = (
     "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; "
@@ -253,7 +256,12 @@ class DeviceProvider(Protocol):
     def forget_network_client_profile(self, command: NetworkCommand) -> NetworkCommandResult: ...
 
     def list_sessions(
-        self, *, cursor: str | None, limit: int, take_id: str | None
+        self,
+        *,
+        cursor: str | None,
+        limit: int,
+        take_id: str | None,
+        api_version: str,
     ) -> Mapping[str, object]: ...
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedRepresentation: ...
@@ -1000,7 +1008,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             and parts[2] in SUPPORTED_API_VERSIONS
             and parts[3] == "sessions"
         ):
-            self._list_sessions(parse_qs(parsed.query, keep_blank_values=True))
+            self._list_sessions(parts[2], parse_qs(parsed.query, keep_blank_values=True))
             return
         if (
             len(parts) == 5
@@ -2044,7 +2052,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         finally:
             self.server.sse_slots.release()
 
-    def _list_sessions(self, query: Mapping[str, list[str]]) -> None:
+    def _list_sessions(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("listSessions") is None:
             return
         if set(query) - {"cursor", "limit", "take_id"} or any(
@@ -2069,8 +2077,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "take_id 必须是 UUIDv7")
             return
         try:
-            result = self.server.provider.list_sessions(cursor=cursor, limit=limit, take_id=take_id)
-            validate_session_list(result, limit=limit, take_id=take_id)
+            result = self.server.provider.list_sessions(
+                cursor=cursor,
+                limit=limit,
+                take_id=take_id,
+                api_version=api_version,
+            )
+            validate_session_list(
+                result,
+                limit=limit,
+                take_id=take_id,
+                api_version=api_version,
+            )
         except InvalidSourceEvent:
             self._invalid_source_state("daemon session list 无效")
             return
@@ -2094,20 +2112,56 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             locked = self.server.provider.open_manifest(session_id, api_version)
             with locked as manifest:
+                etag = getattr(manifest, "etag", None)
+                content_type = getattr(manifest, "content_type", None)
+                size = getattr(manifest, "size", None)
+                iter_chunks = getattr(manifest, "iter_chunks", None)
+                etag_match = QUOTED_SHA256.fullmatch(etag) if isinstance(etag, str) else None
+                if (
+                    etag_match is None
+                    or content_type != "application/json"
+                    or type(size) is not int
+                    or not 0 < size <= MAX_MANIFEST_RESPONSE_BYTES
+                    or not callable(iter_chunks)
+                ):
+                    self._invalid_source_state("daemon manifest representation 元数据无效")
+                    return
+                chunks: list[bytes] = []
+                received = 0
+                try:
+                    for chunk in iter_chunks(0, size):
+                        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                            self._invalid_source_state("daemon manifest representation 字节无效")
+                            return
+                        payload_chunk = bytes(chunk)
+                        received += len(payload_chunk)
+                        if received > size or received > MAX_MANIFEST_RESPONSE_BYTES:
+                            self._invalid_source_state("daemon manifest representation 长度无效")
+                            return
+                        chunks.append(payload_chunk)
+                except Exception:
+                    self._invalid_source_state("daemon manifest representation 读取失败")
+                    return
+                payload = b"".join(chunks)
+                declared_sha256 = etag_match.group(1)
+                if received != size or hashlib.sha256(payload).hexdigest() != declared_sha256:
+                    self._invalid_source_state("daemon manifest representation 摘要无效")
+                    return
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", manifest.content_type)
-                self.send_header("Content-Length", str(manifest.size))
-                self.send_header("ETag", manifest.etag)
-                self.send_header("YLX-Manifest-SHA256", manifest.etag.strip('"'))
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("ETag", etag)
+                self.send_header("YLX-Manifest-SHA256", declared_sha256)
                 self.send_header("Cache-Control", "no-store")
                 self._cors_headers()
                 self.end_headers()
-                for chunk in manifest.iter_chunks(0, manifest.size):
-                    self.wfile.write(chunk)
+                self.wfile.write(payload)
         except ArtifactAccessError:
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "会话不存在或尚未封存")
         except ProviderError as error:
             self._problem(error.status, error.code, error.message, retryable=error.retryable)
+        except Exception:
+            self._provider_failure()
 
     def _get_retained_outcome(self, session_id: str) -> None:
         if self._principal("getRetainedUnsuccessfulSessionOutcome", session_id) is None:
