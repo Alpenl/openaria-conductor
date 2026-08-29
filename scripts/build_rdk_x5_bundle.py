@@ -7,7 +7,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from rp_ylx.deployment import normalize_runtime_archive, write_bundle_manifest
+from rp_ylx.deployment import (
+    normalize_runtime_archive,
+    write_bundle_manifest,
+    write_bundle_sha256sums,
+)
 
 RUNTIME_NAME = re.compile(
     r"^cpython-(3\.11\.\d+)\+\d+-aarch64-unknown-linux-gnu-"
@@ -25,6 +29,10 @@ def main() -> None:
         required=True,
         type=Path,
         help="python-build-standalone CPython 3.11 aarch64 tar.gz",
+    )
+    parser.add_argument(
+        "--build-info",
+        help="optional build-info.txt content to include before SHA256SUMS is generated",
     )
     args = parser.parse_args()
     application_wheel = args.application_wheel.resolve()
@@ -64,12 +72,23 @@ def main() -> None:
         parser.error("runtime 必须是 CPython 3.11 aarch64 unknown-linux-gnu install_only tar.gz")
     normalized_runtime = output / f"cpython-{runtime_match.group(1)}-aarch64.tar.gz"
     normalize_runtime_archive(runtime, normalized_runtime)
-    result = write_bundle_manifest(
+    if args.build_info is not None:
+        if "\n" in args.build_info or "\r" in args.build_info:
+            parser.error("build-info 不能包含换行")
+        (output / "build-info.txt").write_text(f"{args.build_info}\n", encoding="utf-8")
+    manifest = write_bundle_manifest(
         output,
         application_wheel=application_wheel.name,
         version=args.version,
     )
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    sha256sums = write_bundle_sha256sums(output)
+    print(
+        json.dumps(
+            {"manifest": manifest, "sha256sums": sha256sums},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
