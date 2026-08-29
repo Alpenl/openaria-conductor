@@ -561,6 +561,43 @@ def _wheel_commit(wheel: Path) -> str:
     return _wheel_identity(wheel)[0]
 
 
+def write_bundle_sha256sums(
+    directory: str | Path,
+    *,
+    filename: str = "SHA256SUMS",
+) -> Mapping[str, object]:
+    root = Path(directory).resolve()
+    if (
+        PurePosixPath(filename).name != filename
+        or "\n" in filename
+        or "\r" in filename
+        or not filename
+    ):
+        raise DeploymentError("bundle_invalid", "SHA256SUMS 文件名无效")
+    entries: list[dict[str, str]] = []
+    lines: list[str] = []
+    for path in sorted(root.iterdir(), key=lambda candidate: candidate.name):
+        if path.name == filename:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise DeploymentError("bundle_invalid", f"bundle 只能包含顶层普通文件：{path.name}")
+        if "\n" in path.name or "\r" in path.name or PurePosixPath(path.name).name != path.name:
+            raise DeploymentError("bundle_invalid", f"bundle 文件名无效：{path.name}")
+        digest = _sha256(path)
+        entries.append({"file": path.name, "sha256": digest})
+        lines.append(f"{digest}  {path.name}\n")
+    if not entries:
+        raise DeploymentError("bundle_invalid", "bundle 没有可校验文件")
+    target = root / filename
+    _write_bytes_atomic(target, "".join(lines).encode("ascii"), 0o644)
+    return {
+        "file": filename,
+        "bytes": target.stat().st_size,
+        "sha256": _sha256(target),
+        "entries": entries,
+    }
+
+
 def write_bundle_manifest(
     directory: str | Path,
     *,

@@ -41,6 +41,7 @@ from rp_ylx.deployment import (
     normalize_runtime_archive,
     serve_network_control_launcher,
     write_bundle_manifest,
+    write_bundle_sha256sums,
 )
 from rp_ylx.network import MDNS_ASSET_NAME, MDNS_PORT, MDNS_SERVICE, _avahi_service
 from scripts import rdk_x5_install
@@ -965,6 +966,42 @@ class ReleaseManagerTest(unittest.TestCase):
             )
         self.assertEqual(incomplete.exception.code, "runtime_dependency_missing")
         self.assertFalse((bundle / "bundle.json").exists())
+
+    def test_bundle_sha256sums_covers_top_level_files_and_is_strict_checkable(self) -> None:
+        bundle = self.bundle("a")
+        (bundle / "build-info.txt").write_text(
+            f"rp-ylx 0.1.0 ({self.commit('a')})\n",
+            encoding="utf-8",
+        )
+        expected_files = {path.name for path in bundle.iterdir()}
+
+        summary = write_bundle_sha256sums(bundle)
+
+        checksum = bundle / "SHA256SUMS"
+        self.assertTrue(checksum.is_file())
+        self.assertEqual(summary["file"], "SHA256SUMS")
+        self.assertEqual(summary["bytes"], checksum.stat().st_size)
+        self.assertEqual(summary["sha256"], _sha256(checksum))
+        self.assertEqual({entry["file"] for entry in summary["entries"]}, expected_files)
+        lines = checksum.read_text(encoding="ascii").splitlines()
+        self.assertEqual(
+            [line.split("  ", 1)[1] for line in lines],
+            sorted(expected_files),
+        )
+        for line in lines:
+            digest, filename = line.split("  ", 1)
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(all(character in "0123456789abcdef" for character in digest))
+            self.assertEqual(_sha256(bundle / filename), digest)
+        if shutil.which("sha256sum") is None:
+            self.skipTest("sha256sum is not available")
+        subprocess.run(
+            ["sha256sum", "--check", "--strict", "SHA256SUMS"],
+            check=True,
+            cwd=bundle,
+            capture_output=True,
+            text=True,
+        )
 
     def test_upstream_runtime_is_normalized_and_internal_symlinks_are_materialized(self) -> None:
         source = self.root / (

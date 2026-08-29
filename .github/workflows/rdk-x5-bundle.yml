@@ -107,11 +107,12 @@ jobs:
             --application-wheel "$RDK_WHEEL" \
             --runtime "dist-runtime/$RDK_RUNTIME_NAME" \
             --output dist-rdk-x5 \
-            --version 0.1.0
-          printf 'rp-ylx 0.1.0 (%s)\n' "$GITHUB_SHA" > dist-rdk-x5/build-info.txt
+            --version 0.1.0 \
+            --build-info "rp-ylx 0.1.0 (${GITHUB_SHA})"
 
       - name: 校验 bundle manifest
         run: |
+          (cd dist-rdk-x5 && sha256sum --check --strict SHA256SUMS)
           PYTHONPATH=src uv run --python 3.11 --no-project python - <<'PY'
           from pathlib import Path
           from rp_ylx.deployment import load_bundle
