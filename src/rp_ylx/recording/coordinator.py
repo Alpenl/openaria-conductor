@@ -1019,7 +1019,15 @@ class CaptureCoordinator:
         finally:
             store.close()
 
-    def _session_snapshot_is_current(
+    def _invalidate_session_verification(self, session_id: str) -> None:
+        self._verified.pop(session_id, None)
+        self._session_snapshots.pop(session_id, None)
+        summary = self._session_summaries.get(session_id)
+        if summary is not None:
+            summary["verification"] = None
+        self._pending_session_verification.add(session_id)
+
+    def _session_manifest_is_current(
         self,
         session_id: str,
         snapshot: _VerifiedSessionSnapshot,
@@ -1029,32 +1037,25 @@ class CaptureCoordinator:
             admission.catalog_roots,
             verified_manifests={session_id: snapshot.manifest_sha256},
         )
+        representation: object | None = None
         try:
-            manifest_payload, manifest_identity, artifact_identities = (
-                store.snapshot_verified_identities(session_id, "v4")
-            )
+            representation = store.open_manifest(session_id, "v4")
             return (
-                hashlib.sha256(manifest_payload).hexdigest() == snapshot.manifest_sha256
-                and manifest_identity == snapshot.manifest_identity
-                and artifact_identities == snapshot.artifact_identities
+                getattr(representation, "manifest_sha256", None) == snapshot.manifest_sha256
+                and _locked_file_identity(representation) == snapshot.manifest_identity
             )
         except (ArtifactAccessError, DeviceRecordingError, OSError):
             return False
         finally:
+            close = getattr(representation, "close", None)
+            if callable(close):
+                close()
             store.close()
-
-    def _invalidate_session_verification(self, session_id: str) -> None:
-        self._verified.pop(session_id, None)
-        self._session_snapshots.pop(session_id, None)
-        summary = self._session_summaries.get(session_id)
-        if summary is not None:
-            summary["verification"] = None
-        self._pending_session_verification.add(session_id)
 
     def _catalog_sessions(self, *, revalidate_pending: bool = True) -> None:
         admission = self._require_admission()
-        # Identity checks keep steady-state pages cheap while invalidating any broken
-        # immutability assumption before a cached verdict can be reused.
+        # Re-read each small manifest to invalidate replaced catalog entries, but do
+        # not stat every large artifact until that artifact is actually downloaded.
         with self._catalog_lock:
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
@@ -1070,7 +1071,7 @@ class CaptureCoordinator:
                     summary = self._session_summaries.get(session_id)
                     snapshot = self._session_snapshots.get(session_id)
                     if summary is not None and snapshot is not None:
-                        if self._session_snapshot_is_current(session_id, snapshot):
+                        if self._session_manifest_is_current(session_id, snapshot):
                             continue
                         self._invalidate_session_verification(session_id)
                         try:
