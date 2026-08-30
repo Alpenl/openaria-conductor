@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 from unittest.mock import patch
 
+import rp_ylx.api.downloads as downloads_module
 from rp_ylx.api import CaptureCommand, NetworkCommand, ProviderError
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
@@ -1462,6 +1463,26 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(verify.call_count, first_list_verifications)
             finally:
                 restarted.close()
+
+    def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
+            manifest = json.loads(
+                (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+            )
+            self.assertGreater(len(list(iter_device_session_v1_artifacts(manifest))), 1)
+
+            with patch(
+                "rp_ylx.api.downloads._read_exact_file",
+                wraps=downloads_module._read_exact_file,
+            ) as read_manifest:
+                listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
+            self.assertEqual(read_manifest.call_count, 1)
+        finally:
+            coordinator.close()
 
     def test_raw_sbs_frame_is_used_for_preview_without_eye_materialization(self) -> None:
         coordinator = self.coordinator()
