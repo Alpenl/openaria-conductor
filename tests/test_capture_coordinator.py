@@ -17,6 +17,7 @@ from typing import BinaryIO
 from unittest.mock import patch
 
 import rp_ylx.api.downloads as downloads_module
+import rp_ylx.recording.coordinator as coordinator_module
 from rp_ylx.api import CaptureCommand, NetworkCommand, ProviderError
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
@@ -1435,6 +1436,24 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(inspect_session.call_count, first_list_inspections)
             finally:
                 restarted.close()
+
+    def test_cached_catalog_page_does_not_restat_every_verified_artifact(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-page-cache")
+            first = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual([item["session_id"] for item in first["items"]], [session_id])
+
+            with patch.object(
+                coordinator_module._MultiRootSessionStore,
+                "snapshot_verified_identities",
+                side_effect=AssertionError("cached list page must not rescan artifacts"),
+            ):
+                second = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual(second, first)
+        finally:
+            coordinator.close()
 
     def test_restart_defers_catalog_content_verification_until_first_list(self) -> None:
         first = self.coordinator()
