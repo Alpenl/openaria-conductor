@@ -516,6 +516,30 @@ class _MultiRootSessionStore:
             raise last_retryable
         raise ArtifactAccessError("not_found", "artifact 不存在")
 
+    def snapshot_verified_identities(
+        self,
+        session_id: str,
+        api_version: str,
+    ) -> tuple[
+        bytes,
+        tuple[int, int, int, int, int, int, int],
+        tuple[tuple[str, tuple[int, int, int, int, int, int, int]], ...],
+    ]:
+        last_retryable: ArtifactAccessError | None = None
+        for store in self._stores:
+            try:
+                return store.snapshot_verified_identities(session_id, api_version)
+            except ArtifactAccessError as error:
+                if error.code == "not_found" or (
+                    error.code == "not_verified" and error.reason == "stale"
+                ):
+                    last_retryable = error
+                    continue
+                raise
+        if last_retryable is not None:
+            raise last_retryable
+        raise ArtifactAccessError("not_found", "会话不存在")
+
 
 class CaptureCoordinator:
     """单卷单活动会话的生产 DeviceProvider。"""
@@ -949,39 +973,23 @@ class CaptureCoordinator:
 
             def snapshot() -> _VerifiedSessionSnapshot:
                 try:
-                    with store.open_manifest(session_id, "v4") as locked_manifest:
-                        if locked_manifest.read() != manifest_payload:
-                            raise DeviceRecordingError(
-                                "verification_changed",
-                                "manifest 在独立校验期间发生变化",
-                            )
-                        manifest_identity = _locked_file_identity(locked_manifest)
+                    current_payload, manifest_identity, artifact_identities = (
+                        store.snapshot_verified_identities(session_id, "v4")
+                    )
+                    if current_payload != manifest_payload:
+                        raise DeviceRecordingError(
+                            "verification_changed",
+                            "manifest 在独立校验期间发生变化",
+                        )
                 except ArtifactAccessError as error:
                     raise DeviceRecordingError(
                         "verification_changed",
-                        "manifest 在独立校验期间发生变化",
+                        "会话在独立校验期间发生变化",
                     ) from error
-
-                artifact_identities: list[tuple[str, tuple[int, int, int, int, int, int, int]]] = []
-                for descriptor in descriptors:
-                    artifact_id = str(descriptor["artifact_id"])
-                    try:
-                        with store.open_verified_artifact(
-                            session_id,
-                            artifact_id,
-                            "v4",
-                        ) as artifact:
-                            identity = _locked_file_identity(artifact)
-                    except ArtifactAccessError as error:
-                        raise DeviceRecordingError(
-                            "verification_changed",
-                            "artifact 在独立校验期间发生变化",
-                        ) from error
-                    artifact_identities.append((artifact_id, identity))
                 return _VerifiedSessionSnapshot(
                     manifest_sha256=manifest_sha256,
                     manifest_identity=manifest_identity,
-                    artifact_identities=tuple(artifact_identities),
+                    artifact_identities=artifact_identities,
                 )
 
             before = snapshot()
@@ -1022,17 +1030,14 @@ class CaptureCoordinator:
             verified_manifests={session_id: snapshot.manifest_sha256},
         )
         try:
-            with store.open_manifest(session_id, "v4") as manifest:
-                if (
-                    hashlib.sha256(manifest.read()).hexdigest() != snapshot.manifest_sha256
-                    or _locked_file_identity(manifest) != snapshot.manifest_identity
-                ):
-                    return False
-            for artifact_id, expected_identity in snapshot.artifact_identities:
-                with store.open_verified_artifact(session_id, artifact_id, "v4") as artifact:
-                    if _locked_file_identity(artifact) != expected_identity:
-                        return False
-            return True
+            manifest_payload, manifest_identity, artifact_identities = (
+                store.snapshot_verified_identities(session_id, "v4")
+            )
+            return (
+                hashlib.sha256(manifest_payload).hexdigest() == snapshot.manifest_sha256
+                and manifest_identity == snapshot.manifest_identity
+                and artifact_identities == snapshot.artifact_identities
+            )
         except (ArtifactAccessError, DeviceRecordingError, OSError):
             return False
         finally:

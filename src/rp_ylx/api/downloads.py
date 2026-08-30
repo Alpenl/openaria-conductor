@@ -138,6 +138,24 @@ class _FileIdentity:
         )
 
 
+_ExclusiveFileIdentity = tuple[int, int, int, int, int, int, int]
+
+
+def _exclusive_regular_identity(descriptor: int) -> _ExclusiveFileIdentity:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ArtifactAccessError("not_verified", "会话对象不是独占普通文件")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 class LockedBytes:
     """持有从 generation 根一路打开的 fd，读取期间不再按路径查找。"""
 
@@ -834,6 +852,76 @@ class DirectorySessionStore:
             )
             owned = []
             return representation
+        except ArtifactAccessError:
+            raise
+        except OSError as error:
+            raise ArtifactAccessError("not_verified", "artifact 无法安全读取") from error
+        finally:
+            _close_all(owned)
+
+    def snapshot_verified_identities(
+        self,
+        session_id: str,
+        api_version: str,
+    ) -> tuple[
+        bytes,
+        _ExclusiveFileIdentity,
+        tuple[tuple[str, _ExclusiveFileIdentity], ...],
+    ]:
+        """Read one verified manifest and stat every artifact it declares."""
+
+        verified_sha256 = self._verified_manifests.get(session_id)
+        if verified_sha256 is None:
+            raise ArtifactAccessError("not_verified", "会话尚无验证结果", reason="absent")
+        try:
+            owned, manifest_descriptor, _, manifest_bytes = self._open_manifest_bytes(session_id)
+        except ArtifactAccessError as error:
+            raise ArtifactAccessError(
+                "not_verified",
+                "已验证的 manifest 不再存在或无法安全读取",
+                reason="stale",
+            ) from error
+        try:
+            manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            if verified_sha256 != manifest_sha256:
+                raise ArtifactAccessError(
+                    "not_verified", "会话验证结果与当前 manifest 不匹配", reason="stale"
+                )
+            try:
+                manifest = _validated_manifest(manifest_bytes, session_id, api_version)
+            except ArtifactAccessError as error:
+                raise ArtifactAccessError(
+                    "not_verified", "当前 manifest 无法作为 sealed 会话使用"
+                ) from error
+            descriptors = _native_device_session_v1_artifact_descriptors(
+                manifest_bytes,
+                session_id,
+                manifest,
+            )
+            if descriptors is None:
+                descriptors = _artifact_descriptors(manifest)
+
+            artifact_identities: list[tuple[str, _ExclusiveFileIdentity]] = []
+            for artifact_id, selected in descriptors.items():
+                try:
+                    artifact_descriptor = _open_relative_regular(selected.path, owned[1])
+                except ArtifactAccessError as error:
+                    raise ArtifactAccessError(
+                        "not_verified", "manifest 声明的 artifact 不存在或不安全"
+                    ) from error
+                try:
+                    identity = _exclusive_regular_identity(artifact_descriptor)
+                finally:
+                    os.close(artifact_descriptor)
+                if identity[4] != selected.bytes:
+                    raise ArtifactAccessError("not_verified", "artifact 大小与 manifest 不一致")
+                artifact_identities.append((artifact_id, identity))
+
+            return (
+                manifest_bytes,
+                _exclusive_regular_identity(manifest_descriptor),
+                tuple(artifact_identities),
+            )
         except ArtifactAccessError:
             raise
         except OSError as error:
