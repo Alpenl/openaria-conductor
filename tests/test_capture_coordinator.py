@@ -1407,7 +1407,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_list_sessions_reuses_startup_catalog_instead_of_reinspecting_artifacts(self) -> None:
+    def test_list_sessions_builds_catalog_once_instead_of_reinspecting_artifacts(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="catalog-cache")
@@ -1420,17 +1420,46 @@ class CaptureCoordinatorTest(unittest.TestCase):
         ) as inspect_session:
             restarted = self.coordinator()
             try:
-                startup_inspections = inspect_session.call_count
-                self.assertGreater(startup_inspections, 0)
+                self.assertEqual(inspect_session.call_count, 0)
 
-                for _ in range(2):
-                    listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                    self.assertEqual(
-                        [item["session_id"] for item in listed["items"]],
-                        [session_id],
-                    )
+                listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                first_list_inspections = inspect_session.call_count
+                self.assertGreater(first_list_inspections, 0)
+                self.assertEqual(
+                    [item["session_id"] for item in listed["items"]],
+                    [session_id],
+                )
 
-                self.assertEqual(inspect_session.call_count, startup_inspections)
+                restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                self.assertEqual(inspect_session.call_count, first_list_inspections)
+            finally:
+                restarted.close()
+
+    def test_restart_defers_catalog_content_verification_until_first_list(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="deferred-catalog")
+        finally:
+            first.close()
+
+        with patch(
+            "rp_ylx.recording.coordinator.validate_device_session_directory",
+            wraps=validate_device_session_directory,
+        ) as verify:
+            restarted = self.coordinator()
+            try:
+                self.assertEqual(verify.call_count, 0)
+
+                listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                first_list_verifications = verify.call_count
+                self.assertGreater(first_list_verifications, 0)
+                self.assertEqual(
+                    [item["session_id"] for item in listed["items"]],
+                    [session_id],
+                )
+
+                restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                self.assertEqual(verify.call_count, first_list_verifications)
             finally:
                 restarted.close()
 
@@ -2094,7 +2123,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_catalog_verifies_artifact_contents_once_then_reuses_verdict_for_lists(self) -> None:
+    def test_catalog_verifies_artifact_contents_on_first_list_then_reuses_verdict(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="lightweight-catalog")
@@ -2107,11 +2136,12 @@ class CaptureCoordinatorTest(unittest.TestCase):
         ) as verify:
             restarted = self.coordinator()
             try:
-                startup_verifications = verify.call_count
-                self.assertGreater(startup_verifications, 0)
+                self.assertEqual(verify.call_count, 0)
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                first_list_verifications = verify.call_count
+                self.assertGreater(first_list_verifications, 0)
                 restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                self.assertEqual(verify.call_count, startup_verifications)
+                self.assertEqual(verify.call_count, first_list_verifications)
             finally:
                 restarted.close()
         self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])

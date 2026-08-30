@@ -578,7 +578,8 @@ class CaptureCoordinator:
         self._restore_local_state(persisted)
         if self._admission is not None:
             self._recover_sessions()
-            self._catalog_sessions()
+            # Full payload verification is data-size dependent; defer it until
+            # the catalog is requested so service startup stays bounded.
         self._persist_local_state()
 
     @property
@@ -621,7 +622,6 @@ class CaptureCoordinator:
             self._media_lost = False
             self._restore_local_state(persisted)
             self._recover_sessions()
-            self._catalog_sessions()
             self._next_revision()
             self._persist_local_state()
             return admission
