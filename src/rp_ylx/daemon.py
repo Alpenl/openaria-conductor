@@ -23,6 +23,7 @@ from rp_ylx import __commit__, __version__
 from rp_ylx.api import AuditEvent, Principal, SecurityPolicy, create_gateway_server
 from rp_ylx.api.events import EventReplayBuffer
 from rp_ylx.api.preview import LatestPreviewBuffer
+from rp_ylx.api.security import valid_customer_bearer_token
 from rp_ylx.camera import (
     CameraController,
     CameraMode,
@@ -335,11 +336,9 @@ def _read_bearer_token(path: Path) -> str:
         token = raw.rstrip(b"\r\n").decode("ascii")
     except UnicodeDecodeError as error:
         raise ProductionConfigError("Bearer token 必须是 ASCII") from error
-    if (
-        not 32 <= len(token) <= 512
-        or any(not 0x21 <= ord(character) <= 0x7E for character in token)
-        or raw.rstrip(b"\r\n") != raw.removesuffix(b"\n").removesuffix(b"\r")
-    ):
+    if not valid_customer_bearer_token(token) or raw.rstrip(b"\r\n") != raw.removesuffix(
+        b"\n"
+    ).removesuffix(b"\r"):
         raise ProductionConfigError("Bearer token 格式无效")
     return token
 

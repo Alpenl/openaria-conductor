@@ -36,6 +36,8 @@ TRANSACTION_SCHEMA = "ylx.install-transaction.v1"
 RELEASE_SCHEMA = "ylx.installed-release.v1"
 TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
 PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
+CUSTOMER_BEARER_TOKEN_MIN_LENGTH = 8
+CUSTOMER_BEARER_TOKEN_MAX_LENGTH = 512
 RDK_X5_MODEL = "D-Robotics RDK X5 V1.0"
 MAX_BUNDLE_WHEELS = 128
 MAX_WHEEL_BYTES = 512 * 1024 * 1024
@@ -112,6 +114,14 @@ RECOVER_SERVICE = "rp-ylx-recover.service"
 WATCHDOG_SERVICE = "rp-ylx-wifi-watchdog.service"
 WATCHDOG_TIMER = "rp-ylx-wifi-watchdog.timer"
 NETWORK_CONTROL_SOCKET = "run/rp-ylx/network-control.sock"
+
+
+def valid_customer_bearer_token(token: str) -> bool:
+    return CUSTOMER_BEARER_TOKEN_MIN_LENGTH <= len(
+        token
+    ) <= CUSTOMER_BEARER_TOKEN_MAX_LENGTH and all(
+        0x21 <= ord(character) <= 0x7E for character in token
+    )
 
 
 class DeploymentError(RuntimeError):
@@ -1775,11 +1785,9 @@ class ReleaseManager:
             token = payload.rstrip(b"\r\n").decode("ascii")
         except UnicodeDecodeError:
             return False
-        return (
-            32 <= len(token) <= 512
-            and all(0x21 <= ord(character) <= 0x7E for character in token)
-            and payload.rstrip(b"\r\n") == payload.removesuffix(b"\n").removesuffix(b"\r")
-        )
+        return valid_customer_bearer_token(token) and payload.rstrip(
+            b"\r\n"
+        ) == payload.removesuffix(b"\n").removesuffix(b"\r")
 
     def _ensure_customer_identity(
         self,

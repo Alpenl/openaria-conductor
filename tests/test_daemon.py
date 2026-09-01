@@ -126,7 +126,7 @@ class ProductionDaemonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             base = self.config(root)
-            token = "0123456789abcdef0123456789abcdef0123456789abcdef"
+            token = "12345678"
             token_path = root / "customer.token"
             token_path.write_text(token + "\n", encoding="ascii")
             token_path.chmod(0o640)
