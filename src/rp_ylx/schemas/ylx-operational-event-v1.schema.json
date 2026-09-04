@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:ylx:schema:operational-event:v1",
-  "title": "RP-YLX operational event",
+  "title": "Open Aria operational event",
   "type": "object",
   "additionalProperties": false,
   "required": [

@@ -1,4 +1,4 @@
-"""从未安装 RP-YLX 的 RDK X5 启动 bundle 内部署工具。"""
+"""从未安装 Open Aria 的 RDK X5 启动 bundle 内部署工具。"""
 
 from __future__ import annotations
 

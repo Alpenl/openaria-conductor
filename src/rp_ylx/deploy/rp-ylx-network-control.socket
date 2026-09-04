@@ -1,5 +1,5 @@
 [Unit]
-Description=RP-YLX privileged network-control socket
+Description=Open Aria privileged network-control socket
 
 [Socket]
 ListenStream=/run/rp-ylx/network-control.sock

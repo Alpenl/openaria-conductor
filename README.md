@@ -2,7 +2,7 @@
 
 Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 的双目视频与 IMU
 同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。0.5 代码仍保留
-`rp-ylx` package、CLI、systemd unit 和数据标识，以兼容现有安装与已录制会话。
+历史 package、CLI、systemd unit 和数据标识作为兼容别名，以兼容现有安装与已录制会话。
 
 浏览器控制端由 [Open Aria Echo / Web](https://github.com/Alpenl/openaria-echo-web)
 独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
@@ -68,15 +68,18 @@ Conductor 负责设备端采集以及写入部署配置的固定 `/data` 根目�
 
 ```bash
 uv sync --extra dev
-uv run rp-ylx --version
-uv run rp-ylx status
-uv run rp-ylx probe
-uv run rp-ylx hardware-smoke --help
-uv run rp-ylx serve-mock
-uv run rp-ylx serve-hardware-preview --device /dev/video0
+uv run openaria --version
+uv run openaria status
+uv run openaria probe
+uv run openaria hardware-smoke --help
+uv run openaria serve-mock
+uv run openaria serve-hardware-preview --device /dev/video0
 uv run python scripts/check.py
 uv build
 ```
+
+已完成的 Python/Rust 固定 trace 消融结果、原始报告和校验摘要见
+[`experiments/fixed-trace-20260905-132783d`](experiments/fixed-trace-20260905-132783d/README.md)。
 
 ## 设备接入
 
@@ -84,7 +87,7 @@ uv build
 - 救援热点公共密码：`12345678`。
 - 救援热点固定管理地址：`10.42.0.1`，Web 入口为 `http://10.42.0.1:8080/`。
 - SSH 管理账号：`OpenAria`。
-- SSH 管理密码：`123456`。
+- SSH 管理密码：`12345678`。
 
 `status` 在没有相机和 IMU 的电脑上也能正常运行，并明确报告硬件尚未探测。
 日常使用步骤见 [设备使用指南](docs/user-guide.md)。

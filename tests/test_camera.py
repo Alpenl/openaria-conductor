@@ -17,7 +17,6 @@ from rp_ylx.camera import (
     V4L2DiscoveryBackend,
     parse_v4l2_formats,
     split_sbs_mjpeg,
-    split_sbs_mjpeg_native,
     v4l2_production_stream_factory,
     v4l2_stream_factory,
 )
@@ -575,22 +574,6 @@ class V4L2StreamTest(unittest.TestCase):
                 (self.LEFT, self.RIGHT),
             )
 
-        lossless_crop.assert_not_called()
-
-    def test_production_split_rejects_pillow_fallback(self) -> None:
-        with (
-            patch.object(v4l2, "lossless_crop_sbs_jpeg", return_value=None),
-            self.assertRaises(CameraError) as rejected,
-        ):
-            split_sbs_mjpeg_native(b"\xff\xd8single-sbs\xff\xd9", 3840, 1080)
-        self.assertEqual(rejected.exception.code, "native_split_unavailable")
-
-    def test_production_split_accepts_driver_double_jpeg_without_transform(self) -> None:
-        with patch.object(v4l2, "lossless_crop_sbs_jpeg") as lossless_crop:
-            self.assertEqual(
-                split_sbs_mjpeg_native(b"padding" + self.SBS + b"\x00", 3840, 1080),
-                (self.LEFT, self.RIGHT),
-            )
         lossless_crop.assert_not_called()
 
     def test_split_rejects_odd_width_without_calling_lossless_crop(self) -> None:

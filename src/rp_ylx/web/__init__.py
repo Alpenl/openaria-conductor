@@ -1,6 +1,6 @@
-"""RP-YLX 托管的 Open Aria Echo / Web 静态制品。
+"""Open Aria Conductor 托管的 Open Aria Echo / Web 静态制品。
 
-Echo / Web 是独立构建的浏览器客户端；RP-YLX 只固定并托管一份生成后的
+Echo / Web 是独立构建的浏览器客户端；Conductor 只固定并托管一份生成后的
 静态制品。托管集合、内容类型、字节数和 sha256 全部来自内部 ``assets.json``，
 不从扩展名猜类型，也不继续拥有 Node/TypeScript 客户端源码。
 """

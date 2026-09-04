@@ -1,5 +1,5 @@
 [Unit]
-Description=RP-YLX RDK X5 capture service
+Description=Open Aria RDK X5 capture service
 Requires=rp-ylx-recover.service rp-ylx-network-control.socket rp-ylx-network-control.service
 After=rp-ylx-data-volume.service rp-ylx-recover.service rp-ylx-network-control.socket rp-ylx-network-control.service network-online.target NetworkManager.service
 Wants=rp-ylx-data-volume.service network-online.target

@@ -1,5 +1,5 @@
 [Unit]
-Description=RP-YLX RDK X5 Wi-Fi health and recovery check
+Description=Open Aria RDK X5 Wi-Fi health and recovery check
 After=NetworkManager.service network.target rp-ylx-network-control.socket rp-ylx-network-control.service
 Wants=NetworkManager.service rp-ylx-network-control.socket
 

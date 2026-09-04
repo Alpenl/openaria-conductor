@@ -1,4 +1,4 @@
-"""RP-YLX 对外数据契约。"""
+"""Open Aria 对外数据契约。"""
 
 from rp_ylx.contracts.session import (
     SESSION_FORMAT,

@@ -31,7 +31,7 @@ if [ ! -e "$IMAGE" ]; then
     chmod 0600 "$IMAGE"
     # Do not discard the freshly allocated file: the backing root filesystem must
     # reserve the data-volume blocks up front rather than overcommit system space.
-    mkfs.ext4 -F -E nodiscard -L RP-YLX-DATA "$IMAGE" >/dev/null
+    mkfs.ext4 -F -E nodiscard -L OPENARIA-DATA "$IMAGE" >/dev/null
 elif [ ! -f "$IMAGE" ]; then
     echo "$IMAGE exists but is not a regular file" >&2
     exit 1

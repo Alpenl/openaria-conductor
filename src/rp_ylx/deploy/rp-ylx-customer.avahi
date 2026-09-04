@@ -1,7 +1,7 @@
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
 <service-group>
-  <name replace-wildcards="yes">RP-YLX on %h</name>
+  <name replace-wildcards="yes">Open Aria on %h</name>
   <service>
     <type>_ylx-capture._tcp</type>
     <port>8080</port>

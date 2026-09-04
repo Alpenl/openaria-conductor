@@ -1,4 +1,4 @@
-"""Build an offline RDK X5 SD image with a dedicated RP-YLX /data partition.
+"""Build an offline RDK X5 SD image with a dedicated Open Aria /data partition.
 
 The tool intentionally writes only regular image files. It never mutates a block
 device, mounted filesystem, or the running rootfs on an RDK X5.
@@ -21,7 +21,7 @@ from typing import TextIO
 
 SECTOR_SIZE = 512
 ALIGN_BYTES = 1024 * 1024
-DATA_LABEL = "RP-YLX-DATA"
+DATA_LABEL = "OPENARIA-DATA"
 PLAN_SCHEMA = "ylx.rdk-x5-sd-image-plan.v1"
 VOLUME_SCHEMA = "ylx.capture-volume.v1"
 VOLUME_MARKER = ".ylx-volume.json"

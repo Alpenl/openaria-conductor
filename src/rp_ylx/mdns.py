@@ -95,7 +95,7 @@ def _service_infos(
     return tuple(
         ServiceInfo(
             service_type,
-            f"RP-YLX.{service_type}",
+            f"Open Aria.{service_type}",
             port=port,
             properties={"path": "/", "scheme": scheme, "api": "/api/v4/device"},
             server=MDNS_HOSTNAME,
@@ -106,7 +106,7 @@ def _service_infos(
 
 
 class MdnsPublisher:
-    """Publish RP-YLX discovery records and refresh them after address changes."""
+    """Publish Open Aria discovery records and refresh them after address changes."""
 
     def __init__(
         self,

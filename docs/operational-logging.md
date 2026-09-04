@@ -50,8 +50,8 @@ systemd 标识符固定为：
 - `rp-ylx-data-volume`
 
 默认日志级别是 `info`。长期运行时可通过 systemd override 设置
-`RP_YLX_LOG_LEVEL=debug|info|warning|error|critical`。非法值会回退到 `info` 并记录
-`log_level_defaulted`。
+`OPENARIA_LOG_LEVEL=debug|info|warning|error|critical`。非法值会回退到 `info` 并记录
+`log_level_defaulted`。`RP_YLX_LOG_LEVEL` 仍作为旧部署兼容别名读取。
 
 ## API 审计
 

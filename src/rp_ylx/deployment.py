@@ -441,7 +441,7 @@ def load_bundle(path: str | Path) -> Bundle:
         raise DeploymentError("bundle_invalid", "application wheel 不在 bundle 中")
     application_wheels = [name for name in seen if name.casefold().startswith("rp_ylx-")]
     if len(application_wheels) != 1 or application_wheels[0] != value["application_wheel"]:
-        raise DeploymentError("bundle_invalid", "bundle 必须包含唯一 RP-YLX application wheel")
+        raise DeploymentError("bundle_invalid", "bundle 必须包含唯一 Open Aria application wheel")
     wheel_commit, wheel_version = _wheel_identity(root / value["application_wheel"])
     if wheel_commit != commit or wheel_version != value["version"]:
         raise DeploymentError("bundle_invalid", "bundle commit 与 application wheel 不一致")
@@ -2375,7 +2375,9 @@ class ReleaseManager:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rp-ylx-deploy", description="RP-YLX RDK X5 部署工具")
+    parser = argparse.ArgumentParser(
+        prog="openaria-deploy", description="Open Aria RDK X5 部署工具"
+    )
     parser.add_argument("--install-root", type=Path, default=Path("/opt/rp-ylx"))
     parser.add_argument("--config-root", type=Path, default=Path("/etc/rp-ylx"))
     parser.add_argument("--state-root", type=Path, default=Path("/var/lib/rp-ylx"))

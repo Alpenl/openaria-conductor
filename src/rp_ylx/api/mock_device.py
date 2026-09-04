@@ -84,7 +84,7 @@ class MockDevice:
         self,
         *,
         device_id: str = "rp-ylx-mock",
-        label: str = "RP-YLX 模拟设备",
+        label: str = "Open Aria 模拟设备",
         model: str = "mock",
         software_version: str = "0.1.0",
         free_bytes: int = 64 * 1024 * 1024 * 1024,

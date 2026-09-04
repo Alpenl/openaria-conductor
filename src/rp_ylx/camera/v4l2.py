@@ -257,41 +257,6 @@ def split_sbs_mjpeg(payload: bytes, width: int, height: int) -> tuple[bytes, byt
     return _reencode_sbs_jpeg(payload, width, height)
 
 
-def split_sbs_mjpeg_native(payload: bytes, width: int, height: int) -> tuple[bytes, bytes]:
-    """生产 60 FPS 拆分，只允许原始双 JPEG 或 TurboJPEG 无损裁剪。"""
-
-    if not payload:
-        raise CameraError("bad_frame", "V4L2 返回空图像缓冲区")
-    ranges = _jpeg_markers(payload)
-    if len(ranges) == 2:
-        left_start, left_end = ranges[0]
-        right_start, right_end = ranges[1]
-        return payload[left_start:left_end], payload[right_start:right_end]
-    if len(ranges) != 1:
-        raise CameraError("bad_frame", "V4L2 图像缓冲区不是单张或双张完整 JPEG")
-    start, end = ranges[0]
-    trailing = payload[end:]
-    selected = payload[start:end] if start != 0 or trailing.strip(b"\x00") else payload
-    dimensions = _jpeg_dimensions(selected)
-    if dimensions is not None and dimensions != (width, height):
-        raise CameraError(
-            "bad_frame",
-            f"JPEG 尺寸为 {dimensions[0]}x{dimensions[1]}，期望 {width}x{height}",
-        )
-    lossless = (
-        lossless_crop_sbs_jpeg(selected, width, height)
-        if width > 0 and height > 0 and width % 2 == 0
-        else None
-    )
-    eye_dimensions = (width // 2, height)
-    if lossless is not None and all(_jpeg_dimensions(eye) == eye_dimensions for eye in lossless):
-        return lossless
-    raise CameraError(
-        "native_split_unavailable",
-        "正式 60 FPS 路径需要可用的 TurboJPEG 无损裁剪，不允许 Pillow 回退",
-    )
-
-
 def parse_v4l2_formats(output: str) -> tuple[CameraMode, ...]:
     encoding: str | None = None
     size: tuple[int, int] | None = None

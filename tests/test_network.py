@@ -787,7 +787,7 @@ class NetworkCliTest(unittest.TestCase):
     def test_apply_rejects_invalid_or_overexposed_config_without_side_effects(self) -> None:
         cases = [
             '{"mode":"wifi-client","ssid":"Lab","psk":"secret123","extra":true}',
-            '{"mode":"hotspot","ssid":"RP-YLX"}',
+            '{"mode":"hotspot","ssid":"OpenAria"}',
             '{"mode":"ethernet-static","address":"10.42.0.20/24"}',
             '{"mode":"unsupported"}',
         ]
@@ -984,7 +984,7 @@ class NetworkCliTest(unittest.TestCase):
         cases = [
             (
                 "hotspot",
-                {"mode": "hotspot", "ssid": "RP-YLX", "psk": "hotspot-secret"},
+                {"mode": "hotspot", "ssid": "OpenAria", "psk": "hotspot-secret"},
                 ["mode=ap", "address1=10.42.0.1/24", "autoconnect-priority=100"],
             ),
             (
@@ -1388,7 +1388,7 @@ method=disabled
 
         repair_code, repair, repair_error = self.run_cli(
             ["network", "apply", "--request-id", "repair-hotspot", "--config", "-"],
-            stdin='{"mode":"hotspot","ssid":"RP-YLX","psk":"repair-secret"}',
+            stdin='{"mode":"hotspot","ssid":"OpenAria","psk":"repair-secret"}',
             nmcli=nmcli,
         )
 
