@@ -1,5 +1,5 @@
 [Unit]
-Description=RP-YLX /data internal recording volume
+Description=Open Aria /data internal recording volume
 DefaultDependencies=no
 Requires=rp-ylx-recover.service
 After=local-fs.target rp-ylx-recover.service

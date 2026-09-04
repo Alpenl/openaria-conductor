@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from rp_ylx.performance import PerformanceReportError, validate_performance_report
+from rp_ylx.performance.report import PerformanceReportError, validate_performance_report
 
 
 def report() -> dict[str, object]:

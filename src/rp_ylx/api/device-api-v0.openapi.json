@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "RP-YLX 设备 API",
+    "title": "Open Aria 设备 API",
     "version": "v0",
     "description": "设备状态、录制控制、事件和有界实时预览接口。"
   },

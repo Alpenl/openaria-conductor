@@ -16,7 +16,7 @@ from rp_ylx.hardware import HardwareSmokeError
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.network_control import NetworkControlClientError
 from rp_ylx.operational_logging import reset_operational_logging
-from rp_ylx.performance import BenchmarkError
+from rp_ylx.performance.benchmark import BenchmarkError
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -359,7 +359,7 @@ class CliTest(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(main(["--version"]), 0)
-        self.assertEqual(output.getvalue().strip(), f"rp-ylx {__version__} ({__commit__})")
+        self.assertEqual(output.getvalue().strip(), f"Open Aria {__version__} ({__commit__})")
 
     def test_status_runs_without_hardware(self) -> None:
         output = io.StringIO()
@@ -373,6 +373,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(main(["status"]), 0)
         status = json.loads(output.getvalue())
         self.assertEqual(status["commit"], __commit__)
+        self.assertEqual(status["service"], "openaria")
         self.assertEqual(status["hardware"], "not-probed")
         self.assertEqual(status["recording"], "idle")
         self.assertEqual(status["native"]["adapter"], "python")

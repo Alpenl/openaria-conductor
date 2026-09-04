@@ -15,7 +15,7 @@ from rp_ylx.camera import (
     SyntheticCameraBackend,
 )
 from rp_ylx.native import NativeModuleError
-from rp_ylx.performance import PerformanceMetrics
+from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import RecordingConfig, SessionRecorder
 from tests.test_camera import MODE
 

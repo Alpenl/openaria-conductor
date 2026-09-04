@@ -123,8 +123,9 @@ class InstalledWheelTest(unittest.TestCase):
                     text=True,
                 )
                 python = virtual_environment / "bin" / "python"
-                executable = virtual_environment / "bin" / "rp-ylx"
-                spectacular = virtual_environment / "bin" / "rp-ylx-spectacular-check"
+                executable = virtual_environment / "bin" / "openaria"
+                legacy_executable = virtual_environment / "bin" / "rp-ylx"
+                spectacular = virtual_environment / "bin" / "openaria-spectacular-check"
                 subprocess.run(
                     [uv, "pip", "install", "--python", str(python), str(wheel)],
                     cwd=external_root,
@@ -136,6 +137,14 @@ class InstalledWheelTest(unittest.TestCase):
 
                 version = subprocess.run(
                     [str(executable), "--version"],
+                    cwd=external_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                legacy_version = subprocess.run(
+                    [str(legacy_executable), "--version"],
                     cwd=external_root,
                     env=environment,
                     check=True,
@@ -231,8 +240,9 @@ class InstalledWheelTest(unittest.TestCase):
                     ).stdout
                 )
 
-                self.assertEqual(version, f"rp-ylx 0.1.0 ({expected_commit})")
-                self.assertIn("usage: rp-ylx-spectacular-check", spectacular_help)
+                self.assertEqual(version, f"Open Aria 0.1.0 ({expected_commit})")
+                self.assertEqual(legacy_version, version)
+                self.assertIn("usage: openaria-spectacular-check", spectacular_help)
                 self.assertEqual(status["commit"], expected_commit)
                 self.assertEqual(status["native"]["adapter"], "rust")
                 self.assertTrue(status["native"]["module_available"])

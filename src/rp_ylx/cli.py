@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
 
-from rp_ylx import __commit__, __version__
+from rp_ylx import PRODUCT_NAME, __commit__, __version__
 from rp_ylx.api import CameraPreviewPump, MockDevice, create_server
 from rp_ylx.camera import CameraController, CameraError, CameraMode, V4L2DiscoveryBackend
 from rp_ylx.cli_helpers import stable_id_for_device
@@ -40,7 +40,7 @@ def _print_network_error(exc: NetworkError) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rp-ylx", description="RP-YLX 设备端录制程序")
+    parser = argparse.ArgumentParser(prog="openaria", description="Open Aria 设备端录制程序")
     parser.add_argument("--version", action="store_true", help="输出版本和提交标识")
     subcommands = parser.add_subparsers(dest="command")
     subcommands.add_parser("status", help="输出本机可用能力")
@@ -146,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version:
-        print(f"rp-ylx {__version__} ({__commit__})")
+        print(f"{PRODUCT_NAME} {__version__} ({__commit__})")
         return 0
     if args.command == "status":
         try:
@@ -163,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "service": "rp-ylx",
+                    "service": "openaria",
                     "version": __version__,
                     "commit": __commit__,
                     "hardware": "not-probed",
@@ -184,7 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(rendered, end="")
         return 0
     if args.command == "benchmark":
-        from rp_ylx.performance import BenchmarkConfig, BenchmarkError, run_benchmark
+        from rp_ylx.performance.benchmark import BenchmarkConfig, BenchmarkError, run_benchmark
 
         try:
             report = run_benchmark(
@@ -272,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.fault:
             device.set_fault(args.fault, "命令行配置的模拟故障")
         server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
-        print(f"RP-YLX mock API: http://{args.host}:{server.server_port}/api/v0")
+        print(f"{PRODUCT_NAME} mock API: http://{args.host}:{server.server_port}/api/v0")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -291,7 +291,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             pump = CameraPreviewPump(device, controller, mode, stable_id=stable_id)
             pump.start()
             server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
-            print(f"RP-YLX hardware preview API: http://{args.host}:{server.server_port}/api/v0")
+            print(
+                f"{PRODUCT_NAME} hardware preview API: "
+                f"http://{args.host}:{server.server_port}/api/v0"
+            )
             with suppress(KeyboardInterrupt):
                 server.serve_forever()
         except (CameraError, OSError, RuntimeError, ValueError) as exc:

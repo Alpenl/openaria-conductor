@@ -12,11 +12,13 @@ from unittest.mock import patch
 from rp_ylx.camera import CameraMode
 from rp_ylx.camera.models import StereoFrame
 from rp_ylx.native import NativeCapabilities
-from rp_ylx.performance import BenchmarkConfig, BenchmarkError, run_benchmark
 from rp_ylx.performance.benchmark import (
+    BenchmarkConfig,
+    BenchmarkError,
     _ExactCameraBackend,
     _preview_pair_for_frame,
     _run_native_continuous_hardware,
+    run_benchmark,
 )
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.performance.report import validate_performance_report
