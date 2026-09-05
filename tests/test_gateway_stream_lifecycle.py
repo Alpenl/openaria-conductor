@@ -19,6 +19,7 @@ from rp_ylx.api.events import EventReplayBuffer
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.api.security import Principal, SecurityPolicy
+from tests.test_gateway import NETWORK_STATUS
 
 AUTHORITY_EPOCH = "4fa85f64-5717-4562-b3fc-2c963f66afa6"
 PREVIEW_JPEG = b"\xff\xd8frozen-preview\xff\xd9"
@@ -64,6 +65,10 @@ SNAPSHOT_EVENT = {
                 "default_route": "wired",
             },
             "live_imu": None,
+            "camera": {
+                "schema": "ylx.camera-connection.v1",
+                "state": "connected",
+            },
             "camera_focus": None,
         },
     },
@@ -88,6 +93,9 @@ class _LifecycleProvider:
             "source_revision": 1,
             "snapshot": deepcopy(SNAPSHOT_EVENT["data"]),
         }
+
+    def network_status(self) -> dict[str, object]:
+        return deepcopy(NETWORK_STATUS)
 
 
 class _RawStreamClient:
@@ -150,6 +158,7 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
                 "getCaptureStatus": None,
                 "getPreview": None,
                 "streamCaptureEvents": None,
+                "streamNetworkEvents": None,
             },
         )
         self.event_buffer = EventReplayBuffer()
@@ -236,6 +245,21 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
         )
         return client, response
 
+    def open_network_events(
+        self,
+        *,
+        tls: bool = False,
+        last_event_id: str | None = None,
+    ) -> tuple[_RawStreamClient, bytes]:
+        client = _RawStreamClient(self.server.server_port, tls=tls)
+        response = client.request_stream(
+            "/api/v4/network/events",
+            "text/event-stream",
+            b"\n\n",
+            last_event_id=last_event_id,
+        )
+        return client, response
+
     def assert_ok(self, response: bytes) -> None:
         self.assertTrue(response.startswith(b"HTTP/1.1 200 "), response[:200])
 
@@ -310,6 +334,49 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
         self.assertEqual(snapshot["rejected"], 0)
         self.assertGreaterEqual(snapshot["close_reasons"].get("peer_disconnect", 0), 2)
 
+    def test_network_sse_abort_reconnects_without_waiting_for_poll_or_heartbeat(self) -> None:
+        self.start()
+        first, first_response = self.open_network_events()
+        self.assert_ok(first_response)
+
+        started = time.monotonic()
+        first.abort()
+        second, second_response = self.open_network_events()
+        elapsed = time.monotonic() - started
+        try:
+            self.assert_ok(second_response)
+            self.assertLess(elapsed, 0.25)
+        finally:
+            second.abort()
+        self.wait_for_no_streams()
+
+        snapshot = self.server.stream_lifecycle_snapshot()["sse"]
+        self.assertEqual(snapshot["rejected"], 0)
+        self.assertGreaterEqual(snapshot["close_reasons"].get("peer_disconnect", 0), 2)
+
+    def test_capture_and_network_sse_share_one_capacity_owner(self) -> None:
+        self.start()
+        capture, capture_response = self.open_events()
+        self.assert_ok(capture_response)
+        blocked, blocked_response = self.open_network_events()
+        try:
+            self.assertTrue(blocked_response.startswith(b"HTTP/1.1 503 "), blocked_response[:200])
+            headers = blocked_response.partition(b"\r\n\r\n")[0].lower()
+            self.assertIn(b"retry-after: 1\r\n", headers + b"\r\n")
+        finally:
+            blocked.abort()
+            capture.abort()
+
+        network, network_response = self.open_network_events()
+        try:
+            self.assert_ok(network_response)
+            snapshot = self.server.stream_lifecycle_snapshot()["sse"]
+            self.assertEqual(snapshot["active"], 1)
+            self.assertEqual(snapshot["capacity"], 1)
+        finally:
+            network.abort()
+        self.wait_for_no_streams()
+
     def test_capture_sse_last_event_id_replays_only_disconnected_interval(self) -> None:
         self.start()
         first, first_response = self.open_events()
@@ -334,7 +401,7 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
 
     def test_customer_tls_preview_and_sse_abort_reconnect_immediately(self) -> None:
         self.start(tls=True)
-        for opener in (self.open_preview, self.open_events):
+        for opener in (self.open_preview, self.open_events, self.open_network_events):
             with self.subTest(stream=opener.__name__):
                 first, first_response = opener(tls=True)
                 self.assert_ok(first_response)
@@ -376,7 +443,7 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
 
     def test_capacity_errors_are_retryable_503_with_retry_after(self) -> None:
         self.start()
-        for opener in (self.open_preview, self.open_events):
+        for opener in (self.open_preview, self.open_events, self.open_network_events):
             with self.subTest(stream=opener.__name__):
                 active, active_response = opener()
                 self.assert_ok(active_response)
@@ -396,8 +463,9 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
         self.start()
         baseline_fds = len(os.listdir("/proc/self/fd"))
         baseline_threads = threading.active_count()
+        openers = (self.open_preview, self.open_events, self.open_network_events)
         for index in range(1000):
-            opener = self.open_preview if index % 2 == 0 else self.open_events
+            opener = openers[index % len(openers)]
             client, response = opener()
             self.assert_ok(response)
             client.abort()
