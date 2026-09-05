@@ -654,6 +654,18 @@ fn start_control_worker(
     })
 }
 
+fn reap_finished(handlers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handler = handlers.swap_remove(index);
+            let _ = handler.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn main() -> Result<(), AnyError> {
     let arguments = Arguments::parse()?;
     let tls = match (&arguments.certificate, &arguments.private_key) {
@@ -676,6 +688,7 @@ fn main() -> Result<(), AnyError> {
 
     let mut handlers = Vec::new();
     while !state.shutdown.load(Ordering::Acquire) {
+        reap_finished(&mut handlers);
         match listener.accept() {
             Ok((stream, _)) => {
                 state.accepted_connections.fetch_add(1, Ordering::Relaxed);
