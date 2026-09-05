@@ -30,7 +30,7 @@ jobs:
           uv venv --no-project /tmp/rp-ylx-wheel-venv
           uv pip install --python /tmp/rp-ylx-wheel-venv/bin/python dist/*.whl
           build_info="$(cd /tmp && /tmp/rp-ylx-wheel-venv/bin/rp-ylx --version)"
-          test "$build_info" = "Open Aria 0.1.0 ($GITHUB_SHA)"
+          test "$build_info" = "rp-ylx 0.1.0 ($GITHUB_SHA)"
           printf '%s\n' "$build_info" > dist/build-info.txt
       - uses: actions/upload-artifact@v7
         with:
