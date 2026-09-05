@@ -285,20 +285,9 @@ class FakeSplitEyeEncoder:
         )
 
 
-class FakeNativeSessionIo:
+class FakeNativeSessionStore:
     def __init__(self) -> None:
-        self.artifact_calls: list[tuple[str, list[str]]] = []
         self.verify_calls: list[tuple[int, int, str]] = []
-
-    def device_session_v1_artifacts(
-        self,
-        manifest: bytes,
-        session_id: str,
-    ) -> list[dict[str, object]]:
-        decoded = json.loads(manifest)
-        artifacts = list(iter_device_session_v1_artifacts(decoded))
-        self.artifact_calls.append((session_id, [str(item["path"]) for item in artifacts]))
-        return artifacts
 
     def verify_fd(
         self,
@@ -2278,15 +2267,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_list_sessions_uses_native_artifact_scan_for_total_bytes(self) -> None:
+    def test_list_sessions_uses_session_store_for_artifact_verification(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="native-list-scan")
         finally:
             first.close()
 
-        native = FakeNativeSessionIo()
-        with patch("rp_ylx.recording.device_session._session_io_or_none", return_value=native):
+        native = FakeNativeSessionStore()
+        with patch("rp_ylx.recording.device_session._session_store_or_none", return_value=native):
             restarted = self.coordinator()
             try:
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
@@ -2297,12 +2286,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         manifest = json.loads(
             (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
         )
-        expected_paths = [str(item["path"]) for item in iter_device_session_v1_artifacts(manifest)]
-        self.assertGreaterEqual(len(native.artifact_calls), 2)
-        self.assertTrue(
-            all(call_session == session_id for call_session, _ in native.artifact_calls)
-        )
-        self.assertIn(expected_paths, [paths for _, paths in native.artifact_calls])
+        self.assertGreater(len(native.verify_calls), 0)
         self.assertEqual(
             listed["items"][0]["total_bytes"],
             sum(int(item["bytes"]) for item in iter_device_session_v1_artifacts(manifest)),

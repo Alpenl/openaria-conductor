@@ -4,6 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct QueueStats {
     pub(crate) capacity: usize,
     pub(crate) depth: usize,
@@ -30,6 +31,7 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
+    #[cfg(test)]
     fn stats(&self) -> QueueStats {
         let state = self.state.lock().unwrap();
         QueueStats {
@@ -142,6 +144,7 @@ impl<T> Consumer<T> {
         Ok(value)
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> QueueStats {
         self.shared.stats()
     }

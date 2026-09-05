@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 const WRITE_BACKPRESSURE: &str = "write_backpressure";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +130,7 @@ impl ActiveTakeWriter {
         Ok(self.snapshot())
     }
 
+    #[cfg(test)]
     pub(crate) fn reject_frame(
         &mut self,
         frame: ReservedFrame,
@@ -168,6 +170,7 @@ impl ActiveTakeWriter {
         }
     }
 
+    #[cfg(test)]
     fn record_drop(
         &mut self,
         start_frame: u64,
@@ -234,6 +237,7 @@ impl ActiveTakeWriter {
     }
 }
 
+#[cfg(test)]
 fn validate_elapsed(value: f64, name: &str) -> Result<(), ActiveTakeError> {
     if value.is_finite() && value >= 0.0 {
         Ok(())

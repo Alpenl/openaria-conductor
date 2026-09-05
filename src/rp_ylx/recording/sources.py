@@ -10,16 +10,12 @@ from pathlib import Path
 from typing import Protocol
 
 from rp_ylx.api.preview import LatestPreviewBuffer
-from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
+from rp_ylx.camera import CameraError, CameraMode, FrameObservation
 from rp_ylx.imu import ImuObservation, decode_native_imu_observation
 from rp_ylx.native import (
-    NativeCamera,
-    NativeContinuousCaptureRuntime,
-    NativeModuleError,
-    create_native_camera,
-    create_native_continuous_capture_runtime,
-    native_stream_camera_focus_status,
-    set_native_stream_camera_focus,
+    NativeCaptureEngine,
+    NativeCapturePlan,
+    create_native_capture_engine,
 )
 from rp_ylx.performance.metrics import PerformanceMetrics
 
@@ -56,11 +52,11 @@ class NativeContinuousCaptureSources:
 
     keeps_preview_after_stop = True
     supports_calibration_capture = True
+    requires_native_transaction = True
 
     def __init__(
         self,
         device: str,
-        imu_factory: Callable[[], CaptureImu],
         camera_mode: CameraMode,
         *,
         preview: LatestPreviewBuffer,
@@ -68,8 +64,9 @@ class NativeContinuousCaptureSources:
         frame_decimation: int = 1,
         buffer_count: int = 16,
         queue_capacity: int = 64,
-        require_native_imu: bool = True,
         metrics: PerformanceMetrics | None = None,
+        engine_factory: Callable[[NativeCapturePlan, object, object | None], NativeCaptureEngine]
+        | None = None,
     ) -> None:
         if read_timeout <= 0:
             raise ValueError("采集来源 read_timeout 必须大于零")
@@ -81,19 +78,17 @@ class NativeContinuousCaptureSources:
         if abs(camera_mode.fps - rounded_fps) > max(0.01, camera_mode.fps * 0.001):
             raise ValueError("原生连续采集只接受整数帧率")
         self._device = device
-        self._imu_factory = imu_factory
         self._camera_mode = camera_mode
         self._preview = preview
         self._read_timeout = read_timeout
         self._frame_decimation = frame_decimation
         self._buffer_count = buffer_count
         self._queue_capacity = queue_capacity
-        self._require_native_imu = require_native_imu
         self._metrics = metrics
+        self._engine_factory = engine_factory
         self._lock = threading.RLock()
-        self._runtime: NativeContinuousCaptureRuntime | None = None
-        self._camera: NativeCamera | None = None
-        self._recording: _RecordingTap | None = None
+        self._engine: NativeCaptureEngine | None = None
+        self._recording: _EngineRecording | None = None
         self._open_handles = 0
         self._last_preview_error: tuple[str, str] | None = None
 
@@ -109,17 +104,11 @@ class NativeContinuousCaptureSources:
 
     def latest_imu_observation(self) -> ImuObservation | None:
         with self._lock:
-            tap = self._recording
-            if tap is None:
-                return None
-            cached = tap.latest_imu
-            imu = tap.imu
-        if cached is not None:
-            return cached
-        latest = getattr(imu, "latest_observation", None)
-        if callable(latest):
-            return latest()
-        return None
+            engine = self._engine
+        if engine is None:
+            return None
+        raw = engine.latest_imu_observation()
+        return None if raw is None else decode_native_imu_observation(raw)
 
     def camera_connection_status(self) -> dict[str, object]:
         return {
@@ -128,83 +117,69 @@ class NativeContinuousCaptureSources:
         }
 
     def start_preview(self) -> None:
-        stale_runtime: NativeContinuousCaptureRuntime | None = None
-        stale_camera: NativeCamera | None = None
+        stale_engine: NativeCaptureEngine | None = None
         with self._lock:
-            runtime = self._runtime
-            if runtime is not None:
+            engine = self._engine
+            if engine is not None:
                 try:
-                    running = runtime.snapshot().get("running") is True
+                    running = engine.snapshot().get("running") is True
                 except BaseException:
                     running = False
                 if running or self._recording is not None:
                     return
-                stale_runtime = runtime
-                stale_camera = self._camera
-                self._runtime = None
-                self._camera = None
+                stale_engine = engine
+                self._engine = None
                 self._open_handles -= 1
-        if stale_runtime is not None:
+        if stale_engine is not None:
             with suppress(BaseException):
-                stale_runtime.close(self._read_timeout + 1.0)
-        if stale_camera is not None:
-            with suppress(BaseException):
-                stale_camera.close()
+                stale_engine.close(self._read_timeout + 1.0)
         native_preview = self._preview.native_owner
         if native_preview is None:
             raise RuntimeError("正式连续采集需要 Rust preview buffer")
         rounded_fps = round(self._camera_mode.fps)
-        camera: NativeCamera | None = None
-        runtime = None
+        plan = NativeCapturePlan(
+            device=self._device,
+            width=self._camera_mode.width,
+            height=self._camera_mode.height,
+            fps=rounded_fps,
+            encoding=self._camera_mode.encoding,
+            buffer_count=self._buffer_count,
+            queue_capacity=self._queue_capacity,
+            frame_decimation=self._frame_decimation,
+            read_timeout_seconds=self._read_timeout,
+            imu_timeout_seconds=self._read_timeout,
+        )
+        engine: NativeCaptureEngine | None = None
         try:
-            camera = create_native_camera(
-                self._device,
-                self._camera_mode.width,
-                self._camera_mode.height,
-                rounded_fps,
-                self._camera_mode.encoding,
-                buffer_count=self._buffer_count,
-                queue_capacity=self._queue_capacity,
-                split_eyes=False,
-            )
-            if self._metrics is None:
-                runtime = create_native_continuous_capture_runtime(
-                    camera,
+            if self._engine_factory is None:
+                engine = create_native_capture_engine(
+                    plan,
                     native_preview,
-                    self._frame_decimation,
-                    read_timeout_seconds=self._read_timeout,
+                    metrics=None if self._metrics is None else self._metrics.native_owner,
                 )
             else:
-                runtime = create_native_continuous_capture_runtime(
-                    camera,
+                engine = self._engine_factory(
+                    plan,
                     native_preview,
-                    self._frame_decimation,
-                    read_timeout_seconds=self._read_timeout,
-                    metrics=self._metrics.native_owner,
+                    None if self._metrics is None else self._metrics.native_owner,
                 )
-            runtime.start_preview()
+            engine.start_preview()
         except BaseException as error:
-            if runtime is not None:
+            if engine is not None:
                 with suppress(BaseException):
-                    runtime.close(self._read_timeout + 1.0)
-            if camera is not None:
-                with suppress(BaseException):
-                    camera.close()
+                    engine.close(self._read_timeout + 1.0)
             code = str(getattr(error, "code", "camera_preview_unavailable"))
             message = str(getattr(error, "message", error)) or code
             with self._lock:
                 self._last_preview_error = (code, message)
             raise
-        assert camera is not None and runtime is not None
+        assert engine is not None
         with self._lock:
-            if self._runtime is not None:
+            if self._engine is not None:
                 with suppress(BaseException):
-                    runtime.close(self._read_timeout + 1.0)
-                with suppress(BaseException):
-                    camera.close()
+                    engine.close(self._read_timeout + 1.0)
                 return
-            self._runtime = runtime
-            self._camera = camera
+            self._engine = engine
             self._open_handles += 1
             self._last_preview_error = None
 
@@ -220,275 +195,73 @@ class NativeContinuousCaptureSources:
     ) -> None:
         if mode not in {"production", "calibration"}:
             raise RuntimeError("采集模式无效")
-        native_split_targets = self._native_split_sink_targets(native_recorder)
-        if mode == "calibration" and native_split_targets is None:
-            raise RuntimeError("标定录制要求原生 split-eyes H.264 sink")
+        del submit_frame, submit_imu
+        transaction_factory = getattr(native_recorder, "native_recording_transaction", None)
+        if not callable(transaction_factory):
+            raise RuntimeError("正式录制要求 Rust SessionTransaction")
+        transaction = transaction_factory()
+        if transaction is None:
+            raise RuntimeError("Rust SessionTransaction 尚未启动")
         self.start_preview()
-        imu = self._imu_factory()
-        native_imu = getattr(imu, "native_owner", None)
-        if self._require_native_imu and native_imu is None:
-            with suppress(BaseException):
-                imu.close()
-            raise RuntimeError("正式连续采集需要 Rust IMU 采集器")
-        tap = _RecordingTap(
-            generation_id,
-            submit_frame,
-            submit_imu,
-            on_failure,
-            self._frame_decimation,
-            imu=imu,
-        )
-        thread = (
-            None
-            if native_imu is not None
-            else threading.Thread(
-                target=self._imu_loop,
-                args=(tap,),
-                name="rp-ylx-capture-imu",
-                daemon=False,
-            )
-        )
-        tap.imu_thread = thread
+        tap = _EngineRecording(generation_id, on_failure)
         with self._lock:
             if self._recording is not None:
-                with suppress(BaseException):
-                    imu.close()
                 raise RuntimeError("采集来源已经在录制")
-            runtime = self._runtime
-            if runtime is None:
-                with suppress(BaseException):
-                    imu.close()
-                raise RuntimeError("原生连续采集 runtime 未启动")
+            engine = self._engine
+            if engine is None:
+                raise RuntimeError("Rust CaptureEngine 未启动")
             self._recording = tap
             self._open_handles += 1
         try:
-            # A recording failure closes the Python tap immediately, while the
-            # native IMU worker is joined by stop_recording.  Normalize the
-            # runtime before installing the next native recording target so a
-            # failed session cannot poison the first retry.
-            runtime.stop_recording(self._read_timeout + 1.0)
-            if native_split_targets is not None:
-                active_take, sink, encoder, segment_planner, started_monotonic_ns = (
-                    native_split_targets
-                )
-                if native_imu is None:
-                    runtime.start_recording_split_sink(
-                        active_take,
-                        sink,
-                        encoder,
-                        segment_planner,
-                        started_monotonic_ns,
-                        lambda code, message: self._runtime_failure(tap, code, message),
-                    )
-                    assert thread is not None
-                    thread.start()
-                else:
-                    runtime.start_recording_split_sink(
-                        active_take,
-                        sink,
-                        encoder,
-                        segment_planner,
-                        started_monotonic_ns,
-                        lambda code, message: self._runtime_failure(tap, code, message),
-                        native_imu,
-                        self._read_timeout,
-                    )
-                return
-            if mode == "calibration":
-                raise RuntimeError("标定录制禁止回退到非 split-eyes H.264 路径")
-
-            def submit_native_frame(
-                source_sequence: int,
-                host_monotonic_ns: int,
-                dropped_before: int,
-                left: bytes,
-                right: bytes,
-                raw_side_by_side: bytes,
-            ) -> bool:
-                return self._submit_native_frame(
-                    tap,
-                    source_sequence,
-                    host_monotonic_ns,
-                    dropped_before,
-                    left,
-                    right,
-                    raw_side_by_side,
-                )
-
-            if native_imu is None:
-                runtime.start_recording(
-                    submit_native_frame,
-                    lambda code, message: self._runtime_failure(tap, code, message),
-                )
-                assert thread is not None
-                thread.start()
-            else:
-
-                def submit_native_imu(raw: object) -> bool:
-                    return self._submit_native_imu(tap, raw)
-
-                runtime.start_recording(
-                    submit_native_frame,
-                    lambda code, message: self._runtime_failure(tap, code, message),
-                    native_imu,
-                    submit_native_imu,
-                    self._read_timeout,
-                )
+            engine.start_recording(
+                transaction,
+                lambda code, message: self._runtime_failure(tap, code, message),
+            )
         except BaseException:
             with self._lock:
                 if self._recording is tap:
                     self._recording = None
                     self._open_handles -= 1
             with suppress(BaseException):
-                runtime.stop_recording(self._read_timeout + 1.0)
-            with suppress(BaseException):
-                imu.close()
+                engine.stop_recording(self._read_timeout + 1.0)
             raise
 
-    def _native_split_sink_targets(
-        self, native_recorder: object | None
-    ) -> tuple[object, object, object, object, int] | None:
-        if native_recorder is None:
-            return None
-        targets = getattr(native_recorder, "native_split_sink_targets", None)
-        if not callable(targets):
-            return None
-        result = targets()
-        if result is None:
-            return None
-        if not isinstance(result, tuple) or len(result) != 5:
-            raise RuntimeError("原生 split sink 目标无效")
-        started_monotonic_ns = result[4]
-        if not isinstance(started_monotonic_ns, int) or started_monotonic_ns <= 0:
-            raise RuntimeError("原生 split sink 起始时间无效")
-        return result
-
-    def _submit_native_frame(
-        self,
-        tap: _RecordingTap,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        dropped_before: int,
-        left: bytes,
-        right: bytes,
-        raw_side_by_side: bytes,
-    ) -> bool:
-        if self._recording_snapshot() is not tap:
-            return False
-        observation = FrameObservation(
-            StereoFrame(
-                source_sequence,
-                host_monotonic_ns,
-                left,
-                right,
-                True,
-                raw_side_by_side,
-            ),
-            dropped_before=dropped_before,
-        )
-        return tap.submit_frame(observation)
-
-    def _submit_native_imu(self, tap: _RecordingTap, raw: object) -> bool:
-        if self._recording_snapshot() is not tap:
-            return False
-        observation = decode_native_imu_observation(raw)
-        with self._lock:
-            if self._recording is tap:
-                tap.latest_imu = observation
-        if self._recording_snapshot() is not tap:
-            return False
-        return tap.submit_imu(observation)
-
-    def _runtime_failure(self, tap: _RecordingTap, code: object, message: object) -> None:
+    def _runtime_failure(self, tap: _EngineRecording, code: object, message: object) -> None:
         failure_code = str(code)
         failure_message = str(message) or failure_code
         with self._lock:
             if self._recording is tap:
                 self._recording = None
+                self._open_handles -= 1
             self._last_preview_error = (failure_code, failure_message)
-        self._release_recording_imu(tap)
         tap.on_failure(failure_code, failure_message)
-
-    def _recording_snapshot(self) -> _RecordingTap | None:
-        with self._lock:
-            return self._recording
-
-    def _imu_loop(self, tap: _RecordingTap) -> None:
-        assert tap.imu is not None
-        try:
-            while self._recording_snapshot() is tap:
-                observation = tap.imu.read(timeout=self._read_timeout)
-                if self._recording_snapshot() is not tap:
-                    break
-                with self._lock:
-                    if self._recording is tap:
-                        tap.latest_imu = observation
-                tap.submit_imu(observation)
-        except BaseException as error:
-            if self._recording_snapshot() is tap:
-                self._runtime_failure(
-                    tap,
-                    str(getattr(error, "code", "imu_failed")),
-                    str(getattr(error, "message", error)) or "imu_failed",
-                )
-        finally:
-            self._release_recording_imu(tap)
-
-    def _release_recording_imu(self, tap: _RecordingTap) -> None:
-        with self._lock:
-            imu = tap.imu
-            if imu is None:
-                return
-            if self._recording is tap:
-                self._recording = None
-            tap.imu = None
-            tap.imu_thread = None
-            self._open_handles -= 1
-        with suppress(BaseException):
-            imu.close()
 
     def stop(self) -> None:
         with self._lock:
             tap = self._recording
             self._recording = None
-            runtime = self._runtime
-        if runtime is not None:
-            runtime.stop_recording(self._read_timeout + 1.0)
-        if tap is None:
-            return
-        if tap.imu is not None:
-            with suppress(BaseException):
-                tap.imu.close()
-        thread = tap.imu_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=self._read_timeout + 1.0)
-            if thread.is_alive():
-                raise RuntimeError("IMU 采集线程未能在关闭期限内退出")
-        if tap.imu is not None:
-            self._release_recording_imu(tap)
+            engine = self._engine
+            if tap is not None:
+                self._open_handles -= 1
+        if engine is not None:
+            engine.stop_recording(self._read_timeout + 1.0)
 
-    def _camera_for_control(self) -> NativeCamera:
+    def _engine_for_control(self) -> NativeCaptureEngine:
         self.start_preview()
         with self._lock:
-            camera = self._camera
-        if camera is None:
-            raise RuntimeError("原生预览相机尚未启动")
-        return camera
+            engine = self._engine
+        if engine is None:
+            raise RuntimeError("Rust CaptureEngine 尚未启动")
+        return engine
 
     def camera_focus_status(self) -> dict[str, object] | None:
         try:
-            return native_stream_camera_focus_status(self._camera_for_control())
-        except NativeModuleError as error:
-            if error.code in {
-                "native_focus_unavailable",
-                "native_import_failed",
-                "native_dependency_missing",
-                "unsupported_native_abi",
-                "missing_native_capability",
-                "camera_focus_unsupported",
-            }:
+            return self._engine_for_control().camera_focus_status()
+        except RuntimeError as error:
+            code = str(error).partition(": ")[0]
+            if code == "camera_focus_unsupported":
                 return None
-            raise CameraError(error.code, error.message, retryable=True) from error
+            raise CameraError(code, str(error), retryable=True) from error
 
     def set_camera_focus(
         self,
@@ -497,13 +270,10 @@ class NativeContinuousCaptureSources:
         auto_enabled: bool | None = None,
     ) -> dict[str, object]:
         try:
-            return set_native_stream_camera_focus(
-                self._camera_for_control(),
-                value=value,
-                auto_enabled=auto_enabled,
-            )
-        except NativeModuleError as error:
-            retryable = error.code in {
+            return self._engine_for_control().set_camera_focus(value, auto_enabled)
+        except RuntimeError as error:
+            code = str(error).partition(": ")[0]
+            retryable = code in {
                 "camera_focus_open_failed",
                 "camera_focus_get_failed",
                 "camera_focus_set_failed",
@@ -511,24 +281,25 @@ class NativeContinuousCaptureSources:
                 "native_focus_status_failed",
                 "native_focus_set_failed",
             }
-            raise CameraError(error.code, error.message, retryable=retryable) from error
+            raise CameraError(code, str(error), retryable=retryable) from error
 
     def close(self) -> None:
         with suppress(BaseException):
             self.stop()
         with self._lock:
-            runtime = self._runtime
-            camera = self._camera
-            self._runtime = None
-            self._camera = None
-            if runtime is not None:
+            engine = self._engine
+            self._engine = None
+            if engine is not None:
                 self._open_handles -= 1
-        if runtime is not None:
+        if engine is not None:
             with suppress(BaseException):
-                runtime.close(self._read_timeout + 1.0)
-        if camera is not None:
-            with suppress(BaseException):
-                camera.close()
+                engine.close(self._read_timeout + 1.0)
+
+
+@dataclass(slots=True)
+class _EngineRecording:
+    generation_id: str
+    on_failure: Callable[[str, str], None]
 
 
 @dataclass(slots=True)

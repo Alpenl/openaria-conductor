@@ -23,7 +23,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 from rp_ylx.native import (
-    native_session_io_or_none as _session_io_or_none,
+    native_session_store_or_none as _session_store_or_none,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -68,8 +68,6 @@ _RECORDING_SESSION_VALIDATOR = Draft202012Validator(
     _RECORDING_SESSION_SCHEMA,
     format_checker=FormatChecker(),
 )
-_DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
-_DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
 _VALIDATED_MANIFEST_CACHE_LIMIT = 32
 _VALIDATED_MANIFEST_CACHE_LOCK = threading.Lock()
 _VALIDATED_MANIFEST_CACHE: OrderedDict[tuple[str, str, str], Mapping[str, object]] = OrderedDict()
@@ -219,7 +217,7 @@ class LockedBytes:
         self._assert_unchanged()
         available = max(0, self.size - offset)
         selected = available if length is None else min(length, available)
-        native = _session_io_or_none()
+        native = _session_store_or_none()
         if native is not None:
             sent = native.sendfile(output_descriptor, self._descriptor, offset, selected)
             if not isinstance(sent, int) or sent != selected:
@@ -387,91 +385,20 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
     return first, min(last, complete_size - 1)
 
 
-def _native_device_session_v1_artifact_descriptors(
-    manifest_bytes: bytes,
-    session_id: str,
-    manifest: Mapping[str, object],
-) -> dict[str, ArtifactDescriptor] | None:
-    if manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
-        return None
-    summary = _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
-    if summary is not None:
-        raw_artifacts = summary["artifacts"]
-        if not isinstance(raw_artifacts, list):
-            raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
-        return _artifact_descriptors_from_raw(raw_artifacts, legacy=False, path_validated=True)
-    global _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE
-    if _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE:
-        return None
-    native = _session_io_or_none()
-    if native is None:
-        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
-        return None
-    read_artifacts = getattr(native, "device_session_v1_artifacts", None)
-    if not callable(read_artifacts):
-        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
-        return None
-    try:
-        raw_descriptors = read_artifacts(manifest_bytes, session_id)
-    except AttributeError:
-        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
-        return None
-    except BaseException as error:
-        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效") from error
-    if not isinstance(raw_descriptors, list):
-        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
-    return _artifact_descriptors_from_raw(raw_descriptors, legacy=False, path_validated=True)
-
-
 def device_session_v1_summary(
     manifest_bytes: bytes,
     session_id: str,
     manifest: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return the sealed Device Session summary, preferring Rust's v1 manifest fast path."""
+    """Return the sealed Device Session summary from the Python contract owner."""
 
     if manifest is None:
         manifest = _validated_manifest(manifest_bytes, session_id, "v3")
-    native_summary = (
-        _native_device_session_v1_summary(manifest_bytes, session_id, manifest)
-        if manifest.get("schema") == _DEVICE_SESSION_V1_SCHEMA_ID
-        else None
-    )
-    if native_summary is not None:
-        return native_summary
     return _device_session_v1_summary_python(
         manifest,
         manifest_bytes=manifest_bytes,
         session_id=session_id,
     )
-
-
-def _native_device_session_v1_summary(
-    manifest_bytes: bytes,
-    session_id: str,
-    manifest: Mapping[str, object] | None,
-) -> dict[str, object] | None:
-    if manifest is not None and manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
-        return None
-    global _DEVICE_SESSION_SUMMARY_UNAVAILABLE
-    if _DEVICE_SESSION_SUMMARY_UNAVAILABLE:
-        return None
-    native = _session_io_or_none()
-    if native is None:
-        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
-        return None
-    read_summary = getattr(native, "device_session_v1_summary", None)
-    if not callable(read_summary):
-        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
-        return None
-    try:
-        raw_summary = read_summary(manifest_bytes, session_id)
-    except AttributeError:
-        _DEVICE_SESSION_SUMMARY_UNAVAILABLE = True
-        return None
-    except BaseException as error:
-        raise ArtifactAccessError("not_verified", "manifest summary 无效") from error
-    return _coerce_device_session_v1_summary(raw_summary, session_id)
 
 
 def _device_session_v1_summary_python(
@@ -535,107 +462,8 @@ def _device_session_v1_summary_python(
         raise ArtifactAccessError("not_verified", "manifest summary 无效") from error
 
 
-def _coerce_device_session_v1_summary(
-    raw_summary: object,
-    session_id: str,
-) -> dict[str, object]:
-    if not isinstance(raw_summary, Mapping):
-        raise ArtifactAccessError("not_verified", "manifest summary 无效")
-    required = {
-        "session_id",
-        "display_name",
-        "started_at",
-        "ended_at",
-        "duration_seconds",
-        "frames_count",
-        "imu_sample_count",
-        "audio_sample_count",
-        "total_bytes",
-        "artifacts",
-    }
-    if not required.issubset(raw_summary):
-        raise ArtifactAccessError("not_verified", "manifest summary 字段缺失")
-    raw_artifacts = raw_summary["artifacts"]
-    if not isinstance(raw_artifacts, list):
-        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
-    descriptors = _artifact_descriptors_from_raw(
-        raw_artifacts,
-        legacy=False,
-        path_validated=True,
-    )
-    artifacts = _artifact_descriptor_payloads(descriptors)
-    total_bytes = _non_negative_int(raw_summary["total_bytes"], "manifest total_bytes 无效")
-    computed_total = sum(descriptor.bytes for descriptor in descriptors.values())
-    if total_bytes != computed_total:
-        raise ArtifactAccessError("not_verified", "manifest total_bytes 与 artifact 不一致")
-    selected_session_id = _string_value(raw_summary["session_id"], "manifest session_id 无效")
-    if selected_session_id != session_id:
-        raise ArtifactAccessError("not_verified", "manifest 会话身份不匹配")
-    audio_sample_count = raw_summary["audio_sample_count"]
-    if audio_sample_count is not None:
-        audio_sample_count = _non_negative_int(
-            audio_sample_count,
-            "manifest audio sample_count 无效",
-        )
-    return {
-        "session_id": selected_session_id,
-        "display_name": _string_value(
-            raw_summary["display_name"],
-            "manifest display_name 无效",
-        ),
-        "started_at": _string_value(raw_summary["started_at"], "manifest started_at 无效"),
-        "ended_at": _string_value(raw_summary["ended_at"], "manifest ended_at 无效"),
-        "duration_seconds": _non_negative_number(
-            raw_summary["duration_seconds"],
-            "manifest duration_seconds 无效",
-        ),
-        "frames_count": _non_negative_int(
-            raw_summary["frames_count"],
-            "manifest frames count 无效",
-        ),
-        "imu_sample_count": _non_negative_int(
-            raw_summary["imu_sample_count"],
-            "manifest imu sample_count 无效",
-        ),
-        "audio_sample_count": audio_sample_count,
-        "total_bytes": total_bytes,
-        "artifacts": artifacts,
-    }
-
-
-def _native_device_session_v1_artifact_descriptor(
-    manifest_bytes: bytes,
-    session_id: str,
-    manifest: Mapping[str, object],
-    artifact_id: str,
-) -> ArtifactDescriptor | None:
-    if manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS:
-        return None
-    global _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE
-    if _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE:
-        return None
-    native = _session_io_or_none()
-    if native is None:
-        _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = True
-        return None
-    read_artifact = getattr(native, "device_session_v1_artifact", None)
-    if not callable(read_artifact):
-        return None
-    try:
-        raw_descriptor = read_artifact(manifest_bytes, session_id, artifact_id)
-    except AttributeError:
-        return None
-    except BaseException as error:
-        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效") from error
-    if raw_descriptor is None:
-        return None
-    if not isinstance(raw_descriptor, Mapping):
-        raise ArtifactAccessError("not_verified", "manifest artifact 清单无效")
-    return _artifact_descriptor(raw_descriptor, legacy=False, path_validated=True)
-
-
 def _native_open_relative_regular(path: str, session_descriptor: int) -> int | None:
-    native = _session_io_or_none()
+    native = _session_store_or_none()
     if native is None:
         return None
     opener = getattr(native, "open_relative_regular", None)
@@ -654,8 +482,56 @@ def _native_open_relative_regular(path: str, session_descriptor: int) -> int | N
     return descriptor
 
 
+def _native_open_verified_artifact(
+    selected: ArtifactDescriptor,
+    session_descriptor: int,
+) -> tuple[int, _FileIdentity] | None:
+    native = _session_store_or_none()
+    if native is None:
+        return None
+    opener = getattr(native, "open_verified_artifact", None)
+    if not callable(opener):
+        return None
+    try:
+        result = opener(
+            session_descriptor,
+            selected.path,
+            selected.bytes,
+            selected.sha256,
+        )
+    except AttributeError:
+        return None
+    except BaseException as error:
+        raise ArtifactAccessError(
+            "not_verified", "manifest 声明的 artifact 不存在、已变化或不安全"
+        ) from error
+    if not isinstance(result, Mapping):
+        raise ArtifactAccessError("not_verified", "artifact native open 返回无效结果")
+    descriptor = result.get("descriptor")
+    raw_identity = result.get("identity")
+    if not isinstance(descriptor, int) or descriptor < 0 or not isinstance(raw_identity, Mapping):
+        if isinstance(descriptor, int) and descriptor >= 0:
+            os.close(descriptor)
+        raise ArtifactAccessError("not_verified", "artifact native open 返回无效结果")
+    try:
+        exclusive = _exclusive_regular_identity(descriptor)
+        expected_identity = {
+            "device": exclusive[0],
+            "inode": exclusive[1],
+            "size": exclusive[4],
+            "modified_ns": exclusive[5],
+            "nlink": exclusive[3],
+        }
+        if dict(raw_identity) != expected_identity or exclusive[4] != selected.bytes:
+            raise ArtifactAccessError("not_verified", "artifact native identity 与打开文件不一致")
+        return descriptor, _FileIdentity.read(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _native_read_bounded_file(descriptor: int, maximum_bytes: int) -> bytes | None:
-    native = _session_io_or_none()
+    native = _session_store_or_none()
     if native is None:
         return None
     reader = getattr(native, "read_bounded_fd", None)
@@ -782,34 +658,26 @@ class DirectorySessionStore:
                 raise ArtifactAccessError(
                     "not_verified", "当前 manifest 无法作为 sealed 会话使用"
                 ) from error
-            selected = _native_device_session_v1_artifact_descriptor(
-                manifest_bytes,
-                session_id,
-                manifest,
-                artifact_id,
-            )
-            if selected is None:
-                descriptors = _native_device_session_v1_artifact_descriptors(
-                    manifest_bytes,
-                    session_id,
-                    manifest,
-                )
-                if descriptors is None:
-                    descriptors = _artifact_descriptors(manifest)
-                selected = descriptors.get(artifact_id)
+            selected = _artifact_descriptors(manifest).get(artifact_id)
             if selected is None:
                 raise ArtifactAccessError("not_found", "artifact 不存在")
 
+            native_artifact = _native_open_verified_artifact(selected, owned[1])
             try:
-                artifact_descriptor = _open_relative_regular(selected.path, owned[1])
+                if native_artifact is None:
+                    artifact_descriptor = _open_relative_regular(selected.path, owned[1])
+                    try:
+                        identity = _verify_open_artifact_python(artifact_descriptor, selected)
+                    except BaseException:
+                        os.close(artifact_descriptor)
+                        raise
+                else:
+                    artifact_descriptor, identity = native_artifact
             except ArtifactAccessError as error:
                 raise ArtifactAccessError(
-                    "not_verified", "manifest 声明的 artifact 不存在或不安全"
+                    "not_verified", "manifest 声明的 artifact 不存在、已变化或不安全"
                 ) from error
             owned.append(artifact_descriptor)
-            identity = _FileIdentity.read(artifact_descriptor)
-            if identity.size != selected.bytes:
-                raise ArtifactAccessError("not_verified", "artifact 大小与 manifest 不一致")
             representation = LockedArtifact(
                 artifact_descriptor,
                 owned,
@@ -859,22 +727,11 @@ class DirectorySessionStore:
                 raise ArtifactAccessError(
                     "not_verified", "当前 manifest 无法作为 sealed 会话使用"
                 ) from error
-            descriptors = _native_device_session_v1_artifact_descriptors(
-                manifest_bytes,
-                session_id,
-                manifest,
-            )
-            if descriptors is None:
-                descriptors = _artifact_descriptors(manifest)
+            descriptors = _artifact_descriptors(manifest)
 
             artifact_identities: list[tuple[str, _ExclusiveFileIdentity]] = []
             for artifact_id, selected in descriptors.items():
-                try:
-                    artifact_descriptor = _open_relative_regular(selected.path, owned[1])
-                except ArtifactAccessError as error:
-                    raise ArtifactAccessError(
-                        "not_verified", "manifest 声明的 artifact 不存在或不安全"
-                    ) from error
+                artifact_descriptor = _open_relative_regular(selected.path, owned[1])
                 try:
                     identity = _exclusive_regular_identity(artifact_descriptor)
                 finally:
@@ -985,6 +842,30 @@ def _open_relative_regular(path: str, session_descriptor: int) -> int:
     except Exception:
         os.close(current)
         raise
+
+
+def _verify_open_artifact_python(
+    descriptor: int,
+    selected: ArtifactDescriptor,
+) -> _FileIdentity:
+    before = _exclusive_regular_identity(descriptor)
+    if before[4] != selected.bytes:
+        raise ArtifactAccessError("not_verified", "artifact 大小与 manifest 不一致")
+    digest = hashlib.sha256()
+    cursor = 0
+    while cursor < selected.bytes:
+        block = os.pread(descriptor, min(_READ_CHUNK, selected.bytes - cursor), cursor)
+        if not block:
+            raise ArtifactAccessError("not_verified", "artifact 在校验期间被截断")
+        digest.update(block)
+        cursor += len(block)
+    if os.pread(descriptor, 1, selected.bytes):
+        raise ArtifactAccessError("not_verified", "artifact 在校验期间增长")
+    if _exclusive_regular_identity(descriptor) != before:
+        raise ArtifactAccessError("not_verified", "artifact 在校验期间发生变化")
+    if digest.hexdigest() != selected.sha256:
+        raise ArtifactAccessError("not_verified", "artifact 摘要与 manifest 不一致")
+    return _FileIdentity.read(descriptor)
 
 
 def _safe_relative_components(path: str) -> list[str]:

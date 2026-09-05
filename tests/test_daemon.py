@@ -28,20 +28,9 @@ from rp_ylx.native import NativeCapabilities
 
 PRODUCTION_NATIVE_FEATURES = (
     "capability_probe",
-    "native_camera",
+    "capture_engine",
     "native_audio",
-    "native_imu",
-    "recording_sink",
-    "recording_imu_batch",
-    "active_take_writer",
-    "continuous_capture_runtime",
-    "continuous_capture_split_sink",
-    "recording_segment_planner",
-    "artifact_finalize",
-    "stereo_encoder_process",
-    "session_io",
-    "device_session_artifacts",
-    "device_session_finalizer",
+    "session_store",
     "preview_buffer",
     "performance_metrics",
 )
@@ -613,7 +602,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     return_value=NativeCapabilities(
                         True,
                         "0.1.0",
-                        4,
+                        5,
                         PRODUCTION_NATIVE_FEATURES,
                     ),
                 ),
@@ -645,20 +634,9 @@ class ProductionDaemonTest(unittest.TestCase):
 
     def test_missing_required_native_feature_fails_before_side_effects(self) -> None:
         cases = {
-            "native_camera": "native_camera_unavailable",
+            "capture_engine": "native_capture_engine_unavailable",
             "native_audio": "native_audio_unavailable",
-            "native_imu": "native_imu_unavailable",
-            "recording_sink": "native_recording_sink_unavailable",
-            "recording_imu_batch": "native_recording_imu_batch_unavailable",
-            "active_take_writer": "native_active_take_writer_unavailable",
-            "continuous_capture_runtime": "native_continuous_capture_runtime_unavailable",
-            "continuous_capture_split_sink": "native_continuous_capture_split_sink_unavailable",
-            "recording_segment_planner": "native_recording_segment_planner_unavailable",
-            "artifact_finalize": "native_artifact_finalize_unavailable",
-            "stereo_encoder_process": "native_stereo_encoder_process_unavailable",
-            "session_io": "native_session_io_unavailable",
-            "device_session_artifacts": "native_device_session_artifacts_unavailable",
-            "device_session_finalizer": "native_device_session_finalizer_unavailable",
+            "session_store": "native_session_store_unavailable",
             "preview_buffer": "native_preview_buffer_unavailable",
             "performance_metrics": "native_metrics_unavailable",
         }
@@ -668,20 +646,20 @@ class ProductionDaemonTest(unittest.TestCase):
                 capabilities = NativeCapabilities(
                     True,
                     "0.1.0",
-                    4,
+                    5,
                     tuple(item for item in PRODUCTION_NATIVE_FEATURES if item != feature),
                 )
                 with (
                     patch("rp_ylx.daemon.__commit__", "a" * 40),
                     patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
-                    patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                    patch("rp_ylx.daemon.NativeContinuousCaptureSources") as sources,
                     patch("rp_ylx.daemon.CaptureCoordinator") as coordinator,
                     patch("rp_ylx.daemon.create_gateway_server") as gateway,
                     self.assertRaises(ProductionConfigError) as raised,
                 ):
                     build_production_service(config)
                 self.assertEqual(raised.exception.code, error_code)
-                backend.assert_not_called()
+                sources.assert_not_called()
                 coordinator.assert_not_called()
                 gateway.assert_not_called()
                 self.assertFalse(config.state_root.exists())

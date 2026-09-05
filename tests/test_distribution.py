@@ -236,7 +236,7 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(status["commit"], expected_commit)
                 self.assertEqual(status["native"]["adapter"], "rust")
                 self.assertTrue(status["native"]["module_available"])
-                self.assertEqual(status["native"]["abi"], 4)
+                self.assertEqual(status["native"]["abi"], 5)
                 self.assertIn("capability_probe", status["native"]["features"])
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])

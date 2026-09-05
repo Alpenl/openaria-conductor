@@ -27,11 +27,9 @@ from rp_ylx.api.security import valid_customer_bearer_token
 from rp_ylx.camera import (
     CameraController,
     CameraMode,
-    V4L2DiscoveryBackend,
-    v4l2_production_stream_factory,
 )
 from rp_ylx.cli_helpers import stable_id_for_device
-from rp_ylx.imu import ImuCollector, NativeImuCollector
+from rp_ylx.imu import ImuCollector
 from rp_ylx.mdns import MdnsPublisher
 from rp_ylx.native import NativeModuleError, native_capabilities
 from rp_ylx.operational_logging import operational_logger
@@ -583,121 +581,73 @@ def build_production_service(
 ) -> ProductionService:
     if __commit__ == "unknown" or len(__commit__) != 40:
         raise ProductionConfigError("生产服务必须从带精确提交身份的安装包启动")
-    if camera_backend_factory is None:
+    using_native_data_plane = camera_backend_factory is None and imu_source_factory is None
+    if (camera_backend_factory is None) != (imu_source_factory is None):
+        raise ProductionConfigError(
+            "测试采集适配器必须同时提供 camera_backend_factory 和 imu_source_factory",
+            code="incomplete_test_capture_adapter",
+        )
+    if using_native_data_plane:
         try:
             capabilities = native_capabilities()
         except NativeModuleError as exc:
             raise ProductionConfigError(exc.message, code=exc.code) from exc
-        if not capabilities.module_available or "native_camera" not in capabilities.features:
+        if not capabilities.module_available:
             raise ProductionConfigError(
-                "正式 Rust 数据面缺少完整 V4L2/TurboJPEG 原生相机能力",
-                code="native_camera_unavailable",
+                "正式服务缺少 Rust 原生模块",
+                code="native_module_unavailable",
             )
-        if config.audio_enabled and "native_audio" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust/ALSA 原生音频能力",
-                code="native_audio_unavailable",
-            )
-        if "native_imu" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust/UVC XU 原生 IMU 能力",
-                code="native_imu_unavailable",
-            )
-        if "recording_sink" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 热路径写入能力",
-                code="native_recording_sink_unavailable",
-            )
-        if "recording_imu_batch" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust IMU batch 写入能力",
-                code="native_recording_imu_batch_unavailable",
-            )
-        if "active_take_writer" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust active take 写入状态能力",
-                code="native_active_take_writer_unavailable",
-            )
-        if "continuous_capture_runtime" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式持续采集缺少 Rust 连续采集 runtime 能力",
-                code="native_continuous_capture_runtime_unavailable",
-            )
-        if "continuous_capture_split_sink" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式持续采集缺少 Rust split-eyes 直写能力",
-                code="native_continuous_capture_split_sink_unavailable",
-            )
-        if "recording_segment_planner" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 分段规划能力",
-                code="native_recording_segment_planner_unavailable",
-            )
-        if "artifact_finalize" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust artifact 封存能力",
-                code="native_artifact_finalize_unavailable",
-            )
-        if "stereo_encoder_process" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 编码助手进程能力",
-                code="native_stereo_encoder_process_unavailable",
-            )
-        if "session_io" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 会话 I/O 校验能力",
-                code="native_session_io_unavailable",
-            )
-        if "device_session_artifacts" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式下载缺少 Rust device-session artifact 清单能力",
-                code="native_device_session_artifacts_unavailable",
-            )
-        if "device_session_finalizer" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust device-session 封存发布能力",
-                code="native_device_session_finalizer_unavailable",
-            )
-        if "preview_buffer" not in capabilities.features:
-            raise ProductionConfigError(
+        required = [
+            (
+                "capture_engine",
+                "native_capture_engine_unavailable",
+                "正式采集缺少 Rust CaptureEngine 深层资源 owner",
+            ),
+            (
+                "session_store",
+                "native_session_store_unavailable",
+                "正式录制缺少 Rust SessionStore 事务 owner",
+            ),
+            (
+                "preview_buffer",
+                "native_preview_buffer_unavailable",
                 "正式预览缺少 Rust latest-only 缓冲能力",
-                code="native_preview_buffer_unavailable",
-            )
-        if "performance_metrics" not in capabilities.features:
-            raise ProductionConfigError(
+            ),
+            (
+                "performance_metrics",
+                "native_metrics_unavailable",
                 "正式采集缺少 Rust 性能指标累计能力",
-                code="native_metrics_unavailable",
+            ),
+        ]
+        if config.audio_enabled:
+            required.append(
+                (
+                    "native_audio",
+                    "native_audio_unavailable",
+                    "正式采集缺少 Rust/ALSA 原生音频能力",
+                )
             )
+        for feature, code, message in required:
+            if feature not in capabilities.features:
+                raise ProductionConfigError(message, code=code)
     mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
-    use_native_continuous_sources = camera_backend_factory is None and imu_source_factory is None
-    if camera_backend_factory is None:
-
-        def production_backend() -> V4L2DiscoveryBackend:
-            return V4L2DiscoveryBackend(stream_factory=v4l2_production_stream_factory)
-
-        camera_backend_factory = production_backend
     preview = LatestPreviewBuffer(stream_fps=15)
     metrics = PerformanceMetrics()
-    if imu_source_factory is None:
-
-        def imu_factory() -> NativeImuCollector:
-            return NativeImuCollector(config.camera_device)
-
-    else:
-
-        def imu_factory() -> ImuCollector:
-            return ImuCollector(imu_source_factory(config.camera_device))
-
-    if use_native_continuous_sources:
+    if using_native_data_plane:
         sources = NativeContinuousCaptureSources(
             str(config.camera_device),
-            imu_factory,
             mode,
             preview=preview,
             frame_decimation=config.frame_decimation,
             metrics=metrics,
         )
     else:
+        assert camera_backend_factory is not None
+        assert imu_source_factory is not None
+
+        def imu_factory() -> ImuCollector:
+            return ImuCollector(imu_source_factory(config.camera_device))
+
         selector = CameraController(camera_backend_factory())
         stable_id = stable_id_for_device(selector, config.camera_device)
         sources = ContinuousCaptureSources(
