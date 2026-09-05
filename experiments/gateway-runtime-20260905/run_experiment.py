@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -475,6 +476,24 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_identity() -> dict[str, Any]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return {"commit": commit, "dirty": bool(status)}
+
+
 def run_parent(harness: Path, reconnects: int, tls_reconnects: int) -> dict[str, Any]:
     if not harness.is_file():
         raise ExperimentFailure(f"release harness is missing: {harness}")
@@ -482,6 +501,8 @@ def run_parent(harness: Path, reconnects: int, tls_reconnects: int) -> dict[str,
         certificate, private_key = create_certificate(Path(directory))
         result: dict[str, Any] = {
             "schema": "rp-ylx.gateway-runtime-experiment.v1",
+            "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "source": source_identity(),
             "host": {
                 "machine": platform.machine(),
                 "platform": platform.platform(),
