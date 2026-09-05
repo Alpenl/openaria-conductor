@@ -593,30 +593,15 @@ def build_production_service(
                 "正式 Rust 数据面缺少完整 V4L2/TurboJPEG 原生相机能力",
                 code="native_camera_unavailable",
             )
-        if "camera_frame_validator" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust 相机帧连续性校验能力",
-                code="native_camera_frame_validator_unavailable",
-            )
         if config.audio_enabled and "native_audio" not in capabilities.features:
             raise ProductionConfigError(
                 "正式采集缺少 Rust/ALSA 原生音频能力",
                 code="native_audio_unavailable",
             )
-        if "native_timeline" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust 统一录制时间线能力",
-                code="native_timeline_unavailable",
-            )
         if "native_imu" not in capabilities.features:
             raise ProductionConfigError(
                 "正式采集缺少 Rust/UVC XU 原生 IMU 能力",
                 code="native_imu_unavailable",
-            )
-        if "recording_codec" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 热路径编码能力",
-                code="native_recording_unavailable",
             )
         if "recording_sink" not in capabilities.features:
             raise ProductionConfigError(
@@ -633,50 +618,30 @@ def build_production_service(
                 "正式录制缺少 Rust active take 写入状态能力",
                 code="native_active_take_writer_unavailable",
             )
-        if "recording_frame_gate" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 录制帧门控能力",
-                code="native_recording_frame_gate_unavailable",
-            )
-        if "capture_fanout" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式持续采集缺少 Rust fanout 热路径能力",
-                code="native_capture_fanout_unavailable",
-            )
         if "continuous_capture_runtime" not in capabilities.features:
             raise ProductionConfigError(
                 "正式持续采集缺少 Rust 连续采集 runtime 能力",
                 code="native_continuous_capture_runtime_unavailable",
-            )
-        if "continuous_capture_raw_sink" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式持续采集缺少 Rust raw-SBS 直写能力",
-                code="native_continuous_capture_raw_sink_unavailable",
             )
         if "continuous_capture_split_sink" not in capabilities.features:
             raise ProductionConfigError(
                 "正式持续采集缺少 Rust split-eyes 直写能力",
                 code="native_continuous_capture_split_sink_unavailable",
             )
-        if "recording_event_queue" not in capabilities.features:
+        if "recording_segment_planner" not in capabilities.features:
             raise ProductionConfigError(
-                "正式录制缺少 Rust 录制事件队列能力",
-                code="native_recording_event_queue_unavailable",
+                "正式录制缺少 Rust 分段规划能力",
+                code="native_recording_segment_planner_unavailable",
             )
         if "artifact_finalize" not in capabilities.features:
             raise ProductionConfigError(
                 "正式录制缺少 Rust artifact 封存能力",
                 code="native_artifact_finalize_unavailable",
             )
-        if "stereo_encoder_events" not in capabilities.features:
+        if "stereo_encoder_process" not in capabilities.features:
             raise ProductionConfigError(
-                "正式录制缺少 Rust 编码助手事件解析能力",
-                code="native_stereo_encoder_events_unavailable",
-            )
-        if "stereo_encoder_pipe" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 编码助手写入能力",
-                code="native_stereo_encoder_pipe_unavailable",
+                "正式录制缺少 Rust 编码助手进程能力",
+                code="native_stereo_encoder_process_unavailable",
             )
         if "session_io" not in capabilities.features:
             raise ProductionConfigError(

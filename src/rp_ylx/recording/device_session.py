@@ -28,23 +28,16 @@ from rp_ylx.native import (
     NativeActiveTakeWriter,
     NativeAudioRecorder,
     NativeModuleError,
-    NativeRecordingCodec,
-    NativeRecordingEventQueue,
     NativeRecordingSegmentPlanner,
     NativeRecordingSink,
-    NativeSessionIo,
     NativeStereoEncoderProcess,
-    NativeTimeline,
     create_native_active_take_writer,
     create_native_audio_recorder,
-    create_native_recording_codec,
-    create_native_recording_event_queue,
     create_native_recording_segment_planner,
     create_native_recording_sink,
-    create_native_session_io,
-    create_native_timeline,
-    evaluate_native_drop_quality_policy,
-    native_capabilities,
+)
+from rp_ylx.native import (
+    native_session_io_or_none as _session_io_or_none,
 )
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 from rp_ylx.recording.stereo_encoder import (
@@ -211,9 +204,6 @@ _STOP = object()
 _UUID7_LOCK = threading.Lock()
 _UUID7_MILLISECOND = 0
 _UUID7_COUNTER = 0
-_SESSION_IO_LOCK = threading.Lock()
-_SESSION_IO: NativeSessionIo | None = None
-_SESSION_IO_UNAVAILABLE = False
 _ORIGINAL_PATH_OPEN = Path.open
 _ORIGINAL_OS_FSYNC = os.fsync
 
@@ -286,7 +276,7 @@ def _digest(path: Path) -> str:
         try:
             result = native.hash_file(os.fspath(path))
         except BaseException as error:
-            raise _session_io_error(error) from error
+            raise _recording_error(error, "native_session_io_failed") from error
         digest = result.get("sha256") if isinstance(result, Mapping) else None
         if (
             not isinstance(digest, str)
@@ -321,7 +311,7 @@ def _finalize_artifact(
         try:
             result = native.finalize_artifact(os.fspath(path), expected_bytes)
         except BaseException as error:
-            converted = _session_io_error(error)
+            converted = _recording_error(error, "native_session_io_failed")
             raise DeviceRecordingError(code, converted.message) from error
         if not isinstance(result, Mapping):
             raise DeviceRecordingError(code, "原生 artifact 封存结果无效")
@@ -389,83 +379,14 @@ def _failure_details(error: BaseException) -> tuple[str, bool, bool]:
     return "seal_failed", False, False
 
 
-def _audio_recording_error(error: BaseException) -> DeviceRecordingError:
+def _recording_error(error: BaseException, fallback_code: str) -> DeviceRecordingError:
     if isinstance(error, DeviceRecordingError):
         return error
     raw = str(error)
     code, separator, message = raw.partition(": ")
     if not separator or not code.replace("_", "").isalnum():
-        code, message = "audio_failed", raw
+        code, message = fallback_code, raw
     return DeviceRecordingError(code, message)
-
-
-def _recording_codec_error(error: BaseException) -> DeviceRecordingError:
-    if isinstance(error, DeviceRecordingError):
-        return error
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "native_recording_failed", raw
-    return DeviceRecordingError(code, message)
-
-
-def _recording_sink_error(error: BaseException) -> DeviceRecordingError:
-    if isinstance(error, DeviceRecordingError):
-        return error
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "native_recording_sink_failed", raw
-    return DeviceRecordingError(code, message)
-
-
-def _recording_segment_planner_error(error: BaseException) -> DeviceRecordingError:
-    if isinstance(error, DeviceRecordingError):
-        return error
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "native_recording_segment_planner_failed", raw
-    return DeviceRecordingError(code, message)
-
-
-def _active_take_writer_error(error: BaseException) -> DeviceRecordingError:
-    if isinstance(error, DeviceRecordingError):
-        return error
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "active_take_writer_failed", raw
-    return DeviceRecordingError(code, message)
-
-
-def _session_io_error(error: BaseException) -> DeviceRecordingError:
-    if isinstance(error, DeviceRecordingError):
-        return error
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "native_session_io_failed", raw
-    return DeviceRecordingError(code, message)
-
-
-def _session_io_or_none() -> NativeSessionIo | None:
-    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
-    if _SESSION_IO_UNAVAILABLE:
-        return None
-    if _SESSION_IO is not None:
-        return _SESSION_IO
-    with _SESSION_IO_LOCK:
-        if _SESSION_IO_UNAVAILABLE:
-            return None
-        if _SESSION_IO is not None:
-            return _SESSION_IO
-        try:
-            _SESSION_IO = create_native_session_io()
-        except NativeModuleError:
-            _SESSION_IO_UNAVAILABLE = True
-            return None
-        return _SESSION_IO
 
 
 def _native_open_regular_at(root_fd: int, relative: str, *, code: str) -> int | None:
@@ -477,7 +398,7 @@ def _native_open_regular_at(root_fd: int, relative: str, *, code: str) -> int | 
     except AttributeError:
         return None
     except BaseException as error:
-        converted = _session_io_error(error)
+        converted = _recording_error(error, "native_session_io_failed")
         raise DeviceRecordingError(code, converted.message) from error
     if type(descriptor) is not int or descriptor < 0:
         raise DeviceRecordingError(code, "原生 artifact 打开返回无效 fd")
@@ -493,7 +414,7 @@ def _native_read_bounded_fd(descriptor: int, maximum_bytes: int, *, code: str) -
     except AttributeError:
         return None
     except BaseException as error:
-        converted = _session_io_error(error)
+        converted = _recording_error(error, "native_session_io_failed")
         raise DeviceRecordingError(code, converted.message) from error
     if not isinstance(payload, bytes):
         raise DeviceRecordingError(code, "原生 bounded read 返回无效 payload")
@@ -542,7 +463,7 @@ def _native_device_session_artifacts(
     try:
         raw_descriptors = native.device_session_v1_artifacts(manifest_bytes, session_id)
     except BaseException as error:
-        converted = _session_io_error(error)
+        converted = _recording_error(error, "native_session_io_failed")
         raise DeviceRecordingError(code, converted.message) from error
     if not isinstance(raw_descriptors, list) or any(
         not isinstance(item, Mapping) for item in raw_descriptors
@@ -590,7 +511,7 @@ def _native_seal_device_session(
     except AttributeError:
         return None
     except BaseException as error:
-        raise _session_io_error(error) from error
+        raise _recording_error(error, "native_session_io_failed") from error
     if not isinstance(result, Mapping):
         raise DeviceRecordingError("native_session_io_failed", "原生会话封存结果无效")
     manifest_sha256 = result.get("manifest_sha256")
@@ -777,12 +698,7 @@ class DeviceSessionRecorder:
         )
         self._before_write = before_write or (lambda role, payload: None)
         self._metrics = metrics
-        self._native_event_queue: NativeRecordingEventQueue | None = None
-        with suppress(NativeModuleError):
-            self._native_event_queue = create_native_recording_event_queue(queue_capacity)
-        self._queue: queue.Queue[object] | None = (
-            None if self._native_event_queue is not None else queue.Queue(maxsize=queue_capacity)
-        )
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=queue_capacity)
         self._queue_capacity = queue_capacity
         self._enqueue_timeout = enqueue_timeout
         self._checkpoint_interval = checkpoint_interval
@@ -791,24 +707,17 @@ class DeviceSessionRecorder:
         self._state = "new"
         self._partial = self._root / f"{plan.session_id}.partial"
         self._final = self._root / plan.session_id
-        self._split_eyes = config.video_layout == "split-eyes"
         self._segment_frames = max(
             1, round(config.segment_seconds * config.sensor_fps / config.frame_decimation)
         )
         self._segment_planner: NativeRecordingSegmentPlanner | None = None
-        if self._split_eyes:
-            with suppress(NativeModuleError):
-                self._segment_planner = create_native_recording_segment_planner(
-                    self._segment_frames
-                )
+        with suppress(NativeModuleError):
+            self._segment_planner = create_native_recording_segment_planner(self._segment_frames)
         self._encoder_factory = encoder_factory or self._default_encoder_factory
         self._encoder: StereoEncoderProcess | None = None
         self._audio_recorder_factory = (
             audio_recorder_factory or self._default_audio_recorder_factory
         )
-        self._recording_codec: NativeRecordingCodec | None = None
-        with suppress(NativeModuleError):
-            self._recording_codec = create_native_recording_codec()
         self._native_recording_sink: NativeRecordingSink | None = None
         self._native_recording_sink_handles = 0
         self._native_artifacts: dict[str, dict[str, object]] = {}
@@ -826,8 +735,6 @@ class DeviceSessionRecorder:
         self._boundary_elapsed: dict[int, float] = {}
         self._files: dict[str, BinaryIO] = {}
         roles = ("frames.index", "imu.samples")
-        if not self._split_eyes:
-            roles = ("video.raw-side-by-side", *roles)
         self._digests = {role: hashlib.sha256() for role in roles}
         self._artifact_bytes = {role: 0 for role in self._digests}
         # Keyed by session-relative path: split-eye sessions repeat the
@@ -837,7 +744,6 @@ class DeviceSessionRecorder:
         self._writer_error: BaseException | None = None
         self._started_at: datetime | None = None
         self._started_monotonic_ns: int | None = None
-        self._timeline: NativeTimeline | None = None
         self._active_take_writer: NativeActiveTakeWriter | None = None
         with suppress(NativeModuleError):
             self._active_take_writer = create_native_active_take_writer(self._plan.session_id)
@@ -866,19 +772,6 @@ class DeviceSessionRecorder:
                 return None
             return self._live_recording_state_locked(self._current_state)
 
-    def native_raw_sink_targets(
-        self,
-    ) -> tuple[NativeActiveTakeWriter, NativeRecordingSink] | None:
-        with self._lock:
-            if self._state != "recording" or self._split_eyes:
-                return None
-            active_take = self._active_take_writer
-            sink = self._native_recording_sink
-            if active_take is None or sink is None:
-                return None
-            self._native_direct_recording = True
-            return active_take, sink
-
     def native_split_sink_targets(
         self,
     ) -> (
@@ -892,7 +785,7 @@ class DeviceSessionRecorder:
         | None
     ):
         with self._lock:
-            if self._state != "recording" or not self._split_eyes:
+            if self._state != "recording":
                 return None
             active_take = self._active_take_writer
             sink = self._native_recording_sink
@@ -937,34 +830,6 @@ class DeviceSessionRecorder:
         return max(0.0, (self._now() - self._started_at).total_seconds())
 
     def _segment_elapsed(self) -> float:
-        assert self._started_monotonic_ns is not None
-        return max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
-
-    def _start_timeline(self) -> int:
-        try:
-            timeline = create_native_timeline()
-        except NativeModuleError as error:
-            try:
-                capabilities = native_capabilities()
-            except NativeModuleError:
-                capabilities = None
-            if capabilities is not None and capabilities.module_available:
-                raise DeviceRecordingError(error.code, error.message) from error
-            self._timeline = None
-            return time.monotonic_ns()
-        self._timeline = timeline
-        return timeline.start_monotonic_ns()
-
-    def _timeline_elapsed_seconds(self) -> float:
-        timeline = self._timeline
-        if timeline is not None:
-            try:
-                return max(0.0, float(timeline.elapsed_seconds()))
-            except BaseException as error:
-                raise DeviceRecordingError(
-                    "timeline_failed",
-                    f"Rust 录制时间线读取失败：{error}",
-                ) from error
         assert self._started_monotonic_ns is not None
         return max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
 
@@ -1099,7 +964,7 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError("session_exists", "会话标识已经存在")
             self._storage_status()
             self._started_at = self._now()
-            self._started_monotonic_ns = self._start_timeline()
+            self._started_monotonic_ns = time.monotonic_ns()
             try:
                 self._partial.mkdir(mode=0o750)
                 (self._partial / "video").mkdir(mode=0o750)
@@ -1122,9 +987,8 @@ class DeviceSessionRecorder:
                         self._native_recording_sink = create_native_recording_sink(
                             str(self._partial),
                             self._plan.session_id,
-                            split_eyes=self._split_eyes,
                         )
-                        self._native_recording_sink_handles = 2 + int(not self._split_eyes)
+                        self._native_recording_sink_handles = 2
                     except NativeModuleError as error:
                         if error.code != "native_recording_sink_unavailable":
                             raise DeviceRecordingError(error.code, error.message) from error
@@ -1133,14 +997,9 @@ class DeviceSessionRecorder:
                         "frames.index": (self._partial / "frames.ndjson").open("xb"),
                         "imu.samples": (self._partial / "imu.ndjson").open("xb"),
                     }
-                if self._split_eyes:
-                    encoder = self._encoder_factory(self._partial)
-                    encoder.start()
-                    self._encoder = encoder
-                elif self._native_recording_sink is None:
-                    self._files["video.raw-side-by-side"] = (
-                        self._partial / "video/raw-sbs.mjpeg"
-                    ).open("xb")
+                encoder = self._encoder_factory(self._partial)
+                encoder.start()
+                self._encoder = encoder
                 if self._config.audio_enabled:
                     audio = self._audio_recorder_factory(self._partial)
                     audio.start()
@@ -1193,7 +1052,7 @@ class DeviceSessionRecorder:
 
     def _writer_loop(self) -> None:
         while True:
-            item = self._queue_get()
+            item = self._queue.get()
             try:
                 if item is _STOP:
                     return
@@ -1211,37 +1070,14 @@ class DeviceSessionRecorder:
             finally:
                 if isinstance(item, _FrameEvent) and item.payload_lease is not None:
                     item.payload_lease.release()
-                self._queue_task_done()
+                self._queue.task_done()
 
     def _queue_put(self, item: object, timeout: float) -> bool:
-        native_queue = self._native_event_queue
-        if native_queue is not None:
-            return native_queue.put(item, timeout)
-        assert self._queue is not None
         try:
             self._queue.put(item, timeout=timeout)
             return True
         except queue.Full:
             return False
-
-    def _queue_get(self) -> object:
-        native_queue = self._native_event_queue
-        if native_queue is not None:
-            return native_queue.get()
-        assert self._queue is not None
-        return self._queue.get()
-
-    def _queue_depth(self) -> int:
-        native_queue = self._native_event_queue
-        if native_queue is not None:
-            return native_queue.qsize()
-        assert self._queue is not None
-        return self._queue.qsize()
-
-    def _queue_task_done(self) -> None:
-        if self._native_event_queue is None:
-            assert self._queue is not None
-            self._queue.task_done()
 
     def _persist_frame(self, event: _FrameEvent) -> None:
         started = self._metrics.start() if self._metrics is not None else 0
@@ -1250,138 +1086,66 @@ class DeviceSessionRecorder:
         frame = event.observation.frame
         if frame.raw_side_by_side is None:
             raise DeviceRecordingError("raw_frame_unavailable", "生产录制缺少相机原始 SBS MJPEG 帧")
+        encoder = self._encoder
+        if encoder is None:
+            raise DeviceRecordingError("invalid_state", "split-eyes 编码器未启动")
         native_sink = self._native_recording_sink
-        if self._encoder is None:
-            if native_sink is not None:
-                try:
-                    result = native_sink.write_raw_frame(
-                        event.record_sequence,
-                        frame.source_sequence,
-                        frame.host_monotonic_ns,
-                        frame.raw_side_by_side,
-                    )
-                except BaseException as error:
-                    raise _recording_sink_error(error) from error
-                self._bytes_written += _native_uint(
-                    result.get("bytes_written") if isinstance(result, Mapping) else None,
-                    "recording_sink.bytes_written",
-                )
-            else:
-                codec = self._recording_codec
-                try:
-                    payload = (
-                        _jpeg_payload(frame.raw_side_by_side)
-                        if codec is None
-                        else codec.jpeg_payload(frame.raw_side_by_side)
-                    )
-                except BaseException as error:
-                    raise _recording_codec_error(error) from error
-                video_offset = self._files["video.raw-side-by-side"].tell()
-                video_bytes = len(payload)
-                self._write("video.raw-side-by-side", payload)
-                if codec is None:
-                    index_record = json_bytes(
-                        {
-                            "schema": "ylx.frame-index.v1",
-                            "session_id": self._plan.session_id,
-                            "frame": event.record_sequence,
-                            "source_sequence": frame.source_sequence,
-                            "host_monotonic_ns": frame.host_monotonic_ns,
-                            "video_offset": video_offset,
-                            "video_bytes": video_bytes,
-                        }
-                    )
-                else:
-                    try:
-                        index_record = codec.encode_raw_frame_index(
-                            self._plan.session_id,
-                            event.record_sequence,
-                            frame.source_sequence,
-                            frame.host_monotonic_ns,
-                            video_offset,
-                            video_bytes,
-                        )
-                    except BaseException as error:
-                        raise _recording_codec_error(error) from error
-                self._write("frames.index", index_record)
-        else:
-            codec = self._recording_codec
+        payload = _jpeg_payload(frame.raw_side_by_side)
+        ordinal = self._frames_written
+        planner = self._segment_planner
+        if planner is not None:
             try:
-                payload = (
-                    _jpeg_payload(frame.raw_side_by_side)
-                    if codec is None
-                    else codec.jpeg_payload(frame.raw_side_by_side)
+                plan = planner.next_frame(event.record_sequence, self._segment_elapsed())
+            except BaseException as error:
+                raise _recording_error(error, "native_recording_segment_planner_failed") from error
+            planned_ordinal = _native_segment_uint(
+                plan.get("ordinal"), "recording_segment_planner.ordinal"
+            )
+            if planned_ordinal != ordinal:
+                raise DeviceRecordingError(
+                    "segment_invalid",
+                    "原生分段规划器与控制面写入帧数不一致",
+                )
+            segment_index = _native_segment_uint(
+                plan.get("segment_index"), "recording_segment_planner.segment_index"
+            )
+            segment_frame = _native_segment_uint(
+                plan.get("segment_frame"), "recording_segment_planner.segment_frame"
+            )
+        else:
+            if ordinal % self._segment_frames == 0:
+                self._mark_segment_boundary(ordinal, event.record_sequence)
+            segment_index = ordinal // self._segment_frames
+            segment_frame = ordinal % self._segment_frames
+        try:
+            encoder.submit(payload)
+        except StereoEncoderError as error:
+            raise DeviceRecordingError(error.code, error.message) from error
+        if native_sink is not None:
+            try:
+                written = native_sink.write_split_frame_index(
+                    event.record_sequence,
+                    frame.source_sequence,
+                    frame.host_monotonic_ns,
+                    segment_index,
+                    segment_frame,
                 )
             except BaseException as error:
-                raise _recording_codec_error(error) from error
-            ordinal = self._frames_written
-            planner = self._segment_planner
-            if planner is not None:
-                try:
-                    plan = planner.next_frame(event.record_sequence, self._segment_elapsed())
-                except BaseException as error:
-                    raise _recording_segment_planner_error(error) from error
-                planned_ordinal = _native_segment_uint(
-                    plan.get("ordinal"), "recording_segment_planner.ordinal"
-                )
-                if planned_ordinal != ordinal:
-                    raise DeviceRecordingError(
-                        "segment_invalid",
-                        "原生分段规划器与控制面写入帧数不一致",
-                    )
-                segment_index = _native_segment_uint(
-                    plan.get("segment_index"), "recording_segment_planner.segment_index"
-                )
-                segment_frame = _native_segment_uint(
-                    plan.get("segment_frame"), "recording_segment_planner.segment_frame"
-                )
-            else:
-                if ordinal % self._segment_frames == 0:
-                    self._mark_segment_boundary(ordinal, event.record_sequence)
-                segment_index = ordinal // self._segment_frames
-                segment_frame = ordinal % self._segment_frames
-            try:
-                self._encoder.submit(payload)
-            except StereoEncoderError as error:
-                raise DeviceRecordingError(error.code, error.message) from error
-            if native_sink is not None:
-                try:
-                    written = native_sink.write_split_frame_index(
-                        event.record_sequence,
-                        frame.source_sequence,
-                        frame.host_monotonic_ns,
-                        segment_index,
-                        segment_frame,
-                    )
-                except BaseException as error:
-                    raise _recording_sink_error(error) from error
-                self._bytes_written += _native_uint(written, "recording_sink.bytes_written")
-            else:
-                if codec is None:
-                    index_record = json_bytes(
-                        {
-                            "schema": "ylx.frame-index.v1",
-                            "session_id": self._plan.session_id,
-                            "frame": event.record_sequence,
-                            "source_sequence": frame.source_sequence,
-                            "host_monotonic_ns": frame.host_monotonic_ns,
-                            "segment_index": segment_index,
-                            "segment_frame": segment_frame,
-                        }
-                    )
-                else:
-                    try:
-                        index_record = codec.encode_split_frame_index(
-                            self._plan.session_id,
-                            event.record_sequence,
-                            frame.source_sequence,
-                            frame.host_monotonic_ns,
-                            segment_index,
-                            segment_frame,
-                        )
-                    except BaseException as error:
-                        raise _recording_codec_error(error) from error
-                self._write("frames.index", index_record)
+                raise _recording_error(error, "native_recording_sink_failed") from error
+            self._bytes_written += _native_uint(written, "recording_sink.bytes_written")
+        else:
+            index_record = json_bytes(
+                {
+                    "schema": "ylx.frame-index.v1",
+                    "session_id": self._plan.session_id,
+                    "frame": event.record_sequence,
+                    "source_sequence": frame.source_sequence,
+                    "host_monotonic_ns": frame.host_monotonic_ns,
+                    "segment_index": segment_index,
+                    "segment_frame": segment_frame,
+                }
+            )
+            self._write("frames.index", index_record)
         self._frames_written += 1
         self._finish_reserved_frame(event, max(0, self._bytes_written - bytes_before))
         if self._metrics is not None:
@@ -1468,7 +1232,7 @@ class DeviceSessionRecorder:
             try:
                 planner.register_segment(segment.index, segment.start_frame, segment.end_frame)
             except BaseException as error:
-                raise _recording_segment_planner_error(error) from error
+                raise _recording_error(error, "native_recording_segment_planner_failed") from error
         return record
 
     def _persist_imu(self, observation: ImuObservation) -> None:
@@ -1480,7 +1244,7 @@ class DeviceSessionRecorder:
                 try:
                     result = write_observation(observation)
                 except BaseException as error:
-                    raise _recording_sink_error(error) from error
+                    raise _recording_error(error, "native_recording_sink_failed") from error
                 if not isinstance(result, dict):
                     raise DeviceRecordingError(
                         "native_recording_sink_failed", "原生 IMU batch 写入结果无效"
@@ -1523,43 +1287,12 @@ class DeviceSessionRecorder:
                         sample.sync_quality,
                     )
                 except BaseException as error:
-                    raise _recording_sink_error(error) from error
+                    raise _recording_error(error, "native_recording_sink_failed") from error
                 self._bytes_written += _native_uint(written, "recording_sink.bytes_written")
                 self._imu_written += 1
             return
-        codec = self._recording_codec
         for sample in observation.samples:
-            if codec is None:
-                payload = json_bytes(sample.as_record(self._plan.session_id))
-            else:
-                try:
-                    payload = codec.encode_imu_sample(
-                        self._plan.session_id,
-                        sample.sequence,
-                        sample.packet_sequence,
-                        sample.sample_index,
-                        sample.device_timestamp_raw,
-                        sample.device_ticks,
-                        sample.host_read_start_ns,
-                        sample.host_read_end_ns,
-                        sample.host_monotonic_ns,
-                        (
-                            sample.accelerometer.x,
-                            sample.accelerometer.y,
-                            sample.accelerometer.z,
-                        ),
-                        (
-                            sample.gyroscope.x,
-                            sample.gyroscope.y,
-                            sample.gyroscope.z,
-                        ),
-                        sample.sync_offset_ns,
-                        sample.sync_residual_ns,
-                        sample.sync_quality,
-                    )
-                except BaseException as error:
-                    raise _recording_codec_error(error) from error
-            self._write("imu.samples", payload)
+            self._write("imu.samples", json_bytes(sample.as_record(self._plan.session_id)))
             self._imu_written += 1
 
     def _raise_if_unavailable(self) -> None:
@@ -1613,7 +1346,7 @@ class DeviceSessionRecorder:
                     observation.dropped_before,
                 )
             except BaseException as error:
-                raise _active_take_writer_error(error) from error
+                raise _recording_error(error, "active_take_writer_failed") from error
             record_sequence = _active_take_uint(
                 reserved.get("record_sequence"), "active_take.record_sequence"
             )
@@ -1642,7 +1375,7 @@ class DeviceSessionRecorder:
                     self._elapsed(),
                 )
             except BaseException as error:
-                raise _active_take_writer_error(error) from error
+                raise _recording_error(error, "active_take_writer_failed") from error
             self._apply_active_take_snapshot(snapshot)
             return
         with self._counter_lock:
@@ -1661,7 +1394,7 @@ class DeviceSessionRecorder:
                 bytes_written,
             )
         except BaseException as error:
-            raise _active_take_writer_error(error) from error
+            raise _recording_error(error, "active_take_writer_failed") from error
         self._apply_active_take_snapshot(snapshot, expected_frames_written=self._frames_written)
 
     def _finish_active_take(self) -> None:
@@ -1671,7 +1404,7 @@ class DeviceSessionRecorder:
         try:
             summary = active_take.finish()
         except BaseException as error:
-            raise _active_take_writer_error(error) from error
+            raise _recording_error(error, "active_take_writer_failed") from error
         expected = None if self._native_direct_recording else self._frames_written
         self._apply_active_take_snapshot(summary, expected_frames_written=expected)
         if self._native_direct_recording:
@@ -1718,7 +1451,7 @@ class DeviceSessionRecorder:
             ):
                 if self._metrics is not None:
                     self._metrics.observe_queue(
-                        depth=self._queue_depth(), capacity=self._queue_capacity
+                        depth=self._queue.qsize(), capacity=self._queue_capacity
                     )
                 return True
             self._reject_reserved_frame(observation, record_sequence)
@@ -1726,7 +1459,7 @@ class DeviceSessionRecorder:
                 lease.release()
             if self._metrics is not None:
                 self._metrics.observe_queue(
-                    depth=self._queue_depth(), capacity=self._queue_capacity, rejected=1
+                    depth=self._queue.qsize(), capacity=self._queue_capacity, rejected=1
                 )
                 self._metrics.record_loss("queue_rejected")
             return False
@@ -1739,7 +1472,7 @@ class DeviceSessionRecorder:
                 return True
             if self._metrics is not None:
                 self._metrics.observe_queue(
-                    depth=self._queue_depth(), capacity=self._queue_capacity, rejected=1
+                    depth=self._queue.qsize(), capacity=self._queue_capacity, rejected=1
                 )
                 self._metrics.record_loss("queue_rejected")
             failure = DeviceRecordingError("imu_backpressure", "IMU 样本未能进入有界队列")
@@ -1773,7 +1506,6 @@ class DeviceSessionRecorder:
         self._writer = None
 
     _ROLE_PATHS = {
-        "video.raw-side-by-side": "video/raw-sbs.mjpeg",
         "frames.index": "frames.ndjson",
         "imu.samples": "imu.ndjson",
     }
@@ -1784,7 +1516,7 @@ class DeviceSessionRecorder:
             try:
                 result = native_sink.flush_and_close()
             except BaseException as error:
-                raise _recording_sink_error(error) from error
+                raise _recording_error(error, "native_recording_sink_failed") from error
             finally:
                 self._native_recording_sink = None
                 self._native_recording_sink_handles = 0
@@ -1980,15 +1712,6 @@ class DeviceSessionRecorder:
         }
 
     def _video_block(self, duration: float) -> dict[str, object]:
-        if not self._split_eyes:
-            return {
-                "layout": "raw-side-by-side",
-                "codec": "mjpeg",
-                "continuous": True,
-                "artifact": self._artifact(
-                    "video.raw-side-by-side", "video/raw-sbs.mjpeg", "video/x-motion-jpeg"
-                ),
-            }
         if not self._segment_records:
             raise DeviceRecordingError("no_frames", "没有可封存的成片分段")
         segments: list[dict[str, object]] = []
@@ -2023,7 +1746,7 @@ class DeviceSessionRecorder:
         try:
             result = recorder.stop(timeout_seconds=5.0)
         except BaseException as error:
-            raise _audio_recording_error(error) from error
+            raise _recording_error(error, "audio_failed") from error
         self._audio_recorder = None
         if not isinstance(result, Mapping):
             raise DeviceRecordingError("audio_invalid", "原生音频结果无效")
@@ -2110,36 +1833,20 @@ class DeviceSessionRecorder:
         )
         if sample_rate_hz <= 0:
             raise DeviceRecordingError("audio_invalid", "audio.sample_rate_hz 必须是正整数")
-        timeline = self._timeline
-        if timeline is not None:
-            try:
-                sync = dict(
-                    timeline.audio_sync(
-                        started_monotonic_ns,
-                        stopped_monotonic_ns,
-                        sample_rate_hz,
-                    )
-                )
-            except BaseException as error:
-                raise DeviceRecordingError(
-                    "timeline_failed",
-                    f"Rust 音频时间线计算失败：{error}",
-                ) from error
-        else:
-            start_offset_ns = started_monotonic_ns - self._started_monotonic_ns
-            stop_offset_ns = stopped_monotonic_ns - self._started_monotonic_ns
-            sync = {
-                "clock": "host_monotonic",
-                "timebase": "monotonic_ns",
-                "session_start_monotonic_ns": self._started_monotonic_ns,
-                "started_monotonic_ns": started_monotonic_ns,
-                "stopped_monotonic_ns": stopped_monotonic_ns,
-                "session_start_offset_ns": start_offset_ns,
-                "session_stop_offset_ns": stop_offset_ns,
-                "session_start_offset_seconds": start_offset_ns / 1e9,
-                "session_stop_offset_seconds": stop_offset_ns / 1e9,
-                "sample_duration_ns": 1_000_000_000 // sample_rate_hz,
-            }
+        start_offset_ns = started_monotonic_ns - self._started_monotonic_ns
+        stop_offset_ns = stopped_monotonic_ns - self._started_monotonic_ns
+        sync = {
+            "clock": "host_monotonic",
+            "timebase": "monotonic_ns",
+            "session_start_monotonic_ns": self._started_monotonic_ns,
+            "started_monotonic_ns": started_monotonic_ns,
+            "stopped_monotonic_ns": stopped_monotonic_ns,
+            "session_start_offset_ns": start_offset_ns,
+            "session_stop_offset_ns": stop_offset_ns,
+            "session_start_offset_seconds": start_offset_ns / 1e9,
+            "session_stop_offset_seconds": stop_offset_ns / 1e9,
+            "sample_duration_ns": 1_000_000_000 // sample_rate_hz,
+        }
         if (
             sync.get("clock") != "host_monotonic"
             or sync.get("timebase") != "monotonic_ns"
@@ -2180,7 +1887,7 @@ class DeviceSessionRecorder:
             try:
                 boundary = planner.boundary(ordinal, duration)
             except BaseException as error:
-                raise _recording_segment_planner_error(error) from error
+                raise _recording_error(error, "native_recording_segment_planner_failed") from error
             return (
                 _native_segment_uint(boundary.get("frame"), "recording_segment_planner.frame"),
                 _native_segment_float(
@@ -2325,53 +2032,35 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError("artifact_invalid", "artifact 大小在封存前发生变化")
 
     def _enforce_quality_policy(self, duration: float) -> None:
-        try:
-            result = evaluate_native_drop_quality_policy(
-                self._drop_events,
-                self._frames_written,
-                max_contiguous_dropped_frames=self._config.max_contiguous_dropped_frames,
-                max_total_dropped_frames=self._config.max_total_dropped_frames,
-                max_drop_fraction=self._config.max_drop_fraction,
-                window_seconds=self._config.drop_window_seconds,
-                max_dropped_frames_per_window=self._config.max_dropped_frames_per_window,
-            )
-        except NativeModuleError:
-            dropped = sum(int(event["dropped"]) for event in self._drop_events)
-            total = self._frames_written + dropped
-            fraction = 0.0 if total == 0 else dropped / total
-            contiguous = max(
-                (int(event["dropped"]) for event in self._drop_events),
-                default=0,
-            )
-            window_drops = max(
-                (
-                    sum(
-                        int(other["dropped"])
-                        for other in self._drop_events
-                        if float(event["at_time_seconds"])
-                        <= float(other["at_time_seconds"])
-                        < float(event["at_time_seconds"]) + self._config.drop_window_seconds
-                    )
-                    for event in self._drop_events
-                ),
-                default=0,
-            )
-            violations: list[str] = []
-            if contiguous > self._config.max_contiguous_dropped_frames:
-                violations.append("contiguous")
-            if dropped > self._config.max_total_dropped_frames:
-                violations.append("total")
-            if fraction > self._config.max_drop_fraction:
-                violations.append("fraction")
-            if window_drops > self._config.max_dropped_frames_per_window:
-                violations.append("window")
-        else:
-            violations = list(result["violations"])
-            dropped = int(result["dropped"])
-            total = int(result["total"])
-            fraction = float(result["fraction"])
-            contiguous = int(result["contiguous"])
-            window_drops = int(result["window_drops"])
+        dropped = sum(int(event["dropped"]) for event in self._drop_events)
+        total = self._frames_written + dropped
+        fraction = 0.0 if total == 0 else dropped / total
+        contiguous = max(
+            (int(event["dropped"]) for event in self._drop_events),
+            default=0,
+        )
+        window_drops = max(
+            (
+                sum(
+                    int(other["dropped"])
+                    for other in self._drop_events
+                    if float(event["at_time_seconds"])
+                    <= float(other["at_time_seconds"])
+                    < float(event["at_time_seconds"]) + self._config.drop_window_seconds
+                )
+                for event in self._drop_events
+            ),
+            default=0,
+        )
+        violations: list[str] = []
+        if contiguous > self._config.max_contiguous_dropped_frames:
+            violations.append("contiguous")
+        if dropped > self._config.max_total_dropped_frames:
+            violations.append("total")
+        if fraction > self._config.max_drop_fraction:
+            violations.append("fraction")
+        if window_drops > self._config.max_dropped_frames_per_window:
+            violations.append("window")
         if violations:
             raise DeviceRecordingError(
                 "drop_quality_exceeded",
@@ -2411,7 +2100,8 @@ class DeviceSessionRecorder:
             self._finish_audio()
             self._sync_and_close_files()
             ended_at = self._now()
-            duration = self._timeline_elapsed_seconds()
+            assert self._started_monotonic_ns is not None
+            duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
             self._finish_encoder(duration)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
@@ -2517,7 +2207,7 @@ class DeviceSessionRecorder:
             try:
                 planner.finish(encoder.submitted_frames, self._frame_domain, duration)
             except BaseException as error:
-                raise _recording_segment_planner_error(error) from error
+                raise _recording_error(error, "native_recording_segment_planner_failed") from error
         else:
             covered = sum(
                 int(record["end_ordinal"]) - int(record["start_ordinal"])
@@ -2626,7 +2316,7 @@ def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: s
             native.verify_fd(descriptor, expected_bytes, expected_sha256)
             return
         except BaseException as error:
-            raise _session_io_error(error) from error
+            raise _recording_error(error, "native_session_io_failed") from error
     before = os.fstat(descriptor)
     if before.st_size != expected_bytes:
         raise DeviceRecordingError("artifact_invalid", "artifact 大小不匹配")

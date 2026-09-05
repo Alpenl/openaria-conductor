@@ -11,14 +11,13 @@ mod preview;
 mod recording;
 mod session_io;
 mod stereo_encoder;
-mod timeline;
 mod turbojpeg;
 mod v4l2;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,31 +29,19 @@ const TURBOJPEG_SPLIT: &str = "turbojpeg_split";
 const V4L2_CAPTURE: &str = "v4l2_capture";
 const V4L2_FOCUS_CONTROL: &str = "v4l2_focus_control";
 const NATIVE_CAMERA: &str = "native_camera";
-const CAMERA_FRAME_VALIDATOR: &str = "camera_frame_validator";
 const NATIVE_AUDIO: &str = "native_audio";
-const NATIVE_TIMELINE: &str = "native_timeline";
 const ACTIVE_TAKE_WRITER: &str = "active_take_writer";
 const NATIVE_IMU: &str = "native_imu";
-const RECORDING_CODEC: &str = "recording_codec";
 const RECORDING_SINK: &str = "recording_sink";
 const RECORDING_IMU_BATCH: &str = "recording_imu_batch";
-const RECORDING_FRAME_GATE: &str = "recording_frame_gate";
-const RECORDING_TAP_STATE: &str = "recording_tap_state";
-const CAPTURE_FANOUT: &str = "capture_fanout";
 const CONTINUOUS_CAPTURE_RUNTIME: &str = "continuous_capture_runtime";
-const CONTINUOUS_CAPTURE_RAW_SINK: &str = "continuous_capture_raw_sink";
 const CONTINUOUS_CAPTURE_SPLIT_SINK: &str = "continuous_capture_split_sink";
 const RECORDING_SEGMENT_PLANNER: &str = "recording_segment_planner";
-const RECORDING_EVENT_QUEUE: &str = "recording_event_queue";
 const ARTIFACT_FINALIZE: &str = "artifact_finalize";
-const RANGE_PARSER: &str = "range_parser";
-const STEREO_ENCODER_EVENTS: &str = "stereo_encoder_events";
-const STEREO_ENCODER_PIPE: &str = "stereo_encoder_pipe";
 const STEREO_ENCODER_PROCESS: &str = "stereo_encoder_process";
 const SESSION_IO: &str = "session_io";
 const DEVICE_SESSION_ARTIFACTS: &str = "device_session_artifacts";
 const DEVICE_SESSION_FINALIZER: &str = "device_session_finalizer";
-const DROP_QUALITY_POLICY: &str = "drop_quality_policy";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
 
@@ -74,10 +61,6 @@ fn audio_error(error: audio::AudioError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
 
-fn timeline_error(error: timeline::TimelineError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
-}
-
 fn active_take_error(error: active_take::ActiveTakeError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
@@ -91,10 +74,6 @@ fn recording_error(error: recording::RecordingError) -> PyErr {
 }
 
 fn session_io_error(error: session_io::SessionIoError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
-}
-
-fn stereo_encoder_event_error(error: stereo_encoder::EncoderEventError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
 }
 
@@ -270,63 +249,6 @@ impl Drop for NativeCameraStream {
 }
 
 #[pyclass]
-struct NativeCameraFrameValidator {
-    validator: Mutex<native_camera::FrameValidator>,
-}
-
-#[pymethods]
-impl NativeCameraFrameValidator {
-    #[new]
-    fn new() -> Self {
-        Self {
-            validator: Mutex::new(native_camera::FrameValidator::new()),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn validate_frame(
-        &self,
-        py: Python<'_>,
-        source_sequence: i64,
-        host_monotonic_ns: i64,
-        valid: bool,
-        has_left: bool,
-        has_right: bool,
-        has_raw_side_by_side: bool,
-        application_dropped_before: i64,
-    ) -> PyResult<Py<PyDict>> {
-        let has_payload = (has_left && has_right) || has_raw_side_by_side;
-        let validation = {
-            let mut validator = self.validator.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_camera_frame_validator_poisoned: camera frame validator mutex is poisoned",
-                )
-            })?;
-            validator
-                .validate(
-                    source_sequence,
-                    host_monotonic_ns,
-                    valid,
-                    has_payload,
-                    application_dropped_before,
-                )
-                .map_err(camera_error)?
-        };
-        camera_frame_validation_dict(py, &validation)
-    }
-
-    fn reset(&self) -> PyResult<()> {
-        let mut validator = self.validator.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_camera_frame_validator_poisoned: camera frame validator mutex is poisoned",
-            )
-        })?;
-        validator.reset();
-        Ok(())
-    }
-}
-
-#[pyclass]
 struct NativeAudioRecorder {
     recorder: Arc<audio::Recorder>,
 }
@@ -403,71 +325,6 @@ impl Drop for NativeAudioRecorder {
 }
 
 #[pyclass]
-struct NativeTimeline {
-    timeline: timeline::Timeline,
-}
-
-#[pymethods]
-impl NativeTimeline {
-    #[new]
-    #[pyo3(signature = (start_monotonic_ns=None))]
-    fn new(start_monotonic_ns: Option<u64>) -> PyResult<Self> {
-        let timeline = match start_monotonic_ns {
-            Some(value) => timeline::Timeline::new(value),
-            None => timeline::Timeline::start_now(),
-        }
-        .map_err(timeline_error)?;
-        Ok(Self { timeline })
-    }
-
-    #[staticmethod]
-    fn now_monotonic_ns(py: Python<'_>) -> PyResult<u64> {
-        py.allow_threads(timeline::monotonic_ns)
-            .map_err(timeline_error)
-    }
-
-    fn start_monotonic_ns(&self) -> u64 {
-        self.timeline.start_monotonic_ns()
-    }
-
-    fn elapsed_ns(&self, py: Python<'_>) -> PyResult<u64> {
-        let timeline = self.timeline.clone();
-        py.allow_threads(move || timeline.elapsed_ns())
-            .map_err(timeline_error)
-    }
-
-    fn elapsed_seconds(&self, py: Python<'_>) -> PyResult<f64> {
-        let timeline = self.timeline.clone();
-        py.allow_threads(move || timeline.elapsed_seconds())
-            .map_err(timeline_error)
-    }
-
-    fn offset_ns(&self, monotonic_ns: u64) -> i128 {
-        self.timeline.offset_ns(monotonic_ns)
-    }
-
-    fn offset_seconds(&self, monotonic_ns: u64) -> f64 {
-        self.timeline.offset_seconds(monotonic_ns)
-    }
-
-    fn audio_sync(
-        &self,
-        py: Python<'_>,
-        started_monotonic_ns: u64,
-        stopped_monotonic_ns: u64,
-        sample_rate_hz: u32,
-    ) -> PyResult<Py<PyDict>> {
-        let timeline = self.timeline.clone();
-        let sync = py
-            .allow_threads(move || {
-                timeline.audio_sync(started_monotonic_ns, stopped_monotonic_ns, sample_rate_hz)
-            })
-            .map_err(timeline_error)?;
-        timeline_audio_sync_dict(py, &sync)
-    }
-}
-
-#[pyclass]
 struct NativeActiveTakeWriter {
     session_id: String,
     writer: Arc<Mutex<active_take::ActiveTakeWriter>>,
@@ -507,56 +364,6 @@ impl NativeActiveTakeWriter {
                 .map_err(active_take_error)?
         };
         active_take_reserved_frame_dict(py, &frame)
-    }
-
-    fn raw_write_decision(
-        &self,
-        py: Python<'_>,
-        record_sequence: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-    ) -> PyResult<Py<PyDict>> {
-        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
-        let decision = {
-            let writer = self.writer.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "active_take_writer_poisoned: active take writer mutex is poisoned",
-                )
-            })?;
-            writer
-                .raw_write_decision(&frame)
-                .map_err(active_take_error)?
-        };
-        active_take_write_decision_dict(py, &decision)
-    }
-
-    fn split_write_decision(
-        &self,
-        py: Python<'_>,
-        record_sequence: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-        segment_index: u64,
-        segment_frame: u64,
-    ) -> PyResult<Py<PyDict>> {
-        let frame = self.reserved_frame(record_sequence, source_sequence, host_monotonic_ns);
-        let decision = {
-            let writer = self.writer.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "active_take_writer_poisoned: active take writer mutex is poisoned",
-                )
-            })?;
-            writer
-                .split_write_decision(
-                    &frame,
-                    active_take::SplitFrameLocation {
-                        segment_index,
-                        segment_frame,
-                    },
-                )
-                .map_err(active_take_error)?
-        };
-        active_take_write_decision_dict(py, &decision)
     }
 
     fn finish_frame(
@@ -718,104 +525,6 @@ impl Drop for NativeImuCollector {
     }
 }
 
-#[pyclass]
-struct NativeRecordingCodec;
-
-#[pymethods]
-impl NativeRecordingCodec {
-    #[new]
-    fn new() -> Self {
-        Self
-    }
-
-    fn jpeg_payload<'py>(&self, py: Python<'py>, payload: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        let payload = recording::jpeg_payload(payload).map_err(recording_error)?;
-        Ok(PyBytes::new(py, payload))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_split_frame_index<'py>(
-        &self,
-        py: Python<'py>,
-        session_id: &str,
-        frame: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-        segment_index: u64,
-        segment_frame: u64,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let payload = recording::split_frame_index_record(
-            session_id,
-            frame,
-            source_sequence,
-            host_monotonic_ns,
-            segment_index,
-            segment_frame,
-        );
-        Ok(PyBytes::new(py, &payload))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_raw_frame_index<'py>(
-        &self,
-        py: Python<'py>,
-        session_id: &str,
-        frame: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-        video_offset: u64,
-        video_bytes: u64,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let payload = recording::raw_frame_index_record(
-            session_id,
-            frame,
-            source_sequence,
-            host_monotonic_ns,
-            video_offset,
-            video_bytes,
-        );
-        Ok(PyBytes::new(py, &payload))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_imu_sample<'py>(
-        &self,
-        py: Python<'py>,
-        session_id: &str,
-        sequence: u64,
-        packet_sequence: u64,
-        sample_index: u8,
-        device_timestamp_raw: u32,
-        device_ticks: u64,
-        host_read_start_ns: u64,
-        host_read_end_ns: u64,
-        host_monotonic_ns: u64,
-        accelerometer: (i16, i16, i16),
-        gyroscope: (i16, i16, i16),
-        sync_offset_ns: Option<i64>,
-        sync_residual_ns: Option<u64>,
-        sync_quality: &str,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let payload = recording::imu_sample_record(
-            session_id,
-            sequence,
-            packet_sequence,
-            sample_index,
-            device_timestamp_raw,
-            device_ticks,
-            host_read_start_ns,
-            host_read_end_ns,
-            host_monotonic_ns,
-            accelerometer,
-            gyroscope,
-            sync_offset_ns,
-            sync_residual_ns,
-            sync_quality,
-        );
-        Ok(PyBytes::new(py, &payload))
-    }
-}
-
 #[derive(Debug)]
 struct PyImuSampleRecord {
     sequence: u64,
@@ -871,14 +580,15 @@ struct NativeRecordingSink {
 impl NativeRecordingSink {
     #[new]
     fn new(session_root: &str, session_id: &str, split_eyes: bool) -> PyResult<Self> {
+        if !split_eyes {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid_argument: raw-side-by-side recording is not supported",
+            ));
+        }
         Ok(Self {
             sink: Arc::new(Mutex::new(
-                recording::RecordingSink::create(
-                    std::path::Path::new(session_root),
-                    session_id,
-                    split_eyes,
-                )
-                .map_err(recording_error)?,
+                recording::RecordingSink::create(std::path::Path::new(session_root), session_id)
+                    .map_err(recording_error)?,
             )),
         })
     }
@@ -905,30 +615,6 @@ impl NativeRecordingSink {
             segment_frame,
         )
         .map_err(recording_error)
-    }
-
-    fn write_raw_frame(
-        &self,
-        py: Python<'_>,
-        frame: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-        raw_side_by_side: &[u8],
-    ) -> PyResult<Py<PyDict>> {
-        let result = {
-            let mut sink = self.sink.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_poisoned: recording sink mutex is poisoned",
-                )
-            })?;
-            sink.write_raw_frame(frame, source_sequence, host_monotonic_ns, raw_side_by_side)
-                .map_err(recording_error)?
-        };
-        let value = PyDict::new(py);
-        value.set_item("bytes_written", result.bytes_written)?;
-        value.set_item("video_offset", result.video_offset)?;
-        value.set_item("video_bytes", result.video_bytes)?;
-        Ok(value.unbind())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1070,232 +756,6 @@ impl Drop for NativeRecordingSink {
 }
 
 #[pyclass]
-struct NativeRecordingFrameGate {
-    gate: Mutex<recording::RecordingFrameGate>,
-}
-
-#[pymethods]
-impl NativeRecordingFrameGate {
-    #[new]
-    fn new(frame_decimation: u64) -> PyResult<Self> {
-        Ok(Self {
-            gate: Mutex::new(
-                recording::RecordingFrameGate::new(frame_decimation).map_err(recording_error)?,
-            ),
-        })
-    }
-
-    fn begin_frame(&self, py: Python<'_>, dropped_before: u64) -> PyResult<Py<PyDict>> {
-        let decision = {
-            let mut gate = self.gate.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
-                )
-            })?;
-            gate.begin_frame(dropped_before).map_err(recording_error)?
-        };
-        recording_frame_gate_decision_dict(py, &decision)
-    }
-
-    fn finish_frame(&self) -> PyResult<u64> {
-        let mut gate = self.gate.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
-            )
-        })?;
-        gate.finish_frame().map_err(recording_error)
-    }
-
-    fn start_stopping(&self) -> PyResult<u64> {
-        let mut gate = self.gate.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
-            )
-        })?;
-        Ok(gate.start_stopping())
-    }
-
-    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let snapshot = {
-            let gate = self.gate.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_frame_gate_poisoned: frame gate mutex is poisoned",
-                )
-            })?;
-            gate.snapshot()
-        };
-        recording_frame_gate_snapshot_dict(py, &snapshot)
-    }
-}
-
-#[pyclass]
-struct NativeRecordingTapState {
-    tap: Mutex<recording::RecordingTapState>,
-}
-
-#[pymethods]
-impl NativeRecordingTapState {
-    #[new]
-    fn new(frame_decimation: u64) -> PyResult<Self> {
-        Ok(Self {
-            tap: Mutex::new(
-                recording::RecordingTapState::new(frame_decimation).map_err(recording_error)?,
-            ),
-        })
-    }
-
-    fn begin_frame(&self, py: Python<'_>, dropped_before: u64) -> PyResult<Py<PyDict>> {
-        let decision = {
-            let mut tap = self.tap.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_tap_state_poisoned: tap state mutex is poisoned",
-                )
-            })?;
-            tap.begin_frame(dropped_before).map_err(recording_error)?
-        };
-        recording_frame_gate_decision_dict(py, &decision)
-    }
-
-    fn finish_frame(&self) -> PyResult<u64> {
-        let mut tap = self.tap.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_recording_tap_state_poisoned: tap state mutex is poisoned",
-            )
-        })?;
-        tap.finish_frame().map_err(recording_error)
-    }
-
-    fn start_stopping(&self) -> PyResult<u64> {
-        let mut tap = self.tap.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_recording_tap_state_poisoned: tap state mutex is poisoned",
-            )
-        })?;
-        Ok(tap.start_stopping())
-    }
-
-    fn mark_failure(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let (should_report, inflight_frames) = {
-            let mut tap = self.tap.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_tap_state_poisoned: tap state mutex is poisoned",
-                )
-            })?;
-            tap.mark_failure()
-        };
-        let value = PyDict::new(py);
-        value.set_item("should_report", should_report)?;
-        value.set_item("inflight_frames", inflight_frames)?;
-        Ok(value.unbind())
-    }
-
-    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let snapshot = {
-            let tap = self.tap.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_recording_tap_state_poisoned: tap state mutex is poisoned",
-                )
-            })?;
-            tap.snapshot()
-        };
-        recording_tap_snapshot_dict(py, &snapshot)
-    }
-}
-
-#[pyclass]
-struct NativeCaptureFanoutState {
-    fanout: Mutex<recording::CaptureFanoutState>,
-}
-
-#[pymethods]
-impl NativeCaptureFanoutState {
-    #[new]
-    fn new(frame_decimation: u64) -> PyResult<Self> {
-        Ok(Self {
-            fanout: Mutex::new(
-                recording::CaptureFanoutState::new(frame_decimation).map_err(recording_error)?,
-            ),
-        })
-    }
-
-    fn start_recording(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let snapshot = {
-            let mut fanout = self.fanout.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-                )
-            })?;
-            fanout.start_recording().map_err(recording_error)?
-        };
-        capture_fanout_snapshot_dict(py, &snapshot)
-    }
-
-    fn begin_frame(
-        &self,
-        py: Python<'_>,
-        dropped_before: u64,
-        has_preview: bool,
-    ) -> PyResult<Py<PyDict>> {
-        let decision = {
-            let mut fanout = self.fanout.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-                )
-            })?;
-            fanout
-                .begin_frame(dropped_before, has_preview)
-                .map_err(recording_error)?
-        };
-        capture_fanout_decision_dict(py, &decision)
-    }
-
-    fn finish_frame(&self) -> PyResult<u64> {
-        let mut fanout = self.fanout.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-            )
-        })?;
-        fanout.finish_frame().map_err(recording_error)
-    }
-
-    fn start_stopping(&self) -> PyResult<u64> {
-        let mut fanout = self.fanout.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-            )
-        })?;
-        Ok(fanout.start_stopping())
-    }
-
-    fn mark_failure(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let (should_report, inflight_frames) = {
-            let mut fanout = self.fanout.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-                )
-            })?;
-            fanout.mark_failure()
-        };
-        let value = PyDict::new(py);
-        value.set_item("should_report", should_report)?;
-        value.set_item("inflight_frames", inflight_frames)?;
-        Ok(value.unbind())
-    }
-
-    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let snapshot = {
-            let fanout = self.fanout.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "native_capture_fanout_poisoned: capture fanout mutex is poisoned",
-                )
-            })?;
-            fanout.snapshot()
-        };
-        capture_fanout_snapshot_dict(py, &snapshot)
-    }
-}
-
-#[pyclass]
 struct NativeContinuousCaptureRuntime {
     runtime: Arc<capture_runtime::Runtime>,
 }
@@ -1369,42 +829,6 @@ impl NativeContinuousCaptureRuntime {
                 submit_imu,
                 Duration::from_secs_f64(imu_timeout_seconds),
             )
-            .map_err(capture_runtime_error)?;
-        capture_runtime_snapshot_dict(py, &snapshot)
-    }
-
-    #[pyo3(signature = (active_take, sink, on_failure, imu=None, imu_timeout_seconds=1.0))]
-    fn start_recording_raw_sink(
-        &self,
-        py: Python<'_>,
-        active_take: PyRef<'_, NativeActiveTakeWriter>,
-        sink: PyRef<'_, NativeRecordingSink>,
-        on_failure: Py<PyAny>,
-        imu: Option<PyRef<'_, NativeImuCollector>>,
-        imu_timeout_seconds: f64,
-    ) -> PyResult<Py<PyDict>> {
-        if !imu_timeout_seconds.is_finite() || imu_timeout_seconds <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: imu_timeout_seconds must be finite and positive",
-            ));
-        }
-        let imu_collector = imu
-            .as_ref()
-            .map(|collector| Arc::clone(&collector.collector));
-        let runtime = Arc::clone(&self.runtime);
-        let active_take = Arc::clone(&active_take.writer);
-        let sink = Arc::clone(&sink.sink);
-        let timeout = Duration::from_secs_f64(imu_timeout_seconds);
-        let snapshot = py
-            .allow_threads(move || {
-                runtime.start_recording_raw_sink(
-                    active_take,
-                    sink,
-                    on_failure,
-                    imu_collector,
-                    timeout,
-                )
-            })
             .map_err(capture_runtime_error)?;
         capture_runtime_snapshot_dict(py, &snapshot)
     }
@@ -1603,132 +1027,6 @@ impl NativeRecordingSegmentPlanner {
             planner.snapshot()
         };
         recording_segment_planner_snapshot_dict(py, &snapshot)
-    }
-}
-
-#[pyclass]
-struct NativeRecordingEventQueue {
-    producer: bounded::Producer<Py<PyAny>>,
-    consumer: bounded::Consumer<Py<PyAny>>,
-}
-
-#[pymethods]
-impl NativeRecordingEventQueue {
-    #[new]
-    fn new(capacity: usize) -> PyResult<Self> {
-        if capacity == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: recording event queue capacity must be positive",
-            ));
-        }
-        let (producer, consumer) = bounded::channel(capacity);
-        Ok(Self { producer, consumer })
-    }
-
-    #[pyo3(signature = (item, timeout_seconds=0.0))]
-    fn put(&self, py: Python<'_>, item: Py<PyAny>, timeout_seconds: f64) -> PyResult<bool> {
-        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: recording event queue timeout must be finite and non-negative",
-            ));
-        }
-        let producer = self.producer.clone();
-        let timeout = Duration::from_secs_f64(timeout_seconds);
-        match py.allow_threads(move || producer.push_timeout(item, timeout)) {
-            Ok(()) => Ok(true),
-            Err(_item) => Ok(false),
-        }
-    }
-
-    fn get(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let consumer = self.consumer.clone();
-        match py.allow_threads(move || consumer.receive_blocking()) {
-            Ok(item) => Ok(item),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "recording_event_queue_closed: recording event queue is closed",
-                ))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "recording_event_queue_timeout: blocking receive unexpectedly timed out",
-                ))
-            }
-        }
-    }
-
-    fn qsize(&self) -> PyResult<usize> {
-        Ok(self.consumer.stats().depth)
-    }
-
-    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        recording_event_queue_stats_dict(py, &self.consumer.stats())
-    }
-
-    fn close_and_clear(&self) {
-        self.consumer.close_and_clear();
-    }
-}
-
-#[pyclass]
-struct NativeStereoEncoderEvents;
-
-#[pymethods]
-impl NativeStereoEncoderEvents {
-    #[new]
-    fn new() -> Self {
-        Self
-    }
-
-    fn parse(&self, py: Python<'_>, line: &[u8]) -> PyResult<Option<Py<PyDict>>> {
-        let event = stereo_encoder::parse_event(line).map_err(stereo_encoder_event_error)?;
-        let Some(event) = event else {
-            return Ok(None);
-        };
-        Ok(Some(stereo_encoder_event_dict(py, &event)?))
-    }
-}
-
-#[pyclass]
-struct NativeStereoEncoderPipe {
-    descriptor: i32,
-    submitted: AtomicU64,
-}
-
-#[pymethods]
-impl NativeStereoEncoderPipe {
-    #[new]
-    fn new(descriptor: i32) -> PyResult<Self> {
-        if descriptor < 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: encoder pipe descriptor must be non-negative",
-            ));
-        }
-        Ok(Self {
-            descriptor,
-            submitted: AtomicU64::new(0),
-        })
-    }
-
-    fn submit(&self, py: Python<'_>, jpeg: &[u8]) -> PyResult<u64> {
-        let descriptor = self.descriptor;
-        let written = py
-            .allow_threads(move || session_io::write_encoder_frame(descriptor, jpeg))
-            .map_err(session_io_error)?;
-        self.submitted
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "counter_overflow: encoder submitted frame count overflowed",
-                )
-            })?;
-        Ok(written)
-    }
-
-    fn submitted_frames(&self) -> u64 {
-        self.submitted.load(Ordering::SeqCst)
     }
 }
 
@@ -2050,122 +1348,6 @@ impl NativeSessionIo {
     }
 }
 
-fn bounded_range_decimal(value: &str, upper_bound: u64) -> Option<u64> {
-    if value.is_empty() || !value.is_ascii() || !value.bytes().all(|item| item.is_ascii_digit()) {
-        return None;
-    }
-    let normalized = value.trim_start_matches('0');
-    let normalized = if normalized.is_empty() {
-        "0"
-    } else {
-        normalized
-    };
-    let bound = upper_bound.to_string();
-    if normalized.len() > bound.len()
-        || (normalized.len() == bound.len() && normalized > bound.as_str())
-    {
-        return Some(upper_bound.saturating_add(1));
-    }
-    normalized.parse::<u64>().ok()
-}
-
-fn parse_single_http_range(
-    value: Option<&str>,
-    complete_size: i64,
-) -> Result<Option<(u64, u64)>, ()> {
-    if complete_size < 0 {
-        return Err(());
-    }
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if !value.starts_with("bytes=") || value.contains(',') {
-        return Err(());
-    }
-    let complete_size = complete_size as u64;
-    let selected = &value["bytes=".len()..];
-    if let Some(suffix) = selected.strip_prefix('-') {
-        let Some(suffix_size) = bounded_range_decimal(suffix, complete_size) else {
-            return Err(());
-        };
-        if suffix_size == 0 || complete_size == 0 {
-            return Err(());
-        }
-        return Ok(Some((
-            complete_size.saturating_sub(suffix_size),
-            complete_size - 1,
-        )));
-    }
-    let Some((first_text, last_text)) = selected.split_once('-') else {
-        return Err(());
-    };
-    let Some(first) = bounded_range_decimal(first_text, complete_size) else {
-        return Err(());
-    };
-    if first >= complete_size {
-        return Err(());
-    }
-    if last_text.is_empty() {
-        return Ok(Some((first, complete_size - 1)));
-    }
-    let Some(last) = bounded_range_decimal(last_text, complete_size) else {
-        return Err(());
-    };
-    if last < first {
-        return Err(());
-    }
-    Ok(Some((first, last.min(complete_size - 1))))
-}
-
-#[pyfunction]
-fn parse_single_range(value: Option<&str>, complete_size: i64) -> PyResult<Option<(u64, u64)>> {
-    if complete_size < 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "invalid_argument: complete_size must be non-negative",
-        ));
-    }
-    parse_single_http_range(value, complete_size).map_err(|_| {
-        pyo3::exceptions::PyValueError::new_err("range_not_satisfiable: range cannot be satisfied")
-    })
-}
-
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-fn evaluate_drop_quality_policy(
-    py: Python<'_>,
-    drop_events: &Bound<'_, PyAny>,
-    frames_written: u64,
-    max_contiguous_dropped_frames: u64,
-    max_total_dropped_frames: u64,
-    max_drop_fraction: f64,
-    window_seconds: f64,
-    max_dropped_frames_per_window: u64,
-) -> PyResult<Py<PyDict>> {
-    let events = drop_events.downcast::<PySequence>()?;
-    let count = events.len()?;
-    let mut parsed = Vec::with_capacity(count);
-    for index in 0..count {
-        let event = events.get_item(index)?;
-        parsed.push(recording::DropEvent {
-            at_time_seconds: event.get_item("at_time_seconds")?.extract()?,
-            dropped: event.get_item("dropped")?.extract()?,
-        });
-    }
-    let result = recording::evaluate_drop_quality(
-        frames_written,
-        &parsed,
-        recording::DropQualityPolicy {
-            max_contiguous_dropped_frames,
-            max_total_dropped_frames,
-            max_drop_fraction,
-            window_seconds,
-            max_dropped_frames_per_window,
-        },
-    )
-    .map_err(recording_error)?;
-    drop_quality_evaluation_dict(py, &result)
-}
-
 #[pyclass]
 struct NativePreviewBuffer {
     buffer: Arc<preview::LatestBuffer>,
@@ -2408,29 +1590,17 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     result.set_item("module_version", env!("CARGO_PKG_VERSION"))?;
     result.set_item("abi", NATIVE_ABI)?;
     let mut features = vec![CAPABILITY_PROBE, JPEG_CONTRACT, FRAME_STREAM];
-    features.push(RECORDING_CODEC);
     features.push(RECORDING_SINK);
     features.push(RECORDING_IMU_BATCH);
-    features.push(RECORDING_FRAME_GATE);
-    features.push(RECORDING_TAP_STATE);
-    features.push(CAPTURE_FANOUT);
     features.push(RECORDING_SEGMENT_PLANNER);
-    features.push(RECORDING_EVENT_QUEUE);
     features.push(ARTIFACT_FINALIZE);
-    features.push(RANGE_PARSER);
-    features.push(STEREO_ENCODER_EVENTS);
-    features.push(STEREO_ENCODER_PIPE);
     features.push(STEREO_ENCODER_PROCESS);
     features.push(SESSION_IO);
     features.push(DEVICE_SESSION_ARTIFACTS);
     features.push(DEVICE_SESSION_FINALIZER);
-    features.push(DROP_QUALITY_POLICY);
-    features.push(CAMERA_FRAME_VALIDATOR);
     features.push(PREVIEW_BUFFER);
     features.push(PERFORMANCE_METRICS);
-    features.push(NATIVE_TIMELINE);
     features.push(ACTIVE_TAKE_WRITER);
-    features.push(CONTINUOUS_CAPTURE_RAW_SINK);
     features.push(CONTINUOUS_CAPTURE_SPLIT_SINK);
     features.push(V4L2_CAPTURE);
     features.push(V4L2_FOCUS_CONTROL);
@@ -2499,17 +1669,6 @@ fn v4l2_set_focus(
     focus_status_dict(py, status)
 }
 
-fn camera_frame_validation_dict(
-    py: Python<'_>,
-    validation: &native_camera::FrameValidation,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("dropped_before", validation.dropped_before)?;
-    value.set_item("queue_rejected", validation.queue_rejected)?;
-    value.set_item("source_gap", validation.source_gap)?;
-    Ok(value.unbind())
-}
-
 fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("device", &result.device)?;
@@ -2547,40 +1706,6 @@ fn audio_snapshot_dict(
     Ok(value.unbind())
 }
 
-fn timeline_audio_sync_dict(py: Python<'_>, sync: &timeline::AudioSync) -> PyResult<Py<PyDict>> {
-    let session_start_offset_ns = i64::try_from(sync.session_start_offset_ns).map_err(|_| {
-        pyo3::exceptions::PyOverflowError::new_err(
-            "timeline_overflow: audio start offset does not fit in signed 64-bit nanoseconds",
-        )
-    })?;
-    let session_stop_offset_ns = i64::try_from(sync.session_stop_offset_ns).map_err(|_| {
-        pyo3::exceptions::PyOverflowError::new_err(
-            "timeline_overflow: audio stop offset does not fit in signed 64-bit nanoseconds",
-        )
-    })?;
-    let value = PyDict::new(py);
-    value.set_item("clock", "host_monotonic")?;
-    value.set_item("timebase", "monotonic_ns")?;
-    value.set_item(
-        "session_start_monotonic_ns",
-        sync.session_start_monotonic_ns,
-    )?;
-    value.set_item("started_monotonic_ns", sync.started_monotonic_ns)?;
-    value.set_item("stopped_monotonic_ns", sync.stopped_monotonic_ns)?;
-    value.set_item("session_start_offset_ns", session_start_offset_ns)?;
-    value.set_item("session_stop_offset_ns", session_stop_offset_ns)?;
-    value.set_item(
-        "session_start_offset_seconds",
-        sync.session_start_offset_seconds,
-    )?;
-    value.set_item(
-        "session_stop_offset_seconds",
-        sync.session_stop_offset_seconds,
-    )?;
-    value.set_item("sample_duration_ns", sync.sample_duration_ns)?;
-    Ok(value.unbind())
-}
-
 fn active_take_reserved_frame_dict(
     py: Python<'_>,
     frame: &active_take::ReservedFrame,
@@ -2590,32 +1715,6 @@ fn active_take_reserved_frame_dict(
     value.set_item("record_sequence", frame.record_sequence)?;
     value.set_item("source_sequence", frame.source_sequence)?;
     value.set_item("host_monotonic_ns", frame.host_monotonic_ns)?;
-    Ok(value.unbind())
-}
-
-fn active_take_write_decision_dict(
-    py: Python<'_>,
-    decision: &active_take::FrameWriteDecision,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    match decision {
-        active_take::FrameWriteDecision::RawSideBySide(raw) => {
-            value.set_item("layout", "raw-side-by-side")?;
-            value.set_item("session_id", &raw.session_id)?;
-            value.set_item("record_sequence", raw.record_sequence)?;
-            value.set_item("source_sequence", raw.source_sequence)?;
-            value.set_item("host_monotonic_ns", raw.host_monotonic_ns)?;
-        }
-        active_take::FrameWriteDecision::SplitEyes(split) => {
-            value.set_item("layout", "split-eyes")?;
-            value.set_item("session_id", &split.session_id)?;
-            value.set_item("record_sequence", split.record_sequence)?;
-            value.set_item("source_sequence", split.source_sequence)?;
-            value.set_item("host_monotonic_ns", split.host_monotonic_ns)?;
-            value.set_item("segment_index", split.segment_index)?;
-            value.set_item("segment_frame", split.segment_frame)?;
-        }
-    }
     Ok(value.unbind())
 }
 
@@ -2668,75 +1767,6 @@ fn recording_sink_snapshot_dict(
         artifacts.set_item(artifact.role, item)?;
     }
     value.set_item("artifacts", artifacts)?;
-    Ok(value.unbind())
-}
-
-fn recording_frame_gate_decision_dict(
-    py: Python<'_>,
-    decision: &recording::FrameGateDecision,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("record", decision.record)?;
-    value.set_item("dropped_before", decision.dropped_before)?;
-    value.set_item("observed_frames", decision.observed_frames)?;
-    value.set_item("inflight_frames", decision.inflight_frames)?;
-    Ok(value.unbind())
-}
-
-fn recording_frame_gate_snapshot_dict(
-    py: Python<'_>,
-    snapshot: &recording::FrameGateSnapshot,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("frame_decimation", snapshot.frame_decimation)?;
-    value.set_item("first_frame", snapshot.first_frame)?;
-    value.set_item("observed_frames", snapshot.observed_frames)?;
-    value.set_item("inflight_frames", snapshot.inflight_frames)?;
-    value.set_item("stopping", snapshot.stopping)?;
-    Ok(value.unbind())
-}
-
-fn recording_tap_snapshot_dict(
-    py: Python<'_>,
-    snapshot: &recording::RecordingTapSnapshot,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("frame_decimation", snapshot.frame_decimation)?;
-    value.set_item("first_frame", snapshot.first_frame)?;
-    value.set_item("observed_frames", snapshot.observed_frames)?;
-    value.set_item("inflight_frames", snapshot.inflight_frames)?;
-    value.set_item("stopping", snapshot.stopping)?;
-    value.set_item("failure_reported", snapshot.failure_reported)?;
-    Ok(value.unbind())
-}
-
-fn capture_fanout_decision_dict(
-    py: Python<'_>,
-    decision: &recording::CaptureFanoutDecision,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("publish_preview", decision.publish_preview)?;
-    value.set_item("record", decision.record)?;
-    value.set_item("dropped_before", decision.dropped_before)?;
-    value.set_item("observed_frames", decision.observed_frames)?;
-    value.set_item("inflight_frames", decision.inflight_frames)?;
-    value.set_item("recording_active", decision.recording_active)?;
-    Ok(value.unbind())
-}
-
-fn capture_fanout_snapshot_dict(
-    py: Python<'_>,
-    snapshot: &recording::CaptureFanoutSnapshot,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("frame_decimation", snapshot.frame_decimation)?;
-    value.set_item("recording_present", snapshot.recording_present)?;
-    value.set_item("recording_active", snapshot.recording_active)?;
-    value.set_item("first_frame", snapshot.first_frame)?;
-    value.set_item("observed_frames", snapshot.observed_frames)?;
-    value.set_item("inflight_frames", snapshot.inflight_frames)?;
-    value.set_item("stopping", snapshot.stopping)?;
-    value.set_item("failure_reported", snapshot.failure_reported)?;
     Ok(value.unbind())
 }
 
@@ -2807,73 +1837,6 @@ fn recording_segment_planner_snapshot_dict(
     value.set_item("segment_count", snapshot.segment_count)?;
     value.set_item("covered_frames", snapshot.covered_frames)?;
     value.set_item("boundary_count", snapshot.boundary_count)?;
-    Ok(value.unbind())
-}
-
-fn recording_event_queue_stats_dict(
-    py: Python<'_>,
-    stats: &bounded::QueueStats,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("capacity", stats.capacity)?;
-    value.set_item("depth", stats.depth)?;
-    value.set_item("peak_depth", stats.peak_depth)?;
-    value.set_item("enqueued", stats.enqueued)?;
-    value.set_item("delivered", stats.delivered)?;
-    value.set_item("rejected", stats.rejected)?;
-    Ok(value.unbind())
-}
-
-fn drop_quality_evaluation_dict(
-    py: Python<'_>,
-    result: &recording::DropQualityEvaluation,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("accepted", result.accepted)?;
-    value.set_item("dropped", result.dropped)?;
-    value.set_item("total", result.total)?;
-    value.set_item("fraction", result.fraction)?;
-    value.set_item("contiguous", result.contiguous)?;
-    value.set_item("window_drops", result.window_drops)?;
-    value.set_item("violations", result.violations.clone())?;
-    Ok(value.unbind())
-}
-
-fn stereo_encoder_event_dict(
-    py: Python<'_>,
-    event: &stereo_encoder::EncoderEvent,
-) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    match event {
-        stereo_encoder::EncoderEvent::Ready => {
-            value.set_item("event", "ready")?;
-        }
-        stereo_encoder::EncoderEvent::Segment(segment) => {
-            value.set_item("event", "segment")?;
-            value.set_item("index", segment.index)?;
-            value.set_item("start_frame", segment.start_frame)?;
-            value.set_item("end_frame", segment.end_frame)?;
-            let left = PyDict::new(py);
-            left.set_item("path", &segment.left_path)?;
-            left.set_item("bytes", segment.left_bytes)?;
-            value.set_item("left", left)?;
-            let right = PyDict::new(py);
-            right.set_item("path", &segment.right_path)?;
-            right.set_item("bytes", segment.right_bytes)?;
-            value.set_item("right", right)?;
-        }
-        stereo_encoder::EncoderEvent::Done(stats) => {
-            value.set_item("event", "done")?;
-            for (key, number) in stats {
-                value.set_item(key, number)?;
-            }
-        }
-        stereo_encoder::EncoderEvent::Error { code, message } => {
-            value.set_item("event", "error")?;
-            value.set_item("code", code)?;
-            value.set_item("message", message)?;
-        }
-    }
     Ok(value.unbind())
 }
 
@@ -3038,29 +2001,18 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(module.py(), frame_stream::MAGIC),
     )?;
     module.add_function(wrap_pyfunction!(capabilities, module)?)?;
-    module.add_function(wrap_pyfunction!(parse_single_range, module)?)?;
-    module.add_function(wrap_pyfunction!(evaluate_drop_quality_policy, module)?)?;
     module.add_function(wrap_pyfunction!(jpeg_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(encode_frame, module)?)?;
     module.add_function(wrap_pyfunction!(v4l2_focus_status, module)?)?;
     module.add_function(wrap_pyfunction!(v4l2_set_focus, module)?)?;
     module.add_class::<NativeSplitter>()?;
     module.add_class::<NativeCameraStream>()?;
-    module.add_class::<NativeCameraFrameValidator>()?;
     module.add_class::<NativeAudioRecorder>()?;
-    module.add_class::<NativeTimeline>()?;
     module.add_class::<NativeActiveTakeWriter>()?;
     module.add_class::<NativeImuCollector>()?;
-    module.add_class::<NativeRecordingCodec>()?;
     module.add_class::<NativeRecordingSink>()?;
-    module.add_class::<NativeRecordingFrameGate>()?;
-    module.add_class::<NativeRecordingTapState>()?;
-    module.add_class::<NativeCaptureFanoutState>()?;
     module.add_class::<NativeContinuousCaptureRuntime>()?;
     module.add_class::<NativeRecordingSegmentPlanner>()?;
-    module.add_class::<NativeRecordingEventQueue>()?;
-    module.add_class::<NativeStereoEncoderEvents>()?;
-    module.add_class::<NativeStereoEncoderPipe>()?;
     module.add_class::<NativeStereoEncoderProcess>()?;
     module.add_class::<NativeSessionIo>()?;
     module.add_class::<NativePreviewBuffer>()?;
@@ -3072,15 +2024,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_TAKE_WRITER, ARTIFACT_FINALIZE, CAMERA_FRAME_VALIDATOR, CAPABILITY_PROBE,
-        CAPTURE_FANOUT, CONTINUOUS_CAPTURE_RAW_SINK, CONTINUOUS_CAPTURE_RUNTIME,
+        ACTIVE_TAKE_WRITER, ARTIFACT_FINALIZE, CAPABILITY_PROBE, CONTINUOUS_CAPTURE_RUNTIME,
         CONTINUOUS_CAPTURE_SPLIT_SINK, DEVICE_SESSION_ARTIFACTS, DEVICE_SESSION_FINALIZER,
-        DROP_QUALITY_POLICY, FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA,
-        NATIVE_IMU, NATIVE_TIMELINE, PERFORMANCE_METRICS, PREVIEW_BUFFER, RANGE_PARSER,
-        RECORDING_CODEC, RECORDING_EVENT_QUEUE, RECORDING_FRAME_GATE, RECORDING_IMU_BATCH,
-        RECORDING_SEGMENT_PLANNER, RECORDING_SINK, RECORDING_TAP_STATE, SESSION_IO,
-        STEREO_ENCODER_EVENTS, STEREO_ENCODER_PIPE, STEREO_ENCODER_PROCESS, TURBOJPEG_SPLIT,
-        V4L2_CAPTURE, V4L2_FOCUS_CONTROL, parse_single_http_range,
+        FRAME_STREAM, JPEG_CONTRACT, NATIVE_ABI, NATIVE_AUDIO, NATIVE_CAMERA, NATIVE_IMU,
+        PERFORMANCE_METRICS, PREVIEW_BUFFER, RECORDING_IMU_BATCH, RECORDING_SEGMENT_PLANNER,
+        RECORDING_SINK, SESSION_IO, STEREO_ENCODER_PROCESS, TURBOJPEG_SPLIT, V4L2_CAPTURE,
+        V4L2_FOCUS_CONTROL,
     };
 
     #[test]
@@ -3093,68 +2042,23 @@ mod tests {
         assert_eq!(V4L2_CAPTURE, "v4l2_capture");
         assert_eq!(V4L2_FOCUS_CONTROL, "v4l2_focus_control");
         assert_eq!(NATIVE_CAMERA, "native_camera");
-        assert_eq!(CAMERA_FRAME_VALIDATOR, "camera_frame_validator");
         assert_eq!(NATIVE_AUDIO, "native_audio");
-        assert_eq!(NATIVE_TIMELINE, "native_timeline");
         assert_eq!(ACTIVE_TAKE_WRITER, "active_take_writer");
         assert_eq!(NATIVE_IMU, "native_imu");
-        assert_eq!(RECORDING_CODEC, "recording_codec");
         assert_eq!(RECORDING_SINK, "recording_sink");
         assert_eq!(RECORDING_IMU_BATCH, "recording_imu_batch");
-        assert_eq!(RECORDING_FRAME_GATE, "recording_frame_gate");
-        assert_eq!(RECORDING_TAP_STATE, "recording_tap_state");
-        assert_eq!(CAPTURE_FANOUT, "capture_fanout");
         assert_eq!(CONTINUOUS_CAPTURE_RUNTIME, "continuous_capture_runtime");
-        assert_eq!(CONTINUOUS_CAPTURE_RAW_SINK, "continuous_capture_raw_sink");
         assert_eq!(
             CONTINUOUS_CAPTURE_SPLIT_SINK,
             "continuous_capture_split_sink"
         );
         assert_eq!(RECORDING_SEGMENT_PLANNER, "recording_segment_planner");
-        assert_eq!(RECORDING_EVENT_QUEUE, "recording_event_queue");
         assert_eq!(ARTIFACT_FINALIZE, "artifact_finalize");
-        assert_eq!(RANGE_PARSER, "range_parser");
-        assert_eq!(STEREO_ENCODER_EVENTS, "stereo_encoder_events");
-        assert_eq!(STEREO_ENCODER_PIPE, "stereo_encoder_pipe");
         assert_eq!(STEREO_ENCODER_PROCESS, "stereo_encoder_process");
         assert_eq!(SESSION_IO, "session_io");
         assert_eq!(DEVICE_SESSION_ARTIFACTS, "device_session_artifacts");
         assert_eq!(DEVICE_SESSION_FINALIZER, "device_session_finalizer");
-        assert_eq!(DROP_QUALITY_POLICY, "drop_quality_policy");
         assert_eq!(PREVIEW_BUFFER, "preview_buffer");
         assert_eq!(PERFORMANCE_METRICS, "performance_metrics");
-    }
-
-    #[test]
-    fn parses_single_http_ranges_like_gateway_contract() {
-        assert_eq!(parse_single_http_range(None, 26), Ok(None));
-        assert_eq!(
-            parse_single_http_range(Some("bytes=10-"), 26),
-            Ok(Some((10, 25)))
-        );
-        assert_eq!(
-            parse_single_http_range(Some("bytes=-4"), 26),
-            Ok(Some((22, 25)))
-        );
-        assert_eq!(
-            parse_single_http_range(Some("bytes=0-999"), 26),
-            Ok(Some((0, 25)))
-        );
-        assert_eq!(
-            parse_single_http_range(Some("bytes=2-8"), 26),
-            Ok(Some((2, 8)))
-        );
-        for value in [
-            "bytes=0-1,3-4",
-            "bytes=26-",
-            "bytes=8-2",
-            "bytes=-0",
-            "items=0-1",
-            "bytes=invalid",
-            "bytes=999999999999999999999999999999999999",
-        ] {
-            assert!(parse_single_http_range(Some(value), 26).is_err(), "{value}");
-        }
-        assert!(parse_single_http_range(Some("bytes=0-"), -1).is_err());
     }
 }

@@ -119,30 +119,6 @@ class CameraControllerTest(unittest.TestCase):
         self.assertTrue(backend.opened_streams[0].stopped)
         self.assertTrue(backend.opened_streams[0].closed)
 
-    def test_controller_uses_native_frame_validator_when_available(self) -> None:
-        device = descriptor("camera-native-validator")
-        backend = SyntheticCameraBackend(
-            (device,),
-            frames={device.stable_id: [frame(5, 100)]},
-        )
-        validator = Mock()
-        validator.validate_frame.return_value = {
-            "dropped_before": 7,
-            "queue_rejected": 0,
-            "source_gap": 7,
-        }
-        with patch(
-            "rp_ylx.camera.controller.create_native_camera_frame_validator",
-            return_value=validator,
-        ):
-            controller = CameraController(backend)
-        controller.open(MODE)
-        controller.start()
-        self.assertEqual(controller.read().dropped_before, 7)
-        controller.close()
-        validator.validate_frame.assert_called_once_with(5, 100, True, True, True, False, 0)
-        self.assertGreaterEqual(validator.reset.call_count, 2)
-
     def test_bad_frame_regression_and_hot_unplug_release_resources(self) -> None:
         cases = (
             (StereoFrame(0, 1, b"", b"right", True), "bad_frame"),

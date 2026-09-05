@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,22 @@ class InstalledWheelTest(unittest.TestCase):
             text=True,
         ).stdout.strip()
         source_build_info = (REPOSITORY / "src/rp_ylx/_build_info.py").read_bytes()
+        package_root = REPOSITORY / "src/rp_ylx"
+        resource_paths = [
+            REPOSITORY / relative
+            for relative in subprocess.run(
+                ["git", "ls-files", "src/rp_ylx"],
+                cwd=REPOSITORY,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            if Path(relative).suffix != ".py"
+        ]
+        expected_resources = {
+            path.relative_to(package_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in resource_paths
+        }
 
         environment = os.environ.copy()
         for name in ("PYTHONPATH", "RP_YLX_COMMIT", "UV_PROJECT_ENVIRONMENT", "VIRTUAL_ENV"):
@@ -190,6 +207,29 @@ class InstalledWheelTest(unittest.TestCase):
                         text=True,
                     ).stdout.strip()
                 )
+                installed_resources = json.loads(
+                    subprocess.run(
+                        [
+                            str(python),
+                            "-c",
+                            (
+                                "import hashlib, json, sys; "
+                                "from importlib.resources import files; "
+                                "names=json.loads(sys.argv[1]); "
+                                "root=files('rp_ylx'); "
+                                "print(json.dumps({name: hashlib.sha256("
+                                "root.joinpath(*name.split('/')).read_bytes()).hexdigest() "
+                                "for name in sorted(names)}, sort_keys=True))"
+                            ),
+                            json.dumps(sorted(expected_resources)),
+                        ],
+                        cwd=external_root,
+                        env=environment,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                )
 
                 self.assertEqual(version, f"rp-ylx 0.1.0 ({expected_commit})")
                 self.assertIn("usage: rp-ylx-spectacular-check", spectacular_help)
@@ -200,6 +240,7 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertIn("capability_probe", status["native"]["features"])
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])
+                self.assertEqual(installed_resources, expected_resources)
                 self.assertEqual(
                     embedded_web,
                     {

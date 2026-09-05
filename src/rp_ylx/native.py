@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Protocol, cast
@@ -123,21 +124,6 @@ class NativeCamera(Protocol):
     ) -> dict[str, object]: ...
 
 
-class NativeCameraFrameValidator(Protocol):
-    def validate_frame(
-        self,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        valid: bool,
-        has_left: bool,
-        has_right: bool,
-        has_raw_side_by_side: bool,
-        application_dropped_before: int,
-    ) -> dict[str, int]: ...
-
-    def reset(self) -> None: ...
-
-
 class NativeAudioRecorder(Protocol):
     def start(self) -> None: ...
 
@@ -150,50 +136,12 @@ class NativeAudioRecorder(Protocol):
     def close(self) -> None: ...
 
 
-class NativeTimeline(Protocol):
-    @staticmethod
-    def now_monotonic_ns() -> int: ...
-
-    def start_monotonic_ns(self) -> int: ...
-
-    def elapsed_ns(self) -> int: ...
-
-    def elapsed_seconds(self) -> float: ...
-
-    def offset_ns(self, monotonic_ns: int) -> int: ...
-
-    def offset_seconds(self, monotonic_ns: int) -> float: ...
-
-    def audio_sync(
-        self,
-        started_monotonic_ns: int,
-        stopped_monotonic_ns: int,
-        sample_rate_hz: int,
-    ) -> dict[str, object]: ...
-
-
 class NativeActiveTakeWriter(Protocol):
     def reserve_frame(
         self,
         source_sequence: int,
         host_monotonic_ns: int,
         source_gap: int,
-    ) -> dict[str, object]: ...
-
-    def raw_write_decision(
-        self,
-        record_sequence: int,
-        source_sequence: int,
-        host_monotonic_ns: int,
-    ) -> dict[str, object]: ...
-
-    def split_write_decision(
-        self,
-        record_sequence: int,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        segment_index: int,
-        segment_frame: int,
     ) -> dict[str, object]: ...
 
     def finish_frame(
@@ -227,48 +175,6 @@ class NativeImuCollector(Protocol):
     def unit(self) -> int: ...
 
 
-class NativeRecordingCodec(Protocol):
-    def jpeg_payload(self, payload: bytes) -> bytes: ...
-
-    def encode_split_frame_index(
-        self,
-        session_id: str,
-        frame: int,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        segment_index: int,
-        segment_frame: int,
-    ) -> bytes: ...
-
-    def encode_raw_frame_index(
-        self,
-        session_id: str,
-        frame: int,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        video_offset: int,
-        video_bytes: int,
-    ) -> bytes: ...
-
-    def encode_imu_sample(
-        self,
-        session_id: str,
-        sequence: int,
-        packet_sequence: int,
-        sample_index: int,
-        device_timestamp_raw: int,
-        device_ticks: int,
-        host_read_start_ns: int,
-        host_read_end_ns: int,
-        host_monotonic_ns: int,
-        accelerometer: tuple[int, int, int],
-        gyroscope: tuple[int, int, int],
-        sync_offset_ns: int | None,
-        sync_residual_ns: int | None,
-        sync_quality: str,
-    ) -> bytes: ...
-
-
 class NativeRecordingSink(Protocol):
     def write_split_frame_index(
         self,
@@ -278,14 +184,6 @@ class NativeRecordingSink(Protocol):
         segment_index: int,
         segment_frame: int,
     ) -> int: ...
-
-    def write_raw_frame(
-        self,
-        frame: int,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        raw_side_by_side: bytes,
-    ) -> dict[str, int]: ...
 
     def write_imu_sample(
         self,
@@ -313,42 +211,6 @@ class NativeRecordingSink(Protocol):
     def close(self) -> None: ...
 
 
-class NativeRecordingFrameGate(Protocol):
-    def begin_frame(self, dropped_before: int) -> dict[str, object]: ...
-
-    def finish_frame(self) -> int: ...
-
-    def start_stopping(self) -> int: ...
-
-    def snapshot(self) -> dict[str, object]: ...
-
-
-class NativeRecordingTapState(Protocol):
-    def begin_frame(self, dropped_before: int) -> dict[str, object]: ...
-
-    def finish_frame(self) -> int: ...
-
-    def start_stopping(self) -> int: ...
-
-    def mark_failure(self) -> dict[str, object]: ...
-
-    def snapshot(self) -> dict[str, object]: ...
-
-
-class NativeCaptureFanoutState(Protocol):
-    def start_recording(self) -> dict[str, object]: ...
-
-    def begin_frame(self, dropped_before: int, has_preview: bool) -> dict[str, object]: ...
-
-    def finish_frame(self) -> int: ...
-
-    def start_stopping(self) -> int: ...
-
-    def mark_failure(self) -> dict[str, object]: ...
-
-    def snapshot(self) -> dict[str, object]: ...
-
-
 class NativeContinuousCaptureRuntime(Protocol):
     def start_preview(self) -> None: ...
 
@@ -358,15 +220,6 @@ class NativeContinuousCaptureRuntime(Protocol):
         on_failure: object,
         imu: object | None = None,
         submit_imu: object | None = None,
-        imu_timeout_seconds: float = 1.0,
-    ) -> dict[str, object]: ...
-
-    def start_recording_raw_sink(
-        self,
-        active_take: NativeActiveTakeWriter,
-        sink: NativeRecordingSink,
-        on_failure: object,
-        imu: object | None = None,
         imu_timeout_seconds: float = 1.0,
     ) -> dict[str, object]: ...
 
@@ -409,28 +262,6 @@ class NativeRecordingSegmentPlanner(Protocol):
     def boundary(self, ordinal: int, duration_seconds: float) -> dict[str, object]: ...
 
     def snapshot(self) -> dict[str, object]: ...
-
-
-class NativeRecordingEventQueue(Protocol):
-    def put(self, item: object, timeout_seconds: float = 0.0) -> bool: ...
-
-    def get(self) -> object: ...
-
-    def qsize(self) -> int: ...
-
-    def stats(self) -> dict[str, object]: ...
-
-    def close_and_clear(self) -> None: ...
-
-
-class NativeStereoEncoderEvents(Protocol):
-    def parse(self, line: bytes) -> dict[str, object] | None: ...
-
-
-class NativeStereoEncoderPipe(Protocol):
-    def submit(self, jpeg: bytes) -> int: ...
-
-    def submitted_frames(self) -> int: ...
 
 
 class NativeStereoEncoderProcess(Protocol):
@@ -549,20 +380,43 @@ class NativePerformanceMetrics(Protocol):
     def snapshot(self) -> dict[str, object]: ...
 
 
+_SESSION_IO_LOCK = threading.Lock()
+_SESSION_IO: NativeSessionIo | None = None
+_SESSION_IO_UNAVAILABLE = False
+
+
+def _require_native_feature(
+    feature: str,
+    unavailable_code: str,
+    load_subject: str,
+    missing_message: str,
+) -> ModuleType:
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except ImportError as exc:
+        raise NativeModuleError(unavailable_code, f"无法加载{load_subject}：{exc}") from exc
+    if feature not in _validate_capabilities(module).features:
+        raise NativeModuleError(unavailable_code, missing_message)
+    return module
+
+
+def _parse_native_error(exc: Exception, fallback_code: str) -> NativeModuleError:
+    raw = str(exc)
+    code, separator, message = raw.partition(": ")
+    if not separator or not code.replace("_", "").isalnum():
+        code, message = fallback_code, raw
+    return NativeModuleError(code, message)
+
+
 def create_native_splitter() -> NativeSplitter:
     """Create the explicit Rust/TurboJPEG splitter or fail without fallback."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_splitter_unavailable", f"无法加载原生拆分模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "turbojpeg_split" not in capabilities.features:
-        raise NativeModuleError(
-            "native_splitter_unavailable", "原生模块缺少可用的 TurboJPEG 拆分能力"
-        )
+    module = _require_native_feature(
+        "turbojpeg_split",
+        "native_splitter_unavailable",
+        "原生拆分模块",
+        "原生模块缺少可用的 TurboJPEG 拆分能力",
+    )
     try:
         splitter = module.NativeSplitter()
     except Exception as exc:
@@ -585,17 +439,12 @@ def create_native_camera(
 ) -> NativeCamera:
     """Create the complete Rust V4L2/TurboJPEG camera or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_camera_unavailable", f"无法加载原生相机模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "native_camera" not in capabilities.features:
-        raise NativeModuleError(
-            "native_camera_unavailable", "原生模块缺少完整 V4L2/TurboJPEG 相机能力"
-        )
+    module = _require_native_feature(
+        "native_camera",
+        "native_camera_unavailable",
+        "原生相机模块",
+        "原生模块缺少完整 V4L2/TurboJPEG 相机能力",
+    )
     try:
         return module.NativeCameraStream(
             device,
@@ -608,19 +457,7 @@ def create_native_camera(
             split_eyes,
         )
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_camera_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def _parse_native_error(exc: Exception, fallback_code: str) -> NativeModuleError:
-    raw = str(exc)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = fallback_code, raw
-    return NativeModuleError(code, message)
+        raise _parse_native_error(exc, "native_camera_init_failed") from exc
 
 
 def _validate_native_focus_status(status: object) -> dict[str, object] | None:
@@ -658,15 +495,12 @@ def _validate_native_focus_status(status: object) -> dict[str, object] | None:
 def native_camera_focus_status(device: str) -> dict[str, object] | None:
     """Read V4L2 focus controls through the Rust native control path."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_focus_unavailable", f"无法加载原生相机控制模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "v4l2_focus_control" not in capabilities.features:
-        raise NativeModuleError("native_focus_unavailable", "原生模块缺少 V4L2 焦距控制能力")
+    module = _require_native_feature(
+        "v4l2_focus_control",
+        "native_focus_unavailable",
+        "原生相机控制模块",
+        "原生模块缺少 V4L2 焦距控制能力",
+    )
     try:
         status = module.v4l2_focus_status(device)
     except Exception as exc:
@@ -722,49 +556,24 @@ def set_native_camera_focus(
         raise NativeModuleError("invalid_camera_focus", "焦距 value 必须是整数")
     if auto_enabled is not None and type(auto_enabled) is not bool:
         raise NativeModuleError("invalid_camera_focus", "auto_enabled 必须是布尔值")
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_focus_unavailable", f"无法加载原生相机控制模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "v4l2_focus_control" not in capabilities.features:
-        raise NativeModuleError("native_focus_unavailable", "原生模块缺少 V4L2 焦距控制能力")
+    module = _require_native_feature(
+        "v4l2_focus_control",
+        "native_focus_unavailable",
+        "原生相机控制模块",
+        "原生模块缺少 V4L2 焦距控制能力",
+    )
     try:
         module.v4l2_set_focus(device, value, auto_enabled)
     except Exception as exc:
         raise _parse_native_error(exc, "native_focus_set_failed") from exc
-    status = native_camera_focus_status(device)
+    try:
+        status = module.v4l2_focus_status(device)
+    except Exception as exc:
+        raise _parse_native_error(exc, "native_focus_status_failed") from exc
+    status = _validate_native_focus_status(status)
     if status is None:
         raise NativeModuleError("camera_focus_unsupported", "相机没有可读取的焦距控制")
     return status
-
-
-def create_native_camera_frame_validator() -> NativeCameraFrameValidator:
-    """Create the Rust camera continuity/drop-accounting validator or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_camera_frame_validator_unavailable",
-            f"无法加载原生相机帧校验模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "camera_frame_validator" not in capabilities.features:
-        raise NativeModuleError(
-            "native_camera_frame_validator_unavailable",
-            "原生模块缺少相机帧连续性校验能力",
-        )
-    try:
-        return module.NativeCameraFrameValidator()
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_camera_frame_validator_init_failed", raw
-        raise NativeModuleError(code, message) from exc
 
 
 def create_native_audio_recorder(
@@ -777,13 +586,12 @@ def create_native_audio_recorder(
 ) -> NativeAudioRecorder:
     """Create the Rust/ALSA recorder or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError("native_audio_unavailable", f"无法加载原生音频模块：{exc}") from exc
-    capabilities = _validate_capabilities(module)
-    if "native_audio" not in capabilities.features:
-        raise NativeModuleError("native_audio_unavailable", "原生模块缺少 ALSA 音频录制能力")
+    module = _require_native_feature(
+        "native_audio",
+        "native_audio_unavailable",
+        "原生音频模块",
+        "原生模块缺少 ALSA 音频录制能力",
+    )
     try:
         return module.NativeAudioRecorder(
             session_root,
@@ -793,57 +601,22 @@ def create_native_audio_recorder(
             segment_seconds,
         )
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_audio_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_timeline(start_monotonic_ns: int | None = None) -> NativeTimeline:
-    """Create the Rust take/session timeline owner or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_timeline_unavailable", f"无法加载原生时间线模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "native_timeline" not in capabilities.features:
-        raise NativeModuleError("native_timeline_unavailable", "原生模块缺少统一时间线能力")
-    try:
-        return module.NativeTimeline(start_monotonic_ns)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_timeline_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_audio_init_failed") from exc
 
 
 def create_native_active_take_writer(session_id: str) -> NativeActiveTakeWriter:
     """Create the Rust active-take frame/domain/drop owner or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "active_take_writer_unavailable", f"无法加载原生 active take 模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "active_take_writer" not in capabilities.features:
-        raise NativeModuleError(
-            "active_take_writer_unavailable", "原生模块缺少 active take 写入状态能力"
-        )
+    module = _require_native_feature(
+        "active_take_writer",
+        "active_take_writer_unavailable",
+        "原生 active take 模块",
+        "原生模块缺少 active take 写入状态能力",
+    )
     try:
         return module.NativeActiveTakeWriter(session_id)
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "active_take_writer_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "active_take_writer_init_failed") from exc
 
 
 def create_native_imu_collector(
@@ -855,149 +628,35 @@ def create_native_imu_collector(
 ) -> NativeImuCollector:
     """Create the Rust UVC XU IMU collector or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError("native_imu_unavailable", f"无法加载原生 IMU 模块：{exc}") from exc
-    capabilities = _validate_capabilities(module)
-    if "native_imu" not in capabilities.features:
-        raise NativeModuleError("native_imu_unavailable", "原生模块缺少 UVC XU IMU 采集能力")
+    module = _require_native_feature(
+        "native_imu",
+        "native_imu_unavailable",
+        "原生 IMU 模块",
+        "原生模块缺少 UVC XU IMU 采集能力",
+    )
     try:
         return module.NativeImuCollector(device, unit, selector, stale_poll_interval)
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_imu_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_recording_codec() -> NativeRecordingCodec:
-    """Create the Rust recording hot-path codec or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_unavailable", f"无法加载原生录制编码模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_codec" not in capabilities.features:
-        raise NativeModuleError("native_recording_unavailable", "原生模块缺少录制热路径编码能力")
-    try:
-        return module.NativeRecordingCodec()
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_imu_init_failed") from exc
 
 
 def create_native_recording_sink(
     session_root: str,
     session_id: str,
-    *,
-    split_eyes: bool,
 ) -> NativeRecordingSink:
     """Create the Rust recording event sink or fail explicitly."""
 
+    module = _require_native_feature(
+        "recording_sink",
+        "native_recording_sink_unavailable",
+        "原生录制写入模块",
+        "原生模块缺少录制写入热路径能力",
+    )
     try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_sink_unavailable", f"无法加载原生录制写入模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_sink" not in capabilities.features:
-        raise NativeModuleError(
-            "native_recording_sink_unavailable", "原生模块缺少录制写入热路径能力"
-        )
-    try:
-        return module.NativeRecordingSink(session_root, session_id, split_eyes)
+        # Preserve the ABI-4 constructor arity while exposing only the supported layout.
+        return module.NativeRecordingSink(session_root, session_id, True)
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_sink_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_recording_frame_gate(frame_decimation: int) -> NativeRecordingFrameGate:
-    """Create the Rust recording frame fanout/decimation gate or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_frame_gate_unavailable",
-            f"无法加载原生录制帧门控模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_frame_gate" not in capabilities.features:
-        raise NativeModuleError(
-            "native_recording_frame_gate_unavailable", "原生模块缺少录制帧门控热路径能力"
-        )
-    try:
-        return module.NativeRecordingFrameGate(frame_decimation)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_frame_gate_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_recording_tap_state(frame_decimation: int) -> NativeRecordingTapState:
-    """Create the Rust recording tap state machine or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_tap_state_unavailable",
-            f"无法加载原生录制 tap 状态模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_tap_state" not in capabilities.features:
-        raise NativeModuleError(
-            "native_recording_tap_state_unavailable",
-            "原生模块缺少录制 tap 状态热路径能力",
-        )
-    try:
-        return module.NativeRecordingTapState(frame_decimation)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_tap_state_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_capture_fanout_state(frame_decimation: int) -> NativeCaptureFanoutState:
-    """Create the Rust continuous capture fanout state machine or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_capture_fanout_unavailable",
-            f"无法加载原生连续采集 fanout 模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "capture_fanout" not in capabilities.features:
-        raise NativeModuleError(
-            "native_capture_fanout_unavailable",
-            "原生模块缺少连续采集 fanout 热路径能力",
-        )
-    try:
-        return module.NativeCaptureFanoutState(frame_decimation)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_capture_fanout_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_recording_sink_init_failed") from exc
 
 
 def create_native_continuous_capture_runtime(
@@ -1010,19 +669,12 @@ def create_native_continuous_capture_runtime(
 ) -> NativeContinuousCaptureRuntime:
     """Create the Rust continuous capture runtime or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_continuous_capture_runtime_unavailable",
-            f"无法加载原生连续采集 runtime 模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "continuous_capture_runtime" not in capabilities.features:
-        raise NativeModuleError(
-            "native_continuous_capture_runtime_unavailable",
-            "原生模块缺少连续采集 runtime 能力",
-        )
+    module = _require_native_feature(
+        "continuous_capture_runtime",
+        "native_continuous_capture_runtime_unavailable",
+        "原生连续采集 runtime 模块",
+        "原生模块缺少连续采集 runtime 能力",
+    )
     try:
         if metrics is None:
             return module.NativeContinuousCaptureRuntime(
@@ -1039,115 +691,22 @@ def create_native_continuous_capture_runtime(
             metrics,
         )
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_continuous_capture_runtime_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_continuous_capture_runtime_init_failed") from exc
 
 
 def create_native_recording_segment_planner(segment_frames: int) -> NativeRecordingSegmentPlanner:
     """Create the Rust recording segment planner or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_segment_planner_unavailable",
-            f"无法加载原生录制分段规划模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_segment_planner" not in capabilities.features:
-        raise NativeModuleError(
-            "native_recording_segment_planner_unavailable",
-            "原生模块缺少录制分段规划热路径能力",
-        )
+    module = _require_native_feature(
+        "recording_segment_planner",
+        "native_recording_segment_planner_unavailable",
+        "原生录制分段规划模块",
+        "原生模块缺少录制分段规划热路径能力",
+    )
     try:
         return module.NativeRecordingSegmentPlanner(segment_frames)
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_segment_planner_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_recording_event_queue(capacity: int) -> NativeRecordingEventQueue:
-    """Create the Rust recording event queue or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_recording_event_queue_unavailable",
-            f"无法加载原生录制事件队列模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "recording_event_queue" not in capabilities.features:
-        raise NativeModuleError(
-            "native_recording_event_queue_unavailable",
-            "原生模块缺少录制事件队列热路径能力",
-        )
-    try:
-        return module.NativeRecordingEventQueue(capacity)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_recording_event_queue_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_stereo_encoder_events() -> NativeStereoEncoderEvents:
-    """Create the Rust stereo encoder stdout event parser or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_stereo_encoder_events_unavailable",
-            f"无法加载原生编码助手事件解析模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "stereo_encoder_events" not in capabilities.features:
-        raise NativeModuleError(
-            "native_stereo_encoder_events_unavailable",
-            "原生模块缺少编码助手事件解析能力",
-        )
-    try:
-        return module.NativeStereoEncoderEvents()
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_stereo_encoder_events_init_failed", raw
-        raise NativeModuleError(code, message) from exc
-
-
-def create_native_stereo_encoder_pipe(descriptor: int) -> NativeStereoEncoderPipe:
-    """Create the Rust stereo encoder frame pipe writer or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_stereo_encoder_pipe_unavailable",
-            f"无法加载原生编码助手写入模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "stereo_encoder_pipe" not in capabilities.features:
-        raise NativeModuleError(
-            "native_stereo_encoder_pipe_unavailable",
-            "原生模块缺少编码助手写入热路径能力",
-        )
-    try:
-        return module.NativeStereoEncoderPipe(descriptor)
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_stereo_encoder_pipe_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_recording_segment_planner_init_failed") from exc
 
 
 def create_native_stereo_encoder_process(
@@ -1163,19 +722,12 @@ def create_native_stereo_encoder_process(
 ) -> NativeStereoEncoderProcess:
     """Create the Rust-owned stereo encoder helper process or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_stereo_encoder_process_unavailable",
-            f"无法加载原生编码助手进程模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "stereo_encoder_process" not in capabilities.features:
-        raise NativeModuleError(
-            "native_stereo_encoder_process_unavailable",
-            "原生模块缺少编码助手进程 owner 能力",
-        )
+    module = _require_native_feature(
+        "stereo_encoder_process",
+        "native_stereo_encoder_process_unavailable",
+        "原生编码助手进程模块",
+        "原生模块缺少编码助手进程 owner 能力",
+    )
     try:
         return module.NativeStereoEncoderProcess(
             out_dir,
@@ -1188,176 +740,70 @@ def create_native_stereo_encoder_process(
             path_prefix,
         )
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_stereo_encoder_process_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_stereo_encoder_process_init_failed") from exc
 
 
 def create_native_session_io() -> NativeSessionIo:
     """Create the Rust session file I/O helper or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_session_io_unavailable", f"无法加载原生会话 I/O 模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "session_io" not in capabilities.features:
-        raise NativeModuleError("native_session_io_unavailable", "原生模块缺少会话 I/O 能力")
+    module = _require_native_feature(
+        "session_io",
+        "native_session_io_unavailable",
+        "原生会话 I/O 模块",
+        "原生模块缺少会话 I/O 能力",
+    )
     try:
         return module.NativeSessionIo()
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_session_io_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_session_io_init_failed") from exc
 
 
-def parse_native_single_range(
-    value: str | None,
-    complete_size: int,
-) -> tuple[int, int] | None:
-    """Parse a single HTTP Range through the Rust helper or fail explicitly."""
+def native_session_io_or_none() -> NativeSessionIo | None:
+    """Return the process-wide stateless session I/O helper when available."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_range_parser_unavailable", f"无法加载原生 Range 解析模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "range_parser" not in capabilities.features:
-        raise NativeModuleError("native_range_parser_unavailable", "原生模块缺少 Range 解析能力")
-    try:
-        result = module.parse_single_range(value, complete_size)
-    except ValueError:
-        raise
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_range_parser_failed", raw
-        raise NativeModuleError(code, message) from exc
-    if result is None:
+    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
+    if _SESSION_IO_UNAVAILABLE:
         return None
-    if (
-        not isinstance(result, tuple)
-        or len(result) != 2
-        or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in result)
-    ):
-        raise NativeModuleError("native_range_parser_failed", "原生 Range 解析结果无效")
-    return result
-
-
-def evaluate_native_drop_quality_policy(
-    drop_events: object,
-    frames_written: int,
-    *,
-    max_contiguous_dropped_frames: int,
-    max_total_dropped_frames: int,
-    max_drop_fraction: float,
-    window_seconds: float,
-    max_dropped_frames_per_window: int,
-) -> dict[str, object]:
-    """Evaluate recording drop quality through the Rust helper or fail explicitly."""
-
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_drop_quality_policy_unavailable",
-            f"无法加载原生丢帧质量策略模块：{exc}",
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "drop_quality_policy" not in capabilities.features:
-        raise NativeModuleError(
-            "native_drop_quality_policy_unavailable",
-            "原生模块缺少丢帧质量策略能力",
-        )
-    try:
-        result = module.evaluate_drop_quality_policy(
-            drop_events,
-            frames_written,
-            max_contiguous_dropped_frames,
-            max_total_dropped_frames,
-            max_drop_fraction,
-            window_seconds,
-            max_dropped_frames_per_window,
-        )
-    except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_drop_quality_policy_failed", raw
-        raise NativeModuleError(code, message) from exc
-    expected = {
-        "accepted",
-        "dropped",
-        "total",
-        "fraction",
-        "contiguous",
-        "window_drops",
-        "violations",
-    }
-    if (
-        not isinstance(result, dict)
-        or set(result) != expected
-        or type(result["accepted"]) is not bool
-        or any(
-            isinstance(result[name], bool) or not isinstance(result[name], int) or result[name] < 0
-            for name in ("dropped", "total", "contiguous", "window_drops")
-        )
-        or not isinstance(result["fraction"], float)
-        or not isinstance(result["violations"], list)
-        or any(not isinstance(item, str) for item in result["violations"])
-    ):
-        raise NativeModuleError("native_drop_quality_policy_failed", "原生丢帧质量策略结果无效")
-    return result
+    if _SESSION_IO is not None:
+        return _SESSION_IO
+    with _SESSION_IO_LOCK:
+        if _SESSION_IO_UNAVAILABLE:
+            return None
+        if _SESSION_IO is not None:
+            return _SESSION_IO
+        try:
+            _SESSION_IO = create_native_session_io()
+        except NativeModuleError:
+            _SESSION_IO_UNAVAILABLE = True
+            return None
+        return _SESSION_IO
 
 
 def create_native_preview_buffer(stream_fps: int) -> NativePreviewBuffer:
     """Create the Rust latest-only preview buffer or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_preview_buffer_unavailable", f"无法加载原生预览缓冲模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "preview_buffer" not in capabilities.features:
-        raise NativeModuleError("native_preview_buffer_unavailable", "原生模块缺少预览缓冲能力")
+    module = _require_native_feature(
+        "preview_buffer",
+        "native_preview_buffer_unavailable",
+        "原生预览缓冲模块",
+        "原生模块缺少预览缓冲能力",
+    )
     try:
         return module.NativePreviewBuffer(stream_fps)
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_preview_buffer_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_preview_buffer_init_failed") from exc
 
 
 def create_native_performance_metrics() -> NativePerformanceMetrics:
     """Create the Rust performance metrics accumulator or fail explicitly."""
 
-    try:
-        module = importlib.import_module(NATIVE_MODULE)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise NativeModuleError(
-            "native_metrics_unavailable", f"无法加载原生性能指标模块：{exc}"
-        ) from exc
-    capabilities = _validate_capabilities(module)
-    if "performance_metrics" not in capabilities.features:
-        raise NativeModuleError("native_metrics_unavailable", "原生模块缺少性能指标能力")
+    module = _require_native_feature(
+        "performance_metrics",
+        "native_metrics_unavailable",
+        "原生性能指标模块",
+        "原生模块缺少性能指标能力",
+    )
     try:
         return module.NativePerformanceMetrics()
     except Exception as exc:
-        raw = str(exc)
-        code, separator, message = raw.partition(": ")
-        if not separator or not code.replace("_", "").isalnum():
-            code, message = "native_metrics_init_failed", raw
-        raise NativeModuleError(code, message) from exc
+        raise _parse_native_error(exc, "native_metrics_init_failed") from exc

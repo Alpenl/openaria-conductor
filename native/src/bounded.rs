@@ -118,25 +118,6 @@ impl<T> Clone for Consumer<T> {
 }
 
 impl<T> Consumer<T> {
-    pub(crate) fn receive_blocking(&self) -> Result<T, RecvTimeoutError> {
-        let state = self.shared.state.lock().unwrap();
-        let mut state = self
-            .shared
-            .readable
-            .wait_while(state, |state| state.queue.is_empty() && !state.closed)
-            .unwrap();
-        if state.closed && state.queue.is_empty() {
-            return Err(RecvTimeoutError::Disconnected);
-        }
-        let value = state
-            .queue
-            .pop_front()
-            .expect("readable bounded queue must contain one value");
-        state.delivered += 1;
-        self.shared.writable.notify_one();
-        Ok(value)
-    }
-
     pub(crate) fn receive(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         let state = self.shared.state.lock().unwrap();
         let (mut state, result) = self
