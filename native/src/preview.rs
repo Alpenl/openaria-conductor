@@ -1,7 +1,5 @@
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 pub(crate) const MULTIPART_BOUNDARY: &str = "ylx-preview";
@@ -23,12 +21,12 @@ impl PreviewError {
 
 pub(crate) struct Snapshot {
     pub(crate) sequence: u64,
-    pub(crate) jpeg: Py<PyBytes>,
+    pub(crate) jpeg: Arc<[u8]>,
 }
 
 struct Frame {
     sequence: u64,
-    jpeg: Py<PyBytes>,
+    jpeg: Arc<[u8]>,
 }
 
 struct State {
@@ -64,8 +62,8 @@ impl LatestBuffer {
         self.stream_fps
     }
 
-    pub(crate) fn publish(&self, py: Python<'_>, jpeg: Py<PyBytes>) -> Result<u64, PreviewError> {
-        if jpeg.as_bytes(py).is_empty() {
+    pub(crate) fn publish(&self, jpeg: &[u8]) -> Result<u64, PreviewError> {
+        if jpeg.is_empty() {
             return Err(PreviewError::new(
                 "invalid_argument",
                 "preview JPEG must be non-empty bytes",
@@ -81,7 +79,10 @@ impl LatestBuffer {
             PreviewError::new("sequence_overflow", "preview sequence number overflowed")
         })?;
         state.sequence = sequence;
-        state.latest = Some(Frame { sequence, jpeg });
+        state.latest = Some(Frame {
+            sequence,
+            jpeg: Arc::from(jpeg),
+        });
         self.changed.notify_all();
         Ok(sequence)
     }
@@ -98,7 +99,7 @@ impl LatestBuffer {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self, py: Python<'_>) -> Result<Snapshot, PreviewError> {
+    pub(crate) fn snapshot(&self) -> Result<Snapshot, PreviewError> {
         let state = self.state.lock().map_err(|_| {
             PreviewError::new(
                 "preview_buffer_poisoned",
@@ -113,7 +114,7 @@ impl LatestBuffer {
         })?;
         Ok(Snapshot {
             sequence: frame.sequence,
-            jpeg: frame.jpeg.clone_ref(py),
+            jpeg: Arc::clone(&frame.jpeg),
         })
     }
 
@@ -175,23 +176,15 @@ impl LatestBuffer {
     }
 }
 
-pub(crate) fn multipart_part<'py>(
-    py: Python<'py>,
-    jpeg: &Py<PyBytes>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let payload = jpeg.as_bytes(py);
+pub(crate) fn multipart_part(jpeg: &[u8]) -> Vec<u8> {
     let header = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-        payload.len()
+        jpeg.len()
     );
     let trailer = b"\r\n";
-    PyBytes::new_with(py, header.len() + payload.len() + trailer.len(), |target| {
-        let mut cursor = 0;
-        target[cursor..cursor + header.len()].copy_from_slice(header.as_bytes());
-        cursor += header.len();
-        target[cursor..cursor + payload.len()].copy_from_slice(payload);
-        cursor += payload.len();
-        target[cursor..cursor + trailer.len()].copy_from_slice(trailer);
-        Ok(())
-    })
+    let mut payload = Vec::with_capacity(header.len() + jpeg.len() + trailer.len());
+    payload.extend_from_slice(header.as_bytes());
+    payload.extend_from_slice(jpeg);
+    payload.extend_from_slice(trailer);
+    payload
 }

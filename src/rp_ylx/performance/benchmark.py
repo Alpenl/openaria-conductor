@@ -23,11 +23,9 @@ from rp_ylx.camera.models import CameraBackend, CameraStream, StereoFrame
 from rp_ylx.camera.v4l2 import (
     V4L2CameraStream,
     split_sbs_mjpeg,
-    v4l2_production_stream_factory,
 )
 from rp_ylx.hardware import collect_hardware_facts
 from rp_ylx.hardware.target import RDK_X5_BOARD_ID, YLX_2UQ2_CAMERA_ID
-from rp_ylx.imu import NativeImuCollector
 from rp_ylx.native import (
     NativeModuleError,
     create_native_splitter,
@@ -110,10 +108,9 @@ class _ExactCameraBackend(CameraBackend):
         if descriptor != self._descriptor or mode != TARGET_MODE:
             raise BenchmarkError("target_mismatch", "benchmark camera selection changed")
         if self._adapter == "rust":
-            return v4l2_production_stream_factory(
-                self._device,
-                mode,
-                metrics=self._metrics,
+            raise BenchmarkError(
+                "invalid_adapter_path",
+                "Rust hardware benchmark must use the recording-level CaptureEngine",
             )
         return V4L2CameraStream(self._device, mode, metrics=self._metrics)
 
@@ -182,6 +179,7 @@ def _new_recorder(config: BenchmarkConfig, metrics: PerformanceMetrics) -> Devic
         storage_status=lambda: StorageStatus(None, True),
         checkpoint_interval=1.0,
         metrics=metrics,
+        native_data_plane=config.adapter == "rust",
     )
 
 
@@ -227,7 +225,6 @@ def _run_native_continuous_hardware(
     preview = LatestPreviewBuffer(stream_fps=15)
     sources = NativeContinuousCaptureSources(
         str(config.device),
-        lambda: NativeImuCollector(config.device),
         TARGET_MODE,
         preview=preview,
         metrics=metrics,
@@ -279,6 +276,35 @@ def _run_native_continuous_hardware(
         sources.close()
 
 
+def _run_native_preview_hardware(
+    config: BenchmarkConfig, metrics: PerformanceMetrics
+) -> tuple[int, int, int]:
+    """Measure preview through the same recording-level owner used in production."""
+
+    preview = LatestPreviewBuffer(stream_fps=15)
+    sources = NativeContinuousCaptureSources(
+        str(config.device),
+        TARGET_MODE,
+        preview=preview,
+        metrics=metrics,
+    )
+    last_sequence = 0
+    frames = 0
+    try:
+        sources.start_preview()
+        deadline = time.monotonic() + config.duration_seconds
+        while time.monotonic() < deadline:
+            with suppress(PreviewFrameUnavailable):
+                snapshot = preview._snapshot()
+                if snapshot.sequence != last_sequence:
+                    frames += 1
+                    last_sequence = snapshot.sequence
+            time.sleep(1 / 60)
+    finally:
+        sources.close()
+    return frames, frames, 0
+
+
 def _run_trace(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[int, int, int]:
     assert config.trace is not None
     payload = config.trace.read_bytes()
@@ -310,7 +336,9 @@ def _run_trace(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[in
 
 
 def _run_hardware(config: BenchmarkConfig, metrics: PerformanceMetrics) -> tuple[int, int, int]:
-    if config.adapter == "rust" and config.kind in {"recording", "concurrent"}:
+    if config.adapter == "rust":
+        if config.kind == "preview":
+            return _run_native_preview_hardware(config, metrics)
         return _run_native_continuous_hardware(config, metrics)
 
     controller = CameraController(
@@ -387,7 +415,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, object]:
             capabilities = native_capabilities()
         except NativeModuleError as exc:
             raise BenchmarkError(exc.code, exc.message) from exc
-        required = "turbojpeg_split" if config.kind == "fixed_trace" else "native_camera"
+        required = "turbojpeg_split" if config.kind == "fixed_trace" else "capture_engine"
         if not capabilities.module_available or required not in capabilities.features:
             raise BenchmarkError(
                 "native_adapter_unavailable",

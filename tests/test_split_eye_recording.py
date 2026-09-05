@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import queue
 import tempfile
 import threading
 import time
@@ -23,7 +22,7 @@ from rp_ylx.api.downloads import (
 )
 from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
-from rp_ylx.native import NativeModuleError
+from rp_ylx.native import NativeRecordingPlan
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -85,13 +84,11 @@ class FakeStereoEncoder:
         segment_frames: int,
         fail_after: int | None = None,
         drop_tail_segment: bool = False,
-        native_owner: object | None = None,
     ) -> None:
         self._out_dir = out_dir
         self._segment_frames = segment_frames
         self._fail_after = fail_after
         self._drop_tail_segment = drop_tail_segment
-        self.native_owner = native_owner
         self._segments: list[ClosedSegment] = []
         self._submitted = 0
         self._started = False
@@ -233,127 +230,202 @@ class FakeAudioRecorder:
         self.aborted = True
 
 
-class FakeNativeEventQueue:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.put_calls = 0
-        self.get_calls = 0
-        self._queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
-
-    def put(self, item: object, timeout_seconds: float = 0.0) -> bool:
-        self.put_calls += 1
-        try:
-            self._queue.put(item, timeout=timeout_seconds)
-            return True
-        except queue.Full:
-            return False
-
-    def get(self) -> object:
-        self.get_calls += 1
-        return self._queue.get()
-
-    def qsize(self) -> int:
-        return self._queue.qsize()
-
-    def stats(self) -> dict[str, object]:
-        return {
-            "capacity": self.capacity,
-            "depth": self._queue.qsize(),
-            "peak_depth": self.capacity,
-            "enqueued": self.put_calls,
-            "delivered": self.get_calls,
-            "rejected": 0,
-        }
-
-    def close_and_clear(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
-
-
-class FakeNativeSegmentPlanner:
-    def __init__(self, segment_frames: int) -> None:
-        self.segment_frames = segment_frames
+class FakeSessionTransaction:
+    def __init__(self, plan: NativeRecordingPlan, *, fail_finish: bool = False) -> None:
+        self.plan = plan
+        self.root = Path(plan.session_root)
+        self.session_id = plan.session_id
+        self.recording_start_monotonic_ns = plan.recording_start_monotonic_ns
+        self.segment_frames = plan.segment_frames
         self.frames_written = 0
-        self.covered_frames = 0
-        self.next_calls: list[tuple[int, float]] = []
-        self.registered: list[tuple[int, int, int]] = []
-        self.finished: tuple[int, int, float] | None = None
-        self.boundaries: dict[int, tuple[int, float]] = {}
+        self.imu_samples_written = 0
+        self._segments: list[dict[str, object]] = []
+        self.boundary_calls: list[tuple[int, float]] = []
+        self.seal_calls: list[tuple[str, str, str, list[str]]] = []
+        self.fail_finish = fail_finish
+        self.finished = False
+        self.aborted = False
+        self.sealed = False
 
-    def next_frame(self, record_sequence: int, elapsed_seconds: float) -> dict[str, object]:
-        self.next_calls.append((record_sequence, elapsed_seconds))
-        ordinal = self.frames_written
-        boundary_recorded = False
-        if ordinal % self.segment_frames == 0 and ordinal not in self.boundaries:
-            self.boundaries[ordinal] = (record_sequence, elapsed_seconds)
-            boundary_recorded = True
-        self.frames_written += 1
+    @staticmethod
+    def _identity(path: Path) -> dict[str, int]:
+        metadata = path.stat(follow_symlinks=False)
         return {
-            "ordinal": ordinal,
-            "segment_index": ordinal // self.segment_frames,
-            "segment_frame": ordinal % self.segment_frames,
-            "frames_written": self.frames_written,
-            "boundary_recorded": boundary_recorded,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
         }
 
-    def register_segment(
-        self,
-        index: int,
-        start_ordinal: int,
-        end_ordinal: int,
-    ) -> dict[str, object]:
-        if index != len(self.registered) or start_ordinal != self.covered_frames:
-            raise RuntimeError("segment_invalid: fake segment coverage mismatch")
-        self.registered.append((index, start_ordinal, end_ordinal))
-        self.covered_frames = end_ordinal
-        return self.snapshot()
+    def advance(self, *, frames: int, imu_samples: int = 0) -> None:
+        if frames <= 0 or frames < self.frames_written:
+            raise ValueError("fake transaction frames must increase")
+        self.frames_written = frames
+        self.imu_samples_written = imu_samples
+        (self.root / "frames.ndjson").write_bytes(b'{"frame":0}\n' * frames)
+        (self.root / "imu.ndjson").write_bytes(b'{"sample":0}\n' * imu_samples)
+        self._segments = []
+        for start in range(0, frames, self.segment_frames):
+            end = min(frames, start + self.segment_frames)
+            index = len(self._segments)
+            paths: dict[str, tuple[str, int]] = {}
+            for eye in ("left", "right"):
+                relative = f"video/{eye}_{index:05d}.mp4"
+                payload = f"{eye}-{index}-{start}-{end}".encode() * 8
+                (self.root / relative).write_bytes(payload)
+                paths[eye] = (relative, len(payload))
+            self._segments.append(
+                {
+                    "index": index,
+                    "start_frame": start,
+                    "end_frame": end,
+                    "left_path": paths["left"][0],
+                    "left_bytes": paths["left"][1],
+                    "right_path": paths["right"][0],
+                    "right_bytes": paths["right"][1],
+                }
+            )
 
-    def finish(
-        self,
-        submitted_frames: int,
-        frame_domain: int,
-        duration_seconds: float,
-    ) -> dict[str, object]:
-        self.finished = (submitted_frames, frame_domain, duration_seconds)
-        self.boundaries.setdefault(self.frames_written, (frame_domain, duration_seconds))
-        if submitted_frames != self.frames_written or self.covered_frames != self.frames_written:
-            raise RuntimeError("segment_invalid: fake segment coverage incomplete")
-        return self.snapshot()
+    def _active_take(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "frame_domain": self.frames_written,
+            "frames_written": self.frames_written,
+            "pending_frames": 0,
+            "drop_events": [],
+        }
 
-    def boundary(self, ordinal: int, duration_seconds: float) -> dict[str, object]:
-        frame, elapsed = self.boundaries[ordinal]
-        return {"frame": frame, "time_seconds": min(elapsed, duration_seconds)}
+    def _sink(self, *, artifacts: bool) -> dict[str, object]:
+        selected: dict[str, object] = {}
+        for role, relative in (
+            ("frames.index", "frames.ndjson"),
+            ("imu.samples", "imu.ndjson"),
+        ):
+            path = self.root / relative
+            payload = path.read_bytes()
+            identity = self._identity(path)
+            selected[role] = {
+                "role": role,
+                "path": relative,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "identity": identity,
+            }
+        return {
+            "frames_written": self.frames_written,
+            "imu_samples_written": self.imu_samples_written,
+            "bytes_written": sum(
+                int(item["bytes"]) for item in selected.values() if isinstance(item, dict)
+            ),
+            "artifacts": selected if artifacts else {},
+        }
 
     def snapshot(self) -> dict[str, object]:
         return {
-            "segment_frames": self.segment_frames,
-            "frames_written": self.frames_written,
-            "segment_count": len(self.registered),
-            "covered_frames": self.covered_frames,
-            "boundary_count": len(self.boundaries),
+            "state": "finished" if self.finished else "recording",
+            "active_take": self._active_take(),
+            "sink": self._sink(artifacts=False),
+            "segments": list(self._segments),
+            "submitted_frames": self.frames_written,
+            "audio": None,
+        }
+
+    def segments(self) -> list[dict[str, object]]:
+        return list(self._segments)
+
+    def finish(self, duration_seconds: float, timeout_seconds: float) -> dict[str, object]:
+        del timeout_seconds
+        if self.fail_finish:
+            raise RuntimeError("encoder_failed: fake transaction finish failure")
+        if self.frames_written == 0:
+            raise RuntimeError("no_frames: fake transaction has no frames")
+        self.finished = True
+        return {
+            "active_take": self._active_take(),
+            "sink": self._sink(artifacts=True),
+            "audio": None,
+            "segments": list(self._segments),
+            "encoder_stats": {"frames": self.frames_written},
+            "planner": {
+                "segment_frames": self.segment_frames,
+                "frames_written": self.frames_written,
+                "segment_count": len(self._segments),
+                "covered_frames": self.frames_written,
+                "boundary_count": len(self._segments) + 1,
+                "duration_seconds": duration_seconds,
+            },
+        }
+
+    def boundary(self, ordinal: int, duration_seconds: float) -> dict[str, object]:
+        self.boundary_calls.append((ordinal, duration_seconds))
+        return {
+            "frame": ordinal,
+            "time_seconds": duration_seconds * ordinal / self.frames_written,
+        }
+
+    def abort(self, reason: str) -> None:
+        del reason
+        self.aborted = True
+
+    def open_handle_count(self) -> int:
+        return 0 if self.finished or self.aborted else 1
+
+    def seal(
+        self,
+        partial_path: str,
+        final_path: str,
+        session_id: str,
+        manifest: bytes,
+        expected_identities: dict[str, tuple[int, int, int, int]],
+        control_names: list[str] | None = None,
+    ) -> dict[str, object]:
+        if not self.finished:
+            raise RuntimeError("invalid_state: transaction must finish before seal")
+        artifacts = list(iter_device_session_v1_artifacts(json.loads(manifest)))
+        paths = [str(item["path"]) for item in artifacts]
+        self.seal_calls.append((partial_path, final_path, session_id, paths))
+        partial = Path(partial_path)
+        final = Path(final_path)
+        for artifact in artifacts:
+            relative = str(artifact["path"])
+            metadata = (partial / relative).stat(follow_symlinks=False)
+            actual = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+            if actual != expected_identities[relative]:
+                raise RuntimeError("digest_mismatch: artifact changed")
+        (partial / "manifest.json").write_bytes(manifest)
+        for control_name in control_names or ["recording.json", "capture.json"]:
+            (partial / control_name).unlink(missing_ok=True)
+        os.rename(partial, final)
+        self.sealed = True
+        return {
+            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "artifact_count": len(artifacts),
+            "manifest_bytes": len(manifest),
         }
 
 
-class FakeNativeSessionIo:
+class FakeSessionStore:
+    def __init__(self, *, fail_finish: bool = False) -> None:
+        self.fail_finish = fail_finish
+        self.begin_calls: list[NativeRecordingPlan] = []
+        self.transaction: FakeSessionTransaction | None = None
+
+    def begin_recording(self, plan: NativeRecordingPlan) -> FakeSessionTransaction:
+        self.begin_calls.append(plan)
+        self.transaction = FakeSessionTransaction(plan, fail_finish=self.fail_finish)
+        return self.transaction
+
+
+class FakeNativeSessionStoreIo:
     def __init__(self) -> None:
-        self.artifact_calls: list[tuple[str, list[str]]] = []
         self.open_calls: list[tuple[int, str]] = []
         self.read_calls: list[tuple[int, int]] = []
         self.verify_calls: list[tuple[int, int, str]] = []
-        self.seal_calls: list[tuple[str, str, str, list[str]]] = []
-
-    def device_session_v1_artifacts(
-        self,
-        manifest: bytes,
-        session_id: str,
-    ) -> list[dict[str, object]]:
-        decoded = json.loads(manifest)
-        artifacts = list(iter_device_session_v1_artifacts(decoded))
-        self.artifact_calls.append((session_id, [str(item["path"]) for item in artifacts]))
-        return artifacts
 
     def open_relative_regular(self, root_descriptor: int, relative_path: str) -> int:
         self.open_calls.append((root_descriptor, relative_path))
@@ -375,95 +447,6 @@ class FakeNativeSessionIo:
     ) -> dict[str, object]:
         self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
         return {}
-
-    def seal_device_session_v1(
-        self,
-        partial_path: str,
-        final_path: str,
-        session_id: str,
-        manifest: bytes,
-        expected_identities: dict[str, tuple[int, int, int, int]],
-        control_names: list[str] | None = None,
-    ) -> dict[str, object]:
-        artifacts = self.device_session_v1_artifacts(manifest, session_id)
-        paths = [str(item["path"]) for item in artifacts]
-        self.seal_calls.append((partial_path, final_path, session_id, paths))
-        partial = Path(partial_path)
-        final = Path(final_path)
-        if final.exists():
-            raise RuntimeError("session_exists: final exists")
-        for artifact in artifacts:
-            relative = str(artifact["path"])
-            expected = expected_identities[relative]
-            metadata = (partial / relative).stat(follow_symlinks=False)
-            actual = (
-                metadata.st_dev,
-                metadata.st_ino,
-                metadata.st_size,
-                metadata.st_mtime_ns,
-            )
-            if actual != expected or metadata.st_size != int(artifact["bytes"]):
-                raise RuntimeError("digest_mismatch: artifact changed")
-        (partial / "manifest.json").write_bytes(manifest)
-        for control_name in control_names or ["recording.json", "capture.json"]:
-            (partial / control_name).unlink(missing_ok=True)
-        os.rename(partial, final)
-        return {
-            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
-            "artifact_count": len(artifacts),
-            "manifest_bytes": len(manifest),
-        }
-
-
-class FakeLiveNativeActiveTake:
-    def __init__(self, session_id: str) -> None:
-        self.session_id = session_id
-        self.frames_written = 0
-        self.frame_domain = 0
-
-    def advance(self, frames: int) -> None:
-        self.frames_written = frames
-        self.frame_domain = frames
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "frame_domain": self.frame_domain,
-            "frames_written": self.frames_written,
-            "pending_frames": 0,
-            "drop_events": [],
-        }
-
-    def finish(self) -> dict[str, object]:
-        return self.snapshot()
-
-
-class FakeLiveNativeRecordingSink:
-    def __init__(self) -> None:
-        self.frames_written = 0
-        self.bytes_written = 0
-        self.imu_samples_written = 0
-        self.closed = False
-
-    def advance(self, *, frames: int, bytes_written: int, imu_samples: int = 0) -> None:
-        self.frames_written = frames
-        self.bytes_written = bytes_written
-        self.imu_samples_written = imu_samples
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "frames_written": self.frames_written,
-            "imu_samples_written": self.imu_samples_written,
-            "bytes_written": self.bytes_written,
-            "artifacts": {},
-        }
-
-    def flush_and_close(self) -> dict[str, object]:
-        self.closed = True
-        return self.snapshot()
-
-    def close(self) -> None:
-        self.closed = True
 
 
 class SplitEyeRecordingTest(unittest.TestCase):
@@ -488,7 +471,10 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 )
             )
 
-            with patch("rp_ylx.recording.device_session._session_io_or_none", return_value=native):
+            with patch(
+                "rp_ylx.recording.device_session._session_store_or_none",
+                return_value=native,
+            ):
                 finalized = _finalize_artifact(path, 3, code="segment_invalid")
 
             native.finalize_artifact.assert_called_once_with(str(path), 3)
@@ -505,34 +491,16 @@ class SplitEyeRecordingTest(unittest.TestCase):
             )
 
             with (
-                patch("rp_ylx.recording.device_session._session_io_or_none", return_value=native),
+                patch(
+                    "rp_ylx.recording.device_session._session_store_or_none",
+                    return_value=native,
+                ),
                 self.assertRaises(DeviceRecordingError) as raised,
             ):
                 _finalize_artifact(path, 3, code="segment_invalid")
 
             self.assertEqual(raised.exception.code, "segment_invalid")
             self.assertEqual(raised.exception.message, "size changed")
-
-    def test_native_recording_sink_batches_imu_observation_when_available(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            recorder, _, _ = self.build(root)
-            native_sink = SimpleNamespace(
-                write_imu_observation=Mock(
-                    return_value={"bytes_written": 321, "samples_written": 2}
-                ),
-                write_imu_sample=Mock(),
-            )
-            recorder._native_recording_sink = native_sink  # type: ignore[assignment]
-            observation = imu_observation()
-
-            recorder._persist_imu(observation)
-
-            native_sink.write_imu_observation.assert_called_once()
-            self.assertIs(native_sink.write_imu_observation.call_args.args[0], observation)
-            native_sink.write_imu_sample.assert_not_called()
-            self.assertEqual(recorder._bytes_written, 321)
-            self.assertEqual(recorder._imu_written, 2)
 
     def build(
         self,
@@ -543,6 +511,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
         before_write: object | None = None,
         audio_enabled: bool = False,
         audio_fail_stop: bool = False,
+        native_data_plane: bool = False,
         **encoder_options: object,
     ) -> tuple[DeviceSessionRecorder, list[FakeStereoEncoder], list[FakeAudioRecorder]]:
         revision = 0
@@ -602,12 +571,13 @@ class SplitEyeRecordingTest(unittest.TestCase):
             authority_epoch=str(uuid.uuid4()),
             allocate_revision=allocate_revision,
             storage_status=lambda: StorageStatus(1024 * 1024 * 1024, True),
-            encoder_factory=factory,  # type: ignore[arg-type]
+            encoder_factory=None if native_data_plane else factory,  # type: ignore[arg-type]
             checkpoint_interval=0.0,
             queue_capacity=queue_capacity,
             enqueue_timeout=enqueue_timeout,
-            before_write=before_write,  # type: ignore[arg-type]
-            audio_recorder_factory=audio_factory,  # type: ignore[arg-type]
+            before_write=None if native_data_plane else before_write,  # type: ignore[arg-type]
+            audio_recorder_factory=(None if native_data_plane else audio_factory),
+            native_data_plane=native_data_plane,
         )
         return recorder, encoders, audios
 
@@ -652,21 +622,42 @@ class SplitEyeRecordingTest(unittest.TestCase):
             )
             validate_device_session_manifest(manifest)
 
-    def test_stop_uses_native_device_session_finalizer_when_available(self) -> None:
+    def test_session_transaction_owns_live_progress_finish_and_seal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            native = FakeNativeSessionIo()
-            with patch(
-                "rp_ylx.recording.device_session._session_io_or_none",
-                return_value=native,
+            store = FakeSessionStore()
+            with (
+                patch(
+                    "rp_ylx.recording.device_session.native_session_store",
+                    return_value=store,
+                ),
+                patch(
+                    "rp_ylx.recording.device_session.resolve_executable",
+                    return_value=Path("/bin/true"),
+                ),
             ):
-                recorder, _, _ = self.build(root)
+                recorder, _, _ = self.build(root, native_data_plane=True)
                 recorder.start()
-                self.feed(recorder, 4)
+                transaction = recorder.native_recording_transaction()
+                self.assertIs(transaction, store.transaction)
+                assert store.transaction is not None
+                initial = recorder.current_recording_state
+                assert initial is not None
+                store.transaction.advance(frames=4, imu_samples=2)
+                live = recorder.current_recording_state
+                assert live is not None
+                self.assertEqual(live["state_revision"], initial["state_revision"])
+                self.assertEqual(live["progress"]["captured_frames"], 4)
+                self.assertGreater(live["progress"]["bytes_written"], 0)
                 sealed = recorder.stop()
 
-            self.assertEqual(len(native.seal_calls), 1)
-            partial_path, final_path, session_id, paths = native.seal_calls[0]
+            self.assertEqual(len(store.begin_calls), 1)
+            self.assertTrue(store.transaction.finished)
+            self.assertTrue(store.transaction.sealed)
+            self.assertFalse(store.transaction.aborted)
+            self.assertEqual(store.transaction.open_handle_count(), 0)
+            self.assertEqual(len(store.transaction.seal_calls), 1)
+            partial_path, final_path, session_id, paths = store.transaction.seal_calls[0]
             self.assertEqual(Path(final_path), sealed.path)
             self.assertFalse(Path(partial_path).exists())
             self.assertTrue(Path(final_path).is_dir())
@@ -685,6 +676,12 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertTrue((sealed.path / "manifest.json").is_file())
             self.assertFalse((sealed.path / "recording.json").exists())
             self.assertFalse((sealed.path / "capture.json").exists())
+            self.assertEqual(sealed.manifest["frames"]["count"], 4)
+            self.assertEqual(sealed.manifest["imu"]["sample_count"], 2)
+            self.assertEqual(
+                [ordinal for ordinal, _ in store.transaction.boundary_calls],
+                [0, 3, 3, 4],
+            )
             validate_device_session_manifest(sealed.manifest)
 
     def test_device_session_config_rejects_raw_sbs_writer(self) -> None:
@@ -702,154 +699,55 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 video_layout="raw-side-by-side",
             )
 
-    def test_native_direct_sink_live_counters_update_without_new_revision(self) -> None:
+    def test_native_data_plane_rejects_python_frame_and_imu_callbacks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            active_take: FakeLiveNativeActiveTake | None = None
-            sink = FakeLiveNativeRecordingSink()
-            planner = FakeNativeSegmentPlanner(3)
-            native_encoder = object()
-
-            def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
-                nonlocal active_take
-                active_take = FakeLiveNativeActiveTake(session_id)
-                return active_take
-
+            store = FakeSessionStore()
             with (
                 patch(
-                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
+                    "rp_ylx.recording.device_session.native_session_store",
+                    return_value=store,
                 ),
                 patch(
-                    "rp_ylx.recording.device_session.create_native_active_take_writer",
-                    side_effect=active_take_factory,
-                ),
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_sink",
-                    return_value=sink,
-                ),
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
-                    return_value=planner,
+                    "rp_ylx.recording.device_session.resolve_executable",
+                    return_value=Path("/bin/true"),
                 ),
             ):
-                recorder, _, _ = self.build(root, native_owner=native_encoder)
-                try:
-                    recorder.start()
-                    targets = recorder.native_split_sink_targets()
-                    self.assertIsNotNone(targets)
-                    assert active_take is not None
-                    initial = recorder.current_recording_state
-                    assert initial is not None
-                    initial_revision = initial["state_revision"]
+                recorder, _, _ = self.build(root, native_data_plane=True)
+                recorder.start()
+                with self.assertRaises(DeviceRecordingError) as frame_error:
+                    recorder.submit_frame(frame(0))
+                with self.assertRaises(DeviceRecordingError) as imu_error:
+                    recorder.submit_imu(imu_observation())
+                recorder.fail("test_cleanup", "cleanup", recoverable=False)
+            self.assertEqual(frame_error.exception.code, "invalid_state")
+            self.assertEqual(imu_error.exception.code, "invalid_state")
+            assert store.transaction is not None
+            self.assertTrue(store.transaction.aborted)
 
-                    active_take.advance(5)
-                    sink.advance(frames=5, bytes_written=4096, imu_samples=8)
-
-                    live = recorder.current_recording_state
-                    assert live is not None
-                    self.assertEqual(live["state_revision"], initial_revision)
-                    self.assertEqual(
-                        (
-                            live["progress"]["captured_frames"],
-                            live["progress"]["bytes_written"],
-                        ),
-                        (5, 4096),
-                    )
-                finally:
-                    recorder.fail("test_cleanup", "cleanup", recoverable=False)
-
-    def test_native_direct_live_progress_uses_sink_snapshot_tuple_as_owner(self) -> None:
+    def test_session_transaction_failure_aborts_without_publishing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            active_take: FakeLiveNativeActiveTake | None = None
-            sink = FakeLiveNativeRecordingSink()
-            planner = FakeNativeSegmentPlanner(3)
-            native_encoder = object()
-
-            def active_take_factory(session_id: str) -> FakeLiveNativeActiveTake:
-                nonlocal active_take
-                active_take = FakeLiveNativeActiveTake(session_id)
-                return active_take
-
+            store = FakeSessionStore(fail_finish=True)
             with (
                 patch(
-                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
+                    "rp_ylx.recording.device_session.native_session_store",
+                    return_value=store,
                 ),
                 patch(
-                    "rp_ylx.recording.device_session.create_native_active_take_writer",
-                    side_effect=active_take_factory,
-                ),
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_sink",
-                    return_value=sink,
-                ),
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
-                    return_value=planner,
+                    "rp_ylx.recording.device_session.resolve_executable",
+                    return_value=Path("/bin/true"),
                 ),
             ):
-                recorder, _, _ = self.build(root, native_owner=native_encoder)
-                try:
-                    recorder.start()
-                    self.assertIsNotNone(recorder.native_split_sink_targets())
-                    assert active_take is not None
-                    initial = recorder.current_recording_state
-                    assert initial is not None
-
-                    active_take.advance(6)
-                    sink.advance(frames=5, bytes_written=4096, imu_samples=8)
-
-                    live = recorder.current_recording_state
-                    assert live is not None
-                    self.assertEqual(live["state_revision"], initial["state_revision"])
-                    self.assertEqual(
-                        (
-                            live["progress"]["captured_frames"],
-                            live["progress"]["bytes_written"],
-                        ),
-                        (5, 4096),
-                    )
-                finally:
-                    recorder.fail("test_cleanup", "cleanup", recoverable=False)
-
-    def test_native_direct_finalizing_progress_does_not_regress_after_sink_close(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            recorder, _, _ = self.build(Path(directory))
-            sink = FakeLiveNativeRecordingSink()
-            recorder.start()
-            try:
-                sink.advance(frames=53_555, bytes_written=719_135_791)
-                with recorder._lock:
-                    recorder._state = "finalizing"
-                    recorder._native_direct_recording = True
-                    recorder._native_recording_sink = sink
-                    assert recorder._current_state is not None
-                    current = deepcopy(recorder._current_state)
-                    current["state"] = "finalizing"
-                    current["progress"] = {
-                        "elapsed_seconds": 1_800.0,
-                        "captured_frames": 0,
-                        "bytes_written": 0,
-                    }
-                    recorder._current_state = current
-
-                with_sink = recorder.current_recording_state
-                assert with_sink is not None
-                self.assertEqual(with_sink["progress"]["captured_frames"], 53_555)
-
-                with recorder._lock:
-                    recorder._frames_written = 53_555
-                    recorder._bytes_written = 719_135_791
-                    recorder._native_recording_sink = None
-
-                after_close = recorder.current_recording_state
-                assert after_close is not None
-                self.assertEqual(after_close["progress"]["captured_frames"], 53_555)
-                self.assertEqual(after_close["progress"]["bytes_written"], 719_135_791)
-            finally:
-                recorder.abort()
+                recorder, _, _ = self.build(root, native_data_plane=True)
+                recorder.start()
+                assert store.transaction is not None
+                store.transaction.advance(frames=3)
+                with self.assertRaises(DeviceRecordingError) as raised:
+                    recorder.stop()
+            self.assertEqual(raised.exception.code, "encoder_failed")
+            self.assertTrue(store.transaction.aborted)
+            self.assertFalse((root / recorder._plan.session_id).exists())
 
     def test_live_progress_includes_audio_snapshot_bytes_before_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -863,35 +761,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
             assert live is not None
             self.assertEqual(live["progress"]["bytes_written"], 47)
             recorder.fail("test_cleanup", "cleanup", recoverable=False)
-
-    def test_recorder_uses_native_event_queue_when_available(self) -> None:
-        queues: list[FakeNativeEventQueue] = []
-
-        def factory(capacity: int) -> FakeNativeEventQueue:
-            native_queue = FakeNativeEventQueue(capacity)
-            queues.append(native_queue)
-            return native_queue
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                side_effect=factory,
-            ):
-                recorder, _, _ = self.build(
-                    root,
-                    before_write=lambda role, payload: None,
-                )
-            recorder.start()
-            self.feed(recorder, 3)
-            sealed = recorder.stop()
-
-            validate_device_session_manifest(sealed.manifest)
-
-        self.assertEqual(len(queues), 1)
-        self.assertEqual(queues[0].capacity, 128)
-        self.assertGreaterEqual(queues[0].put_calls, 4)
-        self.assertGreaterEqual(queues[0].get_calls, 4)
 
     def test_active_take_pending_allows_writer_inflight_plus_queue_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -914,52 +783,34 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 recorder._apply_active_take_snapshot(snapshot, expected_frames_written=0)
             self.assertEqual(raised.exception.code, "active_take_writer_failed")
 
-    def test_split_eye_native_targets_expose_direct_sink_owners(self) -> None:
+    def test_native_recorder_exposes_only_one_session_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            active_take = object()
-            sink = SimpleNamespace(close=lambda: None)
-            native_encoder = object()
-            planner = FakeNativeSegmentPlanner(3)
+            store = FakeSessionStore()
             with (
                 patch(
-                    "rp_ylx.recording.device_session.create_native_active_take_writer",
-                    return_value=active_take,
+                    "rp_ylx.recording.device_session.native_session_store",
+                    return_value=store,
                 ),
                 patch(
-                    "rp_ylx.recording.device_session.create_native_recording_sink",
-                    return_value=sink,
-                ),
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_segment_planner",
-                    return_value=planner,
+                    "rp_ylx.recording.device_session.resolve_executable",
+                    return_value=Path("/bin/true"),
                 ),
             ):
-                recorder, _, _ = self.build(root, native_owner=native_encoder)
+                recorder, _, _ = self.build(root, native_data_plane=True)
                 recorder.start()
-                targets = recorder.native_split_sink_targets()
-                self.assertIsNotNone(targets)
-                assert targets is not None
-                self.assertIs(targets[0], active_take)
-                self.assertIs(targets[1], sink)
-                self.assertIs(targets[2], native_encoder)
-                self.assertIs(targets[3], planner)
-                self.assertIsInstance(targets[4], int)
-                self.assertGreater(targets[4], 0)
-                self.assertTrue(recorder._native_direct_recording)
+                transaction = recorder.native_recording_transaction()
+                self.assertIs(transaction, store.transaction)
+                self.assertFalse(hasattr(recorder, "native_split_sink_targets"))
                 recorder.fail("test_cleanup", "cleanup", recoverable=False)
 
-    def test_source_checkout_falls_back_to_python_files_when_native_sink_is_missing(self) -> None:
+    def test_explicit_source_test_adapter_uses_python_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_sink",
-                side_effect=NativeModuleError("native_recording_sink_unavailable", "missing"),
-            ):
-                recorder, _, _ = self.build(root)
-                recorder.start()
-                self.feed(recorder, 3)
-                sealed = recorder.stop()
+            recorder, _, _ = self.build(root)
+            recorder.start()
+            self.feed(recorder, 3)
+            sealed = recorder.stop()
 
             self.assertEqual(sealed.manifest["frames"]["count"], 3)
             validate_device_session_manifest(sealed.manifest)
@@ -1014,144 +865,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertEqual([record["segment_index"] for record in records], [0, 0, 0, 1])
             self.assertEqual([record["segment_frame"] for record in records], [0, 1, 2, 0])
             self.assertNotIn("video_offset", records[0])
-
-    def test_native_recording_segment_planner_is_used_for_split_eye_segments(self) -> None:
-        planner = FakeNativeSegmentPlanner(3)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_segment_planner",
-                return_value=planner,
-            ) as create_planner:
-                recorder, _, _ = self.build(root)
-            recorder.start()
-            self.feed(recorder, 4)
-            sealed = recorder.stop()
-
-            create_planner.assert_called_once_with(3)
-            self.assertEqual([call[0] for call in planner.next_calls], [0, 1, 2, 3])
-            self.assertEqual(planner.registered, [(0, 0, 3), (1, 3, 4)])
-            self.assertIsNotNone(planner.finished)
-            assert planner.finished is not None
-            self.assertEqual(planner.finished[:2], (4, 4))
-
-            records = [
-                json.loads(line)
-                for line in (sealed.path / "frames.ndjson").read_text().splitlines()
-            ]
-            self.assertEqual([record["segment_index"] for record in records], [0, 0, 0, 1])
-            self.assertEqual([record["segment_frame"] for record in records], [0, 1, 2, 0])
-            self.assertEqual(
-                [
-                    (segment["start_frame"], segment["end_frame"])
-                    for segment in sealed.manifest["video"]["segments"]
-                ],
-                [(0, 3), (3, 4)],
-            )
-            validate_device_session_manifest(sealed.manifest)
-
-    def test_native_recording_codec_is_used_for_hot_path_records(self) -> None:
-        class FakeRecordingCodec:
-            def __init__(self) -> None:
-                self.jpeg_payload_calls = 0
-                self.frame_index_calls = 0
-                self.imu_sample_calls = 0
-
-            def jpeg_payload(self, payload: bytes) -> bytes:
-                self.jpeg_payload_calls += 1
-                return payload
-
-            def encode_split_frame_index(
-                self,
-                session_id: str,
-                frame: int,
-                source_sequence: int,
-                host_monotonic_ns: int,
-                segment_index: int,
-                segment_frame: int,
-            ) -> bytes:
-                self.frame_index_calls += 1
-                return (
-                    json.dumps(
-                        {
-                            "schema": "ylx.frame-index.v1",
-                            "session_id": session_id,
-                            "frame": frame,
-                            "source_sequence": source_sequence,
-                            "host_monotonic_ns": host_monotonic_ns,
-                            "segment_index": segment_index,
-                            "segment_frame": segment_frame,
-                        },
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                    + "\n"
-                ).encode()
-
-            def encode_imu_sample(
-                self,
-                session_id: str,
-                sequence: int,
-                packet_sequence: int,
-                sample_index: int,
-                device_timestamp_raw: int,
-                device_ticks: int,
-                host_read_start_ns: int,
-                host_read_end_ns: int,
-                host_monotonic_ns: int,
-                accelerometer: tuple[int, int, int],
-                gyroscope: tuple[int, int, int],
-                sync_offset_ns: int | None,
-                sync_residual_ns: int | None,
-                sync_quality: str,
-            ) -> bytes:
-                self.imu_sample_calls += 1
-                return (
-                    json.dumps(
-                        {
-                            "format": "ylx.imu.v0",
-                            "session_id": session_id,
-                            "sequence": sequence,
-                            "packet_sequence": packet_sequence,
-                            "sample_index": sample_index,
-                            "device_timestamp_raw": device_timestamp_raw,
-                            "device_ticks": device_ticks,
-                            "host_read_start_ns": host_read_start_ns,
-                            "host_read_end_ns": host_read_end_ns,
-                            "host_monotonic_ns": host_monotonic_ns,
-                            "raw": {
-                                "accelerometer": list(accelerometer),
-                                "gyroscope": list(gyroscope),
-                            },
-                            "sync": {
-                                "offset_ns": sync_offset_ns,
-                                "residual_ns": sync_residual_ns,
-                                "quality": sync_quality,
-                            },
-                        },
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                    + "\n"
-                ).encode()
-
-        codec = FakeRecordingCodec()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_codec",
-                return_value=codec,
-            ):
-                recorder, _, _ = self.build(root, before_write=lambda _role, _payload: None)
-            recorder.start()
-            self.feed(recorder, 1)
-            recorder.submit_imu(imu_observation())
-            sealed = recorder.stop()
-
-            self.assertEqual(codec.jpeg_payload_calls, 1)
-            self.assertEqual(codec.frame_index_calls, 1)
-            self.assertEqual(codec.imu_sample_calls, 2)
-            validate_device_session_manifest(sealed.manifest)
 
     def test_open_handles_cover_the_encoder_until_the_take_ends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1222,11 +935,14 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 ],
             )
 
-    def test_native_session_io_scans_device_session_artifacts(self) -> None:
-        native = FakeNativeSessionIo()
+    def test_session_store_owns_safe_manifest_and_artifact_io(self) -> None:
+        native = FakeNativeSessionStoreIo()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("rp_ylx.recording.device_session._session_io_or_none", return_value=native):
+            with patch(
+                "rp_ylx.recording.device_session._session_store_or_none",
+                return_value=native,
+            ):
                 recorder, _, _ = self.build(root)
                 recorder.start()
                 self.feed(recorder, 4)
@@ -1236,24 +952,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
         self.assertEqual(inspected["session_id"], sealed.manifest["session_id"])
         self.assertEqual(validated["session_id"], sealed.manifest["session_id"])
-        self.assertGreaterEqual(len(native.artifact_calls), 3)
-        self.assertTrue(
-            all(
-                session_id == sealed.manifest["session_id"]
-                for session_id, _ in native.artifact_calls
-            )
-        )
-        self.assertIn(
-            [
-                "video/left_00000.mp4",
-                "video/right_00000.mp4",
-                "video/left_00001.mp4",
-                "video/right_00001.mp4",
-                "frames.ndjson",
-                "imu.ndjson",
-            ],
-            [paths for _, paths in native.artifact_calls],
-        )
         open_paths = [relative for _, relative in native.open_calls]
         self.assertGreaterEqual(open_paths.count("manifest.json"), 2)
         for relative in (

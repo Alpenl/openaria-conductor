@@ -23,7 +23,6 @@ from rp_ylx.api.downloads import (
     UnsatisfiableRange,
     parse_single_range,
 )
-from rp_ylx.native import NativeModuleError
 from rp_ylx.recording import RecordingConfig, SessionRecorder
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
@@ -32,33 +31,13 @@ ARTIFACT_ID = hashlib.sha256(ARTIFACT_BYTES).hexdigest()
 
 
 class RangeParserTest(unittest.TestCase):
-    def setUp(self) -> None:
-        downloads._RANGE_PARSER_UNAVAILABLE = False
+    def test_parses_closed_open_and_suffix_ranges(self) -> None:
+        self.assertEqual(parse_single_range("bytes=2-8", 26), (2, 8))
+        self.assertEqual(parse_single_range("bytes=10-", 26), (10, 25))
+        self.assertEqual(parse_single_range("bytes=-4", 26), (22, 25))
 
-    def tearDown(self) -> None:
-        downloads._RANGE_PARSER_UNAVAILABLE = False
-
-    def test_native_range_parser_is_preferred(self) -> None:
-        with patch("rp_ylx.api.downloads.parse_native_single_range", return_value=(2, 8)) as native:
-            self.assertEqual(parse_single_range("bytes=2-8", 26), (2, 8))
-        native.assert_called_once_with("bytes=2-8", 26)
-
-    def test_missing_native_range_parser_falls_back_to_python(self) -> None:
-        with patch(
-            "rp_ylx.api.downloads.parse_native_single_range",
-            side_effect=NativeModuleError("native_range_parser_unavailable", "missing"),
-        ):
-            self.assertEqual(parse_single_range("bytes=-4", 26), (22, 25))
-        self.assertTrue(downloads._RANGE_PARSER_UNAVAILABLE)
-
-    def test_native_unsatisfiable_range_maps_to_contract_error(self) -> None:
-        with (
-            patch(
-                "rp_ylx.api.downloads.parse_native_single_range",
-                side_effect=ValueError("range_not_satisfiable"),
-            ),
-            self.assertRaises(UnsatisfiableRange) as raised,
-        ):
+    def test_unsatisfiable_range_reports_complete_size(self) -> None:
+        with self.assertRaises(UnsatisfiableRange) as raised:
             parse_single_range("bytes=26-", 26)
         self.assertEqual(raised.exception.complete_size, 26)
 
@@ -158,7 +137,7 @@ class _DirectoryProvider:
         return locked
 
 
-class _FakeNativeSessionIo:
+class _FakeNativeSessionStore:
     def sendfile(
         self,
         output_descriptor: int,
@@ -185,55 +164,8 @@ class _FakeNativeSessionIo:
         return sent
 
 
-class _NativeArtifacts(_FakeNativeSessionIo):
-    def __init__(self, descriptors: list[dict[str, object]] | None = None) -> None:
-        self.calls: list[tuple[bytes, str]] = []
-        self.descriptors = [] if descriptors is None else descriptors
-
-    def device_session_v1_artifacts(
-        self,
-        manifest: bytes,
-        session_id: str,
-    ) -> list[dict[str, object]]:
-        self.calls.append((manifest, session_id))
-        return self.descriptors
-
-
-class _NativeSummary(_FakeNativeSessionIo):
-    def __init__(self, summary: dict[str, object]) -> None:
-        self.summary = summary
-        self.summary_calls: list[tuple[bytes, str]] = []
-
-    def device_session_v1_summary(
-        self,
-        manifest: bytes,
-        session_id: str,
-    ) -> dict[str, object]:
-        self.summary_calls.append((manifest, session_id))
-        return self.summary
-
-
-class _NativeSingleArtifact(_NativeArtifacts):
-    def __init__(self, descriptor: dict[str, object] | None) -> None:
-        super().__init__([])
-        self.single_calls: list[tuple[bytes, str, str]] = []
-        self.descriptor = descriptor
-
-    def device_session_v1_artifact(
-        self,
-        manifest: bytes,
-        session_id: str,
-        artifact_id: str,
-    ) -> dict[str, object] | None:
-        self.single_calls.append((manifest, session_id, artifact_id))
-        if self.descriptor is not None and self.descriptor["artifact_id"] == artifact_id:
-            return self.descriptor
-        return None
-
-
-class _NativeOpenRelativeRegular(_NativeSingleArtifact):
-    def __init__(self, descriptor: dict[str, object]) -> None:
-        super().__init__(descriptor)
+class _NativeOpenRelativeRegular(_FakeNativeSessionStore):
+    def __init__(self) -> None:
         self.open_calls: list[tuple[int, str]] = []
         self.read_calls: list[tuple[int, int]] = []
 
@@ -250,18 +182,41 @@ class _NativeOpenRelativeRegular(_NativeSingleArtifact):
         return os.pread(descriptor, maximum_bytes + 1, 0)
 
 
-class _MissingNativeArtifacts(_FakeNativeSessionIo):
-    pass
+class _NativeOpenVerifiedArtifact(_NativeOpenRelativeRegular):
+    def __init__(self) -> None:
+        super().__init__()
+        self.verified_calls: list[tuple[int, str, int, str]] = []
 
-
-class _FailingNativeArtifacts(_FakeNativeSessionIo):
-    def device_session_v1_artifacts(
+    def open_verified_artifact(
         self,
-        manifest: bytes,
-        session_id: str,
-    ) -> list[dict[str, object]]:
-        del manifest, session_id
-        raise RuntimeError("manifest_invalid: bad artifact list")
+        root_descriptor: int,
+        relative_path: str,
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> dict[str, object]:
+        self.verified_calls.append(
+            (root_descriptor, relative_path, expected_bytes, expected_sha256)
+        )
+        descriptor = os.open(
+            relative_path,
+            downloads._required_open_flags(),
+            dir_fd=root_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        payload = os.pread(descriptor, expected_bytes + 1, 0)
+        if len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
+            os.close(descriptor)
+            raise RuntimeError("digest_mismatch: artifact changed")
+        return {
+            "descriptor": descriptor,
+            "identity": {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "size": metadata.st_size,
+                "modified_ns": metadata.st_mtime_ns,
+                "nlink": metadata.st_nlink,
+            },
+        }
 
 
 class SessionDownloadHttpTest(unittest.TestCase):
@@ -639,8 +594,6 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
-        downloads._DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
-        downloads._DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -648,8 +601,6 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         self.thread.join(timeout=2)
         self.store.close()
         self.temporary.cleanup()
-        downloads._DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
-        downloads._DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
         downloads._clear_validated_manifest_cache_for_tests()
 
     def request(
@@ -748,132 +699,10 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         self.assertEqual(summary["session_id"], SESSION_ID)
         self.assertIsNone(summary["audio_sample_count"])
 
-    def test_directory_store_prefers_native_v1_artifact_descriptors(self) -> None:
-        native = _NativeArtifacts(
-            [
-                {
-                    "artifact_id": ARTIFACT_ID,
-                    "role": "video.left",
-                    "path": "video/left.mp4",
-                    "media_type": "video/mp4",
-                    "bytes": len(ARTIFACT_BYTES),
-                    "sha256": ARTIFACT_ID,
-                }
-            ]
-        )
+    def test_directory_store_uses_native_open_after_python_contract_validation(self) -> None:
+        native = _NativeOpenRelativeRegular()
 
-        with patch("rp_ylx.api.downloads._session_io_or_none", return_value=native):
-            status, payload, headers = self.request(
-                f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-            )
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, ARTIFACT_BYTES)
-        self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
-        self.assertEqual(native.calls, [(self.manifest_bytes, SESSION_ID)])
-
-    def test_directory_store_prefers_native_v1_summary_for_artifact_descriptors(self) -> None:
-        python_summary = downloads._device_session_v1_summary_python(
-            self.manifest,
-            manifest_bytes=self.manifest_bytes,
-            session_id=SESSION_ID,
-        )
-        native = _NativeSummary(python_summary)
-
-        with (
-            patch("rp_ylx.api.downloads._session_io_or_none", return_value=native),
-            patch(
-                "rp_ylx.api.downloads._artifact_descriptors",
-                side_effect=AssertionError("Python artifact descriptors were used"),
-            ),
-        ):
-            status, payload, headers = self.request(
-                f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-            )
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, ARTIFACT_BYTES)
-        self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
-        self.assertEqual(native.summary_calls, [(self.manifest_bytes, SESSION_ID)])
-
-    def test_device_session_v1_summary_prefers_native_and_matches_python_fallback(self) -> None:
-        python_summary = downloads._device_session_v1_summary_python(
-            self.manifest,
-            manifest_bytes=self.manifest_bytes,
-            session_id=SESSION_ID,
-        )
-        native = _NativeSummary(dict(python_summary))
-
-        with patch("rp_ylx.api.downloads._session_io_or_none", return_value=native):
-            summary = downloads.device_session_v1_summary(self.manifest_bytes, SESSION_ID)
-
-        self.assertEqual(native.summary_calls, [(self.manifest_bytes, SESSION_ID)])
-        self.assertEqual(summary["total_bytes"], python_summary["total_bytes"])
-        self.assertEqual(summary["artifacts"], python_summary["artifacts"])
-        self.assertEqual(summary["frames_count"], 1)
-        self.assertEqual(summary["imu_sample_count"], 0)
-        self.assertIsNone(summary["audio_sample_count"])
-
-    def test_device_session_v1_summary_falls_back_when_native_missing(self) -> None:
-        with (
-            patch(
-                "rp_ylx.api.downloads._session_io_or_none",
-                return_value=_MissingNativeArtifacts(),
-            ),
-            patch(
-                "rp_ylx.api.downloads._artifact_descriptors",
-                wraps=downloads._artifact_descriptors,
-            ) as python_path,
-        ):
-            summary = downloads.device_session_v1_summary(self.manifest_bytes, SESSION_ID)
-
-        self.assertTrue(downloads._DEVICE_SESSION_SUMMARY_UNAVAILABLE)
-        python_path.assert_called_once()
-        self.assertEqual(
-            summary["total_bytes"],
-            sum(item["bytes"] for item in summary["artifacts"]),
-        )
-
-    def test_directory_store_prefers_native_v1_single_artifact_descriptor(self) -> None:
-        descriptor = {
-            "artifact_id": ARTIFACT_ID,
-            "role": "video.left",
-            "path": "video/left.mp4",
-            "media_type": "video/mp4",
-            "bytes": len(ARTIFACT_BYTES),
-            "sha256": ARTIFACT_ID,
-        }
-        native = _NativeSingleArtifact(descriptor)
-
-        with patch("rp_ylx.api.downloads._session_io_or_none", return_value=native):
-            status, payload, headers = self.request(
-                f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-            )
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, ARTIFACT_BYTES)
-        self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
-        self.assertEqual(native.single_calls, [(self.manifest_bytes, SESSION_ID, ARTIFACT_ID)])
-        self.assertEqual(native.calls, [])
-
-    def test_directory_store_prefers_native_relative_artifact_open(self) -> None:
-        descriptor = {
-            "artifact_id": ARTIFACT_ID,
-            "role": "video.left",
-            "path": "video/left.mp4",
-            "media_type": "video/mp4",
-            "bytes": len(ARTIFACT_BYTES),
-            "sha256": ARTIFACT_ID,
-        }
-        native = _NativeOpenRelativeRegular(descriptor)
-
-        with (
-            patch("rp_ylx.api.downloads._session_io_or_none", return_value=native),
-            patch(
-                "rp_ylx.api.downloads._safe_relative_components",
-                side_effect=AssertionError("Python relative artifact path opened"),
-            ),
-        ):
+        with patch("rp_ylx.api.downloads._session_store_or_none", return_value=native):
             status, payload, headers = self.request(
                 f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
             )
@@ -884,40 +713,28 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
         self.assertEqual(native.open_calls[0][1], "video/left.mp4")
         self.assertEqual(len(native.read_calls), 1)
 
-    def test_directory_store_falls_back_when_native_v1_artifact_descriptors_are_missing(
-        self,
-    ) -> None:
+    def test_directory_store_prefers_one_native_open_and_verify_operation(self) -> None:
+        native = _NativeOpenVerifiedArtifact()
+
         with (
+            patch("rp_ylx.api.downloads._session_store_or_none", return_value=native),
             patch(
-                "rp_ylx.api.downloads._session_io_or_none",
-                return_value=_MissingNativeArtifacts(),
+                "rp_ylx.api.downloads._verify_open_artifact_python",
+                side_effect=AssertionError("Python artifact digest executed"),
             ),
-            patch(
-                "rp_ylx.api.downloads._artifact_descriptors",
-                wraps=downloads._artifact_descriptors,
-            ) as python_path,
-        ):
-            status, payload, _ = self.request(
-                f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
-            )
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload, ARTIFACT_BYTES)
-        self.assertTrue(downloads._DEVICE_SESSION_ARTIFACTS_UNAVAILABLE)
-        python_path.assert_called_once()
-
-    def test_directory_store_native_v1_artifact_descriptor_error_fails_closed(self) -> None:
-        with patch(
-            "rp_ylx.api.downloads._session_io_or_none",
-            return_value=_FailingNativeArtifacts(),
         ):
             status, payload, headers = self.request(
                 f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
             )
 
-        self.assertEqual(status, 409)
-        self.assertIsNone(headers["Content-Range"])
-        self.assertEqual(json.loads(payload)["error"]["code"], "session_not_verified")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, ARTIFACT_BYTES)
+        self.assertEqual(headers["ETag"], f'"{ARTIFACT_ID}"')
+        self.assertEqual(
+            [(path, size, digest) for _, path, size, digest in native.verified_calls],
+            [("video/left.mp4", len(ARTIFACT_BYTES), ARTIFACT_ID)],
+        )
+        self.assertEqual(native.open_calls, [])
 
     def test_every_session_path_component_rejects_symbolic_links(self) -> None:
         artifact_url = f"/api/v3/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"

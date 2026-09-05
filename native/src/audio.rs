@@ -1,4 +1,3 @@
-use crate::timeline;
 use libloading::Library;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
@@ -937,7 +936,19 @@ fn start_and_capture(
 }
 
 fn monotonic_ns() -> Result<u64, AudioError> {
-    timeline::monotonic_ns().map_err(|error| AudioError::new(error.code, error.message))
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp points to writable storage.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return Err(AudioError::io(
+            "clock_failed",
+            "clock_gettime",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(timestamp.tv_sec as u64 * 1_000_000_000 + timestamp.tv_nsec as u64)
 }
 
 fn write_wav_header(

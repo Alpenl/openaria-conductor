@@ -1,8 +1,6 @@
-use crate::bounded::{self, Consumer, Producer, QueueStats};
+use crate::bounded::{self, Consumer, Producer};
 use crate::turbojpeg::{TransformHandle, TurboJpegError};
 use crate::v4l2::{Capture, CaptureError, FocusStatus};
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -43,9 +41,9 @@ pub(crate) struct Frame {
     pub(crate) source_sequence: u64,
     pub(crate) host_monotonic_ns: u64,
     pub(crate) application_dropped_before: u64,
-    pub(crate) left: Py<PyBytes>,
-    pub(crate) right: Py<PyBytes>,
-    pub(crate) raw_side_by_side: Py<PyBytes>,
+    pub(crate) left: Vec<u8>,
+    pub(crate) right: Vec<u8>,
+    pub(crate) raw_side_by_side: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,10 +446,6 @@ impl Stream {
         stop_result
     }
 
-    pub(crate) fn stats(&self) -> QueueStats {
-        self.consumer.stats()
-    }
-
     #[cfg(test)]
     pub(crate) fn test_idle(queue_capacity: usize) -> Self {
         let (producer, consumer) = bounded::channel(queue_capacity);
@@ -494,36 +488,18 @@ fn run_producer(
                 return;
             }
         }
-        let frame = Python::with_gil(|py| {
+        let frame = (|| {
             let (source_sequence, host_monotonic_ns, raw_side_by_side) = resources
                 .capture
                 .read_ready_with(|source_sequence, host_monotonic_ns, payload| {
-                    let raw = PyBytes::new_with(py, payload.len(), |target| {
-                        target.copy_from_slice(payload);
-                        Ok(())
-                    })
-                    .map(Bound::unbind)
-                    .map_err(|error| {
-                        CaptureError::new("native_allocation_failed", error.to_string())
-                    })?;
-                    Ok((source_sequence, host_monotonic_ns, raw))
+                    Ok((source_sequence, host_monotonic_ns, payload.to_vec()))
                 })?;
             let (left, right) = if let Some(splitter) = resources.splitter.as_mut() {
-                let payload = raw_side_by_side.as_bytes(py);
-                let (left, right) = py
-                    .allow_threads(|| {
-                        splitter.split_sbs(payload, resources.width, resources.height)
-                    })
-                    .map_err(|error| StreamError::new(error.code, error.message))?;
-                (
-                    PyBytes::new(py, &left).unbind(),
-                    PyBytes::new(py, &right).unbind(),
-                )
+                splitter
+                    .split_sbs(&raw_side_by_side, resources.width, resources.height)
+                    .map_err(|error| StreamError::new(error.code, error.message))?
             } else {
-                (
-                    PyBytes::new(py, &[]).unbind(),
-                    PyBytes::new(py, &[]).unbind(),
-                )
+                (Vec::new(), Vec::new())
             };
             Ok::<_, StreamError>(Frame {
                 source_sequence,
@@ -533,7 +509,7 @@ fn run_producer(
                 right,
                 raw_side_by_side,
             })
-        });
+        })();
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {

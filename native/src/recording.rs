@@ -119,32 +119,6 @@ pub(crate) struct SegmentPlannerSnapshot {
     pub(crate) boundary_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DropEvent {
-    pub(crate) at_time_seconds: f64,
-    pub(crate) dropped: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DropQualityPolicy {
-    pub(crate) max_contiguous_dropped_frames: u64,
-    pub(crate) max_total_dropped_frames: u64,
-    pub(crate) max_drop_fraction: f64,
-    pub(crate) window_seconds: f64,
-    pub(crate) max_dropped_frames_per_window: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DropQualityEvaluation {
-    pub(crate) accepted: bool,
-    pub(crate) dropped: u64,
-    pub(crate) total: u64,
-    pub(crate) fraction: f64,
-    pub(crate) contiguous: u64,
-    pub(crate) window_drops: u64,
-    pub(crate) violations: Vec<&'static str>,
-}
-
 pub(crate) struct RecordingFrameGate {
     frame_decimation: u64,
     first_frame: bool,
@@ -594,87 +568,10 @@ fn validate_non_negative_finite(value: f64, name: &str) -> Result<(), RecordingE
     }
 }
 
-pub(crate) fn evaluate_drop_quality(
-    frames_written: u64,
-    events: &[DropEvent],
-    policy: DropQualityPolicy,
-) -> Result<DropQualityEvaluation, RecordingError> {
-    if !policy.max_drop_fraction.is_finite()
-        || policy.max_drop_fraction < 0.0
-        || !policy.window_seconds.is_finite()
-        || policy.window_seconds < 0.0
-    {
-        return Err(RecordingError::new(
-            "invalid_argument",
-            "drop quality policy limits are invalid",
-        ));
-    }
-    let mut dropped = 0_u64;
-    let mut contiguous = 0_u64;
-    for event in events {
-        if !event.at_time_seconds.is_finite() || event.at_time_seconds < 0.0 {
-            return Err(RecordingError::new(
-                "invalid_argument",
-                "drop event time is invalid",
-            ));
-        }
-        dropped = dropped
-            .checked_add(event.dropped)
-            .ok_or_else(|| RecordingError::new("counter_overflow", "drop count overflow"))?;
-        contiguous = contiguous.max(event.dropped);
-    }
-    let total = frames_written
-        .checked_add(dropped)
-        .ok_or_else(|| RecordingError::new("counter_overflow", "frame count overflow"))?;
-    let fraction = if total == 0 {
-        0.0
-    } else {
-        dropped as f64 / total as f64
-    };
-    let mut window_drops = 0_u64;
-    for start in events {
-        let mut current = 0_u64;
-        let window_end = start.at_time_seconds + policy.window_seconds;
-        for event in events {
-            if start.at_time_seconds <= event.at_time_seconds && event.at_time_seconds < window_end
-            {
-                current = current.checked_add(event.dropped).ok_or_else(|| {
-                    RecordingError::new("counter_overflow", "window drop count overflow")
-                })?;
-            }
-        }
-        window_drops = window_drops.max(current);
-    }
-    let mut violations = Vec::new();
-    if contiguous > policy.max_contiguous_dropped_frames {
-        violations.push("contiguous");
-    }
-    if dropped > policy.max_total_dropped_frames {
-        violations.push("total");
-    }
-    if fraction > policy.max_drop_fraction {
-        violations.push("fraction");
-    }
-    if window_drops > policy.max_dropped_frames_per_window {
-        violations.push("window");
-    }
-    Ok(DropQualityEvaluation {
-        accepted: violations.is_empty(),
-        dropped,
-        total,
-        fraction,
-        contiguous,
-        window_drops,
-        violations,
-    })
-}
-
 pub(crate) struct RecordingSink {
     session_id: String,
-    split_eyes: bool,
     frames: ArtifactWriter,
     imu: ArtifactWriter,
-    raw_video: Option<ArtifactWriter>,
     bytes_written: u64,
     frames_written: u64,
     imu_samples_written: u64,
@@ -682,11 +579,7 @@ pub(crate) struct RecordingSink {
 }
 
 impl RecordingSink {
-    pub(crate) fn create(
-        session_root: &Path,
-        session_id: &str,
-        split_eyes: bool,
-    ) -> Result<Self, RecordingError> {
+    pub(crate) fn create(session_root: &Path, session_id: &str) -> Result<Self, RecordingError> {
         if session_id.is_empty() {
             return Err(RecordingError::new(
                 "invalid_argument",
@@ -695,21 +588,10 @@ impl RecordingSink {
         }
         let frames = ArtifactWriter::create(session_root, "frames.index", "frames.ndjson")?;
         let imu = ArtifactWriter::create(session_root, "imu.samples", "imu.ndjson")?;
-        let raw_video = if split_eyes {
-            None
-        } else {
-            Some(ArtifactWriter::create(
-                session_root,
-                "video.raw-side-by-side",
-                "video/raw-sbs.mjpeg",
-            )?)
-        };
         Ok(Self {
             session_id: session_id.to_owned(),
-            split_eyes,
             frames,
             imu,
-            raw_video,
             bytes_written: 0,
             frames_written: 0,
             imu_samples_written: 0,
@@ -726,12 +608,6 @@ impl RecordingSink {
         segment_frame: u64,
     ) -> Result<u64, RecordingError> {
         self.ensure_open()?;
-        if !self.split_eyes {
-            return Err(RecordingError::new(
-                "invalid_state",
-                "split frame index is only valid for split-eye recording",
-            ));
-        }
         let record = split_frame_index_record(
             &self.session_id,
             frame,
@@ -750,56 +626,6 @@ impl RecordingSink {
             .checked_add(1)
             .ok_or_else(|| RecordingError::new("write_failed", "frame count overflow"))?;
         Ok(written)
-    }
-
-    pub(crate) fn write_raw_frame(
-        &mut self,
-        frame: u64,
-        source_sequence: u64,
-        host_monotonic_ns: u64,
-        raw_side_by_side: &[u8],
-    ) -> Result<RawFrameWrite, RecordingError> {
-        self.ensure_open()?;
-        if self.split_eyes {
-            return Err(RecordingError::new(
-                "invalid_state",
-                "raw frame writes are only valid for raw-side-by-side recording",
-            ));
-        }
-        let payload = jpeg_payload(raw_side_by_side)?;
-        let video = self
-            .raw_video
-            .as_mut()
-            .ok_or_else(|| RecordingError::new("invalid_state", "raw video writer is missing"))?;
-        let video_offset = video.bytes;
-        let video_bytes = u64::try_from(payload.len())
-            .map_err(|_| RecordingError::new("write_failed", "frame too large"))?;
-        let written_video = video.write(payload)?;
-        let record = raw_frame_index_record(
-            &self.session_id,
-            frame,
-            source_sequence,
-            host_monotonic_ns,
-            video_offset,
-            video_bytes,
-        );
-        let written_index = self.frames.write(&record)?;
-        let written = written_video
-            .checked_add(written_index)
-            .ok_or_else(|| RecordingError::new("write_failed", "recording byte count overflow"))?;
-        self.bytes_written = self
-            .bytes_written
-            .checked_add(written)
-            .ok_or_else(|| RecordingError::new("write_failed", "recording byte count overflow"))?;
-        self.frames_written = self
-            .frames_written
-            .checked_add(1)
-            .ok_or_else(|| RecordingError::new("write_failed", "frame count overflow"))?;
-        Ok(RawFrameWrite {
-            bytes_written: written,
-            video_offset,
-            video_bytes,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -882,12 +708,7 @@ impl RecordingSink {
 
     pub(crate) fn flush_and_close(&mut self) -> Result<RecordingSinkSnapshot, RecordingError> {
         self.ensure_open()?;
-        let mut artifacts = Vec::with_capacity(if self.split_eyes { 2 } else { 3 });
-        artifacts.push(self.frames.flush_and_close()?);
-        artifacts.push(self.imu.flush_and_close()?);
-        if let Some(raw_video) = self.raw_video.as_mut() {
-            artifacts.push(raw_video.flush_and_close()?);
-        }
+        let artifacts = vec![self.frames.flush_and_close()?, self.imu.flush_and_close()?];
         self.closed = true;
         Ok(RecordingSinkSnapshot {
             artifacts,
@@ -909,9 +730,6 @@ impl RecordingSink {
     pub(crate) fn close(&mut self) {
         self.frames.close();
         self.imu.close();
-        if let Some(raw_video) = self.raw_video.as_mut() {
-            raw_video.close();
-        }
         self.closed = true;
     }
 
@@ -925,13 +743,6 @@ impl RecordingSink {
             Ok(())
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RawFrameWrite {
-    pub(crate) bytes_written: u64,
-    pub(crate) video_offset: u64,
-    pub(crate) video_bytes: u64,
 }
 
 struct ArtifactWriter {
@@ -1109,24 +920,6 @@ pub(crate) fn split_frame_index_record(
     .into_bytes()
 }
 
-pub(crate) fn raw_frame_index_record(
-    session_id: &str,
-    frame: u64,
-    source_sequence: u64,
-    host_monotonic_ns: u64,
-    video_offset: u64,
-    video_bytes: u64,
-) -> Vec<u8> {
-    let session_id = json_string(session_id);
-    format!(
-        "{{\"frame\":{frame},\"host_monotonic_ns\":{host_monotonic_ns},\
-         \"schema\":\"ylx.frame-index.v1\",\"session_id\":{session_id},\
-         \"source_sequence\":{source_sequence},\"video_bytes\":{video_bytes},\
-         \"video_offset\":{video_offset}}}\n"
-    )
-    .into_bytes()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn imu_sample_record(
     session_id: &str,
@@ -1194,9 +987,8 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureFanoutState, DropEvent, DropQualityPolicy, RecordingFrameGate,
-        RecordingSegmentPlanner, RecordingSink, RecordingTapState, evaluate_drop_quality,
-        imu_sample_record, jpeg_payload, raw_frame_index_record, split_frame_index_record,
+        CaptureFanoutState, RecordingFrameGate, RecordingSegmentPlanner, RecordingSink,
+        RecordingTapState, imu_sample_record, jpeg_payload, split_frame_index_record,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1228,12 +1020,6 @@ mod tests {
             b"{\"frame\":7,\"host_monotonic_ns\":1234,\"schema\":\"ylx.frame-index.v1\",\
               \"segment_frame\":3,\"segment_index\":2,\"session_id\":\"session\",\
               \"source_sequence\":99}\n"
-        );
-        assert_eq!(
-            raw_frame_index_record("session", 7, 99, 1234, 400, 50),
-            b"{\"frame\":7,\"host_monotonic_ns\":1234,\"schema\":\"ylx.frame-index.v1\",\
-              \"session_id\":\"session\",\"source_sequence\":99,\"video_bytes\":50,\
-              \"video_offset\":400}\n"
         );
     }
 
@@ -1481,41 +1267,9 @@ mod tests {
     }
 
     #[test]
-    fn drop_quality_policy_reports_same_violation_terms_as_python() {
-        let events = [
-            DropEvent {
-                at_time_seconds: 0.5,
-                dropped: 2,
-            },
-            DropEvent {
-                at_time_seconds: 0.7,
-                dropped: 1,
-            },
-            DropEvent {
-                at_time_seconds: 2.0,
-                dropped: 1,
-            },
-        ];
-        let policy = DropQualityPolicy {
-            max_contiguous_dropped_frames: 1,
-            max_total_dropped_frames: 10,
-            max_drop_fraction: 0.5,
-            window_seconds: 1.0,
-            max_dropped_frames_per_window: 2,
-        };
-        let result = evaluate_drop_quality(4, &events, policy).unwrap();
-        assert!(!result.accepted);
-        assert_eq!(result.dropped, 4);
-        assert_eq!(result.total, 8);
-        assert_eq!(result.contiguous, 2);
-        assert_eq!(result.window_drops, 3);
-        assert_eq!(result.violations, vec!["contiguous", "window"]);
-    }
-
-    #[test]
     fn recording_sink_writes_split_frame_and_imu_artifacts() {
         let root = temp_root("split");
-        let mut sink = RecordingSink::create(&root, "session", true).unwrap();
+        let mut sink = RecordingSink::create(&root, "session").unwrap();
         let frame_bytes = sink.write_split_frame_index(7, 99, 1234, 2, 3).unwrap();
         let imu_bytes = sink
             .write_imu_sample(
@@ -1567,37 +1321,9 @@ mod tests {
     }
 
     #[test]
-    fn recording_sink_writes_raw_video_and_index() {
-        let root = temp_root("raw");
-        fs::create_dir(root.join("video")).unwrap();
-        let mut sink = RecordingSink::create(&root, "session", false).unwrap();
-        let result = sink
-            .write_raw_frame(5, 10, 123, b"prefix\xff\xd8payload\xff\xd9suffix")
-            .unwrap();
-        assert_eq!(result.video_offset, 0);
-        assert_eq!(result.video_bytes, 11);
-        assert_eq!(
-            fs::read(root.join("video/raw-sbs.mjpeg")).unwrap(),
-            b"\xff\xd8payload\xff\xd9"
-        );
-        assert_eq!(
-            fs::read(root.join("frames.ndjson")).unwrap(),
-            raw_frame_index_record("session", 5, 10, 123, 0, 11)
-        );
-        let snapshot = sink.flush_and_close().unwrap();
-        assert_eq!(snapshot.frames_written, 1);
-        let roles: Vec<_> = snapshot.artifacts.iter().map(|item| item.role).collect();
-        assert_eq!(
-            roles,
-            vec!["frames.index", "imu.samples", "video.raw-side-by-side"]
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn recording_sink_snapshot_reports_counters_without_closing() {
         let root = temp_root("snapshot");
-        let mut sink = RecordingSink::create(&root, "session", true).unwrap();
+        let mut sink = RecordingSink::create(&root, "session").unwrap();
         let frame_bytes = sink.write_split_frame_index(7, 99, 1234, 2, 3).unwrap();
 
         let snapshot = sink.snapshot();

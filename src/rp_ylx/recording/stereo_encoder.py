@@ -14,36 +14,15 @@ import struct
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-
-from rp_ylx.native import (
-    NativeModuleError,
-    NativeSessionIo,
-    NativeStereoEncoderEvents,
-    NativeStereoEncoderPipe,
-    NativeStereoEncoderProcess,
-    create_native_session_io,
-    create_native_stereo_encoder_events,
-    create_native_stereo_encoder_pipe,
-    create_native_stereo_encoder_process,
-)
 
 _FRAME_MAGIC = b"YLXF"
 _HEADER = struct.Struct("<4sI")
 _READY_TIMEOUT_SECONDS = 15.0
 _DEFAULT_EXECUTABLE = "ylx-stereo-encoder"
-_SESSION_IO_LOCK = threading.Lock()
-_SESSION_IO: NativeSessionIo | None = None
-_SESSION_IO_UNAVAILABLE = False
-_ENCODER_EVENTS_LOCK = threading.Lock()
-_ENCODER_EVENTS: NativeStereoEncoderEvents | None = None
-_ENCODER_EVENTS_UNAVAILABLE = False
-_ENCODER_PIPE_LOCK = threading.Lock()
-_ENCODER_PIPE_UNAVAILABLE = False
-_ENCODER_PROCESS_LOCK = threading.Lock()
-_ENCODER_PROCESS_UNAVAILABLE = False
 
 
 class StereoEncoderError(RuntimeError):
@@ -133,8 +112,6 @@ class StereoEncoderProcess:
         self._done = threading.Event()
         self._stats: dict[str, int] = {}
         self._submitted = 0
-        self._native_pipe: NativeStereoEncoderPipe | None = None
-        self._native_process: NativeStereoEncoderProcess | None = None
 
     @property
     def segment_frames(self) -> int:
@@ -142,58 +119,21 @@ class StereoEncoderProcess:
 
     @property
     def segments(self) -> tuple[ClosedSegment, ...]:
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            return tuple(_closed_segment_from_native(item) for item in native_process.segments())
         with self._lock:
             return tuple(self._segments)
 
     @property
     def stats(self) -> dict[str, int]:
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            return {
-                str(key): int(value)
-                for key, value in native_process.stats().items()
-                if isinstance(value, int)
-            }
         with self._lock:
             return dict(self._stats)
 
     @property
     def submitted_frames(self) -> int:
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            return native_process.submitted_frames()
-        if self._native_pipe is not None:
-            return self._native_pipe.submitted_frames()
         return self._submitted
 
-    @property
-    def native_owner(self) -> NativeStereoEncoderProcess | None:
-        return self._native_process
-
     def start(self) -> None:
-        if self._process is not None or self._native_process is not None:
+        if self._process is not None:
             raise StereoEncoderError("invalid_state", "助手进程只能启动一次")
-        native_process = _encoder_process_or_none(
-            self._out_dir,
-            self._executable,
-            width=self._width,
-            height=self._height,
-            fps=self._fps,
-            bitrate_kbps=self._bitrate_kbps,
-            segment_frames=self._segment_frames,
-            path_prefix=self._path_prefix,
-        )
-        if native_process is not None:
-            try:
-                native_process.start()
-            except RuntimeError as error:
-                raise _native_encoder_process_error(error) from error
-            self._native_process = native_process
-            self._ready.set()
-            return
         command = [
             str(self._executable),
             "--out-dir",
@@ -221,8 +161,6 @@ class StereoEncoderProcess:
             )
         except OSError as error:
             raise StereoEncoderError("encoder_unavailable", f"无法启动助手：{error}") from error
-        if self._process.stdin is not None:
-            self._native_pipe = _encoder_pipe_or_none(self._process.stdin.fileno())
         self._reader = threading.Thread(
             target=self._read_events, name="rp-ylx-stereo-encoder-events", daemon=True
         )
@@ -235,35 +173,13 @@ class StereoEncoderProcess:
     def submit(self, jpeg: bytes) -> None:
         """提交一帧并排 MJPEG。助手拒绝即视为本次录制失败，不做静默丢帧。"""
 
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            try:
-                written = native_process.submit(jpeg)
-            except RuntimeError as error:
-                raise _native_encoder_process_error(error) from error
-            if written != _HEADER.size + len(jpeg):
-                raise StereoEncoderError("encoder_failed", "助手写入失败：native write was short")
-            return
         process = self._process
         if process is None or process.stdin is None:
             raise StereoEncoderError("invalid_state", "助手进程未启动")
         self._raise_if_failed()
         try:
-            if self._native_pipe is None:
-                native = _session_io_or_none()
-                if native is None:
-                    _writev_all(
-                        process.stdin.fileno(), (_HEADER.pack(_FRAME_MAGIC, len(jpeg)), jpeg)
-                    )
-                else:
-                    written = native.write_encoder_frame(process.stdin.fileno(), jpeg)
-                    if written != _HEADER.size + len(jpeg):
-                        raise BrokenPipeError("encoder pipe native write was short")
-                self._submitted += 1
-            else:
-                written = self._native_pipe.submit(jpeg)
-                if written != _HEADER.size + len(jpeg):
-                    raise BrokenPipeError("encoder pipe native write was short")
+            _writev_all(process.stdin.fileno(), (_HEADER.pack(_FRAME_MAGIC, len(jpeg)), jpeg))
+            self._submitted += 1
         except (BrokenPipeError, OSError, RuntimeError) as error:
             self._raise_if_failed()
             raise StereoEncoderError("encoder_failed", f"助手写入失败：{error}") from error
@@ -271,14 +187,6 @@ class StereoEncoderProcess:
     def finish(self, *, timeout: float = 30.0) -> Sequence[ClosedSegment]:
         """关闭输入、等待助手封完最后一段，返回全部已封分段。"""
 
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            try:
-                return tuple(
-                    _closed_segment_from_native(item) for item in native_process.finish(timeout)
-                )
-            except RuntimeError as error:
-                raise _native_encoder_process_error(error) from error
         process = self._process
         if process is None:
             raise StereoEncoderError("invalid_state", "助手进程未启动")
@@ -302,16 +210,11 @@ class StereoEncoderProcess:
         return self.segments
 
     def abort(self) -> None:
-        native_process = getattr(self, "_native_process", None)
-        if native_process is not None:
-            with _suppress_base_error():
-                native_process.abort()
-            return
         process = self._process
         if process is None:
             return
         if process.stdin is not None:
-            with _suppress_os_error():
+            with suppress(OSError):
                 process.stdin.close()
         if process.poll() is None:
             process.terminate()
@@ -319,7 +222,7 @@ class StereoEncoderProcess:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-                with _suppress_os_error():
+                with suppress(OSError):
                     process.wait(timeout=5)
         if self._reader is not None:
             self._reader.join(timeout=5)
@@ -385,22 +288,6 @@ class StereoEncoderProcess:
             self._ready.set()
 
 
-class _suppress_os_error:  # noqa: N801 - 与 contextlib.suppress 同用途的轻量写法
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        return isinstance(exc, OSError)
-
-
-class _suppress_base_error:  # noqa: N801 - abort 路径不能再抛出二次异常
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        return isinstance(exc, BaseException)
-
-
 def _writev_all(descriptor: int, chunks: Sequence[bytes]) -> None:
     views = [memoryview(chunk) for chunk in chunks if chunk]
     index = 0
@@ -418,100 +305,7 @@ def _writev_all(descriptor: int, chunks: Sequence[bytes]) -> None:
             offset += written
 
 
-def _session_io_or_none() -> NativeSessionIo | None:
-    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
-    if _SESSION_IO_UNAVAILABLE:
-        return None
-    if _SESSION_IO is not None:
-        return _SESSION_IO
-    with _SESSION_IO_LOCK:
-        if _SESSION_IO_UNAVAILABLE:
-            return None
-        if _SESSION_IO is not None:
-            return _SESSION_IO
-        try:
-            _SESSION_IO = create_native_session_io()
-        except NativeModuleError:
-            _SESSION_IO_UNAVAILABLE = True
-            return None
-        return _SESSION_IO
-
-
-def _encoder_pipe_or_none(descriptor: int) -> NativeStereoEncoderPipe | None:
-    global _ENCODER_PIPE_UNAVAILABLE
-    if _ENCODER_PIPE_UNAVAILABLE:
-        return None
-    with _ENCODER_PIPE_LOCK:
-        if _ENCODER_PIPE_UNAVAILABLE:
-            return None
-        try:
-            return create_native_stereo_encoder_pipe(descriptor)
-        except NativeModuleError:
-            _ENCODER_PIPE_UNAVAILABLE = True
-            return None
-
-
-def _encoder_process_or_none(
-    out_dir: Path,
-    executable: Path,
-    *,
-    width: int,
-    height: int,
-    fps: int,
-    bitrate_kbps: int,
-    segment_frames: int,
-    path_prefix: str,
-) -> NativeStereoEncoderProcess | None:
-    global _ENCODER_PROCESS_UNAVAILABLE
-    if _ENCODER_PROCESS_UNAVAILABLE:
-        return None
-    with _ENCODER_PROCESS_LOCK:
-        if _ENCODER_PROCESS_UNAVAILABLE:
-            return None
-        try:
-            return create_native_stereo_encoder_process(
-                str(out_dir),
-                str(executable),
-                width=width,
-                height=height,
-                fps=fps,
-                bitrate_kbps=bitrate_kbps,
-                segment_frames=segment_frames,
-                path_prefix=path_prefix,
-            )
-        except NativeModuleError as error:
-            if error.code == "native_stereo_encoder_process_unavailable":
-                _ENCODER_PROCESS_UNAVAILABLE = True
-                return None
-            raise _native_encoder_process_error(error) from error
-
-
-def _encoder_events_or_none() -> NativeStereoEncoderEvents | None:
-    global _ENCODER_EVENTS, _ENCODER_EVENTS_UNAVAILABLE
-    if _ENCODER_EVENTS_UNAVAILABLE:
-        return None
-    if _ENCODER_EVENTS is not None:
-        return _ENCODER_EVENTS
-    with _ENCODER_EVENTS_LOCK:
-        if _ENCODER_EVENTS_UNAVAILABLE:
-            return None
-        if _ENCODER_EVENTS is not None:
-            return _ENCODER_EVENTS
-        try:
-            _ENCODER_EVENTS = create_native_stereo_encoder_events()
-        except NativeModuleError:
-            _ENCODER_EVENTS_UNAVAILABLE = True
-            return None
-        return _ENCODER_EVENTS
-
-
 def _parse_event(line: bytes) -> dict[str, object] | None:
-    native = _encoder_events_or_none()
-    if native is not None:
-        try:
-            return native.parse(line)
-        except RuntimeError as error:
-            raise _native_encoder_event_error(error) from error
     text = line.strip()
     if not text:
         return None
@@ -522,43 +316,3 @@ def _parse_event(line: bytes) -> dict[str, object] | None:
     if not isinstance(event, dict):
         raise StereoEncoderError("encoder_failed", "助手输出 JSON 不是对象")
     return event
-
-
-def _native_encoder_event_error(error: RuntimeError) -> StereoEncoderError:
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "encoder_failed", raw
-    return StereoEncoderError(code, message)
-
-
-def _native_encoder_process_error(error: RuntimeError) -> StereoEncoderError:
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = "encoder_failed", raw
-    return StereoEncoderError(code, message)
-
-
-def _closed_segment_from_native(value: Mapping[str, object]) -> ClosedSegment:
-    return ClosedSegment(
-        index=_native_int(value.get("index"), "index"),
-        start_frame=_native_int(value.get("start_frame"), "start_frame"),
-        end_frame=_native_int(value.get("end_frame"), "end_frame"),
-        left_path=_native_str(value.get("left_path"), "left_path"),
-        left_bytes=_native_int(value.get("left_bytes"), "left_bytes"),
-        right_path=_native_str(value.get("right_path"), "right_path"),
-        right_bytes=_native_int(value.get("right_bytes"), "right_bytes"),
-    )
-
-
-def _native_int(value: object, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise StereoEncoderError("encoder_failed", f"native segment {name} 无效")
-    return value
-
-
-def _native_str(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise StereoEncoderError("encoder_failed", f"native segment {name} 无效")
-    return value
