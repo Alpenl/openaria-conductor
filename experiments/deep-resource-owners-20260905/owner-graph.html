@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RP-YLX deep resource owner graph</title>
+  <style>
+    :root {
+      --paper: #f7f8fa;
+      --ink: #182028;
+      --muted: #586471;
+      --line: #62717e;
+      --python: #eaf2f8;
+      --python-stroke: #2b6f9e;
+      --rust: #edf5ee;
+      --rust-stroke: #3a7650;
+      --resource: #fff4dd;
+      --resource-stroke: #a66b14;
+      --deleted: #f4ecec;
+      --deleted-stroke: #8c5252;
+      --surface: #ffffff;
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0;
+    }
+    header, main, footer { width: min(1240px, calc(100% - 32px)); margin-inline: auto; }
+    header { padding: 34px 0 22px; border-bottom: 1px solid #cfd6dc; }
+    h1 { margin: 0 0 8px; font: 700 28px/1.2 system-ui, sans-serif; letter-spacing: 0; }
+    h2 { margin: 30px 0 8px; font: 700 19px/1.3 system-ui, sans-serif; letter-spacing: 0; }
+    p { margin: 6px 0; max-width: 92ch; }
+    .lede { color: var(--muted); }
+    .diagram {
+      margin: 18px 0 8px;
+      padding: 12px;
+      overflow-x: auto;
+      background: var(--surface);
+      border: 1px solid #cfd6dc;
+      border-radius: var(--radius);
+    }
+    svg { display: block; width: 100%; min-width: 760px; height: auto; }
+    .zone { fill: none; stroke: #b5c0c9; stroke-width: 1.5; stroke-dasharray: 7 6; }
+    .python { fill: var(--python); stroke: var(--python-stroke); }
+    .rust { fill: var(--rust); stroke: var(--rust-stroke); }
+    .resource { fill: var(--resource); stroke: var(--resource-stroke); }
+    .deleted { fill: var(--deleted); stroke: var(--deleted-stroke); }
+    .node { stroke-width: 2; rx: 6; }
+    .node-label {
+      width: 100%; height: 100%; padding: 8px 10px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; overflow-wrap: anywhere; font: 600 14px/1.25 system-ui, sans-serif;
+    }
+    .node-label small { display: block; margin-top: 4px; color: var(--muted); font: 12px/1.25 ui-monospace, monospace; }
+    .zone-label { font: 700 13px/1 system-ui, sans-serif; fill: var(--muted); }
+    .edge { fill: none; stroke: var(--line); stroke-width: 1.8; marker-end: url(#arrow); }
+    .hot { stroke: var(--rust-stroke); stroke-width: 3; }
+    .async { stroke-dasharray: 6 5; }
+    .edge-bg { fill: var(--surface); }
+    .edge-label { font: 12px/1 ui-monospace, monospace; fill: var(--ink); text-anchor: middle; }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px 22px; padding: 10px 0 2px; color: var(--muted); }
+    .key { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 18px; height: 12px; border: 2px solid; border-radius: 2px; }
+    .note { padding: 12px 0; border-top: 1px solid #dbe1e6; color: var(--muted); }
+    footer { margin-top: 30px; padding: 18px 0 34px; border-top: 1px solid #cfd6dc; color: var(--muted); font-size: 12px; }
+    @media (max-width: 700px) {
+      header, main, footer { width: min(100% - 20px, 1240px); }
+      h1 { font-size: 22px; }
+      .diagram { padding: 6px; }
+    }
+    @media print {
+      body { background: #fff; }
+      header, main, footer { width: 100%; }
+      .diagram { break-inside: avoid; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RP-YLX deep resource owner graph</h1>
+    <p class="lede">Production construction and lifecycle ownership after Issue #74. Solid green paths are the recording data plane; dashed paths are bounded control or observation calls.</p>
+  </header>
+  <main>
+    <h2>Production owner graph</h2>
+    <div class="diagram">
+      <svg viewBox="0 0 1200 790" role="img" aria-labelledby="graph-title graph-description">
+        <title id="graph-title">Python control plane and Rust resource owners</title>
+        <desc id="graph-description">The Python daemon constructs the policy coordinator, recorder, and gateway. Rust CaptureEngine and SessionStore own hardware, threads, queues, encoder, audio, and files. Per-frame recording traffic stays between the two Rust owners.</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#62717e"></path>
+          </marker>
+        </defs>
+
+        <rect class="zone" x="20" y="35" width="1160" height="220" rx="8"></rect>
+        <text class="zone-label" x="38" y="58">PYTHON: PRODUCT POLICY, CONTRACTS, AND PROCESS ASSEMBLY</text>
+        <rect class="zone" x="20" y="290" width="1160" height="315" rx="8"></rect>
+        <text class="zone-label" x="38" y="313">RUST: LONG-LIVED RESOURCE OWNERS AND RECORDING DATA PLANE</text>
+        <rect class="zone" x="20" y="640" width="1160" height="125" rx="8"></rect>
+        <text class="zone-label" x="38" y="663">OPERATING SYSTEM / HARDWARE RESOURCES</text>
+
+        <rect class="node python" x="55" y="88" width="205" height="95"></rect>
+        <foreignObject x="55" y="88" width="205" height="95"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">Production daemon<small>configuration + startup/close order</small></div></foreignObject>
+        <rect class="node python" x="330" y="88" width="230" height="95"></rect>
+        <foreignObject x="330" y="88" width="230" height="95"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">CaptureCoordinator<small>admission, idempotency, recovery</small></div></foreignObject>
+        <rect class="node python" x="630" y="88" width="230" height="95"></rect>
+        <foreignObject x="630" y="88" width="230" height="95"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">DeviceSessionRecorder<small>manifest product semantics</small></div></foreignObject>
+        <rect class="node python" x="930" y="88" width="205" height="95"></rect>
+        <foreignObject x="930" y="88" width="205" height="95"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">Python gateway<small>HTTP/TLS/auth/SSE contracts</small></div></foreignObject>
+
+        <rect class="node rust" x="110" y="355" width="270" height="135"></rect>
+        <foreignObject x="110" y="355" width="270" height="135"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">CaptureEngine<small>camera + V4L2 mmap + IMU + capture runtime + recording gate/fanout</small></div></foreignObject>
+        <rect class="node rust" x="465" y="355" width="270" height="135"></rect>
+        <foreignObject x="465" y="355" width="270" height="135"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">SessionTransaction<small>active take + sink + segment planner + encoder process + optional audio</small></div></foreignObject>
+        <rect class="node rust" x="820" y="355" width="270" height="135"></rect>
+        <foreignObject x="820" y="355" width="270" height="135"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">SessionStore<small>safe relative I/O + identity + hash + fsync + seal + verified open</small></div></foreignObject>
+        <rect class="node rust" x="110" y="525" width="270" height="55"></rect>
+        <foreignObject x="110" y="525" width="270" height="55"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">Preview / metrics views</div></foreignObject>
+        <rect class="node deleted" x="820" y="525" width="270" height="55"></rect>
+        <foreignObject x="820" y="525" width="270" height="55"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">GatewayRuntime experiment: NO-GO</div></foreignObject>
+
+        <rect class="node resource" x="80" y="690" width="230" height="50"></rect>
+        <foreignObject x="80" y="690" width="230" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">camera / USB IMU handles</div></foreignObject>
+        <rect class="node resource" x="485" y="690" width="230" height="50"></rect>
+        <foreignObject x="485" y="690" width="230" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">threads / queues / encoder</div></foreignObject>
+        <rect class="node resource" x="890" y="690" width="230" height="50"></rect>
+        <foreignObject x="890" y="690" width="230" height="50"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">session directories / file descriptors</div></foreignObject>
+
+        <path class="edge" d="M260 135 H330"></path>
+        <rect class="edge-bg" x="274" y="119" width="44" height="20"></rect><text class="edge-label" x="296" y="133">build</text>
+        <path class="edge" d="M560 135 H630"></path>
+        <rect class="edge-bg" x="570" y="119" width="50" height="20"></rect><text class="edge-label" x="595" y="133">policy</text>
+        <path class="edge async" d="M157 183 V340 H245 V355"></path>
+        <rect class="edge-bg" x="164" y="322" width="126" height="20"></rect><text class="edge-label" x="227" y="336">one CapturePlan</text>
+        <path class="edge async" d="M745 183 V340 H955 V355"></path>
+        <rect class="edge-bg" x="792" y="322" width="126" height="20"></rect><text class="edge-label" x="855" y="336">begin / seal</text>
+        <path class="edge async" d="M630 158 H600 V355"></path>
+        <rect class="edge-bg" x="540" y="247" width="120" height="20"></rect><text class="edge-label" x="600" y="261">transaction</text>
+        <path class="edge hot" d="M380 422 H465"></path>
+        <rect class="edge-bg" x="390" y="399" width="65" height="20"></rect><text class="edge-label" x="423" y="413">frames</text>
+        <path class="edge async" d="M930 183 V270 H1030 V355"></path>
+        <rect class="edge-bg" x="972" y="247" width="116" height="20"></rect><text class="edge-label" x="1030" y="261">verified read</text>
+        <path class="edge async" d="M930 158 H780 V552 H380"></path>
+        <rect class="edge-bg" x="558" y="536" width="130" height="20"></rect><text class="edge-label" x="623" y="550">preview iterator</text>
+        <path class="edge" d="M245 490 V690"></path>
+        <path class="edge" d="M600 490 V690"></path>
+        <path class="edge" d="M955 490 V690"></path>
+      </svg>
+    </div>
+    <div class="legend" aria-label="Diagram legend">
+      <span class="key"><span class="swatch" style="background:var(--python);border-color:var(--python-stroke)"></span>Python policy owner</span>
+      <span class="key"><span class="swatch" style="background:var(--rust);border-color:var(--rust-stroke)"></span>Rust resource owner</span>
+      <span class="key"><span class="swatch" style="background:var(--resource);border-color:var(--resource-stroke)"></span>OS/hardware resource</span>
+      <span class="key"><span class="swatch" style="background:var(--deleted);border-color:var(--deleted-stroke)"></span>Rejected experiment</span>
+    </div>
+    <p class="note">Recording frames, audio chunks, IMU samples, encoder events, and file writes do not call Python. Python crosses PyO3 at lifecycle transitions and bounded progress/manifest boundaries. Preview delivery still crosses the Python gateway once per delivered preview frame because the GatewayRuntime experiment did not meet the same-stage deletion gate.</p>
+
+    <h2>Interface ablation</h2>
+    <div class="diagram">
+      <svg viewBox="0 0 1200 290" role="img" aria-labelledby="ablation-title ablation-description">
+        <title id="ablation-title">Twenty-two shallow classes reduced to deep owners and support views</title>
+        <desc id="ablation-description">The baseline exposed twenty-two PyO3 classes. Fifteen independent factories were removed. Two deep owner factories and five narrow support or returned-view classes remain.</desc>
+        <defs>
+          <marker id="arrow-two" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#62717e"></path>
+          </marker>
+        </defs>
+        <rect class="node deleted" x="55" y="60" width="330" height="160"></rect>
+        <foreignObject x="55" y="60" width="330" height="160"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">Baseline: 22 PyO3 classes<small>camera, validator, audio, timeline, active take, codec, sink, gates, fanout, runtime, planner, event queue, encoder parts, session I/O, preview, metrics</small></div></foreignObject>
+        <path d="M385 140 H515" fill="none" stroke="#62717e" stroke-width="2.4" marker-end="url(#arrow-two)"></path>
+        <rect class="edge-bg" x="405" y="116" width="90" height="20"></rect><text class="edge-label" x="450" y="130">remove 15</text>
+        <rect class="node rust" x="535" y="60" width="270" height="160"></rect>
+        <foreignObject x="535" y="60" width="270" height="160"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">2 constructible deep owners<small>NativeCaptureEngine<br/>NativeSessionStore</small></div></foreignObject>
+        <rect class="node rust" x="875" y="60" width="270" height="160"></rect>
+        <foreignObject x="875" y="60" width="270" height="160"><div xmlns="http://www.w3.org/1999/xhtml" class="node-label">5 support / returned views<small>SessionTransaction, PreviewBuffer, MultipartPreview, PerformanceMetrics, benchmark Splitter</small></div></foreignObject>
+      </svg>
+    </div>
+    <p class="note">The remaining support classes do not let Python assemble the recording internals. SessionTransaction is returned by SessionStore; MultipartPreview is returned by PreviewBuffer; Splitter is used by the explicit fixed-trace benchmark rather than the production daemon.</p>
+  </main>
+  <footer>Last updated: 2026-09-05 Asia/Shanghai · Evidence for mirrorbloom/RP-YLX Issue #74</footer>
+</body>
+</html>
