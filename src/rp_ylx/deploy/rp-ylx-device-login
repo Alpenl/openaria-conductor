@@ -2,7 +2,7 @@
 set -eu
 
 LOGIN_USER=OpenAria
-LOGIN_PASSWORD_HASH='$6$OpenAria$8n0pHB1dXNxHqHr3DU7eVdE81rjiYAtak9RMQ0dVZ1vOAKzYzJQG.np3aa6Jny4oFlhS7hZC3AHhf0YtU9fS71'
+LOGIN_PASSWORD_HASH='$6$OpenAria$sG47eil4DeVNV.9dRDeX15Fev0WuDuVolbkGFH.FJ/4elFempW5GJrepN2lr4coM.y91cSj26eLZYS6B5Zk8r.'
 
 if ! getent passwd "$LOGIN_USER" >/dev/null; then
     useradd --badname --create-home --shell /bin/bash --user-group "$LOGIN_USER"

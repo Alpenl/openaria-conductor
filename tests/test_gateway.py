@@ -1612,7 +1612,7 @@ class GatewayHttpTest(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
             self.assertEqual(response.headers["Content-Type"], "text/event-stream")
-            self.assertEqual(response.headers["Connection"], "keep-alive")
+            self.assertEqual(response.headers["Connection"], "close")
             self.assertIsNone(response.headers["Content-Length"])
 
             payload = self.read_sse_event(response)

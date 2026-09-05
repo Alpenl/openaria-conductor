@@ -7,17 +7,21 @@ import hmac
 import ipaddress
 import json
 import re
+import select
+import socket
 import sys
+import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import BoundedSemaphore, RLock
+from threading import RLock
 from typing import Protocol
 from urllib.parse import parse_qs, urlsplit
 
@@ -474,6 +478,198 @@ class _NetworkEventReplayBuffer:
         return event
 
 
+class _StreamSession:
+    """Own one long-lived HTTP stream from admission through teardown."""
+
+    _POLL_INTERVAL_MS = 50
+
+    def __init__(
+        self,
+        registry: _StreamRegistry,
+        session_id: int,
+        kind: str,
+        connection: socket.socket,
+        slot: threading.BoundedSemaphore,
+        wake_waiters: Callable[[], None],
+    ) -> None:
+        self.session_id = session_id
+        self.kind = kind
+        self.started_at = time.monotonic()
+        self.cancelled = threading.Event()
+        self._registry = registry
+        self._connection = connection
+        self._slot = slot
+        self._wake_waiters = wake_waiters
+        self._lock = threading.Lock()
+        self._body: object | None = None
+        self._close_reason: str | None = None
+        self._finished = False
+        self._watcher = threading.Thread(
+            target=self._watch_peer,
+            name=f"gateway-{kind}-peer-{session_id}",
+            daemon=True,
+        )
+        self._watcher.start()
+
+    def attach_body(self, body: object) -> bool:
+        close: Callable[[], object] | None = None
+        with self._lock:
+            if self._close_reason is None:
+                self._body = body
+                return True
+            candidate = getattr(body, "close", None)
+            if callable(candidate):
+                close = candidate
+        if close is not None:
+            with suppress(Exception):
+                close()
+        return False
+
+    def cancel(self, reason: str, *, interrupt_socket: bool = False) -> bool:
+        close: Callable[[], object] | None = None
+        slot: threading.BoundedSemaphore | None = None
+        with self._lock:
+            if self._close_reason is not None:
+                return False
+            self._close_reason = reason
+            self.cancelled.set()
+            candidate = getattr(self._body, "close", None)
+            if callable(candidate):
+                close = candidate
+            self._body = None
+            slot = self._slot
+            self._slot = None
+
+        with suppress(Exception):
+            self._wake_waiters()
+        if close is not None:
+            with suppress(Exception):
+                close()
+        if interrupt_socket:
+            with suppress(OSError):
+                self._connection.shutdown(socket.SHUT_RDWR)
+        if slot is not None:
+            slot.release()
+        self._registry._cancelled(self, reason)
+        return True
+
+    def finish(self, reason: str) -> None:
+        self.cancel(reason)
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+        if self._watcher is not threading.current_thread():
+            self._watcher.join(timeout=0.25)
+        self._registry._finished(self)
+
+    def _watch_peer(self) -> None:
+        poller = select.poll()
+        disconnect_mask = select.POLLERR | select.POLLHUP | select.POLLNVAL
+        disconnect_mask |= getattr(select, "POLLRDHUP", 0)
+        try:
+            poller.register(self._connection.fileno(), disconnect_mask)
+        except (OSError, ValueError):
+            self.cancel("socket_invalid", interrupt_socket=True)
+            return
+        while not self.cancelled.is_set():
+            try:
+                events = poller.poll(self._POLL_INTERVAL_MS)
+            except (OSError, ValueError):
+                self.cancel("socket_error", interrupt_socket=True)
+                return
+            if any(mask & disconnect_mask for _, mask in events):
+                self.cancel("peer_disconnect", interrupt_socket=True)
+                return
+
+
+class _StreamRegistry:
+    """Admit, observe, and cancel all gateway stream sessions."""
+
+    _ADMISSION_TIMEOUT_SECONDS = 0.2
+
+    def __init__(self, *, max_sse: int, max_preview: int) -> None:
+        self._limits = {"sse": max_sse, "preview": max_preview}
+        self._slots = {
+            kind: threading.BoundedSemaphore(limit) for kind, limit in self._limits.items()
+        }
+        self._condition = threading.Condition()
+        self._active: dict[int, _StreamSession] = {}
+        self._next_id = 1
+        self._rejected: Counter[str] = Counter()
+        self._close_reasons: dict[str, Counter[str]] = {
+            "sse": Counter(),
+            "preview": Counter(),
+        }
+
+    def begin(
+        self,
+        kind: str,
+        connection: socket.socket,
+        wake_waiters: Callable[[], None],
+    ) -> _StreamSession | None:
+        slot = self._slots[kind]
+        if not slot.acquire(timeout=self._ADMISSION_TIMEOUT_SECONDS):
+            with self._condition:
+                self._rejected[kind] += 1
+            return None
+        with self._condition:
+            session_id = self._next_id
+            self._next_id += 1
+            session = _StreamSession(
+                self,
+                session_id,
+                kind,
+                connection,
+                slot,
+                wake_waiters,
+            )
+            self._active[session_id] = session
+            return session
+
+    def cancel_all(self, reason: str) -> None:
+        with self._condition:
+            sessions = tuple(self._active.values())
+        for session in sessions:
+            session.cancel(reason, interrupt_socket=True)
+
+    def wait_empty(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def snapshot(self) -> Mapping[str, object]:
+        now = time.monotonic()
+        with self._condition:
+            result: dict[str, object] = {}
+            for kind, limit in self._limits.items():
+                sessions = [session for session in self._active.values() if session.kind == kind]
+                ages = [max(0.0, now - session.started_at) for session in sessions]
+                result[kind] = {
+                    "capacity": limit,
+                    "active": len(sessions),
+                    "canceling": sum(session.cancelled.is_set() for session in sessions),
+                    "rejected": self._rejected[kind],
+                    "oldest_age_seconds": max(ages, default=0.0),
+                    "close_reasons": dict(self._close_reasons[kind]),
+                }
+            return result
+
+    def _cancelled(self, session: _StreamSession, reason: str) -> None:
+        with self._condition:
+            self._close_reasons[session.kind][reason] += 1
+
+    def _finished(self, session: _StreamSession) -> None:
+        with self._condition:
+            self._active.pop(session.session_id, None)
+            self._condition.notify_all()
+
+
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -503,8 +699,10 @@ class GatewayServer(ThreadingHTTPServer):
         self.network_event_buffer = _NetworkEventReplayBuffer()
         self.sse_heartbeat_seconds = sse_heartbeat_seconds
         self.network_sse_poll_seconds = network_sse_poll_seconds
-        self.sse_slots = BoundedSemaphore(max_sse_connections)
-        self.preview_stream_slots = BoundedSemaphore(max_preview_streams)
+        self._streams = _StreamRegistry(
+            max_sse=max_sse_connections,
+            max_preview=max_preview_streams,
+        )
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
 
@@ -512,6 +710,27 @@ class GatewayServer(ThreadingHTTPServer):
         if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
             return
         super().handle_error(request, client_address)
+
+    def begin_stream(
+        self,
+        kind: str,
+        connection: socket.socket,
+        wake_waiters: Callable[[], None],
+    ) -> _StreamSession | None:
+        return self._streams.begin(kind, connection, wake_waiters)
+
+    def stream_lifecycle_snapshot(self) -> Mapping[str, object]:
+        return self._streams.snapshot()
+
+    def shutdown(self) -> None:
+        self._streams.cancel_all("server_shutdown")
+        super().shutdown()
+        self._streams.wait_empty(timeout=2.0)
+
+    def server_close(self) -> None:
+        self._streams.cancel_all("server_shutdown")
+        super().server_close()
+        self._streams.wait_empty(timeout=2.0)
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -1897,14 +2116,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "Last-Event-ID 必须是十进制 delivery ID",
             )
             return
-        if not self.server.sse_slots.acquire(blocking=False):
+        session = self.server.begin_stream("sse", self.connection, lambda: None)
+        if session is None:
             self._problem(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.SERVICE_UNAVAILABLE,
                 "stream_capacity_exhausted",
                 "SSE 连接数已达设备上限",
                 retryable=True,
+                headers={"Retry-After": "1"},
             )
             return
+        close_reason = "response_complete"
         try:
             try:
                 status = self.server.provider.network_status()
@@ -1917,13 +2139,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not self._valid_network_status(status):
                 self._invalid_source_state("daemon network 状态无效")
                 return
+            if session.cancelled.is_set():
+                return
             cursor = None if last_event_id is None else int(last_event_id)
             events = self.server.network_event_buffer.replay(cursor, status)
+            self.close_connection = True
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self._cors_headers()
             self.end_headers()
             try:
@@ -1935,14 +2160,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if cursor is None:
                     return
                 heartbeat_at = time.monotonic() + self.server.sse_heartbeat_seconds
-                while True:
+                while not session.cancelled.is_set():
                     now = time.monotonic()
-                    time.sleep(
+                    if session.cancelled.wait(
                         min(
                             self.server.network_sse_poll_seconds,
                             max(0.0, heartbeat_at - now),
                         )
-                    )
+                    ):
+                        return
                     try:
                         status = self.server.provider.network_status()
                     except Exception:
@@ -1962,9 +2188,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         continue
                     self.wfile.flush()
             except OSError:
+                close_reason = "write_error"
                 return
         finally:
-            self.server.sse_slots.release()
+            session.finish(close_reason)
 
     def _capture_events(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("streamCaptureEvents") is None:
@@ -1980,14 +2207,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "Last-Event-ID 只能出现一次",
             )
             return
-        if not self.server.sse_slots.acquire(blocking=False):
+        session = self.server.begin_stream(
+            "sse",
+            self.connection,
+            self.server.event_buffer.wake_waiters,
+        )
+        if session is None:
             self._problem(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.SERVICE_UNAVAILABLE,
                 "stream_capacity_exhausted",
                 "SSE 连接数已达设备上限",
                 retryable=True,
+                headers={"Retry-After": "1"},
             )
             return
+        close_reason = "response_complete"
         try:
             try:
                 events = self.server.event_buffer.replay(
@@ -2016,11 +2250,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "事件不能投影到请求的 API 版本",
                 )
                 return
+            if session.cancelled.is_set():
+                return
+            self.close_connection = True
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self._cors_headers()
             self.end_headers()
             try:
@@ -2028,13 +2265,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     self.wfile.write(event.encode())
                 self.wfile.flush()
                 cursor = events[-1].delivery_id if events else int(last_event_id)
-                while True:
+                while not session.cancelled.is_set():
                     delivered = self.server.event_buffer.wait_after(
                         cursor,
                         self.server.sse_heartbeat_seconds,
                         api_version=api_version,
                         snapshot=self.server.provider.capture_snapshot_event,
+                        cancel_event=session.cancelled,
                     )
+                    if session.cancelled.is_set():
+                        return
                     if delivered:
                         for event in delivered:
                             self.wfile.write(event.encode())
@@ -2048,9 +2288,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 InvalidSourceEvent,
                 UnsupportedEventVersion,
             ):
+                close_reason = "write_error"
                 return
         finally:
-            self.server.sse_slots.release()
+            session.finish(close_reason)
 
     def _list_sessions(self, api_version: str, query: Mapping[str, list[str]]) -> None:
         if self._principal("listSessions") is None:
@@ -2249,14 +2490,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else "image/jpeg"
         )
         streaming = accept == "multipart/x-mixed-replace"
-        if streaming and not self.server.preview_stream_slots.acquire(blocking=False):
+        session = (
+            self.server.begin_stream("preview", self.connection, lambda: None)
+            if streaming
+            else None
+        )
+        if streaming and session is None:
             self._problem(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 "preview_capacity_exhausted",
                 "预览流连接数已达设备上限",
                 retryable=True,
+                headers={"Retry-After": "1"},
             )
             return
+        close_reason = "response_complete"
         try:
             try:
                 response = self.server.provider.latest_preview(fps=fps, accept=accept)
@@ -2271,31 +2519,39 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except ProviderError as error:
                 self._send_camera_provider_error(error)
                 return
+            if session is not None and not session.attach_body(response.body):
+                return
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", response.content_type)
             if response.content_length is not None:
                 self.send_header("Content-Length", str(response.content_length))
             else:
+                self.close_connection = True
                 self.send_header("Connection", "close")
             self.send_header("Cache-Control", "no-store")
             self._cors_headers()
             self.end_headers()
-            close = getattr(response.body, "close", None)
             try:
                 if isinstance(response.body, bytes):
                     self.wfile.write(response.body)
                 else:
                     for chunk in response.body:
+                        if session is not None and session.cancelled.is_set():
+                            return
                         self.wfile.write(chunk)
                         self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+                    close_reason = "iterator_eof"
+            except OSError:
+                close_reason = "write_error"
                 return
             finally:
-                if close is not None:
-                    close()
+                if session is None:
+                    close = getattr(response.body, "close", None)
+                    if close is not None:
+                        close()
         finally:
-            if streaming:
-                self.server.preview_stream_slots.release()
+            if session is not None:
+                session.finish(close_reason)
 
     @staticmethod
     def _artifact_route(parts: list[str]) -> tuple[str, str, str] | None:

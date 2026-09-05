@@ -197,6 +197,7 @@ class EventReplayBuffer:
         *,
         api_version: str,
         snapshot: Callable[[], Mapping[str, object]],
+        cancel_event: threading.Event | None = None,
     ) -> tuple[SseEvent, ...]:
         """等待 cursor 后的新事件；超时返回空元组供 gateway 发 heartbeat。"""
 
@@ -208,6 +209,8 @@ class EventReplayBuffer:
         deadline = time.monotonic() + timeout
         with self._changed:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return ()
                 replayed = self._events_after_locked(delivery_id, version, snapshot)
                 if replayed is not None:
                     return replayed
@@ -215,6 +218,12 @@ class EventReplayBuffer:
                 if remaining <= 0:
                     return ()
                 self._changed.wait(remaining)
+
+    def wake_waiters(self) -> None:
+        """Wake blocked SSE readers so they can observe external cancellation."""
+
+        with self._changed:
+            self._changed.notify_all()
 
     def _events_after_locked(
         self,

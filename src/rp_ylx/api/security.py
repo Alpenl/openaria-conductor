@@ -7,6 +7,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
+CUSTOMER_BEARER_TOKEN_MIN_LENGTH = 8
+CUSTOMER_BEARER_TOKEN_MAX_LENGTH = 512
+
+
+def valid_customer_bearer_token(token: str) -> bool:
+    return CUSTOMER_BEARER_TOKEN_MIN_LENGTH <= len(
+        token
+    ) <= CUSTOMER_BEARER_TOKEN_MAX_LENGTH and all(
+        0x21 <= ord(character) <= 0x7E for character in token
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class Principal:

@@ -527,7 +527,7 @@ class ReleaseManagerTest(unittest.TestCase):
         private_key = Path(security["tls_private_key_file"])
         self.assertEqual(certificate, self.config_root / CUSTOMER_TLS_CERTIFICATE_RELATIVE)
         self.assertEqual(private_key, self.config_root / CUSTOMER_TLS_PRIVATE_KEY_RELATIVE)
-        self.assertGreaterEqual(len(token.read_text(encoding="ascii").strip()), 32)
+        self.assertGreaterEqual(len(token.read_text(encoding="ascii").strip()), 8)
         self.assertEqual(token.stat().st_mode & 0o777, 0o640)
         self.assertEqual(certificate.stat().st_mode & 0o777, 0o644)
         self.assertEqual(private_key.stat().st_mode & 0o777, 0o640)
@@ -1251,7 +1251,7 @@ class ReleaseManagerTest(unittest.TestCase):
         certificate.parent.mkdir(parents=True)
         certificate.write_bytes(b"trusted-device-certificate")
         private_key.write_bytes(b"private-key")
-        token.write_text("a" * 48 + "\n", encoding="ascii")
+        token.write_text("12345678\n", encoding="ascii")
         config = manager._default_device_config()
         config["security"] = {
             "profile": "customer",
@@ -1288,7 +1288,7 @@ class ReleaseManagerTest(unittest.TestCase):
         create_context.assert_called_once_with(cafile=str(certificate))
         request = open_url.call_args.args[0]
         self.assertEqual(request.full_url, "https://127.0.0.1:8080/api/v4/device")
-        self.assertEqual(request.get_header("Authorization"), f"Bearer {'a' * 48}")
+        self.assertEqual(request.get_header("Authorization"), "Bearer 12345678")
         self.assertIs(open_url.call_args.kwargs["context"], context)
         self.assertTrue(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
