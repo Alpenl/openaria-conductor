@@ -23,7 +23,6 @@ from rp_ylx.api.downloads import (
     UnsatisfiableRange,
     parse_single_range,
 )
-from rp_ylx.native import NativeModuleError
 from rp_ylx.recording import RecordingConfig, SessionRecorder
 
 SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
@@ -32,33 +31,13 @@ ARTIFACT_ID = hashlib.sha256(ARTIFACT_BYTES).hexdigest()
 
 
 class RangeParserTest(unittest.TestCase):
-    def setUp(self) -> None:
-        downloads._RANGE_PARSER_UNAVAILABLE = False
+    def test_parses_closed_open_and_suffix_ranges(self) -> None:
+        self.assertEqual(parse_single_range("bytes=2-8", 26), (2, 8))
+        self.assertEqual(parse_single_range("bytes=10-", 26), (10, 25))
+        self.assertEqual(parse_single_range("bytes=-4", 26), (22, 25))
 
-    def tearDown(self) -> None:
-        downloads._RANGE_PARSER_UNAVAILABLE = False
-
-    def test_native_range_parser_is_preferred(self) -> None:
-        with patch("rp_ylx.api.downloads.parse_native_single_range", return_value=(2, 8)) as native:
-            self.assertEqual(parse_single_range("bytes=2-8", 26), (2, 8))
-        native.assert_called_once_with("bytes=2-8", 26)
-
-    def test_missing_native_range_parser_falls_back_to_python(self) -> None:
-        with patch(
-            "rp_ylx.api.downloads.parse_native_single_range",
-            side_effect=NativeModuleError("native_range_parser_unavailable", "missing"),
-        ):
-            self.assertEqual(parse_single_range("bytes=-4", 26), (22, 25))
-        self.assertTrue(downloads._RANGE_PARSER_UNAVAILABLE)
-
-    def test_native_unsatisfiable_range_maps_to_contract_error(self) -> None:
-        with (
-            patch(
-                "rp_ylx.api.downloads.parse_native_single_range",
-                side_effect=ValueError("range_not_satisfiable"),
-            ),
-            self.assertRaises(UnsatisfiableRange) as raised,
-        ):
+    def test_unsatisfiable_range_reports_complete_size(self) -> None:
+        with self.assertRaises(UnsatisfiableRange) as raised:
             parse_single_range("bytes=26-", 26)
         self.assertEqual(raised.exception.complete_size, 26)
 

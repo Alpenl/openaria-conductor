@@ -23,10 +23,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 from rp_ylx.native import (
-    NativeModuleError,
-    NativeSessionIo,
-    create_native_session_io,
-    parse_native_single_range,
+    native_session_io_or_none as _session_io_or_none,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -71,10 +68,6 @@ _RECORDING_SESSION_VALIDATOR = Draft202012Validator(
     _RECORDING_SESSION_SCHEMA,
     format_checker=FormatChecker(),
 )
-_SESSION_IO_LOCK = threading.Lock()
-_SESSION_IO: NativeSessionIo | None = None
-_SESSION_IO_UNAVAILABLE = False
-_RANGE_PARSER_UNAVAILABLE = False
 _DEVICE_SESSION_SUMMARY_UNAVAILABLE = False
 _DEVICE_SESSION_ARTIFACTS_UNAVAILABLE = False
 _VALIDATED_MANIFEST_CACHE_LIMIT = 32
@@ -365,14 +358,6 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
         raise ValueError("complete_size 不能为负数")
     if value is None:
         return None
-    global _RANGE_PARSER_UNAVAILABLE
-    if not _RANGE_PARSER_UNAVAILABLE:
-        try:
-            return parse_native_single_range(value, complete_size)
-        except NativeModuleError:
-            _RANGE_PARSER_UNAVAILABLE = True
-        except ValueError as error:
-            raise UnsatisfiableRange(complete_size) from error
     if not value.startswith("bytes=") or "," in value:
         raise UnsatisfiableRange(complete_size)
     selected = value.removeprefix("bytes=")
@@ -400,25 +385,6 @@ def parse_single_range(value: str | None, complete_size: int) -> tuple[int, int]
     if last < first:
         raise UnsatisfiableRange(complete_size)
     return first, min(last, complete_size - 1)
-
-
-def _session_io_or_none() -> NativeSessionIo | None:
-    global _SESSION_IO, _SESSION_IO_UNAVAILABLE
-    if _SESSION_IO_UNAVAILABLE:
-        return None
-    if _SESSION_IO is not None:
-        return _SESSION_IO
-    with _SESSION_IO_LOCK:
-        if _SESSION_IO_UNAVAILABLE:
-            return None
-        if _SESSION_IO is not None:
-            return _SESSION_IO
-        try:
-            _SESSION_IO = create_native_session_io()
-        except NativeModuleError:
-            _SESSION_IO_UNAVAILABLE = True
-            return None
-        return _SESSION_IO
 
 
 def _native_device_session_v1_artifact_descriptors(

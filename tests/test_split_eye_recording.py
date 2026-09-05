@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import queue
 import tempfile
 import threading
 import time
@@ -231,46 +230,6 @@ class FakeAudioRecorder:
 
     def close(self) -> None:
         self.aborted = True
-
-
-class FakeNativeEventQueue:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.put_calls = 0
-        self.get_calls = 0
-        self._queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
-
-    def put(self, item: object, timeout_seconds: float = 0.0) -> bool:
-        self.put_calls += 1
-        try:
-            self._queue.put(item, timeout=timeout_seconds)
-            return True
-        except queue.Full:
-            return False
-
-    def get(self) -> object:
-        self.get_calls += 1
-        return self._queue.get()
-
-    def qsize(self) -> int:
-        return self._queue.qsize()
-
-    def stats(self) -> dict[str, object]:
-        return {
-            "capacity": self.capacity,
-            "depth": self._queue.qsize(),
-            "peak_depth": self.capacity,
-            "enqueued": self.put_calls,
-            "delivered": self.get_calls,
-            "rejected": 0,
-        }
-
-    def close_and_clear(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
 
 
 class FakeNativeSegmentPlanner:
@@ -717,10 +676,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
             with (
                 patch(
-                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
-                ),
-                patch(
                     "rp_ylx.recording.device_session.create_native_active_take_writer",
                     side_effect=active_take_factory,
                 ),
@@ -773,10 +728,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 return active_take
 
             with (
-                patch(
-                    "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                    side_effect=NativeModuleError("native_queue_unavailable", "test fallback"),
-                ),
                 patch(
                     "rp_ylx.recording.device_session.create_native_active_take_writer",
                     side_effect=active_take_factory,
@@ -863,35 +814,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
             assert live is not None
             self.assertEqual(live["progress"]["bytes_written"], 47)
             recorder.fail("test_cleanup", "cleanup", recoverable=False)
-
-    def test_recorder_uses_native_event_queue_when_available(self) -> None:
-        queues: list[FakeNativeEventQueue] = []
-
-        def factory(capacity: int) -> FakeNativeEventQueue:
-            native_queue = FakeNativeEventQueue(capacity)
-            queues.append(native_queue)
-            return native_queue
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_event_queue",
-                side_effect=factory,
-            ):
-                recorder, _, _ = self.build(
-                    root,
-                    before_write=lambda role, payload: None,
-                )
-            recorder.start()
-            self.feed(recorder, 3)
-            sealed = recorder.stop()
-
-            validate_device_session_manifest(sealed.manifest)
-
-        self.assertEqual(len(queues), 1)
-        self.assertEqual(queues[0].capacity, 128)
-        self.assertGreaterEqual(queues[0].put_calls, 4)
-        self.assertGreaterEqual(queues[0].get_calls, 4)
 
     def test_active_take_pending_allows_writer_inflight_plus_queue_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1048,109 +970,6 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 ],
                 [(0, 3), (3, 4)],
             )
-            validate_device_session_manifest(sealed.manifest)
-
-    def test_native_recording_codec_is_used_for_hot_path_records(self) -> None:
-        class FakeRecordingCodec:
-            def __init__(self) -> None:
-                self.jpeg_payload_calls = 0
-                self.frame_index_calls = 0
-                self.imu_sample_calls = 0
-
-            def jpeg_payload(self, payload: bytes) -> bytes:
-                self.jpeg_payload_calls += 1
-                return payload
-
-            def encode_split_frame_index(
-                self,
-                session_id: str,
-                frame: int,
-                source_sequence: int,
-                host_monotonic_ns: int,
-                segment_index: int,
-                segment_frame: int,
-            ) -> bytes:
-                self.frame_index_calls += 1
-                return (
-                    json.dumps(
-                        {
-                            "schema": "ylx.frame-index.v1",
-                            "session_id": session_id,
-                            "frame": frame,
-                            "source_sequence": source_sequence,
-                            "host_monotonic_ns": host_monotonic_ns,
-                            "segment_index": segment_index,
-                            "segment_frame": segment_frame,
-                        },
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                    + "\n"
-                ).encode()
-
-            def encode_imu_sample(
-                self,
-                session_id: str,
-                sequence: int,
-                packet_sequence: int,
-                sample_index: int,
-                device_timestamp_raw: int,
-                device_ticks: int,
-                host_read_start_ns: int,
-                host_read_end_ns: int,
-                host_monotonic_ns: int,
-                accelerometer: tuple[int, int, int],
-                gyroscope: tuple[int, int, int],
-                sync_offset_ns: int | None,
-                sync_residual_ns: int | None,
-                sync_quality: str,
-            ) -> bytes:
-                self.imu_sample_calls += 1
-                return (
-                    json.dumps(
-                        {
-                            "format": "ylx.imu.v0",
-                            "session_id": session_id,
-                            "sequence": sequence,
-                            "packet_sequence": packet_sequence,
-                            "sample_index": sample_index,
-                            "device_timestamp_raw": device_timestamp_raw,
-                            "device_ticks": device_ticks,
-                            "host_read_start_ns": host_read_start_ns,
-                            "host_read_end_ns": host_read_end_ns,
-                            "host_monotonic_ns": host_monotonic_ns,
-                            "raw": {
-                                "accelerometer": list(accelerometer),
-                                "gyroscope": list(gyroscope),
-                            },
-                            "sync": {
-                                "offset_ns": sync_offset_ns,
-                                "residual_ns": sync_residual_ns,
-                                "quality": sync_quality,
-                            },
-                        },
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                    + "\n"
-                ).encode()
-
-        codec = FakeRecordingCodec()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch(
-                "rp_ylx.recording.device_session.create_native_recording_codec",
-                return_value=codec,
-            ):
-                recorder, _, _ = self.build(root, before_write=lambda _role, _payload: None)
-            recorder.start()
-            self.feed(recorder, 1)
-            recorder.submit_imu(imu_observation())
-            sealed = recorder.stop()
-
-            self.assertEqual(codec.jpeg_payload_calls, 1)
-            self.assertEqual(codec.frame_index_calls, 1)
-            self.assertEqual(codec.imu_sample_calls, 2)
             validate_device_session_manifest(sealed.manifest)
 
     def test_open_handles_cover_the_encoder_until_the_take_ends(self) -> None:

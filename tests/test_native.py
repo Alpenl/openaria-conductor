@@ -10,33 +10,24 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import rp_ylx.native as native_module
 from rp_ylx.native import (
     NativeModuleError,
     create_native_active_take_writer,
     create_native_audio_recorder,
     create_native_camera,
-    create_native_camera_frame_validator,
-    create_native_capture_fanout_state,
     create_native_continuous_capture_runtime,
     create_native_imu_collector,
     create_native_performance_metrics,
     create_native_preview_buffer,
-    create_native_recording_codec,
-    create_native_recording_event_queue,
-    create_native_recording_frame_gate,
     create_native_recording_segment_planner,
     create_native_recording_sink,
-    create_native_recording_tap_state,
     create_native_session_io,
     create_native_splitter,
-    create_native_stereo_encoder_events,
-    create_native_stereo_encoder_pipe,
     create_native_stereo_encoder_process,
-    create_native_timeline,
-    evaluate_native_drop_quality_policy,
     native_camera_focus_status,
     native_capabilities,
-    parse_native_single_range,
+    native_session_io_or_none,
     set_native_camera_focus,
 )
 
@@ -150,36 +141,6 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 owner,
             )
         constructor.assert_called_once_with("/dev/video0", 3840, 1080, 60, "mjpg", 4, 64, False)
-
-    def test_explicit_camera_frame_validator_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_camera_frame_validator()
-        self.assertEqual(raised.exception.code, "native_camera_frame_validator_unavailable")
-
-    def test_explicit_camera_frame_validator_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "camera_frame_validator"],
-            },
-            NativeCameraFrameValidator=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_camera_frame_validator(), owner)
-        constructor.assert_called_once_with()
 
     def test_explicit_splitter_never_silently_falls_back(self) -> None:
         module = SimpleNamespace(
@@ -320,36 +281,6 @@ class NativeCapabilitiesTest(unittest.TestCase):
             )
         constructor.assert_called_once_with("/tmp/session", "hw:0,0", 48_000, 2, 30.0)
 
-    def test_explicit_timeline_requires_native_timeline_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_timeline()
-        self.assertEqual(raised.exception.code, "native_timeline_unavailable")
-
-    def test_explicit_timeline_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "native_timeline"],
-            },
-            NativeTimeline=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_timeline(123), owner)
-        constructor.assert_called_once_with(123)
-
     def test_explicit_active_take_writer_requires_native_capability(self) -> None:
         module = SimpleNamespace(
             capabilities=lambda: {
@@ -418,36 +349,6 @@ class NativeCapabilitiesTest(unittest.TestCase):
             )
         constructor.assert_called_once_with("/dev/video0", None, 1, 0.001)
 
-    def test_explicit_recording_codec_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_recording_codec()
-        self.assertEqual(raised.exception.code, "native_recording_unavailable")
-
-    def test_explicit_recording_codec_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_codec"],
-            },
-            NativeRecordingCodec=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_recording_codec(), owner)
-        constructor.assert_called_once_with()
-
     def test_explicit_recording_sink_requires_native_capability(self) -> None:
         module = SimpleNamespace(
             capabilities=lambda: {
@@ -460,7 +361,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
             patch("rp_ylx.native.importlib.import_module", return_value=module),
             self.assertRaises(NativeModuleError) as raised,
         ):
-            create_native_recording_sink("/tmp/session", "session", split_eyes=True)
+            create_native_recording_sink("/tmp/session", "session")
         self.assertEqual(raised.exception.code, "native_recording_sink_unavailable")
 
     def test_explicit_recording_sink_returns_native_owner(self) -> None:
@@ -476,107 +377,17 @@ class NativeCapabilitiesTest(unittest.TestCase):
         )
         with patch("rp_ylx.native.importlib.import_module", return_value=module):
             self.assertIs(
-                create_native_recording_sink("/tmp/session", "session", split_eyes=True),
+                create_native_recording_sink("/tmp/session", "session"),
                 owner,
             )
         constructor.assert_called_once_with("/tmp/session", "session", True)
-
-    def test_explicit_recording_frame_gate_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_recording_frame_gate(2)
-        self.assertEqual(raised.exception.code, "native_recording_frame_gate_unavailable")
-
-    def test_explicit_recording_frame_gate_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_frame_gate"],
-            },
-            NativeRecordingFrameGate=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_recording_frame_gate(3), owner)
-        constructor.assert_called_once_with(3)
-
-    def test_explicit_recording_tap_state_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_frame_gate"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_recording_tap_state(2)
-        self.assertEqual(raised.exception.code, "native_recording_tap_state_unavailable")
-
-    def test_explicit_recording_tap_state_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_tap_state"],
-            },
-            NativeRecordingTapState=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_recording_tap_state(3), owner)
-        constructor.assert_called_once_with(3)
-
-    def test_explicit_capture_fanout_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_tap_state"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_capture_fanout_state(2)
-        self.assertEqual(raised.exception.code, "native_capture_fanout_unavailable")
-
-    def test_explicit_capture_fanout_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "capture_fanout"],
-            },
-            NativeCaptureFanoutState=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_capture_fanout_state(3), owner)
-        constructor.assert_called_once_with(3)
 
     def test_explicit_continuous_capture_runtime_requires_native_capability(self) -> None:
         module = SimpleNamespace(
             capabilities=lambda: {
                 "module_version": "0.1.0",
                 "abi": 4,
-                "features": ["capability_probe", "capture_fanout"],
+                "features": ["capability_probe"],
             }
         )
         with (
@@ -646,7 +457,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
             capabilities=lambda: {
                 "module_version": "0.1.0",
                 "abi": 4,
-                "features": ["capability_probe", "recording_tap_state"],
+                "features": ["capability_probe"],
             }
         )
         with (
@@ -670,96 +481,6 @@ class NativeCapabilitiesTest(unittest.TestCase):
         with patch("rp_ylx.native.importlib.import_module", return_value=module):
             self.assertIs(create_native_recording_segment_planner(3), owner)
         constructor.assert_called_once_with(3)
-
-    def test_explicit_recording_event_queue_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_recording_event_queue(128)
-        self.assertEqual(raised.exception.code, "native_recording_event_queue_unavailable")
-
-    def test_explicit_recording_event_queue_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "recording_event_queue"],
-            },
-            NativeRecordingEventQueue=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_recording_event_queue(256), owner)
-        constructor.assert_called_once_with(256)
-
-    def test_explicit_stereo_encoder_events_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_stereo_encoder_events()
-        self.assertEqual(raised.exception.code, "native_stereo_encoder_events_unavailable")
-
-    def test_explicit_stereo_encoder_events_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "stereo_encoder_events"],
-            },
-            NativeStereoEncoderEvents=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_stereo_encoder_events(), owner)
-        constructor.assert_called_once_with()
-
-    def test_explicit_stereo_encoder_pipe_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
-        with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
-        ):
-            create_native_stereo_encoder_pipe(7)
-        self.assertEqual(raised.exception.code, "native_stereo_encoder_pipe_unavailable")
-
-    def test_explicit_stereo_encoder_pipe_returns_native_owner(self) -> None:
-        owner = object()
-        constructor = unittest.mock.Mock(return_value=owner)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "stereo_encoder_pipe"],
-            },
-            NativeStereoEncoderPipe=constructor,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertIs(create_native_stereo_encoder_pipe(7), owner)
-        constructor.assert_called_once_with(7)
 
     def test_explicit_stereo_encoder_process_requires_native_capability(self) -> None:
         module = SimpleNamespace(
@@ -920,92 +641,29 @@ class NativeCapabilitiesTest(unittest.TestCase):
             self.assertIs(create_native_session_io(), owner)
         constructor.assert_called_once_with()
 
-    def test_explicit_range_parser_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
+    def test_session_io_helper_caches_one_process_wide_owner(self) -> None:
+        owner = object()
         with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
+            patch.object(native_module, "_SESSION_IO", None),
+            patch.object(native_module, "_SESSION_IO_UNAVAILABLE", False),
+            patch("rp_ylx.native.create_native_session_io", return_value=owner) as create,
         ):
-            parse_native_single_range("bytes=0-1", 26)
-        self.assertEqual(raised.exception.code, "native_range_parser_unavailable")
+            self.assertIs(native_session_io_or_none(), owner)
+            self.assertIs(native_session_io_or_none(), owner)
+        create.assert_called_once_with()
 
-    def test_explicit_range_parser_returns_native_result(self) -> None:
-        parser = unittest.mock.Mock(return_value=(2, 8))
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "range_parser"],
-            },
-            parse_single_range=parser,
-        )
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertEqual(parse_native_single_range("bytes=2-8", 26), (2, 8))
-        parser.assert_called_once_with("bytes=2-8", 26)
-
-    def test_explicit_drop_quality_policy_requires_native_capability(self) -> None:
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe"],
-            }
-        )
+    def test_session_io_helper_caches_unavailable_result(self) -> None:
         with (
-            patch("rp_ylx.native.importlib.import_module", return_value=module),
-            self.assertRaises(NativeModuleError) as raised,
+            patch.object(native_module, "_SESSION_IO", None),
+            patch.object(native_module, "_SESSION_IO_UNAVAILABLE", False),
+            patch(
+                "rp_ylx.native.create_native_session_io",
+                side_effect=NativeModuleError("native_session_io_unavailable", "missing"),
+            ) as create,
         ):
-            evaluate_native_drop_quality_policy(
-                [],
-                1,
-                max_contiguous_dropped_frames=0,
-                max_total_dropped_frames=0,
-                max_drop_fraction=0.0,
-                window_seconds=1.0,
-                max_dropped_frames_per_window=0,
-            )
-        self.assertEqual(raised.exception.code, "native_drop_quality_policy_unavailable")
-
-    def test_explicit_drop_quality_policy_returns_native_result(self) -> None:
-        result = {
-            "accepted": False,
-            "dropped": 1,
-            "total": 2,
-            "fraction": 0.5,
-            "contiguous": 1,
-            "window_drops": 1,
-            "violations": ["contiguous", "total", "fraction", "window"],
-        }
-        evaluator = unittest.mock.Mock(return_value=result)
-        module = SimpleNamespace(
-            capabilities=lambda: {
-                "module_version": "0.1.0",
-                "abi": 4,
-                "features": ["capability_probe", "drop_quality_policy"],
-            },
-            evaluate_drop_quality_policy=evaluator,
-        )
-        events = [{"at_time_seconds": 0.5, "dropped": 1}]
-        with patch("rp_ylx.native.importlib.import_module", return_value=module):
-            self.assertEqual(
-                evaluate_native_drop_quality_policy(
-                    events,
-                    1,
-                    max_contiguous_dropped_frames=0,
-                    max_total_dropped_frames=0,
-                    max_drop_fraction=0.0,
-                    window_seconds=1.0,
-                    max_dropped_frames_per_window=0,
-                ),
-                result,
-            )
-        evaluator.assert_called_once_with(events, 1, 0, 0, 0.0, 1.0, 0)
+            self.assertIsNone(native_session_io_or_none())
+            self.assertIsNone(native_session_io_or_none())
+        create.assert_called_once_with()
 
     def test_explicit_preview_buffer_requires_native_capability(self) -> None:
         module = SimpleNamespace(
