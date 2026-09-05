@@ -94,7 +94,14 @@
   "gateway_runtime_experiment": {
     "implementation": "isolated_not_packaged",
     "preflight": "passed",
-    "formal_result": null,
+    "formal_result": {
+      "path": "experiments/gateway-runtime-20260905/result.json",
+      "source_commit": "99855a278634b7f322d9fcef0cf8e0dfe992c65b",
+      "plain_reconnects_per_backend": 1000,
+      "tls_reconnects_per_backend": 100,
+      "capacity_rejections": 0,
+      "permit_leaks": 0
+    },
     "decision": "no-go"
   }
 }
