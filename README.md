@@ -78,6 +78,12 @@ uv run python scripts/check.py
 uv build
 ```
 
+已完成的 Python/Rust 固定 trace 消融结果、原始报告和校验摘要见
+[`experiments/fixed-trace-20260905-132783d`](experiments/fixed-trace-20260905-132783d/README.md)。
+
+全项目结构消融的删除依据、状态机对照实验和打包测量见
+[`experiments/code-structure-20260908`](experiments/code-structure-20260908/README.md)。
+
 ## 设备接入
 
 - 救援热点名称：`OpenAria-XXXXXXXX`，后缀由设备身份生成并在该设备上保持不变。
