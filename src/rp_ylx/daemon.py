@@ -458,9 +458,9 @@ class CaptureEventPump:
         self._interval = interval
         self._progress_interval = progress_interval
         self._stop = threading.Event()
-        initial = coordinator.capture_snapshot_event()
-        self._last_source = (initial["authority_epoch"], initial["source_revision"])
-        self._last_progress_key = self._progress_key(initial)
+        epoch, revision, state = coordinator.capture_recording_progress()
+        self._last_source = (epoch, revision)
+        self._last_progress_key = self._progress_key(self._last_source, state)
         self._last_progress_at = 0.0
         self._thread = threading.Thread(
             target=self._run,
@@ -474,50 +474,55 @@ class CaptureEventPump:
             self._progress_interval if self._last_progress_key is not None else self._interval
         ):
             now = time.monotonic()
-            event = self._coordinator.capture_snapshot_event()
-            source = (event["authority_epoch"], event["source_revision"])
-            if source == self._last_source:
-                progress_event = self._progress_event(event)
-                progress_key = self._progress_key(event)
-                if (
-                    progress_event is not None
-                    and progress_key != self._last_progress_key
-                    and (
-                        self._last_progress_at == 0.0
-                        or now - self._last_progress_at >= self._progress_interval
-                    )
-                ):
-                    self._event_buffer.publish(progress_event)
-                    self._last_progress_key = progress_key
+            epoch, revision, state = self._coordinator.capture_recording_progress()
+            source = (epoch, revision)
+            # Idle sampling also retries preview startup when a camera reconnects.
+            if source != self._last_source or state is None:
+                event = self._coordinator.capture_snapshot_event()
+                source = (event["authority_epoch"], event["source_revision"])
+                state = self._recording_state(event)
+                if source != self._last_source:
+                    self._event_buffer.publish(event)
+                    self._last_source = source
+                    self._last_progress_key = self._progress_key(source, state)
                     self._last_progress_at = now
-                continue
-            self._event_buffer.publish(event)
-            self._last_source = source
-            self._last_progress_key = self._progress_key(event)
-            self._last_progress_at = now
+                    continue
+            progress_event = self._progress_event(source, state)
+            progress_key = self._progress_key(source, state)
+            if (
+                progress_event is not None
+                and progress_key != self._last_progress_key
+                and (
+                    self._last_progress_at == 0.0
+                    or now - self._last_progress_at >= self._progress_interval
+                )
+            ):
+                self._event_buffer.publish(progress_event)
+                self._last_progress_key = progress_key
+                self._last_progress_at = now
 
     @staticmethod
-    def _active_recording(event: Mapping[str, object]) -> Mapping[str, object] | None:
+    def _recording_state(event: Mapping[str, object]) -> Mapping[str, object] | None:
         data = event.get("data")
         if not isinstance(data, Mapping):
             return None
         active = data.get("active_recording")
-        return active if isinstance(active, Mapping) else None
-
-    @classmethod
-    def _progress_key(cls, event: Mapping[str, object]) -> tuple[object, ...] | None:
-        active = cls._active_recording(event)
-        if active is None:
+        if not isinstance(active, Mapping):
             return None
         state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+        return state if isinstance(state, Mapping) else None
+
+    @staticmethod
+    def _progress_key(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> tuple[object, ...] | None:
+        if state is None:
             return None
         progress = state.get("progress")
         if not isinstance(progress, Mapping):
             return None
         return (
-            event.get("authority_epoch"),
-            event.get("source_revision"),
+            *source,
             state.get("session_id"),
             state.get("state"),
             progress.get("elapsed_seconds"),
@@ -525,13 +530,11 @@ class CaptureEventPump:
             progress.get("bytes_written"),
         )
 
-    @classmethod
-    def _progress_event(cls, event: Mapping[str, object]) -> dict[str, object] | None:
-        active = cls._active_recording(event)
-        if active is None:
-            return None
-        state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+    @staticmethod
+    def _progress_event(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> dict[str, object] | None:
+        if state is None:
             return None
         phase = state.get("state")
         if phase not in {"recording", "finalizing", "verifying"}:
@@ -549,8 +552,8 @@ class CaptureEventPump:
         if type(frames) is not int or frames < 0:
             return None
         return {
-            "authority_epoch": event["authority_epoch"],
-            "source_revision": event["source_revision"],
+            "authority_epoch": source[0],
+            "source_revision": source[1],
             "type": "progress",
             "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "session_id": session_id,

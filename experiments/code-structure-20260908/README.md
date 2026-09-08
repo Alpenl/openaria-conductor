@@ -7,6 +7,8 @@ experiment. The ABI 5 integration retains its newer CaptureEngine/SessionStore
 interfaces and ports the flattened fanout state and direct download forwarding.
 Removed ABI 4 Python/PyO3 interfaces are not reintroduced. See the integration
 report for current tests; the historical measurements are not measurements of this merge.
+The subsequent frame-copy, focus-validation, startup, and status-polling changes
+are documented in [the follow-up experiment](follow-up.md).
 
 ## Result
 

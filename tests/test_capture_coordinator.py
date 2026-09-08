@@ -11,6 +11,7 @@ import time
 import unittest
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -1721,6 +1722,297 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(live_imu["raw"]["gyroscope"], {"x": 7, "y": 8, "z": 9})
             self.assertEqual(live_imu["sync"], {"quality": "degraded"})
         finally:
+            coordinator.close()
+
+    def test_slow_status_sampling_does_not_block_stop_and_restart(self) -> None:
+        def check_sampling(operation: str) -> None:
+            with self.subTest(operation=operation):
+                sources = FakeSourcesWithLatestImu(imu_observation(40))
+                coordinator = self.coordinator(sources=sources)
+                blocked = threading.Event()
+                release = threading.Event()
+                poll_thread = None
+
+                def read_status() -> object:
+                    nonlocal poll_thread
+                    poll_thread = threading.get_ident()
+                    return coordinator.capture_status()
+
+                target = coordinator if operation == "runtime" else sources
+                attribute = "_runtime" if operation == "runtime" else operation
+                original = getattr(target, attribute)
+
+                def sample() -> object:
+                    value = original()
+                    if threading.get_ident() == poll_thread:
+                        blocked.set()
+                        if not release.wait(timeout=5):
+                            raise TimeoutError("status sample was not released")
+                    return value
+
+                def restart() -> object:
+                    coordinator.stop_capture(stop_command(f"slow-{operation}-stop"))
+                    sources.observation = imu_observation(80)
+                    return coordinator.start_capture(start_command(f"slow-{operation}-restart"))
+
+                try:
+                    first = coordinator.start_capture(start_command(f"slow-{operation}-start"))
+                    self.assertTrue(coordinator.submit_frame(frame()))
+                    with (
+                        patch.object(target, attribute, side_effect=sample),
+                        ThreadPoolExecutor(max_workers=2) as executor,
+                    ):
+                        polling = executor.submit(read_status)
+                        try:
+                            self.assertTrue(blocked.wait(timeout=1))
+                            restarted = executor.submit(restart).result(timeout=1)
+                        finally:
+                            release.set()
+                        status = polling.result(timeout=2)
+                    validate_capture_status(status)
+                    expected = restarted.body["snapshot"]["active_recording"]
+                    self.assertEqual(
+                        status["snapshot"]["active_recording"]["generation_id"],
+                        expected["generation_id"],
+                    )
+                    session_id = expected["recording_state"]["session_id"]
+                    self.assertNotEqual(
+                        session_id,
+                        first.body["snapshot"]["active_recording"]["recording_state"]["session_id"],
+                    )
+                    self.assertEqual(
+                        status["snapshot"]["active_recording"]["recording_state"]["session_id"],
+                        session_id,
+                    )
+                    self.assertEqual(status["source_revision"], restarted.body["source_revision"])
+                    live_imu = status["snapshot"]["runtime"]["live_imu"]
+                    self.assertEqual(live_imu["session_id"], session_id)
+                    self.assertEqual(live_imu["clock"]["timestamp_ns"], 10_131)
+                finally:
+                    release.set()
+                    coordinator.close()
+
+        for operation in (
+            "runtime",
+            "camera_connection_status",
+            "camera_focus_status",
+            "latest_imu_observation",
+        ):
+            check_sampling(operation)
+
+    def test_slow_focus_query_does_not_return_expired_live_imu(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        clock = {"now": 1.0}
+
+        def slow_focus() -> None:
+            clock["now"] += coordinator_module.LIVE_IMU_STALE_SECONDS + 1
+
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator.time.monotonic", side_effect=lambda: clock["now"]
+            ):
+                coordinator.start_capture(start_command("slow-focus-freshness"))
+                with patch.object(sources, "camera_focus_status", side_effect=slow_focus):
+                    status = coordinator.capture_status()
+                validate_capture_status(status)
+                self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
+    def test_capture_progress_does_not_sample_runtime_or_camera(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        try:
+            started = coordinator.start_capture(start_command("progress-no-hardware-start"))
+            expected = started.body["snapshot"]["active_recording"]["recording_state"]
+            with (
+                patch.object(coordinator, "_runtime") as runtime,
+                patch.object(sources, "camera_connection_status") as camera,
+                patch.object(sources, "camera_focus_status") as focus,
+                patch.object(sources, "latest_imu_observation") as imu,
+            ):
+                for _ in range(25):
+                    epoch, revision, state = coordinator.capture_recording_progress()
+                    self.assertEqual(epoch, started.body["authority_epoch"])
+                    self.assertEqual(revision, started.body["source_revision"])
+                    self.assertEqual(state["session_id"], expected["session_id"])
+                    self.assertEqual(state["state"], "recording")
+                runtime.assert_not_called()
+                camera.assert_not_called()
+                focus.assert_not_called()
+                imu.assert_not_called()
+            self.assertTrue(coordinator.submit_frame(frame()))
+            stopped = coordinator.stop_capture(stop_command("progress-no-hardware-stop"))
+            epoch, revision, state = coordinator.capture_recording_progress()
+            self.assertEqual(epoch, stopped.body["authority_epoch"])
+            self.assertEqual(revision, stopped.body["source_revision"])
+            self.assertIsNone(state)
+        finally:
+            coordinator.close()
+
+    def test_capture_status_retries_focus_sample_after_write_attempt(self) -> None:
+        def check_attempt(fail_after_write: bool) -> None:
+            sources = FakeSources()
+            sources.focus = deepcopy(CAMERA_FOCUS_STATUS)
+            coordinator = self.coordinator(sources=sources)
+            blocked = threading.Event()
+            release = threading.Event()
+            original = sources.camera_focus_status
+            original_write = sources.set_camera_focus
+
+            def sample() -> object:
+                value = original()
+                blocked.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("focus sample was not released")
+                return value
+
+            def write(**kwargs: object) -> object:
+                result = original_write(**kwargs)
+                if fail_after_write:
+                    raise CameraError("camera_io", "focus readback failed", retryable=True)
+                return result
+
+            try:
+                before = coordinator.capture_status()["source_revision"]
+                with (
+                    patch.object(sources, "camera_focus_status", side_effect=sample),
+                    patch.object(sources, "set_camera_focus", side_effect=write),
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
+                    polling = executor.submit(coordinator.capture_status)
+                    try:
+                        self.assertTrue(blocked.wait(timeout=1))
+                        request = command(
+                            f"focus-during-sample-{fail_after_write}",
+                            {"schema": "ylx.camera-focus-set.v1", "value": 77},
+                        )
+                        if fail_after_write:
+                            with self.assertRaises(ProviderError) as raised:
+                                coordinator.set_camera_focus(request)
+                            self.assertEqual(raised.exception.code, "camera_io")
+                        else:
+                            coordinator.set_camera_focus(request)
+                    finally:
+                        release.set()
+                    status = polling.result(timeout=2)
+                validate_capture_status(status)
+                if fail_after_write:
+                    self.assertEqual(status["source_revision"], before)
+                else:
+                    self.assertGreater(status["source_revision"], before)
+                self.assertEqual(status["snapshot"]["runtime"]["camera_focus"]["value"], 77)
+            finally:
+                release.set()
+                coordinator.close()
+
+        for fail_after_write in (False, True):
+            with self.subTest(fail_after_write=fail_after_write):
+                check_attempt(fail_after_write)
+
+    def test_capture_status_does_not_resample_runtime_for_recording_checkpoints(self) -> None:
+        coordinator = self.coordinator(checkpoint_interval=0)
+        try:
+            coordinator.start_capture(start_command("checkpoint-during-sample"))
+            recorder = coordinator._active
+            original = coordinator._runtime
+
+            def sample() -> object:
+                with recorder._lock:
+                    recorder._checkpoint_if_due()
+                return original()
+
+            with patch.object(coordinator, "_runtime", side_effect=sample) as runtime:
+                status = coordinator.capture_status()
+                runtime.assert_called_once_with()
+            validate_capture_status(status)
+            self.assertEqual(
+                status["source_revision"], recorder.current_recording_state["state_revision"]
+            )
+        finally:
+            coordinator.close()
+
+    def test_slow_imu_sample_cannot_overwrite_newer_concurrent_sample(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(20))
+        coordinator = self.coordinator(sources=sources)
+        blocked = threading.Event()
+        release = threading.Event()
+        poll_thread = None
+
+        def read_status() -> object:
+            nonlocal poll_thread
+            poll_thread = threading.get_ident()
+            return coordinator.capture_status()
+
+        def sample() -> object:
+            value = sources.observation
+            if threading.get_ident() == poll_thread:
+                blocked.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("IMU sample was not released")
+            return value
+
+        try:
+            coordinator.start_capture(start_command("concurrent-imu"))
+            sources.observation = imu_observation(40)
+            with (
+                patch.object(sources, "latest_imu_observation", side_effect=sample),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                polling = executor.submit(read_status)
+                try:
+                    self.assertTrue(blocked.wait(timeout=1))
+                    sources.observation = imu_observation(80)
+                    newer = coordinator.capture_status()
+                finally:
+                    release.set()
+                delayed = polling.result(timeout=2)
+            self.assertEqual(delayed["source_revision"], newer["source_revision"])
+            for status in (newer, delayed):
+                validate_capture_status(status)
+                self.assertEqual(
+                    status["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"], 10_131
+                )
+        finally:
+            release.set()
+            coordinator.close()
+
+    def test_capture_status_clears_live_imu_while_sealed_session_is_verified(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        blocked = threading.Event()
+        release = threading.Event()
+        original = coordinator._verify_exact_session_payload
+
+        def verify(*args: object) -> object:
+            blocked.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("session verification was not released")
+            return original(*args)
+
+        try:
+            coordinator.start_capture(start_command("verify-live-imu-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            with (
+                patch.object(coordinator, "_verify_exact_session_payload", side_effect=verify),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                stopping = executor.submit(
+                    coordinator.stop_capture, stop_command("verify-live-imu-stop")
+                )
+                try:
+                    self.assertTrue(blocked.wait(timeout=1))
+                    status = coordinator.capture_status()
+                    validate_capture_status(status)
+                    self.assertIsNone(status["snapshot"]["active_recording"])
+                    self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
+                finally:
+                    release.set()
+                stopped = stopping.result(timeout=2)
+            self.assertEqual(stopped.body["snapshot"]["device_state"], "idle")
+        finally:
+            release.set()
             coordinator.close()
 
     def test_capture_status_refreshes_native_source_imu_for_same_session_revision(self) -> None:

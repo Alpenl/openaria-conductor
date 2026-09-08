@@ -47,6 +47,7 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
+from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.web import (
     WEB_ASSETS,
     EchoWebArtifactError,
@@ -1399,35 +1400,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(status, body, headers=headers)
 
-    @staticmethod
-    def _valid_camera_focus_status(value: object) -> bool:
-        if not isinstance(value, Mapping) or set(value) != {
-            "schema",
-            "value",
-            "minimum",
-            "maximum",
-            "step",
-            "default",
-            "auto_supported",
-            "auto_enabled",
-        }:
-            return False
-        return not (
-            value["schema"] != "ylx.camera-focus.v1"
-            or any(
-                type(value[key]) is not int
-                for key in ("value", "minimum", "maximum", "step", "default")
-            )
-            or value["minimum"] > value["maximum"]
-            or value["step"] <= 0
-            or not value["minimum"] <= value["value"] <= value["maximum"]
-            or (value["value"] - value["minimum"]) % value["step"] != 0
-            or not value["minimum"] <= value["default"] <= value["maximum"]
-            or type(value["auto_supported"]) is not bool
-            or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
-            or (not value["auto_supported"] and value["auto_enabled"] is not None)
-        )
-
     def _send_camera_focus_status(
         self,
         status: int,
@@ -1435,7 +1407,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         *,
         headers: Mapping[str, str] | None = None,
     ) -> None:
-        if not self._valid_camera_focus_status(body):
+        if not valid_camera_focus_status(body):
             self._invalid_source_state("daemon camera focus 状态无效")
             return
         self._send_json(status, body, headers=headers)

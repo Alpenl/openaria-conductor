@@ -1,0 +1,39 @@
+{
+  "schema": "openaria.status-polling-comparison.v1",
+  "baseline_commit": "b9a644840ad65df563f32364be5751167a15d065",
+  "environment": "x86_64 Linux development host; fake camera and encoder; shared native extension",
+  "baseline": {
+    "coordinator_sha256": "e2da6be7ecc1cf310ff505d99446d3ac38132c561bad62012b67973013843d05",
+    "focus_delay_seconds": 0.3,
+    "stop_latency_seconds": [
+      0.3719470468349755,
+      0.3837505243718624,
+      0.39339515287429094,
+      0.3771847006864846,
+      0.40630919113755226
+    ],
+    "stop_latency_median_seconds": 0.3837505243718624,
+    "active_event_pump": {
+      "ticks": 25,
+      "runtime_reads": 25,
+      "focus_reads": 25
+    }
+  },
+  "candidate": {
+    "coordinator_sha256": "d4374383ea8012b13bdb661664d3b5dd67cd69eb4b6d4044e3bbda744ac7f57c",
+    "focus_delay_seconds": 0.3,
+    "stop_latency_seconds": [
+      0.062107892241328955,
+      0.060192517936229706,
+      0.0619953921996057,
+      0.05148123111575842,
+      0.051523970905691385
+    ],
+    "stop_latency_median_seconds": 0.060192517936229706,
+    "active_event_pump": {
+      "ticks": 25,
+      "runtime_reads": 0,
+      "focus_reads": 0
+    }
+  }
+}

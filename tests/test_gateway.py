@@ -7,6 +7,7 @@ import threading
 import unittest
 from contextlib import redirect_stderr
 from copy import deepcopy
+from http import HTTPStatus
 from io import StringIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -2270,6 +2271,21 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+    def test_camera_focus_http_status_requires_plain_integers(self) -> None:
+        for value in (True, HTTPStatus.OK):
+            with self.subTest(value=value):
+                self.server.provider.focus = {**CAMERA_FOCUS_STATUS, "value": value}
+                status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
+                self.assertEqual(status, 500)
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["code"], "invalid_source_state")
+                self.assertEqual(error["message"], "daemon camera focus 状态无效")
+
+        self.server.provider.focus = None
+        status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload)["error"]["code"], "camera_focus_unsupported")
 
     def test_session_listing_validates_query_and_preserves_provider_projection(self) -> None:
         take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
