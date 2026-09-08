@@ -1564,7 +1564,7 @@ class CaptureCoordinator:
                     "session_detail": True,
                     "artifact_download": True,
                     "capture_status": True,
-                    "session_deletion": False,
+                    "session_deletion": True,
                 }
             )
             capabilities["calibration_capture"] = self._calibration_capture_capability(
@@ -2679,6 +2679,51 @@ class CaptureCoordinator:
             except (OSError, DeviceRecordingError):
                 continue
         raise ArtifactAccessError("not_found", "会话不存在")
+
+    def delete_sessions(self, command: CaptureCommand) -> CaptureCommandResult:
+        from rp_ylx.recording.deletion import delete_recordings, valid_delete_request
+
+        if not valid_delete_request(command.body):
+            raise ProviderError("invalid_request", "删除请求无效", status=HTTPStatus.BAD_REQUEST)
+
+        def execute() -> CaptureCommandResult:
+            if self._active is not None or self._stop_inflight is not None:
+                raise ProviderError(
+                    "capture_busy", "录制进行中，不能删除", status=HTTPStatus.CONFLICT
+                )
+            if self._released or self._pending_safe_swap is not None:
+                raise ProviderError(
+                    "volume_releasing", "录制卷已释放或正在释放", status=HTTPStatus.LOCKED
+                )
+            if self._open_representations:
+                raise ProviderError(
+                    "download_busy", "下载进行中，不能删除", status=HTTPStatus.CONFLICT
+                )
+            try:
+                self._check_generation(force=True)
+            except DeviceRecordingError as error:
+                raise ProviderError(
+                    error.code, error.message, status=HTTPStatus.CONFLICT
+                ) from error
+            admission = self._require_admission()
+            expected = {
+                item["session_id"]: item["manifest_sha256"] for item in command.body["sessions"]
+            }
+            with self._catalog_lock:
+                try:
+                    result = delete_recordings(admission.catalog_roots, expected)
+                finally:
+                    for session_id in expected:
+                        self._session_summaries.pop(session_id, None)
+                        self._session_snapshots.pop(session_id, None)
+                        self._verified.pop(session_id, None)
+                        self._session_diagnostics.pop(session_id, None)
+                        self._pending_session_verification.discard(session_id)
+                    self._storage_checked_at = 0.0
+            return CaptureCommandResult(HTTPStatus.OK, result)
+
+        with self._lock:
+            return self._idempotent("delete", command, execute)
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
         with self._lock:

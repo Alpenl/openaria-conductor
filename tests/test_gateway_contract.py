@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "b6f3c677c038e55c03581c587973811b0aa2dc91cfb8b602a95128fbac225827",
-        "bytes": 124_739,
+        "sha256": "b7b244cc78e923d1582aa3113abc35c1b485503ef3b53c8f818d478a07fb7372",
+        "bytes": 128_352,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -97,6 +97,7 @@ ROUTE_GOLDENS = {
         ("/network/forget", "post", "forgetNetworkClientProfile"),
         ("/camera/focus", "get", "getCameraFocus"),
         ("/camera/focus", "post", "setCameraFocus"),
+        ("/sessions/delete", "post", "deleteSessions"),
     },
 }
 

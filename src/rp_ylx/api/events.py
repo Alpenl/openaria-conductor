@@ -739,7 +739,7 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
                 or value["session_detail"] is not True
                 or value["artifact_download"] is not True
                 or value["capture_status"] is not True
-                or value["session_deletion"] is not False
+                or type(value["session_deletion"]) is not bool
             )
         )
     ):

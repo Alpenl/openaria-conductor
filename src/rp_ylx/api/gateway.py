@@ -267,6 +267,8 @@ class DeviceProvider(Protocol):
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedRepresentation: ...
 
+    def delete_sessions(self, command: CaptureCommand) -> CaptureCommandResult: ...
+
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None: ...
 
     def current_safe_swap_receipt(self) -> object | None: ...
@@ -1057,6 +1059,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         parts = path.split("/")
+        if path == "/api/v4/sessions/delete":
+            self._delete_sessions()
+            return
         if (
             len(parts) == 5
             and parts[1] == "api"
@@ -1117,6 +1122,43 @@ class GatewayHandler(BaseHTTPRequestHandler):
             HTTPStatus.METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "接口不允许该请求方法",
+        )
+
+    def _delete_sessions(self) -> None:
+        from rp_ylx.recording.deletion import valid_delete_request
+
+        identity = self._command_principal("deleteSessions")
+        if identity is None:
+            return
+        principal, key = identity
+        body = self._read_json()
+        if body is None:
+            return
+        if not valid_delete_request(body):
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "删除请求无效")
+            return
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            result = self.server.provider.delete_sessions(
+                CaptureCommand(principal.principal_id, key, body, canonical)
+            )
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        self._audit("deleteSessions", None, "completed", principal)
+        self._send_json(
+            result.status,
+            result.body,
+            headers={"Idempotency-Replayed": "true"} if result.replayed else None,
         )
 
     def _get_device(self, api_version: str) -> None:

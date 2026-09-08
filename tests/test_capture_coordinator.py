@@ -1120,6 +1120,136 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def deletion_command(self, coordinator, session_ids, key="delete-one"):
+        items = coordinator.list_sessions(cursor=None, limit=200, take_id=None)["items"]
+        body = {
+            "schema": "ylx.session-delete-request.v1",
+            "sessions": [
+                {
+                    "session_id": item["session_id"],
+                    "manifest_sha256": item["verification"]["manifest_sha256"],
+                }
+                for item in items
+                if item["session_id"] in session_ids
+            ],
+        }
+        return CaptureCommand("bridge", key, body, json.dumps(body, sort_keys=True).encode())
+
+    def test_remote_deletion_removes_only_selected_and_replays_after_restart(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="delete-first")
+            second = self.seal_one(coordinator, prefix="delete-second")
+            command = self.deletion_command(coordinator, {first})
+            result = coordinator.delete_sessions(command)
+            self.assertEqual(result.body["deleted_session_ids"], [first])
+            self.assertFalse((self.mountpoint / "recordings" / first).exists())
+            self.assertTrue((self.mountpoint / "recordings" / second).exists())
+            self.assertTrue(coordinator.delete_sessions(command).replayed)
+            items = coordinator.list_sessions(cursor=None, limit=50, take_id=None)["items"]
+            self.assertEqual([item["session_id"] for item in items], [second])
+        finally:
+            coordinator.close()
+        restarted = self.coordinator()
+        try:
+            self.assertTrue(restarted.delete_sessions(command).replayed)
+        finally:
+            restarted.close()
+
+    def test_remote_deletion_blocks_download_capture_and_stale_manifest(self):
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator)
+            command = self.deletion_command(coordinator, {session_id})
+            with coordinator.open_manifest(session_id, "v4"):
+                with self.assertRaises(ProviderError) as rejected:
+                    coordinator.delete_sessions(command)
+                self.assertEqual(rejected.exception.code, "download_busy")
+            coordinator.start_capture(start_command("busy-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(command)
+            self.assertEqual(rejected.exception.code, "capture_busy")
+            coordinator.stop_capture(stop_command("busy-stop"))
+            body = deepcopy(command.body)
+            body["sessions"][0]["manifest_sha256"] = "0" * 64
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(
+                    CaptureCommand("bridge", "changed", body, json.dumps(body).encode())
+                )
+            self.assertEqual(rejected.exception.code, "manifest_changed")
+            self.assertTrue((self.mountpoint / "recordings" / session_id).exists())
+        finally:
+            coordinator.close()
+
+    def test_remote_deletion_rejects_symlink_and_continuation_orphans(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="first")
+            second = self.seal_one(coordinator, prefix="second")
+            command = self.deletion_command(coordinator, {first})
+            from rp_ylx.recording import deletion
+
+            inspect = deletion.inspect_device_session_directory
+
+            def linked(path):
+                manifest, payload = inspect(path)
+                if path.name == second:
+                    manifest = deepcopy(manifest)
+                    manifest["take"]["continuation_of"] = first
+                return manifest, payload
+
+            with patch.object(deletion, "inspect_device_session_directory", linked):
+                with self.assertRaises(ProviderError) as rejected:
+                    coordinator.delete_sessions(command)
+                self.assertEqual(rejected.exception.code, "continuation_required")
+            root = self.mountpoint / "recordings"
+            (root / first).rename(self.mountpoint / "outside")
+            (root / first).symlink_to(self.mountpoint / "outside", target_is_directory=True)
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(command)
+            self.assertEqual(rejected.exception.code, "catalog_unavailable")
+            self.assertTrue((self.mountpoint / "outside" / "manifest.json").is_file())
+        finally:
+            coordinator.close()
+
+    def test_remote_deletion_reports_storage_failure_and_supports_legacy_root(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="first")
+            second = self.seal_one(coordinator, prefix="second")
+            command = self.deletion_command(coordinator, {first, second})
+            from rp_ylx.recording import deletion
+
+            remove = deletion.shutil.rmtree
+            calls = []
+
+            def fail_second(*args, **kwargs):
+                calls.append(args[0])
+                if len(calls) == 2:
+                    raise PermissionError("read-only")
+                return remove(*args, **kwargs)
+
+            with patch.object(deletion.shutil, "rmtree", fail_second):
+                result = coordinator.delete_sessions(command)
+            self.assertEqual(len(result.body["deleted_session_ids"]), 1)
+            self.assertEqual(len(result.body["failed_sessions"]), 1)
+            remaining = result.body["failed_sessions"][0]["session_id"]
+            legacy = self.mountpoint / "sessions"
+            legacy.mkdir()
+            (self.mountpoint / "recordings" / remaining).rename(legacy / remaining)
+        finally:
+            coordinator.close()
+        restarted = self.coordinator()
+        try:
+            command = self.deletion_command(restarted, {remaining}, key="legacy-delete")
+            self.assertEqual(
+                restarted.delete_sessions(command).body["deleted_session_ids"], [remaining]
+            )
+            self.assertFalse((legacy / remaining).exists())
+        finally:
+            restarted.close()
+
     def test_legacy_sessions_root_remains_listed_and_downloadable(self) -> None:
         first = self.coordinator()
         try:
