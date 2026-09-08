@@ -21,7 +21,110 @@ const WAV_HEADER_BYTES: u64 = 44;
 const DEFAULT_PERIOD_FRAMES: u64 = 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
-const QUEUE_BLOCKS: usize = 256;
+const QUEUE_BLOCKS: usize = 768;
+const IO_BUCKET_NS: [u64; 10] = [
+    100_000,
+    1_000_000,
+    5_000_000,
+    20_000_000,
+    100_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_000_000_000,
+    5_000_000_000,
+    10_000_000_000,
+];
+const MAX_SLOW_IO_EVENTS: usize = 64;
+const MAX_CLOCK_OBSERVATIONS: usize = 65_536;
+
+#[derive(Default)]
+struct IoTiming {
+    count: u64,
+    failures: u64,
+    bytes: u64,
+    total_ns: u64,
+    max_ns: u64,
+    histogram: [u64; 11],
+}
+
+impl IoTiming {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count": self.count, "failures": self.failures, "bytes": self.bytes,
+            "total_ns": self.total_ns, "max_ns": self.max_ns, "histogram": self.histogram,
+        })
+    }
+
+    fn record(&mut self, elapsed_ns: u64, bytes: u64, failed: bool) {
+        self.count += 1;
+        self.failures += u64::from(failed);
+        self.bytes += bytes;
+        self.total_ns += elapsed_ns;
+        self.max_ns = self.max_ns.max(elapsed_ns);
+        let bucket = IO_BUCKET_NS.partition_point(|bound| elapsed_ns > *bound);
+        self.histogram[bucket] += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IoOperation {
+    Open,
+    Write,
+    Sync,
+    Seal,
+}
+
+#[derive(Default)]
+struct WriterDiagnostics {
+    open: IoTiming,
+    write: IoTiming,
+    sync: IoTiming,
+    seal: IoTiming,
+    slow_events: Vec<serde_json::Value>,
+    slow_events_omitted: u64,
+}
+
+impl WriterDiagnostics {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "open": self.open.json(), "write": self.write.json(),
+            "sync": self.sync.json(), "seal": self.seal.json(),
+            "slow_events": self.slow_events, "slow_events_omitted": self.slow_events_omitted,
+        })
+    }
+}
+
+fn measure_io<T, E>(
+    progress: &AudioProgress,
+    operation: IoOperation,
+    bytes: u64,
+    action: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = std::time::Instant::now();
+    let result = action();
+    let elapsed = started.elapsed().as_nanos() as u64;
+    if let Ok(mut diagnostics) = progress.writer_diagnostics.lock() {
+        let (name, timing) = match operation {
+            IoOperation::Open => ("open", &mut diagnostics.open),
+            IoOperation::Write => ("write", &mut diagnostics.write),
+            IoOperation::Sync => ("sync", &mut diagnostics.sync),
+            IoOperation::Seal => ("seal", &mut diagnostics.seal),
+        };
+        timing.record(elapsed, bytes, result.is_err());
+        if elapsed >= 100_000_000 {
+            if diagnostics.slow_events.len() < MAX_SLOW_IO_EVENTS {
+                diagnostics.slow_events.push(serde_json::json!({
+                    "operation": name, "elapsed_ns": elapsed,
+                    "ended_monotonic_ns": monotonic_ns().unwrap_or(0),
+                    "bytes": bytes, "failed": result.is_err(),
+                }));
+            } else {
+                diagnostics.slow_events_omitted += 1;
+            }
+        }
+    }
+    result
+}
 
 #[repr(C)]
 struct SndPcm {
@@ -127,6 +230,7 @@ struct AudioProgress {
     sample_count: AtomicU64,
     bytes_written: AtomicU64,
     segment_count: AtomicU64,
+    writer_diagnostics: Mutex<WriterDiagnostics>,
 }
 
 impl AudioProgress {
@@ -903,10 +1007,10 @@ impl SegmentWriter {
                 .active
                 .as_mut()
                 .ok_or_else(|| AudioError::new("invalid_state", "audio segment was not opened"))?;
-            active
-                .file
-                .write_all(&data[byte_start..byte_end])
-                .map_err(|error| AudioError::io("write_failed", "write audio segment", error))?;
+            measure_io(&self.progress, IoOperation::Write, byte_len as u64, || {
+                active.file.write_all(&data[byte_start..byte_end])
+            })
+            .map_err(|error| AudioError::io("write_failed", "write audio segment", error))?;
             active.data_bytes += selected * self.bytes_per_frame;
             *total_written_before += selected;
             remaining -= selected;
@@ -933,11 +1037,13 @@ impl SegmentWriter {
             std::fs::create_dir_all(parent)
                 .map_err(|error| AudioError::io("write_failed", "create audio directory", error))?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&absolute)
-            .map_err(|error| AudioError::io("write_failed", "open audio segment", error))?;
+        let mut file = measure_io(&self.progress, IoOperation::Open, 0, || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&absolute)
+        })
+        .map_err(|error| AudioError::io("write_failed", "open audio segment", error))?;
         write_wav_header(&mut file, self.sample_rate_hz, self.channels, 0)?;
         self.active = Some(ActiveSegment {
             index: self.next_index,
@@ -958,22 +1064,27 @@ impl SegmentWriter {
         if segment.data_bytes == 0 {
             return Ok(());
         }
-        segment
-            .file
-            .set_len(WAV_HEADER_BYTES + segment.data_bytes)
-            .map_err(|error| {
-                AudioError::io("write_failed", "truncate incomplete audio write", error)
-            })?;
-        write_wav_header(
-            &mut segment.file,
-            self.sample_rate_hz,
-            self.channels,
+        measure_io(&self.progress, IoOperation::Seal, 0, || {
+            segment
+                .file
+                .set_len(WAV_HEADER_BYTES + segment.data_bytes)
+                .map_err(|error| {
+                    AudioError::io("write_failed", "truncate incomplete audio write", error)
+                })?;
+            write_wav_header(
+                &mut segment.file,
+                self.sample_rate_hz,
+                self.channels,
+                segment.data_bytes,
+            )
+        })?;
+        measure_io(
+            &self.progress,
+            IoOperation::Sync,
             segment.data_bytes,
-        )?;
-        segment
-            .file
-            .sync_all()
-            .map_err(|error| AudioError::io("write_failed", "sync audio segment", error))?;
+            || segment.file.sync_all(),
+        )
+        .map_err(|error| AudioError::io("write_failed", "sync audio segment", error))?;
         let end_sample = segment.start_sample + segment.data_bytes / self.bytes_per_frame;
         self.records.push(AudioSegment {
             index: segment.index,
@@ -1052,6 +1163,10 @@ fn start_and_capture(
     let mut sample_count = 0_u64;
     let mut anchors: Vec<[u64; 2]> = Vec::new();
     let mut last_anchor = None;
+    // Diagnostic observations never replace or smooth the authoritative anchors.
+    let mut clock_observations: Vec<[u64; 5]> = Vec::new();
+    let mut observations_omitted = 0_u64;
+    let mut next_observation_ns = 0;
     let enqueue = |buffer, frames| {
         let queued = progress.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames;
         progress
@@ -1079,6 +1194,20 @@ fn start_and_capture(
                         return Err(AudioError::new("audio_failed", "missing ALSA timestamp"));
                     }
                     let anchor = [position, timestamp];
+                    if timestamp >= next_observation_ns {
+                        next_observation_ns = timestamp.saturating_add(100_000_000);
+                        if clock_observations.len() < MAX_CLOCK_OBSERVATIONS {
+                            clock_observations.push([
+                                position,
+                                timestamp,
+                                monotonic_ns()?,
+                                clock_ns(libc::CLOCK_MONOTONIC_RAW)?,
+                                sample_count,
+                            ]);
+                        } else {
+                            observations_omitted += 1;
+                        }
+                    }
                     if anchors
                         .last()
                         .is_none_or(|last| position >= last[0] + u64::from(config.sample_rate_hz))
@@ -1134,10 +1263,15 @@ fn start_and_capture(
         .or(disk_result.as_ref().err())
         .or(clock_result.as_ref().err());
     let diagnostic = serde_json::json!({
-        "schema": "openaria.audio-capture-diagnostic.v1", "sample_count": sample_count,
+        "schema": "openaria.audio-capture-diagnostic.v2", "sample_count": sample_count,
         "anchors": anchors, "thread_started_monotonic_ns": started_monotonic_ns,
         "thread_stopped_monotonic_ns": stopped_monotonic_ns,
         "error": failure.map(|error| serde_json::json!({"code": error.code, "message": error.message})),
+        "clock_observation_fields": ["sample_position", "alsa_monotonic_ns", "observed_monotonic_ns", "observed_raw_ns", "read_samples"],
+        "clock_observations": clock_observations,
+        "clock_observations_omitted": observations_omitted,
+        "io_histogram_upper_bounds_ns": IO_BUCKET_NS,
+        "writer_io": progress.writer_diagnostics.lock().ok().map(|value| value.json()),
     });
     let diagnostic_path = config.session_root.join("audio/capture-clock.json");
     if let Ok(payload) = serde_json::to_vec(&diagnostic) {
@@ -1233,12 +1367,16 @@ fn capture_clock(
 }
 
 fn monotonic_ns() -> Result<u64, AudioError> {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+fn clock_ns(clock: libc::clockid_t) -> Result<u64, AudioError> {
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: timestamp points to writable storage.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+    if unsafe { libc::clock_gettime(clock, &mut timestamp) } != 0 {
         return Err(AudioError::io(
             "clock_failed",
             "clock_gettime",
@@ -1302,6 +1440,36 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use std::path::PathBuf;
+
+    #[test]
+    fn io_histogram_preserves_tail_and_failure_counts() {
+        let mut timing = super::IoTiming::default();
+        for (elapsed, failed) in [(100_000, false), (100_001, false), (16_000_000_000, true)] {
+            timing.record(elapsed, 4096, failed);
+        }
+        assert_eq!(timing.count, 3);
+        assert_eq!(timing.failures, 1);
+        assert_eq!(timing.bytes, 12288);
+        assert_eq!(timing.max_ns, 16_000_000_000);
+        assert_eq!(timing.histogram[0], 1);
+        assert_eq!(timing.histogram[1], 1);
+        assert_eq!(timing.histogram[10], 1);
+        assert_eq!(timing.histogram.iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn io_measurement_does_not_swallow_disk_errors() {
+        let progress = super::AudioProgress::default();
+        let result: std::io::Result<()> =
+            super::measure_io(&progress, super::IoOperation::Sync, 4096, || {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+        let diagnostics = progress.writer_diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.sync.count, 1);
+        assert_eq!(diagnostics.sync.failures, 1);
+        assert_eq!(diagnostics.write.count, 0);
+    }
 
     #[test]
     fn xruns_and_suspend_never_resume_a_continuous_pcm_stream() {

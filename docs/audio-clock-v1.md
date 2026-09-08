@@ -8,6 +8,17 @@ capture fails. Failed recordings retain an audio/capture-clock.json diagnostic.
 The native capture engine checks audio health in its IMU loop and reports the
 failure through the existing recording failure callback.
 
+The writer queue holds 768 blocks of 1024 PCM frames: 16.384 seconds at 48 kHz,
+using 3 MiB of PCM storage for stereo S16_LE, plus one capture block. USB short
+reads fill a block before enqueue; normal stop also submits the final partial block.
+The diagnostic sidecar uses openaria.audio-capture-diagnostic.v2 and includes
+separate open/write/seal/sync latency histograms, failure counts, and up to 64
+slow-operation records. It also retains up to 65536 observations at approximately
+100 ms intervals containing ALSA sample position, ALSA monotonic timestamp,
+observed MONOTONIC/MONOTONIC_RAW timestamps, and read sample count. Omitted
+observation counts are explicit. These diagnostics do not replace the original
+clock anchors, change the v1 clock contract, or assert physical clock accuracy.
+
 The default input is hw:CARD=D2UQ2,DEV=0, the YLX USB audio interface. Explicit
 device configuration remains supported and existing installation configuration
 is preserved. In particular, hw:0,0 may select the RDK board's ES8326 input rather
