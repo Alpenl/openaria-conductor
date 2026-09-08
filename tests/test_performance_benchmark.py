@@ -77,7 +77,7 @@ class PerformanceBenchmarkTest(unittest.TestCase):
         capabilities = NativeCapabilities(
             True,
             "0.1.0",
-            4,
+            5,
             ("capability_probe", "turbojpeg_split"),
         )
         with (
@@ -105,14 +105,14 @@ class PerformanceBenchmarkTest(unittest.TestCase):
                 "adapter": "rust",
                 "module_available": True,
                 "module_version": "0.1.0",
-                "abi": 4,
+                "abi": 5,
             },
         )
         self.assertEqual(splitter.input[1:], (3840, 1080))
         self.assertTrue(splitter.closed)
 
     def test_rust_adapter_requires_the_workload_capability(self) -> None:
-        capabilities = NativeCapabilities(True, "0.1.0", 4, ("capability_probe",))
+        capabilities = NativeCapabilities(True, "0.1.0", 5, ("capability_probe",))
         with (
             tempfile.TemporaryDirectory() as directory,
             patch("rp_ylx.performance.benchmark.__commit__", COMMIT),
@@ -133,19 +133,24 @@ class PerformanceBenchmarkTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "native_adapter_unavailable")
 
-    def test_hardware_adapter_selects_python_or_rust_with_the_same_metrics(self) -> None:
+    def test_python_hardware_adapter_uses_the_exact_camera_backend(self) -> None:
         metrics = PerformanceMetrics()
         mode = CameraMode(3840, 1080, 60.0, "mjpg")
-        for adapter, factory_name in (
-            ("python", "V4L2CameraStream"),
-            ("rust", "v4l2_production_stream_factory"),
-        ):
-            with self.subTest(adapter=adapter):
-                backend = _ExactCameraBackend(Path("/dev/video0"), metrics, adapter)
-                descriptor = backend.discover()[0]
-                with patch(f"rp_ylx.performance.benchmark.{factory_name}") as factory:
-                    self.assertIs(backend.open(descriptor, mode), factory.return_value)
-                self.assertIs(factory.call_args.kwargs["metrics"], metrics)
+        backend = _ExactCameraBackend(Path("/dev/video0"), metrics, "python")
+        descriptor = backend.discover()[0]
+        with patch("rp_ylx.performance.benchmark.V4L2CameraStream") as factory:
+            self.assertIs(backend.open(descriptor, mode), factory.return_value)
+        self.assertIs(factory.call_args.kwargs["metrics"], metrics)
+
+    def test_rust_hardware_adapter_must_use_capture_engine(self) -> None:
+        backend = _ExactCameraBackend(
+            Path("/dev/video0"),
+            PerformanceMetrics(),
+            "rust",
+        )
+        with self.assertRaises(BenchmarkError) as raised:
+            backend.open(backend.discover()[0], CameraMode(3840, 1080, 60.0, "mjpg"))
+        self.assertEqual(raised.exception.code, "invalid_adapter_path")
 
     def test_rust_recording_benchmark_uses_native_continuous_direct_sink(self) -> None:
         class Recorder:

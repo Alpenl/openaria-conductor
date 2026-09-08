@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 const WRITE_BACKPRESSURE: &str = "write_backpressure";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,36 +31,6 @@ pub(crate) struct ReservedFrame {
     pub(crate) record_sequence: u64,
     pub(crate) source_sequence: u64,
     pub(crate) host_monotonic_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SplitFrameLocation {
-    pub(crate) segment_index: u64,
-    pub(crate) segment_frame: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RawFrameWriteDecision {
-    pub(crate) session_id: String,
-    pub(crate) record_sequence: u64,
-    pub(crate) source_sequence: u64,
-    pub(crate) host_monotonic_ns: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SplitFrameWriteDecision {
-    pub(crate) session_id: String,
-    pub(crate) record_sequence: u64,
-    pub(crate) source_sequence: u64,
-    pub(crate) host_monotonic_ns: u64,
-    pub(crate) segment_index: u64,
-    pub(crate) segment_frame: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FrameWriteDecision {
-    RawSideBySide(RawFrameWriteDecision),
-    SplitEyes(SplitFrameWriteDecision),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,35 +109,6 @@ impl ActiveTakeWriter {
         })
     }
 
-    pub(crate) fn raw_write_decision(
-        &self,
-        frame: &ReservedFrame,
-    ) -> Result<FrameWriteDecision, ActiveTakeError> {
-        self.ensure_pending(frame)?;
-        Ok(FrameWriteDecision::RawSideBySide(RawFrameWriteDecision {
-            session_id: self.session_id.clone(),
-            record_sequence: frame.record_sequence,
-            source_sequence: frame.source_sequence,
-            host_monotonic_ns: frame.host_monotonic_ns,
-        }))
-    }
-
-    pub(crate) fn split_write_decision(
-        &self,
-        frame: &ReservedFrame,
-        location: SplitFrameLocation,
-    ) -> Result<FrameWriteDecision, ActiveTakeError> {
-        self.ensure_pending(frame)?;
-        Ok(FrameWriteDecision::SplitEyes(SplitFrameWriteDecision {
-            session_id: self.session_id.clone(),
-            record_sequence: frame.record_sequence,
-            source_sequence: frame.source_sequence,
-            host_monotonic_ns: frame.host_monotonic_ns,
-            segment_index: location.segment_index,
-            segment_frame: location.segment_frame,
-        }))
-    }
-
     pub(crate) fn finish_frame(
         &mut self,
         frame: ReservedFrame,
@@ -188,6 +130,7 @@ impl ActiveTakeWriter {
         Ok(self.snapshot())
     }
 
+    #[cfg(test)]
     pub(crate) fn reject_frame(
         &mut self,
         frame: ReservedFrame,
@@ -227,6 +170,7 @@ impl ActiveTakeWriter {
         }
     }
 
+    #[cfg(test)]
     fn record_drop(
         &mut self,
         start_frame: u64,
@@ -293,6 +237,7 @@ impl ActiveTakeWriter {
     }
 }
 
+#[cfg(test)]
 fn validate_elapsed(value: f64, name: &str) -> Result<(), ActiveTakeError> {
     if value.is_finite() && value >= 0.0 {
         Ok(())
@@ -306,10 +251,7 @@ fn validate_elapsed(value: f64, name: &str) -> Result<(), ActiveTakeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ActiveSourceFrame, ActiveTakeError, ActiveTakeSnapshot, ActiveTakeWriter,
-        FrameWriteDecision, SplitFrameLocation,
-    };
+    use super::{ActiveSourceFrame, ActiveTakeError, ActiveTakeSnapshot, ActiveTakeWriter};
 
     fn source_frame(source_sequence: u64) -> ActiveSourceFrame {
         ActiveSourceFrame {
@@ -376,48 +318,18 @@ mod tests {
     }
 
     #[test]
-    fn frame_sequence_allocation_feeds_raw_and_split_write_decisions() {
+    fn frame_sequence_allocation_tracks_completed_frames() {
         let mut writer = ActiveTakeWriter::new("session").unwrap();
 
-        let raw = writer.reserve_frame(source_frame(20)).unwrap();
-        let raw_decision = writer.raw_write_decision(&raw).unwrap();
-        assert_eq!(raw.record_sequence, 0);
-        assert_eq!(
-            raw_decision,
-            FrameWriteDecision::RawSideBySide(super::RawFrameWriteDecision {
-                session_id: "session".to_owned(),
-                record_sequence: 0,
-                source_sequence: 20,
-                host_monotonic_ns: 1_020,
-            })
-        );
-        let snapshot = writer.finish_frame(raw, 100).unwrap();
+        let first = writer.reserve_frame(source_frame(20)).unwrap();
+        assert_eq!(first.record_sequence, 0);
+        let snapshot = writer.finish_frame(first, 100).unwrap();
         assert_eq!(snapshot.frames_written, 1);
         assert_eq!(snapshot.bytes_written, 100);
 
-        let split = writer.reserve_frame(source_frame(21)).unwrap();
-        let split_decision = writer
-            .split_write_decision(
-                &split,
-                SplitFrameLocation {
-                    segment_index: 2,
-                    segment_frame: 3,
-                },
-            )
-            .unwrap();
-        assert_eq!(split.record_sequence, 1);
-        assert_eq!(
-            split_decision,
-            FrameWriteDecision::SplitEyes(super::SplitFrameWriteDecision {
-                session_id: "session".to_owned(),
-                record_sequence: 1,
-                source_sequence: 21,
-                host_monotonic_ns: 1_021,
-                segment_index: 2,
-                segment_frame: 3,
-            })
-        );
-        let snapshot = writer.finish_frame(split, 24).unwrap();
+        let second = writer.reserve_frame(source_frame(21)).unwrap();
+        assert_eq!(second.record_sequence, 1);
+        let snapshot = writer.finish_frame(second, 24).unwrap();
 
         assert_eq!(snapshot.frame_domain, 2);
         assert_eq!(snapshot.frames_written, 2);

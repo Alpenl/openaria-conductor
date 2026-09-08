@@ -2,7 +2,7 @@
 
 from rp_ylx.imu.collector import ImuCollector, SyntheticImuSource
 from rp_ylx.imu.models import ImuError, ImuObservation, ImuPacketRead, ImuSample, RawVector3
-from rp_ylx.imu.native import NativeImuCollector, decode_native_imu_observation
+from rp_ylx.imu.native import decode_native_imu_observation
 from rp_ylx.imu.protocol import DecodedPacket, decode_packet
 from rp_ylx.imu.time_sync import SyncEstimate, TimestampUnwrapper, TimeSynchronizer
 from rp_ylx.imu.uvc_xu import (
@@ -19,7 +19,6 @@ __all__ = [
     "ImuObservation",
     "ImuPacketRead",
     "ImuSample",
-    "NativeImuCollector",
     "RawVector3",
     "SyncEstimate",
     "SyntheticImuSource",

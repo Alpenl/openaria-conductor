@@ -125,7 +125,7 @@ class PerformanceReportTest(unittest.TestCase):
 
         false_python = report()
         false_python["native"].update(  # type: ignore[union-attr]
-            {"module_available": True, "module_version": "0.1.0", "abi": 4}
+            {"module_available": True, "module_version": "0.1.0", "abi": 5}
         )
         cases.append((false_python, "adapter_mismatch"))
 

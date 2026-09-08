@@ -25,20 +25,6 @@ pub struct ArtifactDescriptor {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DeviceSessionV1Summary {
-    pub session_id: String,
-    pub display_name: String,
-    pub started_at: String,
-    pub ended_at: String,
-    pub duration_seconds: f64,
-    pub frames_count: u64,
-    pub imu_sample_count: u64,
-    pub audio_sample_count: Option<u64>,
-    pub total_bytes: u64,
-    pub artifacts: Vec<ArtifactDescriptor>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIoError {
     pub code: &'static str,
@@ -103,6 +89,12 @@ impl FileIdentity {
 pub struct FileDigest {
     pub identity: FileIdentity,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenedVerifiedArtifact {
+    pub descriptor: libc::c_int,
+    pub identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +308,25 @@ pub fn open_relative_regular(
     result
 }
 
+pub fn open_verified_artifact(
+    root_fd: libc::c_int,
+    relative_path: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<OpenedVerifiedArtifact, SessionIoError> {
+    let descriptor = open_relative_regular(root_fd, relative_path)?;
+    match verify_fd(descriptor, expected_bytes, expected_sha256) {
+        Ok(identity) => Ok(OpenedVerifiedArtifact {
+            descriptor,
+            identity,
+        }),
+        Err(error) => {
+            close_fd(descriptor);
+            Err(error)
+        }
+    }
+}
+
 pub fn read_fd_bounded(fd: libc::c_int, maximum_bytes: usize) -> Result<Vec<u8>, SessionIoError> {
     if fd < 0 {
         return Err(SessionIoError::new("artifact_invalid", "文件描述符无效"));
@@ -370,52 +381,6 @@ pub fn device_session_v1_artifacts(
 ) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
     let root = parse_device_session_manifest(payload, expected_session_id)?;
     collect_device_session_v1_artifacts(manifest_object(&root)?)
-}
-
-pub fn device_session_v1_summary(
-    payload: &[u8],
-    expected_session_id: &str,
-) -> Result<DeviceSessionV1Summary, SessionIoError> {
-    let root = parse_device_session_manifest(payload, expected_session_id)?;
-    let object = manifest_object(&root)?;
-    let time = object_field(object, "time", "manifest time 结构无效")?;
-    let frames = object_field(object, "frames", "manifest frames 结构无效")?;
-    let imu = object_field(object, "imu", "manifest imu 结构无效")?;
-    let audio_sample_count = object
-        .get("audio")
-        .map(|audio| {
-            let audio = audio.as_object().ok_or_else(|| {
-                SessionIoError::new("manifest_invalid", "manifest audio 结构无效")
-            })?;
-            if matches!(
-                audio.get("state").and_then(Value::as_str),
-                Some("not_recorded")
-            ) {
-                return Ok(None);
-            }
-            u64_field(audio, "sample_count", "manifest audio sample_count 无效").map(Some)
-        })
-        .transpose()?
-        .flatten();
-
-    let artifacts = collect_device_session_v1_artifacts(object)?;
-    let total_bytes = total_artifact_bytes(&artifacts)?;
-    Ok(DeviceSessionV1Summary {
-        session_id: string_field(object, "session_id")?.to_owned(),
-        display_name: string_field(object, "display_name")?.to_owned(),
-        started_at: string_field(time, "started_at")?.to_owned(),
-        ended_at: string_field(time, "ended_at")?.to_owned(),
-        duration_seconds: non_negative_number_field(
-            time,
-            "duration_seconds",
-            "manifest duration_seconds 无效",
-        )?,
-        frames_count: u64_field(frames, "count", "manifest frames count 无效")?,
-        imu_sample_count: u64_field(imu, "sample_count", "manifest imu sample_count 无效")?,
-        audio_sample_count,
-        total_bytes,
-        artifacts,
-    })
 }
 
 fn parse_device_session_manifest(
@@ -514,27 +479,6 @@ fn collect_device_session_v1_artifacts(
         ));
     }
     Ok(artifacts)
-}
-
-fn total_artifact_bytes(artifacts: &[ArtifactDescriptor]) -> Result<u64, SessionIoError> {
-    artifacts.iter().try_fold(0_u64, |total, artifact| {
-        total.checked_add(artifact.bytes).ok_or_else(|| {
-            SessionIoError::new("manifest_invalid", "manifest artifact bytes 总和溢出")
-        })
-    })
-}
-
-pub fn device_session_v1_artifact(
-    payload: &[u8],
-    expected_session_id: &str,
-    artifact_id: &str,
-) -> Result<Option<ArtifactDescriptor>, SessionIoError> {
-    if !is_sha256(artifact_id) {
-        return Ok(None);
-    }
-    Ok(device_session_v1_artifacts(payload, expected_session_id)?
-        .into_iter()
-        .find(|artifact| artifact.artifact_id == artifact_id))
 }
 
 pub fn verify_device_session_artifacts(
@@ -778,32 +722,6 @@ fn bool_field(object: &Map<String, Value>, name: &str) -> Result<Option<bool>, S
                 .ok_or_else(|| SessionIoError::new("manifest_invalid", "manifest bool 字段无效"))
         })
         .transpose()
-}
-
-fn u64_field(
-    object: &Map<String, Value>,
-    name: &str,
-    message: &'static str,
-) -> Result<u64, SessionIoError> {
-    object
-        .get(name)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| SessionIoError::new("manifest_invalid", message))
-}
-
-fn non_negative_number_field(
-    object: &Map<String, Value>,
-    name: &str,
-    message: &'static str,
-) -> Result<f64, SessionIoError> {
-    let value = object
-        .get(name)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| SessionIoError::new("manifest_invalid", message))?;
-    if value < 0.0 {
-        return Err(SessionIoError::new("manifest_invalid", message));
-    }
-    Ok(value)
 }
 
 fn is_media_type(value: &str) -> bool {
@@ -1173,10 +1091,9 @@ fn validate_control_name(name: &str) -> Result<(), SessionIoError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpectedArtifactIdentity, device_session_v1_artifact, device_session_v1_artifacts,
-        device_session_v1_summary, finalize_artifact, hash_file, open_relative_regular,
-        read_fd_bounded, seal_device_session, sendfile_all, verify_device_session_artifacts,
-        verify_fd, write_encoder_frame,
+        ExpectedArtifactIdentity, device_session_v1_artifacts, finalize_artifact, hash_file,
+        open_relative_regular, open_verified_artifact, read_fd_bounded, seal_device_session,
+        sendfile_all, verify_device_session_artifacts, verify_fd, write_encoder_frame,
     };
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -1298,6 +1215,49 @@ mod tests {
     }
 
     #[test]
+    fn opens_and_verifies_artifact_as_one_owned_operation() {
+        let root = tempfile_dir();
+        fs::create_dir(root.join("video")).unwrap();
+        let path = root.join("video/left.mp4");
+        fs::write(&path, b"abc").unwrap();
+        let root_file = File::open(&root).unwrap();
+        let artifact = open_verified_artifact(
+            root_file.as_raw_fd(),
+            "video/left.mp4",
+            3,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .unwrap();
+        assert_eq!(artifact.identity.size, 3);
+        let mut file = unsafe { File::from_raw_fd(artifact.descriptor) };
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"abc");
+    }
+
+    #[test]
+    fn failed_open_and_verify_closes_the_artifact_descriptor() {
+        let root = tempfile_dir();
+        let path = root.join("artifact.bin");
+        fs::write(&path, b"abc").unwrap();
+        let root_file = File::open(&root).unwrap();
+        let error = open_verified_artifact(
+            root_file.as_raw_fd(),
+            "artifact.bin",
+            3,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "digest_mismatch");
+        let leaked = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .any(|target| target == path);
+        assert!(!leaked, "failed verification leaked an artifact descriptor");
+    }
+
+    #[test]
     fn artifact_paths_reject_session_reserved_filenames() {
         assert!(super::validate_relative_regular_path("manifest.json").is_ok());
         let error = super::validate_relative_artifact_path("manifest.json").unwrap_err();
@@ -1370,94 +1330,6 @@ mod tests {
         assert_eq!(
             paths,
             vec!["video/raw.mjpeg", "frames.ndjson", "imu.ndjson"]
-        );
-
-        let summary =
-            device_session_v1_summary(payload, "01989f6a-2c00-7a1b-8c2d-3e4f50617283").unwrap();
-        assert_eq!(summary.audio_sample_count, None);
-        assert_eq!(summary.total_bytes, 35);
-    }
-
-    #[test]
-    fn selects_one_device_session_v1_artifact_by_identity() {
-        let payload = br#"{
-          "schema":"ylx.device-session.v1",
-          "sealed":true,
-          "session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283",
-          "video":{"layout":"split-eyes","segments":[{"artifacts":{
-            "left":{"artifact_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"video.left","path":"video/left.mp4","media_type":"video/mp4","bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-            "right":{"artifact_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"video.right","path":"video/right.mp4","media_type":"video/mp4","bytes":11,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
-          }}]},
-          "frames":{"artifact":{"artifact_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
-          "imu":{"artifact":{"artifact_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":13,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}
-        }"#;
-        let selected = device_session_v1_artifact(
-            payload,
-            "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(selected.path, "video/right.mp4");
-        assert_eq!(selected.bytes, 11);
-        assert!(
-            device_session_v1_artifact(
-                payload,
-                "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            device_session_v1_artifact(
-                payload,
-                "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
-                "not-a-sha",
-            )
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn summarizes_device_session_v1_with_total_bytes_and_artifacts() {
-        let payload = br#"{
-          "schema":"ylx.device-session.v1",
-          "sealed":true,
-          "session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283",
-          "display_name":"test capture",
-          "time":{"started_at":"2026-08-08T02:24:00Z","ended_at":"2026-08-08T02:24:01.250Z","duration_seconds":1.25},
-          "video":{"layout":"raw-side-by-side","artifact":{"artifact_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
-          "frames":{"count":7,"artifact":{"artifact_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
-          "imu":{"sample_count":42,"artifact":{"artifact_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":13,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
-          "audio":{"sample_count":48000,"segments":[{"artifact":{"artifact_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","role":"audio.wav","path":"audio/000000.wav","media_type":"audio/wav","bytes":14,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}]}
-        }"#;
-        let summary =
-            device_session_v1_summary(payload, "01989f6a-2c00-7a1b-8c2d-3e4f50617283").unwrap();
-
-        assert_eq!(summary.session_id, "01989f6a-2c00-7a1b-8c2d-3e4f50617283");
-        assert_eq!(summary.display_name, "test capture");
-        assert_eq!(summary.started_at, "2026-08-08T02:24:00Z");
-        assert_eq!(summary.ended_at, "2026-08-08T02:24:01.250Z");
-        assert_eq!(summary.duration_seconds, 1.25);
-        assert_eq!(summary.frames_count, 7);
-        assert_eq!(summary.imu_sample_count, 42);
-        assert_eq!(summary.audio_sample_count, Some(48000));
-        assert_eq!(summary.total_bytes, 49);
-        let paths: Vec<_> = summary
-            .artifacts
-            .iter()
-            .map(|item| item.path.as_str())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "video/raw.mjpeg",
-                "frames.ndjson",
-                "imu.ndjson",
-                "audio/000000.wav"
-            ]
         );
     }
 

@@ -1,0 +1,314 @@
+{
+  "contracts": {
+    "plain": {
+      "control_fake_health_ms": 1.250804,
+      "control_queue_statuses": [
+        200,
+        200,
+        503,
+        503
+      ],
+      "frozen_preview_reconnect_ms": 2.048195,
+      "last_event_id_replayed_ids": [
+        2,
+        3
+      ],
+      "shutdown_seconds": 0.004501,
+      "slow_client_health_ms": 2.152008,
+      "stream_metrics": {
+        "accepted_connections": 14,
+        "completed_connections": 14,
+        "preview": {
+          "acquired": 4,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 4
+          },
+          "rejected": 0,
+          "released": 4
+        },
+        "registered_streams": 0,
+        "sse": {
+          "acquired": 3,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 3
+          },
+          "rejected": 0,
+          "released": 3
+        }
+      }
+    },
+    "tls": {
+      "control_fake_health_ms": 5.396596,
+      "control_queue_statuses": [
+        200,
+        200,
+        503,
+        503
+      ],
+      "frozen_preview_reconnect_ms": 4.313133,
+      "last_event_id_replayed_ids": [
+        2,
+        3
+      ],
+      "shutdown_seconds": 0.005139,
+      "slow_client_health_ms": 4.904001,
+      "stream_metrics": {
+        "accepted_connections": 14,
+        "completed_connections": 14,
+        "preview": {
+          "acquired": 4,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 4
+          },
+          "rejected": 0,
+          "released": 4
+        },
+        "registered_streams": 0,
+        "sse": {
+          "acquired": 3,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 3
+          },
+          "rejected": 0,
+          "released": 3
+        }
+      }
+    }
+  },
+  "decision": {
+    "reason": "The harness validates the mechanism, but it cannot delete the complete Python HTTP/TLS/auth/CORS/body-limit/SSE/error-contract owner in this stage.",
+    "result": "no-go"
+  },
+  "harness": {
+    "path": "experiments/gateway-runtime-20260905/harness/target/release/gateway-runtime-harness",
+    "sha256": "78771017028a34b11092f209fca0e0e74abaa7148b79b1d117ba45e459d82fac"
+  },
+  "host": {
+    "cpu_count": 24,
+    "machine": "x86_64",
+    "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+    "python": "3.13.13"
+  },
+  "schema": "rp-ylx.gateway-runtime-experiment.v1",
+  "source": {
+    "commit": "99855a278634b7f322d9fcef0cf8e0dfe992c65b",
+    "dirty": false
+  },
+  "started_at": "2026-09-05T06:55:21.912567Z",
+  "workloads": {
+    "python_gateway_plain": {
+      "connections": 1000,
+      "elapsed_seconds": 0.84252,
+      "latency_ms": {
+        "max": 2.416018,
+        "mean": 0.311572,
+        "p95": 0.420431
+      },
+      "resources": {
+        "baseline": {
+          "fds": 4,
+          "rss_kib": 36344,
+          "threads": 2
+        },
+        "cpu_seconds": 0.36,
+        "end": {
+          "fds": 4,
+          "rss_kib": 36728,
+          "threads": 2
+        },
+        "peak": {
+          "fds": 5,
+          "rss_kib": 36728,
+          "threads": 5
+        }
+      },
+      "shutdown_seconds": 0.264036,
+      "stream_metrics": {
+        "preview": {
+          "active": 0,
+          "canceling": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 334
+          },
+          "oldest_age_seconds": 0.0,
+          "rejected": 0
+        },
+        "sse": {
+          "active": 0,
+          "canceling": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 666
+          },
+          "oldest_age_seconds": 0.0,
+          "rejected": 0
+        }
+      }
+    },
+    "python_gateway_tls": {
+      "connections": 100,
+      "elapsed_seconds": 5.064582,
+      "latency_ms": {
+        "max": 48.859642,
+        "mean": 45.796427,
+        "p95": 47.899187
+      },
+      "resources": {
+        "baseline": {
+          "fds": 4,
+          "rss_kib": 36912,
+          "threads": 2
+        },
+        "cpu_seconds": 0.11,
+        "end": {
+          "fds": 4,
+          "rss_kib": 37488,
+          "threads": 2
+        },
+        "peak": {
+          "fds": 5,
+          "rss_kib": 37488,
+          "threads": 4
+        }
+      },
+      "shutdown_seconds": 0.229069,
+      "stream_metrics": {
+        "preview": {
+          "active": 0,
+          "canceling": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 34
+          },
+          "oldest_age_seconds": 0.0,
+          "rejected": 0
+        },
+        "sse": {
+          "active": 0,
+          "canceling": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 66
+          },
+          "oldest_age_seconds": 0.0,
+          "rejected": 0
+        }
+      }
+    },
+    "rust_harness_plain": {
+      "connections": 1000,
+      "elapsed_seconds": 2.32701,
+      "latency_ms": {
+        "max": 2.441365,
+        "mean": 2.057224,
+        "p95": 2.091716
+      },
+      "resources": {
+        "baseline": {
+          "fds": 8,
+          "rss_kib": 2304,
+          "threads": 2
+        },
+        "cpu_seconds": 0.09,
+        "end": {
+          "fds": 6,
+          "rss_kib": 2496,
+          "threads": 2
+        },
+        "peak": {
+          "fds": 8,
+          "rss_kib": 2496,
+          "threads": 3
+        }
+      },
+      "shutdown_seconds": 0.003199,
+      "stream_metrics": {
+        "accepted_connections": 1001,
+        "completed_connections": 1001,
+        "preview": {
+          "acquired": 334,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 334
+          },
+          "rejected": 0,
+          "released": 334
+        },
+        "registered_streams": 0,
+        "sse": {
+          "acquired": 666,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 666
+          },
+          "rejected": 0,
+          "released": 666
+        }
+      }
+    },
+    "rust_harness_tls": {
+      "connections": 100,
+      "elapsed_seconds": 0.714476,
+      "latency_ms": {
+        "max": 6.721316,
+        "mean": 4.556425,
+        "p95": 5.274409
+      },
+      "resources": {
+        "baseline": {
+          "fds": 8,
+          "rss_kib": 3072,
+          "threads": 2
+        },
+        "cpu_seconds": 0.07,
+        "end": {
+          "fds": 6,
+          "rss_kib": 3264,
+          "threads": 2
+        },
+        "peak": {
+          "fds": 8,
+          "rss_kib": 3264,
+          "threads": 3
+        }
+      },
+      "shutdown_seconds": 0.005701,
+      "stream_metrics": {
+        "accepted_connections": 101,
+        "completed_connections": 101,
+        "preview": {
+          "acquired": 34,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 34
+          },
+          "rejected": 0,
+          "released": 34
+        },
+        "registered_streams": 0,
+        "sse": {
+          "acquired": 66,
+          "active": 0,
+          "capacity": 1,
+          "close_reasons": {
+            "peer_disconnect": 66
+          },
+          "rejected": 0,
+          "released": 66
+        }
+      }
+    }
+  }
+}

@@ -14,11 +14,11 @@ from rp_ylx.imu import (
     ImuCollector,
     ImuError,
     ImuPacketRead,
-    NativeImuCollector,
     SyntheticImuSource,
     TimestampUnwrapper,
     TimeSynchronizer,
     UvcXuImuSource,
+    decode_native_imu_observation,
     decode_packet,
     discover_uvc_xu_unit,
     find_uvc_xu_unit,
@@ -163,160 +163,50 @@ class CollectorTest(unittest.TestCase):
         self.assertTrue(duplicate_source.closed)
 
 
-class NativeCollectorAdapterTest(unittest.TestCase):
-    def test_converts_native_observation_to_existing_model(self) -> None:
-        class Owner:
-            def __init__(self) -> None:
-                self.timeout: float | None = None
-                self.closed = False
+class NativeObservationDecoderTest(unittest.TestCase):
+    @staticmethod
+    def payload() -> dict[str, object]:
+        def sample(sequence: int, sample_index: int, sign: int) -> dict[str, object]:
+            return {
+                "sequence": sequence,
+                "packet_sequence": 4,
+                "sample_index": sample_index,
+                "device_timestamp_raw": 1000,
+                "device_ticks": 1000,
+                "host_read_start_ns": 10_000_000,
+                "host_read_end_ns": 10_010_000,
+                "host_monotonic_ns": 10_005_000,
+                "raw": {
+                    "accelerometer": [sign, sign * 2, sign * 3],
+                    "gyroscope": [sign * 4, sign * 5, sign * 6],
+                },
+                "sync": {
+                    "offset_ns": None,
+                    "residual_ns": None,
+                    "quality": "insufficient",
+                },
+            }
 
-            def read(self, timeout_seconds: float) -> dict[str, object]:
-                self.timeout = timeout_seconds
-                return {
-                    "dropped_samples": 0,
-                    "samples": [
-                        {
-                            "sequence": 0,
-                            "packet_sequence": 0,
-                            "sample_index": 0,
-                            "device_timestamp_raw": 1000,
-                            "device_ticks": 1000,
-                            "host_read_start_ns": 10_999_900,
-                            "host_read_end_ns": 11_000_100,
-                            "host_monotonic_ns": 11_000_000,
-                            "raw": {
-                                "accelerometer": [1, 2, 3],
-                                "gyroscope": [4, 5, 6],
-                            },
-                            "sync": {
-                                "offset_ns": None,
-                                "residual_ns": None,
-                                "quality": "insufficient",
-                            },
-                        },
-                        {
-                            "sequence": 1,
-                            "packet_sequence": 0,
-                            "sample_index": 1,
-                            "device_timestamp_raw": 1000,
-                            "device_ticks": 1000,
-                            "host_read_start_ns": 10_999_900,
-                            "host_read_end_ns": 11_000_100,
-                            "host_monotonic_ns": 11_000_000,
-                            "raw": {
-                                "accelerometer": [-1, -2, -3],
-                                "gyroscope": [-4, -5, -6],
-                            },
-                            "sync": {
-                                "offset_ns": None,
-                                "residual_ns": None,
-                                "quality": "insufficient",
-                            },
-                        },
-                    ],
-                }
+        return {
+            "dropped_samples": 0,
+            "samples": [sample(8, 0, 1), sample(9, 1, -1)],
+        }
 
-            def unit(self) -> int:
-                return 7
-
-            def close(self) -> None:
-                self.closed = True
-
-        owner = Owner()
-        collector = NativeImuCollector("/dev/video-test", owner=owner)
-        observation = collector.read(timeout=0.25)
-        self.assertEqual(owner.timeout, 0.25)
-        self.assertEqual(collector.unit, 7)
+    def test_converts_capture_engine_snapshot_to_existing_model(self) -> None:
+        observation = decode_native_imu_observation(self.payload())
+        self.assertEqual(observation.samples[0].sequence, 8)
         self.assertEqual(observation.samples[0].accelerometer.as_list(), [1, 2, 3])
         self.assertEqual(observation.samples[1].gyroscope.as_list(), [-4, -5, -6])
         self.assertEqual(observation.samples[0].sync_quality, "insufficient")
-        collector.close()
-        self.assertTrue(owner.closed)
 
-    def test_native_latest_observation_decodes_without_reading_again(self) -> None:
-        class Owner:
-            def latest_observation(self) -> dict[str, object]:
-                return {
-                    "dropped_samples": 0,
-                    "samples": [
-                        {
-                            "sequence": 8,
-                            "packet_sequence": 4,
-                            "sample_index": 0,
-                            "device_timestamp_raw": 1000,
-                            "device_ticks": 1000,
-                            "host_read_start_ns": 10_000_000,
-                            "host_read_end_ns": 10_010_000,
-                            "host_monotonic_ns": 10_005_000,
-                            "raw": {
-                                "accelerometer": [1, 2, 3],
-                                "gyroscope": [4, 5, 6],
-                            },
-                            "sync": {
-                                "offset_ns": None,
-                                "residual_ns": None,
-                                "quality": "insufficient",
-                            },
-                        },
-                        {
-                            "sequence": 9,
-                            "packet_sequence": 4,
-                            "sample_index": 1,
-                            "device_timestamp_raw": 1000,
-                            "device_ticks": 1000,
-                            "host_read_start_ns": 10_000_000,
-                            "host_read_end_ns": 10_010_000,
-                            "host_monotonic_ns": 10_005_000,
-                            "raw": {
-                                "accelerometer": [-1, -2, -3],
-                                "gyroscope": [-4, -5, -6],
-                            },
-                            "sync": {
-                                "offset_ns": None,
-                                "residual_ns": None,
-                                "quality": "insufficient",
-                            },
-                        },
-                    ],
-                }
-
-            def close(self) -> None:
-                pass
-
-        collector = NativeImuCollector("/dev/video-test", owner=Owner())
-        latest = collector.latest_observation()
-        self.assertIsNotNone(latest)
-        assert latest is not None
-        self.assertEqual(latest.samples[0].sequence, 8)
-        self.assertEqual(latest.samples[1].accelerometer.as_list(), [-1, -2, -3])
-
-    def test_native_latest_observation_is_optional_for_old_owner(self) -> None:
-        class Owner:
-            def close(self) -> None:
-                pass
-
-        self.assertIsNone(NativeImuCollector("/dev/video-test", owner=Owner()).latest_observation())
-
-    def test_native_error_keeps_code_retryability_and_closes_owner(self) -> None:
-        class Owner:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def read(self, timeout_seconds: float) -> dict[str, object]:
-                del timeout_seconds
-                raise RuntimeError("sensor_stalled: stale IMU packet")
-
-            def close(self) -> None:
-                self.closed = True
-
-        owner = Owner()
-        collector = NativeImuCollector("/dev/video-test", owner=owner)
+    def test_rejects_malformed_capture_engine_snapshot(self) -> None:
+        payload = self.payload()
+        samples = payload["samples"]
+        assert isinstance(samples, list)
+        payload["samples"] = [samples[0]]
         with self.assertRaises(ImuError) as raised:
-            collector.read(timeout=0.25)
-        self.assertEqual(raised.exception.code, "sensor_stalled")
-        self.assertTrue(raised.exception.retryable)
-        self.assertTrue(owner.closed)
-        self.assertTrue(collector.closed)
+            decode_native_imu_observation(payload)
+        self.assertEqual(raised.exception.code, "invalid_native_observation")
 
 
 class UvcXuImuSourceTest(unittest.TestCase):

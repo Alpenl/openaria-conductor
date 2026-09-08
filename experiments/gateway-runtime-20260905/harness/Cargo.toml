@@ -1,0 +1,11 @@
+[package]
+name = "gateway-runtime-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rustls = { version = "0.23.32", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"

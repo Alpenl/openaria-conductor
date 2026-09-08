@@ -14,9 +14,7 @@ from rp_ylx.camera.models import (
     StereoFrame,
 )
 from rp_ylx.native import (
-    NativeCameraFrameValidator,
     NativeModuleError,
-    create_native_camera_frame_validator,
     native_camera_focus_status,
     set_native_camera_focus,
 )
@@ -35,12 +33,6 @@ class CameraController:
         self._last_source_sequence: int | None = None
         self._last_host_time: int | None = None
         self._metrics = metrics
-        try:
-            self._native_frame_validator: NativeCameraFrameValidator | None = (
-                create_native_camera_frame_validator()
-            )
-        except NativeModuleError:
-            self._native_frame_validator = None
 
     @property
     def state(self) -> str:
@@ -193,46 +185,8 @@ class CameraController:
     def _reset_frame_validation(self) -> None:
         self._last_source_sequence = None
         self._last_host_time = None
-        if self._native_frame_validator is not None:
-            try:
-                self._native_frame_validator.reset()
-            except Exception:
-                self._native_frame_validator = None
 
     def _validate_frame(self, frame: StereoFrame) -> int:
-        if self._native_frame_validator is not None:
-            return self._validate_frame_native(frame)
-        return self._validate_frame_python(frame)
-
-    def _validate_frame_native(self, frame: StereoFrame) -> int:
-        raw = frame.raw_side_by_side
-        try:
-            result = self._native_frame_validator.validate_frame(
-                frame.source_sequence,
-                frame.host_monotonic_ns,
-                frame.valid,
-                bool(frame.left),
-                bool(frame.right),
-                raw is not None and bool(raw),
-                frame._application_dropped_before,
-            )
-            dropped = _native_non_negative_int(result.get("dropped_before"), "dropped_before")
-            queue_rejected = _native_non_negative_int(
-                result.get("queue_rejected"), "queue_rejected"
-            )
-            source_gap = _native_non_negative_int(result.get("source_gap"), "source_gap")
-        except CameraError:
-            raise
-        except Exception as exc:
-            raise _camera_error_from_native(exc, "native_camera_frame_validator_failed") from exc
-        if self._metrics is not None:
-            if queue_rejected:
-                self._metrics.record_loss("queue_rejected", queue_rejected)
-            if source_gap:
-                self._metrics.record_loss("source_gap", source_gap)
-        return dropped
-
-    def _validate_frame_python(self, frame: StereoFrame) -> int:
         if (
             not frame.valid
             or frame.source_sequence < 0
@@ -272,20 +226,3 @@ class CameraController:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
-
-
-def _native_non_negative_int(value: object, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise CameraError(
-            "native_camera_frame_validator_failed",
-            f"原生相机帧校验结果字段无效：{name}",
-        )
-    return value
-
-
-def _camera_error_from_native(error: BaseException, fallback_code: str) -> CameraError:
-    raw = str(error)
-    code, separator, message = raw.partition(": ")
-    if not separator or not code.replace("_", "").isalnum():
-        code, message = fallback_code, raw or fallback_code
-    return CameraError(code, message)

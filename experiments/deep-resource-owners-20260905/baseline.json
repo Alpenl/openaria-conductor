@@ -1,0 +1,107 @@
+{
+  "schema": "rp-ylx.deep-resource-owner-baseline.v1",
+  "measured_at": "2026-09-05",
+  "issue": {
+    "repository": "mirrorbloom/RP-YLX",
+    "number": 74
+  },
+  "baseline": {
+    "commit": "5d4c74bd6bab9760f7fbf63337d1b89f1bdf73d5",
+    "native_protocols": 22,
+    "pyo3_classes": 22,
+    "key_file_lines": {
+      "native/src/lib.rs": 3133,
+      "src/rp_ylx/native.py": 1317,
+      "src/rp_ylx/recording/device_session.py": 2777,
+      "src/rp_ylx/recording/sources.py": 1252
+    }
+  },
+  "candidate": {
+    "implementation_commit": "d75ffa7f74f8bad453b1015aac06af2af9b5307d",
+    "native_abi": 5,
+    "native_protocols": 7,
+    "pyo3_classes": 7,
+    "constructible_recording_owners": [
+      "NativeCaptureEngine",
+      "NativeSessionStore"
+    ],
+    "returned_or_support_classes": [
+      "NativeSessionTransaction",
+      "NativePreviewBuffer",
+      "NativeMultipartPreview",
+      "NativePerformanceMetrics",
+      "NativeSplitter"
+    ],
+    "key_file_lines": {
+      "native/src/lib.rs": 1322,
+      "src/rp_ylx/native.py": 513,
+      "src/rp_ylx/recording/device_session.py": 2290,
+      "src/rp_ylx/recording/sources.py": 682
+    },
+    "product_test_delta": {
+      "files": 34,
+      "insertions": 2953,
+      "deletions": 6057,
+      "net_lines": -3104
+    }
+  },
+  "pyo3_call_frequency": {
+    "captured_video_frame": 0,
+    "audio_chunk": 0,
+    "imu_sample": 0,
+    "encoder_event": 0,
+    "recording_start": {
+      "session_store_begin": 1,
+      "capture_engine_start": 1
+    },
+    "recording_progress_snapshot": {
+      "transaction_snapshot": "at most 1 per requested control-plane snapshot",
+      "transaction_segments": "1 per 200 ms harvest tick",
+      "latest_imu": "bounded by status polling"
+    },
+    "recording_stop": {
+      "capture_engine_stop": 1,
+      "transaction_finish": 1,
+      "transaction_boundary": "2 per encoded segment",
+      "transaction_seal": 1
+    },
+    "multipart_preview": {
+      "open": 1,
+      "iterator_step": "1 per delivered preview frame",
+      "close": 1,
+      "reason": "Python gateway retained after GatewayRuntime NO-GO"
+    }
+  },
+  "fallback_reachability": {
+    "production_camera_imu": "unreachable; native CaptureEngine is daemon-gated",
+    "production_recording_writer": "unreachable; native SessionTransaction is required",
+    "production_session_store": "unreachable; native SessionStore is daemon-gated",
+    "production_preview_metrics": "unreachable; both native capabilities are daemon-gated",
+    "explicit_test_adapters": "reachable only through paired injected factories",
+    "python_gateway": "selected production implementation, not a fallback"
+  },
+  "rdk_x5": {
+    "status": "unavailable",
+    "cpu": null,
+    "rss_kib": null,
+    "threads": null,
+    "file_descriptors": null,
+    "queue_depth": null,
+    "application_drops": null,
+    "stop_latency_seconds": null,
+    "note": "No target measurement is claimed until the exact public artifact runs on a reachable RDK X5."
+  },
+  "gateway_runtime_experiment": {
+    "implementation": "isolated_not_packaged",
+    "preflight": "passed",
+    "formal_result": {
+      "path": "experiments/gateway-runtime-20260905/result.json",
+      "source_commit": "99855a278634b7f322d9fcef0cf8e0dfe992c65b",
+      "plain_reconnects_per_backend": 1000,
+      "tls_reconnects_per_backend": 100,
+      "capacity_rejections": 0,
+      "permit_leaks": 0
+    },
+    "decision": "no-go"
+  }
+}

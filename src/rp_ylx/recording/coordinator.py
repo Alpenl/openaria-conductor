@@ -2127,6 +2127,7 @@ class CaptureCoordinator:
             checkpoint_interval=self._config.checkpoint_interval,
             metrics=self._metrics,
             before_write=self._before_write,
+            native_data_plane=bool(getattr(self._sources, "requires_native_transaction", False)),
         )
         self._active = recorder
         self._active_plan = plan
@@ -2674,6 +2675,13 @@ class CaptureCoordinator:
                     reason="stale",
                 )
             return _TrackedRepresentation(representation, release)
+        except ArtifactAccessError as error:
+            if error.code == "not_verified":
+                with self._catalog_lock:
+                    if self._session_snapshots.get(session_id) == snapshot:
+                        self._invalidate_session_verification(session_id)
+            release()
+            raise
         except Exception:
             release()
             raise

@@ -25,38 +25,6 @@ rp-ylx = "rp_ylx.cli:main"
 rp-ylx-deploy = "rp_ylx.deployment:main"
 rp-ylx-spectacular-check = "rp_ylx.spectacular.check_cli:main"
 
-[tool.setuptools.package-dir]
-"" = "src"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-rp_ylx = [
-  "contracts/*.json",
-  "api/*.json",
-  "api/*.yaml",
-  "schemas/*.json",
-  "hobot/*.c",
-  "hobot/*.h",
-  "hobot/Makefile",
-]
-"rp_ylx.deploy" = [
-  "*.avahi",
-  "*.service",
-  "*.socket",
-  "*.timer",
-  "*.sysusers",
-  "*.tmpfiles",
-  "*.conf",
-  "*.default",
-  "rp-ylx-data-volume",
-  "rp-ylx-device-login",
-  "rp-ylx-wifi-watchdog",
-]
-# Echo / Web 制品：托管集合由内部 assets.json 声明，打包时必须整份带上。
-"rp_ylx.web" = ["assets.json", "*.html", "*.css", "*.js"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"

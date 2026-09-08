@@ -255,13 +255,6 @@ impl Collector {
         }
     }
 
-    pub(crate) fn unit(&self) -> Result<u8, ImuError> {
-        self.state
-            .lock()
-            .map(|state| state.unit)
-            .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))
-    }
-
     pub(crate) fn latest_observation(&self) -> Result<Option<ImuObservation>, ImuError> {
         self.state
             .lock()

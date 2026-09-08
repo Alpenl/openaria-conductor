@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from rp_ylx.api.gateway import ProviderError, create_gateway_server
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewResponse
 from rp_ylx.api.security import Principal, SecurityPolicy
+from rp_ylx.native import NativeModuleError
 
 JPEG_FRAME = b"\xff\xd8latest-preview\xff\xd9"
 FPS_FIVE_FRAME = b"\xff\xd8fps=5;accept=image/jpeg\xff\xd9"
@@ -275,8 +276,12 @@ class GatewayPreviewHttpTest(unittest.TestCase):
             response.close()
             connection.close()
 
-    def test_preview_retains_the_original_owned_bytes_without_copying(self) -> None:
-        buffer = LatestPreviewBuffer(stream_fps=15)
+    def test_python_preview_fallback_retains_original_owned_bytes(self) -> None:
+        with patch(
+            "rp_ylx.api.preview.create_native_preview_buffer",
+            side_effect=NativeModuleError("native_unavailable", "native preview unavailable"),
+        ):
+            buffer = LatestPreviewBuffer(stream_fps=15)
         payload = bytes(bytearray(STREAM_INITIAL))
         buffer.publish(payload)
         response = buffer.jpeg_response()

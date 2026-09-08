@@ -10,13 +10,11 @@ from rp_ylx.camera.models import (
 )
 from rp_ylx.camera.synthetic import SyntheticCameraBackend
 from rp_ylx.camera.v4l2 import (
-    NativeV4L2CameraStream,
     V4L2CameraStream,
     V4L2DiscoveryBackend,
     parse_v4l2_formats,
     split_sbs_mjpeg,
     split_sbs_mjpeg_native,
-    v4l2_production_stream_factory,
     v4l2_stream_factory,
 )
 
@@ -28,12 +26,10 @@ __all__ = [
     "FrameObservation",
     "StereoFrame",
     "SyntheticCameraBackend",
-    "NativeV4L2CameraStream",
     "V4L2CameraStream",
     "V4L2DiscoveryBackend",
     "parse_v4l2_formats",
     "split_sbs_mjpeg",
     "split_sbs_mjpeg_native",
-    "v4l2_production_stream_factory",
     "v4l2_stream_factory",
 ]
