@@ -1,0 +1,19 @@
+{
+  "baseline": {
+    "recording_rs_sha256": "0e0e7c6fda9ea7a555482bd8e480de6cad68cc220dcbbdf64d2fd7c0eb7104f7",
+    "trace": {
+      "sha256": "08c0e50020435a344d0a9c24cf064fc69472aea4913d6caedc81f9edce05c13a",
+      "traces": 400000,
+      "transitions": 2000000
+    }
+  },
+  "candidate": {
+    "recording_rs_sha256": "ca72c36420358be0521e4a2dbce5dcb518c06001b3f1aea39123ccb464d810be",
+    "trace": {
+      "sha256": "08c0e50020435a344d0a9c24cf064fc69472aea4913d6caedc81f9edce05c13a",
+      "traces": 400000,
+      "transitions": 2000000
+    }
+  },
+  "equal": true
+}

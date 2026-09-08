@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -26,6 +26,9 @@ from typing import Protocol
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
+    LockedArtifact,
+    LockedBytes,
+    LockedManifest,
     iter_device_session_v1_artifacts,
 )
 from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
@@ -221,24 +224,6 @@ def _decode_session_cursor(cursor: str) -> Mapping[str, object]:
     return value
 
 
-class _Representation(Protocol):
-    etag: str
-    size: int
-    content_type: str
-
-    def close(self) -> None: ...
-
-    def read(self, offset: int = 0, length: int | None = None) -> bytes: ...
-
-    def iter_chunks(
-        self,
-        offset: int = 0,
-        length: int | None = None,
-        *,
-        chunk_size: int = 1024 * 1024,
-    ) -> object: ...
-
-
 class CaptureSources(Protocol):
     @property
     def supports_calibration_capture(self) -> bool: ...
@@ -409,7 +394,7 @@ def _default_mount_identity(mountpoint: Path) -> str:
 class _TrackedRepresentation:
     def __init__(
         self,
-        representation: _Representation,
+        representation: LockedBytes,
         release: Callable[[], None],
     ) -> None:
         self._representation = representation
@@ -451,23 +436,11 @@ class _TrackedRepresentation:
         length: int | None = None,
         *,
         chunk_size: int = 1024 * 1024,
-    ) -> object:
+    ) -> Iterator[bytes]:
         return self._representation.iter_chunks(offset, length, chunk_size=chunk_size)
 
     def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
-        send_to = getattr(self._representation, "send_to", None)
-        if callable(send_to):
-            return int(send_to(output_descriptor, offset, length))
-        sent = 0
-        for chunk in self.iter_chunks(offset, length):
-            view = memoryview(chunk)
-            while view:
-                written = os.write(output_descriptor, view)
-                if written <= 0:
-                    raise BrokenPipeError("representation socket wrote zero bytes")
-                sent += written
-                view = view[written:]
-        return sent
+        return self._representation.send_to(output_descriptor, offset, length)
 
 
 class _MultiRootSessionStore:
@@ -487,7 +460,7 @@ class _MultiRootSessionStore:
         for store in self._stores:
             store.close()
 
-    def open_manifest(self, session_id: str, api_version: str) -> object:
+    def open_manifest(self, session_id: str, api_version: str) -> LockedManifest:
         not_found: ArtifactAccessError | None = None
         for store in self._stores:
             try:
@@ -500,7 +473,9 @@ class _MultiRootSessionStore:
             raise not_found
         raise ArtifactAccessError("not_found", "会话不存在")
 
-    def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
+    def open_verified_artifact(
+        self, session_id: str, artifact_id: str, api_version: str
+    ) -> LockedArtifact:
         last_retryable: ArtifactAccessError | None = None
         for store in self._stores:
             try:

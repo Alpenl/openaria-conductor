@@ -21,7 +21,7 @@ from rp_ylx.camera import (
     FrameObservation,
     StereoFrame,
 )
-from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.imu import ImuObservation, ImuSample, RawVector3, decode_native_imu_observation
 from rp_ylx.recording import (
     CaptureCoordinator,
     ContinuousCaptureSources,
@@ -264,13 +264,32 @@ class StreamingImu:
         self.closed.set()
 
 
+class FakeNativeImu:
+    def __init__(self) -> None:
+        self.native_owner = object()
+        self.closed = False
+        self.close_calls = 0
+        self.read_calls = 0
+        self.latest: ImuObservation | None = None
+
+    def read(self, *, timeout: float) -> ImuObservation:
+        del timeout
+        self.read_calls += 1
+        raise AssertionError("native capture must not use a Python IMU read loop")
+
+    def latest_observation(self) -> ImuObservation | None:
+        return None if self.closed else self.latest
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+
+
 class FakeNativeContinuousRuntime:
     def __init__(self) -> None:
         self.preview_started = False
         self.closed = False
         self.stop_calls = 0
-        self.submit_frame = None
-        self.submit_imu = None
         self.imu = None
         self.imu_timeout_seconds = None
         self.on_failure = None
@@ -282,21 +301,6 @@ class FakeNativeContinuousRuntime:
 
     def start_preview(self) -> None:
         self.preview_started = True
-
-    def start_recording(
-        self,
-        submit_frame: object,
-        on_failure: object,
-        imu: object | None = None,
-        submit_imu: object | None = None,
-        imu_timeout_seconds: float = 1.0,
-    ) -> dict[str, object]:
-        self.submit_frame = submit_frame
-        self.submit_imu = submit_imu
-        self.imu = imu
-        self.imu_timeout_seconds = imu_timeout_seconds
-        self.on_failure = on_failure
-        return self.snapshot()
 
     def start_recording_split_sink(
         self,
@@ -319,29 +323,6 @@ class FakeNativeContinuousRuntime:
         self.imu_timeout_seconds = imu_timeout_seconds
         return self.snapshot()
 
-    def emit_frame(
-        self,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        dropped_before: int,
-        left: bytes,
-        right: bytes,
-        raw_side_by_side: bytes,
-    ) -> object:
-        assert self.submit_frame is not None
-        return self.submit_frame(
-            source_sequence,
-            host_monotonic_ns,
-            dropped_before,
-            left,
-            right,
-            raw_side_by_side,
-        )
-
-    def emit_imu(self, raw: object) -> object:
-        assert self.submit_imu is not None
-        return self.submit_imu(raw)
-
     def fail(self, code: str, message: str) -> None:
         assert self.on_failure is not None
         self.on_failure(code, message)
@@ -359,14 +340,20 @@ class FakeNativeContinuousRuntime:
     def snapshot(self) -> dict[str, object]:
         return {
             "running": self.preview_started and not self.closed,
-            "recording_present": self.submit_frame is not None or self.active_take is not None,
-            "recording_active": self.submit_frame is not None or self.active_take is not None,
+            "recording_present": self.active_take is not None,
+            "recording_active": self.active_take is not None,
             "inflight_frames": 0,
             "observed_frames": 0,
             "failure_reported": False,
             "terminal_error": None,
             "last_preview_error": None,
         }
+
+
+def native_recorder() -> SimpleNamespace:
+    return SimpleNamespace(
+        native_split_sink_targets=lambda: (object(), object(), object(), object(), 123_456_789)
+    )
 
 
 def capture_command(key: str, body: dict[str, object]) -> CaptureCommand:
@@ -580,8 +567,8 @@ class CaptureSourcesTest(unittest.TestCase):
         )
         self.assertEqual(preview_payloads, [f"left-{index}".encode() for index in range(6)])
 
-    def test_native_continuous_sources_convert_runtime_frames_for_recorder(self) -> None:
-        imu = BlockingImu()
+    def test_native_continuous_sources_open_raw_camera_for_direct_recording(self) -> None:
+        imu = FakeNativeImu()
         runtime = FakeNativeContinuousRuntime()
         native_camera = object()
         preview = SimpleNamespace(native_owner=object())
@@ -594,7 +581,6 @@ class CaptureSourcesTest(unittest.TestCase):
             preview=preview,
             read_timeout=0.1,
             frame_decimation=2,
-            require_native_imu=False,
         )
         try:
             with (
@@ -613,6 +599,7 @@ class CaptureSourcesTest(unittest.TestCase):
                     submit_frame=lambda observation: submitted.append(observation) or True,
                     submit_imu=lambda observation: True,
                     on_failure=lambda code, message: failures.append((code, message)),
+                    native_recorder=native_recorder(),
                 )
             create_camera.assert_called_once_with(
                 "/dev/video0",
@@ -631,19 +618,14 @@ class CaptureSourcesTest(unittest.TestCase):
                 read_timeout_seconds=0.1,
             )
             self.assertTrue(runtime.preview_started)
-            self.assertTrue(
-                runtime.emit_frame(7, 123_456, 3, b"", b"", JPEG),
-            )
+            self.assertIsNotNone(runtime.sink)
         finally:
             sources.close()
 
         self.assertFalse(failures)
-        self.assertEqual(len(submitted), 1)
-        self.assertEqual(submitted[0].frame.source_sequence, 7)
-        self.assertEqual(submitted[0].frame.host_monotonic_ns, 123_456)
-        self.assertEqual(submitted[0].frame.raw_side_by_side, JPEG)
-        self.assertEqual(submitted[0].dropped_before, 3)
-        self.assertTrue(imu.closed.is_set())
+        self.assertFalse(submitted)
+        self.assertTrue(imu.closed)
+        self.assertEqual(imu.read_calls, 0)
         self.assertTrue(runtime.closed)
 
     def test_native_continuous_sources_use_open_camera_for_focus_controls(self) -> None:
@@ -818,6 +800,7 @@ class CaptureSourcesTest(unittest.TestCase):
                     submit_frame=lambda observation: True,
                     submit_imu=lambda observation: True,
                     on_failure=lambda code, message: None,
+                    native_recorder=native_recorder(),
                 )
         finally:
             sources.close()
@@ -825,9 +808,8 @@ class CaptureSourcesTest(unittest.TestCase):
         self.assertTrue(imu.closed.is_set())
         self.assertEqual(sources.open_handle_count, 0)
 
-    def test_native_continuous_sources_require_split_calibration_recorder(self) -> None:
+    def test_native_continuous_sources_require_split_recorder_in_all_modes(self) -> None:
         imu_factory_calls: list[bool] = []
-        recorder = SimpleNamespace()
         sources = NativeContinuousCaptureSources(
             "/dev/video0",
             lambda: imu_factory_calls.append(True),  # type: ignore[arg-type,func-returns-value]
@@ -836,15 +818,24 @@ class CaptureSourcesTest(unittest.TestCase):
             read_timeout=0.1,
         )
         try:
-            with self.assertRaisesRegex(RuntimeError, "split-eyes"):
-                sources.start(
-                    mode="calibration",
-                    generation_id=str(uuid.uuid4()),
-                    submit_frame=lambda observation: True,
-                    submit_imu=lambda observation: True,
-                    on_failure=lambda code, message: None,
-                    native_recorder=recorder,
-                )
+            for mode in ("production", "calibration"):
+                for recorder in (
+                    None,
+                    SimpleNamespace(),
+                    SimpleNamespace(native_split_sink_targets=lambda: None),
+                ):
+                    with (
+                        self.subTest(mode=mode, recorder=recorder),
+                        self.assertRaisesRegex(RuntimeError, "split-eyes"),
+                    ):
+                        sources.start(
+                            mode=mode,
+                            generation_id=str(uuid.uuid4()),
+                            submit_frame=lambda observation: self.fail("unexpected frame callback"),
+                            submit_imu=lambda observation: self.fail("unexpected IMU callback"),
+                            on_failure=lambda code, message: None,
+                            native_recorder=recorder,
+                        )
         finally:
             sources.close()
 
@@ -852,18 +843,6 @@ class CaptureSourcesTest(unittest.TestCase):
         self.assertEqual(sources.open_handle_count, 0)
 
     def test_native_continuous_sources_reap_failed_native_worker_before_retry(self) -> None:
-        class NativeOnlyImu:
-            def __init__(self) -> None:
-                self.native_owner = object()
-                self.closed = False
-
-            def read(self, *, timeout: float) -> ImuObservation:
-                del timeout
-                raise AssertionError("direct native IMU path must not use Python read loop")
-
-            def close(self) -> None:
-                self.closed = True
-
         class StaleWorkerRuntime(FakeNativeContinuousRuntime):
             def __init__(self) -> None:
                 super().__init__()
@@ -901,11 +880,11 @@ class CaptureSourcesTest(unittest.TestCase):
                 return super().stop_recording(timeout_seconds)
 
         runtime = StaleWorkerRuntime()
-        imus: list[NativeOnlyImu] = []
+        imus: list[FakeNativeImu] = []
         failures: list[tuple[str, str]] = []
 
-        def imu_factory() -> NativeOnlyImu:
-            imu = NativeOnlyImu()
+        def imu_factory() -> FakeNativeImu:
+            imu = FakeNativeImu()
             imus.append(imu)
             return imu
 
@@ -964,18 +943,6 @@ class CaptureSourcesTest(unittest.TestCase):
             sources.close()
 
     def test_native_continuous_sources_route_calibration_to_split_sink(self) -> None:
-        class NativeOnlyImu:
-            def __init__(self) -> None:
-                self.native_owner = object()
-                self.closed = False
-
-            def read(self, *, timeout: float) -> ImuObservation:
-                del timeout
-                raise AssertionError("direct split native IMU path must not use Python read loop")
-
-            def close(self) -> None:
-                self.closed = True
-
         active_take = object()
         sink = object()
         encoder = object()
@@ -990,7 +957,7 @@ class CaptureSourcesTest(unittest.TestCase):
                 started_monotonic_ns,
             ),
         )
-        imu = NativeOnlyImu()
+        imu = FakeNativeImu()
         runtime = FakeNativeContinuousRuntime()
         preview = SimpleNamespace(native_owner=object())
         submitted: list[FrameObservation] = []
@@ -1024,8 +991,6 @@ class CaptureSourcesTest(unittest.TestCase):
             self.assertIs(runtime.segment_planner, segment_planner)
             self.assertEqual(runtime.recording_start_monotonic_ns, started_monotonic_ns)
             self.assertIs(runtime.imu, imu.native_owner)
-            self.assertIsNone(runtime.submit_frame)
-            self.assertIsNone(runtime.submit_imu)
         finally:
             sources.close()
 
@@ -1104,22 +1069,8 @@ class CaptureSourcesTest(unittest.TestCase):
         finally:
             sources.close()
 
-    def test_native_continuous_sources_let_runtime_submit_native_imu(self) -> None:
-        class NativeOnlyImu:
-            def __init__(self) -> None:
-                self.native_owner = object()
-                self.closed = False
-                self.read_calls = 0
-
-            def read(self, *, timeout: float) -> ImuObservation:
-                del timeout
-                self.read_calls += 1
-                raise AssertionError("native IMU path must not use Python read loop")
-
-            def close(self) -> None:
-                self.closed = True
-
-        imu = NativeOnlyImu()
+    def test_native_continuous_sources_read_latest_imu_without_python_capture(self) -> None:
+        imu = FakeNativeImu()
         runtime = FakeNativeContinuousRuntime()
         preview = SimpleNamespace(native_owner=object())
         submitted_imu: list[ImuObservation] = []
@@ -1144,20 +1095,25 @@ class CaptureSourcesTest(unittest.TestCase):
                     submit_frame=lambda observation: True,
                     submit_imu=lambda observation: submitted_imu.append(observation) or True,
                     on_failure=lambda code, message: None,
+                    native_recorder=native_recorder(),
                 )
             self.assertIs(runtime.imu, imu.native_owner)
             self.assertEqual(runtime.imu_timeout_seconds, 0.1)
-            self.assertTrue(runtime.emit_imu(native_imu_observation(10)))
+            self.assertIsNone(sources.latest_imu_observation())
+            imu.latest = decode_native_imu_observation(native_imu_observation(10))
+            observation = sources.latest_imu_observation()
+            self.assertIs(observation, imu.latest)
+            self.assertEqual([sample.sequence for sample in observation.samples], [10, 11])
         finally:
             sources.close()
 
         self.assertEqual(imu.read_calls, 0)
         self.assertTrue(imu.closed)
-        self.assertEqual(len(submitted_imu), 1)
-        self.assertEqual([sample.sequence for sample in submitted_imu[0].samples], [10, 11])
+        self.assertFalse(submitted_imu)
+        self.assertIsNone(sources.latest_imu_observation())
 
     def test_native_continuous_sources_detach_imu_on_runtime_failure(self) -> None:
-        imu = BlockingImu()
+        imu = FakeNativeImu()
         runtime = FakeNativeContinuousRuntime()
         preview = SimpleNamespace(native_owner=object())
         failures: list[tuple[str, str]] = []
@@ -1167,7 +1123,6 @@ class CaptureSourcesTest(unittest.TestCase):
             CameraMode(3840, 1080, 60.0, "mjpg"),
             preview=preview,
             read_timeout=0.1,
-            require_native_imu=False,
         )
         try:
             with (
@@ -1183,16 +1138,16 @@ class CaptureSourcesTest(unittest.TestCase):
                     submit_frame=lambda observation: True,
                     submit_imu=lambda observation: True,
                     on_failure=lambda code, message: failures.append((code, message)),
+                    native_recorder=native_recorder(),
                 )
             runtime.fail("camera_failed", "boom")
-            deadline = time.monotonic() + 1
-            while sources.open_handle_count != 1 and time.monotonic() < deadline:
-                time.sleep(0.01)
+            self.assertEqual(sources.open_handle_count, 1)
         finally:
             sources.close()
 
         self.assertEqual(failures, [("camera_failed", "boom")])
-        self.assertTrue(imu.closed.is_set())
+        self.assertTrue(imu.closed)
+        self.assertEqual(imu.close_calls, 1)
         self.assertEqual(sources.open_handle_count, 0)
         self.assertTrue(runtime.closed)
 

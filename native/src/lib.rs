@@ -797,42 +797,6 @@ impl NativeContinuousCaptureRuntime {
             .map_err(capture_runtime_error)
     }
 
-    #[pyo3(signature = (submit_frame, on_failure, imu=None, submit_imu=None, imu_timeout_seconds=1.0))]
-    fn start_recording(
-        &self,
-        py: Python<'_>,
-        submit_frame: Py<PyAny>,
-        on_failure: Py<PyAny>,
-        imu: Option<PyRef<'_, NativeImuCollector>>,
-        submit_imu: Option<Py<PyAny>>,
-        imu_timeout_seconds: f64,
-    ) -> PyResult<Py<PyDict>> {
-        if imu.is_some() != submit_imu.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: imu and submit_imu must be provided together",
-            ));
-        }
-        if !imu_timeout_seconds.is_finite() || imu_timeout_seconds <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "invalid_argument: imu_timeout_seconds must be finite and positive",
-            ));
-        }
-        let imu_collector = imu
-            .as_ref()
-            .map(|collector| Arc::clone(&collector.collector));
-        let snapshot = self
-            .runtime
-            .start_recording(
-                submit_frame,
-                on_failure,
-                imu_collector,
-                submit_imu,
-                Duration::from_secs_f64(imu_timeout_seconds),
-            )
-            .map_err(capture_runtime_error)?;
-        capture_runtime_snapshot_dict(py, &snapshot)
-    }
-
     #[pyo3(signature = (active_take, sink, encoder, segment_planner, recording_start_monotonic_ns, on_failure, imu=None, imu_timeout_seconds=1.0))]
     #[allow(clippy::too_many_arguments)]
     fn start_recording_split_sink(

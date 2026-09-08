@@ -214,15 +214,6 @@ class NativeRecordingSink(Protocol):
 class NativeContinuousCaptureRuntime(Protocol):
     def start_preview(self) -> None: ...
 
-    def start_recording(
-        self,
-        submit_frame: object,
-        on_failure: object,
-        imu: object | None = None,
-        submit_imu: object | None = None,
-        imu_timeout_seconds: float = 1.0,
-    ) -> dict[str, object]: ...
-
     def start_recording_split_sink(
         self,
         active_take: NativeActiveTakeWriter,

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Protocol
 
 from rp_ylx.api.preview import LatestPreviewBuffer
-from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
-from rp_ylx.imu import ImuObservation, decode_native_imu_observation
+from rp_ylx.camera import CameraError, CameraMode, FrameObservation
+from rp_ylx.imu import ImuObservation, NativeImuCollector
 from rp_ylx.native import (
     NativeCamera,
     NativeContinuousCaptureRuntime,
@@ -51,6 +51,12 @@ class CaptureImu(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(slots=True)
+class _NativeRecording:
+    imu: NativeImuCollector | None
+    on_failure: Callable[[str, str], None]
+
+
 class NativeContinuousCaptureSources:
     """生产路径：Rust 拥有连续相机采集、preview 和录制 fanout。"""
 
@@ -60,7 +66,7 @@ class NativeContinuousCaptureSources:
     def __init__(
         self,
         device: str,
-        imu_factory: Callable[[], CaptureImu],
+        imu_factory: Callable[[], NativeImuCollector],
         camera_mode: CameraMode,
         *,
         preview: LatestPreviewBuffer,
@@ -68,7 +74,6 @@ class NativeContinuousCaptureSources:
         frame_decimation: int = 1,
         buffer_count: int = 16,
         queue_capacity: int = 64,
-        require_native_imu: bool = True,
         metrics: PerformanceMetrics | None = None,
     ) -> None:
         if read_timeout <= 0:
@@ -88,12 +93,11 @@ class NativeContinuousCaptureSources:
         self._frame_decimation = frame_decimation
         self._buffer_count = buffer_count
         self._queue_capacity = queue_capacity
-        self._require_native_imu = require_native_imu
         self._metrics = metrics
         self._lock = threading.RLock()
         self._runtime: NativeContinuousCaptureRuntime | None = None
         self._camera: NativeCamera | None = None
-        self._recording: _RecordingTap | None = None
+        self._recording: _NativeRecording | None = None
         self._open_handles = 0
         self._last_preview_error: tuple[str, str] | None = None
 
@@ -112,14 +116,8 @@ class NativeContinuousCaptureSources:
             tap = self._recording
             if tap is None:
                 return None
-            cached = tap.latest_imu
             imu = tap.imu
-        if cached is not None:
-            return cached
-        latest = getattr(imu, "latest_observation", None)
-        if callable(latest):
-            return latest()
-        return None
+        return None if imu is None else imu.latest_observation()
 
     def camera_connection_status(self) -> dict[str, object]:
         return {
@@ -218,37 +216,20 @@ class NativeContinuousCaptureSources:
         on_failure: Callable[[str, str], None],
         native_recorder: object | None = None,
     ) -> None:
+        del generation_id, submit_frame, submit_imu
         if mode not in {"production", "calibration"}:
             raise RuntimeError("采集模式无效")
         native_split_targets = self._native_split_sink_targets(native_recorder)
-        if mode == "calibration" and native_split_targets is None:
-            raise RuntimeError("标定录制要求原生 split-eyes H.264 sink")
+        if native_split_targets is None:
+            raise RuntimeError("原生录制要求原生 split-eyes H.264 sink")
         self.start_preview()
         imu = self._imu_factory()
         native_imu = getattr(imu, "native_owner", None)
-        if self._require_native_imu and native_imu is None:
+        if native_imu is None:
             with suppress(BaseException):
                 imu.close()
             raise RuntimeError("正式连续采集需要 Rust IMU 采集器")
-        tap = _RecordingTap(
-            generation_id,
-            submit_frame,
-            submit_imu,
-            on_failure,
-            self._frame_decimation,
-            imu=imu,
-        )
-        thread = (
-            None
-            if native_imu is not None
-            else threading.Thread(
-                target=self._imu_loop,
-                args=(tap,),
-                name="rp-ylx-capture-imu",
-                daemon=False,
-            )
-        )
-        tap.imu_thread = thread
+        tap = _NativeRecording(imu, on_failure)
         with self._lock:
             if self._recording is not None:
                 with suppress(BaseException):
@@ -267,73 +248,17 @@ class NativeContinuousCaptureSources:
             # runtime before installing the next native recording target so a
             # failed session cannot poison the first retry.
             runtime.stop_recording(self._read_timeout + 1.0)
-            if native_split_targets is not None:
-                active_take, sink, encoder, segment_planner, started_monotonic_ns = (
-                    native_split_targets
-                )
-                if native_imu is None:
-                    runtime.start_recording_split_sink(
-                        active_take,
-                        sink,
-                        encoder,
-                        segment_planner,
-                        started_monotonic_ns,
-                        lambda code, message: self._runtime_failure(tap, code, message),
-                    )
-                    assert thread is not None
-                    thread.start()
-                else:
-                    runtime.start_recording_split_sink(
-                        active_take,
-                        sink,
-                        encoder,
-                        segment_planner,
-                        started_monotonic_ns,
-                        lambda code, message: self._runtime_failure(tap, code, message),
-                        native_imu,
-                        self._read_timeout,
-                    )
-                return
-            if mode == "calibration":
-                raise RuntimeError("标定录制禁止回退到非 split-eyes H.264 路径")
-
-            def submit_native_frame(
-                source_sequence: int,
-                host_monotonic_ns: int,
-                dropped_before: int,
-                left: bytes,
-                right: bytes,
-                raw_side_by_side: bytes,
-            ) -> bool:
-                return self._submit_native_frame(
-                    tap,
-                    source_sequence,
-                    host_monotonic_ns,
-                    dropped_before,
-                    left,
-                    right,
-                    raw_side_by_side,
-                )
-
-            if native_imu is None:
-                runtime.start_recording(
-                    submit_native_frame,
-                    lambda code, message: self._runtime_failure(tap, code, message),
-                )
-                assert thread is not None
-                thread.start()
-            else:
-
-                def submit_native_imu(raw: object) -> bool:
-                    return self._submit_native_imu(tap, raw)
-
-                runtime.start_recording(
-                    submit_native_frame,
-                    lambda code, message: self._runtime_failure(tap, code, message),
-                    native_imu,
-                    submit_native_imu,
-                    self._read_timeout,
-                )
+            active_take, sink, encoder, segment_planner, started_monotonic_ns = native_split_targets
+            runtime.start_recording_split_sink(
+                active_take,
+                sink,
+                encoder,
+                segment_planner,
+                started_monotonic_ns,
+                lambda code, message: self._runtime_failure(tap, code, message),
+                native_imu,
+                self._read_timeout,
+            )
         except BaseException:
             with self._lock:
                 if self._recording is tap:
@@ -363,43 +288,7 @@ class NativeContinuousCaptureSources:
             raise RuntimeError("原生 split sink 起始时间无效")
         return result
 
-    def _submit_native_frame(
-        self,
-        tap: _RecordingTap,
-        source_sequence: int,
-        host_monotonic_ns: int,
-        dropped_before: int,
-        left: bytes,
-        right: bytes,
-        raw_side_by_side: bytes,
-    ) -> bool:
-        if self._recording_snapshot() is not tap:
-            return False
-        observation = FrameObservation(
-            StereoFrame(
-                source_sequence,
-                host_monotonic_ns,
-                left,
-                right,
-                True,
-                raw_side_by_side,
-            ),
-            dropped_before=dropped_before,
-        )
-        return tap.submit_frame(observation)
-
-    def _submit_native_imu(self, tap: _RecordingTap, raw: object) -> bool:
-        if self._recording_snapshot() is not tap:
-            return False
-        observation = decode_native_imu_observation(raw)
-        with self._lock:
-            if self._recording is tap:
-                tap.latest_imu = observation
-        if self._recording_snapshot() is not tap:
-            return False
-        return tap.submit_imu(observation)
-
-    def _runtime_failure(self, tap: _RecordingTap, code: object, message: object) -> None:
+    def _runtime_failure(self, tap: _NativeRecording, code: object, message: object) -> None:
         failure_code = str(code)
         failure_message = str(message) or failure_code
         with self._lock:
@@ -409,32 +298,7 @@ class NativeContinuousCaptureSources:
         self._release_recording_imu(tap)
         tap.on_failure(failure_code, failure_message)
 
-    def _recording_snapshot(self) -> _RecordingTap | None:
-        with self._lock:
-            return self._recording
-
-    def _imu_loop(self, tap: _RecordingTap) -> None:
-        assert tap.imu is not None
-        try:
-            while self._recording_snapshot() is tap:
-                observation = tap.imu.read(timeout=self._read_timeout)
-                if self._recording_snapshot() is not tap:
-                    break
-                with self._lock:
-                    if self._recording is tap:
-                        tap.latest_imu = observation
-                tap.submit_imu(observation)
-        except BaseException as error:
-            if self._recording_snapshot() is tap:
-                self._runtime_failure(
-                    tap,
-                    str(getattr(error, "code", "imu_failed")),
-                    str(getattr(error, "message", error)) or "imu_failed",
-                )
-        finally:
-            self._release_recording_imu(tap)
-
-    def _release_recording_imu(self, tap: _RecordingTap) -> None:
+    def _release_recording_imu(self, tap: _NativeRecording) -> None:
         with self._lock:
             imu = tap.imu
             if imu is None:
@@ -442,7 +306,6 @@ class NativeContinuousCaptureSources:
             if self._recording is tap:
                 self._recording = None
             tap.imu = None
-            tap.imu_thread = None
             self._open_handles -= 1
         with suppress(BaseException):
             imu.close()
@@ -456,16 +319,7 @@ class NativeContinuousCaptureSources:
             runtime.stop_recording(self._read_timeout + 1.0)
         if tap is None:
             return
-        if tap.imu is not None:
-            with suppress(BaseException):
-                tap.imu.close()
-        thread = tap.imu_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=self._read_timeout + 1.0)
-            if thread.is_alive():
-                raise RuntimeError("IMU 采集线程未能在关闭期限内退出")
-        if tap.imu is not None:
-            self._release_recording_imu(tap)
+        self._release_recording_imu(tap)
 
     def _camera_for_control(self) -> NativeCamera:
         self.start_preview()
