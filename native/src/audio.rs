@@ -1052,13 +1052,28 @@ fn start_and_capture(
     let mut sample_count = 0_u64;
     let mut anchors: Vec<[u64; 2]> = Vec::new();
     let mut last_anchor = None;
+    let enqueue = |buffer, frames| {
+        let queued = progress.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames;
+        progress
+            .queue_peak_frames
+            .fetch_max(queued, Ordering::Relaxed);
+        blocks_tx.try_send((buffer, frames)).map_err(|_| {
+            AudioError::new(
+                "audio_failed",
+                "audio writer queue exhausted or disconnected",
+            )
+        })
+    };
     let captured = (|| {
         let mut buffer = pool_rx.try_recv().unwrap();
+        let mut buffered_frames = 0;
         while !stop.load(Ordering::Acquire) {
             progress.check()?;
-            match pcm.readi(&mut buffer, period_frames)? {
+            let offset = (buffered_frames * bytes_per_frame) as usize;
+            match pcm.readi(&mut buffer[offset..], period_frames - buffered_frames)? {
                 ReadOutcome::Frames(frames) => {
                     sample_count += frames;
+                    buffered_frames += frames;
                     let (position, timestamp) = pcm.clock_anchor(sample_count)?;
                     if timestamp == 0 {
                         return Err(AudioError::new("audio_failed", "missing ALSA timestamp"));
@@ -1071,23 +1086,21 @@ fn start_and_capture(
                         anchors.push(anchor);
                     }
                     last_anchor = Some(anchor);
-                    let queued =
-                        progress.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames;
-                    progress
-                        .queue_peak_frames
-                        .fetch_max(queued, Ordering::Relaxed);
-                    blocks_tx.try_send((buffer, frames)).map_err(|_| {
-                        AudioError::new(
-                            "audio_failed",
-                            "audio writer queue exhausted or disconnected",
-                        )
-                    })?;
-                    buffer = pool_rx.try_recv().map_err(|_| {
-                        AudioError::new("audio_failed", "audio writer buffer pool exhausted")
-                    })?;
+                    // USB reads can contain only a few milliseconds. Fill a
+                    // block so queue capacity measures PCM time, not USB polls.
+                    if buffered_frames == period_frames {
+                        enqueue(buffer, buffered_frames)?;
+                        buffered_frames = 0;
+                        buffer = pool_rx.try_recv().map_err(|_| {
+                            AudioError::new("audio_failed", "audio writer buffer pool exhausted")
+                        })?;
+                    }
                 }
                 ReadOutcome::Again => thread::sleep(READ_IDLE_SLEEP),
             }
+        }
+        if buffered_frames > 0 {
+            enqueue(buffer, buffered_frames)?;
         }
         Ok::<(), AudioError>(())
     })();
