@@ -1112,6 +1112,19 @@ class CaptureCoordinator:
                         continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
+                        if self._active is not None:
+                            # Cold catalog reads must not hash historical video while capturing.
+                            self._session_summaries[session_id] = self._session_summary(
+                                session_id,
+                                manifest,
+                                payload,
+                                verification_current=False,
+                            )
+                            self._verified.pop(session_id, None)
+                            self._session_snapshots.pop(session_id, None)
+                            self._pending_session_verification.add(session_id)
+                            self._session_diagnostics.pop(session_id, None)
+                            continue
                         try:
                             verified_snapshot, verification_error = (
                                 self._verify_exact_session_payload(

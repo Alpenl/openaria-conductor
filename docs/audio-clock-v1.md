@@ -58,12 +58,25 @@ LAN readers use the same audio_clock_report rules as Conductor; the shared modul
 must stay byte-identical across the two repositories. Old pinned vendor schemas
 remain intact; the current reader explicitly supports this versioned extension.
 
-Video export uses frames.ndjson to reconstruct the measured frame cadence. A
-constant-rate representation is accepted only if every indexed frame is within
-half a frame of that timeline. Nonlinear clocks fail export and leave original
-source recordings intact. Existing renderer-v1 outputs are rebuilt from verified
-sources; the previous output is retained until the replacement is verified and
-then kept in a separate backup directory.
+Bridge renderer/recipe v3 uses frames.ndjson to preserve each captured video
+timestamp on a microsecond MP4 time base, without duplicate or dropped frames.
+The final frame lasts one measured average interval. Both eyes use the same
+capture clock; the original frame index remains the higher-precision evidence.
+VFR output uses H.264 without B-frame reordering to keep the final frame's timing
+portable across FFmpeg versions. Quality settings stay unchanged, but compression
+efficiency can differ. SDK validates every decoded PTS and frame duration;
+Desktop compares a streaming digest of all decoded microsecond PTS relative to
+the first frame with the capture clock, and independently checks frame count
+and stream boundaries. Older FFmpeg MP4 edit lists can quantize the common origin
+by less than 1 ms; this is bounded and reported as a boundary residual. Newer
+muxers use microsecond precision for both the track and movie time bases.
+Existing older renderer outputs are rebuilt from verified sources; the previous
+output remains available until the replacement has been verified.
+
+While recording, a cold catalog query inspects only small manifests and reports
+unknown byte verification for uncached sessions. Full historical artifact hashing
+is deferred until idle; the deferred state never grants download verification.
+This avoids triggering large historical reads merely to list sessions during capture.
 
 Acceptance covers real USB capture, repeated start/stop, multiple WAV boundaries,
 30-minute capture, audio-clock validation, exported frame count and PTS, and

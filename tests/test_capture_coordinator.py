@@ -1472,6 +1472,50 @@ class CaptureCoordinatorTest(unittest.TestCase):
             finally:
                 restarted.close()
 
+    def test_recording_defers_cold_catalog_hashing_until_idle_without_trusting_bytes(self) -> None:
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                first = self.coordinator()
+                try:
+                    session_id = self.seal_one(first, prefix=f"deferred-active-{corrupt}")
+                finally:
+                    first.close()
+                restarted = self.coordinator()
+                try:
+                    restarted.start_capture(start_command(f"active-list-{corrupt}"))
+                    self.assertTrue(restarted.submit_frame(frame()))
+                    with patch(
+                        "rp_ylx.recording.coordinator.validate_device_session_directory",
+                        side_effect=AssertionError("recording must not hash historical artifacts"),
+                    ):
+                        for _ in range(2):
+                            listed = restarted.list_sessions(
+                                cursor=None, limit=50, take_id=None, api_version="v4"
+                            )
+                            selected = next(
+                                item for item in listed["items"] if item["session_id"] == session_id
+                            )
+                            self.assertIsNone(selected["verification"])
+                    if corrupt:
+                        root = self.mountpoint / "recordings" / session_id
+                        manifest = json.loads((root / "manifest.json").read_bytes())
+                        path = root / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
+                        payload = bytearray(path.read_bytes())
+                        payload[0] ^= 1
+                        path.write_bytes(payload)
+                    restarted.stop_capture(stop_command(f"active-list-stop-{corrupt}"))
+                    listed = restarted.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    selected = next(
+                        item for item in listed["items"] if item["session_id"] == session_id
+                    )
+                    self.assertEqual(
+                        selected["verification"]["verdict"], "unusable" if corrupt else "usable"
+                    )
+                finally:
+                    restarted.close()
+
     def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
         coordinator = self.coordinator()
         try:
