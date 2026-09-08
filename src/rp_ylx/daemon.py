@@ -461,9 +461,9 @@ class CaptureEventPump:
         self._interval = interval
         self._progress_interval = progress_interval
         self._stop = threading.Event()
-        initial = coordinator.capture_snapshot_event()
-        self._last_source = (initial["authority_epoch"], initial["source_revision"])
-        self._last_progress_key = self._progress_key(initial)
+        epoch, revision, state = coordinator.capture_recording_progress()
+        self._last_source = (epoch, revision)
+        self._last_progress_key = self._progress_key(self._last_source, state)
         self._last_progress_at = 0.0
         self._thread = threading.Thread(
             target=self._run,
@@ -477,50 +477,55 @@ class CaptureEventPump:
             self._progress_interval if self._last_progress_key is not None else self._interval
         ):
             now = time.monotonic()
-            event = self._coordinator.capture_snapshot_event()
-            source = (event["authority_epoch"], event["source_revision"])
-            if source == self._last_source:
-                progress_event = self._progress_event(event)
-                progress_key = self._progress_key(event)
-                if (
-                    progress_event is not None
-                    and progress_key != self._last_progress_key
-                    and (
-                        self._last_progress_at == 0.0
-                        or now - self._last_progress_at >= self._progress_interval
-                    )
-                ):
-                    self._event_buffer.publish(progress_event)
-                    self._last_progress_key = progress_key
+            epoch, revision, state = self._coordinator.capture_recording_progress()
+            source = (epoch, revision)
+            # Idle sampling also retries preview startup when a camera reconnects.
+            if source != self._last_source or state is None:
+                event = self._coordinator.capture_snapshot_event()
+                source = (event["authority_epoch"], event["source_revision"])
+                state = self._recording_state(event)
+                if source != self._last_source:
+                    self._event_buffer.publish(event)
+                    self._last_source = source
+                    self._last_progress_key = self._progress_key(source, state)
                     self._last_progress_at = now
-                continue
-            self._event_buffer.publish(event)
-            self._last_source = source
-            self._last_progress_key = self._progress_key(event)
-            self._last_progress_at = now
+                    continue
+            progress_event = self._progress_event(source, state)
+            progress_key = self._progress_key(source, state)
+            if (
+                progress_event is not None
+                and progress_key != self._last_progress_key
+                and (
+                    self._last_progress_at == 0.0
+                    or now - self._last_progress_at >= self._progress_interval
+                )
+            ):
+                self._event_buffer.publish(progress_event)
+                self._last_progress_key = progress_key
+                self._last_progress_at = now
 
     @staticmethod
-    def _active_recording(event: Mapping[str, object]) -> Mapping[str, object] | None:
+    def _recording_state(event: Mapping[str, object]) -> Mapping[str, object] | None:
         data = event.get("data")
         if not isinstance(data, Mapping):
             return None
         active = data.get("active_recording")
-        return active if isinstance(active, Mapping) else None
-
-    @classmethod
-    def _progress_key(cls, event: Mapping[str, object]) -> tuple[object, ...] | None:
-        active = cls._active_recording(event)
-        if active is None:
+        if not isinstance(active, Mapping):
             return None
         state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+        return state if isinstance(state, Mapping) else None
+
+    @staticmethod
+    def _progress_key(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> tuple[object, ...] | None:
+        if state is None:
             return None
         progress = state.get("progress")
         if not isinstance(progress, Mapping):
             return None
         return (
-            event.get("authority_epoch"),
-            event.get("source_revision"),
+            *source,
             state.get("session_id"),
             state.get("state"),
             progress.get("elapsed_seconds"),
@@ -528,13 +533,11 @@ class CaptureEventPump:
             progress.get("bytes_written"),
         )
 
-    @classmethod
-    def _progress_event(cls, event: Mapping[str, object]) -> dict[str, object] | None:
-        active = cls._active_recording(event)
-        if active is None:
-            return None
-        state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+    @staticmethod
+    def _progress_event(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> dict[str, object] | None:
+        if state is None:
             return None
         phase = state.get("state")
         if phase not in {"recording", "finalizing", "verifying"}:
@@ -552,8 +555,8 @@ class CaptureEventPump:
         if type(frames) is not int or frames < 0:
             return None
         return {
-            "authority_epoch": event["authority_epoch"],
-            "source_revision": event["source_revision"],
+            "authority_epoch": source[0],
+            "source_revision": source[1],
             "type": "progress",
             "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "session_id": session_id,
@@ -589,86 +592,81 @@ def build_production_service(
             capabilities = native_capabilities()
         except NativeModuleError as exc:
             raise ProductionConfigError(exc.message, code=exc.code) from exc
-        if not capabilities.module_available or "native_camera" not in capabilities.features:
-            raise ProductionConfigError(
+        requirements = (
+            (
+                "native_camera",
                 "正式 Rust 数据面缺少完整 V4L2/TurboJPEG 原生相机能力",
-                code="native_camera_unavailable",
-            )
-        if config.audio_enabled and "native_audio" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust/ALSA 原生音频能力",
-                code="native_audio_unavailable",
-            )
-        if "native_imu" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式采集缺少 Rust/UVC XU 原生 IMU 能力",
-                code="native_imu_unavailable",
-            )
-        if "recording_sink" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_camera_unavailable",
+            ),
+            ("native_audio", "正式采集缺少 Rust/ALSA 原生音频能力", "native_audio_unavailable"),
+            ("native_imu", "正式采集缺少 Rust/UVC XU 原生 IMU 能力", "native_imu_unavailable"),
+            (
+                "recording_sink",
                 "正式录制缺少 Rust 热路径写入能力",
-                code="native_recording_sink_unavailable",
-            )
-        if "recording_imu_batch" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_recording_sink_unavailable",
+            ),
+            (
+                "recording_imu_batch",
                 "正式录制缺少 Rust IMU batch 写入能力",
-                code="native_recording_imu_batch_unavailable",
-            )
-        if "active_take_writer" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_recording_imu_batch_unavailable",
+            ),
+            (
+                "active_take_writer",
                 "正式录制缺少 Rust active take 写入状态能力",
-                code="native_active_take_writer_unavailable",
-            )
-        if "continuous_capture_runtime" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_active_take_writer_unavailable",
+            ),
+            (
+                "continuous_capture_runtime",
                 "正式持续采集缺少 Rust 连续采集 runtime 能力",
-                code="native_continuous_capture_runtime_unavailable",
-            )
-        if "continuous_capture_split_sink" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_continuous_capture_runtime_unavailable",
+            ),
+            (
+                "continuous_capture_split_sink",
                 "正式持续采集缺少 Rust split-eyes 直写能力",
-                code="native_continuous_capture_split_sink_unavailable",
-            )
-        if "recording_segment_planner" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_continuous_capture_split_sink_unavailable",
+            ),
+            (
+                "recording_segment_planner",
                 "正式录制缺少 Rust 分段规划能力",
-                code="native_recording_segment_planner_unavailable",
-            )
-        if "artifact_finalize" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_recording_segment_planner_unavailable",
+            ),
+            (
+                "artifact_finalize",
                 "正式录制缺少 Rust artifact 封存能力",
-                code="native_artifact_finalize_unavailable",
-            )
-        if "stereo_encoder_process" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_artifact_finalize_unavailable",
+            ),
+            (
+                "stereo_encoder_process",
                 "正式录制缺少 Rust 编码助手进程能力",
-                code="native_stereo_encoder_process_unavailable",
-            )
-        if "session_io" not in capabilities.features:
-            raise ProductionConfigError(
-                "正式录制缺少 Rust 会话 I/O 校验能力",
-                code="native_session_io_unavailable",
-            )
-        if "device_session_artifacts" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_stereo_encoder_process_unavailable",
+            ),
+            ("session_io", "正式录制缺少 Rust 会话 I/O 校验能力", "native_session_io_unavailable"),
+            (
+                "device_session_artifacts",
                 "正式下载缺少 Rust device-session artifact 清单能力",
-                code="native_device_session_artifacts_unavailable",
-            )
-        if "device_session_finalizer" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_device_session_artifacts_unavailable",
+            ),
+            (
+                "device_session_finalizer",
                 "正式录制缺少 Rust device-session 封存发布能力",
-                code="native_device_session_finalizer_unavailable",
-            )
-        if "preview_buffer" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_device_session_finalizer_unavailable",
+            ),
+            (
+                "preview_buffer",
                 "正式预览缺少 Rust latest-only 缓冲能力",
-                code="native_preview_buffer_unavailable",
-            )
-        if "performance_metrics" not in capabilities.features:
-            raise ProductionConfigError(
+                "native_preview_buffer_unavailable",
+            ),
+            (
+                "performance_metrics",
                 "正式采集缺少 Rust 性能指标累计能力",
-                code="native_metrics_unavailable",
-            )
+                "native_metrics_unavailable",
+            ),
+        )
+        for feature, message, code in requirements:
+            if feature == "native_audio" and not config.audio_enabled:
+                continue
+            if not capabilities.module_available or feature not in capabilities.features:
+                raise ProductionConfigError(message, code=code)
     mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
     use_native_continuous_sources = camera_backend_factory is None and imu_source_factory is None
     if camera_backend_factory is None:

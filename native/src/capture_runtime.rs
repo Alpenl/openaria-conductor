@@ -585,7 +585,7 @@ fn process_frame(
             (decision.dropped_before, recording)
         };
         if let Some(recording) = recording {
-            let raw = frame.raw_side_by_side.as_bytes(py).to_vec();
+            let raw = frame.raw_side_by_side.as_bytes(py);
             let write_started = start_stage(metrics);
             let result = py.allow_threads(|| {
                 write_split_sink_frame(
@@ -613,7 +613,7 @@ fn write_split_sink_frame(
     source_sequence: u64,
     host_monotonic_ns: u64,
     dropped_before: u64,
-    raw_side_by_side: Vec<u8>,
+    raw_side_by_side: &[u8],
 ) -> Result<(), RuntimeError> {
     if raw_side_by_side.is_empty() {
         return Err(RuntimeError::new(
@@ -621,7 +621,7 @@ fn write_split_sink_frame(
             "production split-eye recording is missing raw side-by-side MJPEG frame",
         ));
     }
-    let payload = recording::jpeg_payload(&raw_side_by_side)?;
+    let payload = recording::jpeg_payload(raw_side_by_side)?;
     let reserved = {
         let mut writer = recording.active_take.lock().map_err(|_| {
             RuntimeError::new(

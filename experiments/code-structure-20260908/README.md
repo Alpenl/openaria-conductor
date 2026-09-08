@@ -2,6 +2,9 @@
 
 Date: 2026-09-08 (Asia/Shanghai)
 
+The subsequent frame-copy, focus-validation, startup, and status-polling changes
+are documented in [the follow-up experiment](follow-up.md).
+
 ## Result
 
 Starting from `6ce782d74d7653368b31d20c50c76776b1d577d4`, this follow-up audit

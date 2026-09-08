@@ -6,6 +6,8 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import UserDict
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +30,7 @@ from rp_ylx.native import (
     native_camera_focus_status,
     native_capabilities,
     native_session_io_or_none,
+    native_stream_camera_focus_status,
     set_native_camera_focus,
 )
 
@@ -115,6 +118,37 @@ class NativeCapabilitiesTest(unittest.TestCase):
         )
         module.v4l2_set_focus.assert_called_once_with("/dev/video0", 77, False)
         self.assertEqual(raised.exception.code, "invalid_camera_focus")
+
+    def test_camera_focus_status_preserves_native_input_types(self) -> None:
+        focus = {
+            "schema": "ylx.camera-focus.v1",
+            "value": HTTPStatus.OK,
+            "minimum": 0,
+            "maximum": 255,
+            "step": 2,
+            "default": 33,
+            "auto_supported": False,
+            "auto_enabled": None,
+        }
+        read_focus = unittest.mock.Mock()
+        camera = SimpleNamespace(camera_focus_status=read_focus)
+        for status in (None, focus):
+            with self.subTest(status=status):
+                read_focus.return_value = status
+                self.assertIs(native_stream_camera_focus_status(camera), status)
+
+        for invalid in (
+            UserDict(focus),
+            {**focus, "value": True},
+            {**focus, "step": 0},
+            {**focus, "auto_enabled": False},
+        ):
+            with self.subTest(invalid=invalid):
+                read_focus.return_value = invalid
+                with self.assertRaises(NativeModuleError) as raised:
+                    native_stream_camera_focus_status(camera)
+                self.assertEqual(raised.exception.code, "invalid_native_focus_status")
+                self.assertEqual(raised.exception.message, "原生焦距状态无效")
 
     def test_explicit_camera_can_disable_eye_splitting(self) -> None:
         owner = object()

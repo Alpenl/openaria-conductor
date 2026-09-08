@@ -555,6 +555,7 @@ class CaptureCoordinator:
         self._session_summaries: dict[str, dict[str, object]] = {}
         self._session_diagnostics: dict[str, dict[str, object]] = {}
         self._latest_imu: _LatestImuReceipt | None = None
+        self._focus_revision = 0
         self._open_representations = 0
         self._released = False
         self._media_lost = False
@@ -1271,13 +1272,19 @@ class CaptureCoordinator:
             "verification": verification,
         }
 
-    def _recording_snapshot(self) -> tuple[str, object | None, object | None]:
+    def _recording_snapshot(
+        self,
+    ) -> tuple[int, str, dict[str, object] | None, dict[str, object] | None]:
+        if self._admission is None:
+            with suppress(DeviceRecordingError):
+                self._require_admission()
         if self._active is not None:
             recording_state = self._active.current_recording_state
             if recording_state is None:
-                return "blocked", None, None
+                return self._revision, "blocked", None, None
             state = str(recording_state["state"])
             return (
+                int(recording_state["state_revision"]),
                 state,
                 {
                     "generation_id": self._active_plan.generation_id,
@@ -1295,7 +1302,13 @@ class CaptureCoordinator:
             ):
                 retained = copy.deepcopy(candidate)
                 break
-        return "idle", None, retained
+        return self._revision, "idle", None, retained
+
+    def capture_recording_progress(self) -> tuple[str, int, Mapping[str, object] | None]:
+        with self._lock:
+            revision, _, active, _ = self._recording_snapshot()
+            state = None if active is None else active["recording_state"]
+            return self._authority_epoch, revision, state
 
     @staticmethod
     def _raw_imu_vector(vector: RawVector3) -> Mapping[str, object]:
@@ -1347,41 +1360,47 @@ class CaptureCoordinator:
     ) -> _LatestImuReceipt:
         key = self._imu_sample_key(sample)
         cached = self._latest_imu
-        if cached is not None and cached.session_id == session_id and cached.sample_key == key:
+        if (
+            cached is not None
+            and cached.session_id == session_id
+            and (cached.sample_key == key or cached.received_at_monotonic > observed_at_monotonic)
+        ):
             return cached
         receipt = _LatestImuReceipt(session_id, sample, key, observed_at_monotonic)
         self._latest_imu = receipt
         return receipt
 
-    def _latest_imu_sample(self) -> tuple[str, ImuSample] | None:
+    def _refresh_latest_imu(self) -> None:
         with self._lock:
             plan = self._active_plan
             if self._active is None or plan is None:
-                return None
-            session_id = plan.session_id
+                return
             sources = self._sources
         observed_at = time.monotonic()
         latest = getattr(sources, "latest_imu_observation", None)
         if not callable(latest):
-            with self._lock:
-                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
+            return
         try:
             observation = latest()
         except BaseException:
-            observation = None
+            return
         if observation is None or not observation.samples:
-            with self._lock:
-                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
+            return
         sample = observation.samples[-1]
         with self._lock:
-            if self._active_plan is not None and self._active_plan.session_id == session_id:
-                receipt = self._store_latest_imu_locked(
-                    session_id,
+            if self._active_plan is plan and self._active is not None:
+                self._store_latest_imu_locked(
+                    plan.session_id,
                     sample,
                     observed_at_monotonic=observed_at,
                 )
-                return self._fresh_live_imu(receipt, session_id, observed_at)
-        return None
+
+    def _live_imu_snapshot_locked(self) -> Mapping[str, object] | None:
+        plan = self._active_plan
+        if self._active is None or plan is None:
+            return None
+        latest = self._fresh_live_imu(self._latest_imu, plan.session_id, time.monotonic())
+        return None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
 
     def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
         sources = self._sources
@@ -1468,44 +1487,38 @@ class CaptureCoordinator:
     def _runtime_snapshot(self) -> Mapping[str, object]:
         runtime = dict(copy.deepcopy(self._runtime()))
         camera = self._camera_connection_status()
-        latest = self._latest_imu_sample()
-        runtime["live_imu"] = (
-            None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
-        )
         runtime["camera"] = camera
         runtime["camera_focus"] = (
             None if camera["state"] == "disconnected" else self._camera_focus_status()
         )
+        self._refresh_latest_imu()
+        with self._lock:
+            runtime["live_imu"] = self._live_imu_snapshot_locked()
         return runtime
 
-    def _snapshot(self) -> Mapping[str, object]:
-        state, active, retained = self._recording_snapshot()
-        return {
-            "schema": "ylx.capture-snapshot-event.v2",
-            "device_state": state,
-            "active_recording": active,
-            "retained_unsuccessful": retained,
-            "runtime": self._runtime_snapshot(),
-        }
-
     def capture_status(self) -> Mapping[str, object]:
-        with self._lock:
-            if self._admission is None:
-                with suppress(DeviceRecordingError):
-                    self._require_admission()
-            snapshot = self._snapshot()
-            source_revision = self._revision
-            recording = snapshot["active_recording"] or snapshot["retained_unsuccessful"]
-            if isinstance(recording, Mapping):
-                state = recording.get("recording_state")
-                if isinstance(state, Mapping):
-                    source_revision = int(state["state_revision"])
-            return {
-                "schema": "ylx.capture-status.v2",
-                "authority_epoch": self._authority_epoch,
-                "source_revision": source_revision,
-                "snapshot": snapshot,
-            }
+        while True:
+            with self._lock:
+                focus_revision = self._focus_revision
+            runtime = dict(self._runtime_snapshot())
+            with self._lock:
+                source_revision, state, active, retained = self._recording_snapshot()
+                # Checkpoints advance capture revisions without changing hardware controls.
+                if focus_revision != self._focus_revision:
+                    continue
+                runtime["live_imu"] = None if active is None else self._live_imu_snapshot_locked()
+                return {
+                    "schema": "ylx.capture-status.v2",
+                    "authority_epoch": self._authority_epoch,
+                    "source_revision": source_revision,
+                    "snapshot": {
+                        "schema": "ylx.capture-snapshot-event.v2",
+                        "device_state": state,
+                        "active_recording": active,
+                        "retained_unsuccessful": retained,
+                        "runtime": runtime,
+                    },
+                }
 
     def capture_snapshot_event(self) -> Mapping[str, object]:
         status = self.capture_status()
@@ -1915,6 +1928,7 @@ class CaptureCoordinator:
                 "auto_enabled 必须是布尔值",
                 status=HTTPStatus.BAD_REQUEST,
             )
+        self._focus_revision += 1
         try:
             result = self._sources.set_camera_focus(  # type: ignore[union-attr]
                 value=value,

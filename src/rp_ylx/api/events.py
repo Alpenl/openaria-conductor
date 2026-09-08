@@ -17,6 +17,8 @@ from importlib.resources import files
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
+from rp_ylx.camera_focus import CAMERA_FOCUS_KEYS, valid_camera_focus_status
+
 
 class InvalidEventCursor(ValueError):
     """Last-Event-ID 不是契约要求的十进制 delivery ID。"""
@@ -981,30 +983,9 @@ def _validate_runtime_live_imu_session_relation(
 
 
 def _validate_camera_focus(value: object) -> None:
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema",
-        "value",
-        "minimum",
-        "maximum",
-        "step",
-        "default",
-        "auto_supported",
-        "auto_enabled",
-    }:
+    if not isinstance(value, Mapping) or set(value) != CAMERA_FOCUS_KEYS:
         raise InvalidSourceEvent("camera focus 必须是闭合对象")
-    integers = ("value", "minimum", "maximum", "step", "default")
-    if (
-        value["schema"] != "ylx.camera-focus.v1"
-        or any(type(value[key]) is not int for key in integers)
-        or value["minimum"] > value["maximum"]
-        or value["step"] <= 0
-        or not value["minimum"] <= value["value"] <= value["maximum"]
-        or (value["value"] - value["minimum"]) % value["step"] != 0
-        or not value["minimum"] <= value["default"] <= value["maximum"]
-        or type(value["auto_supported"]) is not bool
-        or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
-        or (not value["auto_supported"] and value["auto_enabled"] is not None)
-    ):
+    if not valid_camera_focus_status(value):
         raise InvalidSourceEvent("camera focus 无效")
 
 

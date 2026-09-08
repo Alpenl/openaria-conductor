@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Protocol, cast
 
+from rp_ylx.camera_focus import valid_camera_focus_status
+
 NATIVE_MODULE = "rp_ylx._native"
 SUPPORTED_NATIVE_ABI = 4
 
@@ -454,30 +456,7 @@ def create_native_camera(
 def _validate_native_focus_status(status: object) -> dict[str, object] | None:
     if status is not None and (
         not isinstance(status, dict)
-        or set(status)
-        != {
-            "schema",
-            "value",
-            "minimum",
-            "maximum",
-            "step",
-            "default",
-            "auto_supported",
-            "auto_enabled",
-        }
-        or status["schema"] != "ylx.camera-focus.v1"
-        or any(
-            isinstance(status[key], bool) or not isinstance(status[key], int)
-            for key in ("value", "minimum", "maximum", "step", "default")
-        )
-        or status["step"] <= 0
-        or status["minimum"] > status["maximum"]
-        or not status["minimum"] <= status["value"] <= status["maximum"]
-        or (status["value"] - status["minimum"]) % status["step"] != 0
-        or not status["minimum"] <= status["default"] <= status["maximum"]
-        or type(status["auto_supported"]) is not bool
-        or (status["auto_enabled"] is not None and type(status["auto_enabled"]) is not bool)
-        or (not status["auto_supported"] and status["auto_enabled"] is not None)
+        or not valid_camera_focus_status(status, allow_integer_subclasses=True)
     ):
         raise NativeModuleError("invalid_native_focus_status", "原生焦距状态无效")
     return None if status is None else cast(dict[str, object], status)
