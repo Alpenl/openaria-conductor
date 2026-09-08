@@ -116,7 +116,7 @@ pub(crate) struct SessionTransaction {
     pub(crate) encoder: Arc<Mutex<EncoderProcess>>,
     pub(crate) segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     pub(crate) recording_start_monotonic_ns: u64,
-    audio: Option<Arc<Recorder>>,
+    pub(crate) audio: Option<Arc<Recorder>>,
     state: Mutex<State>,
 }
 
@@ -191,6 +191,9 @@ impl SessionTransaction {
     }
 
     pub(crate) fn ensure_recording(&self) -> Result<(), StoreError> {
+        if let Some(audio) = &self.audio {
+            audio.check_health()?;
+        }
         let state = self
             .state
             .lock()
@@ -219,6 +222,9 @@ impl SessionTransaction {
     }
 
     pub(crate) fn snapshot(&self) -> Result<TransactionSnapshot, StoreError> {
+        if let Some(audio) = &self.audio {
+            audio.check_health()?;
+        }
         let lifecycle = self
             .state
             .lock()

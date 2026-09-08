@@ -227,7 +227,7 @@ class ReleaseManagerTest(unittest.TestCase):
             installed_config["audio"],
             {
                 "enabled": True,
-                "device": "hw:0,0",
+                "device": "hw:CARD=D2UQ2,DEV=0",
                 "sample_rate_hz": 48000,
                 "channels": 2,
                 "sample_format": "S16_LE",

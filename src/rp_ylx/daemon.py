@@ -105,7 +105,7 @@ class ProductionConfig:
     video_bitrate_kbps: int = 8192
     segment_seconds: float = 30.0
     audio_enabled: bool = True
-    audio_device: str = "hw:0,0"
+    audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
     audio_channels: int = 2
     audio_sample_format: str = "S16_LE"
@@ -290,7 +290,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
             audio_enabled=True if audio is None else audio["enabled"],
-            audio_device="hw:0,0" if audio is None else str(audio["device"]),
+            audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),
             audio_sample_rate_hz=(
                 48_000
                 if audio is None

@@ -494,6 +494,7 @@ impl NativeCaptureEngine {
         let segment_planner = Arc::clone(&transaction.transaction.segment_planner);
         let recording_start_monotonic_ns = transaction.transaction.recording_start_monotonic_ns;
         let worker_collector = Arc::clone(&collector);
+        let audio = transaction.transaction.audio.clone();
         let imu_timeout = self.imu_config.timeout;
         let snapshot = py
             .allow_threads(move || {
@@ -506,6 +507,7 @@ impl NativeCaptureEngine {
                     on_failure,
                     Some(worker_collector),
                     imu_timeout,
+                    audio,
                 )
             })
             .map_err(capture_runtime_error);
@@ -982,6 +984,7 @@ fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> Py
     value.set_item("channels", result.channels)?;
     value.set_item("sample_format", result.sample_format)?;
     value.set_item("sample_count", result.sample_count)?;
+    value.set_item("capture_clock_json", result.capture_clock.to_string())?;
     value.set_item("started_monotonic_ns", result.started_monotonic_ns)?;
     value.set_item("stopped_monotonic_ns", result.stopped_monotonic_ns)?;
     let segments = PyList::empty(py);

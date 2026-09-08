@@ -97,7 +97,7 @@ class DeviceSessionConfig:
     video_bitrate_kbps: int = 8192
     segment_seconds: float = 30.0
     audio_enabled: bool = False
-    audio_device: str = "hw:0,0"
+    audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
     audio_channels: int = 2
     audio_sample_format: str = "S16_LE"
@@ -1649,6 +1649,17 @@ class DeviceSessionRecorder:
             raise DeviceRecordingError("audio_invalid", "音频时间线结果无效")
         start_time_seconds = float(sync["session_start_offset_seconds"])
         end_time_seconds = float(sync["session_stop_offset_seconds"])
+        capture_clock = None
+        clock_json = self._audio_result.get("capture_clock_json")
+        if clock_json is not None:
+            capture_clock = json.loads(clock_json)
+            capture_clock["session_start_monotonic_ns"] = self._started_monotonic_ns
+            start_time_seconds = (
+                capture_clock["sample_start_monotonic_ns"] - self._started_monotonic_ns
+            ) / 1e9
+            end_time_seconds = (
+                capture_clock["sample_end_monotonic_ns"] - self._started_monotonic_ns
+            ) / 1e9
         if start_time_seconds < 0 or end_time_seconds <= start_time_seconds:
             raise DeviceRecordingError("audio_invalid", "音频时间线 offset 无效")
         return {
@@ -1670,6 +1681,7 @@ class DeviceSessionRecorder:
                 "video_time_reference": "session_time_seconds",
             },
             "segments": list(self._audio_segment_records),
+            **({"capture_clock": capture_clock} if capture_clock is not None else {}),
         }
 
     def _boundary(self, ordinal: int, duration: float) -> tuple[int, float]:
