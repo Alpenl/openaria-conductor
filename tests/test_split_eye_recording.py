@@ -649,7 +649,21 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 self.assertEqual(live["state_revision"], initial["state_revision"])
                 self.assertEqual(live["progress"]["captured_frames"], 4)
                 self.assertGreater(live["progress"]["bytes_written"], 0)
-                sealed = recorder.stop()
+                native_finish = store.transaction.finish
+                finished_at_ns = []
+
+                def delayed_finish(duration_seconds, timeout_seconds):
+                    result = native_finish(duration_seconds, timeout_seconds)
+                    time.sleep(0.03)
+                    finished_at_ns.append(time.monotonic_ns())
+                    return result
+
+                with patch.object(store.transaction, "finish", side_effect=delayed_finish):
+                    sealed = recorder.stop()
+                self.assertGreaterEqual(
+                    sealed.manifest["time"]["duration_seconds"],
+                    (finished_at_ns[0] - recorder._started_monotonic_ns) / 1e9,
+                )
 
             self.assertEqual(len(store.begin_calls), 1)
             self.assertTrue(store.transaction.finished)

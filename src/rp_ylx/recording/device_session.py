@@ -1937,6 +1937,10 @@ class DeviceSessionRecorder:
                 self._harvest_segments()
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
+                # Native finish joins audio capture; its final samples can arrive
+                # after the stop request timestamp passed to the video planner.
+                ended_at = self._now()
+                duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
             verified_at = self._now()
