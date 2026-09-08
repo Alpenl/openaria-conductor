@@ -25,14 +25,14 @@ x-ylx-security-profiles:
     authentication: bearer
     standard_openapi_security: bearer-only-authority
     description: Every operation requires a customer-issued bearer token.
-    destructive_mutation: not-enabled
+    destructive_mutation: explicit-idempotent-session-deletion
     network_mutation: enabled-idempotent-async
     session_capabilities:
       session_list: true
       session_detail: true
       artifact_download: true
       capture_status: true
-      session_deletion: false
+      session_deletion: true
   lab:
     authentication: none
     standard_openapi_resolution: explicit-lab-profile-artifact-required
@@ -44,8 +44,8 @@ x-ylx-security-profiles:
       resolved, immutable profile artifact plus runtime verification for exactly the
       allowed operation IDs below. The listed network mutations retain write-only
       credentials, closed request schemas, idempotency, asynchronous transactions, and
-      rescue fallback. Destructive mutations and any other implementation-private
-      mutation route MUST reject with 403 before reaching its handler.
+      rescue fallback. Session deletion requires an explicit bounded selection and
+      matching manifest digests. Unlisted mutation operations remain forbidden.
     allowed_operation_ids:
       - getDevice
       - getCaptureStatus
@@ -68,15 +68,106 @@ x-ylx-security-profiles:
       - getRetainedUnsuccessfulSessionOutcome
       - getSessionArtifact
       - headSessionArtifact
-    destructive_mutation: unreachable-or-403
+      - deleteSessions
+    destructive_mutation: explicit-idempotent-session-deletion
     network_mutation: enabled-idempotent-async
     session_capabilities:
       session_list: true
       session_detail: true
       artifact_download: true
       capture_status: true
-      session_deletion: false
+      session_deletion: true
 paths:
+  /sessions/delete:
+    post:
+      tags: [Sessions]
+      operationId: deleteSessions
+      summary: Permanently delete explicitly selected sealed recordings
+      description: |
+        Requires deleteSessions permission, Idempotency-Key, and the write Origin/CSRF
+        policy. No wildcard selection. All manifest digests and continuation dependencies
+        are checked before deleting anything. Capture, finalization, open downloads and
+        released volumes block deletion. Continuations are removed before predecessors.
+        Storage failures stop further removal and return a complete partial result.
+        Repeating the same key and body replays the result; a different body conflicts.
+        Local exports are unaffected. This operation is available only in Device API v4.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema, sessions]
+              properties:
+                schema:
+                  const: ylx.session-delete-request.v1
+                sessions:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  uniqueItems: true
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [session_id, manifest_sha256]
+                    properties:
+                      session_id:
+                        type: string
+                        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                      manifest_sha256:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
+      responses:
+        "200":
+          description: Deletion result, including any storage failures
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema, deleted_session_ids, failed_sessions]
+                properties:
+                  schema:
+                    const: ylx.session-delete-result.v1
+                  deleted_session_ids:
+                    type: array
+                    uniqueItems: true
+                    items:
+                      type: string
+                  failed_sessions:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [session_id, error]
+                      properties:
+                        session_id:
+                          type: string
+                        error:
+                          type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "423":
+          description: Recording volume is being released or has been released
+        "500":
+          $ref: "#/components/responses/InternalError"
   /device:
     get:
       tags: [Device]
@@ -1504,8 +1595,8 @@ components:
               const: true
               description: GET /capture/status is authoritative even when optional live_imu telemetry is null.
             session_deletion:
-              const: false
-              description: Device API v4 exposes no session deletion route in Customer or Lab profile.
+              type: boolean
+              description: True when POST /sessions/delete is supported; false on older firmware.
             calibration_capture:
               $ref: "#/components/schemas/CalibrationCaptureCapability"
         storage:

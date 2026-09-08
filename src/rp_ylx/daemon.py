@@ -66,6 +66,7 @@ LAB_OPERATIONS = frozenset(
         "getSessionArtifact",
         "startCapture",
         "stopCapture",
+        "deleteSessions",
     }
 )
 CUSTOMER_OPERATIONS = LAB_OPERATIONS

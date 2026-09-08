@@ -754,6 +754,62 @@ class GatewayHttpTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
+    def test_remote_deletion_auth_csrf_validation_and_forwarding(self):
+        calls = []
+        body = {
+            "schema": "ylx.session-delete-request.v1",
+            "sessions": [{"session_id": SESSION_ID, "manifest_sha256": "a" * 64}],
+        }
+        self.policy.tokens["delete-token"] = Principal(
+            "deleter", permissions={"deleteSessions": None}
+        )
+
+        def delete(command):
+            calls.append(command)
+            return CaptureCommandResult(
+                200,
+                {
+                    "schema": "ylx.session-delete-result.v1",
+                    "deleted_session_ids": [SESSION_ID],
+                    "failed_sessions": [],
+                },
+            )
+
+        self.server.provider.delete_sessions = delete
+        headers = {
+            "Idempotency-Key": "delete-test",
+            "X-CSRF-Token": "browser-csrf-token",
+            "Origin": self.base,
+        }
+        for token, expected in ((None, 401), ("reader-token", 403)):
+            status, _, _ = self.request(
+                "/api/v4/sessions/delete", token=token, body=body, headers=headers
+            )
+            self.assertEqual(status, expected)
+        status, _, _ = self.request(
+            "/api/v4/sessions/delete",
+            token="delete-token",
+            body=body,
+            headers={"Idempotency-Key": "delete-test"},
+        )
+        self.assertEqual(status, 403)
+        for invalid in (
+            {"schema": "wrong", "sessions": []},
+            {**body, "sessions": body["sessions"] * 2},
+        ):
+            status, _, _ = self.request(
+                "/api/v4/sessions/delete", token="delete-token", body=invalid, headers=headers
+            )
+            self.assertEqual(status, 400)
+        self.assertEqual(calls, [])
+        status, payload, _ = self.request(
+            "/api/v4/sessions/delete", token="delete-token", body=body, headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["deleted_session_ids"], [SESSION_ID])
+        self.assertEqual(calls[0].body, body)
+        self.assertEqual(calls[0].principal_id, "deleter")
+
     def test_expected_client_disconnect_does_not_emit_server_traceback(self) -> None:
         for error in (BrokenPipeError("closed"), ConnectionResetError("reset")):
             with self.subTest(error=type(error).__name__):
