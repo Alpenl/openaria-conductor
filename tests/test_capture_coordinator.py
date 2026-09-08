@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 import uuid
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -299,6 +300,27 @@ class FakeNativeSessionStore:
         payload = os.pread(descriptor, expected_bytes + 1, 0)
         if len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise ValueError("native fixture verification mismatch")
+        return {}
+
+    def verify_fd_interruptible(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+        interrupt_check: Callable[[], None],
+    ) -> dict[str, object]:
+        self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected_bytes:
+            interrupt_check()
+            block = os.pread(descriptor, min(1024 * 1024, expected_bytes - offset), offset)
+            if not block:
+                raise ValueError("native fixture short read")
+            digest.update(block)
+            offset += len(block)
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("digest_mismatch: native fixture verification mismatch")
         return {}
 
 
@@ -1515,6 +1537,78 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     )
                 finally:
                     restarted.close()
+
+    def test_capture_interrupts_inflight_catalog_hash_and_idle_revalidates(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="interrupt-catalog")
+        finally:
+            first.close()
+        root = self.mountpoint / "recordings" / session_id
+        manifest = json.loads((root / "manifest.json").read_bytes())
+        artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
+        path = root / artifact["path"]
+        payload = path.read_bytes() + bytes(2 * 1024 * 1024)
+        path.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        artifact.update(bytes=len(payload), sha256=digest, artifact_id=digest)
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        identity = (path.stat().st_dev, path.stat().st_ino)
+        entered = threading.Event()
+        resume = threading.Event()
+        results = []
+        errors = []
+        reads = []
+        read = os.pread
+        restarted = self.coordinator()
+
+        def blocked_read(fd: int, count: int, offset: int) -> bytes:
+            metadata = os.fstat(fd)
+            if (metadata.st_dev, metadata.st_ino) == identity:
+                reads.append(count)
+                entered.set()
+                if not resume.wait(5):
+                    raise AssertionError("capture did not release the catalog read")
+            return read(fd, count, offset)
+
+        def list_once() -> None:
+            try:
+                results.append(restarted.list_sessions(cursor=None, limit=50, take_id=None))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=list_once)
+        try:
+            with (
+                patch("rp_ylx.recording.device_session.os.pread", side_effect=blocked_read),
+                patch(
+                    "rp_ylx.recording.device_session._session_store_or_none",
+                    return_value=FakeNativeSessionStore(),
+                ),
+            ):
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(5), repr(errors) + repr(results))
+                    restarted.start_capture(start_command("interrupt-active"))
+                    self.assertTrue(restarted.submit_frame(frame()))
+                finally:
+                    resume.set()
+                    thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(reads, [1024 * 1024])
+            selected = next(
+                item for item in results[0]["items"] if item["session_id"] == session_id
+            )
+            self.assertIsNone(selected["verification"])
+            restarted.stop_capture(stop_command("interrupt-stop"))
+            listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+            selected = next(item for item in listed["items"] if item["session_id"] == session_id)
+            self.assertEqual(selected["verification"]["verdict"], "usable")
+        finally:
+            resume.set()
+            thread.join(5)
+            restarted.close()
 
     def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
         coordinator = self.coordinator()

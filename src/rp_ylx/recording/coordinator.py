@@ -568,6 +568,7 @@ class CaptureCoordinator:
         self._stop_condition = threading.Condition(self._lock)
         self._storage_lock = threading.Lock()
         self._catalog_lock = threading.Lock()
+        self._closing = False
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
         self._active: DeviceSessionRecorder | None = None
@@ -949,6 +950,8 @@ class CaptureCoordinator:
         session_id: str,
         manifest: Mapping[str, object],
         manifest_payload: bytes,
+        *,
+        interrupt_check: Callable[[], None] | None = None,
     ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
         manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
         admission = self._require_admission()
@@ -998,6 +1001,7 @@ class CaptureCoordinator:
                 validated_manifest = validate_device_session_directory(
                     session_path,
                     expected_session_id=session_id,
+                    interrupt_check=interrupt_check,
                 )
             except DeviceRecordingError as error:
                 if error.code != "digest_mismatch":
@@ -1051,6 +1055,10 @@ class CaptureCoordinator:
             if callable(close):
                 close()
             store.close()
+
+    def _check_catalog_verification_idle(self) -> None:
+        if self._active is not None or self._closing:
+            raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
 
     def _catalog_sessions(self, *, revalidate_pending: bool = True) -> None:
         admission = self._require_admission()
@@ -1112,7 +1120,7 @@ class CaptureCoordinator:
                         continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
-                        if self._active is not None:
+                        if self._active is not None or self._closing:
                             # Cold catalog reads must not hash historical video while capturing.
                             self._session_summaries[session_id] = self._session_summary(
                                 session_id,
@@ -1132,6 +1140,7 @@ class CaptureCoordinator:
                                     session_id,
                                     manifest,
                                     payload,
+                                    interrupt_check=self._check_catalog_verification_idle,
                                 )
                             )
                         except DeviceRecordingError as error:
@@ -2879,6 +2888,7 @@ class CaptureCoordinator:
             ) from error
 
     def close(self) -> None:
+        self._closing = True
         if self._sources is not None:
             close_sources = getattr(self._sources, "close", None)
             if callable(close_sources):

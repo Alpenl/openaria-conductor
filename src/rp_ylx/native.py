@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Protocol, cast
@@ -219,6 +220,14 @@ class NativeSessionStore(Protocol):
         offset: int,
         length: int,
     ) -> int: ...
+
+    def verify_fd_interruptible(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+        interrupt_check: Callable[[], None],
+    ) -> dict[str, object]: ...
 
     def open_relative_regular(self, root_descriptor: int, relative_path: str) -> int: ...
 

@@ -77,6 +77,9 @@ While recording, a cold catalog query inspects only small manifests and reports
 unknown byte verification for uncached sessions. Full historical artifact hashing
 is deferred until idle; the deferred state never grants download verification.
 This avoids triggering large historical reads merely to list sessions during capture.
+Historical verification that began while idle also checks capture/shutdown state
+between 1 MiB reads. It releases the catalog lock after interruption and remains
+unverified until a complete idle retry; capture sealing still verifies in full.
 
 Acceptance covers real USB capture, repeated start/stop, multiple WAV boundaries,
 30-minute capture, audio-clock validation, exported frame count and PTS, and

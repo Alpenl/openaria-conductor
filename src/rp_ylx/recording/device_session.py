@@ -2148,9 +2148,26 @@ def _read_bounded_fd(descriptor: int, maximum_bytes: int, *, code: str) -> bytes
     return bytes(payload)
 
 
-def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: str) -> None:
+def _verify_artifact_fd(
+    descriptor: int,
+    expected_bytes: int,
+    expected_sha256: str,
+    interrupt_check: Callable[[], None] | None = None,
+) -> None:
     native = _session_store_or_none()
-    if native is not None and hasattr(native, "verify_fd"):
+    if (
+        interrupt_check is not None
+        and native is not None
+        and hasattr(native, "verify_fd_interruptible")
+    ):
+        try:
+            native.verify_fd_interruptible(
+                descriptor, expected_bytes, expected_sha256, interrupt_check
+            )
+            return
+        except BaseException as error:
+            raise _recording_error(error, "native_session_io_failed") from error
+    if interrupt_check is None and native is not None and hasattr(native, "verify_fd"):
         try:
             native.verify_fd(descriptor, expected_bytes, expected_sha256)
             return
@@ -2162,6 +2179,8 @@ def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: s
     digest = hashlib.sha256()
     remaining = expected_bytes
     while remaining:
+        if interrupt_check is not None:
+            interrupt_check()
         block = os.read(descriptor, min(1024 * 1024, remaining))
         if not block:
             raise DeviceRecordingError("artifact_invalid", "artifact 发生短读")
@@ -2242,6 +2261,7 @@ def validate_device_session_directory(
     path: str | Path,
     *,
     expected_session_id: str | None = None,
+    interrupt_check: Callable[[], None] | None = None,
 ) -> Mapping[str, object]:
     """独立校验一个已密封 Device Session 会话的 manifest 与所有 artifact 字节。"""
 
@@ -2277,6 +2297,8 @@ def validate_device_session_directory(
                 code="manifest_invalid",
             )
             for artifact_descriptor in descriptors:
+                if interrupt_check is not None:
+                    interrupt_check()
                 relative, expected_bytes = _artifact_path_and_bytes(
                     artifact_descriptor,
                     code="artifact_invalid",
@@ -2294,6 +2316,7 @@ def validate_device_session_directory(
                         artifact_fd,
                         expected_bytes,
                         expected_sha256,
+                        interrupt_check,
                     )
                 finally:
                     os.close(artifact_fd)

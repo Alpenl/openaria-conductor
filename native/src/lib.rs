@@ -280,6 +280,35 @@ impl NativeSessionStore {
         file_identity_dict(py, &identity)
     }
 
+    fn verify_fd_interruptible(
+        &self,
+        py: Python<'_>,
+        descriptor: i32,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        interrupt_check: Py<PyAny>,
+    ) -> PyResult<Py<PyDict>> {
+        let mut callback_error = None;
+        let result = py.allow_threads(|| {
+            session_io::verify_fd_interruptible(descriptor, expected_bytes, expected_sha256, || {
+                match Python::with_gil(|py| interrupt_check.call0(py)) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        callback_error = Some(error);
+                        Err(session_io::SessionIoError {
+                            code: "verification_changed",
+                            message: "artifact verification interrupted".to_owned(),
+                        })
+                    }
+                }
+            })
+        });
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        file_identity_dict(py, &result.map_err(session_io_error)?)
+    }
+
     fn sendfile(
         &self,
         py: Python<'_>,
