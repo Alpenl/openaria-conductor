@@ -181,8 +181,8 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s --out-dir DIR [--width 3840] [--height 1080] [--fps 30]\n"
             "          [--bitrate-kbps 8192] [--segment-frames 900]\n"
-            "          [--path-prefix video/] [--min-qp 28] [--intra-qp 30]\n"
-            "          [--initial-qp 32] [--intra-period 0] [--vbv-ms 3000]\n",
+            "          [--path-prefix video/] [--min-qp 20] [--intra-qp 22]\n"
+            "          [--initial-qp 24] [--intra-period 0] [--vbv-ms 3000]\n",
             program);
 }
 
@@ -194,9 +194,9 @@ int main(int argc, char **argv)
         .fps = 30,
         .bitrate_kbps = 8192,
         .intra_period = 0,
-        .min_qp = 28,
-        .intra_qp = 30,
-        .initial_qp = 32,
+        .min_qp = 20,
+        .intra_qp = 22,
+        .initial_qp = 24,
         .vbv_ms = 3000,
         .segment_frames = 900,
         .out_dir = NULL,

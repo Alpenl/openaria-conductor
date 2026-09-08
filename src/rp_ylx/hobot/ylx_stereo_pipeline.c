@@ -94,6 +94,17 @@ struct ylx_pipeline {
 
 static const char *const EYE_NAMES[YLX_EYES] = {"left", "right"};
 
+/* Encoder metadata reports only I/P/B, not IDR. Inspect Annex B NAL headers
+ * so stss indexes every true random-access picture, including within a file. */
+static int h264_has_idr(const unsigned char *data, size_t length)
+{
+    for (size_t offset = 0; offset + 3 < length; offset++) {
+        if (data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1 &&
+            (data[offset + 3] & 0x1f) == 5) return 1;
+    }
+    return 0;
+}
+
 static void fail(ylx_pipeline_t *pipeline, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 
@@ -174,7 +185,7 @@ static void configure_encoder(media_codec_context_t *context,
     params->external_frame_buf = false;
     params->bitstream_buf_count = 8;
     /* x5 wave521cl encodes no B frames and keeps a single reference. */
-    params->gop_params.gop_preset_idx = 1;
+    params->gop_params.gop_preset_idx = 9;
     params->gop_params.decoding_refresh_type = 2;
     params->rot_degree = MC_CCW_0;
     params->mir_direction = MC_DIRECTION_NONE;
@@ -256,6 +267,59 @@ static unsigned char *find_box(unsigned char *buffer, size_t length, const char 
     return NULL;
 }
 
+static unsigned char *child_box(unsigned char *parent, size_t skip, const char *type)
+{
+    const size_t length = read_u32(parent);
+    for (size_t offset = skip; offset + 8 <= length;) {
+        const size_t size = read_u32(parent + offset);
+        if (size < 8 || size > length - offset) {
+            return NULL;
+        }
+        if (memcmp(parent + offset + 4, type, 4) == 0) {
+            return parent + offset;
+        }
+        offset += size;
+    }
+    return NULL;
+}
+
+static int mp4_fix_color(unsigned char *moov, char *reason, size_t reason_len)
+{
+    static const struct { const char *type; size_t skip; } path[] = {
+        {"trak", 8}, {"mdia", 8}, {"minf", 8}, {"stbl", 8},
+        {"stsd", 8}, {"avc1", 16}, {"colr", 86},
+    };
+    unsigned char *box = moov;
+    for (size_t index = 0; index < sizeof(path) / sizeof(path[0]); index++) {
+        box = child_box(box, path[index].skip, path[index].type);
+        if (box == NULL) {
+            /* Some vendor versions omit colr and leave the SPS authoritative. */
+            if (index == sizeof(path) / sizeof(path[0]) - 1) return 0;
+            snprintf(reason, reason_len, "missing color path box %s", path[index].type);
+            return -1;
+        }
+    }
+    const size_t size = read_u32(box);
+    if (size < 18 || (memcmp(box + 8, "nclx", 4) != 0 &&
+                      memcmp(box + 8, "nclc", 4) != 0)) {
+        snprintf(reason, reason_len, "unsupported colr box");
+        return -1;
+    }
+    /* Vendor muxer writes reserved primaries/transfer and GBR for NV12.
+     * The camera does not declare these; unspecified (2) is truthful. */
+    for (size_t field = 12; field < 18; field += 2) {
+        if (box[field] == 0 && box[field + 1] == 0) box[field + 1] = 2;
+    }
+    if (memcmp(box + 8, "nclx", 4) == 0) {
+        if (size < 19) {
+            snprintf(reason, reason_len, "short nclx box");
+            return -1;
+        }
+        box[18] = 0x80; /* MJPEG -> NV12 row copy preserves full range. */
+    }
+    return 0;
+}
+
 static int mp4_extend_durations(const char *path, int fps, char *reason, size_t reason_len)
 {
     int fd = open(path, O_RDWR);
@@ -333,11 +397,12 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
         const uint32_t frame_ticks = (timescale + (uint32_t)fps - 1) / (uint32_t)fps;
         unsigned char *field = found + box->duration_offset;
         write_u32(field, read_u32(field) + frame_ticks);
-        if (pwrite(fd, field, 4, moov_offset + (off_t)(field - moov)) != 4) {
-            snprintf(reason, reason_len, "%s write failed: %s", box->type, strerror(errno));
-            result = -1;
-            break;
-        }
+    }
+
+    if (result == 0) result = mp4_fix_color(moov, reason, reason_len);
+    if (result == 0 && pwrite(fd, moov, moov_size, moov_offset) != (ssize_t)moov_size) {
+        snprintf(reason, reason_len, "moov write failed: %s", strerror(errno));
+        result = -1;
     }
 
     free(moov);
@@ -561,9 +626,11 @@ static void *encoder_output_thread(void *argument)
              * discardable. Each segment must stand on its own anyway. */
             stream.pts = eye->current != NULL ? eye->ordinal - eye->current->start_frame
                                               : eye->ordinal;
-            stream.is_key_frame = info.video_stream_info.nalu_type == 5 ||
-                                  (segment_frames > 0 &&
-                                   eye->ordinal % (unsigned long long)segment_frames == 0);
+            stream.is_key_frame = h264_has_idr(buffer.vstream_buf.vir_ptr,
+                                               (size_t)buffer.vstream_buf.size);
+            if (eye->ordinal == eye->current->start_frame && !stream.is_key_frame) {
+                fail(pipeline, "segment_missing_idr: %s", eye->current->relative);
+            }
             if (eye->current != NULL &&
                 hb_mm_mx_write_stream(&eye->current->muxer, &stream) != 0) {
                 fail(pipeline, "segment_write_failed: %s", eye->current->relative);
@@ -684,7 +751,9 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
 {
     if (config == NULL || out == NULL || config->out_dir == NULL ||
         config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->height <= 0 ||
-        config->fps <= 0) {
+        config->fps <= 0 || config->segment_frames < 0 || config->intra_period < 0 ||
+        (config->segment_frames > 0 && config->segment_frames %
+         (config->intra_period > 0 ? config->intra_period : config->fps) != 0)) {
         snprintf(error, error_len, "invalid_configuration");
         return -1;
     }
