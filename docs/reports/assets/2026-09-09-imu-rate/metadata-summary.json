@@ -1,0 +1,15 @@
+{
+  "bytes": 354376,
+  "records": 16108,
+  "header_lengths": {
+    "12": 16108
+  },
+  "flags": {
+    "141": 7976,
+    "143": 60,
+    "140": 8012,
+    "142": 60
+  },
+  "distinct_pts": 120,
+  "unparsed_bytes": 0
+}

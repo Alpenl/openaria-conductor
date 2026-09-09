@@ -1,0 +1,26 @@
+{
+  "manual60": {
+    "reads": 1626,
+    "span_s": 8.003627961,
+    "reads_per_second": 203.1578688968499,
+    "video_last_fps": 59.83
+  },
+  "manual120": {
+    "reads": 1609,
+    "span_s": 8.001162527,
+    "reads_per_second": 201.09577759112054,
+    "video_last_fps": 120.01
+  },
+  "manual210": {
+    "reads": 1537,
+    "span_s": 8.002324618,
+    "reads_per_second": 192.0691890632323,
+    "video_last_fps": 209.8
+  },
+  "manual570": {
+    "reads": 1395,
+    "span_s": 8.006002143,
+    "reads_per_second": 174.24427012172484,
+    "video_last_fps": 555.53
+  }
+}

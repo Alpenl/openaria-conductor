@@ -1,0 +1,507 @@
+{
+  "240p570": {
+    "reads": 2439,
+    "span_seconds": 12.003348127,
+    "reads_per_second": 203.1933069169077,
+    "group_slots_per_second": 406.3866138338154,
+    "counter_changes": 956,
+    "counter_changes_per_second": 79.64444502360136,
+    "counter_delta_histogram": {
+      "1": 956,
+      "0": 1482
+    },
+    "same_counter_reads": 1482,
+    "same_counter_payload_changes": 1482,
+    "read_duration_ms": {
+      "min": 3.97857,
+      "p50": 4.796451,
+      "p95": 5.4692340999999995,
+      "max": 6.425087
+    },
+    "full_payload_changes": 2438,
+    "sha256": "a29730f3e7c8f76d0ba7157b2f9bd5d8b54b06ed6cc9f8fea0e29fc9d0176f74",
+    "accel": {
+      "within_pair_equal_fraction": 0.06888068880688807,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 392.30720880349253,
+      "first_slot_changes_per_second": 203.10999682797086,
+      "second_slot_changes_per_second": 203.10999682797086
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6863468634686347,
+      "previous_second_equals_next_first_fraction": 0.22190319934372438,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 221.77145674981887,
+      "first_slot_changes_per_second": 202.77675647222355,
+      "second_slot_changes_per_second": 202.9433766500972
+    },
+    "pause_recovery": []
+  },
+  "480p210": {
+    "reads": 2439,
+    "span_seconds": 12.00171522,
+    "reads_per_second": 203.22095261313825,
+    "group_slots_per_second": 406.4419052262765,
+    "counter_changes": 716,
+    "counter_changes_per_second": 59.65813943050717,
+    "counter_delta_histogram": {
+      "0": 1722,
+      "1": 716
+    },
+    "same_counter_reads": 1722,
+    "same_counter_payload_changes": 1722,
+    "read_duration_ms": {
+      "min": 3.290731,
+      "p50": 4.787992,
+      "p95": 5.6209804,
+      "max": 6.442211
+    },
+    "full_payload_changes": 2438,
+    "sha256": "971c011d493bc01c5f033dc68d12e923311c70a18f20fae5f7a4faf75cc4340c",
+    "accel": {
+      "within_pair_equal_fraction": 0.053710537105371055,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 395.4434772865741,
+      "first_slot_changes_per_second": 203.13763118935262,
+      "second_slot_changes_per_second": 203.13763118935262
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6437064370643707,
+      "previous_second_equals_next_first_fraction": 0.2526661197703035,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 224.21795140711563,
+      "first_slot_changes_per_second": 202.47105979906763,
+      "second_slot_changes_per_second": 202.3044169514964
+    },
+    "pause_recovery": []
+  },
+  "720p120": {
+    "reads": 2438,
+    "span_seconds": 12.00025569,
+    "reads_per_second": 203.1623377851543,
+    "group_slots_per_second": 406.3246755703086,
+    "counter_changes": 715,
+    "counter_changes_per_second": 59.58206378850916,
+    "counter_delta_histogram": {
+      "0": 1722,
+      "1": 715
+    },
+    "same_counter_reads": 1722,
+    "same_counter_payload_changes": 1722,
+    "read_duration_ms": {
+      "min": 3.718276,
+      "p50": 4.796034000000001,
+      "p95": 5.6066935,
+      "max": 6.660213
+    },
+    "full_payload_changes": 2437,
+    "sha256": "bd77f705b9fbab5456f71fed528deecae0869683f90ffcc1385b0f8624e1dda0",
+    "accel": {
+      "within_pair_equal_fraction": 0.05045118949958983,
+      "previous_second_equals_next_first_fraction": 0.0004103405826836274,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 395.90823085203783,
+      "first_slot_changes_per_second": 203.07900622740814,
+      "second_slot_changes_per_second": 203.07900622740814
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6579163248564397,
+      "previous_second_equals_next_first_fraction": 0.2425112843660238,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 223.32857475972665,
+      "first_slot_changes_per_second": 203.07900622740814,
+      "second_slot_changes_per_second": 202.99567466966198
+    },
+    "pause_recovery": []
+  },
+  "continuous": {
+    "reads": 3048,
+    "span_seconds": 15.002476908,
+    "reads_per_second": 203.16645169269805,
+    "group_slots_per_second": 406.3329033853961,
+    "counter_changes": 892,
+    "counter_changes_per_second": 59.45684872371609,
+    "counter_delta_histogram": {
+      "0": 2155,
+      "1": 892
+    },
+    "same_counter_reads": 2155,
+    "same_counter_payload_changes": 2155,
+    "read_duration_ms": {
+      "min": 3.625859,
+      "p50": 4.6468665,
+      "p95": 5.55043715,
+      "max": 6.521005
+    },
+    "full_payload_changes": 3047,
+    "sha256": "b1e1a21dc01692d966a166de816feec58353849f14d66395ebd34a41b7be9ff4",
+    "accel": {
+      "within_pair_equal_fraction": 0.04954068241469816,
+      "previous_second_equals_next_first_fraction": 0.0003281916639317361,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 396.1345874047587,
+      "first_slot_changes_per_second": 203.0997960326939,
+      "second_slot_changes_per_second": 203.0997960326939
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6456692913385826,
+      "previous_second_equals_next_first_fraction": 0.23137512307187397,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 228.09566853425613,
+      "first_slot_changes_per_second": 202.63320641266472,
+      "second_slot_changes_per_second": 202.63320641266472
+    },
+    "pause_recovery": []
+  },
+  "delay1": {
+    "reads": 2929,
+    "span_seconds": 15.000784878,
+    "reads_per_second": 195.25644983387784,
+    "group_slots_per_second": 390.5128996677557,
+    "counter_changes": 892,
+    "counter_changes_per_second": 59.463555224246846,
+    "counter_delta_histogram": {
+      "0": 2036,
+      "1": 892
+    },
+    "same_counter_reads": 2036,
+    "same_counter_payload_changes": 2036,
+    "read_duration_ms": {
+      "min": 2.553268,
+      "p50": 3.5574,
+      "p95": 5.672715199999998,
+      "max": 6.755506
+    },
+    "full_payload_changes": 2928,
+    "sha256": "2988804c04c81d8c5045f920ae915d7d230042319c7fe85bd8a89a61aef20954",
+    "accel": {
+      "within_pair_equal_fraction": 0.05872311369067941,
+      "previous_second_equals_next_first_fraction": 0.00273224043715847,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 378.44686435879976,
+      "first_slot_changes_per_second": 195.18978665537531,
+      "second_slot_changes_per_second": 195.18978665537531
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.5182656196654148,
+      "previous_second_equals_next_first_fraction": 0.24282786885245902,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 241.85401160713855,
+      "first_slot_changes_per_second": 194.92313394136522,
+      "second_slot_changes_per_second": 194.85647076286273
+    },
+    "pause_recovery": []
+  },
+  "isolated-30": {
+    "reads": 3048,
+    "span_seconds": 15.000583059,
+    "reads_per_second": 203.19210180108772,
+    "group_slots_per_second": 406.38420360217543,
+    "counter_changes": 892,
+    "counter_changes_per_second": 59.46435525149943,
+    "counter_delta_histogram": {
+      "0": 2155,
+      "1": 892
+    },
+    "same_counter_reads": 2155,
+    "same_counter_payload_changes": 2155,
+    "read_duration_ms": {
+      "min": 3.79011,
+      "p50": 4.7849295000000005,
+      "p95": 5.6421084,
+      "max": 6.585963
+    },
+    "full_payload_changes": 3047,
+    "sha256": "e4884ebceb71d979b4d91eb43559da76efeca75e0ad18ddbabd8f54c8c5c8d64",
+    "accel": {
+      "within_pair_equal_fraction": 0.054133858267716536,
+      "previous_second_equals_next_first_fraction": 0.0006563833278634722,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 395.1846389359738,
+      "first_slot_changes_per_second": 203.0587736502996,
+      "second_slot_changes_per_second": 203.12543772569367
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6496062992125984,
+      "previous_second_equals_next_first_fraction": 0.24811289793239252,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 223.92462924863966,
+      "first_slot_changes_per_second": 202.85878142411744,
+      "second_slot_changes_per_second": 202.9254454995115
+    },
+    "pause_recovery": []
+  },
+  "isolated-60": {
+    "reads": 3049,
+    "span_seconds": 15.005415336,
+    "reads_per_second": 203.19330933046822,
+    "group_slots_per_second": 406.38661866093645,
+    "counter_changes": 893,
+    "counter_changes_per_second": 59.51184822305941,
+    "counter_delta_histogram": {
+      "1": 893,
+      "0": 2155
+    },
+    "same_counter_reads": 2155,
+    "same_counter_payload_changes": 2155,
+    "read_duration_ms": {
+      "min": 3.651734,
+      "p50": 4.78945,
+      "p95": 5.6377394,
+      "max": 6.676131
+    },
+    "full_payload_changes": 3048,
+    "sha256": "44b90bc58ea7bac0d34003cc56e71f8517facc4e5306b5b1a45563970e428fb8",
+    "accel": {
+      "within_pair_equal_fraction": 0.05706789111183995,
+      "previous_second_equals_next_first_fraction": 0.000984251968503937,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 394.5242345806402,
+      "first_slot_changes_per_second": 203.12666672327555,
+      "second_slot_changes_per_second": 203.12666672327555
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6359462118727451,
+      "previous_second_equals_next_first_fraction": 0.26246719160104987,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 223.78587495300502,
+      "first_slot_changes_per_second": 202.79345368731217,
+      "second_slot_changes_per_second": 202.7268110801195
+    },
+    "pause_recovery": []
+  },
+  "native-uvc": {
+    "reads": 3048,
+    "span_seconds": 15.000589662,
+    "reads_per_second": 203.19201235944055,
+    "group_slots_per_second": 406.3840247188811,
+    "counter_changes": 892,
+    "counter_changes_per_second": 59.46432907631922,
+    "counter_delta_histogram": {
+      "0": 2155,
+      "1": 892
+    },
+    "same_counter_reads": 2155,
+    "same_counter_payload_changes": 2155,
+    "read_duration_ms": {
+      "min": 4.316989,
+      "p50": 4.777534,
+      "p95": 5.63570425,
+      "max": 6.629005
+    },
+    "full_payload_changes": 3047,
+    "sha256": "dab376026b07cb3ca19a75103a75eac623d638c5ee66be588fa415e31b22c5e2",
+    "accel": {
+      "within_pair_equal_fraction": 0.05610236220472441,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 394.9178087983352,
+      "first_slot_changes_per_second": 203.12534831339087,
+      "second_slot_changes_per_second": 203.12534831339087
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6377952755905512,
+      "previous_second_equals_next_first_fraction": 0.25500492287495896,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 224.92449137163794,
+      "first_slot_changes_per_second": 202.72536403709276,
+      "second_slot_changes_per_second": 202.72536403709276
+    },
+    "pause_recovery": []
+  },
+  "no-video": {
+    "reads": 4915,
+    "span_seconds": 5.000025344,
+    "reads_per_second": 982.9950173948558,
+    "group_slots_per_second": 1965.9900347897117,
+    "counter_changes": 0,
+    "counter_changes_per_second": 0.0,
+    "counter_delta_histogram": {
+      "0": 4914
+    },
+    "same_counter_reads": 4914,
+    "same_counter_payload_changes": 0,
+    "read_duration_ms": {
+      "min": 0.932965,
+      "p50": 1.014299,
+      "p95": 1.0354783,
+      "max": 1.40901
+    },
+    "full_payload_changes": 0,
+    "sha256": "47b8bc57a81d0ded318f9f54becde9c667c56f1af288e5bff361d733a27f313a",
+    "accel": {
+      "within_pair_equal_fraction": 0.0,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 1965.7900358034665,
+      "first_slot_changes_per_second": 0.0,
+      "second_slot_changes_per_second": 0.0
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.0,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 1965.7900358034665,
+      "first_slot_changes_per_second": 0.0,
+      "second_slot_changes_per_second": 0.0
+    },
+    "pause_recovery": []
+  },
+  "pauses": {
+    "reads": 2536,
+    "span_seconds": 15.001601266,
+    "reads_per_second": 169.04862054610484,
+    "group_slots_per_second": 338.0972410922097,
+    "counter_changes": 761,
+    "counter_changes_per_second": 50.72791807396916,
+    "counter_delta_histogram": {
+      "0": 1774,
+      "1": 736,
+      "6": 20,
+      "7": 5
+    },
+    "same_counter_reads": 1774,
+    "same_counter_payload_changes": 1774,
+    "read_duration_ms": {
+      "min": 3.071647,
+      "p50": 4.6441155,
+      "p95": 5.56683125,
+      "max": 6.451379
+    },
+    "full_payload_changes": 2535,
+    "sha256": "36dd45be4914d34079c8be1a7b36d5e70fc731a39143b0f8a8246d5c792ab6f4",
+    "accel": {
+      "within_pair_equal_fraction": 0.04889589905362776,
+      "previous_second_equals_next_first_fraction": 0.0007889546351084812,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 329.63147815476674,
+      "first_slot_changes_per_second": 168.98196099541633,
+      "second_slot_changes_per_second": 168.98196099541633
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.6305205047318612,
+      "previous_second_equals_next_first_fraction": 0.2339250493096647,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 191.91284643226965,
+      "first_slot_changes_per_second": 168.78198234335073,
+      "second_slot_changes_per_second": 168.78198234335073
+    },
+    "pause_recovery": [
+      {
+        "idle_ms": 100.406294,
+        "counter_step": 6,
+        "next_steps": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ]
+      },
+      {
+        "idle_ms": 100.336376,
+        "counter_step": 6,
+        "next_steps": [
+          0,
+          1,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      {
+        "idle_ms": 100.303084,
+        "counter_step": 6,
+        "next_steps": [
+          1,
+          0,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      {
+        "idle_ms": 100.269209,
+        "counter_step": 7,
+        "next_steps": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "idle_ms": 100.307001,
+        "counter_step": 6,
+        "next_steps": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ]
+      },
+      {
+        "idle_ms": 100.37021,
+        "counter_step": 6,
+        "next_steps": [
+          0,
+          1,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      {
+        "idle_ms": 100.307667,
+        "counter_step": 6,
+        "next_steps": [
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "idle_ms": 100.307834,
+        "counter_step": 7,
+        "next_steps": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ]
+      }
+    ]
+  },
+  "yuyv30": {
+    "reads": 2380,
+    "span_seconds": 12.004389239,
+    "reads_per_second": 198.2608154913728,
+    "group_slots_per_second": 396.5216309827456,
+    "counter_changes": 359,
+    "counter_changes_per_second": 29.905728051009593,
+    "counter_delta_histogram": {
+      "0": 2020,
+      "1": 359
+    },
+    "same_counter_reads": 2020,
+    "same_counter_payload_changes": 2020,
+    "read_duration_ms": {
+      "min": 3.36319,
+      "p50": 4.7872005,
+      "p95": 6.03129874999959,
+      "max": 8.681227
+    },
+    "full_payload_changes": 2379,
+    "sha256": "a058b47470e02c2a929813cc16d2fa4cd6eb290e0a51eabd9f2da8bed18db8ab",
+    "accel": {
+      "within_pair_equal_fraction": 0.018067226890756304,
+      "previous_second_equals_next_first_fraction": 0.0,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 392.8563049820647,
+      "first_slot_changes_per_second": 198.17751262772094,
+      "second_slot_changes_per_second": 198.17751262772094
+    },
+    "gyro": {
+      "within_pair_equal_fraction": 0.5415966386554621,
+      "previous_second_equals_next_first_fraction": 0.2862547288776797,
+      "ordered_value_transitions_per_second_NOT_sample_rate": 232.33168672497425,
+      "first_slot_changes_per_second": 197.67769544580992,
+      "second_slot_changes_per_second": 197.67769544580992
+    },
+    "pause_recovery": []
+  }
+}
