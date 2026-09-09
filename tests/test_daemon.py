@@ -713,15 +713,15 @@ class ProductionDaemonTest(unittest.TestCase):
 
     def test_native_capability_priority_and_optional_audio(self) -> None:
         cases = (
-            (False, True, (), "native_camera_unavailable"),
+            (False, True, (), "native_module_unavailable"),
             (
                 True,
                 True,
-                ("native_camera", "native_audio", "native_imu"),
-                "native_camera_unavailable",
+                ("capture_engine", "native_audio", "session_store"),
+                "native_capture_engine_unavailable",
             ),
-            (True, True, ("native_audio", "native_imu"), "native_audio_unavailable"),
-            (True, False, ("native_audio", "native_imu"), "native_imu_unavailable"),
+            (True, True, ("native_audio",), "native_audio_unavailable"),
+            (True, False, ("native_audio", "session_store"), "native_session_store_unavailable"),
         )
         for available, audio_enabled, missing, error_code in cases:
             with (
@@ -732,7 +732,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 capabilities = NativeCapabilities(
                     available,
                     "0.1.0",
-                    4,
+                    5,
                     tuple(
                         feature for feature in PRODUCTION_NATIVE_FEATURES if feature not in missing
                     ),
@@ -740,7 +740,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 with (
                     patch("rp_ylx.daemon.__commit__", "a" * 40),
                     patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
-                    patch("rp_ylx.daemon.V4L2DiscoveryBackend") as backend,
+                    patch("rp_ylx.daemon.NativeContinuousCaptureSources") as backend,
                     self.assertRaises(ProductionConfigError) as raised,
                 ):
                     build_production_service(config)
