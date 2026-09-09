@@ -24,7 +24,7 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             "time_seconds": (time_ns - origin_ns) / 1e9,
             "source": dict(record.get("source", {})),
         }
-        if capture.source_schema == "ylx.device-session.v2":
+        if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
             mapped_frame["segment"] = {
                 "index": record["segment_index"],
                 "frame": record["segment_frame"],
@@ -50,7 +50,7 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             mapped["packet_sequence"] = record["packet_sequence"]
         imu_samples.append(mapped)
 
-    if capture.source_schema == "ylx.device-session.v2":
+    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         video = {
             "authority": capture.video.authority,
             "layout": "split-eyes",
@@ -95,6 +95,11 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
         },
         "video": video,
         "time_origin_monotonic_ns": origin_ns,
+        "imu_timing": {
+            "basis": timing.imu_time_basis,
+            "sample_times_estimated": True,
+            "missed_packets_estimate_available": False,
+        },
         "frames": frames,
         "imu_samples": imu_samples,
     }
@@ -103,7 +108,7 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
 def check_capture(
     capture: CaptureTiming | str | Path,
     *,
-    imu_rate_hz: float = 120.0,
+    imu_rate_hz: float | None = None,
 ) -> dict[str, Any]:
     """Return bounded diagnostics and a stable identity for the mapped input."""
 

@@ -361,6 +361,56 @@ class SpectacularAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(CaptureValidationError, "IMU packet host timing p95"):
             analyze_capture(self.session, max_imu_residual_p95_ms=5.0)
 
+    def test_same_video_frame_packets_export_at_received_400_hz(self) -> None:
+        def use_400_hz(records: list[dict[str, object]]) -> None:
+            for record in records:
+                record["device_timestamp_raw"] = 1000
+                record["device_ticks"] = 1000
+                host = 1_000_000_000 + int(record["packet_sequence"]) * 5_000_000
+                record["host_monotonic_ns"] = host
+                record["host_read_start_ns"] = host - 2_400_000
+                record["host_read_end_ns"] = host + 2_400_000
+
+        _rewrite_artifact(self.session, "imu", use_400_hz)
+        timing = analyze_capture(self.session)
+        self.assertEqual(len(timing.imu_times_ns), 6)
+        self.assertEqual(timing.imu_clock.measured_rate_hz, 200.0)  # two slots per packet
+        self.assertIsNone(timing.imu_clock.expected_rate_hz)
+        self.assertIsNone(timing.imu_clock.rate_error_ppm)
+        self.assertEqual(timing.imu_time_basis, "host_receive_interpolation")
+        self.assertFalse(timing.diagnostics()["imu_missed_packets_estimate_available"])
+        for previous, later in zip(timing.imu_times_ns, timing.imu_times_ns[1:], strict=False):
+            self.assertEqual(later - previous, 2_500_000)
+        for record, timestamp in zip(timing.imu_samples, timing.imu_times_ns, strict=True):
+            self.assertLessEqual(timestamp, record["host_read_end_ns"])
+        self.assertEqual(
+            analyze_capture(self.session, imu_rate_hz=400).imu_times_ns, timing.imu_times_ns
+        )
+        with self.assertRaisesRegex(CaptureValidationError, "measured rate"):
+            analyze_capture(self.session, imu_rate_hz=120)
+        self.assertTrue(build_model_input(timing)["imu_timing"]["sample_times_estimated"])
+
+    def test_repeated_frame_does_not_hide_host_packet_loss_or_frame_regression(self) -> None:
+        def regress_frame(records: list[dict[str, object]]) -> None:
+            for record in records:
+                if record["packet_sequence"] == 1:
+                    record["device_timestamp_raw"] = 999
+                    record["device_ticks"] = 999
+
+        _rewrite_artifact(self.session, "imu", regress_frame)
+        with self.assertRaisesRegex(CaptureValidationError, "device_ticks regressed"):
+            analyze_capture(self.session)
+
+    def test_rejects_host_packet_sequence_gap(self) -> None:
+        def skip_packet(records: list[dict[str, object]]) -> None:
+            for record in records:
+                if record["packet_sequence"] == 2:
+                    record["packet_sequence"] = 3
+
+        _rewrite_artifact(self.session, "imu", skip_packet)
+        with self.assertRaisesRegex(CaptureValidationError, "IMU packet sequence gap"):
+            analyze_capture(self.session)
+
     def test_legacy_raw_capture_routes_through_compatibility_adapter(self) -> None:
         legacy = _make_legacy_capture(self.root)
         timing = analyze_capture(legacy)
@@ -403,7 +453,7 @@ class SpectacularAdapterTest(unittest.TestCase):
 
     def test_rejects_unknown_schema_and_wrong_artifact_role(self) -> None:
         manifest = _manifest(self.session)
-        manifest["schema"] = "ylx.device-session.v3"
+        manifest["schema"] = "ylx.device-session.v99"
         _write_manifest(self.session, manifest)
         with self.assertRaisesRegex(CaptureValidationError, "unsupported Device Session"):
             load_capture(self.session)

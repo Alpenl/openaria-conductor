@@ -1,4 +1,4 @@
-"""Bounded structured operational events for long-running RP-YLX services."""
+"""Bounded structured operational events for long-running Open Aria services."""
 
 from __future__ import annotations
 
@@ -209,7 +209,11 @@ def configure_operational_logging(
 ) -> str:
     """Configure the process-wide operational stream and return its active level."""
 
-    requested = level if level is not None else os.environ.get("RP_YLX_LOG_LEVEL", "info")
+    requested = (
+        level
+        if level is not None
+        else os.environ.get("OPENARIA_LOG_LEVEL", os.environ.get("RP_YLX_LOG_LEVEL", "info"))
+    )
     normalized = requested.casefold()
     invalid_level = normalized not in _LEVELS
     if invalid_level:

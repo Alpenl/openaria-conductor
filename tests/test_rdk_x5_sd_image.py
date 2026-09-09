@@ -30,7 +30,7 @@ class RdkX5SdImageTest(unittest.TestCase):
         self.assertEqual(plan.partitions[0].mountpoint, "/boot/config")
         self.assertEqual(plan.partitions[1].mountpoint, "/")
         self.assertEqual(plan.data_partition.mountpoint, "/data")
-        self.assertEqual(plan.data_partition.label, "RP-YLX-DATA")
+        self.assertEqual(plan.data_partition.label, "OPENARIA-DATA")
         self.assertEqual(plan.volume_id, volume_id)
         for partition in plan.partitions:
             self.assertEqual(partition.start_bytes % rdk_x5_sd_image.ALIGN_BYTES, 0)
@@ -67,7 +67,7 @@ class RdkX5SdImageTest(unittest.TestCase):
         self.assertEqual(rendered["schema"], "ylx.rdk-x5-sd-image-plan.v1")
         self.assertEqual(rendered["data"]["mountpoint"], "/data")
         self.assertEqual(rendered["data"]["directories"], ["recordings", "sessions"])
-        self.assertEqual(rendered["partitions"][2]["label"], "RP-YLX-DATA")
+        self.assertEqual(rendered["partitions"][2]["label"], "OPENARIA-DATA")
 
     def test_source_images_are_copied_into_their_partition_offsets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -156,6 +156,6 @@ class RdkX5SdImageTest(unittest.TestCase):
         self.assertEqual(mkfs[:2], ["mkfs.ext4", "-F"])
         self.assertIn("4096", mkfs)
         self.assertIn(f"offset={plan.data_partition.start_bytes},nodiscard", mkfs)
-        self.assertIn("RP-YLX-DATA", mkfs)
+        self.assertIn("OPENARIA-DATA", mkfs)
         self.assertIn(plan.volume_id, mkfs)
         self.assertEqual(mkfs[-1], str(plan.data_partition.size_bytes // 4096))

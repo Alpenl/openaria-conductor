@@ -47,6 +47,7 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
+from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.web import (
     WEB_ASSETS,
     EchoWebArtifactError,
@@ -269,6 +270,8 @@ class DeviceProvider(Protocol):
     ) -> Mapping[str, object]: ...
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedRepresentation: ...
+
+    def delete_sessions(self, command: CaptureCommand) -> CaptureCommandResult: ...
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None: ...
 
@@ -1275,6 +1278,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         parts = path.split("/")
+        if path == "/api/v4/sessions/delete":
+            self._delete_sessions()
+            return
         if (
             len(parts) == 5
             and parts[1] == "api"
@@ -1335,6 +1341,43 @@ class GatewayHandler(BaseHTTPRequestHandler):
             HTTPStatus.METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "接口不允许该请求方法",
+        )
+
+    def _delete_sessions(self) -> None:
+        from rp_ylx.recording.deletion import valid_delete_request
+
+        identity = self._command_principal("deleteSessions")
+        if identity is None:
+            return
+        principal, key = identity
+        body = self._read_json()
+        if body is None:
+            return
+        if not valid_delete_request(body):
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "删除请求无效")
+            return
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            result = self.server.provider.delete_sessions(
+                CaptureCommand(principal.principal_id, key, body, canonical)
+            )
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        self._audit("deleteSessions", None, "completed", principal)
+        self._send_json(
+            result.status,
+            result.body,
+            headers={"Idempotency-Replayed": "true"} if result.replayed else None,
         )
 
     def _get_device(self, api_version: str) -> None:
@@ -1399,35 +1442,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(status, body, headers=headers)
 
-    @staticmethod
-    def _valid_camera_focus_status(value: object) -> bool:
-        if not isinstance(value, Mapping) or set(value) != {
-            "schema",
-            "value",
-            "minimum",
-            "maximum",
-            "step",
-            "default",
-            "auto_supported",
-            "auto_enabled",
-        }:
-            return False
-        return not (
-            value["schema"] != "ylx.camera-focus.v1"
-            or any(
-                type(value[key]) is not int
-                for key in ("value", "minimum", "maximum", "step", "default")
-            )
-            or value["minimum"] > value["maximum"]
-            or value["step"] <= 0
-            or not value["minimum"] <= value["value"] <= value["maximum"]
-            or (value["value"] - value["minimum"]) % value["step"] != 0
-            or not value["minimum"] <= value["default"] <= value["maximum"]
-            or type(value["auto_supported"]) is not bool
-            or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
-            or (not value["auto_supported"] and value["auto_enabled"] is not None)
-        )
-
     def _send_camera_focus_status(
         self,
         status: int,
@@ -1435,7 +1449,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         *,
         headers: Mapping[str, str] | None = None,
     ) -> None:
-        if not self._valid_camera_focus_status(body):
+        if not valid_camera_focus_status(body):
             self._invalid_source_state("daemon camera focus 状态无效")
             return
         self._send_json(status, body, headers=headers)

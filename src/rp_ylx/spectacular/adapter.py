@@ -394,7 +394,7 @@ def _artifact(
 
 def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     schema = manifest.get("schema")
-    if schema != "ylx.device-session.v2":
+    if schema not in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         raise CaptureValidationError(f"unsupported Device Session schema: {schema!r}")
     if manifest.get("capture_mode") != "calibration":
         raise CaptureValidationError("Spectacular only accepts calibration Device Sessions")

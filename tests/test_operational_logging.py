@@ -101,6 +101,14 @@ class OperationalLoggingTest(unittest.TestCase):
         self.assertEqual(events[0]["event"], "log_level_defaulted")
         self.assertEqual(events[0]["context"], {"error_code": "invalid_log_level"})
 
+    def test_openaria_log_level_environment_takes_precedence_over_legacy_name(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"OPENARIA_LOG_LEVEL": "error", "RP_YLX_LOG_LEVEL": "debug"},
+            clear=False,
+        ):
+            self.assertEqual(configure_operational_logging(stream=self.stream), "error")
+
     def test_api_audit_is_schema_valid_private_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

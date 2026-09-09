@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the RP-YLX RDK X5 Wi-Fi watchdog
+Description=Run the Open Aria RDK X5 Wi-Fi watchdog
 
 [Timer]
 OnBootSec=3min

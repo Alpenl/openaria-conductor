@@ -4,7 +4,9 @@ import http.client
 import json
 import threading
 import unittest
+from collections import UserDict
 from copy import deepcopy
+from http import HTTPStatus
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -410,6 +412,57 @@ class GatewayEventHttpTest(unittest.TestCase):
             _capture_status_from_snapshot_event(matching, api_version="v4"),
             api_version="v4",
         )
+
+    def test_v4_live_imu_accepts_idle_preview_without_session(self) -> None:
+        idle = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        idle["data"]["runtime"]["live_imu"] = {**deepcopy(RAW_LIVE_IMU), "session_id": None}
+        validate_capture_status(
+            _capture_status_from_snapshot_event(idle, api_version="v4"), api_version="v4"
+        )
+
+    def test_v4_focus_status_preserves_mapping_and_validation_errors(self) -> None:
+        focus = {
+            "schema": "ylx.camera-focus.v1",
+            "value": 42,
+            "minimum": 0,
+            "maximum": 255,
+            "step": 2,
+            "default": 33,
+            "auto_supported": True,
+            "auto_enabled": False,
+        }
+        status = _capture_status_from_snapshot_event(SNAPSHOT_SOURCE_EVENT, api_version="v4")
+        runtime = status["snapshot"]["runtime"]
+        for valid in (
+            None,
+            UserDict(focus),
+            {**focus, "auto_enabled": None},
+            {**focus, "auto_supported": False, "auto_enabled": None},
+        ):
+            with self.subTest(valid=valid):
+                runtime["camera_focus"] = valid
+                validate_capture_status(status, api_version="v4")
+
+        for invalid, message in (
+            ([], "camera focus 必须是闭合对象"),
+            ({"schema": focus["schema"]}, "camera focus 必须是闭合对象"),
+            ({**focus, "unknown": 1}, "camera focus 必须是闭合对象"),
+            ({**focus, "schema": "unknown"}, "camera focus 无效"),
+            ({**focus, "value": HTTPStatus.OK}, "camera focus 无效"),
+            ({**focus, "value": True}, "camera focus 无效"),
+            ({**focus, "value": 43}, "camera focus 无效"),
+            ({**focus, "maximum": -1}, "camera focus 无效"),
+            ({**focus, "step": 0}, "camera focus 无效"),
+            ({**focus, "default": 256}, "camera focus 无效"),
+            ({**focus, "auto_supported": 1}, "camera focus 无效"),
+            ({**focus, "auto_enabled": 1}, "camera focus 无效"),
+            ({**focus, "auto_supported": False}, "camera focus 无效"),
+        ):
+            with self.subTest(invalid=invalid):
+                runtime["camera_focus"] = invalid
+                with self.assertRaises(InvalidSourceEvent) as raised:
+                    validate_capture_status(status, api_version="v4")
+                self.assertEqual(str(raised.exception), message)
 
     def test_v4_sse_initial_snapshot_rejects_live_imu_without_matching_active_session(
         self,

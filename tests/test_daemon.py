@@ -25,6 +25,7 @@ from rp_ylx.daemon import (
 )
 from rp_ylx.deployment import ReleaseManager
 from rp_ylx.native import NativeCapabilities
+from rp_ylx.recording.encoding import RecordingEncoding
 
 PRODUCTION_NATIVE_FEATURES = (
     "capability_probe",
@@ -98,7 +99,14 @@ class ProductionDaemonTest(unittest.TestCase):
                 "security": {"profile": "lab", "isolated_network": True},
             }
             path.write_text(json.dumps(value), encoding="utf-8")
-            self.assertEqual(load_production_config(path), config)
+            self.assertEqual(
+                load_production_config(path),
+                replace(
+                    config,
+                    video_bitrate_kbps=16384,
+                    recording_encoding=RecordingEncoding.from_mapping({"preset": "high"}),
+                ),
+            )
             value["security"]["isolated_network"] = False
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(ProductionConfigError):
@@ -357,6 +365,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 port = listener.getsockname()[1]
             config = replace(self.config(root), port=port)
             source = Mock(open_handle_count=0)
+            source.latest_imu_observation.return_value = None
             source.camera_connection_status.return_value = {
                 "schema": "ylx.camera-connection.v1",
                 "state": "connected",
@@ -469,7 +478,14 @@ class ProductionDaemonTest(unittest.TestCase):
 
     def test_event_pump_publishes_each_observed_revision_once_and_closes(self) -> None:
         source = {"authority_epoch": str(uuid.uuid4()), "source_revision": 1}
-        coordinator = Mock(capture_snapshot_event=lambda: dict(source))
+        coordinator = Mock(
+            capture_snapshot_event=Mock(side_effect=lambda: dict(source)),
+            capture_recording_progress=lambda: (
+                source["authority_epoch"],
+                source["source_revision"],
+                None,
+            ),
+        )
         event_buffer = Mock()
         pump = CaptureEventPump(coordinator, event_buffer, interval=0.01)
         try:
@@ -482,12 +498,19 @@ class ProductionDaemonTest(unittest.TestCase):
             self.assertEqual(event["source_revision"], 2)
             time.sleep(0.03)
             self.assertEqual(event_buffer.publish.call_count, 1)
+            self.assertGreater(coordinator.capture_snapshot_event.call_count, 1)
         finally:
             pump.close()
 
     def test_event_pump_defaults_keep_idle_light_and_active_progress_live(self) -> None:
         source = {"authority_epoch": str(uuid.uuid4()), "source_revision": 1}
-        coordinator = Mock(capture_snapshot_event=lambda: dict(source))
+        coordinator = Mock(
+            capture_recording_progress=lambda: (
+                source["authority_epoch"],
+                source["source_revision"],
+                None,
+            ),
+        )
         event_buffer = Mock()
         pump = CaptureEventPump(coordinator, event_buffer)
         try:
@@ -543,10 +566,13 @@ class ProductionDaemonTest(unittest.TestCase):
             "authority_epoch"
         ]
 
-        def snapshot_event() -> dict[str, object]:
-            return dict(source)
-
-        coordinator = Mock(capture_snapshot_event=snapshot_event)
+        coordinator = Mock(
+            capture_recording_progress=lambda: (
+                source["authority_epoch"],
+                source["source_revision"],
+                source["data"]["active_recording"]["recording_state"],
+            )
+        )
         event_buffer = Mock()
         pump = CaptureEventPump(
             coordinator,
@@ -569,8 +595,38 @@ class ProductionDaemonTest(unittest.TestCase):
             self.assertEqual(event["session_id"], source["session_id"])
             self.assertEqual(event["data"]["phase"], "recording")
             self.assertEqual(event["data"]["completed_units"], 60)
+            coordinator.capture_snapshot_event.assert_not_called()
         finally:
             pump.close()
+
+    def test_event_pump_tracks_revision_returned_after_slow_snapshot(self) -> None:
+        epoch = str(uuid.uuid4())
+        state = {
+            "state": "recording",
+            "session_id": str(uuid.uuid4()),
+            "progress": {"elapsed_seconds": 1.0, "captured_frames": 60, "bytes_written": 4096},
+        }
+        event = {
+            "authority_epoch": epoch,
+            "source_revision": 9,
+            "type": "snapshot",
+            "data": {"active_recording": {"recording_state": state}},
+        }
+        coordinator = Mock(
+            capture_recording_progress=Mock(
+                side_effect=[(epoch, 7, None), (epoch, 8, state), (epoch, 9, state)]
+            ),
+            capture_snapshot_event=Mock(return_value=event),
+        )
+        events = Mock()
+        with patch("rp_ylx.daemon.threading.Thread"):
+            pump = CaptureEventPump(coordinator, events)
+        pump._stop = Mock()
+        pump._stop.wait.side_effect = [False, False, True]
+        pump._run()
+        events.publish.assert_called_once_with(event)
+        coordinator.capture_snapshot_event.assert_called_once_with()
+        self.assertEqual(pump._last_source, (epoch, 9))
 
     def test_source_checkout_cannot_start_production_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -662,6 +718,43 @@ class ProductionDaemonTest(unittest.TestCase):
                 sources.assert_not_called()
                 coordinator.assert_not_called()
                 gateway.assert_not_called()
+                self.assertFalse(config.state_root.exists())
+
+    def test_native_capability_priority_and_optional_audio(self) -> None:
+        cases = (
+            (False, True, (), "native_module_unavailable"),
+            (
+                True,
+                True,
+                ("capture_engine", "native_audio", "session_store"),
+                "native_capture_engine_unavailable",
+            ),
+            (True, True, ("native_audio",), "native_audio_unavailable"),
+            (True, False, ("native_audio", "session_store"), "native_session_store_unavailable"),
+        )
+        for available, audio_enabled, missing, error_code in cases:
+            with (
+                self.subTest(available=available, audio_enabled=audio_enabled, missing=missing),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                config = replace(self.config(Path(directory)), audio_enabled=audio_enabled)
+                capabilities = NativeCapabilities(
+                    available,
+                    "0.1.0",
+                    5,
+                    tuple(
+                        feature for feature in PRODUCTION_NATIVE_FEATURES if feature not in missing
+                    ),
+                )
+                with (
+                    patch("rp_ylx.daemon.__commit__", "a" * 40),
+                    patch("rp_ylx.daemon.native_capabilities", return_value=capabilities),
+                    patch("rp_ylx.daemon.NativeContinuousCaptureSources") as backend,
+                    self.assertRaises(ProductionConfigError) as raised,
+                ):
+                    build_production_service(config)
+                self.assertEqual(raised.exception.code, error_code)
+                backend.assert_not_called()
                 self.assertFalse(config.state_root.exists())
 
 

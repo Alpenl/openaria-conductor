@@ -202,6 +202,37 @@ impl EncoderProcess {
         self.wait_ready()
     }
 
+    pub(crate) fn configure(&mut self, args: &[String]) -> Result<(), EncoderProcessError> {
+        if self.child.is_some() || args.len() % 2 != 0 {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "invalid encoder settings",
+            ));
+        }
+        for pair in args.chunks_exact(2) {
+            if !matches!(
+                pair[0].as_str(),
+                "--codec"
+                    | "--rc-mode"
+                    | "--bitrate-kbps"
+                    | "--min-qp"
+                    | "--max-qp"
+                    | "--intra-qp"
+                    | "--initial-qp"
+                    | "--intra-period"
+                    | "--vbv-ms"
+            ) || pair[1].starts_with('-')
+            {
+                return Err(EncoderProcessError::new(
+                    "invalid_argument",
+                    "unsupported encoder setting",
+                ));
+            }
+        }
+        self.args.extend_from_slice(args);
+        Ok(())
+    }
+
     pub(crate) fn submit(&mut self, jpeg: &[u8]) -> Result<u64, EncoderProcessError> {
         self.raise_if_failed()?;
         let stdin = self

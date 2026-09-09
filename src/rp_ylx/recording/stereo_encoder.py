@@ -92,6 +92,7 @@ class StereoEncoderProcess:
         bitrate_kbps: int = 8192,
         segment_frames: int = 900,
         path_prefix: str = "video/",
+        encoder_arguments: tuple[str, ...] = (),
     ) -> None:
         if width <= 0 or width % 4 or height <= 0 or fps <= 0 or segment_frames <= 0:
             raise ValueError("边录边编码参数无效")
@@ -103,6 +104,7 @@ class StereoEncoderProcess:
         self._bitrate_kbps = bitrate_kbps
         self._segment_frames = segment_frames
         self._path_prefix = path_prefix
+        self._encoder_arguments = encoder_arguments
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -150,6 +152,7 @@ class StereoEncoderProcess:
             str(self._bitrate_kbps),
             "--segment-frames",
             str(self._segment_frames),
+            *self._encoder_arguments,
         ]
         try:
             self._process = subprocess.Popen(  # noqa: S603 - 固定参数，无 shell

@@ -17,6 +17,8 @@ from importlib.resources import files
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
+from rp_ylx.camera_focus import CAMERA_FOCUS_KEYS, valid_camera_focus_status
+
 
 class InvalidEventCursor(ValueError):
     """Last-Event-ID 不是契约要求的十进制 delivery ID。"""
@@ -746,7 +748,7 @@ def _validate_capabilities(value: object, *, api_version: str) -> None:
                 or value["session_detail"] is not True
                 or value["artifact_download"] is not True
                 or value["capture_status"] is not True
-                or value["session_deletion"] is not False
+                or type(value["session_deletion"]) is not bool
             )
         )
     ):
@@ -983,37 +985,14 @@ def _validate_runtime_live_imu_session_relation(
     live_imu = runtime["live_imu"]
     if live_imu is None:
         return
-    if active_session_id is None:
-        raise InvalidSourceEvent("v4/source runtime live_imu 仅允许出现在活动录制 snapshot")
     if not isinstance(live_imu, Mapping) or live_imu.get("session_id") != active_session_id:
         raise InvalidSourceEvent("v4/source runtime live_imu session_id 必须与活动录制一致")
 
 
 def _validate_camera_focus(value: object) -> None:
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema",
-        "value",
-        "minimum",
-        "maximum",
-        "step",
-        "default",
-        "auto_supported",
-        "auto_enabled",
-    }:
+    if not isinstance(value, Mapping) or set(value) != CAMERA_FOCUS_KEYS:
         raise InvalidSourceEvent("camera focus 必须是闭合对象")
-    integers = ("value", "minimum", "maximum", "step", "default")
-    if (
-        value["schema"] != "ylx.camera-focus.v1"
-        or any(type(value[key]) is not int for key in integers)
-        or value["minimum"] > value["maximum"]
-        or value["step"] <= 0
-        or not value["minimum"] <= value["value"] <= value["maximum"]
-        or (value["value"] - value["minimum"]) % value["step"] != 0
-        or not value["minimum"] <= value["default"] <= value["maximum"]
-        or type(value["auto_supported"]) is not bool
-        or (value["auto_enabled"] is not None and type(value["auto_enabled"]) is not bool)
-        or (not value["auto_supported"] and value["auto_enabled"] is not None)
-    ):
+    if not valid_camera_focus_status(value):
         raise InvalidSourceEvent("camera focus 无效")
 
 
@@ -1082,7 +1061,9 @@ def _validate_live_imu(value: object) -> None:
     if not isinstance(value, Mapping) or set(value) != LIVE_IMU_KEYS:
         raise InvalidSourceEvent("live_imu 必须是闭合对象")
     session_id = value["session_id"]
-    if not isinstance(session_id, str) or UUID_V7.fullmatch(session_id) is None:
+    if session_id is not None and (
+        not isinstance(session_id, str) or UUID_V7.fullmatch(session_id) is None
+    ):
         raise InvalidSourceEvent("live_imu session_id 无效")
     clock = value["clock"]
     if (

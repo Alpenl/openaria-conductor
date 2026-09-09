@@ -1,0 +1,845 @@
+{
+  "environment": {
+    "cpu": "AMD Ryzen 9 7900X 12-Core Processor",
+    "cpu_affinity": [
+      2
+    ],
+    "cpu_scaling_driver": "amd-pstate-epp",
+    "cpu_scaling_governor": "powersave",
+    "host": "HKU-4090D",
+    "kernel": "6.8.0-94-generic",
+    "machine": "x86_64",
+    "python": "3.11.14",
+    "turbojpeg": "libjpeg-turbo 3.1.4.1 (conda-forge)",
+    "turbojpeg_library": "/home/alpen/miniconda3/envs/lerobot/lib/libturbojpeg.so.0.4.0"
+  },
+  "experiments": {
+    "dual_jpeg_passthrough_control": {
+      "adapters": {
+        "python": {
+          "application_drop_total": 0,
+          "cpu_ms_per_frame": {
+            "max": 0.2853184680486877,
+            "mean": 0.2705907532066958,
+            "median": 0.26856426926582827,
+            "min": 0.2681184388849178,
+            "stdev": 0.005261798820386374
+          },
+          "fps": {
+            "max": 3729.519956138446,
+            "mean": 3696.6779466323414,
+            "median": 3723.399272711953,
+            "min": 3504.6809813612786,
+            "stdev": 68.72245756745623
+          },
+          "frames_total": 55463,
+          "rss_peak_mib": {
+            "max": 37.8046875,
+            "mean": 37.64375,
+            "median": 37.66015625,
+            "min": 37.44140625,
+            "stdev": 0.12199068583525365
+          },
+          "stage_ms_per_frame": {
+            "max": 0.2842358837961202,
+            "mean": 0.2695657144388288,
+            "median": 0.2675622769433422,
+            "min": 0.26709263402430306,
+            "stdev": 0.005240912601503843
+          },
+          "unknown_gap_total": 0
+        },
+        "rust": {
+          "application_drop_total": 0,
+          "cpu_ms_per_frame": {
+            "max": 0.1666983475894246,
+            "mean": 0.1635804230559114,
+            "median": 0.16353659149534608,
+            "min": 0.15923732247453312,
+            "stdev": 0.002371633413310081
+          },
+          "fps": {
+            "max": 6279.710321387458,
+            "mean": 6114.078239887408,
+            "median": 6114.569649934896,
+            "min": 5998.617715103843,
+            "stdev": 88.99638464289261
+          },
+          "frames_total": 91751,
+          "rss_peak_mib": {
+            "max": 38.875,
+            "mean": 38.694140625,
+            "median": 38.740234375,
+            "min": 38.5,
+            "stdev": 0.12876873452052467
+          },
+          "stage_ms_per_frame": {
+            "max": 0.16562243712508332,
+            "mean": 0.16247462511435956,
+            "median": 0.1624302062135804,
+            "min": 0.15810623970713072,
+            "stdev": 0.002385110197718208
+          },
+          "unknown_gap_total": 0
+        }
+      },
+      "duration_seconds_per_run": 1.5,
+      "paired": {
+        "cpu_per_frame_reduction_percent": {
+          "bootstrap95_ci_mean": [
+            38.73623467871626,
+            40.43752666494043
+          ],
+          "max": 42.58147069286028,
+          "mean": 39.526604208332905,
+          "median": 39.36659013215822,
+          "min": 37.968019022086494,
+          "stdev": 1.458951273351689,
+          "t95_ci_mean": [
+            38.48293341457481,
+            40.570275002091
+          ]
+        },
+        "fps_delta": {
+          "bootstrap95_ci_mean": [
+            2352.172656503401,
+            2486.701191090228
+          ],
+          "max": 2599.069330901962,
+          "mean": 2417.400293255066,
+          "median": 2419.675090431346,
+          "min": 2279.7267825918216,
+          "stdev": 114.70267288182256,
+          "t95_ci_mean": [
+            2335.3469499808043,
+            2499.453636529328
+          ]
+        },
+        "fps_uplift_percent": {
+          "bootstrap95_ci_mean": [
+            63.252381110291154,
+            68.02394092328903
+          ],
+          "max": 74.15994051168784,
+          "mean": 65.44930013832152,
+          "median": 64.92609757190746,
+          "min": 61.20437296505796,
+          "stdev": 4.083140845025202,
+          "t95_ci_mean": [
+            62.5283973469873,
+            68.37020292965575
+          ]
+        },
+        "rss_peak_delta_mib": {
+          "bootstrap95_ci_mean": [
+            0.94453125,
+            1.159375
+          ],
+          "max": 1.375,
+          "mean": 1.050390625,
+          "median": 1.0078125,
+          "min": 0.7578125,
+          "stdev": 0.18411891128222943,
+          "t95_ci_mean": [
+            0.9186798997731402,
+            1.1821013502268596
+          ]
+        }
+      },
+      "rounds": 10,
+      "runs": {
+        "python": [
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.26861438818263206,
+            "cpu_utilization": 0.9999781028983129,
+            "fps": 3722.727251000507,
+            "frames": 5585,
+            "report": "fixed_trace-python-round-01.json",
+            "round": 1,
+            "rss_peak_mib": 37.53515625,
+            "stage_ms_per_frame": 0.26763578245299907,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2853184680486877,
+            "cpu_utilization": 0.9999502086013715,
+            "fps": 3504.6809813612786,
+            "frames": 5258,
+            "report": "fixed_trace-python-round-02.json",
+            "round": 2,
+            "rss_peak_mib": 37.44140625,
+            "stage_ms_per_frame": 0.2842358837961202,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.27123535743988425,
+            "cpu_utilization": 0.9999613540510556,
+            "fps": 3686.6924854097747,
+            "frames": 5531,
+            "report": "fixed_trace-python-round-03.json",
+            "round": 3,
+            "rss_peak_mib": 37.70703125,
+            "stage_ms_per_frame": 0.2702030632796963,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.26998696742846856,
+            "cpu_utilization": 0.9999507848425313,
+            "fps": 3703.7001984455496,
+            "frames": 5557,
+            "report": "fixed_trace-python-round-04.json",
+            "round": 4,
+            "rss_peak_mib": 37.71484375,
+            "stage_ms_per_frame": 0.26895329080439084,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2688902953405018,
+            "cpu_utilization": 0.9999736811822715,
+            "fps": 3718.890932512021,
+            "frames": 5580,
+            "report": "fixed_trace-python-round-05.json",
+            "round": 5,
+            "rss_peak_mib": 37.52734375,
+            "stage_ms_per_frame": 0.2678803096774194,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2685141503490245,
+            "cpu_utilization": 0.9999658394612909,
+            "fps": 3724.0712944233987,
+            "frames": 5587,
+            "report": "fixed_trace-python-round-06.json",
+            "round": 6,
+            "rss_peak_mib": 37.57421875,
+            "stage_ms_per_frame": 0.2674887714336853,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2684137427549195,
+            "cpu_utilization": 0.9999619171061901,
+            "fps": 3725.449773334539,
+            "frames": 5590,
+            "report": "fixed_trace-python-round-07.json",
+            "round": 7,
+            "rss_peak_mib": 37.7578125,
+            "stage_ms_per_frame": 0.2674166286225403,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.268435135981392,
+            "cpu_utilization": 0.9999709423456299,
+            "fps": 3725.1864912905744,
+            "frames": 5589,
+            "report": "fixed_trace-python-round-08.json",
+            "round": 8,
+            "rss_peak_mib": 37.61328125,
+            "stage_ms_per_frame": 0.267393860976919,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2681184388849178,
+            "cpu_utilization": 0.9999530684299872,
+            "fps": 3729.519956138446,
+            "frames": 5596,
+            "report": "fixed_trace-python-round-09.json",
+            "round": 9,
+            "rss_peak_mib": 37.76171875,
+            "stage_ms_per_frame": 0.26709263402430306,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.2683805876565295,
+            "cpu_utilization": 0.999948523810095,
+            "fps": 3725.8601024073246,
+            "frames": 5590,
+            "report": "fixed_trace-python-round-10.json",
+            "round": 10,
+            "rss_peak_mib": 37.8046875,
+            "stage_ms_per_frame": 0.26735691932021466,
+            "unknown_gap": 0
+          }
+        ],
+        "rust": [
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16171607931889212,
+            "cpu_utilization": 0.9999505976671044,
+            "fps": 6183.371510604557,
+            "frames": 9279,
+            "report": "fixed_trace-rust-round-01.json",
+            "round": 1,
+            "rss_peak_mib": 38.76171875,
+            "stage_ms_per_frame": 0.16060013805366957,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16382566819521782,
+            "cpu_utilization": 0.9999509734032949,
+            "fps": 6103.750312263241,
+            "frames": 9159,
+            "report": "fixed_trace-rust-round-02.json",
+            "round": 2,
+            "rss_peak_mib": 38.81640625,
+            "stage_ms_per_frame": 0.16275236455944972,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.15923732247453312,
+            "cpu_utilization": 0.9999642574934285,
+            "fps": 6279.710321387458,
+            "frames": 9424,
+            "report": "fixed_trace-rust-round-03.json",
+            "round": 3,
+            "rss_peak_mib": 38.74609375,
+            "stage_ms_per_frame": 0.15810623970713072,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16479393399956072,
+            "cpu_utilization": 0.9999397955857398,
+            "fps": 6067.8191928375545,
+            "frames": 9106,
+            "report": "fixed_trace-rust-round-04.json",
+            "round": 4,
+            "rss_peak_mib": 38.875,
+            "stage_ms_per_frame": 0.1636787615857676,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.1666983475894246,
+            "cpu_utilization": 0.9999596609284602,
+            "fps": 5998.617715103843,
+            "frames": 9002,
+            "report": "fixed_trace-rust-round-05.json",
+            "round": 5,
+            "rss_peak_mib": 38.5,
+            "stage_ms_per_frame": 0.16562243712508332,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16324751479547434,
+            "cpu_utilization": 0.9999545293823358,
+            "fps": 6125.3889876065505,
+            "frames": 9192,
+            "report": "fixed_trace-rust-round-06.json",
+            "round": 6,
+            "rss_peak_mib": 38.7578125,
+            "stage_ms_per_frame": 0.16210804786771105,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16556405969325833,
+            "cpu_utilization": 0.9999615238211281,
+            "fps": 6039.725805671616,
+            "frames": 9063,
+            "report": "fixed_trace-rust-round-07.json",
+            "round": 7,
+            "rss_peak_mib": 38.734375,
+            "stage_ms_per_frame": 0.1644498170583692,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16651563249001333,
+            "cpu_utilization": 0.9999536025819922,
+            "fps": 6005.163525064014,
+            "frames": 9012,
+            "report": "fixed_trace-rust-round-08.json",
+            "round": 8,
+            "rss_peak_mib": 38.51171875,
+            "stage_ms_per_frame": 0.16543468486462495,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16213176834143708,
+            "cpu_utilization": 0.9999561840547616,
+            "fps": 6167.5524438179855,
+            "frames": 9255,
+            "report": "fixed_trace-rust-round-09.json",
+            "round": 9,
+            "rss_peak_mib": 38.67578125,
+            "stage_ms_per_frame": 0.16102220486223662,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 0.16207390366130253,
+            "cpu_utilization": 0.9999445408238657,
+            "fps": 6169.682584517257,
+            "frames": 9259,
+            "report": "fixed_trace-rust-round-10.json",
+            "round": 10,
+            "rss_peak_mib": 38.5625,
+            "stage_ms_per_frame": 0.16097155545955288,
+            "unknown_gap": 0
+          }
+        ]
+      }
+    },
+    "single_jpeg_crop": {
+      "adapters": {
+        "python": {
+          "application_drop_total": 0,
+          "cpu_ms_per_frame": {
+            "max": 15.008402225,
+            "mean": 14.964684268885572,
+            "median": 14.963828739999999,
+            "min": 14.922649616915423,
+            "stdev": 0.02946716101052653
+          },
+          "fps": {
+            "max": 66.76715925783782,
+            "mean": 66.5781237986492,
+            "median": 66.5779644290918,
+            "min": 66.38724443664303,
+            "stdev": 0.1306242151946892
+          },
+          "frames_total": 2003,
+          "rss_peak_mib": {
+            "max": 62.8828125,
+            "mean": 62.699609375,
+            "median": 62.681640625,
+            "min": 62.58984375,
+            "stdev": 0.09321407146182159
+          },
+          "stage_ms_per_frame": {
+            "max": 15.055341005,
+            "mean": 15.012261584084577,
+            "median": 15.01262901,
+            "min": 14.969827233830845,
+            "stdev": 0.02944855892839261
+          },
+          "unknown_gap_total": 0
+        },
+        "rust": {
+          "application_drop_total": 0,
+          "cpu_ms_per_frame": {
+            "max": 13.891642375,
+            "mean": 13.858479804400606,
+            "median": 13.867837472350232,
+            "min": 13.80347262385321,
+            "stdev": 0.028065138566284027
+          },
+          "fps": {
+            "max": 72.44036966464192,
+            "mean": 72.15425942933624,
+            "median": 72.10592476429125,
+            "min": 71.98266024093988,
+            "stdev": 0.14607748353865796
+          },
+          "frames_total": 2171,
+          "rss_peak_mib": {
+            "max": 62.61328125,
+            "mean": 62.382421875,
+            "median": 62.3828125,
+            "min": 62.14453125,
+            "stdev": 0.1325115309202294
+          },
+          "stage_ms_per_frame": {
+            "max": 13.883973259259259,
+            "mean": 13.850655369947827,
+            "median": 13.860013638248848,
+            "min": 13.795518321100916,
+            "stdev": 0.02805958673222739
+          },
+          "unknown_gap_total": 0
+        }
+      },
+      "duration_seconds_per_run": 3.0,
+      "paired": {
+        "cpu_per_frame_reduction_percent": {
+          "bootstrap95_ci_mean": [
+            7.242127121729958,
+            7.543321257494896
+          ],
+          "max": 7.830516907991014,
+          "mean": 7.391789518758637,
+          "median": 7.420992687883061,
+          "min": 7.040564483925261,
+          "stdev": 0.25671429854809114,
+          "t95_ci_mean": [
+            7.208147185646834,
+            7.57543185187044
+          ]
+        },
+        "fps_delta": {
+          "bootstrap95_ci_mean": [
+            5.464331591970295,
+            5.689475062443082
+          ],
+          "max": 5.899949860037779,
+          "mean": 5.576135630687041,
+          "median": 5.595987619236958,
+          "min": 5.317311881951113,
+          "stdev": 0.1927273571971385,
+          "t95_ci_mean": [
+            5.438266794668451,
+            5.714004466705632
+          ]
+        },
+        "fps_uplift_percent": {
+          "bootstrap95_ci_mean": [
+            8.200220241184235,
+            8.553606256265878
+          ],
+          "max": 8.887173899299917,
+          "mean": 8.375690011413784,
+          "median": 8.410652239361506,
+          "min": 7.963963033707944,
+          "stdev": 0.300477470449226,
+          "t95_ci_mean": [
+            8.160741393308308,
+            8.59063862951926
+          ]
+        },
+        "rss_peak_delta_mib": {
+          "bootstrap95_ci_mean": [
+            -0.41640625,
+            -0.224609375
+          ],
+          "max": -0.125,
+          "mean": -0.3171875,
+          "median": -0.31640625,
+          "min": -0.60546875,
+          "stdev": 0.1638743133672792,
+          "t95_ci_mean": [
+            -0.43441611334201924,
+            -0.19995888665798078
+          ]
+        }
+      },
+      "rounds": 10,
+      "runs": {
+        "python": [
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.930002253731343,
+            "cpu_utilization": 0.9962906796833242,
+            "fps": 66.73077892096961,
+            "frames": 201,
+            "report": "fixed_trace-python-round-01.json",
+            "round": 1,
+            "rss_peak_mib": 62.58984375,
+            "stage_ms_per_frame": 14.977914835820895,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.95838762,
+            "cpu_utilization": 0.9963627952013393,
+            "fps": 66.60897019871044,
+            "frames": 200,
+            "report": "fixed_trace-python-round-02.json",
+            "round": 2,
+            "rss_peak_mib": 62.68359375,
+            "stage_ms_per_frame": 15.005142695,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.963091279999999,
+            "cpu_utilization": 0.9962909157093546,
+            "fps": 66.58322782813062,
+            "frames": 200,
+            "report": "fixed_trace-python-round-03.json",
+            "round": 3,
+            "rss_peak_mib": 62.73828125,
+            "stage_ms_per_frame": 15.011289705,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.983528155,
+            "cpu_utilization": 0.9963589779195452,
+            "fps": 66.49695369558607,
+            "frames": 200,
+            "report": "fixed_trace-python-round-04.json",
+            "round": 4,
+            "rss_peak_mib": 62.8828125,
+            "stage_ms_per_frame": 15.030948105,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 15.008402225,
+            "cpu_utilization": 0.9963664671145321,
+            "fps": 66.38724443664303,
+            "frames": 200,
+            "report": "fixed_trace-python-round-05.json",
+            "round": 5,
+            "rss_peak_mib": 62.640625,
+            "stage_ms_per_frame": 15.054951625,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.922649616915423,
+            "cpu_utilization": 0.9963429235215047,
+            "fps": 66.76715925783782,
+            "frames": 201,
+            "report": "fixed_trace-python-round-06.json",
+            "round": 6,
+            "rss_peak_mib": 62.65625,
+            "stage_ms_per_frame": 14.969827233830845,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.939320358208954,
+            "cpu_utilization": 0.9963663977350221,
+            "fps": 66.69422529569977,
+            "frames": 201,
+            "report": "fixed_trace-python-round-07.json",
+            "round": 7,
+            "rss_peak_mib": 62.71484375,
+            "stage_ms_per_frame": 14.98555476119403,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 15.00798985,
+            "cpu_utilization": 0.9963419725860317,
+            "fps": 66.38743646178783,
+            "frames": 200,
+            "report": "fixed_trace-python-round-08.json",
+            "round": 8,
+            "rss_peak_mib": 62.59375,
+            "stage_ms_per_frame": 15.055341005,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.968905130000001,
+            "cpu_utilization": 0.9962186703098628,
+            "fps": 66.55254086107384,
+            "frames": 200,
+            "report": "fixed_trace-python-round-09.json",
+            "round": 9,
+            "rss_peak_mib": 62.6796875,
+            "stage_ms_per_frame": 15.017677560000001,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 14.964566199999998,
+            "cpu_utilization": 0.9962315916770359,
+            "fps": 66.57270103005297,
+            "frames": 200,
+            "report": "fixed_trace-python-round-10.json",
+            "round": 10,
+            "rss_peak_mib": 62.81640625,
+            "stage_ms_per_frame": 15.013968315,
+            "unknown_gap": 0
+          }
+        ],
+        "rust": [
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.80347262385321,
+            "cpu_utilization": 0.9999286595276913,
+            "fps": 72.44036966464192,
+            "frames": 218,
+            "report": "fixed_trace-rust-round-01.json",
+            "round": 1,
+            "rss_peak_mib": 62.40234375,
+            "stage_ms_per_frame": 13.795518321100916,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.891642375,
+            "cpu_utilization": 0.9999573732682682,
+            "fps": 71.98266024093988,
+            "frames": 216,
+            "report": "fixed_trace-rust-round-02.json",
+            "round": 2,
+            "rss_peak_mib": 62.14453125,
+            "stage_ms_per_frame": 13.883973259259259,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.826871201834862,
+            "cpu_utilization": 0.9999417525715167,
+            "fps": 72.31872908737458,
+            "frames": 218,
+            "report": "fixed_trace-rust-round-03.json",
+            "round": 3,
+            "rss_peak_mib": 62.61328125,
+            "stage_ms_per_frame": 13.818600151376147,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.861972179723503,
+            "cpu_utilization": 0.9999229885422537,
+            "fps": 72.1342515753194,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-04.json",
+            "round": 4,
+            "rss_peak_mib": 62.27734375,
+            "stage_ms_per_frame": 13.855078198156683,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.833166751152074,
+            "cpu_utilization": 0.9999608126789148,
+            "fps": 72.28719429668081,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-05.json",
+            "round": 5,
+            "rss_peak_mib": 62.30078125,
+            "stage_ms_per_frame": 13.82583298156682,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.872010847926267,
+            "cpu_utilization": 0.99995656561818,
+            "fps": 72.08447113978893,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-06.json",
+            "round": 6,
+            "rss_peak_mib": 62.36328125,
+            "stage_ms_per_frame": 13.863957230414746,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.880785460829493,
+            "cpu_utilization": 0.9999392968188672,
+            "fps": 72.03765951434224,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-07.json",
+            "round": 7,
+            "rss_peak_mib": 62.328125,
+            "stage_ms_per_frame": 13.872392188940093,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.872679474654378,
+            "cpu_utilization": 0.9999477626638862,
+            "fps": 72.08036230425476,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-08.json",
+            "round": 8,
+            "rss_peak_mib": 62.41796875,
+            "stage_ms_per_frame": 13.864250926267282,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.878533032258066,
+            "cpu_utilization": 0.9999416166485742,
+            "fps": 72.04951808122632,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-09.json",
+            "round": 9,
+            "rss_peak_mib": 62.52734375,
+            "stage_ms_per_frame": 13.870880396313364,
+            "unknown_gap": 0
+          },
+          {
+            "application_drop": 0,
+            "cpu_ms_per_frame": 13.863664096774194,
+            "cpu_utilization": 0.9999497461631642,
+            "fps": 72.12737838879356,
+            "frames": 217,
+            "report": "fixed_trace-rust-round-10.json",
+            "round": 10,
+            "rss_peak_mib": 62.44921875,
+            "stage_ms_per_frame": 13.85607004608295,
+            "unknown_gap": 0
+          }
+        ]
+      }
+    }
+  },
+  "format": "openaria.fixed-trace-ablation.v1",
+  "generated_at": "2026-09-04T22:49:49.969249Z",
+  "identity": {
+    "commit": "132783d2885c7468d42186c6131cbe53f9198bb7",
+    "software_version": "0.1.0",
+    "source_tree": "clean detached worktree at the exact commit",
+    "wheel_sha256": "0b57872d2cf8fd69e8bbece33367e85094aa14219c3012dedd58bb478f2b7ffe",
+    "wheel_tag": "cp311-abi3-linux_x86_64"
+  },
+  "inputs": {
+    "dual_jpeg_passthrough_control": {
+      "bytes": 395438,
+      "description": "left and right lossless crop outputs from the primary input concatenated byte-for-byte; no transform on the measured path",
+      "included_in_repository": false,
+      "sha256": "554e87167e4a8036b932ef1641974dc1ebf9f99e10209d7358048083526173ee"
+    },
+    "expected_outputs": {
+      "left_bytes": 202812,
+      "left_sha256": "72ca2ceae7a444637e28d019abbfdd553c15a9e57acc9d5b53ebd0b0e826b938",
+      "python_rust_byte_equal": true,
+      "right_bytes": 192626,
+      "right_sha256": "baeec212a52c424c9e670aa62618f1ca2524657d4d1e55cac5e742f2713f0075"
+    },
+    "single_jpeg_crop": {
+      "bytes": 395403,
+      "description": "historical YLX Device API SBS preview; one baseline JPEG requiring lossless 1920x1080 left/right crops",
+      "dimensions": [
+        3840,
+        1080
+      ],
+      "encoding": "baseline JPEG, 8-bit, 3 components",
+      "included_in_repository": false,
+      "privacy_reason": "real camera imagery is intentionally not copied into the public source tree",
+      "sha256": "757fc8e484d31fb008485da5168150807eb51088b0abfc9572bd030f272482b8",
+      "source_path": "/data2/openaria-score-46/f05-20260830-continue-staged-assets/rdk-true-device/f05-20260830-rdk-071531Z/acceptance/preview-during-first-catalog.jpg"
+    }
+  },
+  "method": {
+    "instrumentation": "ylx.performance-report.v0; every raw report passed strict validation",
+    "measured_rounds": 10,
+    "order": "odd rounds python then rust; even rounds rust then python",
+    "process_isolation": "one fresh process per adapter per round",
+    "statistics": "paired by round; sample SD; Student t 95% CI and deterministic 100000-draw paired bootstrap CI for the mean",
+    "warmup_seconds_per_adapter": {
+      "dual_jpeg_passthrough_control": 1.0,
+      "single_jpeg_crop": 2.0
+    }
+  },
+  "scope": {
+    "does_not_support_claims_about": [
+      "RDK X5 throughput",
+      "V4L2 capture",
+      "recording I/O",
+      "preview concurrency",
+      "end-to-end frame loss"
+    ],
+    "hardware_reason": "known RDK X5 devices 192.168.110.238 and 192.168.110.36 were unreachable during this run",
+    "supports_claims_about": [
+      "fixed-trace splitter throughput on this x86_64 host",
+      "per-frame CPU cost",
+      "output equivalence"
+    ]
+  },
+  "variants": {
+    "python": "Python JPEG marker/dimension path plus ctypes TurboJPEG lossless crop",
+    "rust": "Rust JPEG marker/dimension path plus dynamically loaded same TurboJPEG lossless crop"
+  }
+}

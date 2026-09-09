@@ -10,6 +10,8 @@ import threading
 import time
 import unittest
 import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -299,6 +301,27 @@ class FakeNativeSessionStore:
         payload = os.pread(descriptor, expected_bytes + 1, 0)
         if len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise ValueError("native fixture verification mismatch")
+        return {}
+
+    def verify_fd_interruptible(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+        interrupt_check: Callable[[], None],
+    ) -> dict[str, object]:
+        self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected_bytes:
+            interrupt_check()
+            block = os.pread(descriptor, min(1024 * 1024, expected_bytes - offset), offset)
+            if not block:
+                raise ValueError("native fixture short read")
+            digest.update(block)
+            offset += len(block)
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("digest_mismatch: native fixture verification mismatch")
         return {}
 
 
@@ -1108,6 +1131,136 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def deletion_command(self, coordinator, session_ids, key="delete-one"):
+        items = coordinator.list_sessions(cursor=None, limit=200, take_id=None)["items"]
+        body = {
+            "schema": "ylx.session-delete-request.v1",
+            "sessions": [
+                {
+                    "session_id": item["session_id"],
+                    "manifest_sha256": item["verification"]["manifest_sha256"],
+                }
+                for item in items
+                if item["session_id"] in session_ids
+            ],
+        }
+        return CaptureCommand("bridge", key, body, json.dumps(body, sort_keys=True).encode())
+
+    def test_remote_deletion_removes_only_selected_and_replays_after_restart(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="delete-first")
+            second = self.seal_one(coordinator, prefix="delete-second")
+            command = self.deletion_command(coordinator, {first})
+            result = coordinator.delete_sessions(command)
+            self.assertEqual(result.body["deleted_session_ids"], [first])
+            self.assertFalse((self.mountpoint / "recordings" / first).exists())
+            self.assertTrue((self.mountpoint / "recordings" / second).exists())
+            self.assertTrue(coordinator.delete_sessions(command).replayed)
+            items = coordinator.list_sessions(cursor=None, limit=50, take_id=None)["items"]
+            self.assertEqual([item["session_id"] for item in items], [second])
+        finally:
+            coordinator.close()
+        restarted = self.coordinator()
+        try:
+            self.assertTrue(restarted.delete_sessions(command).replayed)
+        finally:
+            restarted.close()
+
+    def test_remote_deletion_blocks_download_capture_and_stale_manifest(self):
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator)
+            command = self.deletion_command(coordinator, {session_id})
+            with coordinator.open_manifest(session_id, "v4"):
+                with self.assertRaises(ProviderError) as rejected:
+                    coordinator.delete_sessions(command)
+                self.assertEqual(rejected.exception.code, "download_busy")
+            coordinator.start_capture(start_command("busy-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(command)
+            self.assertEqual(rejected.exception.code, "capture_busy")
+            coordinator.stop_capture(stop_command("busy-stop"))
+            body = deepcopy(command.body)
+            body["sessions"][0]["manifest_sha256"] = "0" * 64
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(
+                    CaptureCommand("bridge", "changed", body, json.dumps(body).encode())
+                )
+            self.assertEqual(rejected.exception.code, "manifest_changed")
+            self.assertTrue((self.mountpoint / "recordings" / session_id).exists())
+        finally:
+            coordinator.close()
+
+    def test_remote_deletion_rejects_symlink_and_continuation_orphans(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="first")
+            second = self.seal_one(coordinator, prefix="second")
+            command = self.deletion_command(coordinator, {first})
+            from rp_ylx.recording import deletion
+
+            inspect = deletion.inspect_device_session_directory
+
+            def linked(path):
+                manifest, payload = inspect(path)
+                if path.name == second:
+                    manifest = deepcopy(manifest)
+                    manifest["take"]["continuation_of"] = first
+                return manifest, payload
+
+            with patch.object(deletion, "inspect_device_session_directory", linked):
+                with self.assertRaises(ProviderError) as rejected:
+                    coordinator.delete_sessions(command)
+                self.assertEqual(rejected.exception.code, "continuation_required")
+            root = self.mountpoint / "recordings"
+            (root / first).rename(self.mountpoint / "outside")
+            (root / first).symlink_to(self.mountpoint / "outside", target_is_directory=True)
+            with self.assertRaises(ProviderError) as rejected:
+                coordinator.delete_sessions(command)
+            self.assertEqual(rejected.exception.code, "catalog_unavailable")
+            self.assertTrue((self.mountpoint / "outside" / "manifest.json").is_file())
+        finally:
+            coordinator.close()
+
+    def test_remote_deletion_reports_storage_failure_and_supports_legacy_root(self):
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="first")
+            second = self.seal_one(coordinator, prefix="second")
+            command = self.deletion_command(coordinator, {first, second})
+            from rp_ylx.recording import deletion
+
+            remove = deletion.shutil.rmtree
+            calls = []
+
+            def fail_second(*args, **kwargs):
+                calls.append(args[0])
+                if len(calls) == 2:
+                    raise PermissionError("read-only")
+                return remove(*args, **kwargs)
+
+            with patch.object(deletion.shutil, "rmtree", fail_second):
+                result = coordinator.delete_sessions(command)
+            self.assertEqual(len(result.body["deleted_session_ids"]), 1)
+            self.assertEqual(len(result.body["failed_sessions"]), 1)
+            remaining = result.body["failed_sessions"][0]["session_id"]
+            legacy = self.mountpoint / "sessions"
+            legacy.mkdir()
+            (self.mountpoint / "recordings" / remaining).rename(legacy / remaining)
+        finally:
+            coordinator.close()
+        restarted = self.coordinator()
+        try:
+            command = self.deletion_command(restarted, {remaining}, key="legacy-delete")
+            self.assertEqual(
+                restarted.delete_sessions(command).body["deleted_session_ids"], [remaining]
+            )
+            self.assertFalse((legacy / remaining).exists())
+        finally:
+            restarted.close()
+
     def test_legacy_sessions_root_remains_listed_and_downloadable(self) -> None:
         first = self.coordinator()
         try:
@@ -1472,6 +1625,122 @@ class CaptureCoordinatorTest(unittest.TestCase):
             finally:
                 restarted.close()
 
+    def test_recording_defers_cold_catalog_hashing_until_idle_without_trusting_bytes(self) -> None:
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                first = self.coordinator()
+                try:
+                    session_id = self.seal_one(first, prefix=f"deferred-active-{corrupt}")
+                finally:
+                    first.close()
+                restarted = self.coordinator()
+                try:
+                    restarted.start_capture(start_command(f"active-list-{corrupt}"))
+                    self.assertTrue(restarted.submit_frame(frame()))
+                    with patch(
+                        "rp_ylx.recording.coordinator.validate_device_session_directory",
+                        side_effect=AssertionError("recording must not hash historical artifacts"),
+                    ):
+                        for _ in range(2):
+                            listed = restarted.list_sessions(
+                                cursor=None, limit=50, take_id=None, api_version="v4"
+                            )
+                            selected = next(
+                                item for item in listed["items"] if item["session_id"] == session_id
+                            )
+                            self.assertIsNone(selected["verification"])
+                    if corrupt:
+                        root = self.mountpoint / "recordings" / session_id
+                        manifest = json.loads((root / "manifest.json").read_bytes())
+                        path = root / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
+                        payload = bytearray(path.read_bytes())
+                        payload[0] ^= 1
+                        path.write_bytes(payload)
+                    restarted.stop_capture(stop_command(f"active-list-stop-{corrupt}"))
+                    listed = restarted.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    selected = next(
+                        item for item in listed["items"] if item["session_id"] == session_id
+                    )
+                    self.assertEqual(
+                        selected["verification"]["verdict"], "unusable" if corrupt else "usable"
+                    )
+                finally:
+                    restarted.close()
+
+    def test_capture_interrupts_inflight_catalog_hash_and_idle_revalidates(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="interrupt-catalog")
+        finally:
+            first.close()
+        root = self.mountpoint / "recordings" / session_id
+        manifest = json.loads((root / "manifest.json").read_bytes())
+        artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
+        path = root / artifact["path"]
+        payload = path.read_bytes() + bytes(2 * 1024 * 1024)
+        path.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        artifact.update(bytes=len(payload), sha256=digest, artifact_id=digest)
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        identity = (path.stat().st_dev, path.stat().st_ino)
+        entered = threading.Event()
+        resume = threading.Event()
+        results = []
+        errors = []
+        reads = []
+        read = os.pread
+        restarted = self.coordinator()
+
+        def blocked_read(fd: int, count: int, offset: int) -> bytes:
+            metadata = os.fstat(fd)
+            if (metadata.st_dev, metadata.st_ino) == identity:
+                reads.append(count)
+                entered.set()
+                if not resume.wait(5):
+                    raise AssertionError("capture did not release the catalog read")
+            return read(fd, count, offset)
+
+        def list_once() -> None:
+            try:
+                results.append(restarted.list_sessions(cursor=None, limit=50, take_id=None))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=list_once)
+        try:
+            with (
+                patch("rp_ylx.recording.device_session.os.pread", side_effect=blocked_read),
+                patch(
+                    "rp_ylx.recording.device_session._session_store_or_none",
+                    return_value=FakeNativeSessionStore(),
+                ),
+            ):
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(5), repr(errors) + repr(results))
+                    restarted.start_capture(start_command("interrupt-active"))
+                    self.assertTrue(restarted.submit_frame(frame()))
+                finally:
+                    resume.set()
+                    thread.join(5)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(reads, [1024 * 1024])
+            selected = next(
+                item for item in results[0]["items"] if item["session_id"] == session_id
+            )
+            self.assertIsNone(selected["verification"])
+            restarted.stop_capture(stop_command("interrupt-stop"))
+            listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+            selected = next(item for item in listed["items"] if item["session_id"] == session_id)
+            self.assertEqual(selected["verification"]["verdict"], "usable")
+        finally:
+            resume.set()
+            thread.join(5)
+            restarted.close()
+
     def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
         coordinator = self.coordinator()
         try:
@@ -1585,6 +1854,297 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_slow_status_sampling_does_not_block_stop_and_restart(self) -> None:
+        def check_sampling(operation: str) -> None:
+            with self.subTest(operation=operation):
+                sources = FakeSourcesWithLatestImu(imu_observation(40))
+                coordinator = self.coordinator(sources=sources)
+                blocked = threading.Event()
+                release = threading.Event()
+                poll_thread = None
+
+                def read_status() -> object:
+                    nonlocal poll_thread
+                    poll_thread = threading.get_ident()
+                    return coordinator.capture_status()
+
+                target = coordinator if operation == "runtime" else sources
+                attribute = "_runtime" if operation == "runtime" else operation
+                original = getattr(target, attribute)
+
+                def sample() -> object:
+                    value = original()
+                    if threading.get_ident() == poll_thread:
+                        blocked.set()
+                        if not release.wait(timeout=5):
+                            raise TimeoutError("status sample was not released")
+                    return value
+
+                def restart() -> object:
+                    coordinator.stop_capture(stop_command(f"slow-{operation}-stop"))
+                    sources.observation = imu_observation(80)
+                    return coordinator.start_capture(start_command(f"slow-{operation}-restart"))
+
+                try:
+                    first = coordinator.start_capture(start_command(f"slow-{operation}-start"))
+                    self.assertTrue(coordinator.submit_frame(frame()))
+                    with (
+                        patch.object(target, attribute, side_effect=sample),
+                        ThreadPoolExecutor(max_workers=2) as executor,
+                    ):
+                        polling = executor.submit(read_status)
+                        try:
+                            self.assertTrue(blocked.wait(timeout=1))
+                            restarted = executor.submit(restart).result(timeout=1)
+                        finally:
+                            release.set()
+                        status = polling.result(timeout=2)
+                    validate_capture_status(status)
+                    expected = restarted.body["snapshot"]["active_recording"]
+                    self.assertEqual(
+                        status["snapshot"]["active_recording"]["generation_id"],
+                        expected["generation_id"],
+                    )
+                    session_id = expected["recording_state"]["session_id"]
+                    self.assertNotEqual(
+                        session_id,
+                        first.body["snapshot"]["active_recording"]["recording_state"]["session_id"],
+                    )
+                    self.assertEqual(
+                        status["snapshot"]["active_recording"]["recording_state"]["session_id"],
+                        session_id,
+                    )
+                    self.assertEqual(status["source_revision"], restarted.body["source_revision"])
+                    live_imu = status["snapshot"]["runtime"]["live_imu"]
+                    self.assertEqual(live_imu["session_id"], session_id)
+                    self.assertEqual(live_imu["clock"]["timestamp_ns"], 10_131)
+                finally:
+                    release.set()
+                    coordinator.close()
+
+        for operation in (
+            "runtime",
+            "camera_connection_status",
+            "camera_focus_status",
+            "latest_imu_observation",
+        ):
+            check_sampling(operation)
+
+    def test_slow_focus_query_does_not_return_expired_live_imu(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        clock = {"now": 1.0}
+
+        def slow_focus() -> None:
+            clock["now"] += coordinator_module.LIVE_IMU_STALE_SECONDS + 1
+
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator.time.monotonic", side_effect=lambda: clock["now"]
+            ):
+                coordinator.start_capture(start_command("slow-focus-freshness"))
+                with patch.object(sources, "camera_focus_status", side_effect=slow_focus):
+                    status = coordinator.capture_status()
+                validate_capture_status(status)
+                self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
+    def test_capture_progress_does_not_sample_runtime_or_camera(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        try:
+            started = coordinator.start_capture(start_command("progress-no-hardware-start"))
+            expected = started.body["snapshot"]["active_recording"]["recording_state"]
+            with (
+                patch.object(coordinator, "_runtime") as runtime,
+                patch.object(sources, "camera_connection_status") as camera,
+                patch.object(sources, "camera_focus_status") as focus,
+                patch.object(sources, "latest_imu_observation") as imu,
+            ):
+                for _ in range(25):
+                    epoch, revision, state = coordinator.capture_recording_progress()
+                    self.assertEqual(epoch, started.body["authority_epoch"])
+                    self.assertEqual(revision, started.body["source_revision"])
+                    self.assertEqual(state["session_id"], expected["session_id"])
+                    self.assertEqual(state["state"], "recording")
+                runtime.assert_not_called()
+                camera.assert_not_called()
+                focus.assert_not_called()
+                imu.assert_not_called()
+            self.assertTrue(coordinator.submit_frame(frame()))
+            stopped = coordinator.stop_capture(stop_command("progress-no-hardware-stop"))
+            epoch, revision, state = coordinator.capture_recording_progress()
+            self.assertEqual(epoch, stopped.body["authority_epoch"])
+            self.assertEqual(revision, stopped.body["source_revision"])
+            self.assertIsNone(state)
+        finally:
+            coordinator.close()
+
+    def test_capture_status_retries_focus_sample_after_write_attempt(self) -> None:
+        def check_attempt(fail_after_write: bool) -> None:
+            sources = FakeSources()
+            sources.focus = deepcopy(CAMERA_FOCUS_STATUS)
+            coordinator = self.coordinator(sources=sources)
+            blocked = threading.Event()
+            release = threading.Event()
+            original = sources.camera_focus_status
+            original_write = sources.set_camera_focus
+
+            def sample() -> object:
+                value = original()
+                blocked.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("focus sample was not released")
+                return value
+
+            def write(**kwargs: object) -> object:
+                result = original_write(**kwargs)
+                if fail_after_write:
+                    raise CameraError("camera_io", "focus readback failed", retryable=True)
+                return result
+
+            try:
+                before = coordinator.capture_status()["source_revision"]
+                with (
+                    patch.object(sources, "camera_focus_status", side_effect=sample),
+                    patch.object(sources, "set_camera_focus", side_effect=write),
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
+                    polling = executor.submit(coordinator.capture_status)
+                    try:
+                        self.assertTrue(blocked.wait(timeout=1))
+                        request = command(
+                            f"focus-during-sample-{fail_after_write}",
+                            {"schema": "ylx.camera-focus-set.v1", "value": 77},
+                        )
+                        if fail_after_write:
+                            with self.assertRaises(ProviderError) as raised:
+                                coordinator.set_camera_focus(request)
+                            self.assertEqual(raised.exception.code, "camera_io")
+                        else:
+                            coordinator.set_camera_focus(request)
+                    finally:
+                        release.set()
+                    status = polling.result(timeout=2)
+                validate_capture_status(status)
+                if fail_after_write:
+                    self.assertEqual(status["source_revision"], before)
+                else:
+                    self.assertGreater(status["source_revision"], before)
+                self.assertEqual(status["snapshot"]["runtime"]["camera_focus"]["value"], 77)
+            finally:
+                release.set()
+                coordinator.close()
+
+        for fail_after_write in (False, True):
+            with self.subTest(fail_after_write=fail_after_write):
+                check_attempt(fail_after_write)
+
+    def test_capture_status_does_not_resample_runtime_for_recording_checkpoints(self) -> None:
+        coordinator = self.coordinator(checkpoint_interval=0)
+        try:
+            coordinator.start_capture(start_command("checkpoint-during-sample"))
+            recorder = coordinator._active
+            original = coordinator._runtime
+
+            def sample() -> object:
+                with recorder._lock:
+                    recorder._checkpoint_if_due()
+                return original()
+
+            with patch.object(coordinator, "_runtime", side_effect=sample) as runtime:
+                status = coordinator.capture_status()
+                runtime.assert_called_once_with()
+            validate_capture_status(status)
+            self.assertEqual(
+                status["source_revision"], recorder.current_recording_state["state_revision"]
+            )
+        finally:
+            coordinator.close()
+
+    def test_slow_imu_sample_cannot_overwrite_newer_concurrent_sample(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(20))
+        coordinator = self.coordinator(sources=sources)
+        blocked = threading.Event()
+        release = threading.Event()
+        poll_thread = None
+
+        def read_status() -> object:
+            nonlocal poll_thread
+            poll_thread = threading.get_ident()
+            return coordinator.capture_status()
+
+        def sample() -> object:
+            value = sources.observation
+            if threading.get_ident() == poll_thread:
+                blocked.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("IMU sample was not released")
+            return value
+
+        try:
+            coordinator.start_capture(start_command("concurrent-imu"))
+            sources.observation = imu_observation(40)
+            with (
+                patch.object(sources, "latest_imu_observation", side_effect=sample),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                polling = executor.submit(read_status)
+                try:
+                    self.assertTrue(blocked.wait(timeout=1))
+                    sources.observation = imu_observation(80)
+                    newer = coordinator.capture_status()
+                finally:
+                    release.set()
+                delayed = polling.result(timeout=2)
+            self.assertEqual(delayed["source_revision"], newer["source_revision"])
+            for status in (newer, delayed):
+                validate_capture_status(status)
+                self.assertEqual(
+                    status["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"], 10_131
+                )
+        finally:
+            release.set()
+            coordinator.close()
+
+    def test_capture_status_clears_live_imu_while_sealed_session_is_verified(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        blocked = threading.Event()
+        release = threading.Event()
+        original = coordinator._verify_exact_session_payload
+
+        def verify(*args: object) -> object:
+            blocked.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("session verification was not released")
+            return original(*args)
+
+        try:
+            coordinator.start_capture(start_command("verify-live-imu-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            with (
+                patch.object(coordinator, "_verify_exact_session_payload", side_effect=verify),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                stopping = executor.submit(
+                    coordinator.stop_capture, stop_command("verify-live-imu-stop")
+                )
+                try:
+                    self.assertTrue(blocked.wait(timeout=1))
+                    status = coordinator.capture_status()
+                    validate_capture_status(status)
+                    self.assertIsNone(status["snapshot"]["active_recording"])
+                    self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
+                finally:
+                    release.set()
+                stopped = stopping.result(timeout=2)
+            self.assertEqual(stopped.body["snapshot"]["device_state"], "idle")
+        finally:
+            release.set()
+            coordinator.close()
+
     def test_capture_status_refreshes_native_source_imu_for_same_session_revision(self) -> None:
         sources = FakeSourcesWithSequentialLatestImu(
             [
@@ -1630,6 +2190,33 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 third["snapshot"]["runtime"]["live_imu"]["clock"]["timestamp_ns"],
                 300,
             )
+        finally:
+            coordinator.close()
+
+    def test_idle_imu_updates_without_recording_and_expires(self) -> None:
+        sources = FakeSourcesWithSequentialLatestImu(
+            [
+                single_imu_observation(
+                    host_monotonic_ns=100, accelerometer=(1, 2, 3), gyroscope=(4, 5, 6)
+                ),
+                single_imu_observation(
+                    host_monotonic_ns=200, accelerometer=(7, 8, 9), gyroscope=(10, 11, 12)
+                ),
+            ]
+        )
+        coordinator = self.coordinator(sources=sources)
+        try:
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=1.0):
+                first = coordinator.capture_status()
+                second = coordinator.capture_status()
+                for status, timestamp in ((first, 100), (second, 200)):
+                    validate_capture_status(status)
+                    self.assertIsNone(status["snapshot"]["active_recording"])
+                    imu = status["snapshot"]["runtime"]["live_imu"]
+                    self.assertIsNone(imu["session_id"])
+                    self.assertEqual(imu["clock"]["timestamp_ns"], timestamp)
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=11.0):
+                self.assertIsNone(coordinator.capture_status()["snapshot"]["runtime"]["live_imu"])
         finally:
             coordinator.close()
 

@@ -22,6 +22,7 @@ from typing import Literal
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
+from rp_ylx.audio_clock import audio_clock_report
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
@@ -35,10 +36,12 @@ _TEMP_COMPONENT = re.compile(r"^[^/]*\.tmp(?:[._-][^/]*)?$")
 _READ_CHUNK = 1024 * 1024
 _DEVICE_SESSION_V1_SCHEMA_ID = "ylx.device-session.v1"
 _DEVICE_SESSION_V2_SCHEMA_ID = "ylx.device-session.v2"
+_DEVICE_SESSION_V3_SCHEMA_ID = "ylx.device-session.v3"
 _DEVICE_SESSION_SCHEMA_IDS = frozenset(
     {
         _DEVICE_SESSION_V1_SCHEMA_ID,
         _DEVICE_SESSION_V2_SCHEMA_ID,
+        _DEVICE_SESSION_V3_SCHEMA_ID,
     }
 )
 _DEVICE_SESSION_V1_SCHEMA = json.loads(
@@ -55,8 +58,18 @@ _DEVICE_SESSION_V2_SCHEMA = json.loads(
     .joinpath("ylx-device-session-v2.schema.json")
     .read_text(encoding="utf-8")
 )
+# The versioned capture-clock extension leaves the pinned vendor bytes intact.
+_DEVICE_SESSION_V2_SCHEMA["$defs"]["recordedAudio"]["properties"]["capture_clock"] = {
+    "type": "object",
+    "required": ["schema"],
+    "properties": {"schema": {"const": "openaria.audio-clock.v1"}},
+}
 _DEVICE_SESSION_V2_VALIDATOR = Draft202012Validator(
     _DEVICE_SESSION_V2_SCHEMA,
+    format_checker=FormatChecker(),
+)
+_DEVICE_SESSION_V3_VALIDATOR = Draft202012Validator(
+    json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v3.schema.json").read_text()),
     format_checker=FormatChecker(),
 )
 _RECORDING_SESSION_SCHEMA = json.loads(
@@ -1145,6 +1158,15 @@ def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
     if schema == _DEVICE_SESSION_V2_SCHEMA_ID:
         _validate_device_session_v2(manifest)
         return
+    if schema == _DEVICE_SESSION_V3_SCHEMA_ID:
+        try:
+            _DEVICE_SESSION_V3_VALIDATOR.validate(manifest)
+        except ValidationError as error:
+            raise ArtifactAccessError(
+                "not_verified", "manifest 不符合 device-session v3 契约"
+            ) from error
+        _validate_device_session_semantics(manifest, schema_version="v2")
+        return
     raise ArtifactAccessError("not_verified", "manifest 不是支持的 device-session 契约")
 
 
@@ -1353,6 +1375,10 @@ def _validate_audio_v2(manifest: Mapping[str, object], audio: Mapping[str, objec
         return
     if state != "recorded":
         raise ArtifactAccessError("not_verified", "manifest audio state 无效")
+    try:
+        audio_clock_report(audio, manifest["time"]["duration_seconds"])
+    except (ValueError, TypeError, KeyError) as error:
+        raise ArtifactAccessError("not_verified", str(error)) from error
 
     sample_rate = audio["sample_rate"]
     channels = audio["channels"]

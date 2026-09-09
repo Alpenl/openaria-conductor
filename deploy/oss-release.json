@@ -1,0 +1,7 @@
+{
+  "bucket": "openaria-firmware-cn",
+  "region": "cn-beijing",
+  "endpoint": "https://oss-cn-beijing.aliyuncs.com",
+  "prefix": "rdk-x5",
+  "public_base_url": "https://openaria-firmware-cn.oss-cn-beijing.aliyuncs.com/rdk-x5"
+}

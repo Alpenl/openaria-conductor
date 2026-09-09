@@ -176,13 +176,26 @@ static bool read_exact(void *destination, size_t length)
     return true;
 }
 
+static int parse_integer(const char *value)
+{
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 1000000) {
+        fprintf(stderr, "invalid integer: %s\n", value);
+        exit(2);
+    }
+    return (int)parsed;
+}
+
 static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s --out-dir DIR [--width 3840] [--height 1080] [--fps 30]\n"
             "          [--bitrate-kbps 8192] [--segment-frames 900]\n"
-            "          [--path-prefix video/] [--min-qp 28] [--intra-qp 30]\n"
-            "          [--initial-qp 32] [--intra-period 0] [--vbv-ms 3000]\n",
+            "          [--path-prefix video/] [--min-qp 20] [--intra-qp 22]\n"
+            "          [--initial-qp 24] [--max-qp 51] [--intra-period 0] [--vbv-ms 3000]\n"
+            "          [--codec h264|hevc] [--rc-mode cbr|vbr|fixqp|avbr]\n",
             program);
 }
 
@@ -194,9 +207,10 @@ int main(int argc, char **argv)
         .fps = 30,
         .bitrate_kbps = 8192,
         .intra_period = 0,
-        .min_qp = 28,
-        .intra_qp = 30,
-        .initial_qp = 32,
+        .min_qp = 20,
+        .max_qp = 51,
+        .intra_qp = 22,
+        .initial_qp = 24,
         .vbv_ms = 3000,
         .segment_frames = 900,
         .out_dir = NULL,
@@ -206,30 +220,43 @@ int main(int argc, char **argv)
     for (int index = 1; index < argc; index += 1) {
         const char *name = argv[index];
         const bool has_value = index + 1 < argc;
-        if (strcmp(name, "--out-dir") == 0 && has_value) {
+        if (strcmp(name, "--codec") == 0 && has_value) {
+            const char *codec = argv[++index];
+            if (strcmp(codec, "h264") != 0 && strcmp(codec, "hevc") != 0) return 2;
+            config.hevc = strcmp(codec, "hevc") == 0;
+        } else if (strcmp(name, "--rc-mode") == 0 && has_value) {
+            const char *mode = argv[++index];
+            if (strcmp(mode, "cbr") == 0) config.rate_control = 0;
+            else if (strcmp(mode, "vbr") == 0) config.rate_control = 1;
+            else if (strcmp(mode, "fixqp") == 0) config.rate_control = 2;
+            else if (strcmp(mode, "avbr") == 0) config.rate_control = 3;
+            else return 2;
+        } else if (strcmp(name, "--out-dir") == 0 && has_value) {
             config.out_dir = argv[++index];
         } else if (strcmp(name, "--path-prefix") == 0 && has_value) {
             config.path_prefix = argv[++index];
         } else if (strcmp(name, "--width") == 0 && has_value) {
-            config.sbs_width = atoi(argv[++index]);
+            config.sbs_width = parse_integer(argv[++index]);
         } else if (strcmp(name, "--height") == 0 && has_value) {
-            config.height = atoi(argv[++index]);
+            config.height = parse_integer(argv[++index]);
         } else if (strcmp(name, "--fps") == 0 && has_value) {
-            config.fps = atoi(argv[++index]);
+            config.fps = parse_integer(argv[++index]);
         } else if (strcmp(name, "--bitrate-kbps") == 0 && has_value) {
-            config.bitrate_kbps = atoi(argv[++index]);
+            config.bitrate_kbps = parse_integer(argv[++index]);
         } else if (strcmp(name, "--segment-frames") == 0 && has_value) {
-            config.segment_frames = atoi(argv[++index]);
+            config.segment_frames = parse_integer(argv[++index]);
         } else if (strcmp(name, "--intra-period") == 0 && has_value) {
-            config.intra_period = atoi(argv[++index]);
+            config.intra_period = parse_integer(argv[++index]);
         } else if (strcmp(name, "--min-qp") == 0 && has_value) {
-            config.min_qp = atoi(argv[++index]);
+            config.min_qp = parse_integer(argv[++index]);
+        } else if (strcmp(name, "--max-qp") == 0 && has_value) {
+            config.max_qp = parse_integer(argv[++index]);
         } else if (strcmp(name, "--intra-qp") == 0 && has_value) {
-            config.intra_qp = atoi(argv[++index]);
+            config.intra_qp = parse_integer(argv[++index]);
         } else if (strcmp(name, "--initial-qp") == 0 && has_value) {
-            config.initial_qp = atoi(argv[++index]);
+            config.initial_qp = parse_integer(argv[++index]);
         } else if (strcmp(name, "--vbv-ms") == 0 && has_value) {
-            config.vbv_ms = atoi(argv[++index]);
+            config.vbv_ms = parse_integer(argv[++index]);
         } else {
             usage(argv[0]);
             return 2;

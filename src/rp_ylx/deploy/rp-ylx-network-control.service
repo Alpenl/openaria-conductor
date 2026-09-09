@@ -1,5 +1,5 @@
 [Unit]
-Description=RP-YLX privileged network-control worker
+Description=Open Aria privileged network-control worker
 Requires=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
 After=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
 Before=rp-ylx.service

@@ -89,6 +89,11 @@ class ImuObservation:
     samples: tuple[ImuSample, ImuSample]
     dropped_samples: int
 
+    @property
+    def missed_packets_estimate_available(self) -> bool:
+        """Known host/transport losses do not measure camera-internal sample loss."""
+        return False
+
 
 class ImuSource(Protocol):
     def read_packet(self, timeout: float) -> ImuPacketRead: ...

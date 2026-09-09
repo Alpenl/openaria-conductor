@@ -4,6 +4,7 @@ mod bounded;
 mod capture_runtime;
 mod frame_stream;
 mod imu;
+mod imu_preview;
 mod jpeg;
 mod metrics;
 mod native_camera;
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const NATIVE_ABI: u32 = 5;
+const NATIVE_ABI: u32 = 6;
 const CAPABILITY_PROBE: &str = "capability_probe";
 const JPEG_CONTRACT: &str = "jpeg_contract";
 const FRAME_STREAM: &str = "frame_stream";
@@ -215,6 +216,9 @@ impl NativeSessionStore {
         let fps = plan.getattr("fps")?.extract::<u64>()?;
         let bitrate_kbps = plan.getattr("bitrate_kbps")?.extract::<u64>()?;
         let segment_frames = plan.getattr("segment_frames")?.extract::<u64>()?;
+        let encoder_arguments = plan
+            .getattr("encoder_arguments")?
+            .extract::<Vec<String>>()?;
         let recording_start_monotonic_ns = plan
             .getattr("recording_start_monotonic_ns")?
             .extract::<u64>()?;
@@ -240,6 +244,7 @@ impl NativeSessionStore {
                     fps,
                     bitrate_kbps,
                     segment_frames,
+                    encoder_arguments: &encoder_arguments,
                     recording_start_monotonic_ns,
                     audio,
                 })
@@ -278,6 +283,35 @@ impl NativeSessionStore {
             })
             .map_err(session_io_error)?;
         file_identity_dict(py, &identity)
+    }
+
+    fn verify_fd_interruptible(
+        &self,
+        py: Python<'_>,
+        descriptor: i32,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        interrupt_check: Py<PyAny>,
+    ) -> PyResult<Py<PyDict>> {
+        let mut callback_error = None;
+        let result = py.allow_threads(|| {
+            session_io::verify_fd_interruptible(descriptor, expected_bytes, expected_sha256, || {
+                match Python::with_gil(|py| interrupt_check.call0(py)) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        callback_error = Some(error);
+                        Err(session_io::SessionIoError {
+                            code: "verification_changed",
+                            message: "artifact verification interrupted".to_owned(),
+                        })
+                    }
+                }
+            })
+        });
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        file_identity_dict(py, &result.map_err(session_io_error)?)
     }
 
     fn sendfile(
@@ -344,13 +378,7 @@ impl NativeSessionStore {
     }
 }
 
-struct CaptureImuConfig {
-    device: String,
-    unit: Option<u8>,
-    selector: u8,
-    stale_poll_interval: Duration,
-    timeout: Duration,
-}
+type CaptureImuConfig = imu_preview::Config;
 
 #[pyclass]
 struct NativeCaptureEngine {
@@ -358,7 +386,7 @@ struct NativeCaptureEngine {
     runtime: Arc<capture_runtime::Runtime>,
     imu_config: CaptureImuConfig,
     imu: Mutex<Option<Arc<imu::Collector>>>,
-    latest_imu: Mutex<Option<imu::ImuObservation>>,
+    idle_imu: imu_preview::Preview,
     close_timeout: Duration,
 }
 
@@ -433,7 +461,7 @@ impl NativeCaptureEngine {
                 timeout: Duration::from_secs_f64(imu_timeout_seconds),
             },
             imu: Mutex::new(None),
-            latest_imu: Mutex::new(None),
+            idle_imu: imu_preview::Preview::default(),
             close_timeout: Duration::from_secs_f64(read_timeout_seconds + 1.0),
         })
     }
@@ -441,7 +469,16 @@ impl NativeCaptureEngine {
     fn start_preview(&self, py: Python<'_>) -> PyResult<()> {
         let runtime = Arc::clone(&self.runtime);
         py.allow_threads(move || runtime.start_preview())
-            .map_err(capture_runtime_error)
+            .map_err(capture_runtime_error)?;
+        if !self
+            .runtime
+            .snapshot()
+            .map_err(capture_runtime_error)?
+            .recording_present
+        {
+            self.idle_imu.start(self.imu_config.clone());
+        }
+        Ok(())
     }
 
     fn start_recording(
@@ -466,6 +503,7 @@ impl NativeCaptureEngine {
             py.allow_threads(move || runtime.stop_recording(timeout))
                 .map_err(capture_runtime_error)?;
         }
+        py.allow_threads(|| self.idle_imu.stop());
         if let Some(stale) = self
             .imu
             .lock()
@@ -478,15 +516,18 @@ impl NativeCaptureEngine {
         {
             stale.close();
         }
-        let collector = Arc::new(
-            imu::Collector::open(
-                &self.imu_config.device,
-                self.imu_config.unit,
-                self.imu_config.selector,
-                Some(self.imu_config.stale_poll_interval),
-            )
-            .map_err(imu_error)?,
-        );
+        let collector = match imu::Collector::open(
+            &self.imu_config.device,
+            self.imu_config.unit,
+            self.imu_config.selector,
+            Some(self.imu_config.stale_poll_interval),
+        ) {
+            Ok(collector) => Arc::new(collector),
+            Err(error) => {
+                self.idle_imu.start(self.imu_config.clone());
+                return Err(imu_error(error));
+            }
+        };
         let runtime = Arc::clone(&self.runtime);
         let active_take = Arc::clone(&transaction.transaction.active_take);
         let sink = Arc::clone(&transaction.transaction.sink);
@@ -494,6 +535,7 @@ impl NativeCaptureEngine {
         let segment_planner = Arc::clone(&transaction.transaction.segment_planner);
         let recording_start_monotonic_ns = transaction.transaction.recording_start_monotonic_ns;
         let worker_collector = Arc::clone(&collector);
+        let audio = transaction.transaction.audio.clone();
         let imu_timeout = self.imu_config.timeout;
         let snapshot = py
             .allow_threads(move || {
@@ -506,6 +548,7 @@ impl NativeCaptureEngine {
                     on_failure,
                     Some(worker_collector),
                     imu_timeout,
+                    audio,
                 )
             })
             .map_err(capture_runtime_error);
@@ -520,6 +563,7 @@ impl NativeCaptureEngine {
             }
             Err(error) => {
                 collector.close();
+                self.idle_imu.start(self.imu_config.clone());
                 Err(error)
             }
         }
@@ -546,15 +590,9 @@ impl NativeCaptureEngine {
             })?
             .take()
         {
-            if let Ok(latest) = collector.latest_observation() {
-                *self.latest_imu.lock().map_err(|_| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "capture_engine_poisoned: latest IMU mutex is poisoned",
-                    )
-                })? = latest;
-            }
             collector.close();
         }
+        self.idle_imu.start(self.imu_config.clone());
         capture_runtime_snapshot_dict(py, &snapshot)
     }
 
@@ -571,15 +609,7 @@ impl NativeCaptureEngine {
             .map(Arc::clone);
         let observation = match current {
             Some(collector) => collector.latest_observation().map_err(imu_error)?,
-            None => self
-                .latest_imu
-                .lock()
-                .map_err(|_| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "capture_engine_poisoned: latest IMU mutex is poisoned",
-                    )
-                })?
-                .clone(),
+            None => self.idle_imu.latest(),
         };
         observation
             .as_ref()
@@ -626,6 +656,7 @@ impl NativeCaptureEngine {
                 "invalid_argument: timeout_seconds must be finite and positive",
             ));
         }
+        py.allow_threads(|| self.idle_imu.stop());
         if let Some(collector) = self
             .imu
             .lock()
@@ -648,6 +679,7 @@ impl NativeCaptureEngine {
 
 impl Drop for NativeCaptureEngine {
     fn drop(&mut self) {
+        self.idle_imu.stop();
         if let Ok(current) = self.imu.get_mut() {
             if let Some(collector) = current.take() {
                 collector.close();
@@ -982,6 +1014,7 @@ fn audio_result_dict(py: Python<'_>, result: &audio::AudioRecordingResult) -> Py
     value.set_item("channels", result.channels)?;
     value.set_item("sample_format", result.sample_format)?;
     value.set_item("sample_count", result.sample_count)?;
+    value.set_item("capture_clock_json", result.capture_clock.to_string())?;
     value.set_item("started_monotonic_ns", result.started_monotonic_ns)?;
     value.set_item("stopped_monotonic_ns", result.stopped_monotonic_ns)?;
     let segments = PyList::empty(py);
@@ -1307,7 +1340,7 @@ mod tests {
 
     #[test]
     fn abi_and_initial_capability_are_stable() {
-        assert_eq!(NATIVE_ABI, 5);
+        assert_eq!(NATIVE_ABI, 6);
         assert_eq!(CAPABILITY_PROBE, "capability_probe");
         assert_eq!(JPEG_CONTRACT, "jpeg_contract");
         assert_eq!(FRAME_STREAM, "frame_stream");

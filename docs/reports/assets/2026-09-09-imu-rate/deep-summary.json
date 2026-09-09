@@ -1,0 +1,37 @@
+{
+  "1": {
+    "responses": 1220,
+    "span_s": 6.0038179,
+    "requests_per_second": 203.20403122153323
+  },
+  "2": {
+    "responses": 1221,
+    "span_s": 6.00905731,
+    "requests_per_second": 203.1932692617305
+  },
+  "4": {
+    "responses": 1223,
+    "span_s": 6.019615173,
+    "requests_per_second": 203.1691337156512
+  },
+  "8": {
+    "responses": 1228,
+    "span_s": 6.042179618,
+    "requests_per_second": 203.23791704929087
+  },
+  "usb": {
+    "pairs": 1017,
+    "submit_to_complete_us": {
+      "min": 3525,
+      "median": 4734,
+      "mean": 4886.271386430679,
+      "max": 6444
+    },
+    "complete_to_next_submit_us": {
+      "min": 17,
+      "median": 28.0,
+      "mean": 34.235236220472444,
+      "max": 636
+    }
+  }
+}

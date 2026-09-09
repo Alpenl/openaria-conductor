@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:ylx:schema:api-audit-event:v1",
-  "title": "RP-YLX API authorization audit event",
+  "title": "Open Aria API authorization audit event",
   "type": "object",
   "additionalProperties": false,
   "required": [

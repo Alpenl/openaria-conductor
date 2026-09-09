@@ -7,6 +7,7 @@ import threading
 import unittest
 from contextlib import redirect_stderr
 from copy import deepcopy
+from http import HTTPStatus
 from io import StringIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -752,6 +753,62 @@ class GatewayHttpTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_remote_deletion_auth_csrf_validation_and_forwarding(self):
+        calls = []
+        body = {
+            "schema": "ylx.session-delete-request.v1",
+            "sessions": [{"session_id": SESSION_ID, "manifest_sha256": "a" * 64}],
+        }
+        self.policy.tokens["delete-token"] = Principal(
+            "deleter", permissions={"deleteSessions": None}
+        )
+
+        def delete(command):
+            calls.append(command)
+            return CaptureCommandResult(
+                200,
+                {
+                    "schema": "ylx.session-delete-result.v1",
+                    "deleted_session_ids": [SESSION_ID],
+                    "failed_sessions": [],
+                },
+            )
+
+        self.server.provider.delete_sessions = delete
+        headers = {
+            "Idempotency-Key": "delete-test",
+            "X-CSRF-Token": "browser-csrf-token",
+            "Origin": self.base,
+        }
+        for token, expected in ((None, 401), ("reader-token", 403)):
+            status, _, _ = self.request(
+                "/api/v4/sessions/delete", token=token, body=body, headers=headers
+            )
+            self.assertEqual(status, expected)
+        status, _, _ = self.request(
+            "/api/v4/sessions/delete",
+            token="delete-token",
+            body=body,
+            headers={"Idempotency-Key": "delete-test"},
+        )
+        self.assertEqual(status, 403)
+        for invalid in (
+            {"schema": "wrong", "sessions": []},
+            {**body, "sessions": body["sessions"] * 2},
+        ):
+            status, _, _ = self.request(
+                "/api/v4/sessions/delete", token="delete-token", body=invalid, headers=headers
+            )
+            self.assertEqual(status, 400)
+        self.assertEqual(calls, [])
+        status, payload, _ = self.request(
+            "/api/v4/sessions/delete", token="delete-token", body=body, headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["deleted_session_ids"], [SESSION_ID])
+        self.assertEqual(calls[0].body, body)
+        self.assertEqual(calls[0].principal_id, "deleter")
 
     def test_expected_client_disconnect_does_not_emit_server_traceback(self) -> None:
         for error in (BrokenPipeError("closed"), ConnectionResetError("reset")):
@@ -2270,6 +2327,21 @@ class GatewayHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "invalid_source_state")
+
+    def test_camera_focus_http_status_requires_plain_integers(self) -> None:
+        for value in (True, HTTPStatus.OK):
+            with self.subTest(value=value):
+                self.server.provider.focus = {**CAMERA_FOCUS_STATUS, "value": value}
+                status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
+                self.assertEqual(status, 500)
+                error = json.loads(payload)["error"]
+                self.assertEqual(error["code"], "invalid_source_state")
+                self.assertEqual(error["message"], "daemon camera focus 状态无效")
+
+        self.server.provider.focus = None
+        status, payload, _ = self.request("/api/v4/camera/focus", token="reader-token")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(payload)["error"]["code"], "camera_focus_unsupported")
 
     def test_session_listing_validates_query_and_preserves_provider_projection(self) -> None:
         take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"

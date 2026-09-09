@@ -21,6 +21,9 @@ dependencies = [
 dev = ["ruff>=0.12,<1"]
 
 [project.scripts]
+openaria = "rp_ylx.cli:main"
+openaria-deploy = "rp_ylx.deployment:main"
+openaria-spectacular-check = "rp_ylx.spectacular.check_cli:main"
 rp-ylx = "rp_ylx.cli:main"
 rp-ylx-deploy = "rp_ylx.deployment:main"
 rp-ylx-spectacular-check = "rp_ylx.spectacular.check_cli:main"

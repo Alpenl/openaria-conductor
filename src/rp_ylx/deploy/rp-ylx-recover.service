@@ -1,5 +1,5 @@
 [Unit]
-Description=Recover interrupted RP-YLX release transaction
+Description=Recover interrupted Open Aria release transaction
 After=local-fs.target
 Before=rp-ylx-data-volume.service rp-ylx-network-control.service rp-ylx.service
 

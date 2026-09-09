@@ -172,6 +172,15 @@ pub fn verify_fd(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<FileIdentity, SessionIoError> {
+    verify_fd_interruptible(fd, expected_bytes, expected_sha256, || Ok(()))
+}
+
+pub fn verify_fd_interruptible(
+    fd: libc::c_int,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    mut interrupt_check: impl FnMut() -> Result<(), SessionIoError>,
+) -> Result<FileIdentity, SessionIoError> {
     if !is_sha256(expected_sha256) {
         return Err(SessionIoError::new("artifact_invalid", "SHA-256 格式无效"));
     }
@@ -189,6 +198,7 @@ pub fn verify_fd(
     let mut offset: u64 = 0;
     let mut buffer = vec![0_u8; READ_CHUNK];
     while remaining > 0 {
+        interrupt_check()?;
         let selected = usize::try_from(remaining.min(READ_CHUNK as u64))
             .map_err(|_| SessionIoError::new("artifact_invalid", "artifact 大小超出平台限制"))?;
         let read = pread_retry(fd, &mut buffer[..selected], offset)?;
@@ -392,7 +402,10 @@ fn parse_device_session_manifest(
     })?;
     let object = manifest_object(&root)?;
     let schema = string_field(object, "schema")?;
-    if !matches!(schema, "ylx.device-session.v1" | "ylx.device-session.v2") {
+    if !matches!(
+        schema,
+        "ylx.device-session.v1" | "ylx.device-session.v2" | "ylx.device-session.v3"
+    ) {
         return Err(SessionIoError::new(
             "manifest_invalid",
             "manifest 不是支持的 device-session",
@@ -1158,6 +1171,44 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "digest_mismatch");
+    }
+
+    #[test]
+    fn interrupted_verification_stops_between_chunks_and_can_restart() {
+        let root = tempfile_dir();
+        let path = root.join("interruptible.bin");
+        fs::write(&path, vec![7_u8; super::READ_CHUNK * 3]).unwrap();
+        let digest = hash_file(&path).unwrap();
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(17)).unwrap();
+        let mut checks = 0;
+        let error = super::verify_fd_interruptible(
+            file.as_raw_fd(),
+            digest.identity.size,
+            &digest.sha256,
+            || {
+                checks += 1;
+                if checks == 2 {
+                    Err(super::SessionIoError::new(
+                        "verification_changed",
+                        "capture started",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "verification_changed");
+        assert_eq!(checks, 2);
+        assert_eq!(file.stream_position().unwrap(), 17);
+        super::verify_fd_interruptible(
+            file.as_raw_fd(),
+            digest.identity.size,
+            &digest.sha256,
+            || Ok(()),
+        )
+        .unwrap();
     }
 
     #[test]

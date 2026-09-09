@@ -57,7 +57,7 @@ class ImuCollector:
         try:
             packet_read = self._source.read_packet(timeout)
             packet = decode_packet(packet_read.payload)
-            device_ticks = self._unwrapper.update(packet.device_timestamp_raw)
+            device_ticks = self._unwrapper.update(packet.device_timestamp_raw, allow_repeated=True)
             estimate = self._synchronizer.add(
                 device_ticks,
                 packet_read.host_read_start_ns,

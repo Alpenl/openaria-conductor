@@ -123,8 +123,9 @@ class InstalledWheelTest(unittest.TestCase):
                     text=True,
                 )
                 python = virtual_environment / "bin" / "python"
-                executable = virtual_environment / "bin" / "rp-ylx"
-                spectacular = virtual_environment / "bin" / "rp-ylx-spectacular-check"
+                executable = virtual_environment / "bin" / "openaria"
+                legacy_executable = virtual_environment / "bin" / "rp-ylx"
+                spectacular = virtual_environment / "bin" / "openaria-spectacular-check"
                 subprocess.run(
                     [uv, "pip", "install", "--python", str(python), str(wheel)],
                     cwd=external_root,
@@ -136,6 +137,14 @@ class InstalledWheelTest(unittest.TestCase):
 
                 version = subprocess.run(
                     [str(executable), "--version"],
+                    cwd=external_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                legacy_version = subprocess.run(
+                    [str(legacy_executable), "--version"],
                     cwd=external_root,
                     env=environment,
                     check=True,
@@ -231,12 +240,13 @@ class InstalledWheelTest(unittest.TestCase):
                     ).stdout
                 )
 
-                self.assertEqual(version, f"rp-ylx 0.1.0 ({expected_commit})")
-                self.assertIn("usage: rp-ylx-spectacular-check", spectacular_help)
+                self.assertEqual(version, f"Open Aria 0.1.0 ({expected_commit})")
+                self.assertEqual(legacy_version, version)
+                self.assertIn("usage: openaria-spectacular-check", spectacular_help)
                 self.assertEqual(status["commit"], expected_commit)
                 self.assertEqual(status["native"]["adapter"], "rust")
                 self.assertTrue(status["native"]["module_available"])
-                self.assertEqual(status["native"]["abi"], 5)
+                self.assertEqual(status["native"]["abi"], 6)
                 self.assertIn("capability_probe", status["native"]["features"])
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])
@@ -244,14 +254,14 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "a858d48dfc745ed311fb4150c191a629c69ffaef",
+                        "source_commit": "3a279ddac1f58ffa2516d09c2d955f650f4aee47",
                         "required_device_api_major": 4,
                         "assets": {
                             "app.js": {
-                                "bytes": 100597,
+                                "bytes": 100610,
                                 "content_type": "text/javascript; charset=utf-8",
                                 "sha256": (
-                                    "898bb2338edf76c2aa396873a730b26113558e65d5c10f79b482fca49fb83f30"
+                                    "81f3139d2f8343271d6700e6241be94505fc70d586f9823ca286caab4a16f5af"
                                 ),
                             },
                             "index.html": {

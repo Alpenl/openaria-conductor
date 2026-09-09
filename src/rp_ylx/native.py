@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Protocol, cast
 
+from rp_ylx.camera_focus import valid_camera_focus_status
+
 NATIVE_MODULE = "rp_ylx._native"
-SUPPORTED_NATIVE_ABI = 5
+SUPPORTED_NATIVE_ABI = 6
 
 
 class NativeModuleError(RuntimeError):
@@ -83,6 +86,7 @@ class NativeRecordingPlan:
     audio_sample_rate_hz: int
     audio_channels: int
     audio_segment_seconds: float
+    encoder_arguments: tuple[str, ...] = ()
 
 
 def _validate_capabilities(module: ModuleType) -> NativeCapabilities:
@@ -220,6 +224,14 @@ class NativeSessionStore(Protocol):
         length: int,
     ) -> int: ...
 
+    def verify_fd_interruptible(
+        self,
+        descriptor: int,
+        expected_bytes: int,
+        expected_sha256: str,
+        interrupt_check: Callable[[], None],
+    ) -> dict[str, object]: ...
+
     def open_relative_regular(self, root_descriptor: int, relative_path: str) -> int: ...
 
     def open_verified_artifact(
@@ -322,30 +334,7 @@ def create_native_splitter() -> NativeSplitter:
 def _validate_native_focus_status(status: object) -> dict[str, object] | None:
     if status is not None and (
         not isinstance(status, dict)
-        or set(status)
-        != {
-            "schema",
-            "value",
-            "minimum",
-            "maximum",
-            "step",
-            "default",
-            "auto_supported",
-            "auto_enabled",
-        }
-        or status["schema"] != "ylx.camera-focus.v1"
-        or any(
-            isinstance(status[key], bool) or not isinstance(status[key], int)
-            for key in ("value", "minimum", "maximum", "step", "default")
-        )
-        or status["step"] <= 0
-        or status["minimum"] > status["maximum"]
-        or not status["minimum"] <= status["value"] <= status["maximum"]
-        or (status["value"] - status["minimum"]) % status["step"] != 0
-        or not status["minimum"] <= status["default"] <= status["maximum"]
-        or type(status["auto_supported"]) is not bool
-        or (status["auto_enabled"] is not None and type(status["auto_enabled"]) is not bool)
-        or (not status["auto_supported"] and status["auto_enabled"] is not None)
+        or not valid_camera_focus_status(status, allow_integer_subclasses=True)
     ):
         raise NativeModuleError("invalid_native_focus_status", "原生焦距状态无效")
     return None if status is None else cast(dict[str, object], status)

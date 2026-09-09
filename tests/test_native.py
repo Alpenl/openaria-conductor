@@ -28,7 +28,7 @@ def _module(*features: str, **members: object) -> SimpleNamespace:
     return SimpleNamespace(
         capabilities=lambda: {
             "module_version": "0.1.0",
-            "abi": 5,
+            "abi": 6,
             "features": ["capability_probe", *features],
         },
         **members,
@@ -84,14 +84,14 @@ class NativeCapabilitiesTest(unittest.TestCase):
             },
         )
 
-    def test_accepts_exact_abi_five_capability_interface(self) -> None:
+    def test_accepts_exact_abi_six_capability_interface(self) -> None:
         with patch(
             "rp_ylx.native.importlib.import_module",
             return_value=_module("capture_engine", "session_store"),
         ):
             capabilities = native_capabilities()
         self.assertEqual(capabilities.adapter, "rust")
-        self.assertEqual(capabilities.as_report_identity()["abi"], 5)
+        self.assertEqual(capabilities.as_report_identity()["abi"], 6)
 
     def test_rejects_dependency_failure_unknown_fields_and_wrong_abi(self) -> None:
         cases = [
@@ -100,7 +100,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 SimpleNamespace(
                     capabilities=lambda: {
                         "module_version": "0.1.0",
-                        "abi": 5,
+                        "abi": 6,
                         "features": ["capability_probe"],
                         "claim": "fast",
                     }
@@ -297,7 +297,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
         }
         self.assertEqual({name for name in removed if hasattr(native_module, name)}, set())
 
-    def test_abi_five_extension_exports_only_deep_and_support_classes(self) -> None:
+    def test_abi_six_extension_exports_only_deep_and_support_classes(self) -> None:
         try:
             extension = importlib.import_module("rp_ylx._native")
         except ModuleNotFoundError as error:

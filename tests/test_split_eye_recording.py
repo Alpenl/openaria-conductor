@@ -37,6 +37,7 @@ from rp_ylx.recording.device_session import (
     manifest_artifact_bytes_total,
     validate_device_session_directory,
 )
+from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 
 FRAME = b"\xff\xd8split-eye\xff\xd9"
@@ -512,6 +513,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
         audio_enabled: bool = False,
         audio_fail_stop: bool = False,
         native_data_plane: bool = False,
+        recording_encoding: RecordingEncoding | None = None,
         **encoder_options: object,
     ) -> tuple[DeviceSessionRecorder, list[FakeStereoEncoder], list[FakeAudioRecorder]]:
         revision = 0
@@ -537,6 +539,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
             video_layout="split-eyes",
             segment_seconds=self.segment_seconds,
             audio_enabled=audio_enabled,
+            recording_encoding=recording_encoding,
         )
 
         def factory(partial: Path) -> FakeStereoEncoder:
@@ -622,6 +625,39 @@ class SplitEyeRecordingTest(unittest.TestCase):
             )
             validate_device_session_manifest(manifest)
 
+    def test_v3_encoding_survives_native_arguments_seal_and_validation(self) -> None:
+        for codec in ("h264", "hevc"):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as directory:
+                encoding = RecordingEncoding.from_mapping(
+                    {"preset": "high", "codec": codec, "gop_frames": 3}
+                )
+                store = FakeSessionStore()
+                with (
+                    patch(
+                        "rp_ylx.recording.device_session.native_session_store", return_value=store
+                    ),
+                    patch(
+                        "rp_ylx.recording.device_session.resolve_executable",
+                        return_value=Path("/bin/true"),
+                    ),
+                ):
+                    recorder, _, _ = self.build(
+                        Path(directory), native_data_plane=True, recording_encoding=encoding
+                    )
+                    recorder.start()
+                    self.assertEqual(store.transaction.plan.encoder_arguments, encoding.arguments())
+                    store.transaction.advance(frames=4, imu_samples=2)
+                    sealed = recorder.stop()
+                self.assertEqual(sealed.manifest["schema"], "ylx.device-session.v3")
+                self.assertEqual(sealed.manifest["video"]["codec"], codec)
+                self.assertEqual(sealed.manifest["video"]["encoding"], encoding.manifest())
+                validate_device_session_manifest(sealed.manifest)
+                validate_device_session_directory(sealed.path)
+                bad = deepcopy(sealed.manifest)
+                bad["video"]["encoding"]["codec"] = "hevc" if codec == "h264" else "h264"
+                with self.assertRaises(ArtifactAccessError):
+                    validate_device_session_manifest(bad)
+
     def test_session_transaction_owns_live_progress_finish_and_seal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -649,7 +685,21 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 self.assertEqual(live["state_revision"], initial["state_revision"])
                 self.assertEqual(live["progress"]["captured_frames"], 4)
                 self.assertGreater(live["progress"]["bytes_written"], 0)
-                sealed = recorder.stop()
+                native_finish = store.transaction.finish
+                finished_at_ns = []
+
+                def delayed_finish(duration_seconds, timeout_seconds):
+                    result = native_finish(duration_seconds, timeout_seconds)
+                    time.sleep(0.03)
+                    finished_at_ns.append(time.monotonic_ns())
+                    return result
+
+                with patch.object(store.transaction, "finish", side_effect=delayed_finish):
+                    sealed = recorder.stop()
+                self.assertGreaterEqual(
+                    sealed.manifest["time"]["duration_seconds"],
+                    (finished_at_ns[0] - recorder._started_monotonic_ns) / 1e9,
+                )
 
             self.assertEqual(len(store.begin_calls), 1)
             self.assertTrue(store.transaction.finished)

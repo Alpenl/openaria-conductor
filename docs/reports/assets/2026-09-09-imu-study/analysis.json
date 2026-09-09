@@ -1,0 +1,332 @@
+{
+  "integrated_65s": {
+    "source": "/data2/openaria-deploy-248-20260909/export/YLX-1C7447D1/01a08557-d9a0-725e-89fa-5e61891bdf58/.openaria/source",
+    "session_id": "01a08557-d9a0-725e-89fa-5e61891bdf58",
+    "device": {
+      "commit": "9503e448272e4c6df0942e2c08b05d50d883868e",
+      "device_id": "14e07ff7-5e1e-4549-8c16-2a466381757a",
+      "device_label": "YLX-1C7447D1",
+      "hardware_fingerprint": "sha256:1c7447d17906f6960ae03d9c34996492d1243038d5a849759cd48a18d9cd7f1d",
+      "platform": "D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+      "software_version": "0.1.0"
+    },
+    "camera": {
+      "coordinate_frame": "opencv_optical",
+      "effective_fps": 28.830438491703358,
+      "eye_width": 1920,
+      "frame_decimation": 2,
+      "height": 1080,
+      "nominal_fps": 30.0,
+      "sensor_fps": 60.0,
+      "width": 3840
+    },
+    "manifest_lifetime_seconds": 67.602162921,
+    "files": {
+      "manifest.json": {
+        "bytes": 7908,
+        "sha256": "538d22efa6a8360ccec0f6d64ff6416a973fdc85f5ce250555c8fe5e032620f9"
+      },
+      "imu.ndjson": {
+        "bytes": 3270917,
+        "sha256": "cfcf97f8cc8c5f9eeb77bb836469b10e73825cd01f9aaac9ad39895e0d222075"
+      },
+      "frames.ndjson": {
+        "bytes": 373018,
+        "sha256": "da0f14e3ddd1e35e7f0480b3ce09f71889b9826d5d548a6f51cce082c019c50c"
+      }
+    },
+    "imu_rows": 7786,
+    "packets": 3893,
+    "video_frames": 1949,
+    "packet_observation_span_seconds": 65.495409866,
+    "packet_rate_hz": 59.42401166681478,
+    "row_equivalent_rate_hz": 118.84802333362956,
+    "video_rate_hz": 29.73780885321132,
+    "counter_range": [
+      6603,
+      10499
+    ],
+    "counter_delta_histogram": {
+      "1": 3890,
+      "2": 1,
+      "4": 1
+    },
+    "counter_gap_events": 2,
+    "missing_counter_positions": 4,
+    "counter_rollovers_observed": 0,
+    "counter_fit_rate_hz": 59.4769445504505,
+    "hypothetical_rollover_hours": 78.35536631887186,
+    "packet_interval_ms": {
+      "min": 9.670917,
+      "p50": 15.416151,
+      "p95": 20.5344053,
+      "p99": 20.63534869,
+      "max": 71.052895
+    },
+    "control_read_duration_ms": {
+      "min": 2.692059,
+      "p50": 3.661857,
+      "p95": 4.5099376,
+      "p99": 4.57290292,
+      "max": 5.873788
+    },
+    "global_fit_abs_residual_ms": {
+      "min": 0.0011654869993549255,
+      "p50": 1.3339820708395678,
+      "p95": 2.550756924130579,
+      "p99": 3.0185982660938704,
+      "max": 7.996297401451885
+    },
+    "saved_window_residual_ms": {
+      "min": 3.485612,
+      "p50": 5.299232,
+      "p95": 6.314772,
+      "p99": 8.542100999999995,
+      "max": 9.613061
+    },
+    "sync_quality_by_packet": {
+      "insufficient": 2,
+      "degraded": 3891
+    },
+    "same_host_time_pair_count": 3893,
+    "same_counter_pair_count": 3893,
+    "equal_accel_within_pair_fraction": 0.007963010531723606,
+    "equal_gyro_within_pair_fraction": 0.6362702286154637,
+    "raw_accel_mean": [
+      84.64551759568457,
+      3822.273953249422,
+      1633.2772925764193
+    ],
+    "raw_accel_std": [
+      12.249323746983865,
+      11.852931832605186,
+      12.848973175030189
+    ],
+    "raw_accel_norm": {
+      "min": 4113.382306569619,
+      "p50": 4157.544828380112,
+      "p95": 4176.775700221638,
+      "p99": 4184.4015461503,
+      "max": 4206.123274465454
+    },
+    "raw_gyro_mean": [
+      6.604931929103519,
+      5.6786539943488314,
+      16.539429745697404
+    ],
+    "raw_gyro_std": [
+      2.486872045978602,
+      2.21511957366722,
+      2.1713874802827826
+    ],
+    "int16_endpoint_values": 0,
+    "frames_with_equal_imu_counter": 1946,
+    "imu_read_minus_video_host_same_counter_ms": {
+      "min": -17.686622,
+      "p50": -13.111707,
+      "p95": -9.81542775,
+      "p99": -8.90277975,
+      "max": -7.928472
+    },
+    "video_source_delta_histogram": {
+      "2": 1948
+    },
+    "imu_first_minus_video_first_ms": 13.379049,
+    "imu_last_minus_video_last_ms": 2.953915
+  },
+  "av_30min": {
+    "source": "/data2/openaria-phone-sync-20260908/long-recording",
+    "session_id": "01a0817e-2adc-788b-8a2d-08348beba80e",
+    "device": {
+      "commit": "df9c7085f8f5c4f92434a6f3d25b95f836c4aaff",
+      "device_id": "14e07ff7-5e1e-4549-8c16-2a466381757a",
+      "device_label": "YLX-1C7447D1",
+      "hardware_fingerprint": "sha256:1c7447d17906f6960ae03d9c34996492d1243038d5a849759cd48a18d9cd7f1d",
+      "platform": "D-Robotics RDK X5 V1.0 + YLX 2UQ2",
+      "software_version": "0.1.0"
+    },
+    "camera": {
+      "coordinate_frame": "opencv_optical",
+      "effective_fps": 29.578610000466398,
+      "eye_width": 1920,
+      "frame_decimation": 2,
+      "height": 1080,
+      "nominal_fps": 30.0,
+      "sensor_fps": 60.0,
+      "width": 3840
+    },
+    "manifest_lifetime_seconds": 1810.091819702,
+    "files": {
+      "manifest.json": {
+        "bytes": 114649,
+        "sha256": "2e017582e4ebdfb3376b67aab3d53b1c51ff4959c3c57051d2cc50fabc1d4dfe"
+      },
+      "imu.ndjson": {
+        "bytes": 92136799,
+        "sha256": "d3efaf3a1077e66a450da8bbab18433d3940f67f9c3afd981140e1872c1f5581"
+      },
+      "frames.ndjson": {
+        "bytes": 10469478,
+        "sha256": "0e19fb2ddaab309768d5c24bd59a2c78902099d21d71d10ece8938a8acca009a"
+      }
+    },
+    "imu_rows": 213772,
+    "packets": 106886,
+    "video_frames": 53540,
+    "packet_observation_span_seconds": 1800.328718361,
+    "packet_rate_hz": 59.36971338062471,
+    "row_equivalent_rate_hz": 118.73942676124942,
+    "video_rate_hz": 29.73860255489873,
+    "counter_range": [
+      3809,
+      110888
+    ],
+    "counter_delta_histogram": {
+      "1": 106699,
+      "2": 183,
+      "5": 1,
+      "3": 1,
+      "6": 1
+    },
+    "counter_gap_events": 186,
+    "missing_counter_positions": 194,
+    "counter_rollovers_observed": 0,
+    "counter_fit_rate_hz": 59.47715877123328,
+    "hypothetical_rollover_hours": 78.35508410384587,
+    "packet_interval_ms": {
+      "min": 5.461757,
+      "p50": 15.405497,
+      "p95": 20.4883874,
+      "p99": 20.597312480000003,
+      "max": 102.640102
+    },
+    "control_read_duration_ms": {
+      "min": 2.498017,
+      "p50": 3.630066,
+      "p95": 4.494356,
+      "p99": 4.574953799999999,
+      "max": 23.797665
+    },
+    "global_fit_abs_residual_ms": {
+      "min": 1.0633414149197051e-05,
+      "p50": 1.3111847099906981,
+      "p95": 2.9081494224101334,
+      "p99": 3.4711327637694462,
+      "max": 9.405724949761757
+    },
+    "saved_window_residual_ms": {
+      "min": 4.356076,
+      "p50": 5.289327500000001,
+      "p95": 5.981536449999999,
+      "p99": 18.45986859,
+      "max": 20.277747
+    },
+    "sync_quality_by_packet": {
+      "insufficient": 2,
+      "degraded": 106884
+    },
+    "same_host_time_pair_count": 106886,
+    "same_counter_pair_count": 106886,
+    "equal_accel_within_pair_fraction": 0.01197537563385289,
+    "equal_gyro_within_pair_fraction": 0.6333102557865389,
+    "raw_accel_mean": [
+      195.57428475197875,
+      2989.445198622832,
+      3013.1226821099117
+    ],
+    "raw_accel_std": [
+      213.7526860455467,
+      408.2990331102827,
+      496.3936465383624
+    ],
+    "raw_accel_norm": {
+      "min": 1322.3970659374588,
+      "p50": 4290.470370483712,
+      "p95": 4400.03719870639,
+      "p99": 4412.636644909702,
+      "max": 18751.93432689012
+    },
+    "raw_gyro_mean": [
+      -5.019516119978294,
+      -0.9761661957599685,
+      59.957262878206684
+    ],
+    "raw_gyro_std": [
+      44.29111822618397,
+      31.620405349425617,
+      29.432500599586387
+    ],
+    "int16_endpoint_values": 0,
+    "frames_with_equal_imu_counter": 53352,
+    "imu_read_minus_video_host_same_counter_ms": {
+      "min": -18.72725,
+      "p50": -13.1918615,
+      "p95": -9.93728265,
+      "p99": -8.997705440000006,
+      "max": -3.39531
+    },
+    "video_source_delta_histogram": {
+      "2": 53539
+    },
+    "imu_first_minus_video_first_ms": 11.758517,
+    "imu_last_minus_video_last_ms": 20.508878
+  },
+  "vendor_examples": [
+    {
+      "hex": "00 03 30 05 0C F2 B8 06 E0 00 1B 00 14 00 1D 05 0A F2 B1 06 E2 00 20 00 15 00 1C",
+      "counter": 816,
+      "sample_0": {
+        "accelerometer": [
+          1292,
+          -3400,
+          1760
+        ],
+        "gyroscope": [
+          27,
+          20,
+          29
+        ]
+      },
+      "sample_1": {
+        "accelerometer": [
+          1290,
+          -3407,
+          1762
+        ],
+        "gyroscope": [
+          32,
+          21,
+          28
+        ]
+      }
+    },
+    {
+      "hex": "00 03 48 05 21 F2 C7 07 17 00 05 00 0E 00 11 05 21 F2 C7 07 17 FF F7 00 12 00 0C",
+      "counter": 840,
+      "sample_0": {
+        "accelerometer": [
+          1313,
+          -3385,
+          1815
+        ],
+        "gyroscope": [
+          5,
+          14,
+          17
+        ]
+      },
+      "sample_1": {
+        "accelerometer": [
+          1313,
+          -3385,
+          1815
+        ],
+        "gyroscope": [
+          -9,
+          18,
+          12
+        ]
+      }
+    }
+  ]
+}

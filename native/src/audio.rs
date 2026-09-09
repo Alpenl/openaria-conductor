@@ -21,6 +21,110 @@ const WAV_HEADER_BYTES: u64 = 44;
 const DEFAULT_PERIOD_FRAMES: u64 = 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
+const QUEUE_BLOCKS: usize = 768;
+const IO_BUCKET_NS: [u64; 10] = [
+    100_000,
+    1_000_000,
+    5_000_000,
+    20_000_000,
+    100_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_000_000_000,
+    5_000_000_000,
+    10_000_000_000,
+];
+const MAX_SLOW_IO_EVENTS: usize = 64;
+const MAX_CLOCK_OBSERVATIONS: usize = 65_536;
+
+#[derive(Default)]
+struct IoTiming {
+    count: u64,
+    failures: u64,
+    bytes: u64,
+    total_ns: u64,
+    max_ns: u64,
+    histogram: [u64; 11],
+}
+
+impl IoTiming {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count": self.count, "failures": self.failures, "bytes": self.bytes,
+            "total_ns": self.total_ns, "max_ns": self.max_ns, "histogram": self.histogram,
+        })
+    }
+
+    fn record(&mut self, elapsed_ns: u64, bytes: u64, failed: bool) {
+        self.count += 1;
+        self.failures += u64::from(failed);
+        self.bytes += bytes;
+        self.total_ns += elapsed_ns;
+        self.max_ns = self.max_ns.max(elapsed_ns);
+        let bucket = IO_BUCKET_NS.partition_point(|bound| elapsed_ns > *bound);
+        self.histogram[bucket] += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IoOperation {
+    Open,
+    Write,
+    Sync,
+    Seal,
+}
+
+#[derive(Default)]
+struct WriterDiagnostics {
+    open: IoTiming,
+    write: IoTiming,
+    sync: IoTiming,
+    seal: IoTiming,
+    slow_events: Vec<serde_json::Value>,
+    slow_events_omitted: u64,
+}
+
+impl WriterDiagnostics {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "open": self.open.json(), "write": self.write.json(),
+            "sync": self.sync.json(), "seal": self.seal.json(),
+            "slow_events": self.slow_events, "slow_events_omitted": self.slow_events_omitted,
+        })
+    }
+}
+
+fn measure_io<T, E>(
+    progress: &AudioProgress,
+    operation: IoOperation,
+    bytes: u64,
+    action: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = std::time::Instant::now();
+    let result = action();
+    let elapsed = started.elapsed().as_nanos() as u64;
+    if let Ok(mut diagnostics) = progress.writer_diagnostics.lock() {
+        let (name, timing) = match operation {
+            IoOperation::Open => ("open", &mut diagnostics.open),
+            IoOperation::Write => ("write", &mut diagnostics.write),
+            IoOperation::Sync => ("sync", &mut diagnostics.sync),
+            IoOperation::Seal => ("seal", &mut diagnostics.seal),
+        };
+        timing.record(elapsed, bytes, result.is_err());
+        if elapsed >= 100_000_000 {
+            if diagnostics.slow_events.len() < MAX_SLOW_IO_EVENTS {
+                diagnostics.slow_events.push(serde_json::json!({
+                    "operation": name, "elapsed_ns": elapsed,
+                    "ended_monotonic_ns": monotonic_ns().unwrap_or(0),
+                    "bytes": bytes, "failed": result.is_err(),
+                }));
+            } else {
+                diagnostics.slow_events_omitted += 1;
+            }
+        }
+    }
+    result
+}
 
 #[repr(C)]
 struct SndPcm {
@@ -34,6 +138,12 @@ struct SndPcmHwParams {
 
 type SndPcmSframes = libc::c_long;
 type SndPcmUframes = libc::c_ulong;
+
+// ALSA uses unsigned long, which is 32 or 64 bits depending on the target ABI.
+#[allow(clippy::unnecessary_cast)]
+fn pcm_frames_u64(frames: SndPcmUframes) -> u64 {
+    frames as u64
+}
 
 type SndPcmOpen = unsafe extern "C" fn(*mut *mut SndPcm, *const c_char, c_int, c_int) -> c_int;
 type SndPcmClose = unsafe extern "C" fn(*mut SndPcm) -> c_int;
@@ -58,6 +168,13 @@ type SndPcmPrepare = unsafe extern "C" fn(*mut SndPcm) -> c_int;
 type SndPcmReadi = unsafe extern "C" fn(*mut SndPcm, *mut c_void, SndPcmUframes) -> SndPcmSframes;
 type SndPcmDrop = unsafe extern "C" fn(*mut SndPcm) -> c_int;
 type SndStrError = unsafe extern "C" fn(c_int) -> *const c_char;
+type SwMalloc = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
+type SwApply = unsafe extern "C" fn(*mut SndPcm, *mut c_void) -> c_int;
+type SwSet = unsafe extern "C" fn(*mut SndPcm, *mut c_void, c_int) -> c_int;
+type SwFree = unsafe extern "C" fn(*mut c_void);
+type Htimestamp =
+    unsafe extern "C" fn(*mut SndPcm, *mut SndPcmUframes, *mut libc::timespec) -> c_int;
+type GetParams = unsafe extern "C" fn(*mut SndPcm, *mut SndPcmUframes, *mut SndPcmUframes) -> c_int;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AudioError {
@@ -90,6 +207,7 @@ pub(crate) struct AudioSegment {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AudioRecordingResult {
+    pub(crate) capture_clock: serde_json::Value,
     pub(crate) device: String,
     pub(crate) sample_rate_hz: u32,
     pub(crate) channels: u16,
@@ -111,12 +229,34 @@ pub(crate) struct AudioRecordingSnapshot {
 
 #[derive(Default)]
 struct AudioProgress {
+    error: Mutex<Option<AudioError>>,
+    queued_frames: AtomicU64,
+    queue_peak_frames: AtomicU64,
+    max_write_ns: AtomicU64,
     sample_count: AtomicU64,
     bytes_written: AtomicU64,
     segment_count: AtomicU64,
+    writer_diagnostics: Mutex<WriterDiagnostics>,
 }
 
 impl AudioProgress {
+    fn fail(&self, error: AudioError) {
+        if let Ok(mut first) = self.error.lock() {
+            first.get_or_insert(error);
+        }
+    }
+
+    fn check(&self) -> Result<(), AudioError> {
+        let error = self
+            .error
+            .lock()
+            .map_err(|_| AudioError::new("audio_failed", "audio error mutex poisoned"))?;
+        match &*error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn publish(&self, snapshot: &AudioRecordingSnapshot) {
         self.sample_count
             .store(snapshot.sample_count, Ordering::Release);
@@ -223,7 +363,10 @@ impl Recorder {
         let stop = Arc::clone(&self.stop);
         let progress = Arc::clone(&self.progress);
         let worker = thread::spawn(move || {
-            let result = start_and_capture(config, stop, progress, ready_tx);
+            let result = start_and_capture(config, stop, Arc::clone(&progress), ready_tx);
+            if let Err(error) = &result {
+                progress.fail(error.clone());
+            }
             let _ = done_tx.send(result);
         });
         match ready_rx.recv_timeout(START_TIMEOUT) {
@@ -341,6 +484,10 @@ impl Recorder {
         self.progress.snapshot()
     }
 
+    pub(crate) fn check_health(&self) -> Result<(), AudioError> {
+        self.progress.check()
+    }
+
     pub(crate) fn abort(&self) {
         self.stop.store(true, Ordering::Release);
         let worker = self
@@ -374,6 +521,14 @@ impl Drop for Recorder {
 }
 
 struct Alsa {
+    sw_malloc: SwMalloc,
+    sw_current: SwApply,
+    sw_apply: SwApply,
+    sw_mode: SwSet,
+    sw_type: SwSet,
+    sw_free: SwFree,
+    htimestamp: Htimestamp,
+    get_params: GetParams,
     _library: Library,
     snd_pcm_open: SndPcmOpen,
     snd_pcm_close: SndPcmClose,
@@ -404,6 +559,14 @@ impl Alsa {
             let library = Library::new("libasound.so.2")
                 .map_err(|error| AudioError::new("audio_unavailable", error.to_string()))?;
             Ok(Arc::new(Self {
+                sw_malloc: load_symbol(&library, b"snd_pcm_sw_params_malloc\0")?,
+                sw_current: load_symbol(&library, b"snd_pcm_sw_params_current\0")?,
+                sw_apply: load_symbol(&library, b"snd_pcm_sw_params\0")?,
+                sw_mode: load_symbol(&library, b"snd_pcm_sw_params_set_tstamp_mode\0")?,
+                sw_type: load_symbol(&library, b"snd_pcm_sw_params_set_tstamp_type\0")?,
+                sw_free: load_symbol(&library, b"snd_pcm_sw_params_free\0")?,
+                htimestamp: load_symbol(&library, b"snd_pcm_htimestamp\0")?,
+                get_params: load_symbol(&library, b"snd_pcm_get_params\0")?,
                 snd_pcm_open: load_symbol(&library, b"snd_pcm_open\0")?,
                 snd_pcm_close: load_symbol(&library, b"snd_pcm_close\0")?,
                 snd_pcm_nonblock: load_symbol(&library, b"snd_pcm_nonblock\0")?,
@@ -466,6 +629,8 @@ unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, Audi
 }
 
 struct Pcm {
+    period_frames: u64,
+    buffer_frames: u64,
     handle: *mut SndPcm,
     alsa: Arc<Alsa>,
 }
@@ -490,7 +655,12 @@ impl Pcm {
         if result < 0 {
             return Err(alsa.error("audio_unavailable", "snd_pcm_open", result));
         }
-        let mut pcm = Self { handle, alsa };
+        let mut pcm = Self {
+            handle,
+            alsa,
+            period_frames: 0,
+            buffer_frames: 0,
+        };
         if let Err(error) = pcm.configure(config) {
             let _ = pcm.close();
             return Err(error);
@@ -597,6 +767,31 @@ impl Pcm {
         self.check("unsupported_audio_mode", "snd_pcm_hw_params", unsafe {
             (self.alsa.snd_pcm_hw_params)(self.handle, params.pointer)
         })?;
+        self.check("unsupported_audio_mode", "snd_pcm_get_params", unsafe {
+            (self.alsa.get_params)(self.handle, &mut buffer, &mut period)
+        })?;
+        self.period_frames = pcm_frames_u64(period);
+        self.buffer_frames = pcm_frames_u64(buffer);
+        let mut sw = std::ptr::null_mut();
+        self.check("audio_failed", "sw_params_malloc", unsafe {
+            (self.alsa.sw_malloc)(&mut sw)
+        })?;
+        let configured = (|| {
+            self.check("audio_failed", "sw_params_current", unsafe {
+                (self.alsa.sw_current)(self.handle, sw)
+            })?;
+            self.check("audio_failed", "timestamp_enable", unsafe {
+                (self.alsa.sw_mode)(self.handle, sw, 1)
+            })?;
+            self.check("audio_failed", "timestamp_monotonic", unsafe {
+                (self.alsa.sw_type)(self.handle, sw, 1)
+            })?;
+            self.check("audio_failed", "sw_params", unsafe {
+                (self.alsa.sw_apply)(self.handle, sw)
+            })
+        })();
+        unsafe { (self.alsa.sw_free)(sw) };
+        configured?;
         self.check("audio_failed", "snd_pcm_prepare", unsafe {
             (self.alsa.snd_pcm_prepare)(self.handle)
         })?;
@@ -612,22 +807,37 @@ impl Pcm {
         let result = unsafe {
             (self.alsa.snd_pcm_readi)(self.handle, buffer.as_mut_ptr().cast::<c_void>(), frames)
         };
-        if result > 0 {
-            return Ok(ReadOutcome::Frames(u64::try_from(result).map_err(
-                |_| AudioError::new("audio_failed", "negative frame count"),
-            )?));
+        classify_read_result(result).map_err(|code| {
+            self.alsa.error(
+                "audio_failed",
+                "snd_pcm_readi: capture continuity lost",
+                code,
+            )
+        })
+    }
+
+    fn clock_anchor(&self, read_frames: u64) -> Result<(u64, u64), AudioError> {
+        let mut available = 0;
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        self.check("audio_failed", "snd_pcm_htimestamp", unsafe {
+            (self.alsa.htimestamp)(self.handle, &mut available, &mut timestamp)
+        })?;
+        if timestamp.tv_sec < 0
+            || !(0..1_000_000_000).contains(&timestamp.tv_nsec)
+            || pcm_frames_u64(available) > self.buffer_frames
+        {
+            return Err(AudioError::new(
+                "audio_failed",
+                "invalid ALSA clock or overrun",
+            ));
         }
-        let code = c_int::try_from(result).unwrap_or(c_int::MIN);
-        if code == -libc::EAGAIN {
-            return Ok(ReadOutcome::Again);
-        }
-        if code == -libc::EPIPE || code == -libc::ESTRPIPE {
-            self.check("audio_failed", "snd_pcm_prepare", unsafe {
-                (self.alsa.snd_pcm_prepare)(self.handle)
-            })?;
-            return Ok(ReadOutcome::Recovered);
-        }
-        Err(self.alsa.error("audio_failed", "snd_pcm_readi", code))
+        Ok((
+            read_frames + pcm_frames_u64(available),
+            timestamp.tv_sec as u64 * 1_000_000_000 + timestamp.tv_nsec as u64,
+        ))
     }
 
     fn check(&self, code: &'static str, context: &str, result: c_int) -> Result<(), AudioError> {
@@ -677,10 +887,22 @@ impl Drop for HwParams {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReadOutcome {
     Frames(u64),
     Again,
-    Recovered,
+}
+
+fn classify_read_result(result: SndPcmSframes) -> Result<ReadOutcome, c_int> {
+    if result > 0 {
+        return Ok(ReadOutcome::Frames(result as u64));
+    }
+    let code = c_int::try_from(result).unwrap_or(c_int::MIN);
+    if code == 0 || code == -libc::EAGAIN || code == -libc::EINTR {
+        Ok(ReadOutcome::Again)
+    } else {
+        Err(code)
+    }
 }
 
 struct SegmentWriter {
@@ -791,10 +1013,10 @@ impl SegmentWriter {
                 .active
                 .as_mut()
                 .ok_or_else(|| AudioError::new("invalid_state", "audio segment was not opened"))?;
-            active
-                .file
-                .write_all(&data[byte_start..byte_end])
-                .map_err(|error| AudioError::io("write_failed", "write audio segment", error))?;
+            measure_io(&self.progress, IoOperation::Write, byte_len as u64, || {
+                active.file.write_all(&data[byte_start..byte_end])
+            })
+            .map_err(|error| AudioError::io("write_failed", "write audio segment", error))?;
             active.data_bytes += selected * self.bytes_per_frame;
             *total_written_before += selected;
             remaining -= selected;
@@ -821,11 +1043,13 @@ impl SegmentWriter {
             std::fs::create_dir_all(parent)
                 .map_err(|error| AudioError::io("write_failed", "create audio directory", error))?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&absolute)
-            .map_err(|error| AudioError::io("write_failed", "open audio segment", error))?;
+        let mut file = measure_io(&self.progress, IoOperation::Open, 0, || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&absolute)
+        })
+        .map_err(|error| AudioError::io("write_failed", "open audio segment", error))?;
         write_wav_header(&mut file, self.sample_rate_hz, self.channels, 0)?;
         self.active = Some(ActiveSegment {
             index: self.next_index,
@@ -846,16 +1070,27 @@ impl SegmentWriter {
         if segment.data_bytes == 0 {
             return Ok(());
         }
-        write_wav_header(
-            &mut segment.file,
-            self.sample_rate_hz,
-            self.channels,
+        measure_io(&self.progress, IoOperation::Seal, 0, || {
+            segment
+                .file
+                .set_len(WAV_HEADER_BYTES + segment.data_bytes)
+                .map_err(|error| {
+                    AudioError::io("write_failed", "truncate incomplete audio write", error)
+                })?;
+            write_wav_header(
+                &mut segment.file,
+                self.sample_rate_hz,
+                self.channels,
+                segment.data_bytes,
+            )
+        })?;
+        measure_io(
+            &self.progress,
+            IoOperation::Sync,
             segment.data_bytes,
-        )?;
-        segment
-            .file
-            .sync_all()
-            .map_err(|error| AudioError::io("write_failed", "sync audio segment", error))?;
+            || segment.file.sync_all(),
+        )
+        .map_err(|error| AudioError::io("write_failed", "sync audio segment", error))?;
         let end_sample = segment.start_sample + segment.data_bytes / self.bytes_per_frame;
         self.records.push(AudioSegment {
             index: segment.index,
@@ -883,38 +1118,181 @@ fn start_and_capture(
             return Err(error);
         }
     };
-    let mut writer = match SegmentWriter::with_progress(&config, progress) {
+    let mut writer = match SegmentWriter::with_progress(&config, Arc::clone(&progress)) {
         Ok(writer) => writer,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
             return Err(error);
         }
     };
-    let started_monotonic_ns = monotonic_ns()?;
-    let _ = ready.send(Ok(()));
     let bytes_per_frame = u64::from(config.channels) * BYTES_PER_SAMPLE;
     let period_frames = DEFAULT_PERIOD_FRAMES;
-    let mut buffer = vec![
-        0_u8;
-        usize::try_from(period_frames * bytes_per_frame).map_err(|_| {
-            AudioError::new("invalid_argument", "audio period buffer is too large")
-        })?
-    ];
-    let mut sample_count = 0_u64;
-    while !stop.load(Ordering::Acquire) {
-        match pcm.readi(&mut buffer, period_frames)? {
-            ReadOutcome::Frames(frames) => {
-                let bytes = usize::try_from(frames * bytes_per_frame).map_err(|_| {
-                    AudioError::new("audio_failed", "audio read byte count overflow")
-                })?;
-                writer.write_frames(&buffer[..bytes], frames, &mut sample_count)?;
+    let block_bytes = usize::try_from(period_frames * bytes_per_frame)
+        .map_err(|_| AudioError::new("invalid_argument", "audio period buffer is too large"))?;
+    let (blocks_tx, blocks_rx) = mpsc::sync_channel::<(Vec<u8>, u64)>(QUEUE_BLOCKS);
+    let (pool_tx, pool_rx) = mpsc::sync_channel(QUEUE_BLOCKS + 1);
+    for _ in 0..=QUEUE_BLOCKS {
+        pool_tx.send(vec![0_u8; block_bytes]).unwrap();
+    }
+    let writer_progress = Arc::clone(&progress);
+    let disk = thread::spawn(move || {
+        let mut written = 0;
+        let mut failure = None;
+        for (buffer, frames) in blocks_rx {
+            writer_progress
+                .queued_frames
+                .fetch_sub(frames, Ordering::AcqRel);
+            let started = std::time::Instant::now();
+            if let Err(error) = writer.write_frames(
+                &buffer[..(frames * bytes_per_frame) as usize],
+                frames,
+                &mut written,
+            ) {
+                writer_progress.fail(error.clone());
+                failure = Some(error);
+                break;
             }
-            ReadOutcome::Again | ReadOutcome::Recovered => thread::sleep(READ_IDLE_SLEEP),
+            writer_progress
+                .max_write_ns
+                .fetch_max(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let _ = pool_tx.try_send(buffer);
         }
+        // Even on capture or disk failure, seal the prefix whose writes completed.
+        let finished = writer.finish();
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        finished.map(|segments| (written, segments))
+    });
+    let started_monotonic_ns = monotonic_ns()?;
+    let _ = ready.send(Ok(()));
+    let mut sample_count = 0_u64;
+    let mut anchors: Vec<[u64; 2]> = Vec::new();
+    let mut last_anchor = None;
+    // Diagnostic observations never replace or smooth the authoritative anchors.
+    let mut clock_observations: Vec<[u64; 5]> = Vec::new();
+    let mut observations_omitted = 0_u64;
+    let mut next_observation_ns = 0;
+    let enqueue = |buffer, frames| {
+        let queued = progress.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames;
+        progress
+            .queue_peak_frames
+            .fetch_max(queued, Ordering::Relaxed);
+        blocks_tx.try_send((buffer, frames)).map_err(|_| {
+            AudioError::new(
+                "audio_failed",
+                "audio writer queue exhausted or disconnected",
+            )
+        })
+    };
+    let captured = (|| {
+        let mut buffer = pool_rx.try_recv().unwrap();
+        let mut buffered_frames = 0;
+        while !stop.load(Ordering::Acquire) {
+            progress.check()?;
+            let offset = (buffered_frames * bytes_per_frame) as usize;
+            match pcm.readi(&mut buffer[offset..], period_frames - buffered_frames)? {
+                ReadOutcome::Frames(frames) => {
+                    sample_count += frames;
+                    buffered_frames += frames;
+                    let (position, timestamp) = pcm.clock_anchor(sample_count)?;
+                    if timestamp == 0 {
+                        return Err(AudioError::new("audio_failed", "missing ALSA timestamp"));
+                    }
+                    let anchor = [position, timestamp];
+                    if timestamp >= next_observation_ns {
+                        next_observation_ns = timestamp.saturating_add(100_000_000);
+                        if clock_observations.len() < MAX_CLOCK_OBSERVATIONS {
+                            clock_observations.push([
+                                position,
+                                timestamp,
+                                monotonic_ns()?,
+                                clock_ns(libc::CLOCK_MONOTONIC_RAW)?,
+                                sample_count,
+                            ]);
+                        } else {
+                            observations_omitted += 1;
+                        }
+                    }
+                    if anchors
+                        .last()
+                        .is_none_or(|last| position >= last[0] + u64::from(config.sample_rate_hz))
+                    {
+                        anchors.push(anchor);
+                    }
+                    last_anchor = Some(anchor);
+                    // USB reads can contain only a few milliseconds. Fill a
+                    // block so queue capacity measures PCM time, not USB polls.
+                    if buffered_frames == period_frames {
+                        enqueue(buffer, buffered_frames)?;
+                        buffered_frames = 0;
+                        buffer = pool_rx.try_recv().map_err(|_| {
+                            AudioError::new("audio_failed", "audio writer buffer pool exhausted")
+                        })?;
+                    }
+                }
+                ReadOutcome::Again => thread::sleep(READ_IDLE_SLEEP),
+            }
+        }
+        if buffered_frames > 0 {
+            enqueue(buffer, buffered_frames)?;
+        }
+        Ok::<(), AudioError>(())
+    })();
+    if let Err(error) = &captured {
+        progress.fail(error.clone());
     }
     let stopped_monotonic_ns = monotonic_ns()?;
-    pcm.close()?;
-    let segments = writer.finish()?;
+    let closed = pcm.close();
+    drop(blocks_tx);
+    let disk_result = disk
+        .join()
+        .map_err(|_| AudioError::new("audio_failed", "audio writer panicked"))?;
+    if let Some(anchor) = last_anchor {
+        if anchors.last() != Some(&anchor) {
+            anchors.push(anchor);
+        }
+    }
+    let clock_result = capture_clock(
+        &config,
+        (pcm.period_frames, pcm.buffer_frames),
+        sample_count,
+        started_monotonic_ns,
+        stopped_monotonic_ns,
+        &anchors,
+        &progress,
+    );
+    let failure = captured
+        .as_ref()
+        .err()
+        .or(closed.as_ref().err())
+        .or(disk_result.as_ref().err())
+        .or(clock_result.as_ref().err());
+    let diagnostic = serde_json::json!({
+        "schema": "openaria.audio-capture-diagnostic.v2", "sample_count": sample_count,
+        "anchors": anchors, "thread_started_monotonic_ns": started_monotonic_ns,
+        "thread_stopped_monotonic_ns": stopped_monotonic_ns,
+        "error": failure.map(|error| serde_json::json!({"code": error.code, "message": error.message})),
+        "clock_observation_fields": ["sample_position", "alsa_monotonic_ns", "observed_monotonic_ns", "observed_raw_ns", "read_samples"],
+        "clock_observations": clock_observations,
+        "clock_observations_omitted": observations_omitted,
+        "io_histogram_upper_bounds_ns": IO_BUCKET_NS,
+        "writer_io": progress.writer_diagnostics.lock().ok().map(|value| value.json()),
+    });
+    let diagnostic_path = config.session_root.join("audio/capture-clock.json");
+    if let Ok(payload) = serde_json::to_vec(&diagnostic) {
+        let _ = std::fs::write(diagnostic_path, payload);
+    }
+    captured?;
+    closed?;
+    let (written, segments) = disk_result?;
+    if written != sample_count {
+        return Err(AudioError::new(
+            "audio_failed",
+            "audio queue did not drain completely",
+        ));
+    }
+    let capture_clock = clock_result?;
     if sample_count == 0 || segments.is_empty() {
         return Err(AudioError::new(
             "audio_empty",
@@ -922,6 +1300,7 @@ fn start_and_capture(
         ));
     }
     Ok(AudioRecordingResult {
+        capture_clock,
         device: config.device,
         sample_rate_hz: config.sample_rate_hz,
         channels: config.channels,
@@ -935,13 +1314,75 @@ fn start_and_capture(
     })
 }
 
+fn capture_clock(
+    config: &RecorderConfig,
+    hardware_frames: (u64, u64),
+    samples: u64,
+    started: u64,
+    stopped: u64,
+    anchors: &[[u64; 2]],
+    progress: &AudioProgress,
+) -> Result<serde_json::Value, AudioError> {
+    if anchors.len() < 2
+        || anchors
+            .windows(2)
+            .any(|pair| pair[1][0] <= pair[0][0] || pair[1][1] <= pair[0][1])
+    {
+        return Err(AudioError::new(
+            "audio_failed",
+            "audio clock anchors are missing or nonmonotonic",
+        ));
+    }
+    let first = anchors[0];
+    let last = anchors[anchors.len() - 1];
+    let ns_per_sample = (last[1] - first[1]) as f64 / (last[0] - first[0]) as f64;
+    let actual_rate = 1e9 / ns_per_sample;
+    let residual = anchors
+        .iter()
+        .map(|a| ((a[1] - first[1]) as f64 - (a[0] - first[0]) as f64 * ns_per_sample).abs())
+        .fold(0.0_f64, f64::max);
+    if (actual_rate / f64::from(config.sample_rate_hz) - 1.0).abs() > 0.01
+        || residual > 20_000_000.0
+    {
+        return Err(AudioError::new(
+            "audio_failed",
+            format!("audio clock discontinuity: rate={actual_rate}, residual_ns={residual}"),
+        ));
+    }
+    let sample_start = first[1] as f64 - first[0] as f64 * ns_per_sample;
+    let sample_end = sample_start + samples as f64 * ns_per_sample;
+    if sample_start < started as f64 - 20_000_000.0 || sample_end > stopped as f64 + 20_000_000.0 {
+        return Err(AudioError::new(
+            "audio_failed",
+            "sample clock outside capture lifetime",
+        ));
+    }
+    Ok(serde_json::json!({
+        "schema": "openaria.audio-clock.v1", "clock": "host_monotonic",
+        "timestamp_source": "alsa_htimestamp_dma", "continuity": "verified",
+        "device": config.device, "period_frames": hardware_frames.0, "buffer_frames": hardware_frames.1,
+        "thread_started_monotonic_ns": started, "thread_stopped_monotonic_ns": stopped,
+        "sample_start_monotonic_ns": sample_start.round() as u64,
+        "sample_end_monotonic_ns": sample_end.round() as u64,
+        "max_residual_ns": residual.ceil() as u64, "anchors": anchors,
+        "queue_capacity_frames": QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,
+        "queue_peak_frames": progress.queue_peak_frames.load(Ordering::Relaxed),
+        "max_write_ns": progress.max_write_ns.load(Ordering::Relaxed),
+        "xrun_count": 0, "suspend_count": 0,
+    }))
+}
+
 fn monotonic_ns() -> Result<u64, AudioError> {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+fn clock_ns(clock: libc::clockid_t) -> Result<u64, AudioError> {
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: timestamp points to writable storage.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+    if unsafe { libc::clock_gettime(clock, &mut timestamp) } != 0 {
         return Err(AudioError::io(
             "clock_failed",
             "clock_gettime",
@@ -1004,6 +1445,107 @@ mod tests {
     use super::{SegmentWriter, write_wav_header};
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
+    use std::path::PathBuf;
+
+    #[test]
+    fn io_histogram_preserves_tail_and_failure_counts() {
+        let mut timing = super::IoTiming::default();
+        for (elapsed, failed) in [(100_000, false), (100_001, false), (16_000_000_000, true)] {
+            timing.record(elapsed, 4096, failed);
+        }
+        assert_eq!(timing.count, 3);
+        assert_eq!(timing.failures, 1);
+        assert_eq!(timing.bytes, 12288);
+        assert_eq!(timing.max_ns, 16_000_000_000);
+        assert_eq!(timing.histogram[0], 1);
+        assert_eq!(timing.histogram[1], 1);
+        assert_eq!(timing.histogram[10], 1);
+        assert_eq!(timing.histogram.iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn io_measurement_does_not_swallow_disk_errors() {
+        let progress = super::AudioProgress::default();
+        let result: std::io::Result<()> =
+            super::measure_io(&progress, super::IoOperation::Sync, 4096, || {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+        let diagnostics = progress.writer_diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.sync.count, 1);
+        assert_eq!(diagnostics.sync.failures, 1);
+        assert_eq!(diagnostics.write.count, 0);
+    }
+
+    #[test]
+    fn xruns_and_suspend_never_resume_a_continuous_pcm_stream() {
+        for code in [libc::EPIPE, libc::ESTRPIPE, libc::ENODEV, libc::EIO] {
+            assert_eq!(super::classify_read_result((-code).into()), Err(-code));
+        }
+        for code in [0, -libc::EAGAIN, -libc::EINTR] {
+            assert_eq!(
+                super::classify_read_result(code.into()),
+                Ok(super::ReadOutcome::Again)
+            );
+        }
+        assert_eq!(
+            super::classify_read_result(512),
+            Ok(super::ReadOutcome::Frames(512))
+        );
+    }
+
+    #[test]
+    fn first_audio_failure_is_visible_before_stop_and_survives_cleanup_errors() {
+        let progress = super::AudioProgress::default();
+        assert!(progress.check().is_ok());
+        progress.fail(super::AudioError::new("audio_failed", "xrun"));
+        progress.fail(super::AudioError::new("write_failed", "cleanup"));
+        assert_eq!(progress.check().unwrap_err().message, "xrun");
+    }
+
+    #[test]
+    fn sample_clock_rejects_steps_without_rewriting_thread_times() {
+        let config = super::RecorderConfig {
+            session_root: PathBuf::new(),
+            device: "hw:test".into(),
+            sample_rate_hz: 10_000,
+            channels: 2,
+            segment_seconds: 30.0,
+        };
+        let progress = super::AudioProgress::default();
+        let anchors = [
+            [1024, 1_202_400_000],
+            [11024, 2_202_400_000],
+            [20000, 3_100_000_000],
+        ];
+        let clock = super::capture_clock(
+            &config,
+            (1024, 8192),
+            20000,
+            1_100_000_000,
+            3_110_000_000,
+            &anchors,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(clock["sample_start_monotonic_ns"], 1_100_000_000_u64);
+        assert_eq!(clock["sample_end_monotonic_ns"], 3_100_000_000_u64);
+        assert_eq!(clock["thread_stopped_monotonic_ns"], 3_110_000_000_u64);
+        let mut broken = anchors;
+        broken[1][1] += 50_000_000;
+        assert!(
+            super::capture_clock(
+                &config,
+                (1024, 8192),
+                20000,
+                1_100_000_000,
+                3_110_000_000,
+                &broken,
+                &progress
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn wav_header_records_pcm_shape() {

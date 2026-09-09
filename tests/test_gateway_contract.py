@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "b6f3c677c038e55c03581c587973811b0aa2dc91cfb8b602a95128fbac225827",
-        "bytes": 124_739,
+        "sha256": "30b913b319ce02377d8169e5f033f913baeca6bb37faf32d622a114844185151",
+        "bytes": 128596,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -55,6 +55,9 @@ SCHEMA_GOLDENS = {
     "ylx-device-session-v2.schema.json": (
         "7de77a092152cb68d57fc9e46dcc3024fe521dbcf5961999cf0ac887186a59c8"
     ),
+    "ylx-device-session-v3.schema.json": (
+        "dedcca7df79d05248d7650bcf82bcd48a86af74233018403dcd6ea9aafa00f4e"
+    ),
     "ylx-recording-state-v1.schema.json": (
         "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"
     ),
@@ -62,7 +65,11 @@ SCHEMA_GOLDENS = {
 SCHEMA_REFERENCES_BY_VERSION = {
     "v2": {"ylx-device-session-v1.schema.json", "ylx-recording-state-v1.schema.json"},
     "v3": {"ylx-device-session-v1.schema.json", "ylx-recording-state-v1.schema.json"},
-    "v4": {"ylx-device-session-v2.schema.json", "ylx-recording-state-v1.schema.json"},
+    "v4": {
+        "ylx-device-session-v2.schema.json",
+        "ylx-device-session-v3.schema.json",
+        "ylx-recording-state-v1.schema.json",
+    },
 }
 
 COMMON_ROUTE_GOLDEN = {
@@ -97,6 +104,7 @@ ROUTE_GOLDENS = {
         ("/network/forget", "post", "forgetNetworkClientProfile"),
         ("/camera/focus", "get", "getCameraFocus"),
         ("/camera/focus", "post", "setCameraFocus"),
+        ("/sessions/delete", "post", "deleteSessions"),
     },
 }
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from rp_ylx.performance import PerformanceReportError, validate_performance_report
+from rp_ylx.performance.report import PerformanceReportError, validate_performance_report
 
 
 def report() -> dict[str, object]:
@@ -125,7 +125,7 @@ class PerformanceReportTest(unittest.TestCase):
 
         false_python = report()
         false_python["native"].update(  # type: ignore[union-attr]
-            {"module_available": True, "module_version": "0.1.0", "abi": 5}
+            {"module_available": True, "module_version": "0.1.0", "abi": 6}
         )
         cases.append((false_python, "adapter_mismatch"))
 

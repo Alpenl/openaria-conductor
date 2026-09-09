@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -26,6 +26,9 @@ from typing import Protocol
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
+    LockedArtifact,
+    LockedBytes,
+    LockedManifest,
     iter_device_session_v1_artifacts,
 )
 from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
@@ -221,24 +224,6 @@ def _decode_session_cursor(cursor: str) -> Mapping[str, object]:
     return value
 
 
-class _Representation(Protocol):
-    etag: str
-    size: int
-    content_type: str
-
-    def close(self) -> None: ...
-
-    def read(self, offset: int = 0, length: int | None = None) -> bytes: ...
-
-    def iter_chunks(
-        self,
-        offset: int = 0,
-        length: int | None = None,
-        *,
-        chunk_size: int = 1024 * 1024,
-    ) -> object: ...
-
-
 class CaptureSources(Protocol):
     @property
     def supports_calibration_capture(self) -> bool: ...
@@ -311,7 +296,7 @@ class CoordinatorConfig:
 
 @dataclass(frozen=True, slots=True)
 class _LatestImuReceipt:
-    session_id: str
+    session_id: str | None
     sample: ImuSample
     sample_key: tuple[int, int, int, int, int]
     received_at_monotonic: float
@@ -409,7 +394,7 @@ def _default_mount_identity(mountpoint: Path) -> str:
 class _TrackedRepresentation:
     def __init__(
         self,
-        representation: _Representation,
+        representation: LockedBytes,
         release: Callable[[], None],
     ) -> None:
         self._representation = representation
@@ -451,23 +436,11 @@ class _TrackedRepresentation:
         length: int | None = None,
         *,
         chunk_size: int = 1024 * 1024,
-    ) -> object:
+    ) -> Iterator[bytes]:
         return self._representation.iter_chunks(offset, length, chunk_size=chunk_size)
 
     def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
-        send_to = getattr(self._representation, "send_to", None)
-        if callable(send_to):
-            return int(send_to(output_descriptor, offset, length))
-        sent = 0
-        for chunk in self.iter_chunks(offset, length):
-            view = memoryview(chunk)
-            while view:
-                written = os.write(output_descriptor, view)
-                if written <= 0:
-                    raise BrokenPipeError("representation socket wrote zero bytes")
-                sent += written
-                view = view[written:]
-        return sent
+        return self._representation.send_to(output_descriptor, offset, length)
 
 
 class _MultiRootSessionStore:
@@ -487,7 +460,7 @@ class _MultiRootSessionStore:
         for store in self._stores:
             store.close()
 
-    def open_manifest(self, session_id: str, api_version: str) -> object:
+    def open_manifest(self, session_id: str, api_version: str) -> LockedManifest:
         not_found: ArtifactAccessError | None = None
         for store in self._stores:
             try:
@@ -500,7 +473,9 @@ class _MultiRootSessionStore:
             raise not_found
         raise ArtifactAccessError("not_found", "会话不存在")
 
-    def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
+    def open_verified_artifact(
+        self, session_id: str, artifact_id: str, api_version: str
+    ) -> LockedArtifact:
         last_retryable: ArtifactAccessError | None = None
         for store in self._stores:
             try:
@@ -568,6 +543,7 @@ class CaptureCoordinator:
         self._stop_condition = threading.Condition(self._lock)
         self._storage_lock = threading.Lock()
         self._catalog_lock = threading.Lock()
+        self._closing = False
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
         self._active: DeviceSessionRecorder | None = None
@@ -580,6 +556,7 @@ class CaptureCoordinator:
         self._session_summaries: dict[str, dict[str, object]] = {}
         self._session_diagnostics: dict[str, dict[str, object]] = {}
         self._latest_imu: _LatestImuReceipt | None = None
+        self._focus_revision = 0
         self._open_representations = 0
         self._released = False
         self._media_lost = False
@@ -949,6 +926,8 @@ class CaptureCoordinator:
         session_id: str,
         manifest: Mapping[str, object],
         manifest_payload: bytes,
+        *,
+        interrupt_check: Callable[[], None] | None = None,
     ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
         manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
         admission = self._require_admission()
@@ -998,6 +977,7 @@ class CaptureCoordinator:
                 validated_manifest = validate_device_session_directory(
                     session_path,
                     expected_session_id=session_id,
+                    interrupt_check=interrupt_check,
                 )
             except DeviceRecordingError as error:
                 if error.code != "digest_mismatch":
@@ -1051,6 +1031,10 @@ class CaptureCoordinator:
             if callable(close):
                 close()
             store.close()
+
+    def _check_catalog_verification_idle(self) -> None:
+        if self._active is not None or self._closing:
+            raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
 
     def _catalog_sessions(self, *, revalidate_pending: bool = True) -> None:
         admission = self._require_admission()
@@ -1112,6 +1096,19 @@ class CaptureCoordinator:
                         continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
+                        if self._active is not None or self._closing:
+                            # Cold catalog reads must not hash historical video while capturing.
+                            self._session_summaries[session_id] = self._session_summary(
+                                session_id,
+                                manifest,
+                                payload,
+                                verification_current=False,
+                            )
+                            self._verified.pop(session_id, None)
+                            self._session_snapshots.pop(session_id, None)
+                            self._pending_session_verification.add(session_id)
+                            self._session_diagnostics.pop(session_id, None)
+                            continue
                         try:
                             verified_snapshot, verification_error = (
                                 self._verify_exact_session_payload(
@@ -1119,6 +1116,7 @@ class CaptureCoordinator:
                                     session_id,
                                     manifest,
                                     payload,
+                                    interrupt_check=self._check_catalog_verification_idle,
                                 )
                             )
                         except DeviceRecordingError as error:
@@ -1296,13 +1294,19 @@ class CaptureCoordinator:
             "verification": verification,
         }
 
-    def _recording_snapshot(self) -> tuple[str, object | None, object | None]:
+    def _recording_snapshot(
+        self,
+    ) -> tuple[int, str, dict[str, object] | None, dict[str, object] | None]:
+        if self._admission is None:
+            with suppress(DeviceRecordingError):
+                self._require_admission()
         if self._active is not None:
             recording_state = self._active.current_recording_state
             if recording_state is None:
-                return "blocked", None, None
+                return self._revision, "blocked", None, None
             state = str(recording_state["state"])
             return (
+                int(recording_state["state_revision"]),
                 state,
                 {
                     "generation_id": self._active_plan.generation_id,
@@ -1320,13 +1324,21 @@ class CaptureCoordinator:
             ):
                 retained = copy.deepcopy(candidate)
                 break
-        return "idle", None, retained
+        return self._revision, "idle", None, retained
+
+    def capture_recording_progress(self) -> tuple[str, int, Mapping[str, object] | None]:
+        with self._lock:
+            revision, _, active, _ = self._recording_snapshot()
+            state = None if active is None else active["recording_state"]
+            return self._authority_epoch, revision, state
 
     @staticmethod
     def _raw_imu_vector(vector: RawVector3) -> Mapping[str, object]:
         return {"x": vector.x, "y": vector.y, "z": vector.z}
 
-    def _live_imu_from_sample(self, session_id: str, sample: ImuSample) -> Mapping[str, object]:
+    def _live_imu_from_sample(
+        self, session_id: str | None, sample: ImuSample
+    ) -> Mapping[str, object]:
         return {
             "session_id": session_id,
             "clock": {
@@ -1354,9 +1366,9 @@ class CaptureCoordinator:
     @staticmethod
     def _fresh_live_imu(
         receipt: _LatestImuReceipt | None,
-        session_id: str,
+        session_id: str | None,
         observed_at_monotonic: float,
-    ) -> tuple[str, ImuSample] | None:
+    ) -> tuple[str | None, ImuSample] | None:
         if receipt is None or receipt.session_id != session_id:
             return None
         if observed_at_monotonic - receipt.received_at_monotonic > LIVE_IMU_STALE_SECONDS:
@@ -1365,48 +1377,51 @@ class CaptureCoordinator:
 
     def _store_latest_imu_locked(
         self,
-        session_id: str,
+        session_id: str | None,
         sample: ImuSample,
         *,
         observed_at_monotonic: float,
     ) -> _LatestImuReceipt:
         key = self._imu_sample_key(sample)
         cached = self._latest_imu
-        if cached is not None and cached.session_id == session_id and cached.sample_key == key:
+        if (
+            cached is not None
+            and cached.session_id == session_id
+            and (cached.sample_key == key or cached.received_at_monotonic > observed_at_monotonic)
+        ):
             return cached
         receipt = _LatestImuReceipt(session_id, sample, key, observed_at_monotonic)
         self._latest_imu = receipt
         return receipt
 
-    def _latest_imu_sample(self) -> tuple[str, ImuSample] | None:
+    def _refresh_latest_imu(self) -> None:
         with self._lock:
             plan = self._active_plan
-            if self._active is None or plan is None:
-                return None
-            session_id = plan.session_id
             sources = self._sources
         observed_at = time.monotonic()
         latest = getattr(sources, "latest_imu_observation", None)
         if not callable(latest):
-            with self._lock:
-                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
+            return
         try:
             observation = latest()
         except BaseException:
-            observation = None
+            return
         if observation is None or not observation.samples:
-            with self._lock:
-                return self._fresh_live_imu(self._latest_imu, session_id, observed_at)
+            return
         sample = observation.samples[-1]
         with self._lock:
-            if self._active_plan is not None and self._active_plan.session_id == session_id:
-                receipt = self._store_latest_imu_locked(
-                    session_id,
+            if self._active_plan is plan:
+                self._store_latest_imu_locked(
+                    None if plan is None or self._active is None else plan.session_id,
                     sample,
                     observed_at_monotonic=observed_at,
                 )
-                return self._fresh_live_imu(receipt, session_id, observed_at)
-        return None
+
+    def _live_imu_snapshot_locked(self) -> Mapping[str, object] | None:
+        plan = self._active_plan
+        session_id = None if self._active is None or plan is None else plan.session_id
+        latest = self._fresh_live_imu(self._latest_imu, session_id, time.monotonic())
+        return None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
 
     def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
         sources = self._sources
@@ -1493,44 +1508,44 @@ class CaptureCoordinator:
     def _runtime_snapshot(self) -> Mapping[str, object]:
         runtime = dict(copy.deepcopy(self._runtime()))
         camera = self._camera_connection_status()
-        latest = self._latest_imu_sample()
-        runtime["live_imu"] = (
-            None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
-        )
         runtime["camera"] = camera
         runtime["camera_focus"] = (
             None if camera["state"] == "disconnected" else self._camera_focus_status()
         )
+        self._refresh_latest_imu()
+        with self._lock:
+            runtime["live_imu"] = self._live_imu_snapshot_locked()
         return runtime
 
-    def _snapshot(self) -> Mapping[str, object]:
-        state, active, retained = self._recording_snapshot()
-        return {
-            "schema": "ylx.capture-snapshot-event.v2",
-            "device_state": state,
-            "active_recording": active,
-            "retained_unsuccessful": retained,
-            "runtime": self._runtime_snapshot(),
-        }
-
     def capture_status(self) -> Mapping[str, object]:
-        with self._lock:
-            if self._admission is None:
-                with suppress(DeviceRecordingError):
-                    self._require_admission()
-            snapshot = self._snapshot()
-            source_revision = self._revision
-            recording = snapshot["active_recording"] or snapshot["retained_unsuccessful"]
-            if isinstance(recording, Mapping):
-                state = recording.get("recording_state")
-                if isinstance(state, Mapping):
-                    source_revision = int(state["state_revision"])
-            return {
-                "schema": "ylx.capture-status.v2",
-                "authority_epoch": self._authority_epoch,
-                "source_revision": source_revision,
-                "snapshot": snapshot,
-            }
+        while True:
+            with self._lock:
+                focus_revision = self._focus_revision
+            runtime = dict(self._runtime_snapshot())
+            with self._lock:
+                source_revision, state, active, retained = self._recording_snapshot()
+                # Checkpoints advance capture revisions without changing hardware controls.
+                if focus_revision != self._focus_revision:
+                    continue
+                runtime["live_imu"] = self._live_imu_snapshot_locked()
+                if (
+                    active is None
+                    and runtime["live_imu"] is not None
+                    and runtime["live_imu"]["session_id"] is not None
+                ):
+                    runtime["live_imu"] = None
+                return {
+                    "schema": "ylx.capture-status.v2",
+                    "authority_epoch": self._authority_epoch,
+                    "source_revision": source_revision,
+                    "snapshot": {
+                        "schema": "ylx.capture-snapshot-event.v2",
+                        "device_state": state,
+                        "active_recording": active,
+                        "retained_unsuccessful": retained,
+                        "runtime": runtime,
+                    },
+                }
 
     def capture_snapshot_event(self) -> Mapping[str, object]:
         status = self.capture_status()
@@ -1576,7 +1591,7 @@ class CaptureCoordinator:
                     "session_detail": True,
                     "artifact_download": True,
                     "capture_status": True,
-                    "session_deletion": False,
+                    "session_deletion": True,
                 }
             )
             capabilities["calibration_capture"] = self._calibration_capture_capability(
@@ -1940,6 +1955,7 @@ class CaptureCoordinator:
                 "auto_enabled 必须是布尔值",
                 status=HTTPStatus.BAD_REQUEST,
             )
+        self._focus_revision += 1
         try:
             result = self._sources.set_camera_focus(  # type: ignore[union-attr]
                 value=value,
@@ -2113,6 +2129,11 @@ class CaptureCoordinator:
                 session_config,
                 video_layout="split-eyes",
                 audio_enabled=False,
+                recording_encoding=(
+                    None
+                    if session_config.recording_encoding is None
+                    else replace(session_config.recording_encoding, codec="h264")
+                ),
             )
         recorder = DeviceSessionRecorder(
             admission.sessions_root,
@@ -2699,6 +2720,51 @@ class CaptureCoordinator:
                 continue
         raise ArtifactAccessError("not_found", "会话不存在")
 
+    def delete_sessions(self, command: CaptureCommand) -> CaptureCommandResult:
+        from rp_ylx.recording.deletion import delete_recordings, valid_delete_request
+
+        if not valid_delete_request(command.body):
+            raise ProviderError("invalid_request", "删除请求无效", status=HTTPStatus.BAD_REQUEST)
+
+        def execute() -> CaptureCommandResult:
+            if self._active is not None or self._stop_inflight is not None:
+                raise ProviderError(
+                    "capture_busy", "录制进行中，不能删除", status=HTTPStatus.CONFLICT
+                )
+            if self._released or self._pending_safe_swap is not None:
+                raise ProviderError(
+                    "volume_releasing", "录制卷已释放或正在释放", status=HTTPStatus.LOCKED
+                )
+            if self._open_representations:
+                raise ProviderError(
+                    "download_busy", "下载进行中，不能删除", status=HTTPStatus.CONFLICT
+                )
+            try:
+                self._check_generation(force=True)
+            except DeviceRecordingError as error:
+                raise ProviderError(
+                    error.code, error.message, status=HTTPStatus.CONFLICT
+                ) from error
+            admission = self._require_admission()
+            expected = {
+                item["session_id"]: item["manifest_sha256"] for item in command.body["sessions"]
+            }
+            with self._catalog_lock:
+                try:
+                    result = delete_recordings(admission.catalog_roots, expected)
+                finally:
+                    for session_id in expected:
+                        self._session_summaries.pop(session_id, None)
+                        self._session_snapshots.pop(session_id, None)
+                        self._verified.pop(session_id, None)
+                        self._session_diagnostics.pop(session_id, None)
+                        self._pending_session_verification.discard(session_id)
+                    self._storage_checked_at = 0.0
+            return CaptureCommandResult(HTTPStatus.OK, result)
+
+        with self._lock:
+            return self._idempotent("delete", command, execute)
+
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
         with self._lock:
             outcome = self._retained.get(session_id)
@@ -2866,6 +2932,7 @@ class CaptureCoordinator:
             ) from error
 
     def close(self) -> None:
+        self._closing = True
         if self._sources is not None:
             close_sources = getattr(self._sources, "close", None)
             if callable(close_sources):

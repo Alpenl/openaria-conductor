@@ -1,0 +1,62 @@
+{
+  "date": "2026-09-08",
+  "baseline_commit": "6ce782d74d7653368b31d20c50c76776b1d577d4",
+  "candidate": {
+    "state": "working-tree",
+    "source_diff_command": "git diff --binary -- native src tests",
+    "source_diff_sha256": "0d399d10bebcc67bf55b67df30a9d10fa22a7a998bac56c9df86924e889e27c1",
+    "changed_implementation_and_test_files": 7,
+    "insertions": 403,
+    "deletions": 994,
+    "net_lines_removed": 591
+  },
+  "environment": {
+    "python": "3.13.13",
+    "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+    "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)"
+  },
+  "tests": {
+    "baseline": {
+      "python_passed": 711,
+      "python_seconds": 175.038,
+      "rust_passed": 69,
+      "ruff": "passed"
+    },
+    "candidate": {
+      "python_passed": 711,
+      "python_seconds": 168.172,
+      "rust_passed": 70,
+      "ruff": "passed",
+      "clippy": "passed",
+      "diff_check": "passed"
+    },
+    "capture_source_regressions_passed": 19,
+    "coordinator_and_download_regressions_passed": 102,
+    "hardware_acceptance_run": false
+  },
+  "fanout": {
+    "comparison_file": "fanout-comparison.json",
+    "traces_per_variant": 400000,
+    "transitions_per_variant": 2000000,
+    "equal": true,
+    "sha256": "08c0e50020435a344d0a9c24cf064fc69472aea4913d6caedc81f9edce05c13a"
+  },
+  "packages": {
+    "baseline": {
+      "filename": "rp_ylx-0.1.0-cp311-abi3-linux_x86_64.whl",
+      "wheel_bytes": 1133658,
+      "wheel_sha256": "442294f5bc489621c111535e4dbfead1be2657934b778dc510c4fff34994922c",
+      "native_bytes": 1836440,
+      "native_compressed_bytes": 717652,
+      "native_sha256": "15b1dcd1f9eed84c7266e7cd5af5005bbf5e6fbbffa7f3e679120c160f0f18f2"
+    },
+    "candidate": {
+      "filename": "rp_ylx-0.1.0-cp311-abi3-linux_x86_64.whl",
+      "wheel_bytes": 1122756,
+      "wheel_sha256": "37817a99b09a6404c049b5fa345548396ca6d9302b6add6c62de8e65d55a2d65",
+      "native_bytes": 1815056,
+      "native_compressed_bytes": 707379,
+      "native_sha256": "504a636a45ba170269ff9f6cce04261ac2f8d585905bdac84317b79987faa31f"
+    }
+  }
+}

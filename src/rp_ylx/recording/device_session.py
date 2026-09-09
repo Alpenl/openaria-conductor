@@ -34,6 +34,7 @@ from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
+from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.stereo_encoder import (
     ClosedSegment,
     StereoEncoderError,
@@ -95,9 +96,10 @@ class DeviceSessionConfig:
     max_dropped_frames_per_window: int = 0
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
+    recording_encoding: RecordingEncoding | None = None
     segment_seconds: float = 30.0
     audio_enabled: bool = False
-    audio_device: str = "hw:0,0"
+    audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
     audio_channels: int = 2
     audio_sample_format: str = "S16_LE"
@@ -145,6 +147,12 @@ class DeviceSessionConfig:
             or self.audio_sample_format != "S16_LE"
         ):
             raise ValueError("Device Session 配置无效")
+        if self.recording_encoding is not None:
+            if not isinstance(self.recording_encoding, RecordingEncoding):
+                raise ValueError("recording_encoding must be RecordingEncoding")
+            segment_frames = round(self.segment_seconds * self.sensor_fps / self.frame_decimation)
+            if segment_frames % self.recording_encoding.gop_frames:
+                raise ValueError("segment frames must be a multiple of recording GOP")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,6 +1081,9 @@ class DeviceSessionRecorder:
             fps=round(self._config.sensor_fps / self._config.frame_decimation),
             bitrate_kbps=self._config.video_bitrate_kbps,
             segment_frames=self._segment_frames,
+            encoder_arguments=()
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.arguments(),
         )
 
     def _begin_native_transaction(self) -> NativeSessionTransaction:
@@ -1092,6 +1103,9 @@ class DeviceSessionRecorder:
             audio_sample_rate_hz=self._config.audio_sample_rate_hz,
             audio_channels=self._config.audio_channels,
             audio_segment_seconds=self._config.segment_seconds,
+            encoder_arguments=()
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.arguments(),
         )
         return native_session_store().begin_recording(plan)
 
@@ -1522,12 +1536,17 @@ class DeviceSessionRecorder:
                     "artifacts": record["artifacts"],
                 }
             )
-        return {
+        video: dict[str, object] = {
             "layout": "split-eyes",
-            "codec": "h264",
+            "codec": "h264"
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.codec,
             "container": "mp4",
             "segments": segments,
         }
+        if self._config.recording_encoding is not None:
+            video["encoding"] = self._config.recording_encoding.manifest()
+        return video
 
     def _finish_audio(self) -> None:
         recorder = self._audio_recorder
@@ -1649,6 +1668,17 @@ class DeviceSessionRecorder:
             raise DeviceRecordingError("audio_invalid", "音频时间线结果无效")
         start_time_seconds = float(sync["session_start_offset_seconds"])
         end_time_seconds = float(sync["session_stop_offset_seconds"])
+        capture_clock = None
+        clock_json = self._audio_result.get("capture_clock_json")
+        if clock_json is not None:
+            capture_clock = json.loads(clock_json)
+            capture_clock["session_start_monotonic_ns"] = self._started_monotonic_ns
+            start_time_seconds = (
+                capture_clock["sample_start_monotonic_ns"] - self._started_monotonic_ns
+            ) / 1e9
+            end_time_seconds = (
+                capture_clock["sample_end_monotonic_ns"] - self._started_monotonic_ns
+            ) / 1e9
         if start_time_seconds < 0 or end_time_seconds <= start_time_seconds:
             raise DeviceRecordingError("audio_invalid", "音频时间线 offset 无效")
         return {
@@ -1670,6 +1700,7 @@ class DeviceSessionRecorder:
                 "video_time_reference": "session_time_seconds",
             },
             "segments": list(self._audio_segment_records),
+            **({"capture_clock": capture_clock} if capture_clock is not None else {}),
         }
 
     def _boundary(self, ordinal: int, duration: float) -> tuple[int, float]:
@@ -1709,7 +1740,9 @@ class DeviceSessionRecorder:
         nominal_fps = self._config.sensor_fps / self._config.frame_decimation
         effective_fps = 0.0 if duration == 0 else self._frames_written / duration
         manifest: dict[str, object] = {
-            "schema": "ylx.device-session.v2",
+            "schema": "ylx.device-session.v2"
+            if self._config.recording_encoding is None
+            else "ylx.device-session.v3",
             "manifest_id": uuid7(),
             "sealed": True,
             "sealed_at": self._timestamp(sealed_at),
@@ -1925,6 +1958,10 @@ class DeviceSessionRecorder:
                 self._harvest_segments()
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
+                # Native finish joins audio capture; its final samples can arrive
+                # after the stop request timestamp passed to the video planner.
+                ended_at = self._now()
+                duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
             verified_at = self._now()
@@ -2132,9 +2169,26 @@ def _read_bounded_fd(descriptor: int, maximum_bytes: int, *, code: str) -> bytes
     return bytes(payload)
 
 
-def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: str) -> None:
+def _verify_artifact_fd(
+    descriptor: int,
+    expected_bytes: int,
+    expected_sha256: str,
+    interrupt_check: Callable[[], None] | None = None,
+) -> None:
     native = _session_store_or_none()
-    if native is not None and hasattr(native, "verify_fd"):
+    if (
+        interrupt_check is not None
+        and native is not None
+        and hasattr(native, "verify_fd_interruptible")
+    ):
+        try:
+            native.verify_fd_interruptible(
+                descriptor, expected_bytes, expected_sha256, interrupt_check
+            )
+            return
+        except BaseException as error:
+            raise _recording_error(error, "native_session_io_failed") from error
+    if interrupt_check is None and native is not None and hasattr(native, "verify_fd"):
         try:
             native.verify_fd(descriptor, expected_bytes, expected_sha256)
             return
@@ -2146,6 +2200,8 @@ def _verify_artifact_fd(descriptor: int, expected_bytes: int, expected_sha256: s
     digest = hashlib.sha256()
     remaining = expected_bytes
     while remaining:
+        if interrupt_check is not None:
+            interrupt_check()
         block = os.read(descriptor, min(1024 * 1024, remaining))
         if not block:
             raise DeviceRecordingError("artifact_invalid", "artifact 发生短读")
@@ -2226,6 +2282,7 @@ def validate_device_session_directory(
     path: str | Path,
     *,
     expected_session_id: str | None = None,
+    interrupt_check: Callable[[], None] | None = None,
 ) -> Mapping[str, object]:
     """独立校验一个已密封 Device Session 会话的 manifest 与所有 artifact 字节。"""
 
@@ -2261,6 +2318,8 @@ def validate_device_session_directory(
                 code="manifest_invalid",
             )
             for artifact_descriptor in descriptors:
+                if interrupt_check is not None:
+                    interrupt_check()
                 relative, expected_bytes = _artifact_path_and_bytes(
                     artifact_descriptor,
                     code="artifact_invalid",
@@ -2278,6 +2337,7 @@ def validate_device_session_directory(
                         artifact_fd,
                         expected_bytes,
                         expected_sha256,
+                        interrupt_check,
                     )
                 finally:
                     os.close(artifact_fd)

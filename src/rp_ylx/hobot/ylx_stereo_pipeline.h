@@ -27,8 +27,11 @@ typedef struct {
     int height;         /* frame height, e.g. 1080 */
     int fps;            /* encoded frame rate after decimation, e.g. 30 */
     int bitrate_kbps;   /* per eye */
+    int hevc;          /* 0 = H.264, 1 = H.265 */
+    int rate_control;  /* 0 = CBR, 1 = VBR, 2 = fixed QP, 3 = AVBR */
     int intra_period;   /* IDR interval in frames; 0 selects fps */
     int min_qp;
+    int max_qp;
     int intra_qp;
     int initial_qp;
     int vbv_ms;

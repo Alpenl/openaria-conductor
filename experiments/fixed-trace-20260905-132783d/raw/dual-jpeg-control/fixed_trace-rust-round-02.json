@@ -1,0 +1,78 @@
+{
+  "copies": [
+    {
+      "bytes_total": 1857555108,
+      "count": 9159,
+      "name": "left_output"
+    },
+    {
+      "bytes_total": 1764261534,
+      "count": 9159,
+      "name": "right_output"
+    }
+  ],
+  "environment": {
+    "evidence_kind": "fixture",
+    "kernel": "6.8.0-94-generic",
+    "machine": "x86_64",
+    "python": "3.11.14",
+    "target": {
+      "board": "not_applicable",
+      "camera": "fixture",
+      "supported": false
+    }
+  },
+  "format": "ylx.performance-report.v0",
+  "identity": {
+    "commit": "132783d2885c7468d42186c6131cbe53f9198bb7",
+    "software_version": "0.1.0",
+    "wheel_sha256": "0b57872d2cf8fd69e8bbece33367e85094aa14219c3012dedd58bb478f2b7ffe"
+  },
+  "loss": {
+    "application_drop": 0,
+    "source_gap": 0,
+    "unknown_gap": 0
+  },
+  "native": {
+    "abi": 4,
+    "adapter": "rust",
+    "module_available": true,
+    "module_version": "0.1.0"
+  },
+  "observed_at": "2026-09-04T22:48:01.378456Z",
+  "queue": {
+    "capacity": 1,
+    "peak_depth": 0,
+    "rejected": 0
+  },
+  "resources": {
+    "bytes_written": 0,
+    "cpu_time_ns": 1500479295,
+    "rss_peak_bytes": 40701952
+  },
+  "result": {
+    "effective_fps": 6103.750312263241
+  },
+  "stages": [
+    {
+      "name": "jpeg_split",
+      "p50_ns": 131072,
+      "p95_ns": 131072,
+      "samples": 9159,
+      "total_ns": 1490648907
+    }
+  ],
+  "workload": {
+    "duration_ns": 1500552862,
+    "frames_input": 9159,
+    "frames_output": 9159,
+    "kind": "fixed_trace",
+    "mode": {
+      "encoding": "mjpg",
+      "fps": 60,
+      "height": 1080,
+      "width": 3840
+    },
+    "round": 2
+  }
+}

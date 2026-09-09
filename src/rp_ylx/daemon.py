@@ -41,6 +41,7 @@ from rp_ylx.recording import (
     DeviceSessionConfig,
     NativeContinuousCaptureSources,
 )
+from rp_ylx.recording.encoding import RecordingEncoding
 
 PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
 LAB_OPERATIONS = frozenset(
@@ -66,6 +67,7 @@ LAB_OPERATIONS = frozenset(
         "getSessionArtifact",
         "startCapture",
         "stopCapture",
+        "deleteSessions",
     }
 )
 CUSTOMER_OPERATIONS = LAB_OPERATIONS
@@ -103,9 +105,10 @@ class ProductionConfig:
     frame_decimation: int = 2
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
+    recording_encoding: RecordingEncoding | None = None
     segment_seconds: float = 30.0
     audio_enabled: bool = True
-    audio_device: str = "hw:0,0"
+    audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
     audio_channels: int = 2
     audio_sample_format: str = "S16_LE"
@@ -206,11 +209,11 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         "device",
         "security",
     }
-    optional = {"audio"}
+    optional = {"audio", "recording"}
     if not isinstance(value, dict):
         raise ProductionConfigError("生产配置顶层字段无效")
     top_level = set(value)
-    if top_level != required and top_level != required | optional:
+    if not required <= top_level or top_level - required - optional:
         raise ProductionConfigError("生产配置顶层字段无效")
     listen = value["listen"]
     camera = value["camera"]
@@ -218,6 +221,10 @@ def load_production_config(path: str | Path) -> ProductionConfig:
     device = value["device"]
     security = value["security"]
     audio = value.get("audio")
+    try:
+        encoding = RecordingEncoding.from_mapping(value.get("recording", {"preset": "high"}))
+    except (TypeError, ValueError) as error:
+        raise ProductionConfigError(str(error)) from error
     security_profile = security.get("profile") if isinstance(security, dict) else None
     security_valid = (
         isinstance(security, dict)
@@ -289,8 +296,10 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             width=_integer(camera["width"], "camera.width"),
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
+            recording_encoding=encoding,
+            video_bitrate_kbps=encoding.bitrate_kbps,
             audio_enabled=True if audio is None else audio["enabled"],
-            audio_device="hw:0,0" if audio is None else str(audio["device"]),
+            audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),
             audio_sample_rate_hz=(
                 48_000
                 if audio is None
@@ -458,9 +467,9 @@ class CaptureEventPump:
         self._interval = interval
         self._progress_interval = progress_interval
         self._stop = threading.Event()
-        initial = coordinator.capture_snapshot_event()
-        self._last_source = (initial["authority_epoch"], initial["source_revision"])
-        self._last_progress_key = self._progress_key(initial)
+        epoch, revision, state = coordinator.capture_recording_progress()
+        self._last_source = (epoch, revision)
+        self._last_progress_key = self._progress_key(self._last_source, state)
         self._last_progress_at = 0.0
         self._thread = threading.Thread(
             target=self._run,
@@ -474,50 +483,55 @@ class CaptureEventPump:
             self._progress_interval if self._last_progress_key is not None else self._interval
         ):
             now = time.monotonic()
-            event = self._coordinator.capture_snapshot_event()
-            source = (event["authority_epoch"], event["source_revision"])
-            if source == self._last_source:
-                progress_event = self._progress_event(event)
-                progress_key = self._progress_key(event)
-                if (
-                    progress_event is not None
-                    and progress_key != self._last_progress_key
-                    and (
-                        self._last_progress_at == 0.0
-                        or now - self._last_progress_at >= self._progress_interval
-                    )
-                ):
-                    self._event_buffer.publish(progress_event)
-                    self._last_progress_key = progress_key
+            epoch, revision, state = self._coordinator.capture_recording_progress()
+            source = (epoch, revision)
+            # Idle sampling also retries preview startup when a camera reconnects.
+            if source != self._last_source or state is None:
+                event = self._coordinator.capture_snapshot_event()
+                source = (event["authority_epoch"], event["source_revision"])
+                state = self._recording_state(event)
+                if source != self._last_source:
+                    self._event_buffer.publish(event)
+                    self._last_source = source
+                    self._last_progress_key = self._progress_key(source, state)
                     self._last_progress_at = now
-                continue
-            self._event_buffer.publish(event)
-            self._last_source = source
-            self._last_progress_key = self._progress_key(event)
-            self._last_progress_at = now
+                    continue
+            progress_event = self._progress_event(source, state)
+            progress_key = self._progress_key(source, state)
+            if (
+                progress_event is not None
+                and progress_key != self._last_progress_key
+                and (
+                    self._last_progress_at == 0.0
+                    or now - self._last_progress_at >= self._progress_interval
+                )
+            ):
+                self._event_buffer.publish(progress_event)
+                self._last_progress_key = progress_key
+                self._last_progress_at = now
 
     @staticmethod
-    def _active_recording(event: Mapping[str, object]) -> Mapping[str, object] | None:
+    def _recording_state(event: Mapping[str, object]) -> Mapping[str, object] | None:
         data = event.get("data")
         if not isinstance(data, Mapping):
             return None
         active = data.get("active_recording")
-        return active if isinstance(active, Mapping) else None
-
-    @classmethod
-    def _progress_key(cls, event: Mapping[str, object]) -> tuple[object, ...] | None:
-        active = cls._active_recording(event)
-        if active is None:
+        if not isinstance(active, Mapping):
             return None
         state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+        return state if isinstance(state, Mapping) else None
+
+    @staticmethod
+    def _progress_key(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> tuple[object, ...] | None:
+        if state is None:
             return None
         progress = state.get("progress")
         if not isinstance(progress, Mapping):
             return None
         return (
-            event.get("authority_epoch"),
-            event.get("source_revision"),
+            *source,
             state.get("session_id"),
             state.get("state"),
             progress.get("elapsed_seconds"),
@@ -525,13 +539,11 @@ class CaptureEventPump:
             progress.get("bytes_written"),
         )
 
-    @classmethod
-    def _progress_event(cls, event: Mapping[str, object]) -> dict[str, object] | None:
-        active = cls._active_recording(event)
-        if active is None:
-            return None
-        state = active.get("recording_state")
-        if not isinstance(state, Mapping):
+    @staticmethod
+    def _progress_event(
+        source: tuple[str, int], state: Mapping[str, object] | None
+    ) -> dict[str, object] | None:
+        if state is None:
             return None
         phase = state.get("state")
         if phase not in {"recording", "finalizing", "verifying"}:
@@ -549,8 +561,8 @@ class CaptureEventPump:
         if type(frames) is not int or frames < 0:
             return None
         return {
-            "authority_epoch": event["authority_epoch"],
-            "source_revision": event["source_revision"],
+            "authority_epoch": source[0],
+            "source_revision": source[1],
             "type": "progress",
             "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "session_id": session_id,
@@ -691,6 +703,7 @@ def build_production_service(
             frame_decimation=config.frame_decimation,
             video_layout=config.video_layout,
             video_bitrate_kbps=config.video_bitrate_kbps,
+            recording_encoding=config.recording_encoding,
             segment_seconds=config.segment_seconds,
             audio_enabled=config.audio_enabled,
             audio_device=config.audio_device,

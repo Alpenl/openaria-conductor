@@ -13,14 +13,14 @@ from .adapter import CaptureValidationError, LoadedCapture, load_capture
 
 @dataclass(frozen=True, slots=True)
 class ClockDiagnostics:
-    expected_rate_hz: float
+    expected_rate_hz: float | None
     measured_rate_hz: float
-    rate_error_ppm: float
+    rate_error_ppm: float | None
     residual_p50_ms: float
     residual_p95_ms: float
     residual_max_ms: float
 
-    def as_dict(self) -> dict[str, float]:
+    def as_dict(self) -> dict[str, float | None]:
         return {
             "expected_rate_hz": self.expected_rate_hz,
             "measured_rate_hz": self.measured_rate_hz,
@@ -39,6 +39,7 @@ class CaptureTiming:
     frame_clock: ClockDiagnostics
     imu_clock: ClockDiagnostics
     imu_read_p95_ms: float
+    imu_time_basis: str = "device_counter_fit"
 
     @property
     def manifest(self) -> dict[str, Any]:
@@ -61,6 +62,9 @@ class CaptureTiming:
             "frame_clock": self.frame_clock.as_dict(),
             "imu_clock": self.imu_clock.as_dict(),
             "imu_read_p95_ms": self.imu_read_p95_ms,
+            "imu_time_basis": self.imu_time_basis,
+            "imu_sample_times_estimated": True,
+            "imu_missed_packets_estimate_available": False,
         }
 
 
@@ -110,7 +114,7 @@ def _unwrap_forward(values: list[int], bits: int, label: str) -> list[int]:
 def _fit_clock(
     counters: list[int],
     host_ns: list[int],
-    expected_rate_hz: float,
+    expected_rate_hz: float | None,
     label: str,
     max_rate_error_ppm: float,
     max_residual_p95_ms: float,
@@ -138,8 +142,10 @@ def _fit_clock(
         raise CaptureValidationError(f"{label} clock period is non-positive")
 
     measured_rate_hz = 1e9 / period_ns
-    rate_error_ppm = (measured_rate_hz / expected_rate_hz - 1) * 1e6
-    if abs(rate_error_ppm) > max_rate_error_ppm:
+    rate_error_ppm = (
+        (measured_rate_hz / expected_rate_hz - 1) * 1e6 if expected_rate_hz is not None else None
+    )
+    if rate_error_ppm is not None and abs(rate_error_ppm) > max_rate_error_ppm:
         raise CaptureValidationError(
             f"{label} measured rate {measured_rate_hz:.6f} Hz differs from "
             f"expected {expected_rate_hz:.6f} Hz by {rate_error_ppm:.1f} ppm"
@@ -264,7 +270,7 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
                 for sample in current
             ):
                 raise CaptureValidationError("records within an IMU packet disagree")
-            if capture.source_schema == "ylx.device-session.v2" and any(
+            if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"} and any(
                 sample["packet_sequence"] != first["packet_sequence"]
                 or sample["device_ticks"] != first["device_ticks"]
                 for sample in current
@@ -281,17 +287,15 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
 
 def _packet_timestamps(capture: LoadedCapture, packets: list[list[dict[str, Any]]]) -> list[int]:
     first_records = [packet[0] for packet in packets]
-    if capture.source_schema == "ylx.device-session.v2":
+    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         _unwrap_contiguous(
             [int(record["packet_sequence"]) for record in first_records],
             32,
             "IMU packet",
         )
         timestamps = [int(record["device_ticks"]) for record in first_records]
-        if any(
-            later <= earlier for earlier, later in zip(timestamps, timestamps[1:], strict=False)
-        ):
-            raise CaptureValidationError("Device Session IMU device_ticks are not strictly forward")
+        if any(later < earlier for earlier, later in zip(timestamps, timestamps[1:], strict=False)):
+            raise CaptureValidationError("Device Session IMU device_ticks regressed")
         if any(
             (int(record["device_ticks"]) & ((1 << 24) - 1)) != int(record["device_timestamp_raw"])
             for record in first_records
@@ -310,16 +314,16 @@ def _packet_timestamps(capture: LoadedCapture, packets: list[list[dict[str, Any]
 def _analyze_capture(
     capture_dir: str | Path,
     *,
-    imu_rate_hz: float,
+    imu_rate_hz: float | None,
     max_rate_error_ppm: float,
     max_residual_p95_ms: float,
     max_imu_residual_p95_ms: float,
     max_imu_read_p95_ms: float,
 ) -> CaptureTiming:
-    if imu_rate_hz <= 0:
+    if imu_rate_hz is not None and (not math.isfinite(imu_rate_hz) or imu_rate_hz <= 0):
         raise CaptureValidationError("IMU rate must be positive")
     capture = load_capture(capture_dir)
-    if capture.source_schema == "ylx.device-session.v2":
+    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         # Device Session source sequences advance by the declared frame
         # decimation. The adapter validates that exact relationship; the
         # contiguous recording domain is the clock-fit counter.
@@ -340,14 +344,33 @@ def _analyze_capture(
 
     packets = _imu_packets(capture)
     packet_records = [packet[0] for packet in packets]
-    packet_times, imu_clock = _fit_timestamp_clock(
-        _packet_timestamps(capture, packets),
-        [int(record["host_monotonic_ns"]) for record in packet_records],
-        imu_rate_hz / capture.imu_samples_per_packet,
-        "IMU packet",
-        max_rate_error_ppm,
-        max_imu_residual_p95_ms,
-    )
+    device_timestamps = _packet_timestamps(capture, packets)
+    packet_hosts = [int(record["host_monotonic_ns"]) for record in packet_records]
+    device_session = capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}
+    if device_session:
+        # The camera counter identifies VIDEO frames. Multiple changing IMU
+        # packets can share it; neither a sample clock nor loss can be inferred
+        # from it. Fit host packet throughput for diagnostics only.
+        _, imu_clock = _fit_clock(
+            list(range(len(packets))),
+            packet_hosts,
+            imu_rate_hz / capture.imu_samples_per_packet if imu_rate_hz is not None else None,
+            "IMU packet",
+            max_rate_error_ppm,
+            max_imu_residual_p95_ms,
+        )
+        packet_times = [float(host) for host in packet_hosts]
+        sample_rate = imu_rate_hz or imu_clock.measured_rate_hz * capture.imu_samples_per_packet
+    else:
+        sample_rate = imu_rate_hz if imu_rate_hz is not None else 120.0
+        packet_times, imu_clock = _fit_timestamp_clock(
+            device_timestamps,
+            packet_hosts,
+            sample_rate / capture.imu_samples_per_packet,
+            "IMU packet",
+            max_rate_error_ppm,
+            max_imu_residual_p95_ms,
+        )
     read_duration_ms = [
         (int(record["host_read_end_ns"]) - int(record["host_read_start_ns"])) / 1e6
         for record in packet_records
@@ -359,15 +382,22 @@ def _analyze_capture(
             f"{max_imu_read_p95_ms:.3f} ms"
         )
 
-    sample_period_ns = 1e9 / imu_rate_hz
+    sample_period_ns = 1e9 / sample_rate
     imu_times: list[float] = []
     previous_time = -math.inf
-    for packet, packet_time in zip(packets, packet_times, strict=True):
+    for packet_index, (packet, packet_time) in enumerate(zip(packets, packet_times, strict=True)):
+        period = sample_period_ns
+        if device_session and packet_index:
+            # Keep the two estimated slots after the preceding observation,
+            # even for a short read interval; do not stretch them across gaps.
+            period = min(
+                period,
+                (packet_time - packet_times[packet_index - 1]) / capture.imu_samples_per_packet,
+            )
         for record in packet:
             sample_time = (
                 packet_time
-                - (capture.imu_samples_per_packet - 1 - int(record["sample_index"]))
-                * sample_period_ns
+                - (capture.imu_samples_per_packet - 1 - int(record["sample_index"])) * period
             )
             if sample_time <= previous_time:
                 raise CaptureValidationError("reconstructed IMU timestamps are not increasing")
@@ -386,13 +416,14 @@ def _analyze_capture(
         frame_clock=frame_clock,
         imu_clock=imu_clock,
         imu_read_p95_ms=read_p95_ms,
+        imu_time_basis="host_receive_interpolation" if device_session else "device_counter_fit",
     )
 
 
 def analyze_capture(
     capture_dir: str | Path,
     *,
-    imu_rate_hz: float = 120.0,
+    imu_rate_hz: float | None = None,
     max_rate_error_ppm: float = 20_000.0,
     max_residual_p95_ms: float = 5.0,
     max_imu_residual_p95_ms: float = 10.0,

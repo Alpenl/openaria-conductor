@@ -210,6 +210,7 @@ impl Runtime {
         on_failure: Py<PyAny>,
         imu: Option<Arc<Collector>>,
         imu_timeout: Duration,
+        audio: Option<Arc<crate::audio::Recorder>>,
     ) -> Result<RuntimeSnapshot, RuntimeError> {
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
@@ -282,6 +283,7 @@ impl Runtime {
                         collector,
                         sink_for_worker,
                         on_failure,
+                        audio,
                         shared,
                         stop,
                         imu_timeout,
@@ -732,10 +734,13 @@ fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+// These owners are moved together into the single IMU/audio monitoring thread.
+#[allow(clippy::too_many_arguments)]
 fn run_imu_loop(
     collector: Arc<Collector>,
     sink: Arc<Mutex<recording::RecordingSink>>,
     on_failure: Arc<Py<PyAny>>,
+    audio: Option<Arc<crate::audio::Recorder>>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     timeout: Duration,
@@ -744,6 +749,16 @@ fn run_imu_loop(
     loop {
         if stop.load(Ordering::Acquire) || !recording_present(&shared) {
             break;
+        }
+        if let Some(audio) = &audio {
+            if let Err(error) = audio.check_health() {
+                report_recording_failure(
+                    &shared,
+                    RuntimeError::new(error.code, error.message),
+                    Some(Arc::clone(&on_failure)),
+                );
+                break;
+            }
         }
         let read_started = start_stage(metrics.as_ref());
         let read_result = collector.read(timeout);

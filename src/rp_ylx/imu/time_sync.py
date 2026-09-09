@@ -18,7 +18,7 @@ class TimestampUnwrapper:
         self._raw: int | None = None
         self._unwrapped: int | None = None
 
-    def update(self, raw: int) -> int:
+    def update(self, raw: int, *, allow_repeated: bool = False) -> int:
         if raw < 0 or raw >= self._modulus:
             raise ImuError("invalid_timestamp", "设备时间超出 24-bit 范围")
         if self._raw is None:
@@ -27,6 +27,9 @@ class TimestampUnwrapper:
             return raw
         delta = (raw - self._raw) % self._modulus
         if delta == 0:
+            if allow_repeated:
+                assert self._unwrapped is not None
+                return self._unwrapped
             raise ImuError("timestamp_stalled", "设备时间没有更新", retryable=True)
         if delta > self._modulus // 2:
             raise ImuError("timestamp_regression", "设备时间发生回退", retryable=True)
@@ -73,6 +76,7 @@ class TimeSynchronizer:
         self._good_residual_ns = good_residual_ns
         self._good_drift_ppm = good_drift_ppm
         self._points: deque[_Point] = deque(maxlen=window_points)
+        self._last_host_ns: int | None = None
 
     def add(
         self, device_ticks: int, host_read_start_ns: int, host_read_end_ns: int
@@ -81,9 +85,14 @@ class TimeSynchronizer:
             raise ImuError("invalid_time_evidence", "设备时间或主机读取区间无效")
         host_ns = (host_read_start_ns + host_read_end_ns) // 2
         if self._points and (
-            device_ticks <= self._points[-1].device_ticks or host_ns <= self._points[-1].host_ns
+            device_ticks < self._points[-1].device_ticks
+            or (self._last_host_ns is not None and host_ns <= self._last_host_ns)
         ):
             raise ImuError("non_monotonic_time", "同步证据必须严格前进", retryable=True)
+        self._last_host_ns = host_ns
+        if self._points and device_ticks == self._points[-1].device_ticks:
+            # A new IMU response within one video frame is not another clock anchor.
+            return SyncEstimate(None, None, "insufficient", None, None, None, len(self._points))
         self._points.append(
             _Point(device_ticks, host_ns, (host_read_end_ns - host_read_start_ns) // 2)
         )
