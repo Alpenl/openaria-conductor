@@ -612,22 +612,15 @@ impl Pcm {
         let result = unsafe {
             (self.alsa.snd_pcm_readi)(self.handle, buffer.as_mut_ptr().cast::<c_void>(), frames)
         };
-        if result > 0 {
-            return Ok(ReadOutcome::Frames(u64::try_from(result).map_err(
-                |_| AudioError::new("audio_failed", "negative frame count"),
-            )?));
-        }
-        let code = c_int::try_from(result).unwrap_or(c_int::MIN);
-        if code == -libc::EAGAIN {
-            return Ok(ReadOutcome::Again);
-        }
-        if code == -libc::EPIPE || code == -libc::ESTRPIPE {
-            self.check("audio_failed", "snd_pcm_prepare", unsafe {
-                (self.alsa.snd_pcm_prepare)(self.handle)
-            })?;
-            return Ok(ReadOutcome::Recovered);
-        }
-        Err(self.alsa.error("audio_failed", "snd_pcm_readi", code))
+        classify_read_result(result).map_err(|code| {
+            let context = if code == -libc::EPIPE || code == -libc::ESTRPIPE {
+                // Restarting ALSA would concatenate samples across an unknown time gap.
+                "snd_pcm_readi lost audio timeline continuity"
+            } else {
+                "snd_pcm_readi"
+            };
+            self.alsa.error("audio_failed", context, code)
+        })
     }
 
     fn check(&self, code: &'static str, context: &str, result: c_int) -> Result<(), AudioError> {
@@ -677,10 +670,21 @@ impl Drop for HwParams {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReadOutcome {
     Frames(u64),
     Again,
-    Recovered,
+}
+
+fn classify_read_result(result: SndPcmSframes) -> Result<ReadOutcome, c_int> {
+    if result > 0 {
+        return Ok(ReadOutcome::Frames(result as u64));
+    }
+    let code = c_int::try_from(result).unwrap_or(c_int::MIN);
+    if code == -libc::EAGAIN {
+        return Ok(ReadOutcome::Again);
+    }
+    Err(code)
 }
 
 struct SegmentWriter {
@@ -909,7 +913,7 @@ fn start_and_capture(
                 })?;
                 writer.write_frames(&buffer[..bytes], frames, &mut sample_count)?;
             }
-            ReadOutcome::Again | ReadOutcome::Recovered => thread::sleep(READ_IDLE_SLEEP),
+            ReadOutcome::Again => thread::sleep(READ_IDLE_SLEEP),
         }
     }
     let stopped_monotonic_ns = monotonic_ns()?;
@@ -1004,6 +1008,21 @@ mod tests {
     use super::{SegmentWriter, write_wav_header};
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn capture_discontinuities_are_fatal_instead_of_silently_recovered() {
+        for code in [libc::EPIPE, libc::ESTRPIPE, libc::ENODEV] {
+            assert_eq!(super::classify_read_result((-code).into()), Err(-code));
+        }
+        assert_eq!(
+            super::classify_read_result((-libc::EAGAIN).into()),
+            Ok(super::ReadOutcome::Again)
+        );
+        assert_eq!(
+            super::classify_read_result(1024),
+            Ok(super::ReadOutcome::Frames(1024))
+        );
+    }
 
     #[test]
     fn wav_header_records_pcm_shape() {
