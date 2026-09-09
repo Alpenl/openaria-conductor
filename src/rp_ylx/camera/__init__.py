@@ -14,7 +14,6 @@ from rp_ylx.camera.v4l2 import (
     V4L2DiscoveryBackend,
     parse_v4l2_formats,
     split_sbs_mjpeg,
-    split_sbs_mjpeg_native,
     v4l2_stream_factory,
 )
 
@@ -30,6 +29,5 @@ __all__ = [
     "V4L2DiscoveryBackend",
     "parse_v4l2_formats",
     "split_sbs_mjpeg",
-    "split_sbs_mjpeg_native",
     "v4l2_stream_factory",
 ]
