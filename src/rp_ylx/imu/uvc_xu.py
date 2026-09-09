@@ -218,7 +218,7 @@ class UvcXuImuSource:
         self._sleep = sleep
         self._stale_poll_interval = stale_poll_interval
         self._close_file = close_file
-        self._last_device_timestamp: int | None = None
+        self._last_payload: bytes | None = None
         self._closed = False
         flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
         self._fd = open_file(os.fspath(device), flags)
@@ -281,9 +281,10 @@ class UvcXuImuSource:
                     "invalid_packet_length",
                     f"UVC GET_CUR returned {len(payload)} bytes instead of {PACKET_BYTES}",
                 )
-            device_timestamp = int.from_bytes(payload[:3], "big")
-            if device_timestamp != self._last_device_timestamp:
-                self._last_device_timestamp = device_timestamp
+            # The first three bytes identify a video frame, not an IMU update.
+            # Multiple different six-axis payloads can belong to the same frame.
+            if payload != self._last_payload:
+                self._last_payload = bytes(payload)
                 return ImuPacketRead(payload, host_read_start_ns, host_read_end_ns)
             if host_read_end_ns >= deadline_ns:
                 raise TimeoutError("UVC XU IMU packet did not advance before timeout")

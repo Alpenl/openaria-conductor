@@ -96,6 +96,8 @@ pub(crate) struct ImuObservation {
 pub(crate) fn observation_dict(py: Python<'_>, result: &ImuObservation) -> PyResult<Py<PyDict>> {
     let value = PyDict::new(py);
     value.set_item("dropped_samples", result.dropped_samples)?;
+    // No independent IMU sample counter is present in the camera's payload.
+    value.set_item("missed_packets_estimate_available", false)?;
     let samples = PyList::empty(py);
     for sample in &result.samples {
         let item = PyDict::new(py);
@@ -178,7 +180,7 @@ struct State {
     unit: u8,
     selector: u8,
     stale_poll_interval: Duration,
-    last_device_timestamp: Option<u32>,
+    last_payload: Option<[u8; PACKET_BYTES]>,
     latest_observation: Option<ImuObservation>,
     unwrapper: TimestampUnwrapper,
     synchronizer: TimeSynchronizer,
@@ -215,7 +217,7 @@ impl Collector {
             unit,
             selector,
             stale_poll_interval: stale_poll_interval.unwrap_or(DEFAULT_STALE_POLL),
-            last_device_timestamp: None,
+            last_payload: None,
             latest_observation: None,
             unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
             synchronizer: TimeSynchronizer::default(),
@@ -292,6 +294,10 @@ impl State {
 
     fn read(&mut self, timeout: Duration) -> Result<ImuObservation, ImuError> {
         let packet_read = self.read_fresh_packet(timeout)?;
+        self.observe_packet(packet_read)
+    }
+
+    fn observe_packet(&mut self, packet_read: PacketRead) -> Result<ImuObservation, ImuError> {
         let packet = decode_packet(&packet_read.payload);
         let device_ticks = self
             .unwrapper
@@ -347,11 +353,9 @@ impl State {
                     ),
                 ));
             }
-            let device_timestamp = device_timestamp(&payload);
-            if Some(device_timestamp) != self.last_device_timestamp {
-                self.last_device_timestamp = Some(device_timestamp);
-                let mut packet = [0_u8; PACKET_BYTES];
-                packet.copy_from_slice(&payload);
+            let mut packet = [0_u8; PACKET_BYTES];
+            packet.copy_from_slice(&payload);
+            if self.accept_payload(packet) {
                 return Ok(PacketRead {
                     payload: packet,
                     host_read_start_ns,
@@ -367,6 +371,15 @@ impl State {
             let remaining = Duration::from_nanos(deadline - host_read_end_ns);
             std::thread::sleep(self.stale_poll_interval.min(remaining));
         }
+    }
+
+    fn accept_payload(&mut self, payload: [u8; PACKET_BYTES]) -> bool {
+        // Frame numbers can repeat while both IMU slots continue updating.
+        if self.last_payload == Some(payload) {
+            return false;
+        }
+        self.last_payload = Some(payload);
+        true
     }
 
     fn query(
@@ -632,10 +645,7 @@ impl TimestampUnwrapper {
         };
         let delta = (raw + self.modulus - previous_raw) % self.modulus;
         if delta == 0 {
-            return Err(ImuError::retryable(
-                "timestamp_stalled",
-                "device time did not advance",
-            ));
+            return Ok(self.unwrapped.unwrap_or(raw));
         }
         if delta > self.modulus / 2 {
             return Err(ImuError::retryable(
@@ -652,6 +662,7 @@ impl TimestampUnwrapper {
 
 struct TimeSynchronizer {
     points: VecDeque<SyncPoint>,
+    last_host_ns: Option<u64>,
     minimum_points: usize,
     window_points: usize,
     good_residual_ns: u64,
@@ -661,6 +672,7 @@ impl Default for TimeSynchronizer {
     fn default() -> Self {
         Self {
             points: VecDeque::with_capacity(64),
+            last_host_ns: None,
             minimum_points: 3,
             window_points: 64,
             good_residual_ns: 1_000_000,
@@ -683,13 +695,26 @@ impl TimeSynchronizer {
         }
         let host_ns = midpoint_ns(host_read_start_ns, host_read_end_ns);
         if let Some(previous) = self.points.back() {
-            if device_ticks <= previous.device_ticks || host_ns <= previous.host_ns {
+            if device_ticks < previous.device_ticks
+                || self.last_host_ns.is_some_and(|last| host_ns <= last)
+            {
                 return Err(ImuError::retryable(
                     "non_monotonic_time",
                     "time evidence must move strictly forward",
                 ));
             }
+            self.last_host_ns = Some(host_ns);
+            if device_ticks == previous.device_ticks {
+                // This response has no independent device-time anchor. Do not
+                // reuse a frame fit as if it timed the new IMU samples.
+                return Ok(SyncEstimate {
+                    offset_ns: None,
+                    residual_ns: None,
+                    quality: "insufficient",
+                });
+            }
         }
+        self.last_host_ns = Some(host_ns);
         if self.points.len() == self.window_points {
             self.points.pop_front();
         }
@@ -808,10 +833,11 @@ pub(crate) fn available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEVICE_TIMESTAMP_MODULUS, PACKET_BYTES, TimeSynchronizer, TimestampUnwrapper,
-        UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, UVC_GET_CUR, UVC_GET_LEN, XU_GUID_BYTES,
-        decode_packet, find_uvc_xu_unit, validate_xu_query,
+        DEVICE_TIMESTAMP_MODULUS, PACKET_BYTES, PacketRead, State, TimeSynchronizer,
+        TimestampUnwrapper, UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, UVC_GET_CUR, UVC_GET_LEN,
+        XU_GUID_BYTES, decode_packet, find_uvc_xu_unit, validate_xu_query,
     };
+    use std::time::Duration;
 
     fn packet(timestamp: u32, seed: i16) -> [u8; PACKET_BYTES] {
         let mut payload = [0_u8; PACKET_BYTES];
@@ -832,6 +858,58 @@ mod tests {
         assert_eq!(decoded.samples[0].gyroscope.z, -1);
         assert_eq!(decoded.samples[1].accelerometer.x, 0);
         assert_eq!(decoded.samples[1].gyroscope.z, 5);
+    }
+
+    #[test]
+    fn same_frame_updates_survive_filter_clock_and_observation() {
+        let mut state = State {
+            fd: None,
+            unit: 3,
+            selector: 1,
+            stale_poll_interval: Duration::from_millis(1),
+            last_payload: None,
+            latest_observation: None,
+            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
+            synchronizer: TimeSynchronizer::default(),
+            packet_sequence: 0,
+            sample_sequence: 0,
+        };
+        let mut samples = Vec::new();
+        for (index, (frame, seed)) in [(0xFF_FFFF, -6), (0xFF_FFFF, -5), (0, -4), (3, -3)]
+            .into_iter()
+            .enumerate()
+        {
+            let payload = packet(frame, seed);
+            assert!(state.accept_payload(payload));
+            assert!(!state.accept_payload(payload));
+            let start = 1_000_000_000 + index as u64 * 5_000_000;
+            let observation = state
+                .observe_packet(PacketRead {
+                    payload,
+                    host_read_start_ns: start,
+                    host_read_end_ns: start + 4_800_000,
+                })
+                .unwrap();
+            assert_eq!(observation.dropped_samples, 0);
+            assert_eq!(observation.samples[0].packet_sequence, index as u64);
+            assert_eq!(observation.samples[0].accelerometer.x, seed);
+            assert_eq!(observation.samples[1].gyroscope.z, seed + 11);
+            if index == 1 {
+                assert_eq!(observation.samples[0].sync_quality, "insufficient");
+                assert_eq!(observation.samples[0].sync_offset_ns, None);
+            }
+            samples.extend(observation.samples);
+        }
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.sequence)
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(samples[4].device_ticks, 0x1_000000);
+        assert_eq!(samples[6].device_ticks, 0x1_000003);
+        assert_eq!(state.latest_observation.unwrap().samples[1].sequence, 7);
     }
 
     #[test]

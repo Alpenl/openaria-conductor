@@ -81,8 +81,22 @@ class TimestampTest(unittest.TestCase):
             regressed.update(9)
         self.assertEqual(backward.exception.code, "timestamp_regression")
 
+    def test_repeated_video_frame_is_allowed_explicitly_even_after_wrap(self) -> None:
+        unwrapper = TimestampUnwrapper(modulus=256)
+        self.assertEqual(unwrapper.update(255, allow_repeated=True), 255)
+        self.assertEqual(unwrapper.update(0, allow_repeated=True), 256)
+        self.assertEqual(unwrapper.update(0, allow_repeated=True), 256)
+
 
 class SynchronizerTest(unittest.TestCase):
+    def test_same_frame_queries_do_not_mask_host_clock_regression(self) -> None:
+        synchronizer = TimeSynchronizer()
+        synchronizer.add(10, 100, 110)
+        synchronizer.add(10, 200, 210)
+        with self.assertRaises(ImuError) as raised:
+            synchronizer.add(10, 150, 160)
+        self.assertEqual(raised.exception.code, "non_monotonic_time")
+
     def test_reports_insufficient_then_good_fit(self) -> None:
         synchronizer = TimeSynchronizer(expected_tick_hz=1_000_000)
         first = synchronizer.add(1_000, 10_999_900, 11_000_100)
@@ -108,6 +122,32 @@ class SynchronizerTest(unittest.TestCase):
 
 
 class CollectorTest(unittest.TestCase):
+    def test_same_frame_updates_and_frame_jumps_keep_samples_without_claiming_loss(self) -> None:
+        source = SyntheticImuSource(
+            [
+                ImuPacketRead(packet(frame, seed), start, start + 4_800_000)
+                for frame, seed, start in (
+                    (10, 1, 1_000_000_000),
+                    (10, 2, 1_005_000_000),
+                    (13, 3, 1_010_000_000),
+                )
+            ]
+        )
+        collector = ImuCollector(source)
+        observations = [collector.read() for _ in range(3)]
+        samples = [sample for observation in observations for sample in observation.samples]
+        self.assertEqual([sample.sequence for sample in samples], list(range(6)))
+        self.assertEqual([sample.device_ticks for sample in samples], [10, 10, 10, 10, 13, 13])
+        self.assertEqual([sample.accelerometer.x for sample in samples], [1, 7, 2, 8, 3, 9])
+        self.assertEqual(samples[2].sync_quality, "insufficient")
+        self.assertIsNone(samples[2].sync_offset_ns)
+        for observation in observations:
+            self.assertEqual(observation.dropped_samples, 0)
+            self.assertFalse(observation.missed_packets_estimate_available)
+        for sample in samples:
+            self.assertLessEqual(sample.host_read_start_ns, sample.host_monotonic_ns)
+            self.assertLessEqual(sample.host_monotonic_ns, sample.host_read_end_ns)
+
     def test_emits_two_raw_samples_with_shared_packet_evidence(self) -> None:
         source = SyntheticImuSource(
             [
@@ -153,13 +193,13 @@ class CollectorTest(unittest.TestCase):
         self.assertTrue(stalled_source.closed)
 
         duplicate_source = SyntheticImuSource(
-            [packet_read(1_000, 11_000_000), packet_read(1_000, 12_000_000)]
+            [packet_read(1_000, 11_000_000), packet_read(999, 12_000_000)]
         )
         duplicate = ImuCollector(duplicate_source)
         duplicate.read()
         with self.assertRaises(ImuError) as timestamp:
             duplicate.read()
-        self.assertEqual(timestamp.exception.code, "timestamp_stalled")
+        self.assertEqual(timestamp.exception.code, "timestamp_regression")
         self.assertTrue(duplicate_source.closed)
 
 
@@ -380,8 +420,8 @@ class UvcXuImuSourceTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "unsupported_packet_length")
         self.assertEqual(closed, [7])
 
-    def test_skips_duplicate_timestamp_and_preserves_host_interval(self) -> None:
-        payloads = iter([packet(10), packet(10), packet(11)])
+    def test_skips_only_full_duplicate_and_preserves_same_frame_new_payload(self) -> None:
+        payloads = iter([packet(10), packet(10), packet(10, seed=1)])
         clock_value = 90
         sleeps: list[float] = []
 
@@ -408,14 +448,15 @@ class UvcXuImuSourceTest(unittest.TestCase):
         first = source.read_packet(1.0)
         second = source.read_packet(1.0)
         self.assertEqual(int.from_bytes(first.payload[:3], "big"), 10)
-        self.assertEqual(int.from_bytes(second.payload[:3], "big"), 11)
+        self.assertEqual(int.from_bytes(second.payload[:3], "big"), 10)
+        self.assertEqual(second.payload, packet(10, seed=1))
         self.assertEqual(
             (second.host_read_start_ns, second.host_read_end_ns),
             (160, 170),
         )
         self.assertEqual(len(sleeps), 1)
 
-    def test_times_out_when_timestamp_remains_stale(self) -> None:
+    def test_times_out_when_full_packet_remains_stale(self) -> None:
         clock_value = 0
 
         def clock() -> int:
