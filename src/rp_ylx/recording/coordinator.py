@@ -296,7 +296,7 @@ class CoordinatorConfig:
 
 @dataclass(frozen=True, slots=True)
 class _LatestImuReceipt:
-    session_id: str
+    session_id: str | None
     sample: ImuSample
     sample_key: tuple[int, int, int, int, int]
     received_at_monotonic: float
@@ -1336,7 +1336,9 @@ class CaptureCoordinator:
     def _raw_imu_vector(vector: RawVector3) -> Mapping[str, object]:
         return {"x": vector.x, "y": vector.y, "z": vector.z}
 
-    def _live_imu_from_sample(self, session_id: str, sample: ImuSample) -> Mapping[str, object]:
+    def _live_imu_from_sample(
+        self, session_id: str | None, sample: ImuSample
+    ) -> Mapping[str, object]:
         return {
             "session_id": session_id,
             "clock": {
@@ -1364,9 +1366,9 @@ class CaptureCoordinator:
     @staticmethod
     def _fresh_live_imu(
         receipt: _LatestImuReceipt | None,
-        session_id: str,
+        session_id: str | None,
         observed_at_monotonic: float,
-    ) -> tuple[str, ImuSample] | None:
+    ) -> tuple[str | None, ImuSample] | None:
         if receipt is None or receipt.session_id != session_id:
             return None
         if observed_at_monotonic - receipt.received_at_monotonic > LIVE_IMU_STALE_SECONDS:
@@ -1375,7 +1377,7 @@ class CaptureCoordinator:
 
     def _store_latest_imu_locked(
         self,
-        session_id: str,
+        session_id: str | None,
         sample: ImuSample,
         *,
         observed_at_monotonic: float,
@@ -1395,8 +1397,6 @@ class CaptureCoordinator:
     def _refresh_latest_imu(self) -> None:
         with self._lock:
             plan = self._active_plan
-            if self._active is None or plan is None:
-                return
             sources = self._sources
         observed_at = time.monotonic()
         latest = getattr(sources, "latest_imu_observation", None)
@@ -1410,18 +1410,17 @@ class CaptureCoordinator:
             return
         sample = observation.samples[-1]
         with self._lock:
-            if self._active_plan is plan and self._active is not None:
+            if self._active_plan is plan:
                 self._store_latest_imu_locked(
-                    plan.session_id,
+                    None if plan is None or self._active is None else plan.session_id,
                     sample,
                     observed_at_monotonic=observed_at,
                 )
 
     def _live_imu_snapshot_locked(self) -> Mapping[str, object] | None:
         plan = self._active_plan
-        if self._active is None or plan is None:
-            return None
-        latest = self._fresh_live_imu(self._latest_imu, plan.session_id, time.monotonic())
+        session_id = None if self._active is None or plan is None else plan.session_id
+        latest = self._fresh_live_imu(self._latest_imu, session_id, time.monotonic())
         return None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
 
     def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
@@ -1528,7 +1527,13 @@ class CaptureCoordinator:
                 # Checkpoints advance capture revisions without changing hardware controls.
                 if focus_revision != self._focus_revision:
                     continue
-                runtime["live_imu"] = None if active is None else self._live_imu_snapshot_locked()
+                runtime["live_imu"] = self._live_imu_snapshot_locked()
+                if (
+                    active is None
+                    and runtime["live_imu"] is not None
+                    and runtime["live_imu"]["session_id"] is not None
+                ):
+                    runtime["live_imu"] = None
                 return {
                     "schema": "ylx.capture-status.v2",
                     "authority_epoch": self._authority_epoch,
@@ -2124,6 +2129,11 @@ class CaptureCoordinator:
                 session_config,
                 video_layout="split-eyes",
                 audio_enabled=False,
+                recording_encoding=(
+                    None
+                    if session_config.recording_encoding is None
+                    else replace(session_config.recording_encoding, codec="h264")
+                ),
             )
         recorder = DeviceSessionRecorder(
             admission.sessions_root,

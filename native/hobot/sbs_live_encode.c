@@ -253,6 +253,7 @@ int main(int argc, char **argv)
         .bitrate_kbps = bitrate_kbps,
         .intra_period = 0,
         .min_qp = 20,
+        .max_qp = 51,
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 3000,

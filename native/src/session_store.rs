@@ -72,6 +72,7 @@ pub(crate) struct RecordingPlan<'a> {
     pub(crate) fps: u64,
     pub(crate) bitrate_kbps: u64,
     pub(crate) segment_frames: u64,
+    pub(crate) encoder_arguments: &'a [String],
     pub(crate) recording_start_monotonic_ns: u64,
     pub(crate) audio: Option<AudioPlan<'a>>,
 }
@@ -146,6 +147,7 @@ impl SessionTransaction {
             plan.segment_frames,
             "video/",
         )?;
+        encoder.configure(plan.encoder_arguments)?;
         if let Err(error) = encoder.start() {
             if let Ok(mut sink) = sink.lock() {
                 sink.close();
@@ -517,6 +519,7 @@ mod tests {
             height: 1080,
             fps: 30,
             bitrate_kbps: 8192,
+            encoder_arguments: &[],
             segment_frames: 3,
             recording_start_monotonic_ns,
             audio: None,

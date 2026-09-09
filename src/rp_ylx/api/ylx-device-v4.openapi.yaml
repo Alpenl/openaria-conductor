@@ -959,7 +959,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "../schemas/ylx-device-session-v2.schema.json"
+                oneOf:
+                  - $ref: "../schemas/ylx-device-session-v2.schema.json"
+                  - $ref: "../schemas/ylx-device-session-v3.schema.json"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2471,7 +2473,10 @@ components:
       required: [session_id, clock, raw, sync]
       properties:
         session_id:
-          $ref: "#/components/schemas/UuidV7"
+          description: Active recording session, or null for continuously sampled idle preview.
+          oneOf:
+            - $ref: "#/components/schemas/UuidV7"
+            - type: "null"
         clock:
           type: object
           additionalProperties: false

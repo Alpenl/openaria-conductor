@@ -34,6 +34,7 @@ from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
+from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.stereo_encoder import (
     ClosedSegment,
     StereoEncoderError,
@@ -95,6 +96,7 @@ class DeviceSessionConfig:
     max_dropped_frames_per_window: int = 0
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
+    recording_encoding: RecordingEncoding | None = None
     segment_seconds: float = 30.0
     audio_enabled: bool = False
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
@@ -145,6 +147,12 @@ class DeviceSessionConfig:
             or self.audio_sample_format != "S16_LE"
         ):
             raise ValueError("Device Session 配置无效")
+        if self.recording_encoding is not None:
+            if not isinstance(self.recording_encoding, RecordingEncoding):
+                raise ValueError("recording_encoding must be RecordingEncoding")
+            segment_frames = round(self.segment_seconds * self.sensor_fps / self.frame_decimation)
+            if segment_frames % self.recording_encoding.gop_frames:
+                raise ValueError("segment frames must be a multiple of recording GOP")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,6 +1081,9 @@ class DeviceSessionRecorder:
             fps=round(self._config.sensor_fps / self._config.frame_decimation),
             bitrate_kbps=self._config.video_bitrate_kbps,
             segment_frames=self._segment_frames,
+            encoder_arguments=()
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.arguments(),
         )
 
     def _begin_native_transaction(self) -> NativeSessionTransaction:
@@ -1092,6 +1103,9 @@ class DeviceSessionRecorder:
             audio_sample_rate_hz=self._config.audio_sample_rate_hz,
             audio_channels=self._config.audio_channels,
             audio_segment_seconds=self._config.segment_seconds,
+            encoder_arguments=()
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.arguments(),
         )
         return native_session_store().begin_recording(plan)
 
@@ -1522,12 +1536,17 @@ class DeviceSessionRecorder:
                     "artifacts": record["artifacts"],
                 }
             )
-        return {
+        video: dict[str, object] = {
             "layout": "split-eyes",
-            "codec": "h264",
+            "codec": "h264"
+            if self._config.recording_encoding is None
+            else self._config.recording_encoding.codec,
             "container": "mp4",
             "segments": segments,
         }
+        if self._config.recording_encoding is not None:
+            video["encoding"] = self._config.recording_encoding.manifest()
+        return video
 
     def _finish_audio(self) -> None:
         recorder = self._audio_recorder
@@ -1721,7 +1740,9 @@ class DeviceSessionRecorder:
         nominal_fps = self._config.sensor_fps / self._config.frame_decimation
         effective_fps = 0.0 if duration == 0 else self._frames_written / duration
         manifest: dict[str, object] = {
-            "schema": "ylx.device-session.v2",
+            "schema": "ylx.device-session.v2"
+            if self._config.recording_encoding is None
+            else "ylx.device-session.v3",
             "manifest_id": uuid7(),
             "sealed": True,
             "sealed_at": self._timestamp(sealed_at),

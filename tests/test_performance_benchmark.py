@@ -79,7 +79,7 @@ class PerformanceBenchmarkTest(unittest.TestCase):
         capabilities = NativeCapabilities(
             True,
             "0.1.0",
-            5,
+            6,
             ("capability_probe", "turbojpeg_split"),
         )
         with (
@@ -107,14 +107,14 @@ class PerformanceBenchmarkTest(unittest.TestCase):
                 "adapter": "rust",
                 "module_available": True,
                 "module_version": "0.1.0",
-                "abi": 5,
+                "abi": 6,
             },
         )
         self.assertEqual(splitter.input[1:], (3840, 1080))
         self.assertTrue(splitter.closed)
 
     def test_rust_adapter_requires_the_workload_capability(self) -> None:
-        capabilities = NativeCapabilities(True, "0.1.0", 5, ("capability_probe",))
+        capabilities = NativeCapabilities(True, "0.1.0", 6, ("capability_probe",))
         with (
             tempfile.TemporaryDirectory() as directory,
             patch("rp_ylx.performance.benchmark.__commit__", COMMIT),

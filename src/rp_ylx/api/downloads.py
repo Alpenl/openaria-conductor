@@ -36,10 +36,12 @@ _TEMP_COMPONENT = re.compile(r"^[^/]*\.tmp(?:[._-][^/]*)?$")
 _READ_CHUNK = 1024 * 1024
 _DEVICE_SESSION_V1_SCHEMA_ID = "ylx.device-session.v1"
 _DEVICE_SESSION_V2_SCHEMA_ID = "ylx.device-session.v2"
+_DEVICE_SESSION_V3_SCHEMA_ID = "ylx.device-session.v3"
 _DEVICE_SESSION_SCHEMA_IDS = frozenset(
     {
         _DEVICE_SESSION_V1_SCHEMA_ID,
         _DEVICE_SESSION_V2_SCHEMA_ID,
+        _DEVICE_SESSION_V3_SCHEMA_ID,
     }
 )
 _DEVICE_SESSION_V1_SCHEMA = json.loads(
@@ -64,6 +66,10 @@ _DEVICE_SESSION_V2_SCHEMA["$defs"]["recordedAudio"]["properties"]["capture_clock
 }
 _DEVICE_SESSION_V2_VALIDATOR = Draft202012Validator(
     _DEVICE_SESSION_V2_SCHEMA,
+    format_checker=FormatChecker(),
+)
+_DEVICE_SESSION_V3_VALIDATOR = Draft202012Validator(
+    json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v3.schema.json").read_text()),
     format_checker=FormatChecker(),
 )
 _RECORDING_SESSION_SCHEMA = json.loads(
@@ -1151,6 +1157,15 @@ def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
         return
     if schema == _DEVICE_SESSION_V2_SCHEMA_ID:
         _validate_device_session_v2(manifest)
+        return
+    if schema == _DEVICE_SESSION_V3_SCHEMA_ID:
+        try:
+            _DEVICE_SESSION_V3_VALIDATOR.validate(manifest)
+        except ValidationError as error:
+            raise ArtifactAccessError(
+                "not_verified", "manifest 不符合 device-session v3 契约"
+            ) from error
+        _validate_device_session_semantics(manifest, schema_version="v2")
         return
     raise ArtifactAccessError("not_verified", "manifest 不是支持的 device-session 契约")
 

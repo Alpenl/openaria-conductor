@@ -41,6 +41,7 @@ from rp_ylx.recording import (
     DeviceSessionConfig,
     NativeContinuousCaptureSources,
 )
+from rp_ylx.recording.encoding import RecordingEncoding
 
 PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
 LAB_OPERATIONS = frozenset(
@@ -104,6 +105,7 @@ class ProductionConfig:
     frame_decimation: int = 2
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
+    recording_encoding: RecordingEncoding | None = None
     segment_seconds: float = 30.0
     audio_enabled: bool = True
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
@@ -207,11 +209,11 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         "device",
         "security",
     }
-    optional = {"audio"}
+    optional = {"audio", "recording"}
     if not isinstance(value, dict):
         raise ProductionConfigError("生产配置顶层字段无效")
     top_level = set(value)
-    if top_level != required and top_level != required | optional:
+    if not required <= top_level or top_level - required - optional:
         raise ProductionConfigError("生产配置顶层字段无效")
     listen = value["listen"]
     camera = value["camera"]
@@ -219,6 +221,10 @@ def load_production_config(path: str | Path) -> ProductionConfig:
     device = value["device"]
     security = value["security"]
     audio = value.get("audio")
+    try:
+        encoding = RecordingEncoding.from_mapping(value.get("recording", {"preset": "high"}))
+    except (TypeError, ValueError) as error:
+        raise ProductionConfigError(str(error)) from error
     security_profile = security.get("profile") if isinstance(security, dict) else None
     security_valid = (
         isinstance(security, dict)
@@ -290,6 +296,8 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             width=_integer(camera["width"], "camera.width"),
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
+            recording_encoding=encoding,
+            video_bitrate_kbps=encoding.bitrate_kbps,
             audio_enabled=True if audio is None else audio["enabled"],
             audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),
             audio_sample_rate_hz=(
@@ -695,6 +703,7 @@ def build_production_service(
             frame_decimation=config.frame_decimation,
             video_layout=config.video_layout,
             video_bitrate_kbps=config.video_bitrate_kbps,
+            recording_encoding=config.recording_encoding,
             segment_seconds=config.segment_seconds,
             audio_enabled=config.audio_enabled,
             audio_device=config.audio_device,

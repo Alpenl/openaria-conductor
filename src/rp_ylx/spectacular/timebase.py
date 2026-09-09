@@ -264,7 +264,7 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
                 for sample in current
             ):
                 raise CaptureValidationError("records within an IMU packet disagree")
-            if capture.source_schema == "ylx.device-session.v2" and any(
+            if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"} and any(
                 sample["packet_sequence"] != first["packet_sequence"]
                 or sample["device_ticks"] != first["device_ticks"]
                 for sample in current
@@ -281,7 +281,7 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
 
 def _packet_timestamps(capture: LoadedCapture, packets: list[list[dict[str, Any]]]) -> list[int]:
     first_records = [packet[0] for packet in packets]
-    if capture.source_schema == "ylx.device-session.v2":
+    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         _unwrap_contiguous(
             [int(record["packet_sequence"]) for record in first_records],
             32,
@@ -319,7 +319,7 @@ def _analyze_capture(
     if imu_rate_hz <= 0:
         raise CaptureValidationError("IMU rate must be positive")
     capture = load_capture(capture_dir)
-    if capture.source_schema == "ylx.device-session.v2":
+    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
         # Device Session source sequences advance by the declared frame
         # decimation. The adapter validates that exact relationship; the
         # contiguous recording domain is the clock-fit counter.

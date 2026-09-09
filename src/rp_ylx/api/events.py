@@ -985,8 +985,6 @@ def _validate_runtime_live_imu_session_relation(
     live_imu = runtime["live_imu"]
     if live_imu is None:
         return
-    if active_session_id is None:
-        raise InvalidSourceEvent("v4/source runtime live_imu 仅允许出现在活动录制 snapshot")
     if not isinstance(live_imu, Mapping) or live_imu.get("session_id") != active_session_id:
         raise InvalidSourceEvent("v4/source runtime live_imu session_id 必须与活动录制一致")
 
@@ -1063,7 +1061,9 @@ def _validate_live_imu(value: object) -> None:
     if not isinstance(value, Mapping) or set(value) != LIVE_IMU_KEYS:
         raise InvalidSourceEvent("live_imu 必须是闭合对象")
     session_id = value["session_id"]
-    if not isinstance(session_id, str) or UUID_V7.fullmatch(session_id) is None:
+    if session_id is not None and (
+        not isinstance(session_id, str) or UUID_V7.fullmatch(session_id) is None
+    ):
         raise InvalidSourceEvent("live_imu session_id 无效")
     clock = value["clock"]
     if (

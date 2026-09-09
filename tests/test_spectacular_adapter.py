@@ -403,7 +403,7 @@ class SpectacularAdapterTest(unittest.TestCase):
 
     def test_rejects_unknown_schema_and_wrong_artifact_role(self) -> None:
         manifest = _manifest(self.session)
-        manifest["schema"] = "ylx.device-session.v3"
+        manifest["schema"] = "ylx.device-session.v99"
         _write_manifest(self.session, manifest)
         with self.assertRaisesRegex(CaptureValidationError, "unsupported Device Session"):
             load_capture(self.session)

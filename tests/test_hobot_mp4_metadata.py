@@ -42,6 +42,10 @@ class HobotMp4MetadataTest(unittest.TestCase):
                 "unsigned char nonidr[] = {0,0,1,0x41,5,0,0};\n"
                 "if (!h264_has_idr(idr,sizeof(idr)) || "
                 "h264_has_idr(nonidr,sizeof(nonidr))) return 9;\n"
+                "unsigned char hevc[] = {0,0,0,1,0x26,1,3};\n"
+                "unsigned char cra[] = {0,0,1,0x2a,1,3};\n"
+                "if (!h265_has_idr(hevc,sizeof(hevc)) || h265_has_idr(cra,sizeof(cra)) || "
+                "h265_has_idr(hevc,5)) return 10;\n"
                 "char reason[128]; if (argc != 2) return 8;\n"
                 "return mp4_extend_durations(argv[1],30,reason,sizeof(reason)) == 0 ? 0 : 1; }\n"
             )
@@ -50,13 +54,18 @@ class HobotMp4MetadataTest(unittest.TestCase):
                 [compiler, "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)],
                 check=True,
             )
-            for primaries, transfer, matrix in [(0, 0, 0), (1, 1, 1)]:
-                with self.subTest(color=(primaries, transfer, matrix)):
+            for sample_entry, primaries, transfer, matrix in [
+                (kind, *color)
+                for kind in (b"avc1", b"hvc1", b"hev1")
+                for color in [(0, 0, 0), (1, 1, 1)]
+            ]:
+                with self.subTest(sample_entry=sample_entry, color=(primaries, transfer, matrix)):
                     colr = box(
                         b"colr", b"nclx" + struct.pack(">HHHB", primaries, transfer, matrix, 0)
                     )
                     stsd = box(
-                        b"stsd", bytes(4) + struct.pack(">I", 1) + box(b"avc1", bytes(78) + colr)
+                        b"stsd",
+                        bytes(4) + struct.pack(">I", 1) + box(sample_entry, bytes(78) + colr),
                     )
                     mvhd = bytearray(28)
                     struct.pack_into(">II", mvhd, 12, 1000, 1000)

@@ -246,7 +246,7 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(status["commit"], expected_commit)
                 self.assertEqual(status["native"]["adapter"], "rust")
                 self.assertTrue(status["native"]["module_available"])
-                self.assertEqual(status["native"]["abi"], 5)
+                self.assertEqual(status["native"]["abi"], 6)
                 self.assertIn("capability_probe", status["native"]["features"])
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])
@@ -254,14 +254,14 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "301a56a20de3cb49ba6e22b27531e5e45cf8618f",
+                        "source_commit": "3a279ddac1f58ffa2516d09c2d955f650f4aee47",
                         "required_device_api_major": 4,
                         "assets": {
                             "app.js": {
                                 "bytes": 100610,
                                 "content_type": "text/javascript; charset=utf-8",
                                 "sha256": (
-                                    "6964af1f4f42ff52b472c7b35f9b7635303aaec33dbf719a70405eb55fdbacab"
+                                    "81f3139d2f8343271d6700e6241be94505fc70d586f9823ca286caab4a16f5af"
                                 ),
                             },
                             "index.html": {

@@ -105,6 +105,17 @@ static int h264_has_idr(const unsigned char *data, size_t length)
     return 0;
 }
 
+static int h265_has_idr(const unsigned char *data, size_t length)
+{
+    for (size_t offset = 0; offset + 4 < length; offset++) {
+        if (data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1) {
+            const unsigned type = (data[offset + 3] >> 1) & 0x3f;
+            if ((type == 19 || type == 20) && (data[offset + 4] & 7) != 0) return 1;
+        }
+    }
+    return 0;
+}
+
 static void fail(ylx_pipeline_t *pipeline, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 
@@ -169,11 +180,11 @@ static void configure_decoder(media_codec_context_t *context,
     params->mjpeg_dec_config.frame_crop_enable = false;
 }
 
-static void configure_encoder(media_codec_context_t *context,
+static int configure_encoder(media_codec_context_t *context,
                               const ylx_pipeline_config_t *config, int eye_width)
 {
     memset(context, 0, sizeof(*context));
-    context->codec_id = MEDIA_CODEC_ID_H264;
+    context->codec_id = config->hevc ? MEDIA_CODEC_ID_H265 : MEDIA_CODEC_ID_H264;
     context->encoder = true;
     mc_video_codec_enc_params_t *params = &context->video_enc_params;
     params->width = eye_width;
@@ -191,32 +202,68 @@ static void configure_encoder(media_codec_context_t *context,
     params->mir_direction = MC_DIRECTION_NONE;
     params->frame_cropping_flag = false;
     params->enable_user_pts = 0;
-    params->rc_params.mode = MC_AV_RC_MODE_H264CBR;
-    hb_mm_mc_get_rate_control_config(context, &params->rc_params);
-    params->rc_params.mode = MC_AV_RC_MODE_H264CBR;
-    mc_h264_cbr_params_t *cbr = &params->rc_params.h264_cbr_params;
-    /* The driver's CBR loop tracks the QP floor far more closely than the bit
-     * budget, so the QP fields are what actually bound the stream size. */
-    cbr->frame_rate = (uint32_t)config->fps;
-    cbr->bit_rate = (uint32_t)config->bitrate_kbps;
-    cbr->intra_period =
-        (uint32_t)(config->intra_period > 0 ? config->intra_period : config->fps);
-    cbr->intra_qp = (uint32_t)config->intra_qp;
-    cbr->initial_rc_qp = config->initial_qp;
-    cbr->vbv_buffer_size = (uint32_t)config->vbv_ms;
-    cbr->mb_level_rc_enalbe = 1;
-    cbr->min_qp_I = (uint32_t)config->min_qp;
-    cbr->max_qp_I = 51;
-    cbr->min_qp_P = (uint32_t)config->min_qp;
-    cbr->max_qp_P = 51;
-    cbr->min_qp_B = (uint32_t)config->min_qp;
-    cbr->max_qp_B = 51;
-    cbr->hvs_qp_enable = 1;
-    cbr->hvs_qp_scale = 2;
-    cbr->max_delta_qp = 10;
-    cbr->qp_map_enable = 0;
-    params->h264_enc_config.h264_profile = MC_H264_PROFILE_HP;
-    params->h264_enc_config.h264_level = MC_H264_LEVEL4;
+    const mc_video_rate_control_mode_t modes[2][4] = {
+        {MC_AV_RC_MODE_H264CBR, MC_AV_RC_MODE_H264VBR, MC_AV_RC_MODE_H264FIXQP, MC_AV_RC_MODE_H264AVBR},
+        {MC_AV_RC_MODE_H265CBR, MC_AV_RC_MODE_H265VBR, MC_AV_RC_MODE_H265FIXQP, MC_AV_RC_MODE_H265AVBR},
+    };
+    params->rc_params.mode = modes[config->hevc][config->rate_control];
+    int ret = hb_mm_mc_get_rate_control_config(context, &params->rc_params);
+    if (ret != 0) return ret;
+    params->rc_params.mode = modes[config->hevc][config->rate_control];
+    const uint32_t period = (uint32_t)(config->intra_period > 0 ? config->intra_period : config->fps);
+    /* Never alias the H.264 and HEVC union members. */
+#define SET_BUDGET_RC(member, block_field) do { \
+    params->rc_params.member.frame_rate = (uint32_t)config->fps; \
+    params->rc_params.member.bit_rate = (uint32_t)config->bitrate_kbps; \
+    params->rc_params.member.intra_period = period; \
+    params->rc_params.member.intra_qp = (uint32_t)config->intra_qp; \
+    params->rc_params.member.initial_rc_qp = config->initial_qp; \
+    params->rc_params.member.vbv_buffer_size = config->vbv_ms; \
+    params->rc_params.member.block_field = 1; \
+    params->rc_params.member.min_qp_I = params->rc_params.member.min_qp_P = \
+        params->rc_params.member.min_qp_B = (uint32_t)config->min_qp; \
+    params->rc_params.member.max_qp_I = params->rc_params.member.max_qp_P = \
+        params->rc_params.member.max_qp_B = (uint32_t)config->max_qp; \
+    params->rc_params.member.hvs_qp_enable = 1; \
+    params->rc_params.member.hvs_qp_scale = 2; \
+    params->rc_params.member.max_delta_qp = 10; \
+    params->rc_params.member.qp_map_enable = 0; \
+} while (0)
+#define SET_VBR(member) do { \
+    params->rc_params.member.frame_rate = (uint32_t)config->fps; \
+    params->rc_params.member.intra_period = period; \
+    params->rc_params.member.intra_qp = (uint32_t)config->intra_qp; \
+    params->rc_params.member.qp_map_enable = 0; \
+} while (0)
+#define SET_FIXQP(member) do { \
+    params->rc_params.member.frame_rate = (uint32_t)config->fps; \
+    params->rc_params.member.intra_period = period; \
+    params->rc_params.member.force_qp_I = (uint32_t)config->intra_qp; \
+    params->rc_params.member.force_qp_P = params->rc_params.member.force_qp_B = (uint32_t)config->initial_qp; \
+} while (0)
+    if (config->hevc) {
+        params->h265_enc_config.main_still_picture_profile_enable = 0;
+        params->h265_enc_config.h265_level = MC_H265_LEVEL_UNSPECIFIED;
+        switch (config->rate_control) {
+            case 0: SET_BUDGET_RC(h265_cbr_params, ctu_level_rc_enalbe); break;
+            case 1: SET_VBR(h265_vbr_params); break;
+            case 2: SET_FIXQP(h265_fixqp_params); break;
+            case 3: SET_BUDGET_RC(h265_avbr_params, ctu_level_rc_enalbe); break;
+        }
+    } else {
+        switch (config->rate_control) {
+            case 0: SET_BUDGET_RC(h264_cbr_params, mb_level_rc_enalbe); break;
+            case 1: SET_VBR(h264_vbr_params); break;
+            case 2: SET_FIXQP(h264_fixqp_params); break;
+            case 3: SET_BUDGET_RC(h264_avbr_params, mb_level_rc_enalbe); break;
+        }
+        params->h264_enc_config.h264_profile = MC_H264_PROFILE_HP;
+        params->h264_enc_config.h264_level = MC_H264_LEVEL_UNSPECIFIED;
+    }
+#undef SET_BUDGET_RC
+#undef SET_VBR
+#undef SET_FIXQP
+    return 0;
 }
 
 /* --------------------------------------------------------------- moov --- */
@@ -291,7 +338,12 @@ static int mp4_fix_color(unsigned char *moov, char *reason, size_t reason_len)
     };
     unsigned char *box = moov;
     for (size_t index = 0; index < sizeof(path) / sizeof(path[0]); index++) {
-        box = child_box(box, path[index].skip, path[index].type);
+        unsigned char *parent = box;
+        box = child_box(parent, path[index].skip, path[index].type);
+        if (box == NULL && strcmp(path[index].type, "avc1") == 0) {
+            box = child_box(parent, path[index].skip, "hvc1");
+            if (box == NULL) box = child_box(parent, path[index].skip, "hev1");
+        }
         if (box == NULL) {
             /* Some vendor versions omit colr and leave the SPS authoritative. */
             if (index == sizeof(path) / sizeof(path[0]) - 1) return 0;
@@ -443,7 +495,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
 
     mx_stream_params_t params;
     memset(&params, 0, sizeof(params));
-    params.codec_id = MEDIA_CODEC_ID_H264;
+    params.codec_id = pipeline->config.hevc ? MEDIA_CODEC_ID_H265 : MEDIA_CODEC_ID_H264;
     params.numerator = 1;
     params.denominator = pipeline->config.fps;
     params.video_params.width = pipeline->eye_width;
@@ -626,7 +678,7 @@ static void *encoder_output_thread(void *argument)
              * discardable. Each segment must stand on its own anyway. */
             stream.pts = eye->current != NULL ? eye->ordinal - eye->current->start_frame
                                               : eye->ordinal;
-            stream.is_key_frame = h264_has_idr(buffer.vstream_buf.vir_ptr,
+            stream.is_key_frame = (pipeline->config.hevc ? h265_has_idr : h264_has_idr)(buffer.vstream_buf.vir_ptr,
                                                (size_t)buffer.vstream_buf.size);
             if (eye->ordinal == eye->current->start_frame && !stream.is_key_frame) {
                 fail(pipeline, "segment_missing_idr: %s", eye->current->relative);
@@ -751,7 +803,14 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
 {
     if (config == NULL || out == NULL || config->out_dir == NULL ||
         config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->height <= 0 ||
-        config->fps <= 0 || config->segment_frames < 0 || config->intra_period < 0 ||
+        config->fps <= 0 || config->fps > 60 || config->segment_frames < 0 || config->intra_period < 0 ||
+        config->intra_period > 300 || config->hevc < 0 || config->hevc > 1 ||
+        config->rate_control < 0 || config->rate_control > 3 ||
+        config->bitrate_kbps < 1 || config->bitrate_kbps > 100000 ||
+        config->min_qp < 0 || config->max_qp > 51 || config->min_qp > config->max_qp ||
+        config->intra_qp < config->min_qp || config->intra_qp > config->max_qp ||
+        config->initial_qp < config->min_qp || config->initial_qp > config->max_qp ||
+        config->vbv_ms < 1 || config->vbv_ms > 3000 ||
         (config->segment_frames > 0 && config->segment_frames %
          (config->intra_period > 0 ? config->intra_period : config->fps) != 0)) {
         snprintf(error, error_len, "invalid_configuration");
@@ -790,11 +849,11 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
         pipeline->eyes[eye].pipeline = pipeline;
         pipeline->eyes[eye].eye = eye;
-        configure_encoder(&pipeline->eyes[eye].codec, &pipeline->config,
+        ret = configure_encoder(&pipeline->eyes[eye].codec, &pipeline->config,
                           pipeline->eye_width);
-        ret = codec_start(&pipeline->eyes[eye].codec);
+        if (ret == 0) ret = codec_start(&pipeline->eyes[eye].codec);
         if (ret != 0) {
-            snprintf(error, error_len, "vpu_unavailable: %s H.264 encoder start failed (%d)",
+            snprintf(error, error_len, "vpu_unavailable: %s video encoder start failed (%d)",
                      EYE_NAMES[eye], ret);
             for (int done = 0; done < eye; done += 1) {
                 codec_stop(&pipeline->eyes[done].codec);

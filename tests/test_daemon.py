@@ -25,6 +25,7 @@ from rp_ylx.daemon import (
 )
 from rp_ylx.deployment import ReleaseManager
 from rp_ylx.native import NativeCapabilities
+from rp_ylx.recording.encoding import RecordingEncoding
 
 PRODUCTION_NATIVE_FEATURES = (
     "capability_probe",
@@ -98,7 +99,14 @@ class ProductionDaemonTest(unittest.TestCase):
                 "security": {"profile": "lab", "isolated_network": True},
             }
             path.write_text(json.dumps(value), encoding="utf-8")
-            self.assertEqual(load_production_config(path), config)
+            self.assertEqual(
+                load_production_config(path),
+                replace(
+                    config,
+                    video_bitrate_kbps=16384,
+                    recording_encoding=RecordingEncoding.from_mapping({"preset": "high"}),
+                ),
+            )
             value["security"]["isolated_network"] = False
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaises(ProductionConfigError):
@@ -357,6 +365,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 port = listener.getsockname()[1]
             config = replace(self.config(root), port=port)
             source = Mock(open_handle_count=0)
+            source.latest_imu_observation.return_value = None
             source.camera_connection_status.return_value = {
                 "schema": "ylx.camera-connection.v1",
                 "state": "connected",

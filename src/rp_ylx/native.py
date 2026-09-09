@@ -12,7 +12,7 @@ from typing import Protocol, cast
 from rp_ylx.camera_focus import valid_camera_focus_status
 
 NATIVE_MODULE = "rp_ylx._native"
-SUPPORTED_NATIVE_ABI = 5
+SUPPORTED_NATIVE_ABI = 6
 
 
 class NativeModuleError(RuntimeError):
@@ -86,6 +86,7 @@ class NativeRecordingPlan:
     audio_sample_rate_hz: int
     audio_channels: int
     audio_segment_seconds: float
+    encoder_arguments: tuple[str, ...] = ()
 
 
 def _validate_capabilities(module: ModuleType) -> NativeCapabilities:

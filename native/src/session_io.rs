@@ -402,7 +402,10 @@ fn parse_device_session_manifest(
     })?;
     let object = manifest_object(&root)?;
     let schema = string_field(object, "schema")?;
-    if !matches!(schema, "ylx.device-session.v1" | "ylx.device-session.v2") {
+    if !matches!(
+        schema,
+        "ylx.device-session.v1" | "ylx.device-session.v2" | "ylx.device-session.v3"
+    ) {
         return Err(SessionIoError::new(
             "manifest_invalid",
             "manifest 不是支持的 device-session",

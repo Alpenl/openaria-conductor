@@ -2193,6 +2193,33 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_idle_imu_updates_without_recording_and_expires(self) -> None:
+        sources = FakeSourcesWithSequentialLatestImu(
+            [
+                single_imu_observation(
+                    host_monotonic_ns=100, accelerometer=(1, 2, 3), gyroscope=(4, 5, 6)
+                ),
+                single_imu_observation(
+                    host_monotonic_ns=200, accelerometer=(7, 8, 9), gyroscope=(10, 11, 12)
+                ),
+            ]
+        )
+        coordinator = self.coordinator(sources=sources)
+        try:
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=1.0):
+                first = coordinator.capture_status()
+                second = coordinator.capture_status()
+                for status, timestamp in ((first, 100), (second, 200)):
+                    validate_capture_status(status)
+                    self.assertIsNone(status["snapshot"]["active_recording"])
+                    imu = status["snapshot"]["runtime"]["live_imu"]
+                    self.assertIsNone(imu["session_id"])
+                    self.assertEqual(imu["clock"]["timestamp_ns"], timestamp)
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=11.0):
+                self.assertIsNone(coordinator.capture_status()["snapshot"]["runtime"]["live_imu"])
+        finally:
+            coordinator.close()
+
     def test_live_imu_source_miss_reuses_cache_only_within_bounded_freshness(self) -> None:
         observation = single_imu_observation(
             host_monotonic_ns=100,

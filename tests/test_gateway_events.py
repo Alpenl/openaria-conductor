@@ -413,6 +413,13 @@ class GatewayEventHttpTest(unittest.TestCase):
             api_version="v4",
         )
 
+    def test_v4_live_imu_accepts_idle_preview_without_session(self) -> None:
+        idle = deepcopy(SNAPSHOT_SOURCE_EVENT)
+        idle["data"]["runtime"]["live_imu"] = {**deepcopy(RAW_LIVE_IMU), "session_id": None}
+        validate_capture_status(
+            _capture_status_from_snapshot_event(idle, api_version="v4"), api_version="v4"
+        )
+
     def test_v4_focus_status_preserves_mapping_and_validation_errors(self) -> None:
         focus = {
             "schema": "ylx.camera-focus.v1",
