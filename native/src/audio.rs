@@ -139,6 +139,12 @@ struct SndPcmHwParams {
 type SndPcmSframes = libc::c_long;
 type SndPcmUframes = libc::c_ulong;
 
+// ALSA uses unsigned long, which is 32 or 64 bits depending on the target ABI.
+#[allow(clippy::unnecessary_cast)]
+fn pcm_frames_u64(frames: SndPcmUframes) -> u64 {
+    frames as u64
+}
+
 type SndPcmOpen = unsafe extern "C" fn(*mut *mut SndPcm, *const c_char, c_int, c_int) -> c_int;
 type SndPcmClose = unsafe extern "C" fn(*mut SndPcm) -> c_int;
 type SndPcmNonblock = unsafe extern "C" fn(*mut SndPcm, c_int) -> c_int;
@@ -764,8 +770,8 @@ impl Pcm {
         self.check("unsupported_audio_mode", "snd_pcm_get_params", unsafe {
             (self.alsa.get_params)(self.handle, &mut buffer, &mut period)
         })?;
-        self.period_frames = period as u64;
-        self.buffer_frames = buffer as u64;
+        self.period_frames = pcm_frames_u64(period);
+        self.buffer_frames = pcm_frames_u64(buffer);
         let mut sw = std::ptr::null_mut();
         self.check("audio_failed", "sw_params_malloc", unsafe {
             (self.alsa.sw_malloc)(&mut sw)
@@ -821,7 +827,7 @@ impl Pcm {
         })?;
         if timestamp.tv_sec < 0
             || !(0..1_000_000_000).contains(&timestamp.tv_nsec)
-            || available as u64 > self.buffer_frames
+            || pcm_frames_u64(available) > self.buffer_frames
         {
             return Err(AudioError::new(
                 "audio_failed",
@@ -829,7 +835,7 @@ impl Pcm {
             ));
         }
         Ok((
-            read_frames + available as u64,
+            read_frames + pcm_frames_u64(available),
             timestamp.tv_sec as u64 * 1_000_000_000 + timestamp.tv_nsec as u64,
         ))
     }

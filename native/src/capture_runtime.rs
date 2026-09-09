@@ -734,6 +734,8 @@ fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+// These owners are moved together into the single IMU/audio monitoring thread.
+#[allow(clippy::too_many_arguments)]
 fn run_imu_loop(
     collector: Arc<Collector>,
     sink: Arc<Mutex<recording::RecordingSink>>,
