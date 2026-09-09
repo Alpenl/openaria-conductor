@@ -17,7 +17,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Validate and map a legacy raw or Device Session calibration capture."
     )
     parser.add_argument("capture_dir", type=Path)
-    parser.add_argument("--imu-rate", type=float, default=120.0)
+    parser.add_argument(
+        "--imu-rate",
+        type=float,
+        help="Expected received records/s (optional for Device Session; legacy default: 120). "
+        "This validates throughput and does not configure hardware ODR.",
+    )
     args = parser.parse_args(argv)
     try:
         result = check_capture(args.capture_dir, imu_rate_hz=args.imu_rate)
