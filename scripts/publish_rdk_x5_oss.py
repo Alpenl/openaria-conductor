@@ -145,6 +145,14 @@ def publish(output: Path, prepared: dict, config: dict, bucket) -> None:
                 break
             except Exception as error:
                 status = getattr(error, "status", 0)
+                # OSS can report FileAlreadyExists as a generic ServerError,
+                # rather than the SDK's ObjectAlreadyExists subclass.
+                if (
+                    immutable
+                    and status == 409
+                    and getattr(error, "code", "") == "FileAlreadyExists"
+                ):
+                    break
                 retryable = status == 429 or status >= 500 or type(error).__name__ == "RequestError"
                 if not retryable or attempt == 2:
                     raise

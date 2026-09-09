@@ -283,6 +283,25 @@ class OnlineUpdateTest(unittest.TestCase):
             )
         )
 
+    def test_generic_oss_file_exists_still_requires_anonymous_hash_check(self):
+        class FileAlreadyExists(Exception):
+            status = 409
+            code = "FileAlreadyExists"
+
+        bucket = Mock()
+        bucket.put_object_from_file.side_effect = FileAlreadyExists()
+        fake_oss = types.SimpleNamespace(
+            exceptions=types.SimpleNamespace(ObjectAlreadyExists=FileExistsError)
+        )
+        with (
+            patch.dict("sys.modules", {"oss2": fake_oss}),
+            patch.object(publisher, "download", side_effect=OSError) as get,
+            self.assertRaises(OSError),
+        ):
+            publisher.publish(self.output, self.prepared, self.config, bucket)
+        self.assertEqual(bucket.put_object_from_file.call_count, 1)
+        get.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
