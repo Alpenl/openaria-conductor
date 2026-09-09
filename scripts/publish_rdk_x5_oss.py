@@ -14,6 +14,7 @@ import shlex
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -133,11 +134,22 @@ def publish(output: Path, prepared: dict, config: dict, bucket) -> None:
         }
         if immutable:
             headers["x-oss-forbid-overwrite"] = "true"
-        try:
-            bucket.put_object_from_file(prefix + "/" + key, str(local), headers=headers)
-        except oss2.exceptions.ObjectAlreadyExists:
-            if not immutable:
-                raise
+        print(f"上传 {key} ({local.stat().st_size} bytes)", file=sys.stderr, flush=True)
+        for attempt in range(3):
+            try:
+                bucket.put_object_from_file(prefix + "/" + key, str(local), headers=headers)
+                break
+            except oss2.exceptions.ObjectAlreadyExists:
+                if not immutable:
+                    raise
+                break
+            except Exception as error:
+                status = getattr(error, "status", 0)
+                retryable = status == 429 or status >= 500 or type(error).__name__ == "RequestError"
+                if not retryable or attempt == 2:
+                    raise
+                print(f"上传暂时失败 HTTP {status}，正在重试…", file=sys.stderr, flush=True)
+                time.sleep(2 ** (attempt + 1))
         # Anonymous full GET proves that public access works and verifies exact bytes.
         with tempfile.TemporaryDirectory() as temp:
             downloaded = Path(temp) / "object"
@@ -179,7 +191,11 @@ def main() -> int:
         print(json.dumps({"published": args.publish, **prepared}, ensure_ascii=False))
     except Exception as error:
         # SDK exception bodies can include signed request details. Do not print them.
-        print(f"发布失败：{type(error).__name__}", file=sys.stderr)
+        print(
+            f"发布失败：{type(error).__name__} HTTP {getattr(error, 'status', 'n/a')} "
+            f"code={getattr(error, 'code', 'n/a')}",
+            file=sys.stderr,
+        )
         return 2
     return 0
 

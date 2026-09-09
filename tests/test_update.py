@@ -258,6 +258,31 @@ class OnlineUpdateTest(unittest.TestCase):
             publisher.publish(self.output, self.prepared, self.config, bucket)
         self.assertNotIn("rdk-x5/latest.json", [key for key, _ in writes])
 
+    def test_publication_retries_transient_oss_error_but_stops_before_channel(self):
+        class ServerError(Exception):
+            status = 503
+
+        bucket = Mock()
+        bucket.put_object_from_file.side_effect = [ServerError(), None]
+        fake_oss = types.SimpleNamespace(
+            exceptions=types.SimpleNamespace(ObjectAlreadyExists=FileExistsError)
+        )
+        with (
+            patch.dict("sys.modules", {"oss2": fake_oss}),
+            patch.object(publisher.time, "sleep") as sleep,
+            patch.object(publisher, "download", side_effect=OSError),
+            self.assertRaises(OSError),
+        ):
+            publisher.publish(self.output, self.prepared, self.config, bucket)
+        self.assertEqual(bucket.put_object_from_file.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertTrue(
+            all(
+                "latest.json" not in call.args[0]
+                for call in bucket.put_object_from_file.call_args_list
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
