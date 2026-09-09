@@ -93,6 +93,7 @@ Linux 的 `UVCIOC_CTRL_QUERY` 根据 unit/selector 访问 XU 控制，载荷内�
 ```python
 import struct
 
+
 def decode_27_bytes(payload: bytes):
     if len(payload) != 27:
         raise ValueError("expected exactly 27 bytes")
