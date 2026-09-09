@@ -2,6 +2,11 @@ name: RDK X5 离线安装包
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_oss:
+        description: "构建成功后发布到国内 OSS 并更新 latest"
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -20,6 +25,8 @@ on:
       - "pyproject.toml"
       - "scripts/build_rdk_x5_bundle.py"
       - "scripts/rdk_x5_install.py"
+      - "scripts/publish_rdk_x5_oss.py"
+      - "deploy/oss-release.json"
       - "src/**"
 
 permissions:
@@ -127,3 +134,14 @@ jobs:
           name: rp-ylx-rdk-x5-${{ github.sha }}
           path: dist-rdk-x5/
           if-no-files-found: error
+
+      - name: 发布到阿里云 OSS 国内下载源
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_oss
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          uv run scripts/publish_rdk_x5_oss.py \
+            --bundle-dir dist-rdk-x5 \
+            --output dist-oss-release \
+            --publish
