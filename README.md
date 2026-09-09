@@ -15,6 +15,8 @@ Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 �
 
 ## 用户文档
 
+- [RDK X5 一键安装与更新](docs/one-click-install.md)：从阿里云 OSS 下载、校验并完成安装，以及发布新固件。
+
 - [设备使用指南](docs/user-guide.md)：从开机、进入页面到录制、封存、下载和正常关机。
 - [网络连接与救援指南](docs/networking.md)：Wi-Fi、设备热点、固定地址、SSH 和正常网络回退。
 
