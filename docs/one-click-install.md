@@ -17,7 +17,9 @@ curl --proto '=https' -fSL --retry 3 \
 5. 调用已有离线部署器，生成设备身份、HTTPS 证书和访问令牌，配置 OpenAria 管理账号、服务与开机启动，等待 Device API 健康检查通过。
 6. 安装 `openaria-update` 命令，并报告访问地址和令牌文件位置。
 
-浏览器访问 `https://设备IP:8080/`。首次访问需要信任设备自签名证书，访问令牌可由设备管理员运行 `sudo cat /etc/rp-ylx/customer.token` 查看。OpenAria SSH 管理账号和救援热点使用项目现有默认策略，见 [README](../README.md#设备接入)。安装不会自动加入一个未知 Wi-Fi；初次联网可使用有线网络或 RDK 系统现有网络。
+浏览器访问 `https://设备IP:8080/`。首次访问需要信任设备自签名证书，访问令牌可由设备管理员运行 `sudo cat /etc/rp-ylx/customer.token` 查看。OpenAria SSH 管理账号和救援热点使用项目现有默认策略，见 [README](../README.md#设备接入)。初次联网可使用有线网络或 RDK 系统现有网络。
+
+首次通过 Wi-Fi 安装时，脚本会让 NetworkManager 保存当前连接的受管副本，并登记为启动后的恢复目标。原始连接配置保留；密码只在 NetworkManager 的受限配置中保存。系统首次启动会短暂验证救援热点，再重连原 Wi-Fi。支持开放 Wi-Fi、系统已保存凭据的 WPA2/WPA3 个人网络；企业认证或依赖桌面密码代理的连接会在激活前停止，需要通过有线网络安装。已有 OpenAria 网络状态不自动覆盖。升级前仍应保持其他客户端空闲。
 
 ## 日常更新与回退
 

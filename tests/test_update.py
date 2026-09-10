@@ -16,6 +16,8 @@ from unittest.mock import Mock, patch
 
 import tests.test_deployment as fixtures
 from rp_ylx import update
+from rp_ylx.network import saved_network_candidate
+from rp_ylx.network_state import NetworkStateStore
 from scripts import publish_rdk_x5_oss as publisher
 
 
@@ -181,6 +183,7 @@ class OnlineUpdateTest(unittest.TestCase):
                 patch.object(update, "require_idle"),
                 patch.object(update, "prepare_dependencies"),
                 patch.object(update, "configure_data_volume"),
+                patch.object(update, "prepare_first_install_network"),
                 patch.object(update, "CONFIG", config),
                 patch.object(update, "download", side_effect=self.download),
                 patch.object(update, "current_commit", side_effect=[None, "a" * 40]),
@@ -226,6 +229,7 @@ class OnlineUpdateTest(unittest.TestCase):
                 patch.object(update, "require_idle"),
                 patch.object(update, "prepare_dependencies"),
                 patch.object(update, "configure_data_volume"),
+                patch.object(update, "prepare_first_install_network"),
                 patch.object(update, "CONFIG", config),
                 patch.object(update, "download", side_effect=self.download),
                 patch.object(update, "current_commit", side_effect=[None, "a" * 40]),
@@ -238,6 +242,118 @@ class OnlineUpdateTest(unittest.TestCase):
             cache = self.root / ("private-cache" if os.geteuid() == 0 else ".cache/openaria")
             self.assertEqual(cache.stat().st_mode & 0o777, 0o700)
             self.assertEqual(os.umask(0o077), 0o077)
+        finally:
+            os.umask(previous_umask)
+
+    def test_fresh_wifi_is_retained_without_activating_or_changing_original(self):
+        state = self.root / "network-state"
+        profiles = self.root / "profiles"
+        profiles.mkdir()
+        original = profiles / "factory.nmconnection"
+        original.write_bytes(b"factory-profile-and-private-credentials")
+        source_uuid = "ab012345-6789-4567-890a-bcdef0123456"
+        fields = {
+            "GENERAL.CON-UUID": source_uuid,
+            "802-11-wireless.mode": "infrastructure",
+            "802-11-wireless.ssid": "Existing Wi-Fi",
+            "802-11-wireless-security.key-mgmt": "wpa-psk",
+            "802-11-wireless-security.psk-flags": "0 (none)",
+            "802-11-wireless-security.psk": "test-only-password",
+            "IP4.GATEWAY": "192.168.1.1",
+            "connection.stable-id": "",
+        }
+
+        def nmcli(argv, **kwargs):
+            if "-g" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, fields[argv[argv.index("-g") + 1]] + "\n"
+                )
+            if "clone" in argv:
+                path = profiles / (argv[-1] + ".nmconnection")
+                path.write_bytes(original.read_bytes())
+                path.chmod(0o600)
+            elif "modify" in argv:
+                self.assertIn("connection.autoconnect", argv)
+                self.assertIn("no", argv)
+                self.assertEqual(argv[-1], source_uuid)
+            else:
+                self.fail(f"unexpected network mutation: {argv}")
+            return subprocess.CompletedProcess(argv, 0, "")
+
+        with (
+            patch.object(update, "NETWORK_STATE", state),
+            patch.object(update, "NETWORK_PROFILES", profiles),
+            patch.object(update.subprocess, "run", side_effect=nmcli) as run,
+            patch.dict(
+                os.environ,
+                {"RP_YLX_NETWORK_STATE_DIR": str(state), "RP_YLX_NM_PROFILE_DIR": str(profiles)},
+            ),
+        ):
+            update.prepare_first_install_network()
+            record = state / "lkg-wlan0.json"
+            self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(fields["802-11-wireless-security.psk"], record.read_text())
+            self.assertEqual(original.read_bytes(), b"factory-profile-and-private-credentials")
+            # The actual controller must load this as a reconnectable Wi-Fi target.
+            snapshot = NetworkStateStore(state).snapshot()
+            self.assertEqual(snapshot["desired"]["mode"], "wifi-client")
+            candidate = saved_network_candidate("wifi-client")
+            self.assertEqual(candidate["config"]["ssid"], "Existing Wi-Fi")
+            run.reset_mock()
+            update.prepare_first_install_network()
+            run.assert_not_called()
+
+    def test_fresh_wifi_unsupported_or_missing_credentials_stop_before_clone(self):
+        cases = [("key-mgmt", "wpa-eap"), ("psk-flags", "1 (agent-owned)"), ("psk", "")]
+        for suffix, rejected in cases:
+            with self.subTest(field=suffix):
+                fields = {
+                    "GENERAL.CON-UUID": "ab012345-6789-4567-890a-bcdef0123456",
+                    "802-11-wireless.mode": "infrastructure",
+                    "802-11-wireless.ssid": "Existing Wi-Fi",
+                    "802-11-wireless-security.key-mgmt": "wpa-psk",
+                    "802-11-wireless-security.psk-flags": "0",
+                    "802-11-wireless-security.psk": "test-only-password",
+                    "IP4.GATEWAY": "192.168.1.1",
+                }
+                fields["802-11-wireless-security." + suffix] = rejected
+
+                def nmcli(argv, fields=fields, **kwargs):
+                    self.assertIn("-g", argv, "must not clone or activate on invalid input")
+                    return subprocess.CompletedProcess(argv, 0, fields[argv[argv.index("-g") + 1]])
+
+                with (
+                    patch.object(update, "NETWORK_STATE", self.root / "unused-state"),
+                    patch.object(update.subprocess, "run", side_effect=nmcli),
+                    self.assertRaises(ValueError),
+                ):
+                    update.prepare_first_install_network()
+
+    def test_wired_first_install_without_wifi_does_not_create_wifi_state(self):
+        state = self.root / "unused-state"
+        with (
+            patch.object(update, "NETWORK_STATE", state),
+            patch.object(
+                update.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "--\n")
+            ) as run,
+        ):
+            update.prepare_first_install_network()
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(state.exists())
+
+    def test_installed_updater_is_readable_despite_private_bootstrap_umask(self):
+        directory = self.root / "updater"
+        launcher = self.root / "openaria-update"
+        previous_umask = os.umask(0o077)
+        try:
+            with (
+                patch.object(update, "UPDATER_DIRECTORY", directory),
+                patch.object(update, "UPDATE_COMMAND", launcher),
+            ):
+                update.install_update_command(self.output / "update.py")
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((directory / "update.py").stat().st_mode & 0o777, 0o644)
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
         finally:
             os.umask(previous_umask)
 

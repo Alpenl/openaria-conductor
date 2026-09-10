@@ -21,6 +21,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -32,6 +33,140 @@ MAX_UNPACKED = 4 * 1024**3
 CONFIG = Path("/etc/rp-ylx/device.json")
 CURRENT = Path("/opt/rp-ylx/current")
 DEFAULT_CACHE = Path("/var/cache/openaria")
+NETWORK_STATE = Path("/var/lib/rp-ylx-network")
+NETWORK_PROFILES = Path("/etc/NetworkManager/system-connections")
+UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
+UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
+
+
+def prepare_first_install_network() -> None:
+    """Retain an active factory Wi-Fi profile before the controller starts.
+
+    The controller validates its rescue AP at boot, then restores its saved
+    target. Without a saved target a factory Wi-Fi installation stays on the AP.
+    NetworkManager clones credentials internally; none enter JSON or logs.
+    """
+    if any(
+        (NETWORK_STATE / name).exists()
+        for name in ("controller-state.json", "lkg-wlan0.json", "lkg-eth0.json", "rescue.json")
+    ):
+        return
+
+    def nmcli(*args: str) -> str:
+        result = subprocess.run(
+            ["nmcli", "--escape", "no", *args], capture_output=True, text=True, timeout=30
+        )
+        if result.returncode:
+            # Never include nmcli output: queries may contain credentials.
+            raise ValueError("无法保存当前 Wi-Fi 配置，尚未激活固件")
+        return result.stdout.rstrip("\n")
+
+    connection = nmcli("-g", "GENERAL.CON-UUID", "device", "show", "wlan0")
+    if connection in {"", "--"}:
+        return
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", connection):
+        raise ValueError("当前 Wi-Fi 连接身份无效")
+
+    def field(name: str) -> str:
+        return nmcli("-g", name, "connection", "show", "uuid", connection)
+
+    if field("802-11-wireless.mode") != "infrastructure":
+        raise ValueError("首次安装需要现有 Wi-Fi 客户端连接或有线网络")
+    ssid = field("802-11-wireless.ssid")
+    security = {"wpa-psk": "wpa2-personal", "sae": "wpa3-personal", "": "open", "--": "open"}.get(
+        field("802-11-wireless-security.key-mgmt")
+    )
+    if security is None or not 1 <= len(ssid.encode()) <= 32 or any(ord(c) < 32 for c in ssid):
+        raise ValueError("当前 Wi-Fi 安全类型或 SSID 不支持自动继承，请通过有线网络安装")
+    if not nmcli("-g", "IP4.GATEWAY", "device", "show", "wlan0").strip("- "):
+        raise ValueError("当前 Wi-Fi 缺少 IPv4 网关，无法验证启动后的管理链路")
+    secret = None
+    if security != "open":
+        if field("802-11-wireless-security.psk-flags") not in {"0", "0 (none)"}:
+            raise ValueError("当前 Wi-Fi 凭据未由系统持久保存，请通过有线网络安装")
+        secret = nmcli(
+            "--show-secrets",
+            "-g",
+            "802-11-wireless-security.psk",
+            "connection",
+            "show",
+            "uuid",
+            connection,
+        )
+        if not secret:
+            raise ValueError("当前 Wi-Fi 缺少已保存凭据，尚未激活固件")
+    stable_id = field("connection.stable-id")
+    if stable_id in {"", "--"}:
+        stable_id = connection
+    else:
+        stable_id = stable_id.replace("${CONNECTION}", connection)
+    profile = "rp-ylx-wifi-client-" + uuid.uuid4().hex[:12]
+    NETWORK_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = NETWORK_STATE.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise ValueError("网络状态目录权限不安全")
+    nmcli("connection", "clone", "uuid", connection, profile)
+    try:
+        nmcli(
+            "connection",
+            "modify",
+            "id",
+            profile,
+            "connection.autoconnect",
+            "no",
+            "connection.interface-name",
+            "wlan0",
+            "connection.permissions",
+            "",
+            "connection.stable-id",
+            stable_id,
+        )
+        path = NETWORK_PROFILES / (profile + ".nmconnection")
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise ValueError("继承的 Wi-Fi profile 必须由 NetworkManager 保存为 0600 普通文件")
+        if (
+            secret is not None
+            and nmcli(
+                "--show-secrets",
+                "-g",
+                "802-11-wireless-security.psk",
+                "connection",
+                "show",
+                "id",
+                profile,
+            )
+            != secret
+        ):
+            raise ValueError("Wi-Fi 副本未完整保存凭据，尚未激活固件")
+        del secret
+        if nmcli("-g", "GENERAL.CON-UUID", "device", "show", "wlan0") != connection:
+            raise ValueError("准备安装时 Wi-Fi 已切换，停止激活固件")
+        record = {
+            "format": "ylx.network-lkg.v0",
+            "mode": "wifi-client",
+            "interface": "wlan0",
+            "profile": profile,
+            "config": {"mode": "wifi-client", "ssid": ssid, "security": security},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", dir=NETWORK_STATE, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(record, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(NETWORK_STATE / "lkg-wlan0.json")
+    except BaseException:
+        nmcli("connection", "delete", "id", profile)
+        raise
+    print("已保存当前 Wi-Fi 的受管副本；首次启动验证热点后会自动重连", file=sys.stderr, flush=True)
 
 
 def sha256(path: Path) -> str:
@@ -331,14 +466,15 @@ def fetch_updater(manifest: dict, directory: Path) -> Path:
 
 
 def install_update_command(source: Path) -> None:
-    directory = Path("/usr/local/lib/openaria")
+    directory = UPDATER_DIRECTORY
     directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o755)
     target = directory / "update.py"
     temporary = directory / ".update.py.tmp"
     temporary.write_bytes(source.read_bytes())
     temporary.chmod(0o644)
     temporary.replace(target)
-    launcher = Path("/usr/local/sbin/openaria-update")
+    launcher = UPDATE_COMMAND
     launcher.parent.mkdir(parents=True, exist_ok=True)
     temporary = launcher.with_name(".openaria-update.tmp")
     temporary.write_text(
@@ -418,6 +554,8 @@ def main(argv=None) -> int:
             prepare_dependencies()
             configure_data_volume()
             require_idle()
+            if current is None:
+                prepare_first_install_network()
             print("校验通过，正在安装并等待服务就绪…", file=sys.stderr, flush=True)
             subprocess.run(
                 ["/usr/bin/python3", str(bundle / "rdk_x5_install.py"), "install", str(bundle)],
