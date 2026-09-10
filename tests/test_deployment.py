@@ -218,10 +218,9 @@ class ReleaseManagerTest(unittest.TestCase):
         config_path = self.config_root / "device.json"
         installed_config = json.loads(config_path.read_bytes())
         identity = installed_config["device"]
-        self.assertEqual(installed_config["security"]["profile"], "customer")
-        self.assertTrue(Path(installed_config["security"]["bearer_token_file"]).is_file())
-        self.assertTrue(Path(installed_config["security"]["tls_certificate_file"]).is_file())
-        self.assertTrue(Path(installed_config["security"]["tls_private_key_file"]).is_file())
+        self.assertEqual(installed_config["security"], {"profile": "lab", "isolated_network": True})
+        self.assertFalse((self.config_root / "customer.token").exists())
+        self.assertFalse((self.config_root / "tls").exists())
         self.assertEqual(installed_config["camera"]["data_plane"], "rust")
         self.assertEqual(
             installed_config["audio"],
@@ -519,7 +518,7 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(unsafe.exception.code, "network_profile_migration_unsafe")
         self.assertFalse((self.install_root / "current").exists())
 
-    def test_customer_install_generates_and_preserves_tls_token_and_https_mdns(self) -> None:
+    def test_customer_upgrade_migrates_to_http_and_preserves_identity_files(self) -> None:
         manager = self.manager()
 
         def generate(certificate: Path, private_key: Path, common_name: str) -> None:
@@ -528,9 +527,11 @@ class ReleaseManagerTest(unittest.TestCase):
 
         generator = MagicMock(side_effect=generate)
         manager.tls_material_generator = generator
-        manager.install(self.bundle("a"), activate=False)
-
-        installed = json.loads((self.config_root / "device.json").read_bytes())
+        manager._ensure_layout()
+        legacy = manager._default_device_config()
+        legacy["security"] = {"profile": "customer", "isolated_network": True}
+        installed = manager._ensure_customer_identity(legacy)
+        _write_atomic(self.config_root / "device.json", installed)
         security = installed["security"]
         token = Path(security["bearer_token_file"])
         certificate = Path(security["tls_certificate_file"])
@@ -541,16 +542,20 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(token.stat().st_mode & 0o777, 0o640)
         self.assertEqual(certificate.stat().st_mode & 0o777, 0o644)
         self.assertEqual(private_key.stat().st_mode & 0o777, 0o640)
-        self.assertEqual((self.config_root / "device.json").stat().st_mode & 0o777, 0o640)
         identity_before = {
             "token": token.read_bytes(),
             "certificate": certificate.read_bytes(),
             "private_key": private_key.read_bytes(),
             "device": installed["device"],
         }
+        manager.install(self.bundle("a"), activate=False)
+        migrated = json.loads((self.config_root / "device.json").read_bytes())
+        self.assertEqual(migrated["security"], {"profile": "lab", "isolated_network": True})
+        self.assertEqual((self.config_root / "device.json").stat().st_mode & 0o777, 0o640)
         advertised = (self.root / "etc/avahi/services/rp-ylx.service").read_text(encoding="utf-8")
-        self.assertIn("<type>_https._tcp</type>", advertised)
-        self.assertIn("<txt-record>scheme=https</txt-record>", advertised)
+        self.assertIn("<type>_http._tcp</type>", advertised)
+        self.assertIn("<txt-record>scheme=http</txt-record>", advertised)
+        self.assertNotIn("_https._tcp", advertised)
         self.assertIn("<txt-record>api=/api/v4/device</txt-record>", advertised)
 
         manager.install(self.bundle("b"), activate=False)
@@ -559,9 +564,10 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(certificate.read_bytes(), identity_before["certificate"])
         self.assertEqual(private_key.read_bytes(), identity_before["private_key"])
         self.assertEqual(upgraded["device"], identity_before["device"])
+        self.assertEqual(upgraded["security"], {"profile": "lab", "isolated_network": True})
         generator.assert_called_once()
 
-    def test_customer_install_rejects_existing_identity_outside_config_root(self) -> None:
+    def test_legacy_customer_identity_rejects_existing_path_outside_config_root(self) -> None:
         manager = self.manager()
         manager._ensure_layout()
         outside = self.root / "outside-customer.token"
@@ -569,32 +575,35 @@ class ReleaseManagerTest(unittest.TestCase):
         outside.write_bytes(payload)
         outside.chmod(0o644)
         config = manager._default_device_config()
+        config["security"]["profile"] = "customer"
         config["security"]["bearer_token_file"] = str(outside)
         _write_atomic(self.config_root / "device.json", config)
 
         with self.assertRaises(DeploymentError) as rejected:
-            manager.install(self.bundle("a"), activate=False)
+            manager._ensure_customer_identity(config)
 
         self.assertEqual(rejected.exception.code, "customer_identity_path_unmanaged")
         self.assertEqual(outside.read_bytes(), payload)
         self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
         self.assertFalse((self.install_root / "current").exists())
 
-    def test_customer_install_rejects_symlinked_identity_parent(self) -> None:
+    def test_legacy_customer_identity_rejects_symlinked_parent(self) -> None:
         manager = self.manager()
         manager._ensure_layout()
         outside = self.root / "outside-tls"
         outside.mkdir()
         (self.config_root / "tls").symlink_to(outside, target_is_directory=True)
+        config = manager._default_device_config()
+        config["security"]["profile"] = "customer"
 
         with self.assertRaises(DeploymentError) as rejected:
-            manager.install(self.bundle("a"), activate=False)
+            manager._ensure_customer_identity(config)
 
         self.assertEqual(rejected.exception.code, "customer_identity_path_unsafe")
         self.assertEqual(list(outside.iterdir()), [])
         self.assertFalse((self.install_root / "current").exists())
 
-    def test_customer_tls_upgrade_failure_and_rollback_restore_release_config(self) -> None:
+    def test_http_migration_failure_and_rollback_keep_http_and_identity(self) -> None:
         manager = self.manager()
         self.seed_lab_config(manager)
         manager.install(self.bundle("a"), activate=False)
@@ -611,6 +620,7 @@ class ReleaseManagerTest(unittest.TestCase):
         }
         _write_atomic(config_path, legacy_config)
         config_path.chmod(0o640)
+        http_config = {**legacy_config, "security": {"profile": "lab", "isolated_network": True}}
 
         def generate(certificate: Path, private_key: Path, common_name: str) -> None:
             certificate.write_bytes(f"certificate:{common_name}".encode())
@@ -620,14 +630,14 @@ class ReleaseManagerTest(unittest.TestCase):
         manager.tls_material_generator = generator
 
         def fail_health() -> None:
-            raise DeploymentError("service_unhealthy", "TLS release did not become ready")
+            raise DeploymentError("service_unhealthy", "release did not become ready")
 
         manager.health_checker = fail_health
         bundle_b = self.bundle("b")
         with self.assertRaises(DeploymentError):
             manager.install(bundle_b)
         self.assertEqual(manager.status()["current"], self.commit("a"))
-        self.assertEqual(json.loads(config_path.read_bytes()), legacy_config)
+        self.assertEqual(json.loads(config_path.read_bytes()), http_config)
         restored_mdns = (self.root / "etc/avahi/services/rp-ylx.service").read_text(
             encoding="utf-8"
         )
@@ -635,14 +645,12 @@ class ReleaseManagerTest(unittest.TestCase):
 
         manager.health_checker = lambda: self.commands.append(("health-check",))
         manager.install(bundle_b)
-        tls_config = json.loads(config_path.read_bytes())
-        self.assertIn("tls_certificate_file", tls_config["security"])
-        self.assertIn("tls_private_key_file", tls_config["security"])
-        generator.assert_called_once()
+        self.assertEqual(json.loads(config_path.read_bytes()), http_config)
+        generator.assert_not_called()
 
         manager.rollback()
         self.assertEqual(manager.status()["current"], self.commit("a"))
-        self.assertEqual(json.loads(config_path.read_bytes()), legacy_config)
+        self.assertEqual(json.loads(config_path.read_bytes()), http_config)
         self.assertEqual(token.read_text(encoding="ascii"), "legacy-token-" + "x" * 40 + "\n")
 
     def test_lab_install_stays_http_and_does_not_create_customer_identity(self) -> None:
