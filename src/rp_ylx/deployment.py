@@ -55,7 +55,9 @@ FORBIDDEN_NETWORK_STATE_KEYS = frozenset(
     {"credential_ref", "password", "passphrase", "psk", "secret", "token"}
 )
 NETWORKMANAGER_CONNECTIONS_RELATIVE = Path("etc/NetworkManager/system-connections")
-MANAGED_WIFI_PROFILE = re.compile(r"rp-ylx-wifi-client-[0-9a-f]{12}\.nmconnection")
+MANAGED_WIFI_PROFILE = re.compile(
+    r"rp-ylx-(?:wifi-client|hotspot(?:-rescue)?)-[0-9a-f]{12}\.nmconnection"
+)
 MAX_NETWORKMANAGER_PROFILE_BYTES = 1024 * 1024
 CUSTOMER_TOKEN_NAME = "customer.token"
 CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")

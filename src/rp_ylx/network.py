@@ -659,7 +659,7 @@ def _network_manager_profile(name: str, config: Mapping[str, Any]) -> bytes:
         f"uuid={profile_uuid}",
         f"type={'wifi' if interface == WIFI_INTERFACE else 'ethernet'}",
         f"interface-name={interface}",
-        f"autoconnect={'false' if mode == 'wifi-client' else 'true'}",
+        f"autoconnect={'false' if mode in {'wifi-client', 'hotspot'} else 'true'}",
         f"autoconnect-priority={priority}",
         "",
     ]
@@ -730,7 +730,7 @@ def _public_rescue_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return deepcopy(dict(record))
 
 
-def _migrate_rescue_profile_password(record: Mapping[str, Any]) -> None:
+def _migrate_rescue_profile(record: Mapping[str, Any]) -> None:
     profile = str(record["profile"])
     profile_path = _profile_dir() / f"{profile}.nmconnection"
     config = {
@@ -784,7 +784,7 @@ def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
         existing = _read_json(rescue_path)
         if existing is not None:
             public = _public_rescue_record(existing)
-            _migrate_rescue_profile_password(public)
+            _migrate_rescue_profile(public)
             return public
 
         digest = hashlib.sha256(device_id.encode()).hexdigest()
@@ -987,6 +987,37 @@ def saved_network_is_healthy(mode: str) -> bool:
     with _network_lock(state_dir):
         record = _saved_record_for_mode(state_dir, mode)
         snapshot = _device_snapshot(_interface(mode))
+        source_uuid = record.get("bootstrap_connection_uuid")
+        if (
+            mode == "wifi-client"
+            and snapshot.get("connected")
+            and snapshot.get("connection") != record.get("profile")
+            and isinstance(source_uuid, str)
+            and re.fullmatch(r"[0-9a-fA-F-]{36}", source_uuid)
+        ):
+            active = _run_nmcli(
+                ["--get-values", "GENERAL.CON-UUID", "device", "show", WIFI_INTERFACE], timeout=10
+            )
+            if active.returncode == 0 and active.stdout.strip() == source_uuid:
+                ssid = _run_nmcli(
+                    [
+                        "--escape",
+                        "no",
+                        "--get-values",
+                        "802-11-wireless.ssid",
+                        "connection",
+                        "show",
+                        "uuid",
+                        source_uuid,
+                    ],
+                    timeout=10,
+                )
+                if ssid.returncode == 0 and ssid.stdout.rstrip("\n") == record["config"].get(
+                    "ssid"
+                ):
+                    # The original active profile is the source of this saved
+                    # clone. Preserve it until a reconnect is actually needed.
+                    snapshot = {**snapshot, "connection": record["profile"]}
         return _health_reason(record, snapshot) is None
 
 

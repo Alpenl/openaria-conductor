@@ -1042,7 +1042,7 @@ class NetworkControllerCoreTest(unittest.TestCase):
             for command in nmcli.commands
             if "connection" in command and "up" in command and rescue_profile in command
         ]
-        self.assertEqual(len(rescue_activations), 2)
+        self.assertEqual(len(rescue_activations), 1)
 
     def test_activation_deadline_includes_snapshot_and_is_strict_at_ten_seconds(self) -> None:
         from tests.test_network import FakeNmcli
@@ -1806,7 +1806,92 @@ class NetworkControllerCoreTest(unittest.TestCase):
         self.assertEqual(restored["transaction"]["latest"]["operation"], "retry")
         self.assertNotIn("health-secret-123", json.dumps(restored))
 
-    def test_boot_starts_rescue_then_restores_saved_client_without_restart_churn(self) -> None:
+    def test_factory_wifi_install_and_boot_only_use_hotspot_after_connection_failure(self) -> None:
+        from tests.test_network import FakeNmcli
+
+        for reconnect, fail, legacy in (
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (False, False, True),
+        ):
+            with (
+                self.subTest(reconnect=reconnect, fail=fail, legacy=legacy),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                profiles = root / "profiles"
+                profiles.mkdir()
+                original = profiles / "factory.nmconnection"
+                original.write_text(
+                    "[connection]\nid=Factory Wi-Fi\nuuid=ab012345-6789-4567-890a-bcdef0123456\n"
+                    "type=wifi\n[wifi]\nmode=infrastructure\nssid=Existing Wi-Fi\n"
+                    "[wifi-security]\nkey-mgmt=wpa-psk\npsk-flags=0\npsk=test-only-password\n"
+                    "[ipv4]\nmethod=auto\n"
+                )
+                original.chmod(0o600)
+                original_bytes = original.read_bytes()
+                boot_id_path = root / "boot-id"
+                boot_id_path.write_text("11111111-1111-4111-8111-111111111111\n")
+                environment = {
+                    "RP_YLX_NETWORK_STATE_DIR": str(root / "state"),
+                    "RP_YLX_NM_PROFILE_DIR": str(profiles),
+                    "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
+                    "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
+                }
+                nmcli = FakeNmcli(profiles)
+                nmcli.active["wlan0"] = "Factory Wi-Fi"
+                nmcli.addresses["wlan0"] = "192.168.50.20/24"
+                nmcli.routes["wlan0"] = "dst = 0.0.0.0/0, nh = 192.168.50.1, mt = 600"
+                with (
+                    patch.dict(os.environ, environment),
+                    patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+                ):
+                    if legacy:
+                        NetworkStateStore(root / "state")
+                    first = NetworkController(
+                        device_id="factory-test", start_worker=False, require_root=False
+                    )
+                    try:
+                        self.assertEqual(first._state.snapshot()["desired"]["mode"], "wifi-client")
+                        first._monitor_once(now_ns=0)
+                        first._monitor_once(now_ns=30_000_000_000)
+                        self.assertFalse(any("up" in command for command in nmcli.commands))
+                        self.assertEqual(nmcli.active["wlan0"], "Factory Wi-Fi")
+                        candidate = json.loads((root / "state/lkg-wlan0.json").read_text())[
+                            "profile"
+                        ]
+                        rescue = json.loads((root / "state/rescue.json").read_text())["profile"]
+                    finally:
+                        first.close()
+                    boot_id_path.write_text("22222222-2222-4222-8222-222222222222\n")
+                    if reconnect:
+                        nmcli.active["wlan0"] = ""
+                        nmcli.addresses["wlan0"] = ""
+                        nmcli.routes["wlan0"] = ""
+                    if fail:
+                        nmcli.fail_modes["wifi-client"] = "Secrets were required, but not provided"
+                    nmcli.commands.clear()
+                    rebooted = NetworkController(
+                        device_id="factory-test", start_worker=False, require_root=False
+                    )
+                    try:
+                        activations = [
+                            command[command.index("id") + 1]
+                            for command in nmcli.commands
+                            if "connection" in command and "up" in command
+                        ]
+                        expected = [candidate, rescue] if fail else [candidate] if reconnect else []
+                        self.assertEqual(activations, expected)
+                        self.assertEqual(original.read_bytes(), original_bytes)
+                        self.assertEqual(
+                            nmcli.active["wlan0"],
+                            rescue if fail else candidate if reconnect else "Factory Wi-Fi",
+                        )
+                    finally:
+                        rebooted.close()
+
+    def test_boot_preserves_healthy_wifi_without_hotspot_or_restart_churn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             boot_id_path = root / "boot-id"
@@ -1912,11 +1997,10 @@ class NetworkControllerCoreTest(unittest.TestCase):
                     rebooted.close()
 
         self.assertEqual(nmcli.active["wlan0"], client_profile)
-        self.assertGreaterEqual(len(reboot_activations), 2)
-        self.assertEqual(reboot_activations[0], rescue_profile)
-        self.assertEqual(reboot_activations[-1], client_profile)
+        self.assertEqual(reboot_activations, [])
         self.assertEqual(status["transaction"]["latest"]["status"], "committed")
-        self.assertEqual(status["transaction"]["latest"]["operation"], "retry")
+        self.assertEqual(status["transaction"]["latest"]["operation"], "apply")
+        self.assertFalse(status["transaction"]["latest"]["rescue"]["ap_validated"])
 
     def test_reboot_retries_rescued_client_without_same_boot_retry_loop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2017,9 +2101,7 @@ class NetworkControllerCoreTest(unittest.TestCase):
 
             persisted = (root / "state/controller-state.json").read_text(encoding="utf-8")
 
-        self.assertGreaterEqual(len(reboot_activations), 2)
-        self.assertEqual(reboot_activations[0], rescue_profile)
-        self.assertEqual(reboot_activations[-1], candidate_profile)
+        self.assertEqual(reboot_activations, [candidate_profile])
         self.assertEqual(after_reboot["transaction"]["latest"]["status"], "committed")
         self.assertEqual(after_reboot["transaction"]["latest"]["operation"], "retry")
         self.assertNotEqual(after_reboot["transaction"]["latest"]["transaction_id"], original_id)
@@ -2462,6 +2544,7 @@ class NetworkControlTest(unittest.TestCase):
                 return_value={"ssid": "YLX-TEST", "interface": "wlan0"},
             ),
             patch("rp_ylx.network_control.rescue_network"),
+            patch("rp_ylx.network_control.prepare_first_install_network"),
         ):
             controller = NetworkController(
                 device_id="device-deferred",

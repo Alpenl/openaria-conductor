@@ -478,6 +478,13 @@ class ReleaseManagerTest(unittest.TestCase):
         )
         managed.write_bytes(original)
         managed.chmod(0o600)
+        hotspots = [
+            connections / f"rp-ylx-{mode}-33fb909c78fc.nmconnection"
+            for mode in ("hotspot", "hotspot-rescue")
+        ]
+        for hotspot in hotspots:
+            hotspot.write_bytes(original)
+            hotspot.chmod(0o600)
         unmanaged = connections / "HKU-CGVU.nmconnection"
         unmanaged.write_bytes(original)
 
@@ -487,6 +494,9 @@ class ReleaseManagerTest(unittest.TestCase):
 
         expected = original.replace(b"autoconnect=true", b"autoconnect=false", 1)
         self.assertEqual(managed.read_bytes(), expected)
+        for hotspot in hotspots:
+            self.assertEqual(hotspot.read_bytes(), expected)
+            self.assertEqual(hotspot.stat().st_mode & 0o777, 0o600)
         self.assertEqual(unmanaged.read_bytes(), original)
         self.assertEqual(managed.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.commands.count(("nmcli", "connection", "reload")), 1)

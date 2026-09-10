@@ -39,22 +39,41 @@ UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
 
 
-def prepare_first_install_network() -> None:
+def prepare_first_install_network(
+    *, state_dir: Path | None = None, profile_dir: Path | None = None
+) -> None:
     """Retain an active factory Wi-Fi profile before the controller starts.
 
-    The controller validates its rescue AP at boot, then restores its saved
-    target. Without a saved target a factory Wi-Fi installation stays on the AP.
+    The active source UUID lets the controller keep the working connection;
+    the saved clone provides a reconnect target if that connection is lost.
     NetworkManager clones credentials internally; none enter JSON or logs.
     """
-    if any(
-        (NETWORK_STATE / name).exists()
-        for name in ("controller-state.json", "lkg-wlan0.json", "lkg-eth0.json", "rescue.json")
+    state_dir = NETWORK_STATE if state_dir is None else state_dir
+    profile_dir = NETWORK_PROFILES if profile_dir is None else profile_dir
+    if any((state_dir / name).exists() for name in ("lkg-wlan0.json", "lkg-eth0.json")):
+        return
+    controller_path = state_dir / "controller-state.json"
+    controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
+    if controller is not None and not isinstance(controller, dict):
+        raise ValueError("网络控制器状态无效，停止继承 Wi-Fi")
+    if controller is not None and not (
+        controller.get("schema") == "ylx.network-controller-state.v1"
+        and controller.get("desired", {}).get("mode") == "hotspot"
+        and controller.get("transaction") == {"current": None, "latest": None}
+        and controller.get("saved") is False
+        and controller.get("verified") is False
+        and controller.get("receipts") == {}
+        and controller.get("work") == {}
     ):
         return
 
     def nmcli(*args: str) -> str:
         result = subprocess.run(
-            ["nmcli", "--escape", "no", *args], capture_output=True, text=True, timeout=30
+            ["nmcli", "--escape", "no", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode:
             # Never include nmcli output: queries may contain credentials.
@@ -70,7 +89,10 @@ def prepare_first_install_network() -> None:
     def field(name: str) -> str:
         return nmcli("-g", name, "connection", "show", "uuid", connection)
 
-    if field("802-11-wireless.mode") != "infrastructure":
+    mode = field("802-11-wireless.mode")
+    if mode == "ap":
+        return
+    if mode != "infrastructure":
         raise ValueError("首次安装需要现有 Wi-Fi 客户端连接或有线网络")
     ssid = field("802-11-wireless.ssid")
     security = {"wpa-psk": "wpa2-personal", "sae": "wpa3-personal", "": "open", "--": "open"}.get(
@@ -101,8 +123,8 @@ def prepare_first_install_network() -> None:
     else:
         stable_id = stable_id.replace("${CONNECTION}", connection)
     profile = "rp-ylx-wifi-client-" + uuid.uuid4().hex[:12]
-    NETWORK_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = NETWORK_STATE.lstat()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = state_dir.lstat()
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
@@ -125,7 +147,7 @@ def prepare_first_install_network() -> None:
             "connection.stable-id",
             stable_id,
         )
-        path = NETWORK_PROFILES / (profile + ".nmconnection")
+        path = profile_dir / (profile + ".nmconnection")
         metadata = path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -155,18 +177,45 @@ def prepare_first_install_network() -> None:
             "mode": "wifi-client",
             "interface": "wlan0",
             "profile": profile,
+            "bootstrap_connection_uuid": connection,
             "config": {"mode": "wifi-client", "ssid": ssid, "security": security},
         }
-        with tempfile.NamedTemporaryFile(mode="w", dir=NETWORK_STATE, delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(record, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(NETWORK_STATE / "lkg-wlan0.json")
+
+        def save_state(path: Path, value: dict) -> None:
+            with tempfile.NamedTemporaryFile(mode="w", dir=state_dir, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(value, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        save_state(state_dir / "lkg-wlan0.json", record)
+        if controller is not None:
+            # Migrate only untouched first-boot hotspot defaults. An explicit
+            # user transaction or previously saved network always takes priority.
+            controller.update(
+                desired={
+                    "mode": "wifi-client",
+                    "ethernet": None,
+                    "wifi_client": {
+                        "ssid": ssid,
+                        "security": security,
+                        "credential_state": "absent" if security == "open" else "stored",
+                    },
+                },
+                saved=True,
+                verified=True,
+                source_revision=controller["source_revision"] + 1,
+            )
+            save_state(controller_path, controller)
     except BaseException:
+        (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
         nmcli("connection", "delete", "id", profile)
         raise
-    print("已保存当前 Wi-Fi 的受管副本；首次启动验证热点后会自动重连", file=sys.stderr, flush=True)
+    print("已保留当前 Wi-Fi 连接，并保存自动重连配置", file=sys.stderr, flush=True)
 
 
 def sha256(path: Path) -> str:

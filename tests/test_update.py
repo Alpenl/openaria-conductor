@@ -341,6 +341,25 @@ class OnlineUpdateTest(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertFalse(state.exists())
 
+    def test_bootstrap_preserves_explicit_user_hotspot_choice(self):
+        state = self.root / "network-choice"
+        state.mkdir()
+        path = state / "controller-state.json"
+        value = {
+            "schema": "ylx.network-controller-state.v1",
+            "desired": {"mode": "hotspot"},
+            "transaction": {"current": None, "latest": {"operation": "apply"}},
+        }
+        path.write_text(json.dumps(value))
+        before = path.read_bytes()
+        with (
+            patch.object(update, "NETWORK_STATE", state),
+            patch.object(update.subprocess, "run") as run,
+        ):
+            update.prepare_first_install_network()
+        run.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
     def test_installed_updater_is_readable_despite_private_bootstrap_umask(self):
         directory = self.root / "updater"
         launcher = self.root / "openaria-update"

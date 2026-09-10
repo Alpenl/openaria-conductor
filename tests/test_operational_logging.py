@@ -158,6 +158,7 @@ class OperationalLoggingTest(unittest.TestCase):
                     return_value={"ssid": "YLX-TEST", "interface": "wlan0"},
                 ),
                 patch("rp_ylx.network_control.rescue_network"),
+                patch("rp_ylx.network_control.prepare_first_install_network"),
                 patch("rp_ylx.network_control.saved_network_is_healthy", return_value=True),
                 patch("rp_ylx.network_control.cleanup_orphan_network_candidates"),
                 patch("rp_ylx.network_control.forget_network_client_profiles"),
@@ -229,6 +230,7 @@ class OperationalLoggingTest(unittest.TestCase):
                     return_value={"ssid": "YLX-TEST", "interface": "wlan0"},
                 ),
                 patch("rp_ylx.network_control.rescue_network"),
+                patch("rp_ylx.network_control.prepare_first_install_network"),
                 patch("rp_ylx.network_control.saved_network_is_healthy", return_value=True),
                 patch("rp_ylx.network_control.cleanup_orphan_network_candidates"),
             ):
