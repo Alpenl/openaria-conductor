@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("status", help="输出本机可用能力")
     validate = subcommands.add_parser("validate", help="验证一个已封存的录制会话目录")
     validate.add_argument("directory")
+    timestamps = subcommands.add_parser(
+        "timestamps",
+        help="导出已封存 Device Session 的逐帧左目、右目和 IMU 时间戳",
+    )
+    timestamps.add_argument("directory")
+    timestamps.add_argument("--output", help="可选 CSV 输出路径；省略时只输出摘要")
     probe = subcommands.add_parser("probe", help="只读探测 RDK X5 硬件和存储事实")
     probe.add_argument("--storage", default="/", help="需要测量容量的录制挂载点")
     probe.add_argument("--output", help="可选 JSON 输出文件；省略时写标准输出")
@@ -182,6 +188,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.output).write_text(rendered, encoding="utf-8")
         else:
             print(rendered, end="")
+        return 0
+    if args.command == "timestamps":
+        from rp_ylx.session_timestamps import SessionTimestampError, build_session_timestamp_report
+
+        try:
+            report = build_session_timestamp_report(
+                args.directory,
+                output=None if args.output is None else Path(args.output),
+            )
+        except (OSError, SessionTimestampError, ValueError) as exc:
+            code = str(getattr(exc, "code", "session_timestamps_failed"))
+            message = str(getattr(exc, "message", exc))
+            print(
+                json.dumps(
+                    {"ok": False, "error": {"code": code, "message": message}},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "benchmark":
         from rp_ylx.performance.benchmark import BenchmarkConfig, BenchmarkError, run_benchmark

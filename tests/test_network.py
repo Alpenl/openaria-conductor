@@ -48,7 +48,7 @@ class FakeNmcli:
         for path in self.profile_dir.glob("*.nmconnection"):
             profile = configparser.ConfigParser(interpolation=None)
             profile.read(path, encoding="utf-8")
-            if profile["connection"]["id"] == name:
+            if name in {profile["connection"]["id"], profile["connection"].get("uuid")}:
                 return profile
         raise AssertionError(f"找不到 NetworkManager profile：{name}")
 
@@ -64,6 +64,49 @@ class FakeNmcli:
         del check, capture_output, text
         self.commands.append(command)
         self.timeouts.append((command, timeout))
+        if command[-5:] in (
+            ["-g", "GENERAL.CON-UUID", "device", "show", "wlan0"],
+            ["--get-values", "GENERAL.CON-UUID", "device", "show", "wlan0"],
+        ):
+            profile = self.active["wlan0"]
+            value = self._load_profile(profile)["connection"]["uuid"] if profile else "--"
+            return subprocess.CompletedProcess(command, 0, value + "\n", "")
+        if "-g" in command and "device" in command:
+            field = command[command.index("-g") + 1]
+            if field == "IP4.GATEWAY":
+                return subprocess.CompletedProcess(command, 0, "192.168.50.1\n", "")
+            raise AssertionError(f"unsupported bootstrap device field: {field}")
+        if "-g" in command and "connection" in command and "show" in command:
+            field = command[command.index("-g") + 1]
+            profile = self._load_profile(command[-1])
+            section, key = field.split(".", 1)
+            section = {"802-11-wireless": "wifi", "802-11-wireless-security": "wifi-security"}.get(
+                section, section
+            )
+            value = profile.get(section, key, fallback="")
+            return subprocess.CompletedProcess(command, 0, value + "\n", "")
+        if "connection" in command and "clone" in command:
+            profile = self._load_profile(command[-2])
+            name = command[-1]
+            profile["connection"]["id"] = name
+            profile["connection"]["uuid"] = str(uuid.uuid4())
+            path = self.profile_dir / (name + ".nmconnection")
+            with path.open("w") as stream:
+                profile.write(stream)
+            path.chmod(0o600)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "connection" in command and "modify" in command:
+            name_index = command.index("id") + 1
+            name = command[name_index]
+            profile = self._load_profile(name)
+            for field, value in zip(
+                command[name_index + 1 :: 2], command[name_index + 2 :: 2], strict=True
+            ):
+                section, key = field.split(".", 1)
+                profile[section][key] = value
+            with (self.profile_dir / (name + ".nmconnection")).open("w") as stream:
+                profile.write(stream)
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[-4:] == ["--fields", "DEVICE,TYPE,STATE", "device", "status"]:
             return subprocess.CompletedProcess(
                 command,
@@ -85,11 +128,13 @@ class FakeNmcli:
             )
         if "--get-values" in command and "connection" in command and "show" in command:
             field = command[command.index("--get-values") + 1]
-            name = command[command.index("id") + 1]
+            name = command[-1]
             profile = self._load_profile(name)
             if field == "802-11-wireless-security.key-mgmt":
                 value = profile.get("wifi-security", "key-mgmt", fallback="")
                 return subprocess.CompletedProcess(command, 0, f"{value}\n", "")
+            if field == "802-11-wireless.ssid":
+                return subprocess.CompletedProcess(command, 0, profile["wifi"]["ssid"] + "\n", "")
             raise AssertionError(f"不支持的 NetworkManager profile 字段：{field}")
         if "connection" in command and "up" in command:
             name = command[command.index("id") + 1]
@@ -665,7 +710,7 @@ class NetworkCliTest(unittest.TestCase):
         profile = profile_path.read_text(encoding="utf-8")
         self.assertIn("mode=ap", profile)
         self.assertIn(f"psk={network_module.PUBLIC_RESCUE_AP_PSK}", profile)
-        self.assertIn("autoconnect=true", profile)
+        self.assertIn("autoconnect=false", profile)
 
         persisted = b"\n".join(
             path.read_bytes() for path in (self.root / "state").rglob("*") if path.is_file()
@@ -675,6 +720,21 @@ class NetworkCliTest(unittest.TestCase):
             sum(command[-2:] == ["connection", "reload"] for command in nmcli.commands),
             1,
         )
+
+    def test_controller_disables_legacy_rescue_autoconnect_without_activating(self) -> None:
+        nmcli = FakeNmcli(self.root / "profiles")
+        with (
+            patch.dict(os.environ, self.environment),
+            patch("rp_ylx.network.subprocess.run", side_effect=nmcli),
+        ):
+            rescue = network_module.ensure_rescue_ap("legacy-autoconnect")
+            profile_path = self.root / "profiles" / f"{rescue['profile']}.nmconnection"
+            expected = profile_path.read_bytes()
+            profile_path.write_bytes(expected.replace(b"autoconnect=false", b"autoconnect=true"))
+            nmcli.commands.clear()
+            network_module.ensure_rescue_ap("legacy-autoconnect")
+        self.assertEqual(profile_path.read_bytes(), expected)
+        self.assertFalse(any("up" in command for command in nmcli.commands))
 
     def test_controller_migrates_existing_rescue_ap_to_public_password(self) -> None:
         nmcli = FakeNmcli(self.root / "profiles")

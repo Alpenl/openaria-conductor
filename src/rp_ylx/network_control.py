@@ -24,6 +24,7 @@ from rp_ylx.network import (
     NETWORK_ACTIVATION_TIMEOUT_SECONDS,
     NetworkError,
     _network_operation_lock,
+    _profile_dir,
     _state_dir,
     activate_network_candidate,
     cleanup_orphan_network_candidates,
@@ -45,6 +46,7 @@ from rp_ylx.network_state import (
     valid_transaction,
 )
 from rp_ylx.operational_logging import operational_logger
+from rp_ylx.update import prepare_first_install_network
 
 CONTROL_REQUEST_SCHEMA = "ylx.network-control-request.v1"
 CONTROL_RESPONSE_SCHEMA = "ylx.network-control-response.v1"
@@ -566,6 +568,8 @@ class NetworkController:
             raise ValueError("network health intervals must be positive")
         self._credentials = credential_store or NetworkCredentialStore()
         self._boot_id = _controller_boot_id()
+        with _network_operation_lock():
+            prepare_first_install_network(state_dir=_state_dir(), profile_dir=_profile_dir())
         self._state = NetworkStateStore(_state_dir())
         with _network_operation_lock():
             self._rescue = ensure_rescue_ap(device_id or _controller_device_id())
@@ -755,7 +759,7 @@ class NetworkController:
         current = snapshot["transaction"]["current"]
         desired = snapshot["desired"]
         mode = str(desired["mode"])
-        new_boot = self._state.boot_requires_rescue(self._boot_id)
+        new_boot = self._state.boot_needs_reconcile(self._boot_id)
         _OPERATIONAL_LOG.event(
             "network_boot_reconcile_started",
             desired_mode=mode,
@@ -764,17 +768,7 @@ class NetworkController:
             saved=bool(snapshot["saved"]),
             verified=bool(snapshot["verified"]),
         )
-        rescue_healthy = False
-        if new_boot:
-            with _network_operation_lock():
-                rescue_network()
-                self._state.mark_boot_rescue_validated(self._boot_id)
-            rescue_healthy = True
-            _OPERATIONAL_LOG.event(
-                "network_boot_rescue_validated",
-                desired_mode=mode,
-                outcome="rescue_ap_ready",
-            )
+        self._state.mark_boot_reconciled(self._boot_id)
         if isinstance(current, Mapping):
             _OPERATIONAL_LOG.event(
                 "network_boot_reconcile_completed",
@@ -800,9 +794,8 @@ class NetworkController:
                     error_code=error.code,
                 )
         if mode == "hotspot":
-            if not rescue_healthy:
-                with _network_operation_lock():
-                    rescue_network()
+            with _network_operation_lock():
+                rescue_network()
             _OPERATIONAL_LOG.event(
                 "network_boot_reconcile_completed",
                 desired_mode=mode,
@@ -816,9 +809,8 @@ class NetworkController:
             "failed",
         }
         if terminal_retry and not new_boot:
-            if not rescue_healthy:
-                with _network_operation_lock():
-                    rescue_network()
+            with _network_operation_lock():
+                rescue_network()
             _OPERATIONAL_LOG.event(
                 "network_boot_reconcile_completed",
                 desired_mode=mode,
@@ -832,9 +824,8 @@ class NetworkController:
                 with _network_operation_lock():
                     candidate = saved_network_candidate(mode)
             except NetworkError as error:
-                if not rescue_healthy:
-                    with _network_operation_lock():
-                        rescue_network()
+                with _network_operation_lock():
+                    rescue_network()
                 _OPERATIONAL_LOG.event(
                     "network_boot_reconcile_completed",
                     level="warning",
@@ -861,8 +852,6 @@ class NetworkController:
                 "desired": deepcopy(desired),
                 "cleanup_work_ids": cleanup_work_ids,
             }
-        work["rescue_ready"] = rescue_healthy
-
         transaction_id = self._accept_system_transaction(
             desired=work["desired"],
             work=work,
@@ -1341,19 +1330,19 @@ class NetworkController:
                 desired=desired,
                 publish_desired=True,
             )
-            if work.get("rescue_ready") is not True:
+            kind = work.get("kind")
+            if kind in {"fallback", "rescue"}:
                 rescue_network(
                     deadline_ns=rescue_deadline_ns,
                     monotonic_ns=(self._monotonic_ns if rescue_deadline_ns is not None else None),
                 )
-            self._transition(
-                transaction_id,
-                status="running",
-                stage="ap_ready",
-                updated_at=_now(),
-                ap_validated=True,
-            )
-            kind = work.get("kind")
+                self._transition(
+                    transaction_id,
+                    status="running",
+                    stage="ap_ready",
+                    updated_at=_now(),
+                    ap_validated=True,
+                )
             if kind == "fallback":
                 fallback_error = work.get("fallback_error")
                 if not isinstance(fallback_error, Mapping):
@@ -1401,7 +1390,7 @@ class NetworkController:
                     status="running",
                     stage="activating",
                     updated_at=_now(),
-                    ap_validated=True,
+                    ap_validated=False,
                     deadline=deadline,
                 )
                 activate_network_candidate(
@@ -1421,7 +1410,7 @@ class NetworkController:
                     status="running",
                     stage="verifying",
                     updated_at=_now(),
-                    ap_validated=True,
+                    ap_validated=False,
                     deadline={**deadline, "remaining_seconds": remaining_seconds},
                 )
                 commit_network_candidate(candidate)
@@ -1439,7 +1428,7 @@ class NetworkController:
                 status="committed",
                 stage="committed",
                 updated_at=_now(),
-                ap_validated=True,
+                ap_validated=kind == "rescue",
                 recovery_action=(
                     "reconnect_target_lan" if kind == "candidate" else "reconnect_rescue_ap"
                 ),
@@ -2086,7 +2075,7 @@ def _notify_ready() -> None:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
             notifier.connect(address)
-            notifier.sendall(b"READY=1\nSTATUS=network rescue path reconciled")
+            notifier.sendall(b"READY=1\nSTATUS=network startup reconciled")
     except OSError as exc:
         raise NetworkError(
             "readiness_notification_failed",

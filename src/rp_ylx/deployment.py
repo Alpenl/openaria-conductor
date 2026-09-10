@@ -55,7 +55,9 @@ FORBIDDEN_NETWORK_STATE_KEYS = frozenset(
     {"credential_ref", "password", "passphrase", "psk", "secret", "token"}
 )
 NETWORKMANAGER_CONNECTIONS_RELATIVE = Path("etc/NetworkManager/system-connections")
-MANAGED_WIFI_PROFILE = re.compile(r"rp-ylx-wifi-client-[0-9a-f]{12}\.nmconnection")
+MANAGED_WIFI_PROFILE = re.compile(
+    r"rp-ylx-(?:wifi-client|hotspot(?:-rescue)?)-[0-9a-f]{12}\.nmconnection"
+)
 MAX_NETWORKMANAGER_PROFILE_BYTES = 1024 * 1024
 CUSTOMER_TOKEN_NAME = "customer.token"
 CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
@@ -1885,7 +1887,7 @@ class ReleaseManager:
             },
             "state_root": str(self.state_root),
             "device": dict(_default_device_identity(os.urandom(32))),
-            "security": {"profile": "customer", "isolated_network": True},
+            "security": {"profile": "lab", "isolated_network": True},
         }
 
     def _ensure_device_config(self) -> Mapping[str, object]:
@@ -1901,14 +1903,7 @@ class ReleaseManager:
             config: dict[str, object] = value
         else:
             config = self._default_device_config()
-        security = config.get("security")
-        profile = security.get("profile") if isinstance(security, Mapping) else None
-        if profile == "customer":
-            config = self._ensure_customer_identity(config)
-        elif profile != "lab":
-            raise DeploymentError("production_config_invalid", "security.profile 无效")
-        self._write_active_device_config(_json_bytes(config))
-        return config
+        return self._write_active_device_config(_json_bytes(config))
 
     @staticmethod
     def _device_config_profile(payload: bytes) -> tuple[str, bool]:
@@ -1935,8 +1930,15 @@ class ReleaseManager:
             mdns_target.parent.mkdir(parents=True, exist_ok=True)
             _write_bytes_atomic(mdns_target, payload, 0o644)
 
-    def _write_active_device_config(self, payload: bytes) -> None:
-        _, tls_enabled = self._device_config_profile(payload)
+    def _write_active_device_config(self, payload: bytes) -> Mapping[str, object]:
+        profile, _ = self._device_config_profile(payload)
+        config = json.loads(payload)
+        if profile == "customer":
+            # Device access is uniformly HTTP, including upgrades and old
+            # configuration snapshots restored during rollback. Retain old
+            # credential files on disk without using or rewriting them.
+            config["security"] = {"profile": "lab", "isolated_network": True}
+            payload = _json_bytes(config)
         path = self.config_root / "device.json"
         group_gid = self.group_resolver("rp-ylx")
         uid, _ = self._deployment_owner()
@@ -1950,7 +1952,8 @@ class ReleaseManager:
         os.chown(self.config_root, uid, group_gid)
         _write_bytes_atomic(path, payload, 0o640)
         os.chown(path, uid, group_gid)
-        self._install_mdns_asset(tls_enabled=tls_enabled)
+        self._install_mdns_asset(tls_enabled=False)
+        return config
 
     def _device_config_snapshot(self, commit: str) -> Path:
         return self.config_root / DEVICE_CONFIG_SNAPSHOT_DIRECTORY / f"{commit}.json"

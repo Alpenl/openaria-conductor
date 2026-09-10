@@ -62,9 +62,11 @@ transport retries. Customer CSRF defaults to the configured Bearer token, with
 
 Echo Web previously rejected descriptors with `session_deletion: true`. The
 companion isolated branch `codex/remote-deletion-compat` in Echo Web changes that
-field to a boolean and updates its contract fingerprint. Conductor contains the
-rebuilt `app.js` and `assets.json`; the Web source is maintained in Echo Web, not
-patched in the generated bundle. No new Web deletion UI is introduced.
+field to a boolean and updates its contract fingerprint. The current Echo Web
+source also exposes a confirmed single-session deletion action when the device
+advertises the capability and the session list contains a verified manifest
+digest. Conductor contains the rebuilt `app.js` and `assets.json`; the Web source
+is maintained in Echo Web, not patched in the generated bundle.
 
 ## Validation
 

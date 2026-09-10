@@ -563,13 +563,15 @@ class NetworkStateStore:
                 and state["execution_release"].get(transaction_id) is True
             )
 
-    def boot_requires_rescue(self, boot_id: str) -> bool:
+    def boot_needs_reconcile(self, boot_id: str) -> bool:
         if not _valid_boot_id(boot_id):
             raise NetworkStateError("state_input_invalid", "Linux boot ID is invalid")
         with self._thread_lock, _network_lock(self._state_dir):
             return self._load_locked()["rescue_boot_id"] != boot_id
 
-    def mark_boot_rescue_validated(self, boot_id: str) -> None:
+    def mark_boot_reconciled(self, boot_id: str) -> None:
+        # Keep the legacy on-disk key for compatibility with installed releases.
+        # It tracks boot reconciliation, not whether an AP was activated.
         if not _valid_boot_id(boot_id):
             raise NetworkStateError("state_input_invalid", "Linux boot ID is invalid")
         with self._thread_lock, _network_lock(self._state_dir):
