@@ -4,7 +4,9 @@ import ast
 import copy
 import io
 import json
+import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import types
@@ -192,6 +194,52 @@ class OnlineUpdateTest(unittest.TestCase):
                 self.assertEqual(install.call_count, 0 if fail else 1)
                 self.assertEqual(run.call_args.args[0][2], "install")
                 self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_bootstrap_private_umask_does_not_restrict_installed_code(self):
+        config = self.root / "config.json"
+        config.write_text(
+            json.dumps({"security": {"profile": "customer"}, "listen": {"port": 8080}})
+        )
+        installed = self.root / "installed-code"
+        real_run = subprocess.run
+
+        def installer_probe(argv, **kwargs):
+            # Exercise the real child process boundary with the bootstrap's 077.
+            # A fake payload avoids requiring root/systemd in this regression.
+            return real_run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; "
+                    "p = Path(sys.argv[1]); p.mkdir(); (p / 'module.py').write_text('')",
+                    str(installed),
+                ],
+                **kwargs,
+            )
+
+        previous_umask = os.umask(0o077)
+        try:
+            with (
+                patch.object(update, "DEFAULT_CACHE", self.root / "private-cache"),
+                patch.object(update.Path, "home", return_value=self.root),
+                patch.object(update, "require_target"),
+                patch.object(update, "require_idle"),
+                patch.object(update, "prepare_dependencies"),
+                patch.object(update, "configure_data_volume"),
+                patch.object(update, "CONFIG", config),
+                patch.object(update, "download", side_effect=self.download),
+                patch.object(update, "current_commit", side_effect=[None, "a" * 40]),
+                patch.object(update, "install_update_command"),
+                patch.object(update.subprocess, "run", side_effect=installer_probe),
+            ):
+                self.assertEqual(update.main([]), 0)
+            self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((installed / "module.py").stat().st_mode & 0o777, 0o644)
+            cache = self.root / ("private-cache" if os.geteuid() == 0 else ".cache/openaria")
+            self.assertEqual(cache.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(os.umask(0o077), 0o077)
+        finally:
+            os.umask(previous_umask)
 
     def test_busy_device_and_unknown_status_block_update(self):
         config = self.root / "config.json"

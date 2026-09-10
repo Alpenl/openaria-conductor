@@ -422,6 +422,10 @@ def main(argv=None) -> int:
             subprocess.run(
                 ["/usr/bin/python3", str(bundle / "rdk_x5_install.py"), "install", str(bundle)],
                 check=True,
+                # The download bootstrap uses 077 for its private workspace.
+                # Installed code must be readable/traversable by rp-ylx; secrets
+                # are secured explicitly by the bundle installer.
+                umask=0o022,
             )
             if current_commit() != manifest["commit"]:
                 raise ValueError("安装后版本不匹配")
