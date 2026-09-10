@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -24,9 +25,12 @@ from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 from rp_ylx.spectacular import (
     CaptureValidationError,
     analyze_capture,
+    build_frame_timestamp_rows,
     build_model_input,
     check_capture,
+    frame_timestamp_alignment_summary,
     load_capture,
+    write_frame_timestamp_csv,
 )
 from rp_ylx.spectacular.check_cli import main as check_main
 
@@ -319,9 +323,44 @@ class SpectacularAdapterTest(unittest.TestCase):
             model["imu_samples"][3]["source"]["sync"],
             {"offset_ns": None, "residual_ns": None, "quality": "insufficient"},
         )
+        timestamp_rows = build_frame_timestamp_rows(timing)
+        self.assertEqual(len(timestamp_rows), 4)
+        self.assertEqual(timestamp_rows[0]["frame_index"], 0)
+        self.assertEqual(timestamp_rows[0]["left_eye"]["timestamp_ns"], 1_000_000_000)
+        self.assertEqual(timestamp_rows[0]["right_eye"]["timestamp_ns"], 1_000_000_000)
+        self.assertEqual(timestamp_rows[0]["left_eye"]["timestamp_source"], "shared_sbs_frame")
+        self.assertEqual(timestamp_rows[0]["nearest_imu"]["sample_number"], 1)
+        self.assertAlmostEqual(timestamp_rows[0]["nearest_imu_delta_ms"], 0.0)
+        alignment = frame_timestamp_alignment_summary(timing)
+        self.assertEqual(alignment["camera_timestamp_source"], "shared_sbs_frame")
+        self.assertEqual(alignment["camera_time_base"], "host_monotonic")
+        self.assertEqual(alignment["imu_matching"], "nearest_reconstructed_sample")
+        self.assertEqual(alignment["rows"], 4)
+        self.assertEqual(result["timestamp_alignment"]["rows"], 4)
         self.assertEqual(result["model_input"]["frames"], 4)
         self.assertEqual(len(result["model_input"]["sha256"]), 64)
         self.assertEqual(check_capture(self.session)["model_input"], result["model_input"])
+
+    def test_writes_per_frame_timestamp_csv(self) -> None:
+        timing = analyze_capture(self.session)
+        output = self.root / "frame-timestamps.csv"
+
+        rows_written = write_frame_timestamp_csv(timing, output)
+
+        self.assertEqual(rows_written, 4)
+        with output.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["frame_index"], "0")
+        self.assertEqual(rows[0]["source_sequence"], "0")
+        self.assertEqual(rows[0]["left_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["right_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["nearest_imu_sample_number"], "1")
+        self.assertEqual(rows[0]["nearest_imu_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["imu_device_ticks"], "1000")
+        self.assertEqual(rows[0]["imu_packet_sequence"], "0")
+        self.assertEqual(rows[0]["imu_sample_index"], "1")
+        self.assertEqual(rows[0]["imu_sync_quality"], "insufficient")
 
     def test_device_session_accepts_declared_frame_decimation(self) -> None:
         session = _make_device_session(self.root, frame_decimation=2)
@@ -429,6 +468,23 @@ class SpectacularAdapterTest(unittest.TestCase):
             status = check_main([str(self.session)])
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(output.getvalue())["schema"], "rp-ylx.spectacular.check.v1")
+
+    def test_cli_can_write_per_frame_timestamp_csv(self) -> None:
+        csv_path = self.root / "cli-frame-timestamps.csv"
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            status = check_main([str(self.session), "--timestamp-csv", str(csv_path)])
+
+        self.assertEqual(status, 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["timestamp_csv"], {"path": str(csv_path), "rows": 4})
+        with csv_path.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["left_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["right_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["nearest_imu_sample_number"], "1")
 
     def test_rejects_production_mode_before_reading_artifacts(self) -> None:
         manifest = _manifest(self.session)

@@ -27,8 +27,15 @@ paths: video callback timing has a 5 ms p95 residual limit, while USB control-re
 packet timing has a 10 ms p95 residual limit and a separate 10 ms p95 read-duration
 limit. The IMU residual limit remains below one 60 Hz packet period.
 
+For review, support, or vendor comparison, the same check can emit a per-frame CSV
+that places the left-eye, right-eye, and nearest IMU timestamps on one row. YLX split-eye
+recordings come from one shared SBS camera frame, so the left-eye and right-eye columns
+carry the same host-monotonic timestamp; the IMU columns retain both the recorded host
+receive timestamp and the reconstructed sample timestamp used for nearest-sample matching.
+
 Run the same acceptance boundary used by downstream calibration code with:
 
 ```console
 rp-ylx-spectacular-check /path/to/session
+rp-ylx-spectacular-check /path/to/session --timestamp-csv frame-timestamps.csv
 ```

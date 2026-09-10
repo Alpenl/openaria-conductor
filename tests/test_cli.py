@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
 import tempfile
@@ -13,6 +14,7 @@ from rp_ylx import __commit__, __version__
 from rp_ylx.camera import CameraError, CameraMode, FrameObservation, StereoFrame
 from rp_ylx.cli import build_parser, main
 from rp_ylx.hardware import HardwareSmokeError
+from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.network_control import NetworkControlClientError
 from rp_ylx.operational_logging import reset_operational_logging
@@ -122,18 +124,43 @@ class CliTest(unittest.TestCase):
             encoder_factory=lambda partial: _SplitEyeFixtureEncoder(partial / "video"),
         )
         recorder.start()
-        recorder.submit_frame(
-            FrameObservation(
-                StereoFrame(
-                    source_sequence=0,
-                    host_monotonic_ns=1,
-                    left=b"left",
-                    right=b"right",
-                    raw_side_by_side=b"\xff\xd8cli-v1\xff\xd9",
-                ),
-                dropped_before=0,
+        for sequence in range(2):
+            recorder.submit_frame(
+                FrameObservation(
+                    StereoFrame(
+                        source_sequence=sequence,
+                        host_monotonic_ns=1_000_000_000 + sequence * 16_666_667,
+                        left=b"left",
+                        right=b"right",
+                        raw_side_by_side=b"\xff\xd8cli-v1\xff\xd9",
+                    ),
+                    dropped_before=0,
+                )
             )
-        )
+        sample_sequence = 0
+        for packet_sequence in range(3):
+            host = 1_000_000_000 + packet_sequence * 8_333_333
+            samples = []
+            for sample_index in range(2):
+                samples.append(
+                    ImuSample(
+                        sequence=sample_sequence,
+                        packet_sequence=packet_sequence,
+                        sample_index=sample_index,
+                        device_timestamp_raw=1_000 + packet_sequence,
+                        device_ticks=1_000 + packet_sequence,
+                        host_read_start_ns=host - 100,
+                        host_read_end_ns=host + 100,
+                        host_monotonic_ns=host,
+                        accelerometer=RawVector3(1, 2, 3),
+                        gyroscope=RawVector3(4, 5, 6),
+                        sync_offset_ns=None,
+                        sync_residual_ns=None,
+                        sync_quality="insufficient",
+                    )
+                )
+                sample_sequence += 1
+            recorder.submit_imu(ImuObservation(tuple(samples), dropped_samples=0))
         return recorder.stop().path
 
     def test_benchmark_failure_is_machine_readable_and_does_not_write_report(self) -> None:
@@ -397,6 +424,31 @@ class CliTest(unittest.TestCase):
         rendered = json.loads(output.getvalue())
         self.assertTrue(rendered["valid"])
         self.assertEqual(rendered["session_id"], session.name)
+
+    def test_timestamps_exports_production_session_csv(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output):
+            root = Path(directory)
+            session = self.produce_v1(root)
+            csv_path = root / "timestamps.csv"
+            self.assertEqual(main(["timestamps", str(session), "--output", str(csv_path)]), 0)
+            with csv_path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+
+        rendered = json.loads(output.getvalue())
+        self.assertTrue(rendered["ok"])
+        self.assertEqual(rendered["capture_mode"], "production")
+        self.assertEqual(rendered["frames"], 2)
+        self.assertEqual(rendered["imu_samples"], 6)
+        self.assertEqual(
+            rendered["timestamp_alignment"]["camera_timestamp_source"],
+            "shared_sbs_frame",
+        )
+        self.assertEqual(rendered["timestamp_alignment"]["left_right_delta_ms"], 0.0)
+        self.assertEqual(rendered["csv"]["rows"], 2)
+        self.assertEqual(rows[0]["left_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["right_eye_host_monotonic_ns"], "1000000000")
+        self.assertEqual(rows[0]["nearest_imu_sample_number"], "1")
 
     def test_validate_v1_rejects_artifact_symlink_even_when_bytes_match(self) -> None:
         error = io.StringIO()
