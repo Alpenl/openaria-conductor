@@ -1253,9 +1253,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             coordinator.close()
         restarted = self.coordinator()
         try:
-            manifest = json.loads(
-                (legacy / remaining / "manifest.json").read_bytes()
-            )
+            manifest = json.loads((legacy / remaining / "manifest.json").read_bytes())
             artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
             restarted.open_verified_artifact(remaining, artifact_id, "v4").close()
             command = self.deletion_command(restarted, {remaining}, key="legacy-delete")
