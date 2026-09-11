@@ -914,7 +914,9 @@ paths:
             summary fields. The opaque cursor advances across both collections, and the
             limit counts items plus diagnostics, so a quarantined candidate cannot cause
             an empty-page loop. verification is null when no current verdict exists;
-            listing a candidate never grants artifact download or export. Every page
+            discovery reads manifest metadata only, and complete artifact byte validation
+            is deferred until a concrete artifact is consumed. Listing a candidate never
+            grants artifact download or export. Every page
             reached from one cursor chain carries the same catalog_revision.
           content:
             application/json:
@@ -3246,7 +3248,9 @@ components:
           pattern: '^sha256:[0-9a-f]{64}$'
           description: |
             Domain-separated SHA-256 over the complete, unpaginated, canonical
-            newest-first catalog, including item verification and quarantine diagnostics.
+            newest-first catalog, including the currently cached item verdicts and
+            quarantine diagnostics. A cold list may contain null verification while
+            artifact byte validation is deferred until that artifact is consumed.
         items:
           type: array
           items:

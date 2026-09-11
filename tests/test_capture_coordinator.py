@@ -1253,6 +1253,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             coordinator.close()
         restarted = self.coordinator()
         try:
+            manifest = json.loads((legacy / remaining / "manifest.json").read_bytes())
+            artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
+            restarted.open_verified_artifact(remaining, artifact_id, "v4").close()
             command = self.deletion_command(restarted, {remaining}, key="legacy-delete")
             self.assertEqual(
                 restarted.delete_sessions(command).body["deleted_session_ids"], [remaining]
@@ -1597,7 +1600,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_restart_defers_catalog_content_verification_until_first_list(self) -> None:
+    def test_restart_defers_catalog_content_verification_until_artifact_access(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="deferred-catalog")
@@ -1613,15 +1616,22 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(verify.call_count, 0)
 
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                first_list_verifications = verify.call_count
-                self.assertGreater(first_list_verifications, 0)
+                self.assertEqual(verify.call_count, 0)
+                self.assertIsNone(listed["items"][0]["verification"])
+                manifest = json.loads(
+                    (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                )
+                artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
+                restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
+                first_access_verifications = verify.call_count
+                self.assertGreater(first_access_verifications, 0)
                 self.assertEqual(
                     [item["session_id"] for item in listed["items"]],
                     [session_id],
                 )
 
                 restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                self.assertEqual(verify.call_count, first_list_verifications)
+                self.assertEqual(verify.call_count, first_access_verifications)
             finally:
                 restarted.close()
 
@@ -1663,8 +1673,27 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     selected = next(
                         item for item in listed["items"] if item["session_id"] == session_id
                     )
+                    self.assertIsNone(selected["verification"])
+                    manifest = json.loads(
+                        (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                    )
+                    artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"][
+                        "artifact_id"
+                    ]
+                    if corrupt:
+                        with self.assertRaises(ArtifactAccessError):
+                            restarted.open_verified_artifact(session_id, artifact_id, "v4")
+                    else:
+                        restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
+                    refreshed = restarted.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    refreshed_selected = next(
+                        item for item in refreshed["items"] if item["session_id"] == session_id
+                    )
                     self.assertEqual(
-                        selected["verification"]["verdict"], "unusable" if corrupt else "usable"
+                        refreshed_selected["verification"]["verdict"],
+                        "unusable" if corrupt else "usable",
                     )
                 finally:
                     restarted.close()
@@ -1684,61 +1713,19 @@ class CaptureCoordinatorTest(unittest.TestCase):
         digest = hashlib.sha256(payload).hexdigest()
         artifact.update(bytes=len(payload), sha256=digest, artifact_id=digest)
         (root / "manifest.json").write_text(json.dumps(manifest))
-        identity = (path.stat().st_dev, path.stat().st_ino)
-        entered = threading.Event()
-        resume = threading.Event()
-        results = []
-        errors = []
-        reads = []
-        read = os.pread
         restarted = self.coordinator()
-
-        def blocked_read(fd: int, count: int, offset: int) -> bytes:
-            metadata = os.fstat(fd)
-            if (metadata.st_dev, metadata.st_ino) == identity:
-                reads.append(count)
-                entered.set()
-                if not resume.wait(5):
-                    raise AssertionError("capture did not release the catalog read")
-            return read(fd, count, offset)
-
-        def list_once() -> None:
-            try:
-                results.append(restarted.list_sessions(cursor=None, limit=50, take_id=None))
-            except BaseException as error:
-                errors.append(error)
-
-        thread = threading.Thread(target=list_once)
         try:
-            with (
-                patch("rp_ylx.recording.device_session.os.pread", side_effect=blocked_read),
-                patch(
-                    "rp_ylx.recording.device_session._session_store_or_none",
-                    return_value=FakeNativeSessionStore(),
-                ),
+            with patch(
+                "rp_ylx.recording.coordinator.validate_device_session_directory",
+                side_effect=AssertionError("catalog list must not hash historical artifacts"),
             ):
-                thread.start()
-                try:
-                    self.assertTrue(entered.wait(5), repr(errors) + repr(results))
-                    restarted.start_capture(start_command("interrupt-active"))
-                    self.assertTrue(restarted.submit_frame(frame()))
-                finally:
-                    resume.set()
-                    thread.join(5)
-                self.assertFalse(thread.is_alive())
-                self.assertEqual(errors, [])
-                self.assertEqual(reads, [1024 * 1024])
-            selected = next(
-                item for item in results[0]["items"] if item["session_id"] == session_id
-            )
-            self.assertIsNone(selected["verification"])
-            restarted.stop_capture(stop_command("interrupt-stop"))
-            listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+                listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
             selected = next(item for item in listed["items"] if item["session_id"] == session_id)
-            self.assertEqual(selected["verification"]["verdict"], "usable")
+            self.assertIsNone(selected["verification"])
+            restarted.start_capture(start_command("interrupt-active"))
+            self.assertTrue(restarted.submit_frame(frame()))
+            restarted.stop_capture(stop_command("interrupt-stop"))
         finally:
-            resume.set()
-            thread.join(5)
             restarted.close()
 
     def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
@@ -2739,7 +2726,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_catalog_verifies_artifact_contents_on_first_list_then_reuses_verdict(self) -> None:
+    def test_catalog_verifies_artifact_contents_on_first_artifact_access(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="lightweight-catalog")
@@ -2754,10 +2741,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
             try:
                 self.assertEqual(verify.call_count, 0)
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                first_list_verifications = verify.call_count
-                self.assertGreater(first_list_verifications, 0)
+                self.assertEqual(verify.call_count, 0)
+                self.assertIsNone(listed["items"][0]["verification"])
+                manifest = json.loads(
+                    (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                )
+                artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
+                restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
+                first_access_verifications = verify.call_count
+                self.assertGreater(first_access_verifications, 0)
                 restarted.list_sessions(cursor=None, limit=50, take_id=None)
-                self.assertEqual(verify.call_count, first_list_verifications)
+                self.assertEqual(verify.call_count, first_access_verifications)
             finally:
                 restarted.close()
         self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
@@ -2792,7 +2786,21 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 take_id=None,
                 api_version="v4",
             )
-            verification = listed["items"][0]["verification"]
+            self.assertIsNone(listed["items"][0]["verification"])
+            with self.assertRaises(ArtifactAccessError) as blocked:
+                restarted.open_verified_artifact(
+                    session_id,
+                    video["artifact_id"],
+                    "v4",
+                )
+            self.assertEqual(blocked.exception.code, "not_verified")
+            refreshed = restarted.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            verification = refreshed["items"][0]["verification"]
             self.assertEqual(verification["verdict"], "unusable")
             self.assertEqual(
                 verification["diagnostics"],
@@ -2803,13 +2811,6 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     }
                 ],
             )
-            with self.assertRaises(ArtifactAccessError) as blocked:
-                restarted.open_verified_artifact(
-                    session_id,
-                    video["artifact_id"],
-                    "v4",
-                )
-            self.assertEqual(blocked.exception.code, "not_verified")
         finally:
             restarted.close()
 
@@ -2846,9 +2847,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 api_version="v4",
             )
             self.assertNotEqual(after["catalog_revision"], before["catalog_revision"])
-            self.assertEqual(after["items"][0]["verification"]["verdict"], "unusable")
+            selected = next(item for item in after["items"] if item["session_id"] == session_id)
+            self.assertEqual(selected["verification"]["verdict"], "unusable")
             self.assertEqual(
-                after["items"][0]["verification"]["diagnostics"][0]["code"],
+                selected["verification"]["diagnostics"][0]["code"],
                 "artifact_digest_mismatch",
             )
         finally:
@@ -2873,7 +2875,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         manifest = json.loads(
             (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
         )
-        self.assertGreater(len(native.verify_calls), 0)
+        self.assertEqual(native.verify_calls, [])
         self.assertEqual(
             listed["items"][0]["total_bytes"],
             sum(int(item["bytes"]) for item in iter_device_session_v1_artifacts(manifest)),

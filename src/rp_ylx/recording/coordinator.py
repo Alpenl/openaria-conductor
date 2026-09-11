@@ -1036,7 +1036,13 @@ class CaptureCoordinator:
         if self._active is not None or self._closing:
             raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
 
-    def _catalog_sessions(self, *, revalidate_pending: bool = True) -> None:
+    def _catalog_sessions(
+        self,
+        *,
+        revalidate_pending: bool = True,
+        verify_payload: bool = True,
+        session_ids: set[str] | None = None,
+    ) -> None:
         admission = self._require_admission()
         # Re-read each small manifest to invalidate replaced catalog entries, but do
         # not stat every large artifact until that artifact is actually downloaded.
@@ -1049,6 +1055,8 @@ class CaptureCoordinator:
                         or candidate.name.endswith(".partial")
                         or candidate.name in discovered
                     ):
+                        continue
+                    if session_ids is not None and candidate.name not in session_ids:
                         continue
                     discovered.add(candidate.name)
                     session_id = candidate.name
@@ -1098,6 +1106,18 @@ class CaptureCoordinator:
                         manifest, payload = inspect_device_session_directory(candidate)
                         if self._active is not None or self._closing:
                             # Cold catalog reads must not hash historical video while capturing.
+                            self._session_summaries[session_id] = self._session_summary(
+                                session_id,
+                                manifest,
+                                payload,
+                                verification_current=False,
+                            )
+                            self._verified.pop(session_id, None)
+                            self._session_snapshots.pop(session_id, None)
+                            self._pending_session_verification.add(session_id)
+                            self._session_diagnostics.pop(session_id, None)
+                            continue
+                        if not verify_payload:
                             self._session_summaries[session_id] = self._session_summary(
                                 session_id,
                                 manifest,
@@ -1166,13 +1186,16 @@ class CaptureCoordinator:
                             diagnostic = current_diagnostic
                         self._session_diagnostics[session_id] = diagnostic
 
-            for session_id in set(self._session_summaries) - discovered:
-                self._session_summaries.pop(session_id, None)
-                self._verified.pop(session_id, None)
-                self._session_snapshots.pop(session_id, None)
-                self._pending_session_verification.discard(session_id)
-            for session_id in set(self._session_diagnostics) - discovered:
-                self._session_diagnostics.pop(session_id, None)
+            # A targeted catalog refresh must not evict summaries for unrelated
+            # sessions. Full discovery performs the stale-entry cleanup.
+            if session_ids is None:
+                for session_id in set(self._session_summaries) - discovered:
+                    self._session_summaries.pop(session_id, None)
+                    self._verified.pop(session_id, None)
+                    self._session_snapshots.pop(session_id, None)
+                    self._pending_session_verification.discard(session_id)
+                for session_id in set(self._session_diagnostics) - discovered:
+                    self._session_diagnostics.pop(session_id, None)
 
     @staticmethod
     def _session_diagnostic(candidate_identity: str, error: object) -> dict[str, object]:
@@ -2662,11 +2685,22 @@ class CaptureCoordinator:
             store.close()
 
     def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
-        # A caller may download without listing first. Refresh only file
-        # identities here so a same-size replacement cannot reuse a cached
-        # usable verdict; full digest revalidation is deferred to the next
-        # catalog refresh and the current download fails closed.
-        self._catalog_sessions(revalidate_pending=False)
+        # A caller may download or replay without listing first. Resolve and
+        # verify only this session so a same-size replacement cannot reuse a
+        # cached usable verdict.
+        # Verify only the session whose artifact is being consumed. This keeps
+        # replay/download access protected by the exact byte check while
+        # avoiding a full-volume hash during ordinary catalog reads.
+        with self._catalog_lock:
+            # Artifact requests are the explicit integrity boundary. Force a
+            # fresh target-session digest so an in-place, same-size mutation
+            # cannot reuse a previously verified snapshot.
+            self._invalidate_session_verification(session_id)
+        self._catalog_sessions(
+            revalidate_pending=True,
+            verify_payload=True,
+            session_ids={session_id},
+        )
         with self._catalog_lock:
             snapshot = self._session_snapshots.get(session_id)
             if snapshot is None or self._verified.get(session_id) != snapshot.manifest_sha256:
@@ -2796,7 +2830,10 @@ class CaptureCoordinator:
                 retryable=True,
             ) from error
         self._require_admission()
-        self._catalog_sessions()
+        # Listing is deliberately metadata-only. Full artifact hashing is
+        # deferred until a caller requests a concrete artifact, so a large
+        # recording volume does not block the initial web UI render.
+        self._catalog_sessions(revalidate_pending=False, verify_payload=False)
         with self._catalog_lock:
             all_items = [copy.deepcopy(item) for item in self._session_summaries.values()]
             diagnostics = copy.deepcopy(list(self._session_diagnostics.values()))
