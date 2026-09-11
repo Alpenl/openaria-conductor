@@ -2691,6 +2691,11 @@ class CaptureCoordinator:
         # Verify only the session whose artifact is being consumed. This keeps
         # replay/download access protected by the exact byte check while
         # avoiding a full-volume hash during ordinary catalog reads.
+        with self._catalog_lock:
+            # Artifact requests are the explicit integrity boundary. Force a
+            # fresh target-session digest so an in-place, same-size mutation
+            # cannot reuse a previously verified snapshot.
+            self._invalidate_session_verification(session_id)
         self._catalog_sessions(
             revalidate_pending=True,
             verify_payload=True,
