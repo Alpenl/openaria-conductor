@@ -1679,7 +1679,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     manifest = json.loads(
                         (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
                     )
-                    artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
+                    artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"][
+                        "artifact_id"
+                    ]
                     if corrupt:
                         with self.assertRaises(ArtifactAccessError):
                             restarted.open_verified_artifact(session_id, artifact_id, "v4")
