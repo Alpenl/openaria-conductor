@@ -80,25 +80,10 @@ struct SplitSinkRecording {
     imu: Option<Arc<Collector>>,
 }
 
-impl SplitSinkRecording {
-    fn imu(&self) -> Option<Arc<Collector>> {
-        self.imu.as_ref().map(Arc::clone)
-    }
-}
-
-struct RecordingDispatch {
-    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
-    sink: Arc<Mutex<recording::RecordingSink>>,
-    encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
-    segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
-    recording_start_monotonic_ns: u64,
-    on_failure: Arc<Py<PyAny>>,
-}
-
 struct State {
     fanout: CaptureFanoutState,
     validator: FrameValidator,
-    recording: Option<SplitSinkRecording>,
+    recording: Option<Arc<SplitSinkRecording>>,
     running: bool,
     terminal_error: Option<RuntimeError>,
     last_preview_error: Option<RuntimeError>,
@@ -259,7 +244,7 @@ impl Runtime {
             ));
         }
         state.fanout.start_recording()?;
-        state.recording = Some(SplitSinkRecording {
+        state.recording = Some(Arc::new(SplitSinkRecording {
             active_take,
             sink,
             encoder,
@@ -267,7 +252,7 @@ impl Runtime {
             recording_start_monotonic_ns,
             on_failure: Arc::clone(&on_failure),
             imu,
-        });
+        }));
         self.shared.changed.notify_all();
         let snapshot = snapshot_locked(&state);
         drop(state);
@@ -360,7 +345,10 @@ impl Runtime {
                 "capture runtime state mutex is poisoned",
             )
         })?;
-        let imu = state.recording.as_ref().and_then(SplitSinkRecording::imu);
+        let imu = state
+            .recording
+            .as_ref()
+            .and_then(|recording| recording.imu.clone());
         let inflight = state.fanout.start_stopping();
         self.shared.changed.notify_all();
         Ok((inflight, imu))
@@ -399,9 +387,6 @@ impl Runtime {
         state.recording = None;
         state.fanout.start_stopping();
         self.shared.changed.notify_all();
-        if !timeout.is_zero() {
-            let _ = timeout;
-        }
         Ok(snapshot_locked(&state))
     }
 
@@ -424,7 +409,10 @@ impl Runtime {
                     "capture runtime state mutex is poisoned",
                 )
             })?;
-            state.recording.as_ref().and_then(SplitSinkRecording::imu)
+            state
+                .recording
+                .as_ref()
+                .and_then(|recording| recording.imu.clone())
         };
         if let Some(imu) = imu {
             imu.close();
@@ -589,14 +577,7 @@ fn process_frame(
                 }
             }
             let dispatch = if decision.record {
-                state.recording.as_ref().map(|recording| RecordingDispatch {
-                    active_take: Arc::clone(&recording.active_take),
-                    sink: Arc::clone(&recording.sink),
-                    encoder: Arc::clone(&recording.encoder),
-                    segment_planner: Arc::clone(&recording.segment_planner),
-                    recording_start_monotonic_ns: recording.recording_start_monotonic_ns,
-                    on_failure: Arc::clone(&recording.on_failure),
-                })
+                state.recording.clone()
             } else {
                 None
             };
@@ -604,21 +585,11 @@ fn process_frame(
         };
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
-            let write_result = write_split_sink_frame(
-                dispatch.active_take,
-                dispatch.sink,
-                dispatch.encoder,
-                dispatch.segment_planner,
-                dispatch.recording_start_monotonic_ns,
-                frame.source_sequence,
-                frame.host_monotonic_ns,
-                dropped_before,
-                frame.raw_side_by_side,
-            );
+            let write_result = write_split_sink_frame(&dispatch, &frame, dropped_before);
             finish_stage(metrics, "native_recording_split_sink", write_started);
             finish_recording_frame(shared)?;
             if let Err(error) = write_result {
-                report_recording_failure(shared, error.clone(), Some(dispatch.on_failure));
+                report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
             }
         }
         Ok(())
@@ -627,45 +598,38 @@ fn process_frame(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_split_sink_frame(
-    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
-    sink: Arc<Mutex<recording::RecordingSink>>,
-    encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
-    segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
-    recording_start_monotonic_ns: u64,
-    source_sequence: u64,
-    host_monotonic_ns: u64,
+    recording: &SplitSinkRecording,
+    frame: &Frame,
     dropped_before: u64,
-    raw_side_by_side: Vec<u8>,
 ) -> Result<(), RuntimeError> {
-    if raw_side_by_side.is_empty() {
+    if frame.raw_side_by_side.is_empty() {
         return Err(RuntimeError::new(
             "raw_frame_unavailable",
             "production split-eye recording is missing raw side-by-side MJPEG frame",
         ));
     }
-    let payload = recording::jpeg_payload(&raw_side_by_side)?;
+    let payload = recording::jpeg_payload(&frame.raw_side_by_side)?;
     let reserved = {
-        let mut writer = active_take.lock().map_err(|_| {
+        let mut writer = recording.active_take.lock().map_err(|_| {
             RuntimeError::new(
                 "active_take_writer_poisoned",
                 "active take writer mutex is poisoned",
             )
         })?;
         writer.reserve_frame(active_take::ActiveSourceFrame {
-            source_sequence,
-            host_monotonic_ns,
+            source_sequence: frame.source_sequence,
+            host_monotonic_ns: frame.host_monotonic_ns,
             source_gap: dropped_before,
         })?
     };
-    let elapsed_seconds = if host_monotonic_ns >= recording_start_monotonic_ns {
-        (host_monotonic_ns - recording_start_monotonic_ns) as f64 / 1_000_000_000.0
+    let elapsed_seconds = if frame.host_monotonic_ns >= recording.recording_start_monotonic_ns {
+        (frame.host_monotonic_ns - recording.recording_start_monotonic_ns) as f64 / 1_000_000_000.0
     } else {
         0.0
     };
     let plan = {
-        let mut planner = segment_planner.lock().map_err(|_| {
+        let mut planner = recording.segment_planner.lock().map_err(|_| {
             RuntimeError::new(
                 "native_recording_segment_planner_poisoned",
                 "recording segment planner mutex is poisoned",
@@ -674,13 +638,13 @@ fn write_split_sink_frame(
         planner.next_frame(reserved.record_sequence, elapsed_seconds)?
     };
     {
-        let mut encoder = encoder.lock().map_err(|_| {
+        let mut encoder = recording.encoder.lock().map_err(|_| {
             RuntimeError::new("encoder_failed", "encoder process mutex is poisoned")
         })?;
         encoder.submit(payload).map_err(encoder_runtime_error)?;
     }
     let written = {
-        let mut sink = sink.lock().map_err(|_| {
+        let mut sink = recording.sink.lock().map_err(|_| {
             RuntimeError::new(
                 "native_recording_poisoned",
                 "recording sink mutex is poisoned",
@@ -695,7 +659,7 @@ fn write_split_sink_frame(
         )?
     };
     {
-        let mut writer = active_take.lock().map_err(|_| {
+        let mut writer = recording.active_take.lock().map_err(|_| {
             RuntimeError::new(
                 "active_take_writer_poisoned",
                 "active take writer mutex is poisoned",
@@ -983,13 +947,9 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&helper, permissions).unwrap();
 
+        pyo3::prepare_freethreaded_python();
         {
-            let active_take = Arc::new(Mutex::new(
-                active_take::ActiveTakeWriter::new("session").unwrap(),
-            ));
-            let sink = Arc::new(Mutex::new(
-                recording::RecordingSink::create(&root, "session").unwrap(),
-            ));
+            let mut target = Python::with_gil(|py| test_recording(py, &root));
             let mut encoder = stereo_encoder::EncoderProcess::new(
                 &root.join("video"),
                 &helper,
@@ -1002,29 +962,28 @@ mod tests {
             )
             .unwrap();
             encoder.start().unwrap();
-            let encoder = Arc::new(Mutex::new(encoder));
-            let segment_planner = Arc::new(Mutex::new(
-                recording::RecordingSegmentPlanner::new(3).unwrap(),
-            ));
+            target.encoder = Arc::new(Mutex::new(encoder));
+            target.recording_start_monotonic_ns = 1_000_000;
 
             write_split_sink_frame(
-                Arc::clone(&active_take),
-                Arc::clone(&sink),
-                Arc::clone(&encoder),
-                Arc::clone(&segment_planner),
-                1_000_000,
-                9,
-                34_000_000,
+                &target,
+                &Frame {
+                    source_sequence: 9,
+                    host_monotonic_ns: 34_000_000,
+                    application_dropped_before: 0,
+                    left: Vec::new(),
+                    right: Vec::new(),
+                    raw_side_by_side: b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
+                },
                 0,
-                b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
             )
             .unwrap();
 
-            let summary = active_take.lock().unwrap().finish().unwrap();
+            let summary = target.active_take.lock().unwrap().finish().unwrap();
             assert_eq!(summary.frames_written, 1);
             assert_eq!(summary.frame_domain, 1);
             assert_eq!(summary.pending_frames, 0);
-            let snapshot = sink.lock().unwrap().flush_and_close().unwrap();
+            let snapshot = target.sink.lock().unwrap().flush_and_close().unwrap();
             assert_eq!(snapshot.frames_written, 1);
             assert_eq!(snapshot.imu_samples_written, 0);
             assert!(snapshot.bytes_written > 0);
@@ -1034,8 +993,16 @@ mod tests {
                     .iter()
                     .any(|artifact| artifact.relative_path == "frames.ndjson")
             );
-            assert_eq!(encoder.lock().unwrap().submitted_frames(), 1);
-            assert_eq!(segment_planner.lock().unwrap().snapshot().frames_written, 1);
+            assert_eq!(target.encoder.lock().unwrap().submitted_frames(), 1);
+            assert_eq!(
+                target
+                    .segment_planner
+                    .lock()
+                    .unwrap()
+                    .snapshot()
+                    .frames_written,
+                1
+            );
         }
 
         let _ = fs::remove_dir_all(root);
@@ -1058,7 +1025,7 @@ mod tests {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
                 state.fanout.start_recording().unwrap();
-                state.recording = Some(test_recording(py, &root));
+                state.recording = Some(Arc::new(test_recording(py, &root)));
             }
             let (done_tx, done_rx) = mpsc::channel();
             let handle = thread::spawn(move || {
@@ -1097,7 +1064,7 @@ mod tests {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
                 state.fanout.start_recording().unwrap();
-                state.recording = Some(test_recording(py, &root));
+                state.recording = Some(Arc::new(test_recording(py, &root)));
             }
             let (inflight, imu) = runtime.begin_recording_stop().unwrap();
             assert_eq!(inflight, 0);
@@ -1112,5 +1079,94 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root);
         });
+    }
+
+    #[test]
+    fn stop_preserves_inflight_frame_until_encoder_and_index_finish() {
+        pyo3::prepare_freethreaded_python();
+        let root = temp_root("inflight-stop");
+        let mut target = Python::with_gil(|py| test_recording(py, &root));
+        let helper = root.join("encoder-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut encoder = stereo_encoder::EncoderProcess::new(
+            &root.join("video"),
+            &helper,
+            3840,
+            1080,
+            60,
+            8192,
+            3,
+            "video/",
+        )
+        .unwrap();
+        encoder.start().unwrap();
+        target.encoder = Arc::new(Mutex::new(encoder));
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        let active_take = Arc::clone(&target.active_take);
+        let sink = Arc::clone(&target.sink);
+        let blocked_writer = active_take.lock().unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording().unwrap();
+            state.recording = Some(Arc::new(target));
+        }
+        let shared = Arc::clone(&runtime.shared);
+        let preview = Arc::clone(&runtime.preview);
+        let worker = thread::spawn(move || {
+            process_frame(
+                &preview,
+                &shared,
+                Frame {
+                    source_sequence: 1,
+                    host_monotonic_ns: 1_000_000,
+                    application_dropped_before: 0,
+                    left: Vec::new(),
+                    right: Vec::new(),
+                    raw_side_by_side: b"\xff\xd8payload\xff\xd9".to_vec(),
+                },
+                None,
+            )
+        });
+        let started = Instant::now();
+        while runtime.snapshot().unwrap().inflight_frames != 1 {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::yield_now();
+        }
+        let (inflight, _) = runtime.begin_recording_stop().unwrap();
+        assert_eq!(inflight, 1);
+        assert!(!runtime.snapshot().unwrap().recording_active);
+        // Stopping closes admission while the blocked frame still owns its resources.
+        drop(blocked_writer);
+        worker.join().unwrap().unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.inflight_frames, 0);
+        assert!(!snapshot.recording_present);
+        assert!(!snapshot.failure_reported);
+        assert_eq!(
+            active_take.lock().unwrap().finish().unwrap().frames_written,
+            1
+        );
+        assert_eq!(
+            sink.lock()
+                .unwrap()
+                .flush_and_close()
+                .unwrap()
+                .frames_written,
+            1
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

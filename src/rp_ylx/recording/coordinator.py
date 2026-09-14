@@ -542,7 +542,7 @@ class CaptureCoordinator:
         self._lock = threading.RLock()
         self._stop_condition = threading.Condition(self._lock)
         self._storage_lock = threading.Lock()
-        self._catalog_lock = threading.Lock()
+        self._catalog_lock = threading.RLock()
         self._closing = False
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
@@ -552,7 +552,6 @@ class CaptureCoordinator:
         self._retained: dict[str, dict[str, object]] = {}
         self._verified: dict[str, str] = {}
         self._session_snapshots: dict[str, _VerifiedSessionSnapshot] = {}
-        self._pending_session_verification: set[str] = set()
         self._session_summaries: dict[str, dict[str, object]] = {}
         self._session_diagnostics: dict[str, dict[str, object]] = {}
         self._latest_imu: _LatestImuReceipt | None = None
@@ -1005,7 +1004,6 @@ class CaptureCoordinator:
         summary = self._session_summaries.get(session_id)
         if summary is not None:
             summary["verification"] = None
-        self._pending_session_verification.add(session_id)
 
     def _session_manifest_is_current(
         self,
@@ -1036,27 +1034,56 @@ class CaptureCoordinator:
         if self._active is not None or self._closing:
             raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
 
+    def _session_payload_is_current(
+        self, session_id: str, snapshot: _VerifiedSessionSnapshot
+    ) -> bool:
+        admission = self._require_admission()
+        store = _MultiRootSessionStore(
+            admission.catalog_roots,
+            verified_manifests={session_id: snapshot.manifest_sha256},
+        )
+        try:
+            payload, manifest_identity, artifact_identities = store.snapshot_verified_identities(
+                session_id, "v4"
+            )
+            return (
+                hashlib.sha256(payload).hexdigest() == snapshot.manifest_sha256
+                and manifest_identity == snapshot.manifest_identity
+                and artifact_identities == snapshot.artifact_identities
+            )
+        except (ArtifactAccessError, DeviceRecordingError, OSError):
+            return False
+        finally:
+            store.close()
+
     def _catalog_sessions(
         self,
         *,
-        revalidate_pending: bool = True,
-        verify_payload: bool = True,
-        session_ids: set[str] | None = None,
+        verify_session: str | None = None,
     ) -> None:
         admission = self._require_admission()
         # Re-read each small manifest to invalidate replaced catalog entries, but do
         # not stat every large artifact until that artifact is actually downloaded.
+        if verify_session is not None and (
+            verify_session in {"", ".", ".."}
+            or "\x00" in verify_session
+            or Path(verify_session).name != verify_session
+        ):
+            return
         with self._catalog_lock:
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
-                for candidate in sessions_root.iterdir():
+                candidates = (
+                    sessions_root.iterdir()
+                    if verify_session is None
+                    else (sessions_root / verify_session,)
+                )
+                for candidate in candidates:
                     if (
                         not candidate.is_dir()
                         or candidate.name.endswith(".partial")
                         or candidate.name in discovered
                     ):
-                        continue
-                    if session_ids is not None and candidate.name not in session_ids:
                         continue
                     discovered.add(candidate.name)
                     session_id = candidate.name
@@ -1083,18 +1110,15 @@ class CaptureCoordinator:
                             ValueError,
                         ) as error:
                             self._session_summaries.pop(session_id, None)
-                            self._pending_session_verification.discard(session_id)
                             self._session_diagnostics[session_id] = self._session_diagnostic(
                                 session_id,
                                 error,
                             )
                         continue
 
-                    if (
-                        summary is not None
-                        and session_id in self._pending_session_verification
-                        and not revalidate_pending
-                    ):
+                    # A summary without a snapshot is already metadata-only.
+                    # Only an explicit artifact request can promote it to verified.
+                    if summary is not None and verify_session is None:
                         continue
                     if candidate.name in self._retained and candidate.name not in self._verified:
                         if candidate.name not in self._session_diagnostics:
@@ -1104,64 +1128,38 @@ class CaptureCoordinator:
                         continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
-                        if self._active is not None or self._closing:
-                            # Cold catalog reads must not hash historical video while capturing.
-                            self._session_summaries[session_id] = self._session_summary(
-                                session_id,
-                                manifest,
-                                payload,
-                                verification_current=False,
-                            )
-                            self._verified.pop(session_id, None)
-                            self._session_snapshots.pop(session_id, None)
-                            self._pending_session_verification.add(session_id)
-                            self._session_diagnostics.pop(session_id, None)
-                            continue
-                        if not verify_payload:
-                            self._session_summaries[session_id] = self._session_summary(
-                                session_id,
-                                manifest,
-                                payload,
-                                verification_current=False,
-                            )
-                            self._verified.pop(session_id, None)
-                            self._session_snapshots.pop(session_id, None)
-                            self._pending_session_verification.add(session_id)
-                            self._session_diagnostics.pop(session_id, None)
-                            continue
-                        try:
-                            verified_snapshot, verification_error = (
-                                self._verify_exact_session_payload(
-                                    candidate,
-                                    session_id,
-                                    manifest,
-                                    payload,
-                                    interrupt_check=self._check_catalog_verification_idle,
+                        verified_snapshot = None
+                        verification_error = None
+                        if (
+                            verify_session is not None
+                            and self._active is None
+                            and not self._closing
+                        ):
+                            try:
+                                verified_snapshot, verification_error = (
+                                    self._verify_exact_session_payload(
+                                        candidate,
+                                        session_id,
+                                        manifest,
+                                        payload,
+                                        interrupt_check=self._check_catalog_verification_idle,
+                                    )
                                 )
-                            )
-                        except DeviceRecordingError as error:
-                            if error.code != "verification_changed":
-                                raise
-                            self._session_summaries[session_id] = self._session_summary(
-                                session_id,
-                                manifest,
-                                payload,
-                                verification_current=False,
-                            )
-                            self._verified.pop(session_id, None)
-                            self._session_snapshots.pop(session_id, None)
-                            self._pending_session_verification.add(session_id)
-                            self._session_diagnostics.pop(session_id, None)
-                            continue
+                            except DeviceRecordingError as error:
+                                if error.code != "verification_changed":
+                                    raise
                         self._session_summaries[session_id] = self._session_summary(
                             session_id,
                             manifest,
                             payload,
                             verification_error=verification_error,
+                            verification_current=verified_snapshot is not None,
                         )
-                        self._session_snapshots[session_id] = verified_snapshot
-                        self._pending_session_verification.discard(session_id)
                         self._session_diagnostics.pop(session_id, None)
+                        if verified_snapshot is None:
+                            self._invalidate_session_verification(session_id)
+                            continue
+                        self._session_snapshots[session_id] = verified_snapshot
                         if verification_error is None:
                             self._verified[session_id] = verified_snapshot.manifest_sha256
                         else:
@@ -1176,7 +1174,6 @@ class CaptureCoordinator:
                         self._session_summaries.pop(session_id, None)
                         self._verified.pop(session_id, None)
                         self._session_snapshots.pop(session_id, None)
-                        self._pending_session_verification.discard(session_id)
                         diagnostic = self._session_diagnostic(session_id, error)
                         current_diagnostic = self._session_diagnostics.get(session_id)
                         if (
@@ -1188,12 +1185,11 @@ class CaptureCoordinator:
 
             # A targeted catalog refresh must not evict summaries for unrelated
             # sessions. Full discovery performs the stale-entry cleanup.
-            if session_ids is None:
+            if verify_session is None:
                 for session_id in set(self._session_summaries) - discovered:
                     self._session_summaries.pop(session_id, None)
                     self._verified.pop(session_id, None)
                     self._session_snapshots.pop(session_id, None)
-                    self._pending_session_verification.discard(session_id)
                 for session_id in set(self._session_diagnostics) - discovered:
                     self._session_diagnostics.pop(session_id, None)
 
@@ -1308,12 +1304,7 @@ class CaptureCoordinator:
             "started_at": timing["started_at"],
             "ended_at": timing["ended_at"],
             "duration_seconds": timing["duration_seconds"],
-            "total_bytes": manifest_artifact_bytes_total(
-                manifest,
-                manifest_bytes=manifest_payload,
-                session_id=session_id,
-                code="manifest_invalid",
-            ),
+            "total_bytes": manifest_artifact_bytes_total(manifest, code="manifest_invalid"),
             "verification": verification,
         }
 
@@ -2345,10 +2336,8 @@ class CaptureCoordinator:
                     )
                     if verified_snapshot is not None:
                         self._session_snapshots[plan.session_id] = verified_snapshot
-                        self._pending_session_verification.discard(plan.session_id)
                     else:
                         self._session_snapshots.pop(plan.session_id, None)
-                        self._pending_session_verification.add(plan.session_id)
                     if verified_snapshot is not None and verification_error is None:
                         self._verified[plan.session_id] = verified_snapshot.manifest_sha256
                     else:
@@ -2685,23 +2674,15 @@ class CaptureCoordinator:
             store.close()
 
     def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
-        # A caller may download or replay without listing first. Resolve and
-        # verify only this session so a same-size replacement cannot reuse a
-        # cached usable verdict.
-        # Verify only the session whose artifact is being consumed. This keeps
-        # replay/download access protected by the exact byte check while
-        # avoiding a full-volume hash during ordinary catalog reads.
+        # Verify only the requested session, including direct access without listing first.
         with self._catalog_lock:
-            # Artifact requests are the explicit integrity boundary. Force a
-            # fresh target-session digest so an in-place, same-size mutation
-            # cannot reuse a previously verified snapshot.
-            self._invalidate_session_verification(session_id)
-        self._catalog_sessions(
-            revalidate_pending=True,
-            verify_payload=True,
-            session_ids={session_id},
-        )
-        with self._catalog_lock:
+            # Reuse full payload verification only while EVERY securely opened
+            # file identity (including ctime) is unchanged. Same-size edits,
+            # restored mtimes, replacements and link changes invalidate it.
+            snapshot = self._session_snapshots.get(session_id)
+            if snapshot is None or not self._session_payload_is_current(session_id, snapshot):
+                self._invalidate_session_verification(session_id)
+                self._catalog_sessions(verify_session=session_id)
             snapshot = self._session_snapshots.get(session_id)
             if snapshot is None or self._verified.get(session_id) != snapshot.manifest_sha256:
                 raise ArtifactAccessError(
@@ -2792,7 +2773,6 @@ class CaptureCoordinator:
                         self._session_snapshots.pop(session_id, None)
                         self._verified.pop(session_id, None)
                         self._session_diagnostics.pop(session_id, None)
-                        self._pending_session_verification.discard(session_id)
                     self._storage_checked_at = 0.0
             return CaptureCommandResult(HTTPStatus.OK, result)
 
@@ -2833,7 +2813,7 @@ class CaptureCoordinator:
         # Listing is deliberately metadata-only. Full artifact hashing is
         # deferred until a caller requests a concrete artifact, so a large
         # recording volume does not block the initial web UI render.
-        self._catalog_sessions(revalidate_pending=False, verify_payload=False)
+        self._catalog_sessions()
         with self._catalog_lock:
             all_items = [copy.deepcopy(item) for item in self._session_summaries.values()]
             diagnostics = copy.deepcopy(list(self._session_diagnostics.values()))

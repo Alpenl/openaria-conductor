@@ -1,0 +1,58 @@
+{
+  "baseline_commit": "24bb5089c60997dcfb75f9043af4a020c0b6374e",
+  "checks": {
+    "baseline": {
+      "tests": 748,
+      "seconds": 159.755,
+      "result": "OK (skipped=2)",
+      "log_sha256": "814e0f1f2f1ea4e9c5c1aba85941268284e8b86c872d2bab02d34788c99903ed",
+      "log_path": "/tmp/openaria-ablation-20260912/baseline-native-check.log",
+      "command": ".venv/bin/python scripts/check.py",
+      "ruff_check": true,
+      "ruff_format": true
+    },
+    "candidate": {
+      "tests": 751,
+      "seconds": 161.793,
+      "result": "OK (skipped=2)",
+      "log_sha256": "5c827c8c650febc5d9fb9da7cae8f31acbef65bc18e2d49d34dc65b211ab11c9",
+      "log_path": "/tmp/openaria-ablation-20260912/candidate-check.log",
+      "command": ".venv/bin/python scripts/check.py",
+      "ruff_check": true,
+      "ruff_format": true
+    },
+    "final_boundary_checks": {
+      "tests": 3,
+      "seconds": 0.912,
+      "result": "OK",
+      "log_sha256": "96fb1b33412e85d974dd68b870847c49ab9d4b6874cac98046cd5ac4faabb338",
+      "log_path": "/tmp/openaria-ablation-20260912/final-targeted-tests.log"
+    },
+    "state_only": {
+      "tests": 79,
+      "seconds": 13.008,
+      "result": "OK",
+      "log_sha256": "1b2d0ae4a6f871e4714213fbcaaf88750879a5ddcca4d98d630b4f9cef0e1453",
+      "log_path": "/tmp/openaria-ablation-20260912/state-tests.log"
+    }
+  },
+  "structure": {
+    "baseline": {
+      "production_lines": 3758,
+      "catalog_keyword_parameters": [
+        "revalidate_pending",
+        "verify_payload",
+        "session_ids"
+      ],
+      "pending_verification_references": 13
+    },
+    "candidate": {
+      "production_lines": 3718,
+      "catalog_keyword_parameters": [
+        "verify_session"
+      ],
+      "pending_verification_references": 0
+    }
+  },
+  "note": "Full candidate run preceded the final NUL-path guard; the final three boundary tests passed after that guard. No Rust source changed. Both checkouts use the same ABI 6 native extension. The initial archive-only run lacked Git metadata and is excluded; the baseline was rerun with matching Git identity and native extension."
+}

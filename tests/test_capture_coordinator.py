@@ -1635,6 +1635,117 @@ class CaptureCoordinatorTest(unittest.TestCase):
             finally:
                 restarted.close()
 
+    def test_artifact_access_does_not_enumerate_unrelated_sessions(self) -> None:
+        first = self.coordinator()
+        try:
+            current = self.seal_one(first, prefix="target-current")
+            legacy = self.seal_one(first, prefix="target-legacy")
+        finally:
+            first.close()
+        legacy_root = self.mountpoint / "sessions"
+        legacy_root.mkdir()
+        (self.mountpoint / "recordings" / legacy).rename(legacy_root / legacy)
+        restarted = self.coordinator()
+        try:
+            listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(len(listed["items"]), 2)
+            roots = set(restarted._require_admission().catalog_roots)
+            iterdir = Path.iterdir
+
+            def without_catalog_scan(path: Path):
+                if path in roots:
+                    raise AssertionError("artifact access must not enumerate other sessions")
+                return iterdir(path)
+
+            for session_id, root in (
+                (current, self.mountpoint / "recordings"),
+                (legacy, legacy_root),
+            ):
+                manifest = json.loads((root / session_id / "manifest.json").read_bytes())
+                artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
+                with (
+                    patch.object(Path, "iterdir", without_catalog_scan),
+                    restarted.open_verified_artifact(
+                        session_id, artifact["artifact_id"], "v4"
+                    ) as opened,
+                ):
+                    self.assertEqual(
+                        opened.read(), (root / session_id / artifact["path"]).read_bytes()
+                    )
+                self.assertEqual(
+                    len(restarted.list_sessions(cursor=None, limit=50, take_id=None)["items"]), 2
+                )
+        finally:
+            restarted.close()
+
+    def test_artifact_access_rejects_session_paths(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="target-path")
+            root = self.mountpoint / "recordings" / session_id
+            manifest = json.loads((root / "manifest.json").read_bytes())
+            artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
+            for invalid in (
+                "",
+                ".",
+                "..",
+                "bad\x00session",
+                str(root),
+                f"../recordings/{session_id}",
+                f"{session_id}/",
+            ):
+                with self.subTest(session_id=invalid), self.assertRaises(ArtifactAccessError):
+                    coordinator.open_verified_artifact(invalid, artifact_id, "v4")
+            coordinator.open_verified_artifact(session_id, artifact_id, "v4").close()
+        finally:
+            coordinator.close()
+
+    def test_artifact_access_rejects_corruption_in_another_artifact(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="other-eye-corrupt")
+            root = self.mountpoint / "recordings" / session_id
+            manifest = json.loads((root / "manifest.json").read_bytes())
+            artifacts = manifest["video"]["segments"][0]["artifacts"]
+            right = root / artifacts["right"]["path"]
+            original_stat = right.stat()
+            payload = bytearray(right.read_bytes())
+            payload[0] ^= 1
+            right.write_bytes(payload)
+            # ctime must catch same-size tampering even when mtime is restored.
+            os.utime(right, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            with self.assertRaises(ArtifactAccessError):
+                coordinator.open_verified_artifact(
+                    session_id, artifacts["left"]["artifact_id"], "v4"
+                )
+        finally:
+            coordinator.close()
+
+    def test_cold_download_hashes_session_once_then_reuses_unchanged_identities(self) -> None:
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first, prefix="reuse-download-validation")
+        finally:
+            first.close()
+        restarted = self.coordinator()
+        try:
+            root = self.mountpoint / "recordings" / session_id
+            manifest = json.loads((root / "manifest.json").read_bytes())
+            from rp_ylx.recording.coordinator import validate_device_session_directory
+
+            with patch(
+                "rp_ylx.recording.coordinator.validate_device_session_directory",
+                wraps=validate_device_session_directory,
+            ) as validate:
+                for artifact in iter_device_session_v1_artifacts(manifest):
+                    with restarted.open_verified_artifact(
+                        session_id, artifact["artifact_id"], "v4"
+                    ) as opened:
+                        self.assertEqual(opened.read(), (root / artifact["path"]).read_bytes())
+                self.assertEqual(validate.call_count, 1)
+        finally:
+            restarted.close()
+
     def test_recording_defers_cold_catalog_hashing_until_idle_without_trusting_bytes(self) -> None:
         for corrupt in (False, True):
             with self.subTest(corrupt=corrupt):

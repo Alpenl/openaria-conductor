@@ -2364,6 +2364,29 @@ class NetworkControlTest(unittest.TestCase):
         self.assertIs(response["ok"], False)
         self.assertEqual(response["error"]["code"], "request_invalid")
 
+    def test_apply_rejects_non_string_mode_before_controller_dispatch(self) -> None:
+        controller = Mock()
+        for mode in ([], {}, ["hotspot"], {"mode": "hotspot"}):
+            with self.subTest(mode=mode):
+                response = handle_control_payload(
+                    json.dumps(
+                        {
+                            "schema": "ylx.network-control-request.v1",
+                            "operation": "apply",
+                            "principal_id": "customer",
+                            "idempotency_key": "invalid-mode",
+                            "body": {
+                                "schema": "ylx.network-apply-request.v1",
+                                "desired": {"mode": mode, "wifi_client": None, "ethernet": None},
+                            },
+                        }
+                    ),
+                    controller=controller,
+                )
+                self.assertIs(response["ok"], False)
+                self.assertEqual(response["error"]["code"], "request_invalid")
+        controller._handle_validated.assert_not_called()
+
     def test_secret_bearing_controller_response_is_replaced_fail_closed(self) -> None:
         controller = Mock()
         controller._handle_validated.return_value = {

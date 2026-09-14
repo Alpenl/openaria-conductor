@@ -1,0 +1,904 @@
+{
+  "method": "Inventory of all tracked implementation source under src, native, scripts and root build backend, plus the new shared validator. Names and callers were screened, followed by targeted behavior experiments. Inventory is not a claim of exhaustive semantic proof for every function.",
+  "files": [
+    {
+      "path": "build_backend.py",
+      "lines": 142,
+      "sha256": "0f3423e8b6d0712acef4bfa661626a6b88e78b2575c4dc167a0512799892a975",
+      "changed_this_round": false,
+      "baseline_lines": 142,
+      "functions": 12,
+      "classes": 0
+    },
+    {
+      "path": "native/hobot/sbs_live_encode.c",
+      "lines": 432,
+      "sha256": "33236bbc7186b11a975c5727d34fa3c3ac48f812a0e7c0f714039a1a38862a98",
+      "changed_this_round": false,
+      "baseline_lines": 432
+    },
+    {
+      "path": "native/src/active_take.rs",
+      "lines": 365,
+      "sha256": "6e8c813ba16eb90f4e4f608abe5e0d1e09b4e85f92d828b4d131d4816c468f99",
+      "changed_this_round": false,
+      "baseline_lines": 365
+    },
+    {
+      "path": "native/src/audio.rs",
+      "lines": 1643,
+      "sha256": "f4ba5292e56d408d787f4182f8534caea03e5704264a08534a754b7cabe2a728",
+      "changed_this_round": false,
+      "baseline_lines": 1643
+    },
+    {
+      "path": "native/src/bounded.rs",
+      "lines": 163,
+      "sha256": "d0f2dd95b9bcc8fcad78f53bf79c4706ba47a700be8f81e5064e9cb434e16399",
+      "changed_this_round": true,
+      "baseline_lines": 267
+    },
+    {
+      "path": "native/src/capture_runtime.rs",
+      "lines": 1172,
+      "sha256": "79f1c8dd57f9e344e9eda30275fa4f9a79fe4f6377dee523fc5db23e32d5f5ac",
+      "changed_this_round": true,
+      "baseline_lines": 1116
+    },
+    {
+      "path": "native/src/frame_stream.rs",
+      "lines": 34,
+      "sha256": "eb8a27e3a1aee08ec15f819528220f0d0edb2f7a7b8564a4c78c5a5ce18ff338",
+      "changed_this_round": false,
+      "baseline_lines": 34
+    },
+    {
+      "path": "native/src/imu.rs",
+      "lines": 986,
+      "sha256": "b4152fdc25d2cffb9d247041f3f5df6400bff5876625aee3000e739bb17162a5",
+      "changed_this_round": false,
+      "baseline_lines": 986
+    },
+    {
+      "path": "native/src/imu_preview.rs",
+      "lines": 179,
+      "sha256": "3715013d4d8eca5a79dfb4a1736e9514d1d3df51f5fcca665f72671432b6420d",
+      "changed_this_round": false,
+      "baseline_lines": 179
+    },
+    {
+      "path": "native/src/jpeg.rs",
+      "lines": 98,
+      "sha256": "cd3317033120ebe678800f23909966a9494e0a8c077092dcf1486f5eb0762f6c",
+      "changed_this_round": false,
+      "baseline_lines": 98
+    },
+    {
+      "path": "native/src/lib.rs",
+      "lines": 1355,
+      "sha256": "3071179d092049fc402c2b7179f2c4890a231c69c257925417b3f499a9dfa1dc",
+      "changed_this_round": false,
+      "baseline_lines": 1355
+    },
+    {
+      "path": "native/src/metrics.rs",
+      "lines": 358,
+      "sha256": "c0f8efc31e6204f2ae9d04bdf0881cef2db49175634714df1062c8bb256f0aeb",
+      "changed_this_round": false,
+      "baseline_lines": 358
+    },
+    {
+      "path": "native/src/native_camera.rs",
+      "lines": 592,
+      "sha256": "63e9986b4bf6b75fc6548cf858745b338f6fa8f31b118783d4268cae87200e8e",
+      "changed_this_round": false,
+      "baseline_lines": 592
+    },
+    {
+      "path": "native/src/preview.rs",
+      "lines": 190,
+      "sha256": "5c5bfb9675195ec3c883f11ed9d130fcafb5aca43a21c9b0e6b3bb554943eeda",
+      "changed_this_round": false,
+      "baseline_lines": 190
+    },
+    {
+      "path": "native/src/recording.rs",
+      "lines": 1222,
+      "sha256": "ca72c36420358be0521e4a2dbce5dcb518c06001b3f1aea39123ccb464d810be",
+      "changed_this_round": false,
+      "baseline_lines": 1222
+    },
+    {
+      "path": "native/src/session_io.rs",
+      "lines": 1551,
+      "sha256": "f74e0d127deab59d766021413fc4623364c1a411e9b347cac2546c92cb4c03db",
+      "changed_this_round": false,
+      "baseline_lines": 1551
+    },
+    {
+      "path": "native/src/session_store.rs",
+      "lines": 579,
+      "sha256": "5782b414a4a19c87e3ce602b7e0d6a67f66ed79e17f40f7ae7668d645a03550a",
+      "changed_this_round": false,
+      "baseline_lines": 579
+    },
+    {
+      "path": "native/src/stereo_encoder.rs",
+      "lines": 620,
+      "sha256": "1245ec14cf35d2e5033a326e64299e32f1ccbfd49ed18e8c89328a2a43a959d3",
+      "changed_this_round": false,
+      "baseline_lines": 620
+    },
+    {
+      "path": "native/src/turbojpeg.rs",
+      "lines": 509,
+      "sha256": "2f20e4da649555401552013dce0ee6e848e478d2a456821c86d3b29ce3baeec0",
+      "changed_this_round": false,
+      "baseline_lines": 509
+    },
+    {
+      "path": "native/src/v4l2.rs",
+      "lines": 1220,
+      "sha256": "89098b198b6df5f9a2a395420c7d93ac17edb5ef7dfb21104a88b061740250fe",
+      "changed_this_round": false,
+      "baseline_lines": 1220
+    },
+    {
+      "path": "scripts/build_rdk_x5_bundle.py",
+      "lines": 95,
+      "sha256": "94f3438fb2a287908ae00301eb927bd91f6570be37422fdacb1062f30aaa2a1a",
+      "changed_this_round": false,
+      "baseline_lines": 95,
+      "functions": 1,
+      "classes": 0
+    },
+    {
+      "path": "scripts/check.py",
+      "lines": 26,
+      "sha256": "dcdc3a3b260e70642fbdba6c8581428560bf40feaaece59565739509c5e9c2c9",
+      "changed_this_round": false,
+      "baseline_lines": 26,
+      "functions": 2,
+      "classes": 0
+    },
+    {
+      "path": "scripts/generate_contract_fixtures.py",
+      "lines": 240,
+      "sha256": "8956456bc7fdec1321a442fef8352a37f66ab55ad8f87dc0a621d3c66269b8e6",
+      "changed_this_round": false,
+      "baseline_lines": 240,
+      "functions": 8,
+      "classes": 0
+    },
+    {
+      "path": "scripts/openaria_update.py",
+      "lines": 11,
+      "sha256": "0318466b7b27053e4ae739e4726c41a8704a8e1fdb5f7b3a1bf68ab68a46b5e2",
+      "changed_this_round": false,
+      "baseline_lines": 11,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "scripts/publish_rdk_x5_oss.py",
+      "lines": 212,
+      "sha256": "d25847e04499a92788d05231d74ba1f25ee6f0b1935d8d00c65000e65855494e",
+      "changed_this_round": false,
+      "baseline_lines": 212,
+      "functions": 6,
+      "classes": 0
+    },
+    {
+      "path": "scripts/rdk_ap_sta_preflight.py",
+      "lines": 1050,
+      "sha256": "f2fad2ade55678fbd8f25c3611113dc96dea961d9d82099efe0792d665efa089",
+      "changed_this_round": false,
+      "baseline_lines": 1050,
+      "functions": 45,
+      "classes": 3
+    },
+    {
+      "path": "scripts/rdk_audio_sync_acceptance.py",
+      "lines": 522,
+      "sha256": "b247baaa091c2b29195719ed7f45a506dac75138dcef744d874bbc206eb0d2b0",
+      "changed_this_round": false,
+      "baseline_lines": 522,
+      "functions": 22,
+      "classes": 1
+    },
+    {
+      "path": "scripts/rdk_camera_focus_negative_evidence.py",
+      "lines": 2066,
+      "sha256": "1a53324582ae6ebb24bf3aadc5205156f2c84f0eb7f056be52704e60e2269f2f",
+      "changed_this_round": false,
+      "baseline_lines": 2066,
+      "functions": 75,
+      "classes": 12
+    },
+    {
+      "path": "scripts/rdk_live_projection_acceptance.py",
+      "lines": 1233,
+      "sha256": "5e251d252e80f6b9998306c0ca0c522d20034c874b9a3db7533c44cef30ddfaa",
+      "changed_this_round": false,
+      "baseline_lines": 1233,
+      "functions": 47,
+      "classes": 2
+    },
+    {
+      "path": "scripts/rdk_x5_install.py",
+      "lines": 131,
+      "sha256": "a8563a19c2ac2e4a39af89f7ce32da1700a739b73028076f54b4e5098418f700",
+      "changed_this_round": false,
+      "baseline_lines": 131,
+      "functions": 3,
+      "classes": 0
+    },
+    {
+      "path": "scripts/rdk_x5_sd_image.py",
+      "lines": 383,
+      "sha256": "3900a17bb67faf9bfe5dbebe276295e25fba4336920c445d56165536b52ce2a5",
+      "changed_this_round": false,
+      "baseline_lines": 383,
+      "functions": 22,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/__init__.py",
+      "lines": 14,
+      "sha256": "307f334995de0ca246d0104bdb5759d3eec19ea3d858e408bfe2985e8cfeb0b7",
+      "changed_this_round": false,
+      "baseline_lines": 14,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/__main__.py",
+      "lines": 3,
+      "sha256": "7fce465d814fe14997dc2bbcd5fc3d2575e7a6361b4df22d51dd6d868ddb572e",
+      "changed_this_round": false,
+      "baseline_lines": 3,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/_build_info.py",
+      "lines": 3,
+      "sha256": "8becea5eb7cc50737d8628c075cc678145e083b8f84d9809a7db6085c12e6507",
+      "changed_this_round": false,
+      "baseline_lines": 3,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/api/__init__.py",
+      "lines": 35,
+      "sha256": "255256bf3c755bff0fbe43719ab75441fbbe1c91552adc60fb1d617479cacb79",
+      "changed_this_round": false,
+      "baseline_lines": 35,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/api/downloads.py",
+      "lines": 1547,
+      "sha256": "f9272bc0a4418036e76ecb0bff807b48baa4501a32db02b241707269ec284687",
+      "changed_this_round": true,
+      "baseline_lines": 1573,
+      "functions": 65,
+      "classes": 8
+    },
+    {
+      "path": "src/rp_ylx/api/events.py",
+      "lines": 1226,
+      "sha256": "bd1d71ad2f809460664343ba4023a4fb4e729ef5c3b17445f24de14cb0a565c3",
+      "changed_this_round": false,
+      "baseline_lines": 1226,
+      "functions": 61,
+      "classes": 6
+    },
+    {
+      "path": "src/rp_ylx/api/gateway.py",
+      "lines": 2918,
+      "sha256": "515a169837995830c111802d94d50c564f41cacfe3af18469f76c35dfad9a1cd",
+      "changed_this_round": true,
+      "baseline_lines": 3017,
+      "functions": 129,
+      "classes": 15
+    },
+    {
+      "path": "src/rp_ylx/api/mock_device.py",
+      "lines": 439,
+      "sha256": "d3619f50c4582fb0736315e3063f00ce060af4083cd0e7eab69750295b8878c3",
+      "changed_this_round": false,
+      "baseline_lines": 439,
+      "functions": 23,
+      "classes": 4
+    },
+    {
+      "path": "src/rp_ylx/api/preview.py",
+      "lines": 176,
+      "sha256": "b78f21e14a88d4fad561b8ee56acd0810c700f5fef530a808179cb076785ff77",
+      "changed_this_round": false,
+      "baseline_lines": 176,
+      "functions": 16,
+      "classes": 5
+    },
+    {
+      "path": "src/rp_ylx/api/preview_pump.py",
+      "lines": 314,
+      "sha256": "2393ff0b1dff7a41afbf7da5002592620fb2f85c3595c72c0dd3611d924292ac",
+      "changed_this_round": false,
+      "baseline_lines": 314,
+      "functions": 20,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/api/security.py",
+      "lines": 126,
+      "sha256": "8c61125699403817a266453a585426b578f2f515f1d25cd011369cf73c126a05",
+      "changed_this_round": false,
+      "baseline_lines": 126,
+      "functions": 7,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/api/server.py",
+      "lines": 262,
+      "sha256": "274da944e195b22314f6266b92639a8c3bf413b305fe9e322bcc8ddb540a98bc",
+      "changed_this_round": false,
+      "baseline_lines": 262,
+      "functions": 13,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/audio_clock.py",
+      "lines": 181,
+      "sha256": "7d4d7af71b7f7696a307dc50afaafa1eadfba1221a26bbc6b42fb2751e909f3a",
+      "changed_this_round": false,
+      "baseline_lines": 181,
+      "functions": 1,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/camera/__init__.py",
+      "lines": 33,
+      "sha256": "65925f8cb7492e12cf1403df5412978db950f976efe958d91f612dabb2ce06eb",
+      "changed_this_round": false,
+      "baseline_lines": 33,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/camera/controller.py",
+      "lines": 228,
+      "sha256": "19fcdd02feb814b3715a30ba0f2ad6a1e92255bda5dc2741acc67aedac3e58bc",
+      "changed_this_round": false,
+      "baseline_lines": 228,
+      "functions": 16,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/camera/models.py",
+      "lines": 72,
+      "sha256": "6e1de6945f359db2720bb559cc459497101a2a53477d02e58df25cbe819f1264",
+      "changed_this_round": false,
+      "baseline_lines": 72,
+      "functions": 9,
+      "classes": 7
+    },
+    {
+      "path": "src/rp_ylx/camera/synthetic.py",
+      "lines": 63,
+      "sha256": "4605383d0901cd5e27b14268af29637018f56388fbfa8629d8bff66214fbd7ba",
+      "changed_this_round": false,
+      "baseline_lines": 63,
+      "functions": 8,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/camera/turbojpeg.py",
+      "lines": 132,
+      "sha256": "093e7776ff911ffeced5d60737201f6d782f4c0ca6e19d63a45cb626b0c87768",
+      "changed_this_round": false,
+      "baseline_lines": 132,
+      "functions": 5,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/camera/v4l2.py",
+      "lines": 709,
+      "sha256": "bb7756a14d6f45b10e92eba2927b837d9113a94be89391d6de9946ad2922112e",
+      "changed_this_round": false,
+      "baseline_lines": 709,
+      "functions": 31,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/camera_focus.py",
+      "lines": 29,
+      "sha256": "8f8d2c245ec6b950c0ae2a56b8bac1a30141c0d7e0bdb6bb729a91a675211095",
+      "changed_this_round": false,
+      "baseline_lines": 29,
+      "functions": 1,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/cli.py",
+      "lines": 503,
+      "sha256": "463c251526894205330ed602a0b97b1c320a301b566e3061cd529136326af4dd",
+      "changed_this_round": false,
+      "baseline_lines": 503,
+      "functions": 3,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/cli_helpers.py",
+      "lines": 22,
+      "sha256": "9feefe1fb03ca46be5b01ec9ba49abf03b1cddba985789bd9cbf18ea4b4cff93",
+      "changed_this_round": false,
+      "baseline_lines": 22,
+      "functions": 1,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/contracts/__init__.py",
+      "lines": 9,
+      "sha256": "bc9896ff6cb8af53ccb5d0ed722a8769a3576fbd52436dbc2ccc324e4767e1db",
+      "changed_this_round": false,
+      "baseline_lines": 9,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/contracts/frame_stream.py",
+      "lines": 47,
+      "sha256": "6c54e6a6e5f0390d6b685dcbc77eede4ce79c2ca10550a20363976b3815c934d",
+      "changed_this_round": false,
+      "baseline_lines": 47,
+      "functions": 4,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/contracts/session.py",
+      "lines": 502,
+      "sha256": "58cbe885ddf5ed8e0fe669e1fa4e1a3d2fbe34a9447c6b17f278bdc99d860963",
+      "changed_this_round": false,
+      "baseline_lines": 502,
+      "functions": 16,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/daemon.py",
+      "lines": 822,
+      "sha256": "bd73eba7f91aa8d9b1cc81205949b0774fffa3058d6caf4f6dc84ea5034e9b3e",
+      "changed_this_round": true,
+      "baseline_lines": 835,
+      "functions": 21,
+      "classes": 4
+    },
+    {
+      "path": "src/rp_ylx/deploy/__init__.py",
+      "lines": 1,
+      "sha256": "9ea4e48920c249788017894a185493f909fec57df221176b905404ff7d3fa5cd",
+      "changed_this_round": false,
+      "baseline_lines": 1,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/deployment.py",
+      "lines": 2443,
+      "sha256": "afb6c7cbacf788ebc6ac78401cd34c002dc21a13efe70b810de26d101d58346c",
+      "changed_this_round": false,
+      "baseline_lines": 2443,
+      "functions": 88,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/hardware/__init__.py",
+      "lines": 6,
+      "sha256": "f828936b79abf502eba7fe0087813886058c16df5ee70ffc5da2d07aac0ce2d1",
+      "changed_this_round": false,
+      "baseline_lines": 6,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/hardware/probe.py",
+      "lines": 235,
+      "sha256": "ae41e2d632b59658ba61fbf5d441b3854d3ef88fafc8d19555e29c8c651c8df0",
+      "changed_this_round": false,
+      "baseline_lines": 235,
+      "functions": 12,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/hardware/smoke.py",
+      "lines": 495,
+      "sha256": "33e7b5e0d3b8a5dfa8b6125aeac24a22e95368aeddc436e68c0a7306ebd8d467",
+      "changed_this_round": false,
+      "baseline_lines": 495,
+      "functions": 12,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/hardware/target.py",
+      "lines": 35,
+      "sha256": "34fb69632eb5539a1d3b8eb4b04ba5bed95c7465b0c071230c09994b98763976",
+      "changed_this_round": false,
+      "baseline_lines": 35,
+      "functions": 3,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/hobot/ylx_stereo_encoder.c",
+      "lines": 341,
+      "sha256": "5748e0a9bf34c5fc9a0b797ed32a90369d45695b95f4f2b57867b52b05d41320",
+      "changed_this_round": false,
+      "baseline_lines": 341
+    },
+    {
+      "path": "src/rp_ylx/hobot/ylx_stereo_pipeline.c",
+      "lines": 971,
+      "sha256": "06748022302338fe65ff86f64c9c781b7ef401988a80f1b574f2b0cfce544d3e",
+      "changed_this_round": false,
+      "baseline_lines": 971
+    },
+    {
+      "path": "src/rp_ylx/hobot/ylx_stereo_pipeline.h",
+      "lines": 89,
+      "sha256": "40880c861ea0532467c222f5abd9ef4753b6739ec42fa7975ce4b5f3ecf680fd",
+      "changed_this_round": false,
+      "baseline_lines": 89
+    },
+    {
+      "path": "src/rp_ylx/imu/__init__.py",
+      "lines": 33,
+      "sha256": "0c6cf9d6a82fdb91b7693f7433b19ac7e485ce88e5703eaf416f4b50ff2a49cb",
+      "changed_this_round": false,
+      "baseline_lines": 33,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/imu/collector.py",
+      "lines": 115,
+      "sha256": "22eb34fabfd86ba46b82ff96c991fbecea124b21381ca9be2a51515a8e4ccfac",
+      "changed_this_round": false,
+      "baseline_lines": 115,
+      "functions": 9,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/imu/models.py",
+      "lines": 101,
+      "sha256": "ba09a7d537177cb3d3e0c11a4dbdfc1f62490cb6ae6ab3c4488543609dc86044",
+      "changed_this_round": false,
+      "baseline_lines": 101,
+      "functions": 8,
+      "classes": 6
+    },
+    {
+      "path": "src/rp_ylx/imu/native.py",
+      "lines": 70,
+      "sha256": "cd1a20184ffe346b3ae3352d94941769c8ee7a5a533b8b3a69bd3bc0bfe038c7",
+      "changed_this_round": true,
+      "baseline_lines": 74,
+      "functions": 6,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/imu/protocol.py",
+      "lines": 53,
+      "sha256": "a7bc2554aa3e3a879af122fb403f7347ef9d0c93598fbf0659aeb81bbc380323",
+      "changed_this_round": false,
+      "baseline_lines": 53,
+      "functions": 1,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/imu/time_sync.py",
+      "lines": 139,
+      "sha256": "a2f081fa8e1811b9b3f28e5014261c30ecd339e71744831fa37464f2f6b88daa",
+      "changed_this_round": false,
+      "baseline_lines": 139,
+      "functions": 5,
+      "classes": 4
+    },
+    {
+      "path": "src/rp_ylx/imu/uvc_xu.py",
+      "lines": 303,
+      "sha256": "8262bf13d63a7baff4e1b9cfaf123fbc0470838e059c4ff8b74a72f231d09066",
+      "changed_this_round": false,
+      "baseline_lines": 303,
+      "functions": 18,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/mdns.py",
+      "lines": 253,
+      "sha256": "9f1a38a7135ec9bd61c848fc19a1679ca30fbb39a61dd310643bc8db25c5e859",
+      "changed_this_round": false,
+      "baseline_lines": 253,
+      "functions": 15,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/native.py",
+      "lines": 502,
+      "sha256": "4854b336df5bb5e960903ac0c2ead33cbc9eb5b0db74ca69abd29b155dc3eaf4",
+      "changed_this_round": false,
+      "baseline_lines": 502,
+      "functions": 58,
+      "classes": 11
+    },
+    {
+      "path": "src/rp_ylx/network.py",
+      "lines": 2307,
+      "sha256": "b59c9c63fbd47537a05f53152456c9a403db87cb2cad911be3ddfa861f65c05f",
+      "changed_this_round": true,
+      "baseline_lines": 2324,
+      "functions": 86,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/network_control.py",
+      "lines": 2138,
+      "sha256": "1224d188c46996d88985144bdde1716bcce6496301106f6f98c1aa694c7d4d19",
+      "changed_this_round": true,
+      "baseline_lines": 2244,
+      "functions": 61,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/network_credentials.py",
+      "lines": 220,
+      "sha256": "9d2092248896d082eb6864dc98b9e942d2fb8d51ec2d52d75da32b9daa4982c2",
+      "changed_this_round": false,
+      "baseline_lines": 220,
+      "functions": 17,
+      "classes": 4
+    },
+    {
+      "path": "src/rp_ylx/network_state.py",
+      "lines": 695,
+      "sha256": "f35f1f595a4b79a7473618178e866f6bea55a5160b38d5ab32d5c03fd87b1cbc",
+      "changed_this_round": true,
+      "baseline_lines": 712,
+      "functions": 25,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/network_validation.py",
+      "lines": 113,
+      "sha256": "2977b6a7c2d266928a080d567e8fe02934dca8f46da0dccc5bccadd620e5ee9c",
+      "changed_this_round": true,
+      "baseline_lines": 0,
+      "functions": 6,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/operational_logging.py",
+      "lines": 259,
+      "sha256": "12e738487468a0839bdcfdd16a9406f67e979c5f6e11ef6f5e1268b94614187c",
+      "changed_this_round": false,
+      "baseline_lines": 259,
+      "functions": 9,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/performance/__init__.py",
+      "lines": 9,
+      "sha256": "32a80a7c7abe059efb1e1a42e03eb31a22b8618f84c5125990a0c94f1ba5d51c",
+      "changed_this_round": false,
+      "baseline_lines": 9,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/performance/benchmark.py",
+      "lines": 483,
+      "sha256": "2d51d395d9e55749226f0ca7021141a28a031e698eef8320db81ef68eb2e40a9",
+      "changed_this_round": false,
+      "baseline_lines": 483,
+      "functions": 19,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/performance/metrics.py",
+      "lines": 229,
+      "sha256": "5bc1b3e53fbc41485130ab554c83597da223a21980daadb5a277b9e4d6069273",
+      "changed_this_round": false,
+      "baseline_lines": 229,
+      "functions": 17,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/performance/report.py",
+      "lines": 162,
+      "sha256": "d921c2a86d57d4ba9d18c8ed28b9116a1fe730eeb9cecad5e199f797c1a2f187",
+      "changed_this_round": false,
+      "baseline_lines": 162,
+      "functions": 6,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/recording/__init__.py",
+      "lines": 45,
+      "sha256": "89712f34be1fb9234395487f89bc99ba4315ddaeaf14ea45498b8b7b8222cb67",
+      "changed_this_round": false,
+      "baseline_lines": 45,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/recording/coordinator.py",
+      "lines": 2960,
+      "sha256": "c3445dc0d5a0dc91253620021a831ac545a70791f0a0745d77c2204b899d4e94",
+      "changed_this_round": true,
+      "baseline_lines": 2965,
+      "functions": 122,
+      "classes": 8
+    },
+    {
+      "path": "src/rp_ylx/recording/deletion.py",
+      "lines": 117,
+      "sha256": "5766f456b47a019cede2b0a11060d250a0ee58f5199358bf140572503a4c0f31",
+      "changed_this_round": false,
+      "baseline_lines": 117,
+      "functions": 2,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/recording/device_session.py",
+      "lines": 2316,
+      "sha256": "27f3bd6b5d4e1fcff86f50e56dd866e01945185a82768cb00b73524a40466b90",
+      "changed_this_round": true,
+      "baseline_lines": 2350,
+      "functions": 96,
+      "classes": 10
+    },
+    {
+      "path": "src/rp_ylx/recording/encoding.py",
+      "lines": 85,
+      "sha256": "d8f8064cdaf5950304cbb6054938b813d79a97f83b36c283233daaedf315ade8",
+      "changed_this_round": false,
+      "baseline_lines": 85,
+      "functions": 4,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/recording/session.py",
+      "lines": 590,
+      "sha256": "18697cad85ce514e0e3662c81e96f574931b0990fe7e5e675d4911c61d2e86f4",
+      "changed_this_round": false,
+      "baseline_lines": 590,
+      "functions": 33,
+      "classes": 5
+    },
+    {
+      "path": "src/rp_ylx/recording/sources.py",
+      "lines": 682,
+      "sha256": "391b4b3665dfa182145d10fa2740c16e0788df29fe31065eb5a91f2aaa711c20",
+      "changed_this_round": false,
+      "baseline_lines": 682,
+      "functions": 45,
+      "classes": 6
+    },
+    {
+      "path": "src/rp_ylx/recording/stereo_encoder.py",
+      "lines": 321,
+      "sha256": "36092d0982cb4c5011244bce0420ff24dd21d11a6ba641c1871be2a2ffd7e9c7",
+      "changed_this_round": false,
+      "baseline_lines": 321,
+      "functions": 16,
+      "classes": 3
+    },
+    {
+      "path": "src/rp_ylx/runtime.py",
+      "lines": 185,
+      "sha256": "af97cdea186540310f560b4a374e8aec710dbeac3c44363e3d39c7edcd588ef8",
+      "changed_this_round": false,
+      "baseline_lines": 185,
+      "functions": 5,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/schemas/__init__.py",
+      "lines": 1,
+      "sha256": "fc0127152c446fd6b21907ffe13ff194b5ac4a5eec7e20d96670885b444fd8d9",
+      "changed_this_round": false,
+      "baseline_lines": 1,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/session_timestamps.py",
+      "lines": 461,
+      "sha256": "dce1ee6d01ce4d754b92ad2c9a82dd7f26d1232534a61b01bef9367102584463",
+      "changed_this_round": false,
+      "baseline_lines": 461,
+      "functions": 19,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/spectacular/__init__.py",
+      "lines": 25,
+      "sha256": "714395189ea5b8e87849d33652e2eaf314134e56eab8d3ed296ed50cedfd5f71",
+      "changed_this_round": false,
+      "baseline_lines": 25,
+      "functions": 0,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/spectacular/adapter.py",
+      "lines": 636,
+      "sha256": "8af3723f6379311a320915f9873460a7cc7cd97f70b1596273bde5811f3c5b03",
+      "changed_this_round": false,
+      "baseline_lines": 636,
+      "functions": 22,
+      "classes": 4
+    },
+    {
+      "path": "src/rp_ylx/spectacular/check_cli.py",
+      "lines": 53,
+      "sha256": "86474e4116e18b8042fd673c06ce426233b9699a1f43244fb23c30de710eaf84",
+      "changed_this_round": false,
+      "baseline_lines": 53,
+      "functions": 1,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/spectacular/model.py",
+      "lines": 292,
+      "sha256": "999b5d6bac48e57ee5473e233012d93b6db8856fdfb2a2c2fd8e594bb45efac9",
+      "changed_this_round": false,
+      "baseline_lines": 292,
+      "functions": 9,
+      "classes": 0
+    },
+    {
+      "path": "src/rp_ylx/spectacular/timebase.py",
+      "lines": 454,
+      "sha256": "00a2868a3d2a02133a5b107dbbe5009931197b1d7bc130917c85e284551487d2",
+      "changed_this_round": false,
+      "baseline_lines": 454,
+      "functions": 14,
+      "classes": 2
+    },
+    {
+      "path": "src/rp_ylx/update.py",
+      "lines": 650,
+      "sha256": "189c620696bd21a9715b9033b929f8e9243fa6b8ac9f130d7e5052cad8967c6a",
+      "changed_this_round": false,
+      "baseline_lines": 650,
+      "functions": 24,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/validation.py",
+      "lines": 92,
+      "sha256": "0e96d6b14c8ee9bd4e9541f5963e28c094b375bd6dda0cccec58407e8798a135",
+      "changed_this_round": false,
+      "baseline_lines": 92,
+      "functions": 3,
+      "classes": 1
+    },
+    {
+      "path": "src/rp_ylx/web/__init__.py",
+      "lines": 199,
+      "sha256": "3d72f7e85e348f4eaf2dfd658e6e53f92918a8289fa239cbed7f746a3a296619",
+      "changed_this_round": false,
+      "baseline_lines": 199,
+      "functions": 10,
+      "classes": 2
+    }
+  ],
+  "counts_by_suffix": {
+    ".py": 82,
+    ".c": 3,
+    ".rs": 18,
+    ".h": 1
+  },
+  "source_files": 104
+}

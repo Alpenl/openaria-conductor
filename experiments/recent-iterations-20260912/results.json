@@ -1,0 +1,228 @@
+{
+  "python": "3.13.13 | packaged by Anaconda, Inc. | (main, Apr 14 2026, 06:19:41) [GCC 14.3.0]",
+  "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+  "baseline_commit": "24bb5089c60997dcfb75f9043af4a020c0b6374e",
+  "probes": {
+    "baseline_catalog": {
+      "median_ms": 14.53289098571986,
+      "samples_ms": [
+        14.313610037788749,
+        14.69780900515616,
+        14.919274020940065,
+        14.036221022251993,
+        14.827773033175617,
+        14.53289098571986,
+        14.11401602672413
+      ],
+      "peak_python_bytes": 332027,
+      "output_sha256": "57d6e37e3651bd028cf914c867d3e260ff18c2a88a79dec7647b5811f06aca4c",
+      "siblings": 2000,
+      "work_per_request": {
+        "catalog_entries": 2001,
+        "candidate_is_dir": 2001,
+        "full_verifications": 1
+      }
+    },
+    "state_only_catalog": {
+      "median_ms": 15.392169007100165,
+      "samples_ms": [
+        16.580294002778828,
+        15.876436023972929,
+        14.026853023096919,
+        15.392169007100165,
+        14.117402024567127,
+        17.720739007927477,
+        14.85567499184981
+      ],
+      "peak_python_bytes": 331817,
+      "output_sha256": "57d6e37e3651bd028cf914c867d3e260ff18c2a88a79dec7647b5811f06aca4c",
+      "siblings": 2000,
+      "work_per_request": {
+        "catalog_entries": 2001,
+        "candidate_is_dir": 2001,
+        "full_verifications": 1
+      }
+    },
+    "candidate_catalog": {
+      "median_ms": 3.349240985698998,
+      "samples_ms": [
+        3.4812179510481656,
+        3.5848820116370916,
+        3.349240985698998,
+        3.142012981697917,
+        3.672556020319462,
+        3.29211400821805,
+        3.1687429873272777
+      ],
+      "peak_python_bytes": 91510,
+      "output_sha256": "57d6e37e3651bd028cf914c867d3e260ff18c2a88a79dec7647b5811f06aca4c",
+      "siblings": 2000,
+      "work_per_request": {
+        "catalog_entries": 0,
+        "candidate_is_dir": 1,
+        "full_verifications": 1
+      }
+    },
+    "baseline_timestamps": {
+      "frames": 18000,
+      "imu_samples": 240000,
+      "operations": {
+        "production_summary": {
+          "median_ms": 256.90088199917227,
+          "samples_ms": [
+            230.39485496701673,
+            251.04710197774693,
+            256.90088199917227,
+            243.80420002853498,
+            262.44895899435505,
+            263.2603779784404,
+            282.11071202531457
+          ],
+          "peak_python_bytes": 30888212,
+          "output_sha256": "0c087efbf2a1364775975d2c309356a31903b93cee859409788e6a8f988bd3d7"
+        },
+        "production_csv": {
+          "median_ms": 336.4364320295863,
+          "samples_ms": [
+            347.230082959868,
+            362.95845097629353,
+            355.0717040197924,
+            304.2876109830104,
+            322.38213799428195,
+            313.23969102231786,
+            336.4364320295863
+          ],
+          "peak_python_bytes": 30887444,
+          "output_sha256": "d23a7ef4709eb9a17b304d0c9e556208eb312e29a4b5c62255f8356c381cb4e2"
+        },
+        "calibration_summary": {
+          "median_ms": 83.62354798009619,
+          "samples_ms": [
+            83.62354798009619,
+            79.07028298359364,
+            80.91921504819766,
+            87.40463701542467,
+            79.90170002449304,
+            93.59828301239759,
+            99.97686702990904
+          ],
+          "peak_python_bytes": 19210140,
+          "output_sha256": "ff618b7c29f6b4e35aea9278363bcfaf611e74a228ffab02bd9125dc98baf0ed"
+        },
+        "calibration_csv": {
+          "median_ms": 187.21942900447175,
+          "samples_ms": [
+            192.27310101268813,
+            192.82646698411554,
+            198.69624701095745,
+            187.21942900447175,
+            154.91228096652776,
+            166.36714700143784,
+            167.2665619989857
+          ],
+          "peak_python_bytes": 18590835,
+          "output_sha256": "cc9c0046b32e73899f33817fea06bd8638a1904cb6a6e4ebb62c71cfbc9d29c8"
+        }
+      }
+    },
+    "candidate_timestamps": {
+      "frames": 18000,
+      "imu_samples": 240000,
+      "operations": {
+        "production_summary": {
+          "median_ms": 214.2499249894172,
+          "samples_ms": [
+            207.2761289891787,
+            257.0339399971999,
+            278.0079289805144,
+            233.4308089921251,
+            214.2499249894172,
+            209.72848002566025,
+            199.562496971339
+          ],
+          "peak_python_bytes": 21374708,
+          "output_sha256": "0c087efbf2a1364775975d2c309356a31903b93cee859409788e6a8f988bd3d7"
+        },
+        "production_csv": {
+          "median_ms": 310.84288097918034,
+          "samples_ms": [
+            262.23680801922455,
+            348.8334810244851,
+            307.24321195157245,
+            313.84416099172086,
+            307.9408170306124,
+            310.84288097918034,
+            317.3334230086766
+          ],
+          "peak_python_bytes": 21373940,
+          "output_sha256": "d23a7ef4709eb9a17b304d0c9e556208eb312e29a4b5c62255f8356c381cb4e2"
+        },
+        "calibration_summary": {
+          "median_ms": 7.612573041114956,
+          "samples_ms": [
+            7.541548984590918,
+            11.36903598671779,
+            7.612573041114956,
+            7.62974499957636,
+            7.437684980686754,
+            7.281022029928863,
+            7.88789801299572
+          ],
+          "peak_python_bytes": 777956,
+          "output_sha256": "ff618b7c29f6b4e35aea9278363bcfaf611e74a228ffab02bd9125dc98baf0ed"
+        },
+        "calibration_csv": {
+          "median_ms": 161.9289019727148,
+          "samples_ms": [
+            161.39351099263877,
+            159.27002497483045,
+            163.48205000394955,
+            161.9289019727148,
+            166.0078589920886,
+            168.8022599555552,
+            139.04089003335685
+          ],
+          "peak_python_bytes": 160495,
+          "output_sha256": "cc9c0046b32e73899f33817fea06bd8638a1904cb6a6e4ebb62c71cfbc9d29c8"
+        }
+      }
+    },
+    "baseline_nearest": {
+      "cases": 20000,
+      "output_sha256": "50ab03cd2a21f4ad9a991c9fd67bd57b85698e6d997da4497cae56843478b17f"
+    },
+    "candidate_nearest": {
+      "cases": 20000,
+      "output_sha256": "50ab03cd2a21f4ad9a991c9fd67bd57b85698e6d997da4497cae56843478b17f"
+    },
+    "negative_control": {
+      "test": "test_artifact_access_rejects_corruption_in_another_artifact",
+      "intact": {
+        "passed": true,
+        "failures": 0,
+        "errors": 0,
+        "log": ".\n----------------------------------------------------------------------\nRan 1 test in 0.189s\n\nOK\n"
+      },
+      "without_session_payload_validation": {
+        "passed": false,
+        "failures": 1,
+        "errors": 0,
+        "log": "F\n======================================================================\nFAIL: test_artifact_access_rejects_corruption_in_another_artifact (test_capture_coordinator.CaptureCoordinatorTest.test_artifact_access_rejects_corruption_in_another_artifact)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/alpen/DEV/openaria-conductor/tests/test_capture_coordinator.py\", line 1714, in test_artifact_access_rejects_corruption_in_another_artifact\n    with self.assertRaises(ArtifactAccessError):\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ArtifactAccessError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 0.172s\n\nFAILED (failures=1)\n"
+      }
+    }
+  },
+  "source_sha256": {
+    "baseline": {
+      "src/rp_ylx/recording/coordinator.py": "f003b51096f054389271125f76df77e0b74f819fedbf185757d9b5ff75a417fb",
+      "src/rp_ylx/session_timestamps.py": "5559a44eae439ec21f7fd12fa8824135a4bf134f3e385efebd1a1291e897d18b",
+      "src/rp_ylx/spectacular/model.py": "b85e1126418e7082f193e77f4d282a0a39b3750d32885054fea78580abcf0c0a",
+      "src/rp_ylx/_native.abi3.so": "d7e972149492adae93a69f8e385959e5d77c211675bfc88f8ae6cbe8f4866319"
+    },
+    "candidate": {
+      "src/rp_ylx/recording/coordinator.py": "fa0efec1bfff0cb74f6bae1a4cdc0ca785cf0278918e599d0107e8e8be4e103a",
+      "src/rp_ylx/session_timestamps.py": "dce1ee6d01ce4d754b92ad2c9a82dd7f26d1232534a61b01bef9367102584463",
+      "src/rp_ylx/spectacular/model.py": "999b5d6bac48e57ee5473e233012d93b6db8856fdfb2a2c2fd8e594bb45efac9",
+      "src/rp_ylx/_native.abi3.so": "d7e972149492adae93a69f8e385959e5d77c211675bfc88f8ae6cbe8f4866319"
+    }
+  }
+}

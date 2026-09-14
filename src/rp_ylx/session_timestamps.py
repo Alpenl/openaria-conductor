@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+from bisect import bisect_left
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from statistics import fmean, median, pstdev
 from typing import Any
@@ -287,14 +289,7 @@ def _estimated_imu_times(
 
 
 def _nearest_index(values: list[float], target: int) -> int:
-    lo = 0
-    hi = len(values)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if values[mid] < target:
-            lo = mid + 1
-        else:
-            hi = mid
+    lo = bisect_left(values, target)
     if lo <= 0:
         return 0
     if lo >= len(values):
@@ -353,41 +348,46 @@ def _alignment_rows(
     frames: list[dict[str, int]],
     samples: list[dict[str, Any]],
     imu_times: list[float],
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+) -> Iterator[dict[str, Any]]:
     for frame in frames:
         frame_time = frame["host_monotonic_ns"]
         imu_index = _nearest_index(imu_times, frame_time)
         imu = samples[imu_index]
         imu_time = imu_times[imu_index]
-        rows.append(
-            {
-                "frame_index": frame["frame_index"],
-                "source_sequence": frame["source_sequence"],
-                "left_eye_host_monotonic_ns": frame_time,
-                "right_eye_host_monotonic_ns": frame_time,
-                "nearest_imu_sample_number": imu["sample_number"],
-                "nearest_imu_host_monotonic_ns": imu["host_monotonic_ns"],
-                "nearest_imu_estimated_monotonic_ns": int(round(imu_time)),
-                "nearest_imu_delta_ms": (imu_time - frame_time) / 1_000_000.0,
-                "imu_device_timestamp_raw": imu["device_timestamp_raw"],
-                "imu_device_ticks": imu["device_ticks"],
-                "imu_packet_sequence": imu["packet_sequence"],
-                "imu_sample_index": imu["sample_index"],
-                "imu_sync_quality": imu["sync_quality"],
-            }
+        yield {
+            "frame_index": frame["frame_index"],
+            "source_sequence": frame["source_sequence"],
+            "left_eye_host_monotonic_ns": frame_time,
+            "right_eye_host_monotonic_ns": frame_time,
+            "nearest_imu_sample_number": imu["sample_number"],
+            "nearest_imu_host_monotonic_ns": imu["host_monotonic_ns"],
+            "nearest_imu_estimated_monotonic_ns": int(round(imu_time)),
+            "nearest_imu_delta_ms": (imu_time - frame_time) / 1_000_000.0,
+            "imu_device_timestamp_raw": imu["device_timestamp_raw"],
+            "imu_device_ticks": imu["device_ticks"],
+            "imu_packet_sequence": imu["packet_sequence"],
+            "imu_sample_index": imu["sample_index"],
+            "imu_sync_quality": imu["sync_quality"],
+        }
+
+
+def _alignment_summary(frames: list[dict[str, int]], imu_times: list[float]) -> dict[str, Any]:
+    deltas = [
+        abs(
+            (
+                imu_times[_nearest_index(imu_times, frame["host_monotonic_ns"])]
+                - frame["host_monotonic_ns"]
+            )
+            / 1_000_000.0
         )
-    return rows
-
-
-def _alignment_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    deltas = [abs(float(row["nearest_imu_delta_ms"])) for row in rows]
+        for frame in frames
+    ]
     return {
         "camera_timestamp_source": "shared_sbs_frame",
         "camera_time_base": "host_monotonic",
         "left_right_delta_ms": 0.0,
         "imu_matching": "nearest_estimated_sample",
-        "rows": len(rows),
+        "rows": len(frames),
         "nearest_imu_delta_p50_ms": _percentile(deltas, 0.50),
         "nearest_imu_delta_p95_ms": _percentile(deltas, 0.95),
         "nearest_imu_delta_max_ms": max(deltas, default=None),
@@ -434,7 +434,6 @@ def build_session_timestamp_report(
         raise SessionTimestampError("session_timestamps_empty", "会话没有可对齐的 IMU 样本")
     imu = _imu_summary(samples, packets)
     imu_times = _estimated_imu_times(packets, imu["record_rate_hz"])
-    rows = _alignment_rows(frames, samples, imu_times)
     report: dict[str, Any] = {
         "ok": True,
         "schema": "openaria.session-timestamps.v1",
@@ -445,7 +444,7 @@ def build_session_timestamp_report(
         "imu_samples": len(samples),
         "frame_interval": _frame_interval_summary(frames, manifest),
         "imu": imu,
-        "timestamp_alignment": _alignment_summary(rows),
+        "timestamp_alignment": _alignment_summary(frames, imu_times),
     }
     if output is not None:
         path = Path(output)
@@ -453,10 +452,10 @@ def build_session_timestamp_report(
         with path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=TIMESTAMP_CSV_FIELDS)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(_alignment_rows(frames, samples, imu_times))
         report["csv"] = {
             "path": str(path),
-            "rows": len(rows),
+            "rows": len(frames),
             "columns": list(TIMESTAMP_CSV_FIELDS),
         }
     return report

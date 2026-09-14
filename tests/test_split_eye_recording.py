@@ -11,6 +11,8 @@ import time
 import unittest
 import uuid
 from copy import deepcopy
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -625,6 +627,31 @@ class SplitEyeRecordingTest(unittest.TestCase):
             )
             validate_device_session_manifest(manifest)
 
+    def test_ntp_jump_preserves_elapsed_and_repairs_sealed_recording_time(self) -> None:
+        for start_text in ("2000-01-01T08:01:29+08:00", "2026-09-14T18:28:00+08:00"):
+            with self.subTest(start=start_text), tempfile.TemporaryDirectory() as directory:
+                recorder, _, _ = self.build(Path(directory))
+                start = datetime.fromisoformat(start_text)
+                end = datetime.fromisoformat("2026-09-13T18:28:14+08:00")
+                recorder._plan = replace(
+                    recorder._plan, display_name=start.strftime("录制 %Y-%m-%d %H:%M:%S")
+                )
+                with patch.object(recorder, "_now", return_value=start):
+                    recorder.start()
+                    self.feed(recorder, 7)
+                with patch.object(recorder, "_now", return_value=end):
+                    self.assertLess(recorder._elapsed(), 5)
+                    sealed = recorder.stop()
+                timing = sealed.manifest["time"]
+                corrected = datetime.fromisoformat(timing["started_at"])
+                self.assertAlmostEqual(
+                    (end - corrected).total_seconds(), timing["duration_seconds"], places=5
+                )
+                self.assertEqual(
+                    sealed.manifest["display_name"], corrected.strftime("录制 %Y-%m-%d %H:%M:%S")
+                )
+                validate_device_session_manifest(sealed.manifest)
+
     def test_v3_encoding_survives_native_arguments_seal_and_validation(self) -> None:
         for codec in ("h264", "hevc"):
             with self.subTest(codec=codec), tempfile.TemporaryDirectory() as directory:
@@ -1094,12 +1121,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertEqual(len(verifying_states), 1)
             final_state = verifying_states[0]
             self.assertEqual(final_state["state"], "verifying")
-            expected_bytes = manifest_artifact_bytes_total(
-                sealed.manifest,
-                manifest_bytes=sealed.manifest_bytes,
-                session_id=sealed.manifest["session_id"],
-                code="artifact_invalid",
-            )
+            expected_bytes = manifest_artifact_bytes_total(sealed.manifest, code="artifact_invalid")
             self.assertEqual(final_state["progress"]["bytes_written"], expected_bytes)
 
     def test_audio_failure_fails_closed(self) -> None:

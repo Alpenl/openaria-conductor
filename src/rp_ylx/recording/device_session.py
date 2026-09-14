@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
 from zoneinfo import ZoneInfo
@@ -426,7 +426,7 @@ def _native_read_bounded_fd(descriptor: int, maximum_bytes: int, *, code: str) -
     return payload
 
 
-def _collect_manifest_artifacts_python(
+def _manifest_artifacts(
     manifest: Mapping[str, object],
 ) -> list[Mapping[str, object]]:
     descriptors: list[Mapping[str, object]] = []
@@ -444,17 +444,6 @@ def _collect_manifest_artifacts_python(
 
     collect(manifest)
     return descriptors
-
-
-def _manifest_artifacts(
-    manifest: Mapping[str, object],
-    *,
-    manifest_bytes: bytes | None = None,
-    session_id: str | None = None,
-    code: str,
-) -> list[Mapping[str, object]]:
-    del manifest_bytes, session_id, code
-    return _collect_manifest_artifacts_python(manifest)
 
 
 def _seal_native_transaction(
@@ -516,17 +505,10 @@ def _artifact_path_and_bytes(
 def manifest_artifact_bytes_total(
     manifest: Mapping[str, object],
     *,
-    manifest_bytes: bytes | None = None,
-    session_id: str | None = None,
     code: str,
 ) -> int:
     total = 0
-    for descriptor in _manifest_artifacts(
-        manifest,
-        manifest_bytes=manifest_bytes,
-        session_id=session_id,
-        code=code,
-    ):
+    for descriptor in _manifest_artifacts(manifest):
         _, artifact_bytes = _artifact_path_and_bytes(descriptor, code=code)
         total += artifact_bytes
     return total
@@ -773,9 +755,9 @@ class DeviceSessionRecorder:
         return value.isoformat(timespec="microseconds")
 
     def _elapsed(self) -> float:
-        if self._started_at is None:
+        if self._started_monotonic_ns is None:
             return 0.0
-        return max(0.0, (self._now() - self._started_at).total_seconds())
+        return max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
 
     def _state_document(
         self,
@@ -1736,6 +1718,14 @@ class DeviceSessionRecorder:
         imu = self._artifact("imu.samples", "imu.ndjson", "application/x-ndjson")
         frames = self._artifact("frames.index", "frames.ndjson", "application/x-ndjson")
         assert self._started_at is not None
+        started_at = self._started_at
+        display_name = self._plan.display_name
+        # NTP may correct the RTC during capture. Keep wall-clock metadata
+        # consistent with the monotonic duration, using the calibrated end.
+        if ended_at.year >= 2020 and abs((ended_at - started_at).total_seconds() - duration) > 5:
+            started_at = ended_at - timedelta(seconds=duration)
+            if display_name == self._started_at.strftime("录制 %Y-%m-%d %H:%M:%S"):
+                display_name = started_at.strftime("录制 %Y-%m-%d %H:%M:%S")
         dropped = sum(int(event["dropped"]) for event in self._drop_events)
         nominal_fps = self._config.sensor_fps / self._config.frame_decimation
         effective_fps = 0.0 if duration == 0 else self._frames_written / duration
@@ -1749,7 +1739,7 @@ class DeviceSessionRecorder:
             "session_id": self._plan.session_id,
             "volume_id": self._plan.volume_id,
             "capture_mode": self._plan.capture_mode,
-            "display_name": self._plan.display_name,
+            "display_name": display_name,
             "device": {
                 "device_id": self._config.device_id,
                 "device_label": self._config.device_label,
@@ -1759,7 +1749,7 @@ class DeviceSessionRecorder:
                 "commit": self._config.commit,
             },
             "time": {
-                "started_at": self._timestamp(self._started_at),
+                "started_at": self._timestamp(started_at),
                 "ended_at": self._timestamp(ended_at),
                 "timezone": self._config.timezone,
                 "duration_seconds": duration,
@@ -1828,14 +1818,8 @@ class DeviceSessionRecorder:
         manifest: Mapping[str, object],
         *,
         root: Path | None = None,
-        manifest_bytes: bytes | None = None,
     ) -> None:
-        descriptors = _manifest_artifacts(
-            manifest,
-            manifest_bytes=manifest_bytes,
-            session_id=str(manifest.get("session_id", "")),
-            code="artifact_invalid",
-        )
+        descriptors = _manifest_artifacts(manifest)
         for descriptor in descriptors:
             relative, expected_bytes = _artifact_path_and_bytes(
                 descriptor,
@@ -1980,14 +1964,14 @@ class DeviceSessionRecorder:
                     self._artifact_identities,
                 )
             if native_manifest_sha256 is None:
-                self._validate_artifact_bytes(manifest, manifest_bytes=payload)
+                self._validate_artifact_bytes(manifest)
                 if before_publish is not None:
                     before_publish()
-                self._validate_artifact_bytes(manifest, manifest_bytes=payload)
+                self._validate_artifact_bytes(manifest)
                 manifest_path = self._partial / "manifest.json"
                 with manifest_path.open("xb") as stream:
                     self._before_write("manifest", payload)
-                    self._validate_artifact_bytes(manifest, manifest_bytes=payload)
+                    self._validate_artifact_bytes(manifest)
                     if stream.write(payload) != len(payload):
                         raise OSError("manifest.json 发生短写")
                     stream.flush()
@@ -2004,7 +1988,7 @@ class DeviceSessionRecorder:
                 self._native_transaction = None
             if native_manifest_sha256 is None:
                 fsync_directory(self._root)
-                self._validate_artifact_bytes(manifest, root=self._final, manifest_bytes=payload)
+                self._validate_artifact_bytes(manifest, root=self._final)
         except BaseException as error:
             if self._native_transaction is not None:
                 with suppress(BaseException):
@@ -2248,12 +2232,7 @@ def inspect_device_session_directory(
             raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
         validate_device_session_manifest(manifest)
 
-        descriptors = _manifest_artifacts(
-            manifest,
-            manifest_bytes=payload,
-            session_id=selected_session_id,
-            code="manifest_invalid",
-        )
+        descriptors = _manifest_artifacts(manifest)
         for artifact in descriptors:
             relative, expected_bytes = _artifact_path_and_bytes(
                 artifact,
@@ -2311,12 +2290,7 @@ def validate_device_session_directory(
             if not isinstance(manifest, dict) or manifest.get("session_id") != selected_session_id:
                 raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
             validate_device_session_manifest(manifest)
-            descriptors = _manifest_artifacts(
-                manifest,
-                manifest_bytes=payload,
-                session_id=selected_session_id,
-                code="manifest_invalid",
-            )
+            descriptors = _manifest_artifacts(manifest)
             for artifact_descriptor in descriptors:
                 if interrupt_check is not None:
                     interrupt_check()

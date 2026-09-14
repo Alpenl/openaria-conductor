@@ -1,0 +1,114 @@
+{
+  "schema": "openaria.repository-ablation-validation.v1",
+  "branch": "refactor/recent-iterations-ablation-20260912",
+  "head": "24bb5089c60997dcfb75f9043af4a020c0b6374e",
+  "uncommitted": true,
+  "implementation_files_changed_this_round": 12,
+  "implementation_line_delta_this_round": -256,
+  "implementation_line_delta_two_rounds": -296,
+  "line_count_scope": "Implementation files include embedded Rust tests; Python test and experiment files are excluded.",
+  "inventory_source_hashes_match": true,
+  "measured_source_hashes_match": true,
+  "baseline_patch_matches": true,
+  "candidate_tracked_patch_sha256": "549208e889b2f3fa97339a7e302cf880c4f7b020f9edd23f89becc2701250605",
+  "checks": [
+    {
+      "name": "final-check",
+      "command": "shnote --what 全仓检查 --why 验证候选 run .venv/bin/python scripts/check.py",
+      "log": "/tmp/openaria-repository-ablation-20260912/final-check.log",
+      "log_sha256": "2ed025ffa97fe29fded8c2254b6376b1b3497408ea0050c2d5096427cf5624cc",
+      "passed": true,
+      "tests": 752,
+      "seconds": 169.044,
+      "skipped": [
+        "'set HOBOT_SDK_INCLUDE to the X5 libmm headers'"
+      ]
+    },
+    {
+      "name": "candidate-rust-tests",
+      "command": "shnote --what Rust回归 --why 验证候选 run env LD_LIBRARY_PATH=/home/alpen/miniconda3/lib cargo test --lib --locked",
+      "log": "/tmp/openaria-repository-ablation-20260912/candidate-rust-tests.log",
+      "log_sha256": "5221266aadf3c33526958b66598437247dc1bc86330e6fd9141d69985922688e",
+      "passed": true,
+      "tests": 82
+    },
+    {
+      "name": "baseline-rust-tests",
+      "command": "cargo test --lib --locked (baseline, LD_LIBRARY_PATH=/home/alpen/miniconda3/lib)",
+      "log": "/tmp/openaria-repository-ablation-20260912/baseline-rust-tests.log",
+      "log_sha256": "3cc93efad371750a75f425bf94df179c7284237d580a6b7486fad51cde4cb374",
+      "passed": true,
+      "tests": 81
+    },
+    {
+      "name": "lifecycle-baseline-tests",
+      "command": "cargo test --lib --locked stop_preserves_inflight_frame (baseline plus the candidate behavioral test adapted only for its original ownership type)",
+      "log": "/tmp/openaria-repository-ablation-20260912/lifecycle-baseline-tests.log",
+      "log_sha256": "34120647db0097954cfb2091d83d34025d633b46d383b0005b4d5ba8a3f27546",
+      "passed": true,
+      "tests": 1
+    },
+    {
+      "name": "imu-source-tests",
+      "command": "PYTHONPATH=src:tests .venv/bin/python -m unittest test_imu test_capture_sources -v",
+      "log": "/tmp/openaria-repository-ablation-20260912/imu-source-tests.log",
+      "log_sha256": "5a7b416b4f17373161a0cd3fa72581370d373a8572255dd9c03e3fceaf11f058",
+      "passed": true,
+      "tests": 38,
+      "seconds": 2.166,
+      "skipped": []
+    },
+    {
+      "name": "native-surface-tests",
+      "command": "PYTHONPATH=src:tests .venv/bin/python -m unittest test_native -v",
+      "log": "/tmp/openaria-repository-ablation-20260912/native-surface-tests.log",
+      "log_sha256": "fb18b5b2573998fa4ef889220be2cbbbfe10fab9a0a6e6133a05aed25643a08f",
+      "passed": true,
+      "tests": 16,
+      "seconds": 0.003,
+      "skipped": []
+    },
+    {
+      "name": "clippy",
+      "command": "cargo clippy --all-targets --locked -- -D warnings",
+      "log": "/tmp/openaria-repository-ablation-20260912/clippy.log",
+      "log_sha256": "c744d4cff3b846e20ba7ae00f69009e2e9bba90abc34a7f1a0a85184c1539002",
+      "passed": true
+    },
+    {
+      "name": "wheel-build",
+      "command": "uv build --wheel --out-dir /tmp/openaria-repository-ablation-20260912/wheels",
+      "log": "/tmp/openaria-repository-ablation-20260912/wheel-build.log",
+      "log_sha256": "452a32213cfacc273f89ce2820ba966c7b16b583eee53e03706ffb0e8e618833",
+      "passed": true
+    },
+    {
+      "name": "final-static",
+      "command": "ruff check .; ruff format --check .; cargo fmt --all -- --check; git diff --check (separate commands)",
+      "log": "/tmp/openaria-repository-ablation-20260912/final-static.log",
+      "log_sha256": "a0966fb1dc37c3f971b6536cf03fe45eddddca0f66640233ec1d51afaa1ac06a",
+      "passed": true
+    }
+  ],
+  "native_extension": {
+    "path": "src/rp_ylx/_native.abi3.so",
+    "abi": 6,
+    "sha256": "8e6ce6c9587def39106643145b59a0341ca1957645e654022a88f4f15a7a5f46",
+    "source_wheel": "/tmp/openaria-repository-ablation-20260912/wheels/rp_ylx-0.1.0-cp311-abi3-linux_x86_64.whl",
+    "wheel_sha256": "8b51c2c7a6e1577db6827c9e218a78541a34e2540a2e636607a63067d1115363"
+  },
+  "artifacts": {
+    "README.md": "79a97389b215766d8a21c59d43bd1e4ff875dd34bc263657c24e160a2280a550",
+    "baseline.patch": "3e92a2b7f229273f7a718a040d0b78f3ec18d485765e0f79c8285abc692e1a35",
+    "inventory.json": "0bd12b5f06c9aa7882e29632debfc169357c3cb21432db6be945b604c31c4283",
+    "probe.py": "156e31444ad99082fd4ecb5709ad0df965637b7829ebd001019447970553df85",
+    "queue_probe.rs": "fd19196b8945c0f19f105b2c28c4296cdb84a5f2bb145a3a76bddf8b4c1a0c14",
+    "results.json": "f8c24e1a882fa585b49f0257708cda89c3fb625beda8ad2adb10d92f82d07981",
+    "run_ablation.py": "31ca1efa18bd3547a3ca761137222d2e6eea9b0ac781d5a000126ac8eace716e"
+  },
+  "limits": [
+    "Full Python checks passed with one missing-X5-SDK-header skip.",
+    "The final IMU forwarding deletion was additionally checked with 38 IMU/capture-source tests.",
+    "No real device acceptance or deployment was performed."
+  ]
+}
