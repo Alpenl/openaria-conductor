@@ -254,28 +254,28 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertEqual(
                     embedded_web,
                     {
-                        "source_commit": "b0e2b4ebb65b6b95030eab541c25010ed8984d20",
+                        "source_commit": "b7245c001b25bf8ef75077c3d8ee40b63766509b",
                         "required_device_api_major": 4,
                         "assets": {
                             "app.js": {
-                                "bytes": 107602,
+                                "bytes": 112596,
                                 "content_type": "text/javascript; charset=utf-8",
                                 "sha256": (
-                                    "b3513f71708cacae652d8ed4e6470d316cc031bbe8916171e8cb61da4909577f"
+                                    "0c3c92fdaf30939d590d4aab0f137f1945dd15d0b0940a55a5ed2d51791ee1d2"
                                 ),
                             },
                             "index.html": {
-                                "bytes": 454,
+                                "bytes": 490,
                                 "content_type": "text/html; charset=utf-8",
                                 "sha256": (
-                                    "6149533de647bab93b56d60bd2c3568e78ce675b83c9dc438ea8c614e94a2272"
+                                    "402ee712f34a5d328fa5567f7fa232c868664e5992aaebd873dd32c7a7ef69ba"
                                 ),
                             },
                             "styles.css": {
-                                "bytes": 30015,
+                                "bytes": 37866,
                                 "content_type": "text/css; charset=utf-8",
                                 "sha256": (
-                                    "fc113e82e8433fd3ec6942f132d5840bd59628a1cffd6183b3980a8c2819af99"
+                                    "a05870f1c3ebfbcc516ab916519cf5580cb76e8082e115782c93e888f445fe96"
                                 ),
                             },
                         },
