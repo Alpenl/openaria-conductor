@@ -57,7 +57,9 @@ def _sample(value: object) -> ImuSample:
     )
 
 
-def _observation(value: object) -> ImuObservation:
+def decode_native_imu_observation(value: object) -> ImuObservation:
+    """Convert the Rust IMU observation dict into the Python recording model."""
+
     item = _dict(value, "observation")
     samples = item.get("samples")
     if not isinstance(samples, (list, tuple)) or len(samples) != 2:
@@ -66,9 +68,3 @@ def _observation(value: object) -> ImuObservation:
         samples=(_sample(samples[0]), _sample(samples[1])),
         dropped_samples=_int(item.get("dropped_samples"), "dropped_samples"),
     )
-
-
-def decode_native_imu_observation(value: object) -> ImuObservation:
-    """Convert the Rust IMU observation dict into the Python recording model."""
-
-    return _observation(value)

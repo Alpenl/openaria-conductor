@@ -407,20 +407,6 @@ def device_session_v1_summary(
 
     if manifest is None:
         manifest = _validated_manifest(manifest_bytes, session_id, "v3")
-    return _device_session_v1_summary_python(
-        manifest,
-        manifest_bytes=manifest_bytes,
-        session_id=session_id,
-    )
-
-
-def _device_session_v1_summary_python(
-    manifest: Mapping[str, object],
-    *,
-    manifest_bytes: bytes,
-    session_id: str,
-) -> dict[str, object]:
-    del manifest_bytes
     try:
         if (
             manifest.get("schema") not in _DEVICE_SESSION_SCHEMA_IDS
@@ -995,19 +981,10 @@ def _artifact_descriptors(manifest: Mapping[str, object]) -> dict[str, ArtifactD
         raw_descriptors = artifacts
         legacy = True
 
-    return _artifact_descriptors_from_raw(raw_descriptors, legacy=legacy)
-
-
-def _artifact_descriptors_from_raw(
-    raw_descriptors: list[object],
-    *,
-    legacy: bool,
-    path_validated: bool = False,
-) -> dict[str, ArtifactDescriptor]:
     descriptors: dict[str, ArtifactDescriptor] = {}
     paths: set[str] = set()
     for raw in raw_descriptors:
-        descriptor = _artifact_descriptor(raw, legacy=legacy, path_validated=path_validated)
+        descriptor = _artifact_descriptor(raw, legacy=legacy)
         existing = descriptors.get(descriptor.artifact_id)
         if descriptor.path in paths:
             raise ArtifactAccessError("not_verified", "manifest artifact 路径重复")
@@ -1520,9 +1497,7 @@ def _api_datetime(value: object) -> datetime:
         raise ArtifactAccessError("not_verified", "manifest 时间戳无效") from error
 
 
-def _artifact_descriptor(
-    raw: object, *, legacy: bool, path_validated: bool = False
-) -> ArtifactDescriptor:
+def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
     if not isinstance(raw, dict):
         raise ArtifactAccessError("not_verified", "manifest artifact 描述符无效")
     required = {"role", "path", "media_type", "bytes", "sha256"}
@@ -1554,8 +1529,7 @@ def _artifact_descriptor(
         records = raw.get("records")
         if isinstance(records, bool) or not isinstance(records, int) or records < 0:
             raise ArtifactAccessError("not_verified", "manifest artifact records 无效")
-    if not path_validated:
-        _safe_relative_components(path)
+    _safe_relative_components(path)
     return ArtifactDescriptor(
         artifact_id=artifact_id,
         role=role if isinstance(role, str) else "",

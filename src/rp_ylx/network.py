@@ -1021,23 +1021,6 @@ def saved_network_is_healthy(mode: str) -> bool:
         return _health_reason(record, snapshot) is None
 
 
-def activate_saved_network(mode: str) -> dict[str, Any]:
-    """Activate one previously verified target; the persisted record never contains its secret."""
-
-    state_dir = _state_dir()
-    _prepare_state_dir(state_dir)
-    with _network_operation_lock(state_dir), _network_lock(state_dir):
-        record = _saved_record_for_mode(state_dir, mode)
-        _activate_saved(record, interface=_interface(mode))
-        return {
-            "format": RESULT_FORMAT,
-            "ok": True,
-            "action": "restore-saved",
-            "mode": mode,
-            "recovery": "lkg",
-        }
-
-
 def _legacy_wifi_security(profile: str) -> str:
     result = _run_nmcli(
         [

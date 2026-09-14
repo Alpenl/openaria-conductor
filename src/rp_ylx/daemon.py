@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
 import os
@@ -821,15 +820,3 @@ def run_production_service(config_path: str | Path) -> None:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
         _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
-
-
-def default_device_identity(seed: bytes) -> Mapping[str, str]:
-    """为首次安装生成稳定写入配置的身份；升级不会重新生成。"""
-
-    device_id = str(uuid.uuid4())
-    digest = hashlib.sha256(seed + device_id.encode()).hexdigest()
-    return {
-        "device_id": device_id,
-        "device_label": f"YLX-{digest[:8].upper()}",
-        "hardware_fingerprint": f"sha256:{digest}",
-    }

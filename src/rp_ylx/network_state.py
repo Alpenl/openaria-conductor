@@ -102,7 +102,7 @@ def _contains_forbidden_key(value: object) -> bool:
     return False
 
 
-def _valid_desired(value: object) -> bool:
+def valid_desired_state(value: object) -> bool:
     if not isinstance(value, Mapping) or set(value) != {"mode", "wifi_client", "ethernet"}:
         return False
     mode = value.get("mode")
@@ -182,7 +182,7 @@ def _valid_deadline(value: object) -> bool:
     )
 
 
-def _valid_transaction(value: object) -> bool:
+def valid_transaction(value: object) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
         "authority_epoch",
@@ -214,7 +214,7 @@ def _valid_transaction(value: object) -> bool:
         and value.get("status") in TRANSACTION_STATUSES
         and value.get("stage") in TRANSACTION_STAGES
         and STAGE_STATUS.get(str(value.get("stage"))) == value.get("status")
-        and _valid_desired(value.get("desired"))
+        and valid_desired_state(value.get("desired"))
         and isinstance(value.get("accepted_at"), str)
         and bool(value["accepted_at"])
         and isinstance(value.get("updated_at"), str)
@@ -261,7 +261,7 @@ def _valid_receipts(value: object, authority_epoch: str, source_revision: int) -
         if (
             receipt.get("schema") != RECEIPT_SCHEMA
             or not isinstance(receipt.get("accepted_at"), str)
-            or not _valid_transaction(transaction)
+            or not valid_transaction(transaction)
             or transaction.get("status") != "accepted"
             or transaction.get("authority_epoch") != authority_epoch
             or transaction.get("source_revision", source_revision + 1) > source_revision
@@ -302,9 +302,9 @@ def _valid_state(value: object) -> bool:
         and type(value.get("saved")) is bool
         and type(value.get("verified")) is bool
         and (not value["verified"] or value["saved"])
-        and _valid_desired(value.get("desired"))
-        and (current is None or _valid_transaction(current))
-        and (latest is None or _valid_transaction(latest))
+        and valid_desired_state(value.get("desired"))
+        and (current is None or valid_transaction(current))
+        and (latest is None or valid_transaction(latest))
         and (current is None or current.get("status") in {"accepted", "running"})
         and (latest is None or latest.get("status") in TERMINAL_STATUSES)
         and all(
@@ -330,14 +330,6 @@ def _valid_state(value: object) -> bool:
         )
         and not _contains_forbidden_key(value)
     )
-
-
-def valid_desired_state(value: object) -> bool:
-    return _valid_desired(value)
-
-
-def valid_transaction(value: object) -> bool:
-    return _valid_transaction(value)
 
 
 class NetworkStateStore:
@@ -468,7 +460,7 @@ class NetworkStateStore:
     ) -> tuple[dict[str, Any], bool]:
         if (
             operation not in {"apply", "retry", "forget"}
-            or not _valid_desired(desired)
+            or not valid_desired_state(desired)
             or UUID_V7_PATTERN.fullmatch(transaction_id) is None
             or not isinstance(accepted_at, str)
             or not accepted_at
@@ -643,7 +635,7 @@ class NetworkStateStore:
             or not isinstance(updated_at, str)
             or not updated_at
             or (ap_validated is not None and type(ap_validated) is not bool)
-            or (desired is not None and not _valid_desired(desired))
+            or (desired is not None and not valid_desired_state(desired))
             or type(publish_desired) is not bool
             or not _valid_deadline(deadline)
             or recovery_action not in RECOVERY_ACTIONS
@@ -693,15 +685,6 @@ class NetworkStateStore:
             self._validate(state)
             self._write_locked(state)
             return deepcopy(current)
-
-    def clear_work(self) -> None:
-        with self._thread_lock, _network_lock(self._state_dir):
-            state = self._load_locked()
-            if state["work"]:
-                state["work"] = {}
-                state["source_revision"] += 1
-                self._validate(state)
-                self._write_locked(state)
 
     def scan_stamp(self) -> tuple[str, int]:
         with self._thread_lock, _network_lock(self._state_dir):

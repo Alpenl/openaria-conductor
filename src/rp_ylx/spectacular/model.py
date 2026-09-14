@@ -6,6 +6,8 @@ import csv
 import hashlib
 import json
 import math
+from bisect import bisect_left
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -135,14 +137,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 def _nearest_index(values: tuple[float, ...], target: float) -> int:
-    lo = 0
-    hi = len(values)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if values[mid] < target:
-            lo = mid + 1
-        else:
-            hi = mid
+    lo = bisect_left(values, target)
     if lo <= 0:
         return 0
     if lo >= len(values):
@@ -155,8 +150,11 @@ def _nearest_index(values: tuple[float, ...], target: float) -> int:
 def build_frame_timestamp_rows(timing: CaptureTiming) -> tuple[dict[str, Any], ...]:
     """Pair every video frame with the nearest reconstructed IMU sample timestamp."""
 
+    return tuple(_iter_frame_timestamp_rows(timing))
+
+
+def _iter_frame_timestamp_rows(timing: CaptureTiming) -> Iterator[dict[str, Any]]:
     origin_ns = min(timing.frame_times_ns[0], timing.imu_times_ns[0])
-    rows: list[dict[str, Any]] = []
     for frame, frame_time_ns in zip(timing.capture.frames, timing.frame_times_ns, strict=True):
         imu_index = _nearest_index(timing.imu_times_ns, frame_time_ns)
         imu_time_ns = timing.imu_times_ns[imu_index]
@@ -166,45 +164,47 @@ def build_frame_timestamp_rows(timing: CaptureTiming) -> tuple[dict[str, Any], .
         rounded_imu_ns = int(round(imu_time_ns))
         frame_seconds = (frame_time_ns - origin_ns) / 1e9
         imu_seconds = (imu_time_ns - origin_ns) / 1e9
-        rows.append(
-            {
-                "frame_index": frame["frame_index"],
-                "source_sequence": frame["uvc_sequence"],
-                "left_eye": {
-                    "time_base": "host_monotonic",
-                    "timestamp_ns": frame_source_ns,
-                    "time_seconds": frame_seconds,
-                    "timestamp_source": "shared_sbs_frame",
-                },
-                "right_eye": {
-                    "time_base": "host_monotonic",
-                    "timestamp_ns": frame_source_ns,
-                    "time_seconds": frame_seconds,
-                    "timestamp_source": "shared_sbs_frame",
-                },
-                "nearest_imu": {
-                    "time_base": "host_monotonic",
-                    "estimated_timestamp_ns": rounded_imu_ns,
-                    "source_host_monotonic_ns": int(imu["host_monotonic_ns"]),
-                    "time_seconds": imu_seconds,
-                    "sample_number": imu["sample_number"],
-                    "sample_index": imu["sample_index"],
-                    "packet_sequence": imu.get("packet_sequence"),
-                    "device_timestamp_raw": imu["device_timestamp_raw"],
-                    "device_ticks": imu.get("device_ticks"),
-                    "sync_quality": imu_sync.get("quality") if isinstance(imu_sync, dict) else None,
-                },
-                "nearest_imu_delta_ms": (imu_time_ns - frame_time_ns) / 1e6,
-            }
-        )
-    return tuple(rows)
+        yield {
+            "frame_index": frame["frame_index"],
+            "source_sequence": frame["uvc_sequence"],
+            "left_eye": {
+                "time_base": "host_monotonic",
+                "timestamp_ns": frame_source_ns,
+                "time_seconds": frame_seconds,
+                "timestamp_source": "shared_sbs_frame",
+            },
+            "right_eye": {
+                "time_base": "host_monotonic",
+                "timestamp_ns": frame_source_ns,
+                "time_seconds": frame_seconds,
+                "timestamp_source": "shared_sbs_frame",
+            },
+            "nearest_imu": {
+                "time_base": "host_monotonic",
+                "estimated_timestamp_ns": rounded_imu_ns,
+                "source_host_monotonic_ns": int(imu["host_monotonic_ns"]),
+                "time_seconds": imu_seconds,
+                "sample_number": imu["sample_number"],
+                "sample_index": imu["sample_index"],
+                "packet_sequence": imu.get("packet_sequence"),
+                "device_timestamp_raw": imu["device_timestamp_raw"],
+                "device_ticks": imu.get("device_ticks"),
+                "sync_quality": imu_sync.get("quality") if isinstance(imu_sync, dict) else None,
+            },
+            "nearest_imu_delta_ms": (imu_time_ns - frame_time_ns) / 1e6,
+        }
 
 
 def frame_timestamp_alignment_summary(timing: CaptureTiming) -> dict[str, Any]:
     """Return compact timing alignment facts for the CLI check output."""
 
-    rows = build_frame_timestamp_rows(timing)
-    deltas = [abs(float(row["nearest_imu_delta_ms"])) for row in rows]
+    deltas = [
+        abs(
+            (timing.imu_times_ns[_nearest_index(timing.imu_times_ns, frame_time)] - frame_time)
+            / 1e6
+        )
+        for frame_time in timing.frame_times_ns
+    ]
     return {
         "schema": "rp-ylx.spectacular.frame-timestamp-alignment.v1",
         "camera_timestamp_source": "shared_sbs_frame",
@@ -212,7 +212,7 @@ def frame_timestamp_alignment_summary(timing: CaptureTiming) -> dict[str, Any]:
         "left_right_delta_ms": 0.0,
         "imu_matching": "nearest_reconstructed_sample",
         "imu_time_basis": timing.imu_time_basis,
-        "rows": len(rows),
+        "rows": len(timing.frame_times_ns),
         "nearest_imu_delta_p50_ms": _percentile(deltas, 0.50),
         "nearest_imu_delta_p95_ms": _percentile(deltas, 0.95),
         "nearest_imu_delta_max_ms": max(deltas, default=0.0),
@@ -228,13 +228,12 @@ def _csv_value(value: object) -> object:
 def write_frame_timestamp_csv(timing: CaptureTiming, output_path: str | Path) -> int:
     """Write one row per video frame with left/right camera and nearest IMU timestamps."""
 
-    rows = build_frame_timestamp_rows(timing)
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=TIMESTAMP_CSV_FIELDS)
         writer.writeheader()
-        for row in rows:
+        for row in _iter_frame_timestamp_rows(timing):
             left = row["left_eye"]
             right = row["right_eye"]
             imu = row["nearest_imu"]
@@ -258,7 +257,7 @@ def write_frame_timestamp_csv(timing: CaptureTiming, output_path: str | Path) ->
                     "imu_sync_quality": imu["sync_quality"],
                 }
             )
-    return len(rows)
+    return len(timing.frame_times_ns)
 
 
 def check_capture(

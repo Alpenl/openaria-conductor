@@ -302,8 +302,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
             extension = importlib.import_module("rp_ylx._native")
         except ModuleNotFoundError as error:
             raise unittest.SkipTest("native wheel is not installed") from error
-        if extension.NATIVE_ABI != 5:
-            raise unittest.SkipTest("installed native module predates ABI 5")
+        self.assertEqual(extension.NATIVE_ABI, 6)
         exported = {
             name
             for name in dir(extension)

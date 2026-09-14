@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import os
 import queue
-import re
 import socket
 import sys
 import threading
@@ -45,6 +43,11 @@ from rp_ylx.network_state import (
     valid_desired_state,
     valid_transaction,
 )
+from rp_ylx.network_validation import (
+    NETWORK_CREDENTIAL_REF,
+    WIFI_SECURITY,
+    valid_network_request,
+)
 from rp_ylx.operational_logging import operational_logger
 from rp_ylx.update import prepare_first_install_network
 
@@ -61,15 +64,11 @@ NETWORK_HEALTH_POLL_SECONDS = 1.0
 NETWORK_HEALTH_FAILURE_SECONDS = 10.0
 NETWORK_RESCUE_REACHABILITY_SECONDS = 15.0
 NETWORK_MONITOR_ERROR_LOG_INTERVAL_SECONDS = 60.0
-NETWORK_MODES = frozenset({"hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"})
 MUTATION_OPERATIONS = frozenset({"apply", "retry", "forget"})
 ROOT_OPERATIONS = frozenset({"create_credential", "health", "scan", "status"})
 SUPPORTED_OPERATIONS = MUTATION_OPERATIONS | ROOT_OPERATIONS
 SECRET_FIELD_NAMES = frozenset({"password", "psk", "secret", "token"})
 RESPONSE_SECRET_FIELD_NAMES = SECRET_FIELD_NAMES | {"credential", "passphrase"}
-NETWORK_CREDENTIAL_REF = re.compile(r"^cred-[A-Za-z0-9_.:-]+$")
-UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-WIFI_SECURITY = frozenset({"open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"})
 _OPERATIONAL_LOG = operational_logger("network-control")
 
 
@@ -129,107 +128,6 @@ def _valid_principal_id(value: object) -> bool:
     )
 
 
-def _valid_ipv4(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        ipaddress.IPv4Address(value)
-    except ValueError:
-        return False
-    return True
-
-
-def _valid_network_static_ipv4(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {
-        "address",
-        "prefix_length",
-        "gateway",
-        "dns",
-    }:
-        return False
-    dns = value.get("dns")
-    return (
-        _valid_ipv4(value.get("address"))
-        and type(value.get("prefix_length")) is int
-        and 1 <= value["prefix_length"] <= 32
-        and (value.get("gateway") is None or _valid_ipv4(value.get("gateway")))
-        and isinstance(dns, list)
-        and len(dns) <= 3
-        and all(_valid_ipv4(item) for item in dns)
-        and len(set(dns)) == len(dns)
-    )
-
-
-def _valid_network_ethernet(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {"addressing", "static_ipv4"}:
-        return False
-    addressing = value.get("addressing")
-    static = value.get("static_ipv4")
-    return (addressing == "dhcp" and static is None) or (
-        addressing == "static" and _valid_network_static_ipv4(static)
-    )
-
-
-def _valid_network_apply_wifi_client(value: object) -> bool:
-    if not isinstance(value, Mapping) or not {"ssid", "security"}.issubset(value):
-        return False
-    security = value.get("security")
-    expected_keys = (
-        {"ssid", "security"} if security == "open" else {"ssid", "security", "credential_ref"}
-    )
-    if set(value) != expected_keys or security not in WIFI_SECURITY:
-        return False
-    ssid = value.get("ssid")
-    credential_ref = value.get("credential_ref")
-    return (
-        isinstance(ssid, str)
-        and 1 <= len(ssid.encode("utf-8")) <= 32
-        and (
-            security == "open"
-            or isinstance(credential_ref, str)
-            and 1 <= len(credential_ref) <= 128
-            and NETWORK_CREDENTIAL_REF.fullmatch(credential_ref) is not None
-        )
-    )
-
-
-def _valid_network_apply_desired_state(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {"mode", "wifi_client", "ethernet"}:
-        return False
-    mode = value.get("mode")
-    wifi = value.get("wifi_client")
-    ethernet = value.get("ethernet")
-    if mode not in NETWORK_MODES:
-        return False
-    if mode == "wifi-client":
-        if not _valid_network_apply_wifi_client(wifi):
-            return False
-    elif wifi is not None:
-        return False
-    if ethernet is not None and not _valid_network_ethernet(ethernet):
-        return False
-    return not (mode == "ethernet-static" and ethernet is None)
-
-
-def _valid_network_body(operation: str, body: object) -> bool:
-    if not isinstance(body, Mapping):
-        return False
-    if operation == "apply":
-        return (
-            set(body) == {"schema", "desired"}
-            and body.get("schema") == "ylx.network-apply-request.v1"
-            and _valid_network_apply_desired_state(body.get("desired"))
-        )
-    if operation == "retry":
-        return (
-            set(body) == {"schema", "transaction_id"}
-            and body.get("schema") == "ylx.network-retry-request.v1"
-            and isinstance(body.get("transaction_id"), str)
-            and UUID_V7.fullmatch(str(body["transaction_id"])) is not None
-        )
-    return set(body) == {"schema"} and body.get("schema") == "ylx.network-forget-request.v1"
-
-
 def _valid_control_request(operation: str, request: Mapping[str, object]) -> bool:
     if operation in {"health", "scan", "status"}:
         return set(request) == {"schema", "operation"}
@@ -249,7 +147,7 @@ def _valid_control_request(operation: str, request: Mapping[str, object]) -> boo
         set(request) == {"schema", "operation", "principal_id", "idempotency_key", "body"}
         and _valid_principal_id(request.get("principal_id"))
         and _valid_idempotency_key(request.get("idempotency_key"))
-        and _valid_network_body(operation, request.get("body"))
+        and valid_network_request(operation, request.get("body"))
     )
 
 
@@ -287,10 +185,6 @@ def _response_contains_secret_field(value: object) -> bool:
     if isinstance(value, list):
         return any(_response_contains_secret_field(item) for item in value)
     return False
-
-
-def _valid_transaction_shape(value: object) -> bool:
-    return valid_transaction(value)
 
 
 def _valid_uuid4(value: object) -> bool:
@@ -469,7 +363,7 @@ def _valid_controller_success(response: Mapping[str, Any]) -> bool:
             and isinstance(transaction, Mapping)
             and set(transaction) == {"current", "latest"}
             and all(
-                item is None or _valid_transaction_shape(item)
+                item is None or valid_transaction(item)
                 for item in (transaction.get("current"), transaction.get("latest"))
             )
             and all(
@@ -494,7 +388,7 @@ def _valid_controller_success(response: Mapping[str, Any]) -> bool:
             and isinstance(body, Mapping)
             and set(body) == {"schema", "accepted_at", "transaction"}
             and body.get("schema") == "ylx.network-transaction-receipt.v1"
-            and _valid_transaction_shape(body.get("transaction"))
+            and valid_transaction(body.get("transaction"))
             and body.get("accepted_at") == body["transaction"]["accepted_at"]
             and type(response.get("replayed")) is bool
         )

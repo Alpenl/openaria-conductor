@@ -1,0 +1,124 @@
+{
+  "schema": "openaria.repository-ablation.v1",
+  "environment": {
+    "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+    "python": "3.13.13",
+    "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)"
+  },
+  "baseline": {
+    "head": "24bb5089c60997dcfb75f9043af4a020c0b6374e",
+    "tracked_patch_sha256": "3e92a2b7f229273f7a718a040d0b78f3ec18d485765e0f79c8285abc692e1a35",
+    "sources": {
+      "native/src/bounded.rs": "6a634c7c5cbe74040b27940c4718853d55e573a3553a57d376bf8e0c180311ae",
+      "native/src/capture_runtime.rs": "a9c0bec56dea5d4405da8fb1e6f8d386908dc3c32d2fbdc10774509bb15df970",
+      "src/rp_ylx/network_validation.py": null,
+      "src/rp_ylx/network_control.py": "79675a7b0c9b7ce283beaa3e1a3ebb4f0abc44ac63e170cbd5069a8e4fdde3b6",
+      "src/rp_ylx/network_state.py": "0398be859ebbc49598a4ed784d3665da3f25037741d070291b1920da8be52e7e",
+      "src/rp_ylx/network.py": "cc59fe7efb5ced13b9fa661c187db05a17b707697f4630fe593d9c6983827e75",
+      "src/rp_ylx/api/gateway.py": "562455e9925cc64547608a469f43820b87b949456086c2b8cde20ea19554b000",
+      "src/rp_ylx/api/downloads.py": "f91d14362c1b07f6dbd303d1b691cd0856007329bc8f7d828f7a1ecf025751ee",
+      "src/rp_ylx/recording/device_session.py": "a148872b25e94747b031f613c99419d613934e675bb9b2f010c71000a903defc",
+      "src/rp_ylx/recording/coordinator.py": "fa0efec1bfff0cb74f6bae1a4cdc0ca785cf0278918e599d0107e8e8be4e103a",
+      "src/rp_ylx/daemon.py": "b5f8699d53bcdcafbf1cd2ede6ff1a23904c25b3307fdf630a86547a14debeec",
+      "src/rp_ylx/imu/native.py": "bdb8efb8c7a3f0be91aa6b61ff38f5e1b7bc24c3ad4213bfdcff0a39cbb86737"
+    }
+  },
+  "candidate": {
+    "head": "24bb5089c60997dcfb75f9043af4a020c0b6374e",
+    "tracked_patch_sha256": "549208e889b2f3fa97339a7e302cf880c4f7b020f9edd23f89becc2701250605",
+    "sources": {
+      "native/src/bounded.rs": "d0f2dd95b9bcc8fcad78f53bf79c4706ba47a700be8f81e5064e9cb434e16399",
+      "native/src/capture_runtime.rs": "79f1c8dd57f9e344e9eda30275fa4f9a79fe4f6377dee523fc5db23e32d5f5ac",
+      "src/rp_ylx/network_validation.py": "2977b6a7c2d266928a080d567e8fe02934dca8f46da0dccc5bccadd620e5ee9c",
+      "src/rp_ylx/network_control.py": "1224d188c46996d88985144bdde1716bcce6496301106f6f98c1aa694c7d4d19",
+      "src/rp_ylx/network_state.py": "f35f1f595a4b79a7473618178e866f6bea55a5160b38d5ab32d5c03fd87b1cbc",
+      "src/rp_ylx/network.py": "b59c9c63fbd47537a05f53152456c9a403db87cb2cad911be3ddfa861f65c05f",
+      "src/rp_ylx/api/gateway.py": "515a169837995830c111802d94d50c564f41cacfe3af18469f76c35dfad9a1cd",
+      "src/rp_ylx/api/downloads.py": "f9272bc0a4418036e76ecb0bff807b48baa4501a32db02b241707269ec284687",
+      "src/rp_ylx/recording/device_session.py": "27f3bd6b5d4e1fcff86f50e56dd866e01945185a82768cb00b73524a40466b90",
+      "src/rp_ylx/recording/coordinator.py": "c3445dc0d5a0dc91253620021a831ac545a70791f0a0745d77c2204b899d4e94",
+      "src/rp_ylx/daemon.py": "bd73eba7f91aa8d9b1cc81205949b0774fffa3058d6caf4f6dc84ea5034e9b3e",
+      "src/rp_ylx/imu/native.py": "cd1a20184ffe346b3ae3352d94941769c8ee7a5a533b8b3a69bd3bc0bfe038c7"
+    }
+  },
+  "network": {
+    "cases": 5061,
+    "corpus_sha256": "4558af40f468eebe4bac4ab1544852da1012fc8d737f7a6a8739f783720224c2",
+    "http_identical": true,
+    "control_typeerror_to_rejection": 76,
+    "baseline_http_outcomes": {
+      "{\"value\": true}": 74,
+      "{\"value\": false}": 4954,
+      "{\"code\": null, \"error\": \"UnicodeEncodeError\"}": 4,
+      "{\"code\": null, \"error\": \"TypeError\"}": 29
+    },
+    "candidate_control_outcomes": {
+      "{\"value\": true}": 74,
+      "{\"value\": false}": 4954,
+      "{\"code\": null, \"error\": \"UnicodeEncodeError\"}": 4,
+      "{\"code\": null, \"error\": \"TypeError\"}": 29
+    }
+  },
+  "manifest": {
+    "cases": 2038,
+    "corpus_sha256": "d80e1ce75851e5b75a3c52efc714be9c2368605d98715b6d5b90d6b1f4de1820",
+    "results_sha256": "49995c49821d9e1d2141d4c5eae04c052407d2394de1b0be787199250145301a",
+    "identical": true,
+    "successful_summary_cases": 196
+  },
+  "queue": {
+    "baseline": {
+      "trace_hashes": [
+        2951725356872396879,
+        16885568126733689941,
+        17479948919141721019
+      ],
+      "concurrent_frames": 80000,
+      "round_trips_per_sample": 200000,
+      "samples_ns": [
+        60479805,
+        60118725,
+        60537402,
+        60606151,
+        61210678,
+        61080713,
+        61358906
+      ],
+      "median_ns": 60606151
+    },
+    "candidate": {
+      "trace_hashes": [
+        2951725356872396879,
+        16885568126733689941,
+        17479948919141721019
+      ],
+      "concurrent_frames": 80000,
+      "round_trips_per_sample": 200000,
+      "samples_ns": [
+        35322654,
+        35017429,
+        34944272,
+        36261969,
+        36518802,
+        36169726,
+        36404627
+      ],
+      "median_ns": 36169726
+    },
+    "median_reduction_percent": 40.32004111265868
+  },
+  "negative_controls": {
+    "network_validation_removed_accepts_invalid": 3385,
+    "path_validation_removed_changes_cases": 19,
+    "queue_capacity_removed": {
+      "returncode": 101,
+      "stderr": "thread 'main' (849115) panicked at /home/alpen/DEV/openaria-conductor/experiments/repository-ablation-20260912/queue_probe.rs:49:17:\nassertion `left == right` failed\n  left: Ok(())\n right: Err(1)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+    }
+  },
+  "limits": [
+    "Queue timing is a host microbenchmark, not camera throughput.",
+    "Manifest probes exercise decoded projection and descriptors; full validation is covered by the existing suites.",
+    "Existing TypeError/UnicodeEncodeError outcomes outside mode membership remain unchanged.",
+    "No RDK X5, camera, IMU, ALSA, NetworkManager, or board codec acceptance was run."
+  ]
+}
