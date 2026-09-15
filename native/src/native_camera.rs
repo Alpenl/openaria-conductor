@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PRODUCER_POLL: Duration = Duration::from_millis(50);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,6 +41,9 @@ pub(crate) struct Frame {
     pub(crate) source_sequence: u64,
     pub(crate) host_monotonic_ns: u64,
     pub(crate) application_dropped_before: u64,
+    pub(crate) producer_max_interval_ns: u64,
+    pub(crate) producer_max_control_ns: u64,
+    pub(crate) producer_max_read_ns: u64,
     pub(crate) left: Vec<u8>,
     pub(crate) right: Vec<u8>,
     pub(crate) raw_side_by_side: Vec<u8>,
@@ -482,8 +485,13 @@ fn run_producer(
     terminal_error: &Mutex<Option<StreamError>>,
 ) {
     let mut pending_rejected = 0_u64;
+    let mut previous_frame = Instant::now();
+    let mut timings = [(0_u64, 0_u64, 0_u64); 64];
+    let mut timing_index = 0;
     while !stop.load(Ordering::Acquire) {
+        let control_started = Instant::now();
         process_control_commands(resources);
+        let control_ns = control_started.elapsed().as_nanos() as u64;
         match resources.capture.wait(PRODUCER_POLL) {
             Ok(()) => {}
             Err(error) if error.code == "frame_timeout" => continue,
@@ -493,11 +501,20 @@ fn run_producer(
             }
         }
         let frame = (|| {
+            let read_started = Instant::now();
             let (source_sequence, host_monotonic_ns, raw_side_by_side) = resources
                 .capture
                 .read_ready_with(|source_sequence, host_monotonic_ns, payload| {
                     Ok((source_sequence, host_monotonic_ns, payload.to_vec()))
                 })?;
+            let now = Instant::now();
+            timings[timing_index] = (
+                now.duration_since(previous_frame).as_nanos() as u64,
+                control_ns,
+                read_started.elapsed().as_nanos() as u64,
+            );
+            timing_index = (timing_index + 1) % timings.len();
+            previous_frame = now;
             let (left, right) = if let Some(splitter) = resources.splitter.as_mut() {
                 splitter
                     .split_sbs(&raw_side_by_side, resources.width, resources.height)
@@ -509,6 +526,9 @@ fn run_producer(
                 source_sequence,
                 host_monotonic_ns,
                 application_dropped_before: pending_rejected,
+                producer_max_interval_ns: timings.iter().map(|value| value.0).max().unwrap_or(0),
+                producer_max_control_ns: timings.iter().map(|value| value.1).max().unwrap_or(0),
+                producer_max_read_ns: timings.iter().map(|value| value.2).max().unwrap_or(0),
                 left,
                 right,
                 raw_side_by_side,

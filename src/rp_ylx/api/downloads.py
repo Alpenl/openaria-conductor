@@ -1044,7 +1044,7 @@ def _non_negative_number(value: object, message: str) -> int | float:
 def iter_device_session_v1_artifacts(
     manifest: Mapping[str, object],
 ) -> Iterator[Mapping[str, object]]:
-    """Yield every artifact descriptor declared by a Device Session v1/v2 manifest."""
+    """Yield every artifact descriptor declared by a Device Session manifest."""
 
     try:
         video = manifest["video"]
@@ -1091,18 +1091,25 @@ def iter_device_session_v1_artifacts(
     if audio is not None:
         if not isinstance(audio, Mapping):
             raise ArtifactAccessError("not_verified", "manifest audio 结构无效")
-        if audio.get("state") == "not_recorded":
-            return
-        segments = audio.get("segments")
-        if not isinstance(segments, list):
-            raise ArtifactAccessError("not_verified", "manifest audio segments 无效")
-        for segment in segments:
-            if not isinstance(segment, Mapping):
-                raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
-            artifact = segment.get("artifact")
-            if not isinstance(artifact, Mapping):
-                raise ArtifactAccessError("not_verified", "manifest audio artifact 无效")
-            yield artifact
+        if audio.get("state") != "not_recorded":
+            segments = audio.get("segments")
+            if not isinstance(segments, list):
+                raise ArtifactAccessError("not_verified", "manifest audio segments 无效")
+            for segment in segments:
+                if not isinstance(segment, Mapping):
+                    raise ArtifactAccessError("not_verified", "manifest audio segment 无效")
+                artifact = segment.get("artifact")
+                if not isinstance(artifact, Mapping):
+                    raise ArtifactAccessError("not_verified", "manifest audio artifact 无效")
+                yield artifact
+
+    logs = manifest.get("logs", [])
+    if not isinstance(logs, list):
+        raise ArtifactAccessError("not_verified", "manifest logs 无效")
+    for artifact in logs:
+        if not isinstance(artifact, Mapping):
+            raise ArtifactAccessError("not_verified", "manifest log artifact 无效")
+        yield artifact
 
 
 def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:

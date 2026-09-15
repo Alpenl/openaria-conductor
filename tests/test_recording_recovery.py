@@ -113,6 +113,13 @@ class RecordingRecoveryTests(unittest.TestCase):
                     coordinator._catalog_sessions(verify_session=recorder._plan.session_id)
                     # Recovered data uses the ordinary artifact access contract.
                     representation = coordinator.open_manifest(recorder._plan.session_id, "v4")
+                    manifest = json.loads(representation.read())
+                    representation.close()
+                    receipt = manifest["logs"][0]
+                    representation = coordinator.open_verified_artifact(
+                        recorder._plan.session_id, receipt["artifact_id"], "v4"
+                    )
+                    self.assertEqual(json.loads(representation.read())["saved_frames"], 30)
                     representation.close()
                     self.assertEqual(
                         coordinator.capture_status()["snapshot"]["retained_unsuccessful"][

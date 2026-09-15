@@ -608,7 +608,7 @@ fn process_frame(
             if let Err(mut error) = write_result {
                 if error.code == "source_sequence_gap" {
                     error.message = format!(
-                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={})",
+                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={})",
                         error.message,
                         frame
                             .source_sequence
@@ -616,6 +616,9 @@ fn process_frame(
                         frame.source_sequence,
                         validation.source_gap,
                         validation.queue_rejected,
+                        frame.producer_max_interval_ns,
+                        frame.producer_max_control_ns,
+                        frame.producer_max_read_ns,
                     );
                 }
                 report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
@@ -1000,6 +1003,9 @@ mod tests {
                     source_sequence: 9,
                     host_monotonic_ns: 34_000_000,
                     application_dropped_before: 0,
+                    producer_max_interval_ns: 0,
+                    producer_max_control_ns: 0,
+                    producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
                     raw_side_by_side: b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
@@ -1231,6 +1237,9 @@ mod tests {
                     source_sequence: 1,
                     host_monotonic_ns: 1_000_000,
                     application_dropped_before: 0,
+                    producer_max_interval_ns: 0,
+                    producer_max_control_ns: 0,
+                    producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
                     raw_side_by_side: b"\xff\xd8payload\xff\xd9".to_vec(),
