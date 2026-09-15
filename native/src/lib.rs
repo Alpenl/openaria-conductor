@@ -491,18 +491,10 @@ impl NativeCaptureEngine {
             .transaction
             .ensure_recording()
             .map_err(session_store_error)?;
-        let runtime_snapshot = self.runtime.snapshot().map_err(capture_runtime_error)?;
-        if runtime_snapshot.recording_active {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "invalid_state: capture engine is already recording",
-            ));
-        }
-        if runtime_snapshot.recording_present {
-            let runtime = Arc::clone(&self.runtime);
-            let timeout = self.close_timeout;
-            py.allow_threads(move || runtime.stop_recording(timeout))
-                .map_err(capture_runtime_error)?;
-        }
+        let runtime = Arc::clone(&self.runtime);
+        let timeout = self.close_timeout;
+        py.allow_threads(move || runtime.prepare_recording(timeout))
+            .map_err(capture_runtime_error)?;
         py.allow_threads(|| self.idle_imu.stop());
         if let Some(stale) = self
             .imu
@@ -1125,6 +1117,11 @@ fn session_transaction_snapshot_dict(
         stereo_encoder_segment_list(py, &snapshot.segments)?,
     )?;
     value.set_item("submitted_frames", snapshot.submitted_frames)?;
+    let encoder_stats = PyDict::new(py);
+    for (name, count) in &snapshot.encoder_stats {
+        encoder_stats.set_item(name, count)?;
+    }
+    value.set_item("encoder_stats", encoder_stats)?;
     Ok(value.unbind())
 }
 

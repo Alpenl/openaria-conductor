@@ -282,6 +282,19 @@ impl Runtime {
         Ok(snapshot)
     }
 
+    pub(crate) fn prepare_recording(&self, timeout: Duration) -> Result<(), RuntimeError> {
+        if self.snapshot()?.recording_active {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "capture engine is already recording",
+            ));
+        }
+        // Failure callbacks can clear recording before the IMU worker exits.
+        // Always reap that worker before installing the next recording target.
+        self.stop_recording(timeout)?;
+        Ok(())
+    }
+
     pub(crate) fn stop_recording(
         &self,
         timeout: Duration,
@@ -469,6 +482,10 @@ fn run_loop(
         let read_started = start_stage(metrics.as_ref());
         let read_result = stream.read(read_timeout);
         finish_stage(metrics.as_ref(), "native_capture_read", read_started);
+        if let Some(metrics) = &metrics {
+            let (depth, capacity, peak) = stream.queue_stats();
+            let _ = metrics.observe_queue(depth as u64, capacity as u64, 0, Some(peak as u64));
+        }
         match read_result {
             Ok(frame) => {
                 if let Err(error) = process_frame(&preview, &shared, frame, metrics.as_ref()) {
@@ -544,7 +561,7 @@ fn process_frame(
                     "application dropped frame count is out of range",
                 )
             })?;
-        let (dropped_before, dispatch) = {
+        let (dropped_before, validation, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
                     "capture_runtime_poisoned",
@@ -581,14 +598,26 @@ fn process_frame(
             } else {
                 None
             };
-            (decision.dropped_before, dispatch)
+            (decision.dropped_before, validation, dispatch)
         };
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
             let write_result = write_split_sink_frame(&dispatch, &frame, dropped_before);
             finish_stage(metrics, "native_recording_split_sink", write_started);
             finish_recording_frame(shared)?;
-            if let Err(error) = write_result {
+            if let Err(mut error) = write_result {
+                if error.code == "source_sequence_gap" {
+                    error.message = format!(
+                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={})",
+                        error.message,
+                        frame
+                            .source_sequence
+                            .saturating_sub(validation.dropped_before + 1),
+                        frame.source_sequence,
+                        validation.source_gap,
+                        validation.queue_rejected,
+                    );
+                }
                 report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
             }
         }
@@ -1006,6 +1035,75 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_recording_reaps_failed_imu_worker_and_allows_retry() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let root = temp_root("failed-recording-retry");
+            let runtime = Runtime::new(
+                Arc::new(Stream::test_idle(1)),
+                Arc::new(LatestBuffer::new(30).unwrap()),
+                1,
+                Duration::from_millis(10),
+                None,
+            )
+            .unwrap();
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                state.running = true;
+                state.fanout.start_recording().unwrap();
+                state.recording = Some(Arc::new(test_recording(py, &root)));
+            }
+            let stop = Arc::clone(&runtime.imu_stop);
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                // Exercise cleanup while the old monitoring thread still exists.
+                while !stop.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                let _ = done_tx.send(());
+            });
+            *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
+                handle,
+                done: done_rx,
+            });
+            report_recording_failure(
+                &runtime.shared,
+                RuntimeError::new(
+                    "source_sequence_gap",
+                    "source frame sequence has a gap of 8",
+                ),
+                None,
+            );
+            assert!(!runtime.snapshot().unwrap().recording_present);
+            assert!(runtime.imu_worker.lock().unwrap().is_some());
+            runtime.prepare_recording(Duration::from_secs(1)).unwrap();
+            assert!(runtime.imu_worker.lock().unwrap().is_none());
+            let next = test_recording(py, &root.join("next"));
+            let snapshot = runtime
+                .start_recording(
+                    Arc::clone(&next.active_take),
+                    Arc::clone(&next.sink),
+                    Arc::clone(&next.encoder),
+                    Arc::clone(&next.segment_planner),
+                    1,
+                    PyBytes::new(py, b"callback").into_any().unbind(),
+                    None,
+                    Duration::from_millis(10),
+                    None,
+                )
+                .unwrap();
+            assert!(snapshot.recording_active);
+            let error = runtime
+                .prepare_recording(Duration::from_secs(1))
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_state");
+            assert!(runtime.snapshot().unwrap().recording_active);
+            runtime.stop_recording(Duration::from_secs(1)).unwrap();
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     #[test]

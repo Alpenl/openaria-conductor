@@ -62,6 +62,7 @@ from rp_ylx.recording.device_session import (
     validate_device_session_directory,
     write_json_atomic,
 )
+from rp_ylx.recording.recovery import RECOVERY_ROLE, recover_device_session
 from rp_ylx.runtime import collect_linux_runtime
 
 VOLUME_MARKER = ".ylx-volume.json"
@@ -852,11 +853,7 @@ class CaptureCoordinator:
                 if parsed.version != 7 or str(parsed) != session_id:
                     continue
                 manifest = partial / "manifest.json"
-                controls_absent = (
-                    not (partial / "recording.json").exists()
-                    and not (partial / "capture.json").exists()
-                )
-                if manifest.is_file() and controls_absent:
+                if manifest.is_file():
                     final = sessions_root / session_id
                     try:
                         validate_device_session_directory(
@@ -865,6 +862,16 @@ class CaptureCoordinator:
                         )
                         if final.exists():
                             raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
+                        for control in ("capture.json", "recording.json"):
+                            path = partial / control
+                            if path.exists():
+                                recovery = partial / "recovery"
+                                if recovery.is_symlink():
+                                    raise DeviceRecordingError("artifact_invalid", "恢复目录无效")
+                                recovery.mkdir(exist_ok=True)
+                                os.replace(path, recovery / control)
+                                fsync_directory(recovery)
+                        fsync_directory(partial)
                         os.rename(partial, final)
                         fsync_directory(sessions_root)
                         payload = (final / "manifest.json").read_bytes()
@@ -874,6 +881,56 @@ class CaptureCoordinator:
                         with suppress(OSError):
                             manifest.unlink(missing_ok=True)
                 self._settle_partial(partial, session_id)
+                self._recover_completed_prefix(partial, session_id)
+        # Publication may have finished just before a crash, before the local
+        # retained state was saved. Reconcile here without taking the catalog
+        # lock: catalog reads must never acquire the capture-state lock.
+        for session_id in tuple(self._retained):
+            for sessions_root in admission.catalog_roots:
+                try:
+                    recovered, _ = inspect_device_session_directory(sessions_root / session_id)
+                except (OSError, DeviceRecordingError):
+                    continue
+                if any(log.get("role") == RECOVERY_ROLE for log in recovered["logs"]):
+                    self._record_saved_prefix(session_id, recovered)
+
+    def _recover_completed_prefix(self, partial: Path, session_id: str) -> None:
+        try:
+            recovered = recover_device_session(partial)
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            DeviceRecordingError,
+            ArtifactAccessError,
+        ):
+            return
+        if recovered is not None:
+            self._verified[session_id] = recovered.manifest_sha256
+            self._record_saved_prefix(session_id, recovered.manifest)
+
+    def _record_saved_prefix(self, session_id: str, manifest: Mapping[str, object]) -> None:
+        retained = self._retained.get(session_id)
+        if retained is None:
+            return
+        state = copy.deepcopy(retained["recording_state"])
+        if any(item.get("code") == "recording_prefix_saved" for item in state["diagnostics"]):
+            return
+        duration = manifest["time"]["duration_seconds"]
+        state["diagnostics"].append(
+            {
+                "code": "recording_prefix_saved",
+                "severity": "info",
+                "message": f"录制已中断，已保存前 {duration:.1f} 秒，可导出",
+                "at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "recoverable": False,
+            }
+        )
+        state["authority_epoch"] = self._authority_epoch
+        state["state_revision"] = self._next_revision()
+        state["updated_at"] = state["diagnostics"][-1]["at"]
+        retained["recording_state"] = state
 
     def _settle_partial(self, partial: Path, session_id: str) -> None:
         admission = self._require_admission()
@@ -1120,14 +1177,20 @@ class CaptureCoordinator:
                     # Only an explicit artifact request can promote it to verified.
                     if summary is not None and verify_session is None:
                         continue
-                    if candidate.name in self._retained and candidate.name not in self._verified:
-                        if candidate.name not in self._session_diagnostics:
-                            self._session_diagnostics[candidate.name] = self._session_diagnostic(
-                                candidate.name, "会话发布失败，未进入可下载 catalog"
-                            )
-                        continue
                     try:
                         manifest, payload = inspect_device_session_directory(candidate)
+                        recovered = any(
+                            log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
+                        )
+                        if (
+                            session_id in self._retained
+                            and session_id not in self._verified
+                            and not recovered
+                        ):
+                            self._session_diagnostics[session_id] = self._session_diagnostic(
+                                session_id, "会话发布失败，未进入可下载 catalog"
+                            )
+                            continue
                         verified_snapshot = None
                         verification_error = None
                         if (
@@ -1267,6 +1330,13 @@ class CaptureCoordinator:
             (f"{validator_name}\x00{validator_version}\x00{self._config.session.commit}").encode()
         ).hexdigest()
         diagnostics: list[dict[str, str]] = []
+        if any(log.get("role") == RECOVERY_ROLE for log in manifest.get("logs", [])):
+            diagnostics.append(
+                {
+                    "code": "recording_interrupted",
+                    "summary": "录制已中断，完整前段已保存，可正常导出",
+                }
+            )
         if verification_error is not None:
             code, summary = GATEWAY_VERIFICATION_DIAGNOSTICS.get(
                 verification_error.code,
@@ -2408,6 +2478,12 @@ class CaptureCoordinator:
             "generation_id": plan.generation_id,
             "recording_state": copy.deepcopy(state),
         }
+        if not media_lost:
+            if recorder.recovered_session is not None:
+                self._verified[plan.session_id] = recorder.recovered_session.manifest_sha256
+                self._record_saved_prefix(plan.session_id, recorder.recovered_session.manifest)
+            elif recorder.partial_path.is_dir():
+                self._recover_completed_prefix(recorder.partial_path, plan.session_id)
         self._active = None
         self._active_plan = None
         self._latest_imu = None

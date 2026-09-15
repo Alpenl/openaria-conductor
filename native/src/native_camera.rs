@@ -193,6 +193,10 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
+    pub(crate) fn queue_stats(&self) -> (usize, usize, usize) {
+        self.consumer.queue_stats()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         device: &str,

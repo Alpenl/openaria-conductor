@@ -275,7 +275,7 @@ class StereoEncoderProcess:
             )
             with self._lock:
                 self._segments.append(segment)
-        elif kind == "done":
+        elif kind in {"done", "stats"}:
             with self._lock:
                 self._stats = {
                     key: int(value)

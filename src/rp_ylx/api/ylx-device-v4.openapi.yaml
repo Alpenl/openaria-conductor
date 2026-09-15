@@ -3229,7 +3229,7 @@ components:
       required: [code, summary]
       properties:
         code:
-          enum: [artifact_digest_mismatch, artifact_invalid, manifest_invalid, verification_failed]
+          enum: [artifact_digest_mismatch, artifact_invalid, manifest_invalid, verification_failed, recording_interrupted]
           description: Stable gateway-local verification failure category.
         summary:
           type: string

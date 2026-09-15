@@ -11,7 +11,7 @@ TARGET := ylx-stereo-encoder
 
 all: $(TARGET)
 
-$(TARGET): ylx_stereo_encoder.c ylx_stereo_pipeline.c ylx_stereo_pipeline.h
+$(TARGET): ylx_stereo_encoder.c ylx_stereo_pipeline.c ylx_stereo_pipeline.h ylx_packet_queue.h
 	$(CC) $(CFLAGS) -o $@ ylx_stereo_encoder.c ylx_stereo_pipeline.c $(LDFLAGS) $(LDLIBS)
 
 install: $(TARGET)

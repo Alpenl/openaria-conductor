@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "d9034f856d909dc3847ad706d0ef044257233d65ddfba0f10d0ac15b34b1b2b2",
-        "bytes": 128908,
+        "sha256": "49ab84ec5b894aa33891729b7538ec2348f9ec0cbb56d31aa1d2575123bcde9d",
+        "bytes": 128931,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -53,10 +53,10 @@ SCHEMA_GOLDENS = {
         "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
     ),
     "ylx-device-session-v2.schema.json": (
-        "7de77a092152cb68d57fc9e46dcc3024fe521dbcf5961999cf0ac887186a59c8"
+        "2d9aaad4523029fb593198e0e4911fd88c5f29c3d7a3b93018847a238eb2e13f"
     ),
     "ylx-device-session-v3.schema.json": (
-        "dedcca7df79d05248d7650bcf82bcd48a86af74233018403dcd6ea9aafa00f4e"
+        "a342b904daa39f397a6629f74d8c9f81b490a2387668b4934035a88ce44a61a3"
     ),
     "ylx-recording-state-v1.schema.json": (
         "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"

@@ -953,7 +953,8 @@
         "requested_mode": {
           "enum": [
             "device_default",
-            "disabled"
+            "disabled",
+            "enabled"
           ]
         },
         "resolved_mode": {
@@ -962,7 +963,8 @@
         "reason": {
           "enum": [
             "user_disabled",
-            "device_default_disabled"
+            "device_default_disabled",
+            "recording_interrupted"
           ]
         }
       }

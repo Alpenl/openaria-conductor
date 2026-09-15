@@ -6,6 +6,7 @@ use std::time::Duration;
 struct State<T> {
     queue: VecDeque<T>,
     closed: bool,
+    peak: usize,
 }
 
 struct Shared<T> {
@@ -33,6 +34,7 @@ impl<T> Producer<T> {
             return Err(value);
         }
         state.queue.push_back(value);
+        state.peak = state.peak.max(state.queue.len());
         self.shared.readable.notify_one();
         Ok(())
     }
@@ -51,6 +53,11 @@ impl<T> Clone for Consumer<T> {
 }
 
 impl<T> Consumer<T> {
+    pub(crate) fn queue_stats(&self) -> (usize, usize, usize) {
+        let state = self.shared.state.lock().unwrap();
+        (state.queue.len(), self.shared.capacity, state.peak)
+    }
+
     pub(crate) fn receive(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         let state = self.shared.state.lock().unwrap();
         let (mut state, result) = self
@@ -84,6 +91,7 @@ impl<T> Consumer<T> {
         let mut state = self.shared.state.lock().unwrap();
         debug_assert!(state.queue.is_empty());
         state.closed = false;
+        state.peak = 0;
     }
 }
 
@@ -94,6 +102,7 @@ pub(crate) fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         state: Mutex::new(State {
             queue: VecDeque::with_capacity(capacity),
             closed: false,
+            peak: 0,
         }),
         readable: Condvar::new(),
     });

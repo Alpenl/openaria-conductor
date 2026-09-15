@@ -112,6 +112,7 @@ GATEWAY_VERIFICATION_DIAGNOSTIC_CODES = frozenset(
         "artifact_invalid",
         "manifest_invalid",
         "verification_failed",
+        "recording_interrupted",
     }
 )
 INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
