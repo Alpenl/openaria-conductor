@@ -1,0 +1,27 @@
+{
+  "base_commit": "f89a3b7aa5e455f62dea6984c266b65d3c0d3917",
+  "full_commit": "379d7e402e5aea39da7e263319db3b06863bc904",
+  "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+  "python": "3.13.13",
+  "cc": "cc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0",
+  "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "scope": "local short controlled ablations; no device deployment or capture",
+  "scripts": {
+    "run_rust.py": "10f8e6e930b78d33bb9e153bcc9975915a7088d3432d9a44b8bb459de53a9cd9",
+    "run_auxiliary.py": "646125374cf34136b628870972a6cc1de1379cf4805b350e791ccef91b2f65fe",
+    "run_python.py": "c1a70f322a83a8067133755989cf0465a2691e87b64f3873a59e05d178fd86a3",
+    "run_c.py": "b06a8b4d57bcceec2a1548534a600166825743389a4ff43bf58507814463412b"
+  },
+  "results": {
+    "auxiliary-results.json": "1f2a6a4212b3804450fe7fb593cde0166ecfdfd454ac52329ec9d90a2da85f72",
+    "rust-results.json": "93ed7c5029df43d69d2b8b47eb3697e48989407194c8d3402fad6eea359baf34",
+    "python-results.json": "409c55a9e5d42bb443e54979b67f5b99643a4f3e2e26bfd455ee293ecf618d6d",
+    "c-results.json": "3b14a0b31720a0e7f51140f8b8b8ef86144af6f2d79cb1db0ab11689a0a6f7d5"
+  },
+  "archived_scripts": {
+    "run_auxiliary.py": "e7339ade4db9a1af48a2d95c53fbfd042ea7c728eedfa292374979f1bc579d3d",
+    "run_c.py": "8155f90fd0efe42725bdd68b73205e795f01ba3b6d4d533b952f0f0d5f8eaeff",
+    "run_python.py": "af3d9ae3548a9ec3bc02206e34fc5129616f2b53c4c370f4d24949ac07a8a9a4",
+    "run_rust.py": "cfe60ee7b2d5b6c18d92d04d50c7080f46095e4ce2d3c0a41d89389b67d6e7d9"
+  }
+}

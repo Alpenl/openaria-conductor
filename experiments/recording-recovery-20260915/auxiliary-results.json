@@ -1,0 +1,153 @@
+[
+  {
+    "experiment": "failure_progress",
+    "repeat": 0,
+    "variant": "full",
+    "actual_frames": 3,
+    "reported_frames": 3,
+    "reported_bytes": 230,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 0,
+    "variant": "no_progress_snapshot",
+    "actual_frames": 3,
+    "reported_frames": 0,
+    "reported_bytes": 168,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 1,
+    "variant": "no_progress_snapshot",
+    "actual_frames": 3,
+    "reported_frames": 0,
+    "reported_bytes": 168,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 1,
+    "variant": "full",
+    "actual_frames": 3,
+    "reported_frames": 3,
+    "reported_bytes": 230,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 2,
+    "variant": "full",
+    "actual_frames": 3,
+    "reported_frames": 3,
+    "reported_bytes": 230,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 2,
+    "variant": "no_progress_snapshot",
+    "actual_frames": 3,
+    "reported_frames": 0,
+    "reported_bytes": 168,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 3,
+    "variant": "no_progress_snapshot",
+    "actual_frames": 3,
+    "reported_frames": 0,
+    "reported_bytes": 168,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 3,
+    "variant": "full",
+    "actual_frames": 3,
+    "reported_frames": 3,
+    "reported_bytes": 230,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 4,
+    "variant": "full",
+    "actual_frames": 3,
+    "reported_frames": 3,
+    "reported_bytes": 230,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "failure_progress",
+    "repeat": 4,
+    "variant": "no_progress_snapshot",
+    "actual_frames": 3,
+    "reported_frames": 0,
+    "reported_bytes": 168,
+    "raw_index_bytes": 36,
+    "error_code": "source_sequence_gap"
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "full_eof",
+    "repeat": 0,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "operation_ms": 0.001893,
+    "blocked_at_watchdog": false
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "old_terminator",
+    "repeat": 0,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "blocked_at_watchdog": true
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "full_eof",
+    "repeat": 1,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "operation_ms": 0.001833,
+    "blocked_at_watchdog": false
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "old_terminator",
+    "repeat": 1,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "blocked_at_watchdog": true
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "full_eof",
+    "repeat": 2,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "operation_ms": 0.001703,
+    "blocked_at_watchdog": false
+  },
+  {
+    "experiment": "finish_pipe",
+    "variant": "old_terminator",
+    "repeat": 2,
+    "pipe_bytes": 65536,
+    "watchdog_ms": 300,
+    "blocked_at_watchdog": true
+  }
+]

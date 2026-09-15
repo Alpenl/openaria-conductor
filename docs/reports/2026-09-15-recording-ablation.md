@@ -125,7 +125,7 @@
 
 ## 证据与复现
 
-证据目录：/data2/openaria-recording-ablation-20260915/。
+原始证据目录：/data2/openaria-recording-ablation-20260915/。脚本、原始 JSON 结果、CSV 汇总和版本哈希已归档到仓库的 [experiments/recording-recovery-20260915](../../experiments/recording-recovery-20260915/README.md)。
 
 - run_python.py、python-results.json：12 组恢复/下载/完整性对照，每组 5 次，共 60 次。
 - run_c.py、c-results.json：写盘 25 次；双眼配对新旧各穷举 252 种顺序；封存 10 种新旧组合。生成的 writer.c、ledger.c、seal.c 保留提取的真实函数和测试适配器。
@@ -136,10 +136,10 @@
 在本报告对应源码和已有项目环境下可复现：
 
 ~~~bash
-shnote --what "复现恢复消融" --why "比较相同输入下的各机制" run .venv/bin/python /data2/openaria-recording-ablation-20260915/run_python.py
-shnote --what "复现 C 路径消融" --why "比较写盘、配对和封存" run python3 /data2/openaria-recording-ablation-20260915/run_c.py
-shnote --what "复现原生重试消融" --why "比较失败后的 worker 清理" run python3 /data2/openaria-recording-ablation-20260915/run_rust.py
-shnote --what "复现进度和结束信号消融" --why "比较状态保留和满管道处理" run .venv/bin/python /data2/openaria-recording-ablation-20260915/run_auxiliary.py
+shnote --what "复现恢复消融" --why "比较相同输入下的各机制" run .venv/bin/python experiments/recording-recovery-20260915/run_python.py
+shnote --what "复现 C 路径消融" --why "比较写盘、配对和封存" run .venv/bin/python experiments/recording-recovery-20260915/run_c.py
+shnote --what "复现原生重试消融" --why "比较失败后的 worker 清理" run .venv/bin/python experiments/recording-recovery-20260915/run_rust.py
+shnote --what "复现进度和结束信号消融" --why "比较状态保留和满管道处理" run .venv/bin/python experiments/recording-recovery-20260915/run_auxiliary.py
 ~~~
 
-脚本是本工作站实验资产，使用本地绝对路径。复现会更新同名实验输出；保留原始结果时应先复制证据目录。Rust 实验复用项目 target 构建缓存，不修改工作区的 Rust 源文件。
+归档脚本使用仓库相对路径，并做了格式和闭包变量绑定整理；原始结果未重跑，原始与归档脚本哈希分别保留。复现会更新同名实验输出；保留原始结果时应先备份。Rust 实验复用项目 target 构建缓存，不修改工作区的 Rust 源文件。

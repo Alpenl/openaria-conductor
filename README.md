@@ -8,10 +8,13 @@ Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 �
 独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
 
 [Score D-049](https://github.com/mirrorbloom/openaria-score/blob/main/docs/DECISIONS.md#d-049-fixed-storage-and-lan-only-delivery-removable-and-interruption-workflows-retired)
-规定当前 0.5 产品只向部署配置的固定 `/data` 写入，并只通过 LAN 交付已正常封存的会话。
-真实 TF `p3`、可移除介质、ENOSPC/inode 耗尽验证、安全换盘，以及意外掉电、进程或操作
-中断后的恢复都不是当前产品能力或发布门槛。仓库中保留的相关路由、schema 和测试仅用于冻结
-兼容性，当前 UI 不调用或展示它们。
+规定当前 0.5 产品向部署配置的固定 `/data` 写入，并通过 LAN 交付封存会话。
+2026-09-15 根据录制兜底要求补充了完整前段恢复：录制失败或进程中断后，设备校验已完成的
+连续双目分段并发布可用前段，界面显示“录制已中断，已保存前 … 秒，可导出”。无法确认有效的
+尾段保留在设备上供排查。物理断电持久性、真实 TF `p3`、可移除介质、ENOSPC/inode 耗尽和
+安全换盘仍未完成硬件验收。实现、实机证据和限制见
+[分段恢复报告](docs/reports/2026-09-15-recording-recovery.md)及
+[消融实验](docs/reports/2026-09-15-recording-ablation.md)。
 
 ## 用户文档
 
