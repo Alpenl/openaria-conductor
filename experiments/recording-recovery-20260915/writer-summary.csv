@@ -1,0 +1,6 @@
+variant,stall_ms,queue_capacity_frames,repetitions,max_hold_ms_median,output_ms_median,drain_total_ms_median,peak_queue_bytes,frames_written,rejected
+full,0,480,5,0.022222,63.893371,63.944636,65536,60,0
+old_synchronous,0,480,5,0.052548,65.563568,65.563578,0,60,0
+full,250,480,5,0.038492,65.617699,253.046176,3932160,60,0
+old_synchronous,250,480,5,250.085481,315.484262,315.484282,0,60,0
+full,250,8,5,0.029205,9.753354,251.46714,524288,8,1

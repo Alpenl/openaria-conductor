@@ -1,0 +1,82 @@
+[
+  {
+    "error": "",
+    "experiment": "recording_retry",
+    "retry_started": true,
+    "stale_worker_after_prepare": false,
+    "variant": "full",
+    "repeat": 0
+  },
+  {
+    "error": "invalid_state",
+    "experiment": "recording_retry",
+    "retry_started": false,
+    "stale_worker_after_prepare": true,
+    "variant": "old_conditional_cleanup",
+    "repeat": 0
+  },
+  {
+    "error": "invalid_state",
+    "experiment": "recording_retry",
+    "retry_started": false,
+    "stale_worker_after_prepare": true,
+    "variant": "old_conditional_cleanup",
+    "repeat": 1
+  },
+  {
+    "error": "",
+    "experiment": "recording_retry",
+    "retry_started": true,
+    "stale_worker_after_prepare": false,
+    "variant": "full",
+    "repeat": 1
+  },
+  {
+    "error": "",
+    "experiment": "recording_retry",
+    "retry_started": true,
+    "stale_worker_after_prepare": false,
+    "variant": "full",
+    "repeat": 2
+  },
+  {
+    "error": "invalid_state",
+    "experiment": "recording_retry",
+    "retry_started": false,
+    "stale_worker_after_prepare": true,
+    "variant": "old_conditional_cleanup",
+    "repeat": 2
+  },
+  {
+    "error": "invalid_state",
+    "experiment": "recording_retry",
+    "retry_started": false,
+    "stale_worker_after_prepare": true,
+    "variant": "old_conditional_cleanup",
+    "repeat": 3
+  },
+  {
+    "error": "",
+    "experiment": "recording_retry",
+    "retry_started": true,
+    "stale_worker_after_prepare": false,
+    "variant": "full",
+    "repeat": 3
+  },
+  {
+    "error": "",
+    "experiment": "recording_retry",
+    "retry_started": true,
+    "stale_worker_after_prepare": false,
+    "variant": "full",
+    "repeat": 4
+  },
+  {
+    "error": "invalid_state",
+    "experiment": "recording_retry",
+    "retry_started": false,
+    "stale_worker_after_prepare": true,
+    "variant": "old_conditional_cleanup",
+    "repeat": 4
+  }
+]

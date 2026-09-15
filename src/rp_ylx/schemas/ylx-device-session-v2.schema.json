@@ -396,9 +396,9 @@
       "required": ["state", "requested_mode", "resolved_mode", "reason"],
       "properties": {
         "state": {"const": "not_recorded"},
-        "requested_mode": {"enum": ["device_default", "disabled"]},
+        "requested_mode": {"enum": ["device_default", "disabled", "enabled"]},
         "resolved_mode": {"const": "disabled"},
-        "reason": {"enum": ["user_disabled", "device_default_disabled"]}
+        "reason": {"enum": ["user_disabled", "device_default_disabled", "recording_interrupted"]}
       }
     },
     "audioSegment": {

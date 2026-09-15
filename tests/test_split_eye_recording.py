@@ -802,6 +802,31 @@ class SplitEyeRecordingTest(unittest.TestCase):
             assert store.transaction is not None
             self.assertTrue(store.transaction.aborted)
 
+    def test_native_failure_preserves_recorded_frame_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = FakeSessionStore()
+            with (
+                patch("rp_ylx.recording.device_session.native_session_store", return_value=store),
+                patch(
+                    "rp_ylx.recording.device_session.resolve_executable",
+                    return_value=Path("/bin/true"),
+                ),
+            ):
+                recorder, _, _ = self.build(root, native_data_plane=True)
+                recorder.start()
+                assert store.transaction is not None
+                store.transaction.advance(frames=3, imu_samples=2)
+                partial = recorder.fail(
+                    "source_sequence_gap", "source frame sequence has a gap of 8"
+                )
+            state = json.loads((partial / "recording.json").read_text())
+            self.assertEqual(state["progress"]["captured_frames"], 3)
+            self.assertGreater(state["progress"]["bytes_written"], 0)
+            self.assertEqual(state["diagnostics"][0]["code"], "source_sequence_gap")
+            self.assertFalse((partial / "manifest.json").exists())
+            self.assertTrue(store.transaction.aborted)
+
     def test_session_transaction_failure_aborts_without_publishing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

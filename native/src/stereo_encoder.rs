@@ -1,7 +1,7 @@
 use crate::session_io;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -262,10 +262,9 @@ impl EncoderProcess {
         if self.child.is_none() {
             return Err(EncoderProcessError::new("invalid_state", "助手进程未启动"));
         }
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = session_io::write_encoder_frame(stdin.as_raw_fd(), &[]);
-            let _ = stdin.flush();
-        }
+        // EOF is the helper's normal finish signal. Writing a terminator to a
+        // full pipe could block forever before wait_child's timeout even began.
+        drop(self.stdin.take());
         let status = {
             let child = self.child.as_mut().expect("child checked above");
             wait_child(child, timeout).map_err(|error| {
@@ -485,7 +484,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<Option<EncoderEvent>, EncoderEv
     match kind {
         "ready" => Ok(Some(EncoderEvent::Ready)),
         "segment" => Ok(Some(EncoderEvent::Segment(parse_segment(object)?))),
-        "done" => {
+        "done" | "stats" => {
             let stats = object
                 .iter()
                 .filter_map(|(key, value)| {

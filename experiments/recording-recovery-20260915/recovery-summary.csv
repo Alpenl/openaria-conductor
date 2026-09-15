@@ -1,0 +1,13 @@
+variant,repetitions,saved_pairs,saved_frames,audio_samples,all_artifacts_readable
+full,5,10,30,47520,True
+no_segment_checkpoint,5,0,0,0,False
+no_capture_context,5,0,0,0,False
+no_recovery,5,0,0,0,False
+no_checkpoint_and_recovery,5,0,0,0,False
+no_audio_checkpoint,5,10,30,0,True
+old_log_collector,5,10,30,47520,False
+no_audio_and_old_collector,5,10,30,0,False
+corrupt_last_eye,5,9,27,42720,True
+torn_last_index,5,9,27,42720,True
+audio_clock_invalid,5,10,30,0,True
+old_audio_schema,5,0,0,0,False

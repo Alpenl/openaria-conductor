@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
@@ -705,6 +705,7 @@ class DeviceSessionRecorder:
         self._native_direct_recording = False
         self._current_state: Mapping[str, object] | None = None
         self._last_checkpoint = 0.0
+        self.recovered_session: SealedDeviceSession | None = None
 
     @property
     def state(self) -> str:
@@ -910,6 +911,9 @@ class DeviceSessionRecorder:
                         "take_sequence": self._plan.take_sequence,
                         "continuation_of": self._plan.continuation_of,
                         "started_at": self._timestamp(self._started_at),
+                        "started_monotonic_ns": self._started_monotonic_ns,
+                        "config": asdict(self._config),
+                        "plan": asdict(self._plan),
                     },
                 )
                 if self._native_transaction_enabled:
@@ -1127,8 +1131,39 @@ class DeviceSessionRecorder:
             closed = encoder.segments
         while self._harvested_segments < len(closed):
             segment = closed[self._harvested_segments]
+            if transaction is not None:
+                available = transaction.snapshot()["sink"]["frames_written"]
+            else:
+                available = self._frames_written
+            if available < segment.end_frame:
+                # The helper can announce completion before the last index
+                # write returns. Commit only after that frame has an index.
+                return
             self._segment_records.append(self._segment_record(segment))
             self._harvested_segments += 1
+            # Commit each pair independently. Index files are append-only; sync
+            # them through separate descriptors so a slow flush never holds the
+            # capture sink mutex. Recovery still verifies the indexed prefix.
+            for relative in ("frames.ndjson", "imu.ndjson"):
+                stream = self._files.get(
+                    "frames.index" if relative == "frames.ndjson" else "imu.samples"
+                )
+                if stream is not None and not stream.closed:
+                    stream.flush()
+                descriptor = os.open(self._partial / relative, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            write_json_atomic(
+                self._partial / "segments.json",
+                {
+                    "schema": "openaria.segment-checkpoint.v1",
+                    "session_id": self._plan.session_id,
+                    "segments": self._segment_records,
+                    "diagnostics": self._capture_diagnostics(),
+                },
+            )
 
     def _segment_record(self, segment: ClosedSegment) -> dict[str, object]:
         artifacts: dict[str, object] = {}
@@ -1466,6 +1501,23 @@ class DeviceSessionRecorder:
                 return self._partial
             self._state = "stopping"
         self._stop_writer()
+        with suppress(Exception):
+            write_json_atomic(
+                self._partial / "failure-diagnostics.json",
+                {"code": code, "message": message, **self._capture_diagnostics()},
+            )
+        if self._native_transaction is not None and not media_lost:
+            self._harvest_stop.set()
+            if self._harvester is not None:
+                self._harvester.join(timeout=5)
+                if not self._harvester.is_alive():
+                    self._harvester = None
+            # The source has detached this transaction. Drain accepted frames
+            # and audio so a source gap need only lose the rejected frame.
+            if self._harvester is None:
+                with suppress(Exception):
+                    duration = max(0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
+                    self._native_transaction.finish(duration, 10.0)
         self._abandon_audio()
         self._abandon_encoder()
         self._close_files(ignore_errors=True)
@@ -1475,7 +1527,40 @@ class DeviceSessionRecorder:
             recoverable=recoverable,
             media_lost=media_lost,
         )
+        if not media_lost:
+            self.recover_completed_segments()
         return self._partial
+
+    def _capture_diagnostics(self) -> dict[str, object]:
+        result: dict[str, object] = {"observed_monotonic_ns": time.monotonic_ns()}
+        if self._metrics is not None:
+            result["capture"] = asdict(self._metrics.snapshot())
+        if self._native_transaction is not None:
+            try:
+                result["encoder"] = self._native_transaction.snapshot().get("encoder_stats", {})
+            except Exception as error:
+                result["snapshot_error"] = str(error)
+        elif self._encoder is not None:
+            result["encoder"] = getattr(self._encoder, "stats", {})
+        return result
+
+    def recover_completed_segments(self) -> SealedDeviceSession | None:
+        from rp_ylx.recording.recovery import recover_device_session
+
+        try:
+            self.recovered_session = recover_device_session(self._partial)
+            return self.recovered_session
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            DeviceRecordingError,
+            ArtifactAccessError,
+        ):
+            # Keep the original artifacts and failure state for the next boot
+            # (including ENOSPC, missing media and a torn checkpoint).
+            return None
 
     def _artifact(self, role: str, relative: str, media_type: str) -> dict[str, object]:
         native = self._native_artifacts.get(role)
@@ -2064,8 +2149,26 @@ class DeviceSessionRecorder:
         self._harvest_stop.set()
         if self._harvester is not None:
             self._harvester.join(timeout=5)
-            self._harvester = None
+            if not self._harvester.is_alive():
+                self._harvester = None
+        if self._harvester is None:
+            # Include pairs that closed after the last periodic harvest.
+            with suppress(Exception):
+                self._harvest_segments()
         if self._native_transaction is not None:
+            # Preserve native progress before abort releases the transaction.
+            # Failed recordings must not report zero frames after writing media.
+            with suppress(BaseException):
+                sink = self._native_transaction.snapshot().get("sink")
+                if isinstance(sink, Mapping):
+                    self._frames_written = max(
+                        self._frames_written,
+                        _native_uint(sink.get("frames_written"), "recording_sink.frames_written"),
+                    )
+                    self._bytes_written = max(
+                        self._bytes_written,
+                        _native_uint(sink.get("bytes_written"), "recording_sink.bytes_written"),
+                    )
             with suppress(BaseException):
                 self._native_transaction.abort("recording abandoned")
             self._native_transaction = None

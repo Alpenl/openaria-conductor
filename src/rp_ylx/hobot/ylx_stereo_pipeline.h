@@ -49,6 +49,11 @@ typedef struct {
     unsigned long long drop_decoder_input;
     unsigned long long drop_encoder_input;
     unsigned long long drop_decoder_output;
+    unsigned long long write_queue_peak_bytes[YLX_EYES];
+    unsigned long long write_queue_peak_frames[YLX_EYES];
+    unsigned long long write_queue_rejected[YLX_EYES];
+    unsigned long long max_write_ns[YLX_EYES];
+    unsigned long long max_seal_ns;
 } ylx_pipeline_stats_t;
 
 /*

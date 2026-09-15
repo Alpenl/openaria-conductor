@@ -138,12 +138,29 @@ static void emit_error_event(const char *code, const char *message)
     fflush(stream);
 }
 
+static void emit_stats(const char *event, const ylx_pipeline_stats_t *stats)
+{
+    emit("{\"event\":\"%s\",\"offered\":%llu,\"submitted\":%llu,\"decoded\":%llu,"
+         "\"left_frames\":%llu,\"right_frames\":%llu,\"left_bytes\":%llu,\"right_bytes\":%llu,"
+         "\"drop_decoder_input\":%llu,\"drop_encoder_input\":%llu,\"drop_decoder_output\":%llu,"
+         "\"left_write_queue_peak_bytes\":%llu,\"right_write_queue_peak_bytes\":%llu,"
+         "\"left_write_queue_peak_frames\":%llu,\"right_write_queue_peak_frames\":%llu,"
+         "\"left_write_queue_rejected\":%llu,\"right_write_queue_rejected\":%llu,"
+         "\"left_max_write_ns\":%llu,\"right_max_write_ns\":%llu,\"max_seal_ns\":%llu}",
+         event, stats->offered, stats->submitted, stats->decoded,
+         stats->encoded[0], stats->encoded[1], stats->bytes[0], stats->bytes[1],
+         stats->drop_decoder_input, stats->drop_encoder_input, stats->drop_decoder_output,
+         stats->write_queue_peak_bytes[0], stats->write_queue_peak_bytes[1],
+         stats->write_queue_peak_frames[0], stats->write_queue_peak_frames[1],
+         stats->write_queue_rejected[0], stats->write_queue_rejected[1],
+         stats->max_write_ns[0], stats->max_write_ns[1], stats->max_seal_ns);
+}
+
 static void on_segment(void *user, int index, unsigned long long start_frame,
                        unsigned long long end_frame, const char *left_path,
                        unsigned long long left_bytes, const char *right_path,
                        unsigned long long right_bytes)
 {
-    (void)user;
     FILE *stream = event_output();
     fprintf(stream,
             "{\"event\":\"segment\",\"index\":%d,\"start_frame\":%llu,\"end_frame\":%llu,"
@@ -154,6 +171,11 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
     write_json_string(right_path);
     fprintf(stream, ",\"bytes\":%llu}}\n", right_bytes);
     fflush(stream);
+    if (user != NULL && *(ylx_pipeline_t **)user != NULL) {
+        ylx_pipeline_stats_t stats;
+        ylx_pipeline_stats(*(ylx_pipeline_t **)user, &stats);
+        emit_stats("stats", &stats);
+    }
 }
 
 static bool read_exact(void *destination, size_t length)
@@ -274,7 +296,7 @@ int main(int argc, char **argv)
 
     char error[256] = {0};
     ylx_pipeline_t *pipeline = NULL;
-    if (ylx_pipeline_open(&config, on_segment, NULL, &pipeline, error, sizeof(error)) != 0) {
+    if (ylx_pipeline_open(&config, on_segment, &pipeline, &pipeline, error, sizeof(error)) != 0) {
         emit_error_event("pipeline_open_failed", error);
         return 3;
     }
@@ -327,13 +349,7 @@ int main(int argc, char **argv)
     if (failure_code != NULL) {
         emit_error_event(failure_code, pipeline_error[0] != '\0' ? pipeline_error : failure_code);
     }
-    emit("{\"event\":\"done\",\"offered\":%llu,\"submitted\":%llu,\"decoded\":%llu,"
-         "\"left_frames\":%llu,\"right_frames\":%llu,\"left_bytes\":%llu,"
-         "\"right_bytes\":%llu,\"drop_decoder_input\":%llu,\"drop_encoder_input\":%llu,"
-         "\"drop_decoder_output\":%llu}",
-         stats.offered, stats.submitted, stats.decoded, stats.encoded[0],
-         stats.encoded[1], stats.bytes[0], stats.bytes[1], stats.drop_decoder_input,
-         stats.drop_encoder_input, stats.drop_decoder_output);
+    emit_stats("done", &stats);
 
     free(payload);
     ylx_pipeline_close(pipeline);

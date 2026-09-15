@@ -469,18 +469,23 @@ fn collect_device_session_v1_artifacts(
         let audio = audio
             .as_object()
             .ok_or_else(|| SessionIoError::new("manifest_invalid", "manifest audio 结构无效"))?;
-        if matches!(
+        if !matches!(
             audio.get("state").and_then(Value::as_str),
             Some("not_recorded")
         ) {
-            return Ok(collector.finish());
+            let segments = array_field(audio, "segments", "manifest audio segments 无效")?;
+            for segment in segments {
+                let segment = segment.as_object().ok_or_else(|| {
+                    SessionIoError::new("manifest_invalid", "manifest audio segment 无效")
+                })?;
+                collector.collect(value_field(segment, "artifact")?)?;
+            }
         }
-        let segments = array_field(audio, "segments", "manifest audio segments 无效")?;
-        for segment in segments {
-            let segment = segment.as_object().ok_or_else(|| {
-                SessionIoError::new("manifest_invalid", "manifest audio segment 无效")
-            })?;
-            collector.collect(value_field(segment, "artifact")?)?;
+    }
+
+    if object.contains_key("logs") {
+        for artifact in array_field(object, "logs", "manifest logs 无效")? {
+            collector.collect(artifact)?;
         }
     }
 
@@ -1382,6 +1387,22 @@ mod tests {
             paths,
             vec!["video/raw.mjpeg", "frames.ndjson", "imu.ndjson"]
         );
+        let mut with_log: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        with_log["logs"] = serde_json::json!([{
+            "artifact_id": "d".repeat(64),
+            "role": "log.recording-recovery",
+            "path": "recovery/interruption.json",
+            "media_type": "application/json",
+            "bytes": 17,
+            "sha256": "d".repeat(64)
+        }]);
+        let artifacts = device_session_v1_artifacts(
+            &serde_json::to_vec(&with_log).unwrap(),
+            "01989f6a-2c00-7a1b-8c2d-3e4f50617283",
+        )
+        .unwrap();
+        assert_eq!(artifacts.len(), 4);
+        assert_eq!(artifacts[3].path, "recovery/interruption.json");
     }
 
     #[test]
