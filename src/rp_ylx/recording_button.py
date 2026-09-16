@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import logging
+import re
 import signal
 import ssl
 import sys
@@ -64,12 +65,18 @@ class ButtonConfig:
     cooldown_ms: int = 1000
     poll_ms: int = 20
     request_timeout_ms: int = 5000
+    status_led: str | None = "ACT"
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool or type(self.active_low) is not bool:
             raise ValueError("enabled and active_low must be booleans")
         if type(self.physical_pin) is not int or self.physical_pin not in GPIO_PINS:
             raise ValueError("physical_pin must be an RDK X5 BOARD GPIO pin, not power or ground")
+        if self.status_led is not None and (
+            not isinstance(self.status_led, str)
+            or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", self.status_led) is None
+        ):
+            raise ValueError("status_led must be a Linux LED name or null")
         for name, minimum, maximum in (
             ("debounce_ms", 20, 1000),
             ("cooldown_ms", 100, 10000),
@@ -175,7 +182,7 @@ class CaptureClient:
             raise ButtonError("Device API response is not an object")
         return value
 
-    def handle_press(self) -> str | None:
+    def capture_snapshot(self) -> dict:
         status = self.request("/capture/status")
         if not isinstance(status, dict) or status.get("schema") != "ylx.capture-status.v4":
             raise ButtonError("invalid capture status")
@@ -185,6 +192,10 @@ class CaptureClient:
             or snapshot.get("schema") != "ylx.capture-snapshot-event.v4"
         ):
             raise ButtonError("invalid capture snapshot")
+        return snapshot
+
+    def handle_press(self) -> str | None:
+        snapshot = self.capture_snapshot()
         state = snapshot.get("device_state")
         if state == "recording":
             self.request("/capture/stop", {"schema": "ylx.capture-stop.v2", "reason": "user"})
@@ -318,11 +329,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     stopped = threading.Event()
     previous = {}
+    indicator_thread = None
     try:
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous[signum] = signal.signal(signum, lambda *_: stopped.set())
-        run_button(config, load_gpio(), client, stopped, monitor=args.monitor)
+        gpio = load_gpio()
+        if config.status_led is not None and not args.monitor:
+            from rp_ylx.recording_indicator import run_indicator
+
+            indicator_client = create_capture_client(
+                args.device_config, min(config.request_timeout_ms / 1000, 2.0)
+            )
+            indicator_thread = threading.Thread(
+                target=run_indicator,
+                args=(Path("/sys/class/leds") / config.status_led, indicator_client, stopped),
+                name="recording-indicator",
+                daemon=True,
+            )
+            indicator_thread.start()
+        run_button(config, gpio, client, stopped, monitor=args.monitor)
     finally:
+        stopped.set()
+        if indicator_thread is not None:
+            indicator_thread.join(timeout=3)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     return 0

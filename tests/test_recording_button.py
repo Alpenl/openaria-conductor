@@ -97,10 +97,27 @@ class ButtonInputTest(unittest.TestCase):
                 {"poll_ms": True},
                 {"poll_ms": 100, "debounce_ms": 20},
                 {"arbitrary": 1},
+                {"status_led": "../../gpio"},
+                {"status_led": "/sys/class/leds/ACT"},
+                {"status_led": True},
             ):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     path.write_text(json.dumps(value))
                     load_button_config(path)
+
+    def test_monitor_never_starts_led_worker(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "button.json"
+            config.write_text(json.dumps({"status_led": "ACT"}))
+            with (
+                patch("rp_ylx.recording_button.load_gpio"),
+                patch("rp_ylx.recording_button.run_button"),
+                patch("rp_ylx.recording_button.create_capture_client") as client,
+                patch("rp_ylx.recording_indicator.run_indicator") as indicator,
+            ):
+                self.assertEqual(main(["--config", str(config), "--monitor"]), 0)
+                client.assert_not_called()
+                indicator.assert_not_called()
 
     def run_trace(self, *, monitor=False, active_low=False, failure=False):
         clock = [0.0]
