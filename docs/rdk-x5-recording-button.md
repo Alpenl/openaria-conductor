@@ -101,6 +101,12 @@ sudo journalctl -u rp-ylx-recording-button.service -f
 也可用 `"status_led": "ACT"` 显式指定 Linux LED 名称。按钮服务正常停止时会恢复
 接管前的灯光触发模式，`--monitor` 检测模式不会改变指示灯。
 
+如果实物灯的亮灭与上表相反，在同一配置中加入 `"status_led_inverted": true`，
+然后重启按钮服务。默认值为 `false`，表示遵循 Linux LED brightness 的通常语义。
+这项配置只反转指示灯的亮灭方向，与按钮的 `active_low` 无关；慢闪和快闪保持原频率。
+`.248` 的板载 ACT 已由实物观察确认需要反向：`brightness=0` 时亮，`1` 时灭。
+读取 sysfs 数值只能证明软件写入成功，验收时还需确认实物灯与真实录制状态一致。
+
 本功能控制板载灯。三线按钮模块的 `S` 仍是输入信号，不用它输出电平驱动模块上的灯。
 
 ## 录制行为

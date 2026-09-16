@@ -66,10 +66,13 @@ class ButtonConfig:
     poll_ms: int = 20
     request_timeout_ms: int = 5000
     status_led: str | None = "ACT"
+    status_led_inverted: bool = False
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool or type(self.active_low) is not bool:
             raise ValueError("enabled and active_low must be booleans")
+        if type(self.status_led_inverted) is not bool:
+            raise ValueError("status_led_inverted must be a boolean")
         if type(self.physical_pin) is not int or self.physical_pin not in GPIO_PINS:
             raise ValueError("physical_pin must be an RDK X5 BOARD GPIO pin, not power or ground")
         if self.status_led is not None and (
@@ -343,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             indicator_thread = threading.Thread(
                 target=run_indicator,
                 args=(Path("/sys/class/leds") / config.status_led, indicator_client, stopped),
+                kwargs={"inverted": config.status_led_inverted},
                 name="recording-indicator",
                 daemon=True,
             )

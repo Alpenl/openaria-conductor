@@ -100,6 +100,8 @@ class ButtonInputTest(unittest.TestCase):
                 {"status_led": "../../gpio"},
                 {"status_led": "/sys/class/leds/ACT"},
                 {"status_led": True},
+                {"status_led_inverted": "true"},
+                {"status_led_inverted": 1},
             ):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     path.write_text(json.dumps(value))

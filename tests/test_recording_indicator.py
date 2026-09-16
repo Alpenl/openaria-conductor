@@ -72,6 +72,29 @@ class RecordingIndicatorTest(unittest.TestCase):
         self.assertEqual((self.path / "delay_on").read_text().strip(), "200")
         self.assertEqual((self.path / "delay_off").read_text().strip(), "700")
 
+    def test_inverted_led_changes_steady_levels_but_preserves_blink_and_restore(self) -> None:
+        for inverted in (False, True):
+            with self.subTest(inverted=inverted):
+                (self.path / "trigger").write_text("none timer [heartbeat]\n")
+                (self.path / "brightness").write_text("0\n")
+                led = StatusLed(self.path, inverted=inverted)
+                for pattern, expected in (
+                    ("idle", int(inverted)),
+                    ("recording", int(not inverted)),
+                ):
+                    led.show(pattern)
+                    self.assertEqual((self.path / "brightness").read_text().strip(), str(expected))
+                    self.assertEqual((self.path / "trigger").read_text().strip(), "none")
+                for pattern, delay in (("saving", "500"), ("error", "125")):
+                    led.show(pattern)
+                    self.assertEqual((self.path / "brightness").read_text().strip(), "1")
+                    self.assertEqual((self.path / "trigger").read_text().strip(), "timer")
+                    self.assertEqual((self.path / "delay_on").read_text().strip(), delay)
+                    self.assertEqual((self.path / "delay_off").read_text().strip(), delay)
+                led.restore()
+                self.assertEqual((self.path / "trigger").read_text().strip(), "heartbeat")
+                self.assertEqual((self.path / "brightness").read_text().strip(), "0")
+
     def test_status_timeout_signals_error_then_recovers_and_restores_on_exit(self) -> None:
         client = Mock()
         client.capture_snapshot.side_effect = [

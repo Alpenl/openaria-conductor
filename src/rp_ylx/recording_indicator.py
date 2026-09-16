@@ -25,8 +25,9 @@ def indicator_pattern(snapshot: dict) -> str:
 
 
 class StatusLed:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, inverted: bool = False) -> None:
         self.path = path
+        self.inverted = inverted
         self.maximum = int((path / "max_brightness").read_text())
         self.previous_brightness = int((path / "brightness").read_text())
         triggers = (path / "trigger").read_text().split()
@@ -53,12 +54,17 @@ class StatusLed:
             return
         self.owned = True
         self._write("trigger", "none")
-        self._write("brightness", 0 if pattern == "idle" else self.maximum)
         if pattern in {"saving", "error"}:
+            # The kernel timer needs a nonzero brightness even on an inverted LED.
+            # Both blink patterns have equal on/off times, so polarity preserves cadence.
+            self._write("brightness", self.maximum)
             self._write("trigger", "timer")
             delay = 500 if pattern == "saving" else 125
             self._write("delay_on", delay)
             self._write("delay_off", delay)
+        else:
+            illuminated = pattern == "recording"
+            self._write("brightness", self.maximum if illuminated != self.inverted else 0)
         self.pattern = pattern
         LOG.info("recording indicator: %s", pattern)
 
@@ -73,12 +79,18 @@ class StatusLed:
         self.owned = False
 
 
-def run_indicator(led_path: Path, client: CaptureClient, stopped: threading.Event) -> None:
+def run_indicator(
+    led_path: Path,
+    client: CaptureClient,
+    stopped: threading.Event,
+    *,
+    inverted: bool = False,
+) -> None:
     """Poll independently so slow HTTP requests never block physical button sampling."""
     led = None
     unavailable = False
     try:
-        led = StatusLed(led_path)
+        led = StatusLed(led_path, inverted=inverted)
         while not stopped.is_set():
             try:
                 pattern = indicator_pattern(client.capture_snapshot())
