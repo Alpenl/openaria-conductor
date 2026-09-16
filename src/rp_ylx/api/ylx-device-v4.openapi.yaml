@@ -48,6 +48,8 @@ x-ylx-security-profiles:
       matching manifest digests. Unlisted mutation operations remain forbidden.
     allowed_operation_ids:
       - getDevice
+      - getDeviceClock
+      - syncDeviceClock
       - getCaptureStatus
       - startCapture
       - stopCapture
@@ -78,6 +80,75 @@ x-ylx-security-profiles:
       capture_status: true
       session_deletion: true
 paths:
+  /clock:
+    get:
+      tags: [Device]
+      operationId: getDeviceClock
+      summary: Read clock authority and obtain a short-lived client clock challenge
+      description: |
+        Optional extension; older firmware returns 404. NTP takes precedence over
+        client time. An unsynchronized device issues a principal-bound, single-use
+        challenge valid for 5000 ms on its monotonic clock. No wall time is changed.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Clock authority and optional challenge
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClockStatus"
+        "503":
+          description: Clock controller or NTP status is unavailable
+  /clock/sync:
+    post:
+      tags: [Device]
+      operationId: syncDeviceClock
+      summary: Initialize an offline device clock using the connected client date
+      description: |
+        Uses the normal write Origin/CSRF and bearer policy. No Idempotency-Key is
+        needed: a challenge is consumed once, and cannot replay a clock change.
+        Send Date.now() immediately before POST; values must be in [2024, 2100) UTC.
+        NTP and an already accepted client reference take precedence; other clients
+        cannot continuously step the clock. Changes are prohibited throughout
+        recording/finalization, including queued requests whose caller timed out.
+        This initializes calendar dates, not precise multi-device sensor alignment.
+        The client clock must itself be correct. RTC battery persistence is unchanged.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema, challenge, unix_time_ms]
+              properties:
+                schema:
+                  const: ylx.clock-sync-request.v1
+                challenge:
+                  type: string
+                  pattern: '^[0-9a-f]{32}$'
+                unix_time_ms:
+                  type: integer
+                  minimum: 1704067200000
+                  maximum: 4102444799999
+      responses:
+        "200":
+          description: Client clock applied or an existing clock authority preserved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClockStatus"
+        "400":
+          description: Invalid timestamp or request
+        "409":
+          description: Capture active, expired challenge, or clock changed; retry with a new challenge
+        "503":
+          description: Clock controller, NTP state, or permission to set time unavailable
   /sessions/delete:
     post:
       tags: [Sessions]
@@ -1491,6 +1562,25 @@ components:
     InternalErrorHead:
       description: Unexpected device error; HEAD sends no response body
   schemas:
+    ClockStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, source, unix_time_ms, challenge, expires_in_ms, applied]
+      properties:
+        schema:
+          const: ylx.clock-status.v1
+        source:
+          enum: [ntp, client, unsynchronized]
+        unix_time_ms:
+          type: integer
+          minimum: 0
+        challenge:
+          type: [string, "null"]
+          pattern: '^[0-9a-f]{32}$'
+        expires_in_ms:
+          enum: [0, 5000]
+        applied:
+          type: boolean
     UuidV7:
       type: string
       format: uuid

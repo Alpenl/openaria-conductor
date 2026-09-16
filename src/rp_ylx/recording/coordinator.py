@@ -1927,6 +1927,51 @@ class CaptureCoordinator:
             unavailable_reasons.get(code, "controller_unavailable")
         )
 
+    def clock_status(self, principal_id: str) -> Mapping[str, object]:
+        return self._clock_control("clock_status", principal_id, {})
+
+    def sync_clock(self, principal_id: str, body: Mapping[str, object]) -> Mapping[str, object]:
+        # Share the start/stop lock: never step wall time halfway through a capture
+        # or between allocating its session ID and writing the initial metadata.
+        with self._lock:
+            if self._active is not None:
+                raise ProviderError(
+                    "capture_active",
+                    "录制结束后再校准设备日期",
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                )
+            return self._clock_control("clock_sync", principal_id, body)
+
+    @staticmethod
+    def _clock_control(
+        operation: str, principal_id: str, body: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        try:
+            response = request_network_control(
+                operation,
+                principal_id=principal_id,
+                body=body,
+                timeout_seconds=3.0,
+            )
+        except NetworkControlClientError as exc:
+            raise ProviderError(
+                "clock_sync_unavailable",
+                "设备校时服务暂时不可用",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from exc
+        if response.get("ok") is not True:
+            error = response.get("error", {})
+            code = str(error.get("code", "clock_sync_unavailable"))
+            status = (
+                HTTPStatus.CONFLICT
+                if code in {"clock_challenge_expired", "clock_changed", "capture_active"}
+                else HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            raise ProviderError(code, "设备日期尚未校准，请重试", status=status, retryable=True)
+        return response["body"]
+
     def scan_networks(self) -> Mapping[str, object]:
         try:
             response = request_network_control(

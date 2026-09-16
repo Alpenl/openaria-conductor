@@ -46,6 +46,8 @@ PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
 LAB_OPERATIONS = frozenset(
     {
         "getDevice",
+        "syncDeviceClock",
+        "getDeviceClock",
         "getCaptureStatus",
         "streamCaptureEvents",
         "listSessions",

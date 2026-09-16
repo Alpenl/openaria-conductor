@@ -1865,7 +1865,7 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn("ProtectKernelTunables=yes", service)
         self.assertIn("ProtectKernelModules=yes", service)
         self.assertIn("ProtectControlGroups=yes", service)
-        self.assertIn("CapabilityBoundingSet=\n", service)
+        self.assertIn("CapabilityBoundingSet=CAP_SYS_TIME\n", service)
         self.assertIn(
             "Environment=RP_YLX_NETWORK_STATE_DIR=/var/lib/rp-ylx-network",
             service,
