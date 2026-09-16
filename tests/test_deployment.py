@@ -322,6 +322,23 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(advertised.read_bytes(), _avahi_service())
         self.assertEqual(advertised.read_bytes(), _asset_bytes(MDNS_ASSET_NAME))
 
+    def test_optional_recording_button_configuration_survives_upgrade(self) -> None:
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+        path = self.config_root / "recording-button.json"
+        config = json.loads(path.read_bytes())
+        self.assertFalse(config["enabled"])
+        config.update(enabled=True, active_low=True)
+        path.write_text(json.dumps(config))
+        manager.install(self.bundle("b"))
+        self.assertEqual(json.loads(path.read_bytes()), config)
+        self.assertNotIn(
+            ("systemctl", "enable", "--now", "rp-ylx-recording-button.service"), self.commands
+        )
+        unit = self.root / "usr/lib/systemd/system/rp-ylx-recording-button.service"
+        self.assertIn("PartOf=rp-ylx.service", unit.read_text())
+        self.assertIn("WantedBy=rp-ylx.service", unit.read_text())
+
     def test_bootstrap_root_carries_the_mdns_asset_for_standalone_deploys(self) -> None:
         # deployment.py 会被单独复制到 /usr/local/lib/rp-ylx 运行，其资产也必须一并落地。
         manager = self.manager()
@@ -772,6 +789,7 @@ class ReleaseManagerTest(unittest.TestCase):
             "rp-ylx": "rp_ylx",
             "rp-ylx-deploy": "rp_ylx.deployment",
             "rp-ylx-spectacular-check": "rp_ylx.spectacular.check_cli",
+            "rp-ylx-recording-button": "rp_ylx.recording_button",
         }
         for name, module in expected.items():
             with self.subTest(command=name):

@@ -10,5 +10,6 @@ dist/
 node_modules/
 playwright-report/
 test-results/
+/tmp/
 target/
 src/rp_ylx/_native*.so

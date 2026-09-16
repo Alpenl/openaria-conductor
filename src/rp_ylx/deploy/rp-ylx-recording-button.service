@@ -1,0 +1,28 @@
+[Unit]
+Description=Open Aria RDK X5 physical recording button
+Wants=rp-ylx.service
+After=rp-ylx.service
+PartOf=rp-ylx.service
+ConditionPathExists=/etc/rp-ylx/recording-button.json
+ConditionPathExists=/opt/rp-ylx/current/site-packages/rp_ylx/recording_button.py
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rp-ylx/current/bin/rp-ylx-recording-button
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=rp-ylx.service

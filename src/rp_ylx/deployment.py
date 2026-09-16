@@ -77,6 +77,11 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         0o644,
     ),
     "rp-ylx.service": ("usr/lib/systemd/system/rp-ylx.service", 0o644),
+    "rp-ylx-recording-button.service": (
+        "usr/lib/systemd/system/rp-ylx-recording-button.service",
+        0o644,
+    ),
+    "rp-ylx-recording-button.json": ("etc/rp-ylx/recording-button.json", 0o644),
     # avahi only scans /etc/avahi/services, so the mDNS service definition is
     # installed under /etc rather than /usr/lib.
     "rp-ylx.avahi": ("etc/avahi/services/rp-ylx.service", 0o644),
@@ -104,7 +109,7 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         0o644,
     ),
 }
-PRESERVED_DEPLOYMENT_ASSETS = {"rp-ylx-wifi-watchdog.default"}
+PRESERVED_DEPLOYMENT_ASSETS = {"rp-ylx-wifi-watchdog.default", "rp-ylx-recording-button.json"}
 SUPPORTING_DEPLOYMENT_ASSETS: Mapping[str, int] = {"rp-ylx-customer.avahi": 0o644}
 CORE_SYSTEMD_UNITS = (
     "rp-ylx-data-volume.service",
@@ -1087,6 +1092,7 @@ def _install_stage(bundle: Bundle, stage: Path) -> None:
         ("rp-ylx", "rp_ylx"),
         ("rp-ylx-deploy", "rp_ylx.deployment"),
         ("rp-ylx-spectacular-check", "rp_ylx.spectacular.check_cli"),
+        ("rp-ylx-recording-button", "rp_ylx.recording_button"),
     )
     for name, module in launchers:
         launcher = bin_directory / name

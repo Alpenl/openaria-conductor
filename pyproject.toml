@@ -27,6 +27,7 @@ openaria-spectacular-check = "rp_ylx.spectacular.check_cli:main"
 rp-ylx = "rp_ylx.cli:main"
 rp-ylx-deploy = "rp_ylx.deployment:main"
 rp-ylx-spectacular-check = "rp_ylx.spectacular.check_cli:main"
+rp-ylx-recording-button = "rp_ylx.recording_button:main"
 
 [tool.ruff]
 line-length = 100

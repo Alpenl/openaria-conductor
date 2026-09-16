@@ -159,6 +159,15 @@ class InstalledWheelTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ).stdout
+                button_help = subprocess.run(
+                    [str(virtual_environment / "bin/rp-ylx-recording-button"), "--help"],
+                    cwd=external_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertIn("--monitor", button_help)
                 status = json.loads(
                     subprocess.run(
                         [str(executable), "status"],
