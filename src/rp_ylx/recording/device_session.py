@@ -22,7 +22,11 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
 from zoneinfo import ZoneInfo
 
-from rp_ylx.api.downloads import ArtifactAccessError, validate_device_session_manifest
+from rp_ylx.api.downloads import (
+    ArtifactAccessError,
+    validate_device_session_manifest,
+    validated_device_session_payload,
+)
 from rp_ylx.camera import FrameObservation
 from rp_ylx.imu import ImuObservation
 from rp_ylx.native import (
@@ -846,7 +850,10 @@ class DeviceSessionRecorder:
                 "verification": {"completed": completed, "total": total},
             }
             self._current_state = document
-        self._state_sink(document)
+        # Progress is observable through current_recording_state. The state
+        # sink fsyncs coordinator recovery data; doing that per artifact adds
+        # a disk barrier for every five-second audio segment. State transitions
+        # and the final command result remain durable through _persist_state.
 
     def _live_audio_bytes(self) -> int:
         recorder = self._audio_recorder
@@ -2167,8 +2174,8 @@ class DeviceSessionRecorder:
                 for relative in compacted_originals:
                     self._artifact_identities.pop(relative, None)
             finished_stage("manifest_compaction")
-            validate_device_session_manifest(manifest)
             payload = json_bytes(manifest)
+            validated_device_session_payload(payload, self._plan.session_id)
             native_manifest_sha256 = None
             if before_publish is None and transaction is not None:
                 native_manifest_sha256 = _seal_native_transaction(
@@ -2535,11 +2542,8 @@ def validate_device_session_directory(
                 payload = _read_bounded_fd(manifest_fd, MAX_MANIFEST_BYTES, code="manifest_invalid")
             finally:
                 os.close(manifest_fd)
-            manifest = json.loads(payload)
             selected_session_id = root.name if expected_session_id is None else expected_session_id
-            if not isinstance(manifest, dict) or manifest.get("session_id") != selected_session_id:
-                raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
-            validate_device_session_manifest(manifest)
+            manifest = validated_device_session_payload(payload, selected_session_id)
             descriptors = _manifest_artifacts(manifest)
 
             def verify_artifact(artifact_descriptor):

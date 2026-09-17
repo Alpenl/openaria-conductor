@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import json
@@ -1272,6 +1273,18 @@ def validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
     """验证生产者与下载路径共享的 Device Session v1/v2 语义。"""
 
     _validate_device_session_manifest(manifest)
+
+
+def validated_device_session_payload(payload: bytes, session_id: str) -> Mapping[str, object]:
+    """Validate exact immutable bytes, sharing the download schema cache.
+
+    Only schema/semantic work is cached. Callers must still verify current
+    manifest bytes and artifact identities/digests. Return an isolated copy so
+    producer or validation callers cannot mutate the cached parsed document.
+    """
+
+    manifest = _validated_manifest(payload, session_id, "v4")
+    return copy.deepcopy(manifest)
 
 
 def _validate_recording_session_v0(manifest: Mapping[str, object]) -> None:

@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.device_session import DeviceRecordingError, validate_device_session_directory
@@ -16,6 +16,55 @@ from tests import test_split_eye_recording as fixtures
 
 
 class LiveSealingTests(unittest.TestCase):
+    def test_progress_does_not_sync_coordinator_for_each_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = fixtures.SplitEyeRecordingTest().build(Path(directory))
+            recorder.start()
+            sink = recorder._state_sink = Mock()
+            try:
+                with patch(
+                    "rp_ylx.recording.device_session.write_json_atomic",
+                    side_effect=AssertionError("progress must not add disk barriers"),
+                ):
+                    for completed in range(1, 123):
+                        recorder._verification_progress(completed, 123)
+                sink.assert_not_called()
+                self.assertEqual(
+                    recorder.current_recording_state["progress"]["verification"],
+                    {"completed": 122, "total": 123},
+                )
+                recorder._persist_state("verifying")
+                sink.assert_called_once()
+            finally:
+                recorder.abort()
+
+    def test_manifest_cache_reuses_only_exact_bytes_and_isolates_mutation(self):
+        from rp_ylx.api import downloads
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = fixtures.SplitEyeRecordingTest()
+            recorder, _, _ = fixture.build(Path(directory))
+            recorder.start()
+            fixture.feed(recorder, 3)
+            sealed = recorder.stop()
+            downloads._clear_validated_manifest_cache_for_tests()
+            validate = downloads._decode_and_validate_manifest
+            with patch.object(downloads, "_decode_and_validate_manifest", wraps=validate) as run:
+                one = downloads.validated_device_session_payload(
+                    sealed.manifest_bytes, sealed.path.name
+                )
+                one["sealed"] = False
+                two = downloads.validated_device_session_payload(
+                    sealed.manifest_bytes, sealed.path.name
+                )
+                self.assertTrue(two["sealed"])
+                self.assertEqual(run.call_count, 1)
+                with self.assertRaises(downloads.ArtifactAccessError):
+                    downloads.validated_device_session_payload(
+                        json.dumps(one).encode(), sealed.path.name
+                    )
+                self.assertEqual(run.call_count, 2)
+
     def test_incremental_blocks_tail_and_final_native_digest_agree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
