@@ -88,12 +88,18 @@ impl NativeSessionTransaction {
     }
 
     fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let snapshot = self.transaction.snapshot().map_err(session_store_error)?;
+        let transaction = Arc::clone(&self.transaction);
+        let snapshot = py
+            .allow_threads(move || transaction.snapshot())
+            .map_err(session_store_error)?;
         session_transaction_snapshot_dict(py, &snapshot)
     }
 
     fn segments(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let segments = self.transaction.segments().map_err(session_store_error)?;
+        let transaction = Arc::clone(&self.transaction);
+        let segments = py
+            .allow_threads(move || transaction.segments())
+            .map_err(session_store_error)?;
         stereo_encoder_segment_list(py, &segments)
     }
 

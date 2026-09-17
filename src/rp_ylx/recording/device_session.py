@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -816,6 +817,23 @@ class DeviceSessionRecorder:
             self._current_state = document
         self._state_sink(document)
         return document
+
+    def _verification_progress(self, completed: int, total: int) -> None:
+        # This is live progress, not a recovery checkpoint. Avoid fsync for each
+        # compressed artifact; the original journals remain durable until seal.
+        revision = self._allocate_revision()
+        with self._lock:
+            if self._current_state is None:
+                return
+            document = dict(self._current_state)
+            document["state_revision"] = revision
+            document["updated_at"] = self._timestamp(self._now())
+            document["progress"] = {
+                **document["progress"],
+                "verification": {"completed": completed, "total": total},
+            }
+            self._current_state = document
+        self._state_sink(document)
 
     def _live_audio_bytes(self) -> int:
         recorder = self._audio_recorder
@@ -2042,12 +2060,6 @@ class DeviceSessionRecorder:
                 from rp_ylx.recording.audit import capture_audit
                 from rp_ylx.recording.storage import compact_manifest
 
-                manifest["capture_audit"] = capture_audit(
-                    self._partial,
-                    self._config.sensor_fps / self._config.frame_decimation,
-                    self._config.frame_decimation,
-                )
-
                 def finalize_compacted(path: Path) -> dict[str, object]:
                     result = _finalize_artifact(path, None, code="compaction_invalid")
                     relative = path.relative_to(self._partial).as_posix()
@@ -2059,9 +2071,26 @@ class DeviceSessionRecorder:
                         "artifact_id": result.sha256,
                     }
 
-                manifest, compacted_originals = compact_manifest(
-                    self._partial, manifest, finalize_compacted
-                )
+                # Both jobs read immutable raw journals. Compaction never removes
+                # them until publication, and the executor joins even on failure.
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="clock-audit") as audit:
+                    audited = audit.submit(
+                        capture_audit,
+                        self._partial,
+                        self._config.sensor_fps / self._config.frame_decimation,
+                        self._config.frame_decimation,
+                    )
+                    manifest, compacted_originals = compact_manifest(
+                        self._partial,
+                        manifest,
+                        finalize_compacted,
+                        # Reserve the last unit for audit, publication and the
+                        # coordinator's independent full-byte verification.
+                        progress=lambda completed, total: self._verification_progress(
+                            completed, total + 1
+                        ),
+                    )
+                    manifest["capture_audit"] = audited.result()
                 for relative in compacted_originals:
                     self._artifact_identities.pop(relative, None)
             validate_device_session_manifest(manifest)
@@ -2101,7 +2130,9 @@ class DeviceSessionRecorder:
                     (self._final / relative).unlink()
             with self._lock:
                 self._state = "sealed"
-                self._current_state = None
+                # The coordinator still independently verifies all sealed bytes.
+                # Keep the verifying snapshot until it releases this recorder;
+                # clearing it here incorrectly exposes device_state="blocked".
                 self._native_transaction = None
             if native_manifest_sha256 is None:
                 fsync_directory(self._root)
@@ -2426,7 +2457,8 @@ def validate_device_session_directory(
                 raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
             validate_device_session_manifest(manifest)
             descriptors = _manifest_artifacts(manifest)
-            for artifact_descriptor in descriptors:
+
+            def verify_artifact(artifact_descriptor):
                 if interrupt_check is not None:
                     interrupt_check()
                 relative, expected_bytes = _artifact_path_and_bytes(
@@ -2450,6 +2482,21 @@ def validate_device_session_directory(
                     )
                 finally:
                     os.close(artifact_fd)
+
+            if interrupt_check is not None:
+                # Catalog verification must yield promptly to a new recording;
+                # keep its existing sequential interruption semantics.
+                for descriptor in descriptors:
+                    verify_artifact(descriptor)
+            else:
+                # Each worker owns its artifact fd; the pinned root stays open
+                # until both have joined. All bytes are still independently
+                # hashed, including on devices without SHA instructions.
+                with ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="session-verify"
+                ) as executor:
+                    for _ in executor.map(verify_artifact, descriptors):
+                        pass
             return manifest
         finally:
             os.close(root_fd)

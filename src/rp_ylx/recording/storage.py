@@ -12,6 +12,7 @@ import io
 import os
 import subprocess
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -120,6 +121,8 @@ def compact_audio(path: Path) -> tuple[Path, dict]:
             "error",
             "-i",
             str(temporary),
+            "-threads",
+            "1",
             "-map",
             "0:a:0",
             "-f",
@@ -141,14 +144,17 @@ def compact_audio(path: Path) -> tuple[Path, dict]:
     return target, {"codec": "flac", "pcm_bytes": pcm_bytes, "pcm_sha256": pcm.hexdigest()}
 
 
-def compact_manifest(root: Path, manifest: dict, finalize) -> tuple[dict, list[str]]:
+def compact_manifest(
+    root: Path, manifest: dict, finalize, *, progress=None
+) -> tuple[dict, list[str]]:
     """Caller owns manifest, updates file identities, then seals before cleanup."""
     originals = []
     descriptors = [manifest["frames"]["artifact"], manifest["imu"]["artifact"]]
     descriptors += [
         segment["artifact"] for segment in manifest.get("audio", {}).get("segments", [])
     ]
-    for descriptor in descriptors:
+
+    def compact(descriptor):
         relative = descriptor["path"]
         path = root / relative
         audio = descriptor["media_type"] == "audio/wav"
@@ -166,9 +172,21 @@ def compact_manifest(root: Path, manifest: dict, finalize) -> tuple[dict, list[s
             != expected_source
         ):
             raise ValueError("metadata compaction did not preserve the sealed source")
-        descriptor.update(finalize(target))
-        descriptor["media_type"] = "audio/flac" if audio else "application/zstd"
-        descriptor["storage_encoding"] = compression
-        originals.append(relative)
+        return target, compression, relative, audio
+
+    # Two bounded workers overlap codec startup / disk waits. All descriptor
+    # mutation and finalization stays on the calling thread. Originals survive
+    # any failure, and executor shutdown joins outstanding work before recovery.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="lossless-seal") as executor:
+        for completed, (descriptor, result) in enumerate(
+            zip(descriptors, executor.map(compact, descriptors), strict=True), 1
+        ):
+            target, compression, relative, audio = result
+            descriptor.update(finalize(target))
+            descriptor["media_type"] = "audio/flac" if audio else "application/zstd"
+            descriptor["storage_encoding"] = compression
+            originals.append(relative)
+            if progress is not None:
+                progress(completed, len(descriptors))
     manifest["schema"] = "ylx.device-session.v4"
     return manifest, originals

@@ -87,6 +87,7 @@ struct State {
     running: bool,
     terminal_error: Option<RuntimeError>,
     last_preview_error: Option<RuntimeError>,
+    max_consumer_frame_ns: u64,
 }
 
 struct Shared {
@@ -136,6 +137,7 @@ impl Runtime {
                     running: false,
                     terminal_error: None,
                     last_preview_error: None,
+                    max_consumer_frame_ns: 0,
                 }),
                 changed: Condvar::new(),
             }),
@@ -244,6 +246,7 @@ impl Runtime {
             ));
         }
         state.fanout.start_recording()?;
+        state.max_consumer_frame_ns = 0;
         state.recording = Some(Arc::new(SplitSinkRecording {
             active_take,
             sink,
@@ -516,7 +519,7 @@ fn process_frame(
     frame: Frame,
     metrics: Option<&Arc<Metrics>>,
 ) -> Result<(), RuntimeError> {
-    let frame_started = start_stage(metrics);
+    let frame_started = Instant::now();
     let result = (|| {
         let left_size = usize_to_u64(frame.left.len());
         let right_size = usize_to_u64(frame.right.len());
@@ -608,7 +611,7 @@ fn process_frame(
             if let Err(mut error) = write_result {
                 if error.code == "source_sequence_gap" {
                     error.message = format!(
-                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={})",
+                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={}, consumer_max_frame_ns={})",
                         error.message,
                         frame
                             .source_sequence
@@ -619,6 +622,11 @@ fn process_frame(
                         frame.producer_max_interval_ns,
                         frame.producer_max_control_ns,
                         frame.producer_max_read_ns,
+                        shared
+                            .state
+                            .lock()
+                            .map(|state| state.max_consumer_frame_ns)
+                            .unwrap_or(0),
                     );
                 }
                 report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
@@ -626,7 +634,12 @@ fn process_frame(
         }
         Ok(())
     })();
-    finish_stage(metrics, "native_capture_frame", frame_started);
+    if let Ok(mut state) = shared.state.lock() {
+        state.max_consumer_frame_ns = state
+            .max_consumer_frame_ns
+            .max(frame_started.elapsed().as_nanos() as u64);
+    }
+    finish_stage(metrics, "native_capture_frame", Some(frame_started));
     result
 }
 
