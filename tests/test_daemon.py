@@ -103,8 +103,8 @@ class ProductionDaemonTest(unittest.TestCase):
                 load_production_config(path),
                 replace(
                     config,
-                    video_bitrate_kbps=16384,
-                    recording_encoding=RecordingEncoding.from_mapping({"preset": "high"}),
+                    video_bitrate_kbps=12288,
+                    recording_encoding=RecordingEncoding.from_mapping({}),
                 ),
             )
             value["security"]["isolated_network"] = False

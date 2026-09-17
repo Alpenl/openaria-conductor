@@ -38,6 +38,8 @@ impl From<TurboJpegError> for StreamError {
 }
 
 pub(crate) struct Frame {
+    pub(crate) buffer_flags: u32,
+    pub(crate) dequeue_monotonic_ns: u64,
     pub(crate) source_sequence: u64,
     pub(crate) host_monotonic_ns: u64,
     pub(crate) application_dropped_before: u64,
@@ -523,6 +525,8 @@ fn run_producer(
                 (Vec::new(), Vec::new())
             };
             Ok::<_, StreamError>(Frame {
+                buffer_flags: resources.capture.last_buffer_flags,
+                dequeue_monotonic_ns: resources.capture.last_dequeue_monotonic_ns,
                 source_sequence,
                 host_monotonic_ns,
                 application_dropped_before: pending_rejected,

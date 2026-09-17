@@ -7,12 +7,12 @@
       "required_major": 4
     }
   },
-  "total_bytes": 160196,
+  "total_bytes": 161805,
   "files": [
     {
       "path": "app.js",
-      "bytes": 121368,
-      "sha256": "82fab32223c250d854a4443e783799a3f04631ee9e246d17df2352e99825ad35",
+      "bytes": 122977,
+      "sha256": "8ab654b3a33b583ed801c0861cec2b3a7c55fbc1d9fa61710d4e9c3ac1bee32f",
       "content_type": "text/javascript; charset=utf-8"
     },
     {

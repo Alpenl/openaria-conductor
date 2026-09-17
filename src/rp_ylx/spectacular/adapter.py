@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from rp_ylx.frame_index import valid_frame_record
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     validate_device_session_directory,
 )
+from rp_ylx.recording.storage import open_metadata
 
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NDJSON_LINE_BYTES = 1024 * 1024
@@ -175,7 +177,7 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
 def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     try:
-        with path.open("rb") as stream:
+        with open_metadata(path) as stream:
             line_number = 0
             while True:
                 line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
@@ -211,22 +213,16 @@ def _normalize_device_frames(
     frame_decimation: int,
     segments: tuple[CaptureVideoSegment, ...],
 ) -> tuple[dict[str, Any], ...]:
-    expected_keys = {
-        "schema",
-        "session_id",
-        "frame",
-        "source_sequence",
-        "host_monotonic_ns",
-        "segment_index",
-        "segment_frame",
-    }
     normalized: list[dict[str, Any]] = []
     previous_host = -1
     previous_source: int | None = None
     for index, record in enumerate(records):
-        if set(record) != expected_keys:
+        if not valid_frame_record(record):
             raise CaptureValidationError(f"Device Session frame {index} is not a closed record")
-        if record["schema"] != "ylx.frame-index.v1" or record["session_id"] != session_id:
+        if (
+            record["schema"] not in {"ylx.frame-index.v1", "ylx.frame-index.v2"}
+            or record["session_id"] != session_id
+        ):
             raise CaptureValidationError(f"Device Session frame {index} identity is invalid")
         frame = _integer(record["frame"], f"frame[{index}].frame")
         source_sequence = _integer(
@@ -377,11 +373,24 @@ def _artifact(
     allow_empty: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     descriptor = _mapping(value, label)
-    if set(descriptor) != {"artifact_id", "role", "path", "media_type", "bytes", "sha256"}:
+    if set(descriptor) - {"storage_encoding"} != {
+        "artifact_id",
+        "role",
+        "path",
+        "media_type",
+        "bytes",
+        "sha256",
+    }:
         raise CaptureValidationError(f"{label} descriptor is not closed")
     if (
         descriptor["role"] != role
-        or descriptor["media_type"] != media_type
+        or (
+            descriptor["media_type"] != media_type
+            and not (
+                media_type == "application/x-ndjson"
+                and descriptor["media_type"] == "application/zstd"
+            )
+        )
         or descriptor["artifact_id"] != descriptor["sha256"]
     ):
         raise CaptureValidationError(f"{label} role or content identity is invalid")
@@ -394,7 +403,7 @@ def _artifact(
 
 def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     schema = manifest.get("schema")
-    if schema not in {"ylx.device-session.v2", "ylx.device-session.v3"}:
+    if schema not in {"ylx.device-session.v2", "ylx.device-session.v3", "ylx.device-session.v4"}:
         raise CaptureValidationError(f"unsupported Device Session schema: {schema!r}")
     if manifest.get("capture_mode") != "calibration":
         raise CaptureValidationError("Spectacular only accepts calibration Device Sessions")

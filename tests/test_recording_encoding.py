@@ -9,8 +9,11 @@ class RecordingEncodingTest(unittest.TestCase):
         self.assertEqual(value.bitrate_kbps, 16384)
         self.assertEqual((value.min_qp, value.max_qp), (18, 32))
         self.assertEqual(value.manifest()["b_frames"], 0)
-        self.assertEqual(RecordingEncoding.from_mapping({}), value)
-        self.assertEqual(RecordingEncoding.from_mapping({"codec": "hevc"}).bitrate_kbps, 16384)
+        efficient = RecordingEncoding.from_mapping({})
+        self.assertEqual(efficient.codec, "hevc")
+        self.assertEqual(efficient.bitrate_kbps, 12288)
+        self.assertEqual(efficient.manifest()["profile"], "main")
+        self.assertEqual(RecordingEncoding.from_mapping({"codec": "hevc"}).bitrate_kbps, 12288)
 
     def test_rejects_ignored_typos_and_invalid_hardware_ranges(self):
         for settings in (

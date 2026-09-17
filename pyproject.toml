@@ -15,6 +15,7 @@ dependencies = [
   "pillow>=10,<13",
   "typing-extensions>=4.4,<5",
   "zeroconf>=0.150,<1",
+  "zstandard>=0.23,<1",
 ]
 
 [project.optional-dependencies]

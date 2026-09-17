@@ -1035,6 +1035,7 @@ paths:
                 oneOf:
                   - $ref: "../schemas/ylx-device-session-v2.schema.json"
                   - $ref: "../schemas/ylx-device-session-v3.schema.json"
+                  - $ref: "../schemas/ylx-device-session-v4.schema.json"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

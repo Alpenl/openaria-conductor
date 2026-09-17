@@ -37,11 +37,13 @@ _READ_CHUNK = 1024 * 1024
 _DEVICE_SESSION_V1_SCHEMA_ID = "ylx.device-session.v1"
 _DEVICE_SESSION_V2_SCHEMA_ID = "ylx.device-session.v2"
 _DEVICE_SESSION_V3_SCHEMA_ID = "ylx.device-session.v3"
+_DEVICE_SESSION_V4_SCHEMA_ID = "ylx.device-session.v4"
 _DEVICE_SESSION_SCHEMA_IDS = frozenset(
     {
         _DEVICE_SESSION_V1_SCHEMA_ID,
         _DEVICE_SESSION_V2_SCHEMA_ID,
         _DEVICE_SESSION_V3_SCHEMA_ID,
+        _DEVICE_SESSION_V4_SCHEMA_ID,
     }
 )
 _DEVICE_SESSION_V1_SCHEMA = json.loads(
@@ -70,6 +72,10 @@ _DEVICE_SESSION_V2_VALIDATOR = Draft202012Validator(
 )
 _DEVICE_SESSION_V3_VALIDATOR = Draft202012Validator(
     json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v3.schema.json").read_text()),
+    format_checker=FormatChecker(),
+)
+_DEVICE_SESSION_V4_VALIDATOR = Draft202012Validator(
+    json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v4.schema.json").read_text()),
     format_checker=FormatChecker(),
 )
 _RECORDING_SESSION_SCHEMA = json.loads(
@@ -1142,9 +1148,14 @@ def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
     if schema == _DEVICE_SESSION_V2_SCHEMA_ID:
         _validate_device_session_v2(manifest)
         return
-    if schema == _DEVICE_SESSION_V3_SCHEMA_ID:
+    if schema in {_DEVICE_SESSION_V3_SCHEMA_ID, _DEVICE_SESSION_V4_SCHEMA_ID}:
         try:
-            _DEVICE_SESSION_V3_VALIDATOR.validate(manifest)
+            validator = (
+                _DEVICE_SESSION_V4_VALIDATOR
+                if schema == _DEVICE_SESSION_V4_SCHEMA_ID
+                else _DEVICE_SESSION_V3_VALIDATOR
+            )
+            validator.validate(manifest)
         except ValidationError as error:
             raise ArtifactAccessError(
                 "not_verified", "manifest 不符合 device-session v3 契约"
@@ -1439,7 +1450,14 @@ def _validate_audio_v2(manifest: Mapping[str, object], audio: Mapping[str, objec
             or isinstance(wav_header_bytes, bool)
             or not isinstance(wav_header_bytes, int)
             or pcm_payload_bytes != expected_payload_bytes
-            or artifact["bytes"] != pcm_payload_bytes + wav_header_bytes
+            or (
+                artifact.get("media_type") != "audio/flac"
+                and artifact["bytes"] != pcm_payload_bytes + wav_header_bytes
+            )
+            or (
+                artifact.get("media_type") == "audio/flac"
+                and artifact.get("storage_encoding", {}).get("pcm_bytes") != pcm_payload_bytes
+            )
         ):
             raise ArtifactAccessError("not_verified", "manifest audio bytes 域无效")
         previous_end = segment["end_sample"]
@@ -1509,7 +1527,7 @@ def _artifact_descriptor(raw: object, *, legacy: bool) -> ArtifactDescriptor:
         raise ArtifactAccessError("not_verified", "manifest artifact 描述符无效")
     required = {"role", "path", "media_type", "bytes", "sha256"}
     expected = required | ({"records"} if legacy else {"artifact_id"})
-    if set(raw) != expected:
+    if set(raw) - (set() if legacy else {"storage_encoding"}) != expected:
         raise ArtifactAccessError("not_verified", "manifest artifact 描述符字段无效")
     sha256 = raw.get("sha256")
     artifact_id = sha256 if legacy else raw.get("artifact_id")

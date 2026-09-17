@@ -55,7 +55,14 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
             or not 44 <= header <= 65536
             or payload != (last_sample - first_sample) * channels * 2
             or not isinstance(artifact, Mapping)
-            or artifact.get("bytes") != payload + header
+            or (
+                artifact.get("media_type") != "audio/flac"
+                and artifact.get("bytes") != payload + header
+            )
+            or (
+                artifact.get("media_type") == "audio/flac"
+                and artifact.get("storage_encoding", {}).get("pcm_bytes") != payload
+            )
         ):
             raise ValueError("audio segment byte count does not match samples")
         previous = last_sample

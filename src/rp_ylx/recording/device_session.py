@@ -97,6 +97,7 @@ class DeviceSessionConfig:
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
+    lossless_storage: bool = False
     segment_seconds: float = 30.0
     audio_enabled: bool = False
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
@@ -2036,6 +2037,33 @@ class DeviceSessionRecorder:
             verified_at = self._now()
             sealed_at = self._now()
             manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
+            compacted_originals: list[str] = []
+            if self._config.lossless_storage:
+                from rp_ylx.recording.audit import capture_audit
+                from rp_ylx.recording.storage import compact_manifest
+
+                manifest["capture_audit"] = capture_audit(
+                    self._partial,
+                    self._config.sensor_fps / self._config.frame_decimation,
+                    self._config.frame_decimation,
+                )
+
+                def finalize_compacted(path: Path) -> dict[str, object]:
+                    result = _finalize_artifact(path, None, code="compaction_invalid")
+                    relative = path.relative_to(self._partial).as_posix()
+                    self._artifact_identities[relative] = result.identity
+                    return {
+                        "path": relative,
+                        "bytes": result.bytes,
+                        "sha256": result.sha256,
+                        "artifact_id": result.sha256,
+                    }
+
+                manifest, compacted_originals = compact_manifest(
+                    self._partial, manifest, finalize_compacted
+                )
+                for relative in compacted_originals:
+                    self._artifact_identities.pop(relative, None)
             validate_device_session_manifest(manifest)
             payload = json_bytes(manifest)
             native_manifest_sha256 = None
@@ -2067,6 +2095,10 @@ class DeviceSessionRecorder:
                 fsync_directory(self._partial)
                 os.rename(self._partial, self._final)
             published = True
+            # Power loss before this point leaves all raw recovery journals intact.
+            for relative in compacted_originals:
+                with suppress(OSError):
+                    (self._final / relative).unlink()
             with self._lock:
                 self._state = "sealed"
                 self._current_state = None

@@ -496,6 +496,7 @@ def prepare_dependencies() -> None:
         "sshd": "openssh-server",
         "sudo": "sudo",
         "runuser": "util-linux",
+        "ffmpeg": "ffmpeg",
     }
     needed = {package for command, package in packages.items() if shutil.which(command) is None}
     for library, package in (

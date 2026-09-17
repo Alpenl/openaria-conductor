@@ -47,7 +47,11 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             "time_seconds": (time_ns - origin_ns) / 1e9,
             "source": dict(record.get("source", {})),
         }
-        if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
+        if capture.source_schema in {
+            "ylx.device-session.v2",
+            "ylx.device-session.v3",
+            "ylx.device-session.v4",
+        }:
             mapped_frame["segment"] = {
                 "index": record["segment_index"],
                 "frame": record["segment_frame"],
@@ -73,7 +77,11 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             mapped["packet_sequence"] = record["packet_sequence"]
         imu_samples.append(mapped)
 
-    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
+    if capture.source_schema in {
+        "ylx.device-session.v2",
+        "ylx.device-session.v3",
+        "ylx.device-session.v4",
+    }:
         video = {
             "authority": capture.video.authority,
             "layout": "split-eyes",

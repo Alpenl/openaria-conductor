@@ -116,7 +116,15 @@ class FirmwareSupervisor:
             current, previous = self._release("current"), self._release("previous")
             available = self.cache
             has_update = bool(
-                current and available and newer(available["version"], current["version"])
+                current
+                and available
+                and (
+                    newer(available["version"], current["version"])
+                    or (
+                        available["version"] == current["version"]
+                        and available["commit"] != current["commit"]
+                    )
+                )
             )
             return {
                 "schema": "openaria.firmware-status.v1",

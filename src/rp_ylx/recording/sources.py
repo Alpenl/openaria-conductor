@@ -11,6 +11,7 @@ from typing import Protocol
 
 from rp_ylx.api.preview import LatestPreviewBuffer
 from rp_ylx.camera import CameraError, CameraMode, FrameObservation
+from rp_ylx.camera.exposure import configure_exposure
 from rp_ylx.imu import ImuObservation, decode_native_imu_observation
 from rp_ylx.native import (
     NativeCaptureEngine,
@@ -65,6 +66,7 @@ class NativeContinuousCaptureSources:
         buffer_count: int = 16,
         queue_capacity: int = 64,
         metrics: PerformanceMetrics | None = None,
+        exposure_time_absolute: int | None = None,
         engine_factory: Callable[[NativeCapturePlan, object, object | None], NativeCaptureEngine]
         | None = None,
     ) -> None:
@@ -85,6 +87,8 @@ class NativeContinuousCaptureSources:
         self._buffer_count = buffer_count
         self._queue_capacity = queue_capacity
         self._metrics = metrics
+        self._exposure_time_absolute = exposure_time_absolute
+        self.exposure_readback: dict[str, int] | None = None
         self._engine_factory = engine_factory
         self._lock = threading.RLock()
         self._engine: NativeCaptureEngine | None = None
@@ -137,6 +141,7 @@ class NativeContinuousCaptureSources:
         if native_preview is None:
             raise RuntimeError("正式连续采集需要 Rust preview buffer")
         rounded_fps = round(self._camera_mode.fps)
+        self.exposure_readback = configure_exposure(self._device, self._exposure_time_absolute)
         plan = NativeCapturePlan(
             device=self._device,
             width=self._camera_mode.width,
