@@ -1,4 +1,5 @@
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,3 +64,21 @@ class CaptureAuditTests(unittest.TestCase):
         ):
             configure_exposure("/dev/video0", 100)
         closed.assert_called_once_with(9)
+
+    def test_automatic_exposure_does_not_set_a_fixed_shutter(self):
+        writes = []
+
+        def ioctl(fd, request, data, *args):
+            control, value = struct.unpack("=Ii", data)
+            if request == 0xC008561C:
+                writes.append((control, value))
+            else:
+                data[:] = struct.pack("=Ii", control, 3)
+
+        with (
+            patch("rp_ylx.camera.exposure.os.open", return_value=9),
+            patch("rp_ylx.camera.exposure.os.close"),
+            patch("rp_ylx.camera.exposure.fcntl.ioctl", side_effect=ioctl),
+        ):
+            self.assertEqual(configure_exposure("/dev/video0", "auto"), {"auto_exposure": 3})
+        self.assertEqual(writes, [(0x009A0901, 3)])

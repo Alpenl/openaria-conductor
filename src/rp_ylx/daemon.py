@@ -109,7 +109,7 @@ class ProductionConfig:
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
-    exposure_time_absolute: int | None = 100
+    exposure_time_absolute: int | str | None = "auto"
     segment_seconds: float = 30.0
     audio_enabled: bool = True
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
@@ -120,11 +120,13 @@ class ProductionConfig:
     minimum_available_inodes: int = 1024
 
     def __post_init__(self) -> None:
-        if self.exposure_time_absolute is not None and (
+        if self.exposure_time_absolute not in (None, "auto") and (
             type(self.exposure_time_absolute) is not int
             or not 1 <= self.exposure_time_absolute <= 100
         ):
-            raise ProductionConfigError("camera.exposure_time_absolute 必须为 null 或 1..100 整数")
+            raise ProductionConfigError(
+                "camera.exposure_time_absolute 必须为 auto、null 或 1..100 整数"
+            )
         try:
             address = ipaddress.ip_address(self.host)
             device_id = uuid.UUID(self.device_id)
@@ -306,7 +308,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
             recording_encoding=encoding,
-            exposure_time_absolute=camera.get("exposure_time_absolute", 100),
+            exposure_time_absolute=camera.get("exposure_time_absolute", "auto"),
             video_bitrate_kbps=encoding.bitrate_kbps,
             audio_enabled=True if audio is None else audio["enabled"],
             audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),

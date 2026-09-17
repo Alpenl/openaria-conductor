@@ -75,6 +75,19 @@ class FirmwareControlTest(unittest.TestCase):
         self.fetch.return_value = {**self.manifest, "version": "0.2.1", "commit": "a" * 40}
         self.assertFalse(self.supervisor.check(force=True)["has_update"])
 
+    def test_legacy_channel_is_distinguished_from_network_failure(self):
+        self.supervisor.check(force=True)
+        self.fetch.return_value = {**self.manifest, "version": "0.1.0"}
+        status = self.supervisor.check(force=True)
+        self.assertIn("已连接 OSS", status["warning"])
+        self.assertIsNone(status["available"])
+        self.assertFalse(status["has_update"])
+        self.assertIsNotNone(status["checked_at"])
+        self.fetch.side_effect = ValueError("invalid checksum")
+        self.assertIn("清单校验失败", self.supervisor.check(force=True)["warning"])
+        self.fetch.side_effect = OSError("offline")
+        self.assertIn("无法连接 OSS", self.supervisor.check(force=True)["warning"])
+
     def test_task_survives_new_browser_and_retries_are_idempotent(self):
         calls = []
 

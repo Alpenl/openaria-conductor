@@ -66,7 +66,7 @@ class NativeContinuousCaptureSources:
         buffer_count: int = 16,
         queue_capacity: int = 64,
         metrics: PerformanceMetrics | None = None,
-        exposure_time_absolute: int | None = None,
+        exposure_time_absolute: int | str | None = None,
         engine_factory: Callable[[NativeCapturePlan, object, object | None], NativeCaptureEngine]
         | None = None,
     ) -> None:

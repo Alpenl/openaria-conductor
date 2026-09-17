@@ -147,7 +147,14 @@ class FirmwareSupervisor:
                 with tempfile.TemporaryDirectory() as directory:
                     manifest = update.fetch_manifest(update.DEFAULT_MANIFEST, Path(directory))
                 if not SEMVER.fullmatch(manifest["version"]) or manifest["version"] == "0.2.0":
-                    raise ValueError("channel version outside 0.2.x")
+                    with self.lock:
+                        self.cache = None
+                        self.checked_at = int(time.time())
+                        self.warning = (
+                            "已连接 OSS，但公共渠道尚无兼容的 0.2.x 正式版本；"
+                            "请等待正式发布后重新检查。当前固件不会降级。"
+                        )
+                    return self.status()
                 notes = manifest.get("release_notes", "")
                 if not isinstance(notes, str) or len(notes) > 16000:
                     raise ValueError("invalid release notes")
@@ -160,8 +167,11 @@ class FirmwareSupervisor:
                     }
                     self.checked_at = int(time.time())
                     self.warning = None
-            except (OSError, ValueError, KeyError, TypeError):
-                self.warning = "无法取得有效的 0.2.x 发布清单，请检查设备互联网连接或稍后重试"
+            except OSError:
+                self.warning = "无法连接 OSS 发布源，请检查设备互联网连接后重试"
+                return self.status()
+            except (ValueError, KeyError, TypeError):
+                self.warning = "OSS 发布清单校验失败，请联系维护者检查发布内容后重试"
                 return self.status()
             return self.status()
 
