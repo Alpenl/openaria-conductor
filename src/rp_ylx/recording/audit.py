@@ -5,9 +5,32 @@ from __future__ import annotations
 import json
 from collections import deque
 from pathlib import Path
+from threading import Event
 
 
-def capture_audit(root: Path, nominal_fps: float, frame_decimation: int = 1) -> dict:
+def _journal_lines(stream, finished: Event | None):
+    """Tail complete records; a producer may be halfway through one write."""
+    pending = b""
+    while True:
+        line = stream.readline()
+        if line:
+            pending += line
+            if len(pending) > 1_048_576:
+                raise ValueError("capture audit record exceeds limit")
+            if pending.endswith(b"\n"):
+                yield pending
+                pending = b""
+            continue
+        if finished is None or finished.is_set():
+            if pending:
+                raise ValueError("capture audit found a truncated record")
+            return
+        finished.wait(0.02)
+
+
+def capture_audit(
+    root: Path, nominal_fps: float, frame_decimation: int = 1, *, finished: Event | None = None
+) -> dict:
     first = previous = last = None
     frames = matched = 0
     maximum_interval = 0
@@ -46,8 +69,9 @@ def capture_audit(root: Path, nominal_fps: float, frame_decimation: int = 1) -> 
         maximum_read = max(maximum_read, row["host_read_end_ns"] - row["host_read_start_ns"])
 
     with (root / "imu.ndjson").open("rb") as imu, (root / "frames.ndjson").open("rb") as camera:
+        imu_rows = iter(_journal_lines(imu, finished))
         pending = None
-        for line in camera:
+        for line in _journal_lines(camera, finished):
             frame = json.loads(line)
             host = frame["host_monotonic_ns"]
             if first is None:
@@ -66,8 +90,8 @@ def capture_audit(root: Path, nominal_fps: float, frame_decimation: int = 1) -> 
             frames += 1
             while True:
                 if pending is None:
-                    data = imu.readline()
-                    if not data:
+                    data = next(imu_rows, None)
+                    if data is None:
                         break
                     pending = json.loads(data)
                 if pending["host_monotonic_ns"] > host + 50_000_000:
@@ -91,7 +115,7 @@ def capture_audit(root: Path, nominal_fps: float, frame_decimation: int = 1) -> 
                 maximum_dequeue_delay = max(maximum_dequeue_delay, dequeue - host)
         if pending is not None:
             observe_imu(pending)
-        for line in imu:
+        for line in imu_rows:
             observe_imu(json.loads(line))
     frame_span = 0 if first is None or last is None else (last - first) / 1e9
     imu_span = 0 if imu_first is None or imu_last is None else (imu_last - imu_first) / 1e9

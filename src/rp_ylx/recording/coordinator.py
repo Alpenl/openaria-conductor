@@ -536,7 +536,7 @@ class CaptureCoordinator:
         self._mount_checker = mount_checker or (lambda path: path.is_mount())
         self._mount_identity = mount_identity or _default_mount_identity
         self._runtime = runtime or collect_linux_runtime
-        self._preview = preview or LatestPreviewBuffer(stream_fps=15)
+        self._preview = preview or LatestPreviewBuffer(stream_fps=25, thumbnails=True)
         self._sources = sources
         self._metrics = metrics
         self._before_write = before_write
@@ -984,6 +984,7 @@ class CaptureCoordinator:
         manifest_payload: bytes,
         *,
         interrupt_check: Callable[[], None] | None = None,
+        verified_artifacts=None,
     ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
         manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
         admission = self._require_admission()
@@ -1034,6 +1035,7 @@ class CaptureCoordinator:
                     session_path,
                     expected_session_id=session_id,
                     interrupt_check=interrupt_check,
+                    **({"verified_artifacts": verified_artifacts} if verified_artifacts else {}),
                 )
             except DeviceRecordingError as error:
                 if error.code != "digest_mismatch":
@@ -2447,6 +2449,7 @@ class CaptureCoordinator:
                     plan.session_id,
                     sealed.manifest,
                     sealed.manifest_bytes,
+                    verified_artifacts=sealed.verified_artifacts,
                 )
             except DeviceRecordingError:
                 verification_current = False

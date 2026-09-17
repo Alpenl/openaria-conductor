@@ -1,4 +1,4 @@
-"""Verified, bounded lossless compaction after acquisition has stopped.
+"""Verified, bounded lossless compaction and prepared-artifact admission.
 
 Source files survive until the new manifest has been atomically sealed. Each
 1 MiB Zstandard block is a complete checksummed frame; an interrupted compaction
@@ -145,7 +145,7 @@ def compact_audio(path: Path) -> tuple[Path, dict]:
 
 
 def compact_manifest(
-    root: Path, manifest: dict, finalize, *, progress=None
+    root: Path, manifest: dict, finalize, *, progress=None, prepared=None
 ) -> tuple[dict, list[str]]:
     """Caller owns manifest, updates file identities, then seals before cleanup."""
     originals = []
@@ -156,6 +156,8 @@ def compact_manifest(
 
     def compact(descriptor):
         relative = descriptor["path"]
+        if prepared is not None and relative in prepared:
+            return prepared[relative].use(root, descriptor)
         path = root / relative
         audio = descriptor["media_type"] == "audio/wav"
         with path.open("rb") as source:

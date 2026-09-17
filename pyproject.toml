@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "rp-ylx"
-version = "0.2.2"
+version = "0.2.3"
 description = "RDK X5 + YLX 2UQ2 双目视频与 IMU 录制服务"
 readme = "README.md"
 requires-python = ">=3.11"

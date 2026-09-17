@@ -73,7 +73,7 @@ WEB_PATHS = {"/": "index.html", **{f"/{name}": name for name in WEB_ASSETS if na
 WEB_CONTENT_SECURITY_POLICY = (
     "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; "
     "frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; "
-    "script-src 'self'; style-src 'self'"
+    "script-src 'self'; worker-src 'self' blob:; style-src 'self'"
 )
 SUPPORTED_API_VERSIONS = frozenset({"v2", "v3", "v4"})
 assert_compatible_web_device_api(SUPPORTED_API_VERSIONS)
