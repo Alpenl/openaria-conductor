@@ -3,13 +3,14 @@ import shutil
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import zstandard
 
 from rp_ylx.api.downloads import DirectorySessionStore
-from rp_ylx.recording.device_session import validate_device_session_directory
+from rp_ylx.recording.device_session import DeviceRecordingError, validate_device_session_directory
 from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.recovery import recover_device_session
 from rp_ylx.recording.storage import BLOCK_BYTES, compact_metadata, open_metadata
@@ -87,6 +88,42 @@ class LosslessStorageTests(unittest.TestCase):
             recovered = recover_device_session(recorder.partial_path)
             self.assertEqual(recovered.manifest["frames"]["count"], 30)
             self.assertEqual((recovered.path / "frames.ndjson").read_bytes(), original)
+            validate_device_session_directory(recovered.path)
+
+    def test_audit_failure_after_parallel_compaction_keeps_recovery_journals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = fixtures.SplitEyeRecordingTest()
+            recorder, _, _ = fixture.build(Path(directory))
+            recorder._config = replace(recorder._config, lossless_storage=True)
+            with patch.object(
+                recorder, "_now", return_value=datetime.now(UTC) - timedelta(seconds=10)
+            ):
+                recorder.start()
+            for index in range(3):
+                recorder.submit_frame(
+                    fixtures.FrameObservation(
+                        fixtures.StereoFrame(
+                            source_sequence=index * 2,
+                            host_monotonic_ns=recorder._started_monotonic_ns
+                            + 10_000_000
+                            + index * 33_333_333,
+                            left=b"",
+                            right=b"",
+                            raw_side_by_side=fixtures.FRAME,
+                        ),
+                        dropped_before=0,
+                    )
+                )
+            with (
+                patch("rp_ylx.recording.audit.capture_audit", side_effect=ValueError("bad clock")),
+                self.assertRaisesRegex(DeviceRecordingError, "bad clock"),
+            ):
+                recorder.stop()
+            self.assertTrue((recorder.partial_path / "frames.ndjson").is_file())
+            self.assertTrue((recorder.partial_path / "imu.ndjson").is_file())
+            self.assertFalse((recorder.partial_path / "manifest.json").exists())
+            recovered = recover_device_session(recorder.partial_path)
+            self.assertEqual(recovered.manifest["frames"]["count"], 3)
             validate_device_session_directory(recovered.path)
 
     def test_write_failure_keeps_original_metadata(self):

@@ -1,18 +1,18 @@
 {
   "schema": "openaria.echo-web-artifacts.v2",
   "name": "openaria-echo-web",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "compatibility": {
     "device_api": {
       "required_major": 4
     }
   },
-  "total_bytes": 162068,
+  "total_bytes": 162351,
   "files": [
     {
       "path": "app.js",
-      "bytes": 123240,
-      "sha256": "a2565aa683985661b2c8c808121966ea78a579ab8cc0cfa99bf07296e8946005",
+      "bytes": 123523,
+      "sha256": "aba0138c307b7573a851065be210982913669dadbf27175efcca3e590bc38feb",
       "content_type": "text/javascript; charset=utf-8"
     },
     {

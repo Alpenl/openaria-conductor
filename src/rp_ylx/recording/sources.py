@@ -64,7 +64,7 @@ class NativeContinuousCaptureSources:
         read_timeout: float = 2.0,
         frame_decimation: int = 1,
         buffer_count: int = 16,
-        queue_capacity: int = 64,
+        queue_capacity: int = 256,
         metrics: PerformanceMetrics | None = None,
         exposure_time_absolute: int | str | None = None,
         engine_factory: Callable[[NativeCapturePlan, object, object | None], NativeCaptureEngine]

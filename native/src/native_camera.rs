@@ -225,7 +225,12 @@ impl Stream {
         } else {
             None
         };
-        let (producer, consumer) = bounded::channel(queue_capacity);
+        // Absorb short codec/storage stalls without allowing large MJPEG frames
+        // to turn a frame-count bound into unbounded memory pressure.
+        let (producer, consumer) =
+            bounded::weighted_channel(queue_capacity, 128 * 1024 * 1024, |frame: &Frame| {
+                frame.raw_side_by_side.len() + frame.left.len() + frame.right.len()
+            });
         let (control_sender, control_receiver) = mpsc::channel();
         Ok(Self {
             lifecycle: Mutex::new(Lifecycle {

@@ -2233,7 +2233,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     self.assertTrue(blocked.wait(timeout=1))
                     status = coordinator.capture_status()
                     validate_capture_status(status)
-                    self.assertIsNone(status["snapshot"]["active_recording"])
+                    self.assertEqual(status["snapshot"]["device_state"], "verifying")
+                    self.assertIsNotNone(status["snapshot"]["active_recording"])
                     self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
                 finally:
                     release.set()

@@ -1613,7 +1613,10 @@ class CaptureCoordinator:
                     continue
                 runtime["live_imu"] = self._live_imu_snapshot_locked()
                 if (
-                    active is None
+                    (
+                        active is None
+                        or (self._active is not None and self._active.state == "sealed")
+                    )
                     and runtime["live_imu"] is not None
                     and runtime["live_imu"]["session_id"] is not None
                 ):
