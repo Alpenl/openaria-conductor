@@ -47,6 +47,8 @@ from rp_ylx.api.events import (
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
 from rp_ylx.camera_focus import valid_camera_focus_status
+from rp_ylx.clock_sync import valid_clock_request, valid_clock_response
+from rp_ylx.firmware_control import FirmwareError, request_firmware
 from rp_ylx.network_validation import (
     NETWORK_CREDENTIAL_REF,
     NETWORK_MODES,
@@ -250,6 +252,10 @@ class DeviceProvider(Protocol):
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult: ...
 
     def network_status(self) -> Mapping[str, object]: ...
+
+    def clock_status(self, principal_id: str) -> Mapping[str, object]: ...
+
+    def sync_clock(self, principal_id: str, body: Mapping[str, object]) -> Mapping[str, object]: ...
 
     def scan_networks(self) -> Mapping[str, object]: ...
 
@@ -1029,6 +1035,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return True
 
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
+        if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
+            return ("GET", "OPTIONS")
+        if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
+            return ("POST", "OPTIONS")
+        if path == "/api/v4/clock":
+            return ("GET", "OPTIONS")
+        if path == "/api/v4/clock/sync":
+            return ("POST", "OPTIONS")
         parts = path.split("/")
         if len(parts) < 4 or parts[1] != "api" or parts[2] not in SUPPORTED_API_VERSIONS:
             return None
@@ -1090,7 +1104,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parts = path.split("/")
         if method == "POST":
             headers.extend(("Content-Type", "X-CSRF-Token"))
-            if parts[3:] != ["network", "credentials"]:
+            if parts[3:] not in (["network", "credentials"], ["clock", "sync"]):
                 headers.append("Idempotency-Key")
         elif len(parts) == 5 and parts[3:] in (["capture", "events"], ["network", "events"]):
             headers.append("Last-Event-ID")
@@ -1150,6 +1164,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         path = parsed.path
+        if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
+            self._firmware_request("check" if path.endswith("/check") else "status")
+            return
+        if path == "/api/v4/clock":
+            self._clock_request(sync=False)
+            return
         web_asset = WEB_PATHS.get(path)
         if web_asset is not None:
             self._send_web_asset(web_asset)
@@ -1280,6 +1300,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not self._begin_request(body_allowed=True):
             return
         path = urlsplit(self.path).path
+        if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
+            self._firmware_request(path.rsplit("/", 1)[1])
+            return
+        if path == "/api/v4/clock/sync":
+            self._clock_request(sync=True)
+            return
         parts = path.split("/")
         if path == "/api/v4/sessions/delete":
             self._delete_sessions()
@@ -1344,6 +1370,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
             HTTPStatus.METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "接口不允许该请求方法",
+        )
+
+    def _firmware_request(self, operation: str) -> None:
+        fields = {}
+        if operation in {"update", "rollback"}:
+            identity = self._command_principal("firmwareUpdate")
+            if identity is None:
+                return
+            principal, key = identity
+            body = self._read_json()
+            if body is None:
+                return
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"commit"}
+                or not isinstance(body.get("commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", body["commit"])
+            ):
+                self._problem(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", "更新请求必须指定完整 commit"
+                )
+                return
+            fields = {"key": key, "commit": body["commit"]}
+        else:
+            principal = self._principal("firmwareStatus")
+            if principal is None:
+                return
+            if operation == "check":
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if set(query) - {"force"} or query.get("force", ["false"]) not in (
+                    ["true"],
+                    ["false"],
+                ):
+                    self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "force 参数无效")
+                    return
+                fields = {"force": query.get("force") == ["true"]}
+        try:
+            result = request_firmware(operation, **fields)
+        except FirmwareError as error:
+            self._problem(error.status, error.code, error.message, retryable=True)
+            return
+        self._audit("firmware" + operation.title(), None, "completed", principal)
+        self._send_json(
+            HTTPStatus.ACCEPTED if operation in {"update", "rollback"} else HTTPStatus.OK, result
         )
 
     def _delete_sessions(self) -> None:
@@ -2738,6 +2808,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "Idempotency-Key 无效")
             return None
         return principal, key
+
+    def _clock_request(self, *, sync: bool) -> None:
+        principal = (
+            self._write_principal("syncDeviceClock") if sync else self._principal("getDeviceClock")
+        )
+        if principal is None:
+            return
+        body = self._read_json() if sync else {}
+        if body is None:
+            return
+        if sync and not valid_clock_request(body):
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "客户端日期或校时请求无效")
+            return
+        try:
+            result = (
+                self.server.provider.sync_clock(principal.principal_id, body)
+                if sync
+                else self.server.provider.clock_status(principal.principal_id)
+            )
+        except ProviderError as error:
+            self._problem(error.status, error.code, error.message, retryable=error.retryable)
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not valid_clock_response(result):
+            self._invalid_source_state("设备校时响应无效")
+            return
+        self._send_json(HTTPStatus.OK, result)
 
     def _create_network_credential(self) -> None:
         principal = self._write_principal("createNetworkCredentialReference")

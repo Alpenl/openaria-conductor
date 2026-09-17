@@ -64,6 +64,7 @@ CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
 CUSTOMER_TLS_PRIVATE_KEY_RELATIVE = Path("tls/device.key")
 DEVICE_CONFIG_SNAPSHOT_DIRECTORY = ".release-configs"
 DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "openaria-update.service": ("usr/lib/systemd/system/openaria-update.service", 0o644),
     "rp-ylx-recover.service": (
         "usr/lib/systemd/system/rp-ylx-recover.service",
         0o644,
@@ -77,6 +78,11 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         0o644,
     ),
     "rp-ylx.service": ("usr/lib/systemd/system/rp-ylx.service", 0o644),
+    "rp-ylx-recording-button.service": (
+        "usr/lib/systemd/system/rp-ylx-recording-button.service",
+        0o644,
+    ),
+    "rp-ylx-recording-button.json": ("etc/rp-ylx/recording-button.json", 0o644),
     # avahi only scans /etc/avahi/services, so the mDNS service definition is
     # installed under /etc rather than /usr/lib.
     "rp-ylx.avahi": ("etc/avahi/services/rp-ylx.service", 0o644),
@@ -104,7 +110,7 @@ DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
         0o644,
     ),
 }
-PRESERVED_DEPLOYMENT_ASSETS = {"rp-ylx-wifi-watchdog.default"}
+PRESERVED_DEPLOYMENT_ASSETS = {"rp-ylx-wifi-watchdog.default", "rp-ylx-recording-button.json"}
 SUPPORTING_DEPLOYMENT_ASSETS: Mapping[str, int] = {"rp-ylx-customer.avahi": 0o644}
 CORE_SYSTEMD_UNITS = (
     "rp-ylx-data-volume.service",
@@ -760,6 +766,13 @@ def _module_bytes() -> bytes:
     raise DeploymentError("install_resource_missing", "无法读取部署模块自身")
 
 
+def _support_module_bytes(name: str) -> bytes:
+    sibling = Path(__file__).parent / name
+    if sibling.is_file():
+        return sibling.read_bytes()
+    return files("rp_ylx").joinpath(name).read_bytes()
+
+
 def _notify_systemd_ready(status: str) -> None:
     address = os.environ.get("NOTIFY_SOCKET")
     if not address:
@@ -1087,6 +1100,7 @@ def _install_stage(bundle: Bundle, stage: Path) -> None:
         ("rp-ylx", "rp_ylx"),
         ("rp-ylx-deploy", "rp_ylx.deployment"),
         ("rp-ylx-spectacular-check", "rp_ylx.spectacular.check_cli"),
+        ("rp-ylx-recording-button", "rp_ylx.recording_button"),
     )
     for name, module in launchers:
         launcher = bin_directory / name
@@ -2011,6 +2025,19 @@ class ReleaseManager:
         bootstrap_module = bootstrap_root / "deployment.py"
         bootstrap_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         _write_bytes_atomic(bootstrap_module, _module_bytes(), 0o644)
+        update_root = self.system_root / "usr/local/lib/openaria"
+        update_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        for name in ("update.py", "firmware_control.py"):
+            source = _support_module_bytes(name)
+            _write_bytes_atomic(bootstrap_root / name, source, 0o644)
+            _write_bytes_atomic(update_root / name, source, 0o644)
+        update_launcher = self.system_root / "usr/local/sbin/openaria-update"
+        update_launcher.parent.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomic(
+            update_launcher,
+            b'#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/openaria/update.py "$@"\n',
+            0o755,
+        )
         for name, (_, mode) in targets.items():
             bootstrap_asset = bootstrap_root / name
             _write_bytes_atomic(bootstrap_asset, _asset_bytes(name), mode)
@@ -2171,6 +2198,9 @@ class ReleaseManager:
         )
 
     def _start_release_services(self, *, check_health: bool) -> None:
+        # Independent of capture/network units: never stop this supervisor while
+        # it is executing the transaction that restarts those services.
+        self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
         for unit in CORE_SYSTEMD_UNITS:
             self.runner(["systemctl", "enable", "--now", unit])
         if check_health:
@@ -2348,6 +2378,7 @@ class ReleaseManager:
 
     def uninstall(self) -> Mapping[str, object]:
         self._require_platform()
+        self.runner(["systemctl", "disable", "--now", "openaria-update.service"])
         self._deactivate_systemd_units()
         if self.install_root.exists() and not self.install_root.is_symlink():
             shutil.rmtree(self.install_root)
@@ -2359,6 +2390,10 @@ class ReleaseManager:
         bootstrap_root = self.system_root / "usr/local/lib/rp-ylx"
         if bootstrap_root.exists() and not bootstrap_root.is_symlink():
             shutil.rmtree(bootstrap_root)
+        (self.system_root / "usr/local/sbin/openaria-update").unlink(missing_ok=True)
+        update_root = self.system_root / "usr/local/lib/openaria"
+        if update_root.is_dir() and not update_root.is_symlink():
+            shutil.rmtree(update_root)
         self.runner(["systemctl", "daemon-reload"])
         return {"installed": False, "config_preserved": True, "state_preserved": True}
 

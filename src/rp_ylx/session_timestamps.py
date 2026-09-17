@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 from statistics import fmean, median, pstdev
 from typing import Any
 
+from rp_ylx.frame_index import valid_frame_record
+from rp_ylx.recording.storage import open_metadata
 from rp_ylx.validation import PublicValidationError, validate_public_session
 
 MAX_NDJSON_LINE_BYTES = 1024 * 1024
@@ -75,7 +77,10 @@ def _safe_relative(value: object, label: str) -> PurePosixPath:
 
 def _artifact_path(root: Path, descriptor: object, *, role: str, label: str) -> Path:
     artifact = _mapping(descriptor, label)
-    if artifact.get("role") != role or artifact.get("media_type") != "application/x-ndjson":
+    if artifact.get("role") != role or artifact.get("media_type") not in {
+        "application/x-ndjson",
+        "application/zstd",
+    }:
         raise SessionTimestampError("session_timestamps_invalid", f"{label} artifact 角色无效")
     relative = _safe_relative(artifact.get("path"), label)
     path = root.joinpath(*relative.parts)
@@ -86,7 +91,7 @@ def _artifact_path(root: Path, descriptor: object, *, role: str, label: str) -> 
 
 def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    with path.open("rb") as stream:
+    with open_metadata(path) as stream:
         line_number = 0
         while True:
             line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
@@ -121,16 +126,7 @@ def _load_frames(root: Path, manifest: dict[str, Any]) -> list[dict[str, int]]:
     normalized: list[dict[str, int]] = []
     previous_host = -1
     for index, record in enumerate(records):
-        expected_keys = {
-            "schema",
-            "session_id",
-            "frame",
-            "source_sequence",
-            "host_monotonic_ns",
-            "segment_index",
-            "segment_frame",
-        }
-        if set(record) != expected_keys or record.get("schema") != "ylx.frame-index.v1":
+        if not valid_frame_record(record):
             raise SessionTimestampError(
                 "session_timestamps_invalid",
                 f"frames:{index + 1} 不是闭合帧索引记录",
@@ -425,6 +421,7 @@ def build_session_timestamp_report(
         "ylx.device-session.v1",
         "ylx.device-session.v2",
         "ylx.device-session.v3",
+        "ylx.device-session.v4",
     }:
         raise SessionTimestampError("unsupported_session", "只支持 Device Session v1/v2/v3")
     frames = _load_frames(root, manifest)

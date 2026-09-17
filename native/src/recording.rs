@@ -461,6 +461,7 @@ impl RecordingSink {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn write_split_frame_index(
         &mut self,
         frame: u64,
@@ -469,8 +470,28 @@ impl RecordingSink {
         segment_index: u64,
         segment_frame: u64,
     ) -> Result<u64, RecordingError> {
+        self.write_audited_frame_index(
+            frame,
+            source_sequence,
+            host_monotonic_ns,
+            segment_index,
+            segment_frame,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_audited_frame_index(
+        &mut self,
+        frame: u64,
+        source_sequence: u64,
+        host_monotonic_ns: u64,
+        segment_index: u64,
+        segment_frame: u64,
+        audit: Option<serde_json::Value>,
+    ) -> Result<u64, RecordingError> {
         self.ensure_open()?;
-        let record = split_frame_index_record(
+        let mut record = split_frame_index_record(
             &self.session_id,
             frame,
             source_sequence,
@@ -478,6 +499,15 @@ impl RecordingSink {
             segment_index,
             segment_frame,
         );
+        if let Some(audit) = audit {
+            let mut row: serde_json::Value = serde_json::from_slice(&record)
+                .map_err(|error| RecordingError::new("write_failed", error.to_string()))?;
+            row["schema"] = serde_json::json!("ylx.frame-index.v2");
+            row["timestamp_audit"] = audit;
+            record = serde_json::to_vec(&row)
+                .map_err(|error| RecordingError::new("write_failed", error.to_string()))?;
+            record.push(b'\n');
+        }
         let written = self.frames.write(&record)?;
         self.bytes_written = self
             .bytes_written
@@ -764,6 +794,34 @@ pub(crate) fn jpeg_payload(payload: &[u8]) -> Result<&[u8], RecordingError> {
     Ok(&payload[start..end + 2])
 }
 
+/// YLX AVI1 APP0 payload: signature, six vendor bytes, then BE24 frame counter.
+/// Walk JPEG segments; never mistake entropy bytes or another camera's APP0 for it.
+pub(crate) fn avi1_counter(jpeg: &[u8]) -> Option<u32> {
+    if !jpeg.starts_with(b"\xff\xd8") {
+        return None;
+    }
+    let mut offset = 2usize;
+    while offset + 4 <= jpeg.len() {
+        if jpeg[offset] != 0xff {
+            return None;
+        }
+        let marker = jpeg[offset + 1];
+        if marker == 0xda || marker == 0xd9 {
+            return None;
+        }
+        let length = u16::from_be_bytes([jpeg[offset + 2], jpeg[offset + 3]]) as usize;
+        if length < 2 || offset + 2 + length > jpeg.len() {
+            return None;
+        }
+        let data = &jpeg[offset + 4..offset + 2 + length];
+        if marker == 0xe0 && data.len() == 31 && data.starts_with(b"AVI1\0\x01\x01\x01") {
+            return Some(((data[10] as u32) << 16) | ((data[11] as u32) << 8) | data[12] as u32);
+        }
+        offset += 2 + length;
+    }
+    None
+}
+
 pub(crate) fn split_frame_index_record(
     session_id: &str,
     frame: u64,
@@ -864,6 +922,24 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rp-ylx-recording-{name}-{unique}"));
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn avi1_counter_requires_vendor_layout_and_valid_jpeg_segments() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x21];
+        let mut data = vec![0; 31];
+        data[..8].copy_from_slice(b"AVI1\0\x01\x01\x01");
+        data[10..13].copy_from_slice(&[0x12, 0x34, 0x56]);
+        jpeg.extend_from_slice(&data);
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(super::avi1_counter(&jpeg), Some(0x123456));
+        let mut shifted = vec![0xff, 0xd8, 0xff, 0xe1, 0, 4, 7, 9];
+        shifted.extend_from_slice(&jpeg[2..]);
+        assert_eq!(super::avi1_counter(&shifted), Some(0x123456));
+        assert_eq!(super::avi1_counter(&jpeg[..18]), None);
+        jpeg[6] = b'J';
+        assert_eq!(super::avi1_counter(&jpeg), None);
+        assert_eq!(super::avi1_counter(b"\xff\xd8\xff\xda\x00\x02AVI1"), None);
     }
 
     #[test]

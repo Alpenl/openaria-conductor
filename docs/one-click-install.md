@@ -23,6 +23,14 @@ curl --proto '=https' -fSL --retry 3 \
 
 ## 日常更新与回退
 
+从 `0.2.1` 起，网页顶部版本徽章打开“版本与更新”：检查更新、阅读发布说明、确认更新，
+或回退到设备保留的上一版本。任务由独立 `openaria-update.service` 执行，服务自动重启，
+无需另点重启；页面断线后会继续查询结果。成功后点击“刷新页面”加载配套的新页面。
+检查发布源失败会明确显示错误，不会当成“已是最新版本”。
+
+旧固件尚无更新页面，需要先运行一次下面的更新命令，安装包含网页更新能力的版本。
+网页只提供比当前版本更高的 `0.2.x` 正式版；本机上一版本回退不要求联网。
+
 ```bash
 openaria-update --check           # 查询可用 commit，无需 sudo
 sudo openaria-update             # 更新到发布渠道当前版本
@@ -31,7 +39,7 @@ sudo openaria-update --rollback  # 离线回退到上一版本
 sudo openaria-update --reinstall # 修复性重复安装同一版本
 ```
 
-更新前先停止录制，等待设备回到空闲状态，并在安装期间保持其他客户端空闲。脚本在切换前检查录制状态，无法确认空闲时会停止。更新会保留既有设备配置、凭据和录制文件；版本按完整 Git commit 判断，避免多个开发固件都使用 `0.1.0` 时漏掉更新。普通重复运行同一 commit 不重启服务，同时刷新本地更新器。
+更新前先停止录制，等待设备回到空闲状态，并在安装期间保持其他客户端空闲。脚本在切换前检查录制状态，无法确认空闲时会停止。更新维护锁与采集生命周期互斥，包含实体按钮发起的录制。更新会保留既有设备配置、凭据和录制文件；CLI 按完整 Git commit 固定安装身份，网页按正式版本号判断是否有更新。普通重复运行同一 commit 不重启服务，同时刷新本地更新器。
 
 默认缓存为 `/var/cache/openaria`。下载错误或校验失败不会执行固件代码；安装失败使用既有部署器的激活失败处理和回退机制。它不扩展当前产品对意外掉电恢复的承诺。两个安装命令不能同时运行。回退到旧版本后，下一次普通更新仍会安装发布渠道当前版本。
 
@@ -61,20 +69,35 @@ OSS 参数已经配置在 [`deploy/oss-release.json`](../deploy/oss-release.json
 uv run scripts/publish_rdk_x5_oss.py \
   --bundle-dir dist-rdk-x5 \
   --output dist-oss-release \
-  --publish
+  --publish --tag v0.2.1
 ```
 
 默认读取 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` 和可选 `OSS_SESSION_TOKEN`。已有 Alibaba Cloud CLI 的发布机可追加 `--aliyun-profile <profile名称>`，直接读取 `~/.aliyun/config.json`，不复制密钥。不带 `--publish` 时只生成可审查的本地发布目录；输出目录必须为空。
 
-GitHub Actions 的“RDK X5 离线安装包”工作流已接入发布步骤。手动运行时勾选 `publish_oss` 即可在构建和 bundle 校验成功后上传并切换渠道。仓库使用同名 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` Secrets，发布账号仅有该桶 `rdk-x5/*` 的对象上传和对象 ACL 设置权限。普通 push/PR 构建不修改公开渠道。CLI 触发方式：
+版本统一从 `0.2.1` 开始；用户明确要求后续只递增 `0.2.x`，禁止未经明确授权改变版本系列或发 `0.x.0`。Conductor 的 `pyproject.toml`、Rust 包和固定的 Echo Web 制品版本必须相同。构建脚本自动读取版本，workflow 中不再硬编码 wheel 版本。
+
+GitHub Actions 的“RDK X5 离线安装包”工作流在推送附注标签时正式发布。标签必须与当前源码版本完全一致，说明取自标签正文。工作流执行完整无硬件检查、构建并校验 bundle，上传 OSS，最后创建同版本 GitHub Release。仓库使用同名 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` Secrets，发布账号仅有该桶 `rdk-x5/*` 的对象上传和对象 ACL 设置权限。普通 push/PR 构建不修改公开渠道。
+
+第一次发布的操作示例（先确认待发提交已完成设备验收）：
 
 ```bash
-gh workflow run rdk-x5-bundle.yml --ref <待发布分支> -f publish_oss=true
+git tag -a v0.2.1 -F docs/releases/0.2.1.md
+git push origin v0.2.1
+```
+
+重试已有标签发布时：
+
+```bash
+gh workflow run rdk-x5-bundle.yml --ref v0.2.1 -f publish_oss=true
 ```
 
 发布器会验证 wheel 构建身份和所有 bundle 文件，再生成确定性 tar.gz。文件按 `releases/<完整commit>/<sha256>.tar.gz` 存放，禁止覆盖不可变对象；更新器也以摘要命名。每个对象上传后都进行匿名完整下载和 SHA-256 核验，全部成功后才最后更新 `latest.json`。渠道清单与 `install.sh` 使用 `Cache-Control: no-cache`，固件使用长期缓存。
 
-`latest.json` 使用 `openaria.rdk-x5-release.v1`，包含 `platform`、`commit`、`version`、`bundle` 和 `updater`；两个下载对象都声明 `url`、`bytes`、`sha256`。信任来源为 HTTPS 发布源和有权写入的发布账号，摘要用于校验传输与内容完整性。客户端不接受 HTTP 降级重定向。
+正式发布拒绝轻量标签、分支发布、脏工作树、版本/提交不一致、渠道降级和同版本替换不同产物。公开发布任务串行执行，不被后续构建取消。失败后先检查工作流具体步骤。OSS 已切换但 GitHub Release 尚未创建时，应使用渠道清单指定的已发布原包与标签说明补建 Release；重建结果如与原包不同会被拒绝，不能覆盖同版本。禁止移动已发布标签。
+
+`latest.json` 使用 `openaria.rdk-x5-release.v1`，包含 `platform`、`commit`、`version`、`bundle` 和 `updater`；正式发布增加 `release_notes` 和 `published_at`，保持旧安装器可读取。两个下载对象都声明 `url`、`bytes`、`sha256`。信任来源为 HTTPS 发布源和有权写入的发布账号，摘要用于校验传输与内容完整性。客户端不接受 HTTP 降级重定向。
+
+更新服务只接受固定命令，不接受浏览器提供的下载 URL、文件路径或 shell 命令。任务结果与最近一次执行日志位于 root-only `/var/lib/openaria-update/`；任务接口见 [更新 API](firmware-api.md)。服务中断时，未完成任务标为失败，必须重新核实当前版本；不会仅凭版本目录已经切换而宣称更新成功。
 
 OSS 同时保留不可变发布清单 `releases/<commit>/<清单sha256>.json`，可把它的 HTTPS URL 作为安装器位置参数固定版本。切换公共渠道时，先核验目标清单指向的对象可匿名下载，再用发布凭据将该清单恢复到 `latest.json`；不删除已发布固件。
 

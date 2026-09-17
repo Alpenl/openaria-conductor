@@ -104,7 +104,7 @@ def _frames(root: Path, plan: SessionPlan, segments: list[dict], decimation: int
                 if (
                     not line.endswith(b"\n")
                     or row["session_id"] != plan.session_id
-                    or row["schema"] != "ylx.frame-index.v1"
+                    or row["schema"] not in {"ylx.frame-index.v1", "ylx.frame-index.v2"}
                     or row["frame"] != len(rows)
                     or row["segment_index"] != segment_index
                     or row["segment_frame"] != len(rows) - segment["start_ordinal"]

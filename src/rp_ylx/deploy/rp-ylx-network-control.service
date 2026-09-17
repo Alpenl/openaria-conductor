@@ -1,5 +1,5 @@
 [Unit]
-Description=Open Aria privileged network-control worker
+Description=Open Aria privileged network and clock control worker
 Requires=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
 After=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
 Before=rp-ylx.service
@@ -36,5 +36,5 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_SYS_TIME
 AmbientCapabilities=

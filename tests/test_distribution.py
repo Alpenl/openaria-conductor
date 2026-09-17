@@ -7,8 +7,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
+
+from rp_ylx.web import ECHO_WEB_SOURCE_COMMIT
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -26,6 +29,20 @@ class InstalledWheelTest(unittest.TestCase):
         ).stdout.strip()
         source_build_info = (REPOSITORY / "src/rp_ylx/_build_info.py").read_bytes()
         package_root = REPOSITORY / "src/rp_ylx"
+        expected_version = tomllib.loads((REPOSITORY / "pyproject.toml").read_text())["project"][
+            "version"
+        ]
+        web_manifest = json.loads((package_root / "web/assets.json").read_text())
+        expected_web = {
+            "source_commit": ECHO_WEB_SOURCE_COMMIT,
+            "required_device_api_major": web_manifest["compatibility"]["device_api"][
+                "required_major"
+            ],
+            "assets": {
+                entry["path"]: {key: entry[key] for key in ("bytes", "content_type", "sha256")}
+                for entry in web_manifest["files"]
+            },
+        }
         resource_paths = [
             REPOSITORY / relative
             for relative in subprocess.run(
@@ -159,6 +176,15 @@ class InstalledWheelTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ).stdout
+                button_help = subprocess.run(
+                    [str(virtual_environment / "bin/rp-ylx-recording-button"), "--help"],
+                    cwd=external_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertIn("--monitor", button_help)
                 status = json.loads(
                     subprocess.run(
                         [str(executable), "status"],
@@ -240,7 +266,7 @@ class InstalledWheelTest(unittest.TestCase):
                     ).stdout
                 )
 
-                self.assertEqual(version, f"Open Aria 0.1.0 ({expected_commit})")
+                self.assertEqual(version, f"Open Aria {expected_version} ({expected_commit})")
                 self.assertEqual(legacy_version, version)
                 self.assertIn("usage: openaria-spectacular-check", spectacular_help)
                 self.assertEqual(status["commit"], expected_commit)
@@ -251,36 +277,7 @@ class InstalledWheelTest(unittest.TestCase):
                 self.assertIn("jpeg_contract", status["native"]["features"])
                 self.assertIn("frame_stream", status["native"]["features"])
                 self.assertEqual(installed_resources, expected_resources)
-                self.assertEqual(
-                    embedded_web,
-                    {
-                        "source_commit": "6604d806123cd580ce20ba89e3051624f58004ad",
-                        "required_device_api_major": 4,
-                        "assets": {
-                            "app.js": {
-                                "bytes": 113254,
-                                "content_type": "text/javascript; charset=utf-8",
-                                "sha256": (
-                                    "64f18c5e208ceacf11417982d7ad42e977bce9f71fc75a7053826a295e51cc1c"
-                                ),
-                            },
-                            "index.html": {
-                                "bytes": 490,
-                                "content_type": "text/html; charset=utf-8",
-                                "sha256": (
-                                    "402ee712f34a5d328fa5567f7fa232c868664e5992aaebd873dd32c7a7ef69ba"
-                                ),
-                            },
-                            "styles.css": {
-                                "bytes": 37866,
-                                "content_type": "text/css; charset=utf-8",
-                                "sha256": (
-                                    "a05870f1c3ebfbcc516ab916519cf5580cb76e8082e115782c93e888f445fe96"
-                                ),
-                            },
-                        },
-                    },
-                )
+                self.assertEqual(embedded_web, expected_web)
                 self.assertIn(virtual_environment, module_path.parents)
                 self.assertIn("site-packages", module_path.parts)
                 self.assertNotIn(REPOSITORY.resolve(), module_path.parents)

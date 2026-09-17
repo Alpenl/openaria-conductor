@@ -46,6 +46,10 @@ PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
 LAB_OPERATIONS = frozenset(
     {
         "getDevice",
+        "syncDeviceClock",
+        "getDeviceClock",
+        "firmwareStatus",
+        "firmwareUpdate",
         "getCaptureStatus",
         "streamCaptureEvents",
         "listSessions",
@@ -105,6 +109,7 @@ class ProductionConfig:
     video_layout: str = "split-eyes"
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
+    exposure_time_absolute: int | str | None = "auto"
     segment_seconds: float = 30.0
     audio_enabled: bool = True
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
@@ -115,6 +120,13 @@ class ProductionConfig:
     minimum_available_inodes: int = 1024
 
     def __post_init__(self) -> None:
+        if self.exposure_time_absolute not in (None, "auto") and (
+            type(self.exposure_time_absolute) is not int
+            or not 1 <= self.exposure_time_absolute <= 100
+        ):
+            raise ProductionConfigError(
+                "camera.exposure_time_absolute 必须为 auto、null 或 1..100 整数"
+            )
         try:
             address = ipaddress.ip_address(self.host)
             device_id = uuid.UUID(self.device_id)
@@ -221,7 +233,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
     security = value["security"]
     audio = value.get("audio")
     try:
-        encoding = RecordingEncoding.from_mapping(value.get("recording", {"preset": "high"}))
+        encoding = RecordingEncoding.from_mapping(value.get("recording", {}))
     except (TypeError, ValueError) as error:
         raise ProductionConfigError(str(error)) from error
     security_profile = security.get("profile") if isinstance(security, dict) else None
@@ -252,7 +264,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         or not all(isinstance(item, dict) for item in (listen, camera, storage, device, security))
         or (audio is not None and not isinstance(audio, dict))
         or set(listen) != {"host", "port"}
-        or set(camera)
+        or (set(camera) - {"exposure_time_absolute"})
         not in (
             {"device", "width", "height", "fps"},
             {"device", "width", "height", "fps", "data_plane"},
@@ -296,6 +308,7 @@ def load_production_config(path: str | Path) -> ProductionConfig:
             height=_integer(camera["height"], "camera.height"),
             fps=_integer(camera["fps"], "camera.fps"),
             recording_encoding=encoding,
+            exposure_time_absolute=camera.get("exposure_time_absolute", "auto"),
             video_bitrate_kbps=encoding.bitrate_kbps,
             audio_enabled=True if audio is None else audio["enabled"],
             audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),
@@ -651,6 +664,7 @@ def build_production_service(
             preview=preview,
             frame_decimation=config.frame_decimation,
             metrics=metrics,
+            exposure_time_absolute=config.exposure_time_absolute,
         )
     else:
         assert camera_backend_factory is not None
@@ -703,6 +717,7 @@ def build_production_service(
             video_layout=config.video_layout,
             video_bitrate_kbps=config.video_bitrate_kbps,
             recording_encoding=config.recording_encoding,
+            lossless_storage=True,
             segment_seconds=config.segment_seconds,
             audio_enabled=config.audio_enabled,
             audio_device=config.audio_device,

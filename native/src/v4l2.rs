@@ -458,6 +458,8 @@ pub(crate) struct Capture {
     last_raw_sequence: Option<u32>,
     sequence_epoch: u64,
     last_timestamp_ns: Option<u64>,
+    pub(crate) last_buffer_flags: u32,
+    pub(crate) last_dequeue_monotonic_ns: u64,
 }
 
 impl Capture {
@@ -518,6 +520,8 @@ impl Capture {
             last_raw_sequence: None,
             sequence_epoch: 0,
             last_timestamp_ns: None,
+            last_buffer_flags: 0,
+            last_dequeue_monotonic_ns: 0,
         };
         if let Err(error) = capture.configure(width, height, fps, format, buffer_count) {
             capture.close();
@@ -785,6 +789,11 @@ impl Capture {
         let index = read_u32(&dequeue, 0) as usize;
         let bytes_used = read_u32(&dequeue, 8) as usize;
         let flags = read_u32(&dequeue, 12);
+        self.last_buffer_flags = flags;
+        self.last_dequeue_monotonic_ns = self
+            .io
+            .monotonic_ns()
+            .map_err(|error| CaptureError::io("clock_failed", "clock_gettime", error))?;
         let raw_sequence = read_u32(&dequeue, 56);
         if index >= self.buffers.len() {
             let error = CaptureError::new("bad_frame", "invalid V4L2 buffer index");

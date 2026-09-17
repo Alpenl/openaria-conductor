@@ -682,12 +682,27 @@ fn write_split_sink_frame(
                 "recording sink mutex is poisoned",
             )
         })?;
-        sink.write_split_frame_index(
+        sink.write_audited_frame_index(
             reserved.record_sequence,
             reserved.source_sequence,
             reserved.host_monotonic_ns,
             plan.segment_index,
             plan.segment_frame,
+            Some(serde_json::json!({
+                "schema": "openaria.frame-timestamp-audit.v1",
+                "v4l2_buffer_flags": frame.buffer_flags,
+                "host_dequeue_monotonic_ns": frame.dequeue_monotonic_ns,
+                "timestamp_clock": if frame.buffer_flags & 0x2000 != 0 {
+                    "v4l2_monotonic"
+                } else { "host_monotonic_fallback" },
+                "timestamp_source": if frame.buffer_flags & 0x70000 == 0x10000 {
+                    "start_of_exposure"
+                } else if frame.buffer_flags & 0x70000 == 0 {
+                    "end_of_frame"
+                } else { "unknown" },
+                "camera_counter_raw": recording::avi1_counter(payload),
+                "counter_bits": 24,
+            })),
         )?
     };
     {
@@ -1000,6 +1015,8 @@ mod tests {
             write_split_sink_frame(
                 &target,
                 &Frame {
+                    buffer_flags: 0,
+                    dequeue_monotonic_ns: 0,
                     source_sequence: 9,
                     host_monotonic_ns: 34_000_000,
                     application_dropped_before: 0,
@@ -1234,6 +1251,8 @@ mod tests {
                 &preview,
                 &shared,
                 Frame {
+                    buffer_flags: 0,
+                    dequeue_monotonic_ns: 0,
                     source_sequence: 1,
                     host_monotonic_ns: 1_000_000,
                     application_dropped_before: 0,

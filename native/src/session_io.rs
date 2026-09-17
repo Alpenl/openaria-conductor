@@ -404,7 +404,10 @@ fn parse_device_session_manifest(
     let schema = string_field(object, "schema")?;
     if !matches!(
         schema,
-        "ylx.device-session.v1" | "ylx.device-session.v2" | "ylx.device-session.v3"
+        "ylx.device-session.v1"
+            | "ylx.device-session.v2"
+            | "ylx.device-session.v3"
+            | "ylx.device-session.v4"
     ) {
         return Err(SessionIoError::new(
             "manifest_invalid",
@@ -655,7 +658,7 @@ fn parse_artifact_descriptor(raw: &Value) -> Result<ArtifactDescriptor, SessionI
             ));
         }
     }
-    if object.len() != 6 {
+    if object.len() != 6 && !(object.len() == 7 && object.contains_key("storage_encoding")) {
         return Err(SessionIoError::new(
             "manifest_invalid",
             "manifest artifact 描述符字段无效",

@@ -4,3 +4,5 @@ d /var/lib/rp-ylx-network 0700 root root -
 d /etc/rp-ylx 0750 root rp-ylx -
 d /run/rp-ylx 0750 root rp-ylx -
 f /run/rp-ylx/network-operation.lock 0660 root rp-ylx -
+f /run/rp-ylx/maintenance.lock 0660 root rp-ylx -
+d /var/lib/openaria-update 0700 root root -

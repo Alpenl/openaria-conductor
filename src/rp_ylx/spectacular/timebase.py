@@ -270,7 +270,11 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
                 for sample in current
             ):
                 raise CaptureValidationError("records within an IMU packet disagree")
-            if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"} and any(
+            if capture.source_schema in {
+                "ylx.device-session.v2",
+                "ylx.device-session.v3",
+                "ylx.device-session.v4",
+            } and any(
                 sample["packet_sequence"] != first["packet_sequence"]
                 or sample["device_ticks"] != first["device_ticks"]
                 for sample in current
@@ -287,7 +291,11 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
 
 def _packet_timestamps(capture: LoadedCapture, packets: list[list[dict[str, Any]]]) -> list[int]:
     first_records = [packet[0] for packet in packets]
-    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
+    if capture.source_schema in {
+        "ylx.device-session.v2",
+        "ylx.device-session.v3",
+        "ylx.device-session.v4",
+    }:
         _unwrap_contiguous(
             [int(record["packet_sequence"]) for record in first_records],
             32,
@@ -323,7 +331,11 @@ def _analyze_capture(
     if imu_rate_hz is not None and (not math.isfinite(imu_rate_hz) or imu_rate_hz <= 0):
         raise CaptureValidationError("IMU rate must be positive")
     capture = load_capture(capture_dir)
-    if capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}:
+    if capture.source_schema in {
+        "ylx.device-session.v2",
+        "ylx.device-session.v3",
+        "ylx.device-session.v4",
+    }:
         # Device Session source sequences advance by the declared frame
         # decimation. The adapter validates that exact relationship; the
         # contiguous recording domain is the clock-fit counter.
@@ -346,7 +358,11 @@ def _analyze_capture(
     packet_records = [packet[0] for packet in packets]
     device_timestamps = _packet_timestamps(capture, packets)
     packet_hosts = [int(record["host_monotonic_ns"]) for record in packet_records]
-    device_session = capture.source_schema in {"ylx.device-session.v2", "ylx.device-session.v3"}
+    device_session = capture.source_schema in {
+        "ylx.device-session.v2",
+        "ylx.device-session.v3",
+        "ylx.device-session.v4",
+    }
     if device_session:
         # The camera counter identifies VIDEO frames. Multiple changing IMU
         # packets can share it; neither a sample clock nor loss can be inferred

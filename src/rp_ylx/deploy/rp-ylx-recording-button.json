@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "physical_pin": 37,
+  "active_low": false,
+  "debounce_ms": 80,
+  "cooldown_ms": 1000,
+  "poll_ms": 20,
+  "request_timeout_ms": 5000
+}

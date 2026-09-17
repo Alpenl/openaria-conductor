@@ -42,14 +42,15 @@ class RecordingEncoding:
         if not isinstance(value, Mapping):
             raise ValueError("recording must be an object")
         settings = dict(value)
-        preset = settings.pop("preset", "high")
-        if preset not in {"standard", "high"}:
-            raise ValueError("recording.preset must be standard or high")
+        preset = settings.pop("preset", "efficient")
+        if preset not in {"standard", "high", "efficient"}:
+            raise ValueError("recording.preset must be standard, high or efficient")
         defaults = (
             {}
             if preset == "standard"
             else {
-                "bitrate_kbps": 16384,
+                "codec": "hevc" if preset == "efficient" else "h264",
+                "bitrate_kbps": 12288 if preset == "efficient" else 16384,
                 "min_qp": 18,
                 "max_qp": 32,
                 "intra_qp": 20,

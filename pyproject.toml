@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "rp-ylx"
-version = "0.1.0"
+version = "0.2.1"
 description = "RDK X5 + YLX 2UQ2 双目视频与 IMU 录制服务"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,7 @@ dependencies = [
   "pillow>=10,<13",
   "typing-extensions>=4.4,<5",
   "zeroconf>=0.150,<1",
+  "zstandard>=0.23,<1",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +28,7 @@ openaria-spectacular-check = "rp_ylx.spectacular.check_cli:main"
 rp-ylx = "rp_ylx.cli:main"
 rp-ylx-deploy = "rp_ylx.deployment:main"
 rp-ylx-spectacular-check = "rp_ylx.spectacular.check_cli:main"
+rp-ylx-recording-button = "rp_ylx.recording_button:main"
 
 [tool.ruff]
 line-length = 100

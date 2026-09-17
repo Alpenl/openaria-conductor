@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
+import subprocess
+import sys
 import tempfile
+import tomllib
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
-import rp_ylx.api.gateway as gateway_module
 import rp_ylx.web as web_module
 from rp_ylx.api.gateway import SUPPORTED_API_VERSIONS
 from rp_ylx.web import (
@@ -37,9 +38,12 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
         self.assertIn(ENTRY_ASSET, WEB_ASSETS)
 
     def test_release_and_source_identity_are_pinned(self) -> None:
-        self.assertEqual(echo_web_release(), ("openaria-echo-web", "0.1.0"))
+        project = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        self.assertEqual(echo_web_release(), ("openaria-echo-web", project["project"]["version"]))
         self.assertEqual(echo_web_source(), (ECHO_WEB_SOURCE_REPOSITORY, ECHO_WEB_SOURCE_COMMIT))
-        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "6604d806123cd580ce20ba89e3051624f58004ad")
+        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "e126a5c33beed15fee946baeb7db1a432398bb50")
 
     def test_manifest_requires_a_device_api_major_provided_by_the_gateway(self) -> None:
         self.assertEqual(echo_web_required_device_api_major(), 4)
@@ -65,18 +69,27 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "echo_web_device_api_incompatible")
 
     def test_gateway_startup_fails_closed_on_an_incompatible_embedded_artifact(self) -> None:
-        try:
-            with (
-                mock.patch.object(
-                    web_module, "echo_web_required_device_api_major", return_value=999
-                ),
-                self.assertRaises(EchoWebArtifactError) as raised,
-            ):
-                importlib.reload(gateway_module)
-        finally:
-            importlib.reload(gateway_module)
-
-        self.assertEqual(raised.exception.code, "echo_web_device_api_incompatible")
+        # Reloading gateway in this process changes exception class identities
+        # retained by daemon providers, making later HTTP tests return 500.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from unittest.mock import patch\n"
+                "from rp_ylx.web import EchoWebArtifactError\n"
+                "with patch('rp_ylx.web.echo_web_required_device_api_major', return_value=999):\n"
+                "    try:\n"
+                "        import rp_ylx.api.gateway\n"
+                "    except EchoWebArtifactError as error:\n"
+                "        assert error.code == 'echo_web_device_api_incompatible'\n"
+                "    else:\n"
+                "        raise AssertionError('incompatible gateway started')\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_v2_manifest_missing_required_major_fails_closed(self) -> None:
         def remove_required_major(root: Path) -> None:

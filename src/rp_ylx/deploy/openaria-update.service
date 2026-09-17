@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenAria firmware update supervisor
+After=systemd-tmpfiles-setup.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=rp-ylx
+ExecStart=/usr/bin/python3 /usr/local/lib/openaria/firmware_control.py
+UMask=0077
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
