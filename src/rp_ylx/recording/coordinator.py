@@ -48,6 +48,7 @@ from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.network import network_status_v1 as project_network_status_v1
 from rp_ylx.network_control import CONTROL_RESPONSE_TIMEOUT_SECONDS, NetworkControlClientError
 from rp_ylx.network_control import request_control as request_network_control
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -2405,6 +2406,7 @@ class CaptureCoordinator:
             assert plan is not None
             self._stop_inflight = scope
 
+        stop_started = time.monotonic()
         try:
             if self._sources is not None:
                 try:
@@ -2424,6 +2426,12 @@ class CaptureCoordinator:
                     ) from error
             if not self._sources_keep_preview():
                 self._preview.clear()
+            operational_logger("recording").event(
+                "stop_stage",
+                stage="sources_stop",
+                transaction_id=plan.session_id,
+                duration_ms=(time.monotonic() - stop_started) * 1000,
+            )
 
             try:
                 sealed = recorder.stop(
@@ -2443,6 +2451,7 @@ class CaptureCoordinator:
             verified_snapshot: _VerifiedSessionSnapshot | None = None
             verification_error: DeviceRecordingError | None = None
             verification_current = True
+            verify_started = time.monotonic()
             try:
                 verified_snapshot, verification_error = self._verify_exact_session_payload(
                     self._require_admission().sessions_root / plan.session_id,
@@ -2453,6 +2462,12 @@ class CaptureCoordinator:
                 )
             except DeviceRecordingError:
                 verification_current = False
+            operational_logger("recording").event(
+                "stop_stage",
+                stage="independent_admission",
+                transaction_id=plan.session_id,
+                duration_ms=(time.monotonic() - verify_started) * 1000,
+            )
 
             with self._lock:
                 if self._active is not recorder:

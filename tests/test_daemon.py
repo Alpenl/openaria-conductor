@@ -669,6 +669,7 @@ class ProductionDaemonTest(unittest.TestCase):
                     return_value=sources,
                 ),
                 patch("rp_ylx.daemon.CaptureCoordinator", return_value=coordinator),
+                patch("rp_ylx.daemon.LatestPreviewBuffer") as preview_buffer,
                 patch("rp_ylx.daemon.create_gateway_server", return_value=server),
                 patch("rp_ylx.daemon.CaptureEventPump", return_value=event_pump),
                 patch("rp_ylx.daemon.MdnsPublisher", return_value=mdns_publisher),
@@ -676,6 +677,7 @@ class ProductionDaemonTest(unittest.TestCase):
                 service = build_production_service(config)
             try:
                 stable_id.assert_not_called()
+                preview_buffer.assert_called_once_with(stream_fps=25, thumbnails=True)
                 sources.start_preview.assert_called_once_with()
                 mdns_publisher.start.assert_called_once_with()
                 self.assertIs(service.server, server)

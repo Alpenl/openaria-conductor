@@ -34,6 +34,7 @@ from rp_ylx.native import (
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.live_seal import LiveSealing
@@ -2040,8 +2041,22 @@ class DeviceSessionRecorder:
         published = False
         prepared = None
         live_audit = None
+        stage_started = time.monotonic()
+
+        def finished_stage(stage: str) -> None:
+            nonlocal stage_started
+            now = time.monotonic()
+            operational_logger("recording").event(
+                "sealing_stage",
+                stage=stage,
+                transaction_id=self._plan.session_id,
+                duration_ms=(now - stage_started) * 1000,
+            )
+            stage_started = now
+
         try:
             self._persist_state("finalizing")
+            finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None
             transaction = self._native_transaction
             if transaction is None:
@@ -2067,6 +2082,7 @@ class DeviceSessionRecorder:
                     outcome = transaction.finish(duration, 30.0)
                 except BaseException as error:
                     raise _recording_error(error, "native_session_store_failed") from error
+                finished_stage("native_finish")
                 active_take = outcome.get("active_take")
                 sink = outcome.get("sink")
                 if not isinstance(active_take, Mapping) or not isinstance(sink, Mapping):
@@ -2086,9 +2102,12 @@ class DeviceSessionRecorder:
                         target = artifact.target.relative_to(self._partial).as_posix()
                         self._verified_artifacts[target] = artifact.output
                     self._live_sealing = None
+                finished_stage("incremental_drain")
                 if self._config.audio_enabled:
                     self._apply_audio_result(outcome.get("audio"))
+                finished_stage("audio_inventory")
                 self._harvest_segments()
+                finished_stage("video_tail")
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
                 # Native finish joins audio capture; its final samples can arrive
@@ -2097,6 +2116,7 @@ class DeviceSessionRecorder:
                 duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
+            finished_stage("verifying_checkpoint")
             verified_at = self._now()
             sealed_at = self._now()
             manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
@@ -2144,6 +2164,7 @@ class DeviceSessionRecorder:
                     manifest["capture_audit"] = live_audit if audited is None else audited.result()
                 for relative in compacted_originals:
                     self._artifact_identities.pop(relative, None)
+            finished_stage("manifest_compaction")
             validate_device_session_manifest(manifest)
             payload = json_bytes(manifest)
             native_manifest_sha256 = None
@@ -2189,6 +2210,7 @@ class DeviceSessionRecorder:
             if native_manifest_sha256 is None:
                 fsync_directory(self._root)
                 self._validate_artifact_bytes(manifest, root=self._final)
+            finished_stage("publication")
         except BaseException as error:
             if self._native_transaction is not None:
                 with suppress(BaseException):

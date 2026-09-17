@@ -655,7 +655,7 @@ def build_production_service(
             if feature not in capabilities.features:
                 raise ProductionConfigError(message, code=code)
     mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
-    preview = LatestPreviewBuffer(stream_fps=15)
+    preview = LatestPreviewBuffer(stream_fps=25, thumbnails=using_native_data_plane)
     metrics = PerformanceMetrics()
     if using_native_data_plane:
         sources = NativeContinuousCaptureSources(
