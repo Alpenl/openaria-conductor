@@ -103,7 +103,9 @@ class DeviceSessionConfig:
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
     lossless_storage: bool = False
-    segment_seconds: float = 30.0
+    # Bound stop-time hashing/compaction to a short tail. Closed segments are
+    # independently verified during capture; GOP alignment is checked below.
+    segment_seconds: float = 5.0
     audio_enabled: bool = False
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000

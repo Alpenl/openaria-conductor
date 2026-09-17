@@ -173,6 +173,9 @@ class LiveSealing:
                     journal.pump()
                 self._audio()
                 if self.finished.is_set():
+                    # finish() may race the checkpoint read above. Producers
+                    # are now joined, so include the final closed audio tail.
+                    self._audio()
                     for name, journal in journals.items():
                         self.prepared[name] = journal.finish()
                     return

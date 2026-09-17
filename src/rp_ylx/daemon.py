@@ -110,7 +110,7 @@ class ProductionConfig:
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
     exposure_time_absolute: int | str | None = "auto"
-    segment_seconds: float = 30.0
+    segment_seconds: float = 5.0
     audio_enabled: bool = True
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
