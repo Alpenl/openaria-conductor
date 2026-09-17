@@ -43,8 +43,11 @@ class FirmwareControlTest(unittest.TestCase):
         target.mkdir(parents=True, exist_ok=True)
         (target / "release.json").write_text(json.dumps({"version": version, "commit": char * 40}))
         path = self.install / link
-        path.unlink(missing_ok=True)
-        path.symlink_to(target)
+        # Production switches links atomically; readers must never observe the
+        # unlink/create gap introduced by the former concurrent test fixture.
+        temporary = path.with_name(path.name + ".next")
+        temporary.symlink_to(target)
+        temporary.replace(path)
 
     def wait_task(self):
         deadline = time.monotonic() + 3

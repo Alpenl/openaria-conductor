@@ -32,7 +32,7 @@ class _Frame:
 class LatestPreviewBuffer:
     """单槽预览缓冲区；发布新帧会替换旧帧，不会排队。"""
 
-    def __init__(self, *, stream_fps: int) -> None:
+    def __init__(self, *, stream_fps: int, thumbnails: bool = False) -> None:
         if stream_fps < 1:
             raise ValueError("stream_fps must be at least 1")
         self._stream_fps = stream_fps
@@ -43,6 +43,11 @@ class LatestPreviewBuffer:
         self._condition = threading.Condition()
         self._latest: _Frame | None = None
         self._sequence = 0
+        self._thumbnails = None
+        if thumbnails:
+            from rp_ylx.api.preview_thumbnail import PreviewThumbnails
+
+            self._thumbnails = PreviewThumbnails(self._snapshot)
 
     def publish(self, jpeg: bytes) -> int:
         if not isinstance(jpeg, bytes) or not jpeg:
@@ -58,10 +63,14 @@ class LatestPreviewBuffer:
     def clear(self) -> None:
         if self._native is not None:
             self._native.clear()
+            if self._thumbnails is not None:
+                self._thumbnails.clear()
             return
         with self._condition:
             self._latest = None
             self._condition.notify_all()
+        if self._thumbnails is not None:
+            self._thumbnails.clear()
 
     @property
     def native_owner(self) -> NativePreviewBuffer | None:
@@ -73,7 +82,13 @@ class LatestPreviewBuffer:
         return self.jpeg_response()
 
     def jpeg_response(self) -> PreviewResponse:
-        frame = self._snapshot()
+        if self._thumbnails is None:
+            frame = self._snapshot()
+        else:
+            try:
+                frame = self._thumbnails.get()
+            except RuntimeError as error:
+                raise PreviewFrameUnavailable(str(error)) from error
         return PreviewResponse("image/jpeg", frame.jpeg, len(frame.jpeg))
 
     def multipart_response(self, requested_fps: int | None) -> PreviewResponse:

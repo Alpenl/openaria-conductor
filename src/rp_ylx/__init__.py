@@ -9,6 +9,6 @@ PRODUCT_NAME = "Open Aria"
 try:
     __version__ = version("rp-ylx")
 except PackageNotFoundError:
-    __version__ = "0.2.2"
+    __version__ = "0.2.3"
 
 __all__ = ["PRODUCT_NAME", "__commit__", "__version__"]

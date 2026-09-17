@@ -16,13 +16,17 @@ import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
 from zoneinfo import ZoneInfo
 
-from rp_ylx.api.downloads import ArtifactAccessError, validate_device_session_manifest
+from rp_ylx.api.downloads import (
+    ArtifactAccessError,
+    validate_device_session_manifest,
+    validated_device_session_payload,
+)
 from rp_ylx.camera import FrameObservation
 from rp_ylx.imu import ImuObservation
 from rp_ylx.native import (
@@ -34,14 +38,18 @@ from rp_ylx.native import (
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 from rp_ylx.recording.encoding import RecordingEncoding
+from rp_ylx.recording.live_seal import LiveSealing
 from rp_ylx.recording.stereo_encoder import (
     ClosedSegment,
     StereoEncoderError,
     StereoEncoderProcess,
     resolve_executable,
 )
+from rp_ylx.recording.verified import VerifiedArtifact
+from rp_ylx.recording.verified import identity as verified_identity
 
 
 class DeviceRecordingError(RuntimeError):
@@ -99,7 +107,9 @@ class DeviceSessionConfig:
     video_bitrate_kbps: int = 8192
     recording_encoding: RecordingEncoding | None = None
     lossless_storage: bool = False
-    segment_seconds: float = 30.0
+    # Bound stop-time hashing/compaction to a short tail. Closed segments are
+    # independently verified during capture; GOP alignment is checked below.
+    segment_seconds: float = 5.0
     audio_enabled: bool = False
     audio_device: str = "hw:CARD=D2UQ2,DEV=0"
     audio_sample_rate_hz: int = 48_000
@@ -205,6 +215,7 @@ class SealedDeviceSession:
     manifest: Mapping[str, object]
     manifest_bytes: bytes
     manifest_sha256: str
+    verified_artifacts: Mapping[str, VerifiedArtifact] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +706,9 @@ class DeviceSessionRecorder:
         # Keyed by session-relative path: split-eye sessions repeat the
         # video.left / video.right roles once per segment.
         self._artifact_identities: dict[str, tuple[int, int, int, int]] = {}
+        self._verified_artifacts: dict[str, VerifiedArtifact] = {}
+        self._live_sealing: LiveSealing | None = None
+        self._stopped_elapsed: float | None = None
         self._writer: threading.Thread | None = None
         self._writer_error: BaseException | None = None
         self._started_at: datetime | None = None
@@ -748,6 +762,7 @@ class DeviceSessionRecorder:
                 + int(self._audio_recorder is not None)
                 + int(self._harvester is not None and self._harvester.is_alive())
                 + transaction_handles
+                + int(self._live_sealing is not None)
             )
 
     def _now(self) -> datetime:
@@ -758,6 +773,8 @@ class DeviceSessionRecorder:
         return value.isoformat(timespec="microseconds")
 
     def _elapsed(self) -> float:
+        if self._stopped_elapsed is not None:
+            return self._stopped_elapsed
         if self._started_monotonic_ns is None:
             return 0.0
         return max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
@@ -833,7 +850,10 @@ class DeviceSessionRecorder:
                 "verification": {"completed": completed, "total": total},
             }
             self._current_state = document
-        self._state_sink(document)
+        # Progress is observable through current_recording_state. The state
+        # sink fsyncs coordinator recovery data; doing that per artifact adds
+        # a disk barrier for every five-second audio segment. State transitions
+        # and the final command result remain durable through _persist_state.
 
     def _live_audio_bytes(self) -> int:
         recorder = self._audio_recorder
@@ -960,6 +980,12 @@ class DeviceSessionRecorder:
                         self._audio_recorder = audio
                 fsync_directory(self._partial)
                 fsync_directory(self._root)
+                if self._native_transaction is not None and self._config.lossless_storage:
+                    self._live_sealing = LiveSealing(
+                        self._partial,
+                        self._config.sensor_fps / self._config.frame_decimation,
+                        self._config.frame_decimation,
+                    )
             except Exception as error:
                 self._abandon_audio()
                 self._abandon_encoder()
@@ -1191,7 +1217,7 @@ class DeviceSessionRecorder:
             ("right", segment.right_path, segment.right_bytes),
         ):
             path = self._partial / relative
-            finalized = _finalize_artifact(path, declared, code="segment_invalid")
+            finalized = self._finalize_for_seal(path, declared, code="segment_invalid")
             self._artifact_identities[relative] = finalized.identity
             artifacts[eye] = {
                 "artifact_id": finalized.sha256,
@@ -1683,7 +1709,7 @@ class DeviceSessionRecorder:
             if not relative.startswith("audio/") or not relative.endswith(".wav"):
                 raise DeviceRecordingError("audio_invalid", "音频 artifact 路径无效")
             path = self._partial / relative
-            finalized = _finalize_artifact(path, None, code="audio_invalid")
+            finalized = self._finalize_for_seal(path, None, code="audio_invalid")
             pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
             wav_header_bytes = finalized.bytes - pcm_payload_bytes
             if wav_header_bytes < 44 or wav_header_bytes > 65_536:
@@ -1989,6 +2015,24 @@ class DeviceSessionRecorder:
                 ),
             )
 
+    def _finalize_for_seal(
+        self, path: Path, expected_bytes: int | None, *, code: str
+    ) -> _FinalizedArtifact:
+        relative = path.relative_to(self._partial).as_posix()
+        before = verified_identity(path.stat(follow_symlinks=False))
+        proof = self._verified_artifacts.get(relative)
+        if proof is not None and proof.identity == before:
+            if expected_bytes is not None and expected_bytes != before[4]:
+                raise DeviceRecordingError(code, "closed artifact size changed")
+            return _FinalizedArtifact(
+                proof.sha256, before[4], (before[0], before[1], before[4], before[5])
+            )
+        result = _finalize_artifact(path, expected_bytes, code=code)
+        if verified_identity(path.stat(follow_symlinks=False)) != before:
+            raise DeviceRecordingError(code, "artifact changed during independent verification")
+        self._verified_artifacts[relative] = VerifiedArtifact(before, result.sha256)
+        return result
+
     def stop(self, *, before_publish: Callable[[], None] | None = None) -> SealedDeviceSession:
         with self._lock:
             if self._state == "sealed":
@@ -2002,9 +2046,26 @@ class DeviceSessionRecorder:
             if self._state != "recording":
                 raise DeviceRecordingError("invalid_state", "只有 recording 会话可以停止")
             self._state = "finalizing"
+            self._stopped_elapsed = self._elapsed()
         published = False
+        prepared = None
+        live_audit = None
+        stage_started = time.monotonic()
+
+        def finished_stage(stage: str) -> None:
+            nonlocal stage_started
+            now = time.monotonic()
+            operational_logger("recording").event(
+                "sealing_stage",
+                stage=stage,
+                transaction_id=self._plan.session_id,
+                duration_ms=(now - stage_started) * 1000,
+            )
+            stage_started = now
+
         try:
             self._persist_state("finalizing")
+            finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None
             transaction = self._native_transaction
             if transaction is None:
@@ -2030,6 +2091,7 @@ class DeviceSessionRecorder:
                     outcome = transaction.finish(duration, 30.0)
                 except BaseException as error:
                     raise _recording_error(error, "native_session_store_failed") from error
+                finished_stage("native_finish")
                 active_take = outcome.get("active_take")
                 sink = outcome.get("sink")
                 if not isinstance(active_take, Mapping) or not isinstance(sink, Mapping):
@@ -2041,9 +2103,20 @@ class DeviceSessionRecorder:
                     active_take.get("frames_written"), "active_take.frames_written"
                 )
                 self._apply_session_transaction_sink(sink)
+                if self._live_sealing is not None:
+                    live_audit = self._live_sealing.finish()
+                    prepared = self._live_sealing.prepared
+                    for relative, artifact in prepared.items():
+                        self._verified_artifacts[relative] = artifact.source
+                        target = artifact.target.relative_to(self._partial).as_posix()
+                        self._verified_artifacts[target] = artifact.output
+                    self._live_sealing = None
+                finished_stage("incremental_drain")
                 if self._config.audio_enabled:
                     self._apply_audio_result(outcome.get("audio"))
+                finished_stage("audio_inventory")
                 self._harvest_segments()
+                finished_stage("video_tail")
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
                 # Native finish joins audio capture; its final samples can arrive
@@ -2052,6 +2125,7 @@ class DeviceSessionRecorder:
                 duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
+            finished_stage("verifying_checkpoint")
             verified_at = self._now()
             sealed_at = self._now()
             manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
@@ -2061,7 +2135,7 @@ class DeviceSessionRecorder:
                 from rp_ylx.recording.storage import compact_manifest
 
                 def finalize_compacted(path: Path) -> dict[str, object]:
-                    result = _finalize_artifact(path, None, code="compaction_invalid")
+                    result = self._finalize_for_seal(path, None, code="compaction_invalid")
                     relative = path.relative_to(self._partial).as_posix()
                     self._artifact_identities[relative] = result.identity
                     return {
@@ -2071,30 +2145,37 @@ class DeviceSessionRecorder:
                         "artifact_id": result.sha256,
                     }
 
-                # Both jobs read immutable raw journals. Compaction never removes
-                # them until publication, and the executor joins even on failure.
+                # Native acquisition has already prepared closed data. Explicit
+                # test adapters retain the offline path; raw recovery files stay
+                # intact until publication in both cases.
                 with ThreadPoolExecutor(max_workers=1, thread_name_prefix="clock-audit") as audit:
-                    audited = audit.submit(
-                        capture_audit,
-                        self._partial,
-                        self._config.sensor_fps / self._config.frame_decimation,
-                        self._config.frame_decimation,
+                    audited = (
+                        audit.submit(
+                            capture_audit,
+                            self._partial,
+                            self._config.sensor_fps / self._config.frame_decimation,
+                            self._config.frame_decimation,
+                        )
+                        if live_audit is None
+                        else None
                     )
                     manifest, compacted_originals = compact_manifest(
                         self._partial,
                         manifest,
                         finalize_compacted,
+                        prepared=prepared,
                         # Reserve the last unit for audit, publication and the
-                        # coordinator's independent full-byte verification.
+                        # coordinator's independent verification admission.
                         progress=lambda completed, total: self._verification_progress(
                             completed, total + 1
                         ),
                     )
-                    manifest["capture_audit"] = audited.result()
+                    manifest["capture_audit"] = live_audit if audited is None else audited.result()
                 for relative in compacted_originals:
                     self._artifact_identities.pop(relative, None)
-            validate_device_session_manifest(manifest)
+            finished_stage("manifest_compaction")
             payload = json_bytes(manifest)
+            validated_device_session_payload(payload, self._plan.session_id)
             native_manifest_sha256 = None
             if before_publish is None and transaction is not None:
                 native_manifest_sha256 = _seal_native_transaction(
@@ -2130,13 +2211,15 @@ class DeviceSessionRecorder:
                     (self._final / relative).unlink()
             with self._lock:
                 self._state = "sealed"
-                # The coordinator still independently verifies all sealed bytes.
+                # The coordinator still admits the sealed manifest against
+                # independent read proofs and current file identities.
                 # Keep the verifying snapshot until it releases this recorder;
                 # clearing it here incorrectly exposes device_state="blocked".
                 self._native_transaction = None
             if native_manifest_sha256 is None:
                 fsync_directory(self._root)
                 self._validate_artifact_bytes(manifest, root=self._final)
+            finished_stage("publication")
         except BaseException as error:
             if self._native_transaction is not None:
                 with suppress(BaseException):
@@ -2171,6 +2254,7 @@ class DeviceSessionRecorder:
             manifest,
             payload,
             hashlib.sha256(payload).hexdigest(),
+            dict(self._verified_artifacts),
         )
 
     def _finish_encoder(self, duration: float) -> None:
@@ -2238,6 +2322,9 @@ class DeviceSessionRecorder:
         if self._encoder is not None:
             self._encoder.abort()
             self._encoder = None
+        if self._live_sealing is not None:
+            self._live_sealing.close()
+            self._live_sealing = None
 
     def _abandon_audio(self) -> None:
         if self._audio_recorder is None:
@@ -2428,8 +2515,12 @@ def validate_device_session_directory(
     *,
     expected_session_id: str | None = None,
     interrupt_check: Callable[[], None] | None = None,
+    verified_artifacts: Mapping[str, VerifiedArtifact] | None = None,
 ) -> Mapping[str, object]:
-    """独立校验一个已密封 Device Session 会话的 manifest 与所有 artifact 字节。"""
+    """校验 manifest 和所有 artifact；仅本次录制的独立读回证明可复用。
+
+    CLI、恢复和历史会话均不提供缓存，仍逐字节读取。缓存从不从磁盘加载。
+    """
 
     root = Path(path)
     root_flags = (
@@ -2451,11 +2542,8 @@ def validate_device_session_directory(
                 payload = _read_bounded_fd(manifest_fd, MAX_MANIFEST_BYTES, code="manifest_invalid")
             finally:
                 os.close(manifest_fd)
-            manifest = json.loads(payload)
             selected_session_id = root.name if expected_session_id is None else expected_session_id
-            if not isinstance(manifest, dict) or manifest.get("session_id") != selected_session_id:
-                raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
-            validate_device_session_manifest(manifest)
+            manifest = validated_device_session_payload(payload, selected_session_id)
             descriptors = _manifest_artifacts(manifest)
 
             def verify_artifact(artifact_descriptor):
@@ -2474,6 +2562,11 @@ def validate_device_session_directory(
                     code="artifact_invalid",
                 )
                 try:
+                    proof = None if verified_artifacts is None else verified_artifacts.get(relative)
+                    if proof is not None and proof.matches(
+                        os.fstat(artifact_fd), expected_bytes, expected_sha256
+                    ):
+                        return
                     _verify_artifact_fd(
                         artifact_fd,
                         expected_bytes,
@@ -2490,8 +2583,8 @@ def validate_device_session_directory(
                     verify_artifact(descriptor)
             else:
                 # Each worker owns its artifact fd; the pinned root stays open
-                # until both have joined. All bytes are still independently
-                # hashed, including on devices without SHA instructions.
+                # until both have joined. Uncached or changed files are fully
+                # read, including on devices without SHA instructions.
                 with ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="session-verify"
                 ) as executor:

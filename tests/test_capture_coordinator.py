@@ -1861,6 +1861,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def test_raw_sbs_frame_is_used_for_preview_without_eye_materialization(self) -> None:
         coordinator = self.coordinator()
+        # This fixture is marker-only fake JPEG; codec behavior has real-JPEG tests.
+        coordinator._preview._thumbnails = None
         try:
             coordinator.start_capture(start_command("raw-sbs-preview"))
             observation = FrameObservation(
@@ -2213,11 +2215,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
         release = threading.Event()
         original = coordinator._verify_exact_session_payload
 
-        def verify(*args: object) -> object:
+        def verify(*args: object, **kwargs: object) -> object:
             blocked.set()
             if not release.wait(timeout=5):
                 raise TimeoutError("session verification was not released")
-            return original(*args)
+            return original(*args, **kwargs)
 
         try:
             coordinator.start_capture(start_command("verify-live-imu-start"))
