@@ -36,6 +36,11 @@ MP4 分段仍采用编码器的标称帧率时基。**定量分析和完整视�
 时间戳，并沿用 ALSA 捕获时钟校正音频速率；不可用 `frame/30` 替代真实时间。
 浏览器 HEVC 解码能力取决于浏览器和系统，文件下载不受影响。
 
+v4 需要配套 Bridge SDK 源码提交
+[`5bb7031426da6ab280d1bd4eefa7d42de26991ea`](https://github.com/Alpenl/openaria-bridge-sdk/commit/5bb7031426da6ab280d1bd4eefa7d42de26991ea)
+或包含该提交的更新构建。旧 `v0.4.3` 发布包不支持 v4；不可仅根据同名包版本
+判断兼容性。安装该固定源码版本后，按 SDK 原有 verify / export 流程消费。
+
 IMU 的两个六轴槽位共享一次 USB 读取的中点时间。现有协议没有经过确认的
 独立 ADC 时间戳、FIFO 溢出计数、轴/尺度及完整标定参数，软件不会插值冒充
 高频独立采样，也不会把计数器匹配当成物理同步标定。UVC PTS/SCR 与曝光帧

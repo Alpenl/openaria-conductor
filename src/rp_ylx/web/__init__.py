@@ -20,7 +20,7 @@ MANIFEST_SCHEMA_V1 = "openaria.echo-web-artifacts.v1"
 MANIFEST_SCHEMA = "openaria.echo-web-artifacts.v2"
 ENTRY_ASSET = "index.html"
 ECHO_WEB_SOURCE_REPOSITORY = "https://github.com/Alpenl/openaria-echo-web"
-ECHO_WEB_SOURCE_COMMIT = "529d49e930bb386f46977cedd55ed49ff02f615c"
+ECHO_WEB_SOURCE_COMMIT = "e3929e3231bba3dd9639f7ead944a24751f6b004"
 DEVICE_API_VERSION = re.compile(r"^v([1-9][0-9]*)$")
 
 
