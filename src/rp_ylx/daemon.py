@@ -48,6 +48,8 @@ LAB_OPERATIONS = frozenset(
         "getDevice",
         "syncDeviceClock",
         "getDeviceClock",
+        "firmwareStatus",
+        "firmwareUpdate",
         "getCaptureStatus",
         "streamCaptureEvents",
         "listSessions",

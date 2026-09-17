@@ -1734,6 +1734,15 @@ class CaptureCoordinator:
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 retryable=True,
             )
+        from rp_ylx.update import maintenance_lock
+
+        maintenance = maintenance_lock(shared=True)
+        try:
+            maintenance.__enter__()
+        except (OSError, ValueError) as error:
+            raise ProviderError(
+                "maintenance_active", "设备正在更新，暂时不能开始录制", status=HTTPStatus.CONFLICT
+            ) from error
         descriptor = -1
         try:
             descriptor = os.open(
@@ -1752,6 +1761,7 @@ class CaptureCoordinator:
                 os.fchmod(descriptor, 0o660)
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
+            maintenance.__exit__(None, None, None)
             if descriptor >= 0:
                 with suppress(OSError):
                     os.close(descriptor)
@@ -1769,8 +1779,13 @@ class CaptureCoordinator:
                 retryable=True,
             ) from error
         self._network_operation_lease = descriptor
+        self._maintenance_lease = maintenance
 
     def _release_network_operation_lease(self) -> None:
+        maintenance = getattr(self, "_maintenance_lease", None)
+        self._maintenance_lease = None
+        if maintenance is not None:
+            maintenance.__exit__(None, None, None)
         descriptor = self._network_operation_lease
         self._network_operation_lease = None
         if descriptor is None:

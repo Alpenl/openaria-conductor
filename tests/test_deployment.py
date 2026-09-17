@@ -1653,6 +1653,8 @@ class ReleaseManagerTest(unittest.TestCase):
             archive.writestr("rp_ylx/__init__.py", "from ._build_info import __commit__\n")
             archive.writestr("rp_ylx/deploy/__init__.py", "")
             archive.write(repository / "src/rp_ylx/deployment.py", "rp_ylx/deployment.py")
+            for module in ("update.py", "firmware_control.py"):
+                archive.write(repository / "src/rp_ylx" / module, f"rp_ylx/{module}")
             archive.writestr("rp_ylx/_build_info.py", f'__commit__ = "{commit}"\n')
             for name in DEPLOYMENT_ASSETS:
                 archive.write(repository / "src/rp_ylx/deploy" / name, f"rp_ylx/deploy/{name}")

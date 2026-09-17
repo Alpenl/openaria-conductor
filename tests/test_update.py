@@ -27,6 +27,11 @@ class OnlineUpdateTest(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
         self.root = self.fixture.root
+        maintenance = patch.dict(
+            os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+        )
+        maintenance.start()
+        self.addCleanup(maintenance.stop)
         self.bundle = self.fixture.bundle("a")
         self.config = {
             "public_base_url": "https://downloads.example.test/rdk-x5",

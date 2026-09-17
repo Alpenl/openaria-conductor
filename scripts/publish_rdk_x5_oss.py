@@ -11,10 +11,12 @@ import gzip
 import json
 import re
 import shlex
+import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -23,12 +25,34 @@ from rp_ylx.update import (  # noqa: E402
     PLATFORM,
     RELEASE_SCHEMA,
     download,
+    fetch_manifest,
     https_url,
     sha256,
     verify_bundle,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def check_channel_promotion(prepared: dict, config: dict) -> None:
+    """A delayed/retried release cannot downgrade or replace a released version."""
+    with tempfile.TemporaryDirectory() as directory:
+        current = fetch_manifest(
+            config["public_base_url"].rstrip("/") + "/latest.json", Path(directory)
+        )
+    incoming = prepared["manifest"]
+
+    def version(value):
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+            raise ValueError("渠道版本无效")
+        return tuple(map(int, value.split(".")))
+
+    if version(incoming["version"]) < version(current["version"]):
+        raise ValueError("拒绝通过正式发布降级渠道；撤回渠道须使用专门回退流程")
+    if incoming["version"] == current["version"] and (
+        incoming["commit"] != current["commit"] or incoming["bundle"] != current["bundle"]
+    ):
+        raise ValueError("该版本已发布不同产物，请递增 0.2.x 补丁号")
 
 
 def bootstrap_script(base_url: str, updater_key: str, digest: str) -> str:
@@ -53,7 +77,9 @@ python3 "$work/update.py" "$@"
 """
 
 
-def prepare(bundle_dir: Path, output: Path, config: dict) -> dict:
+def prepare(
+    bundle_dir: Path, output: Path, config: dict, *, release_notes: str | None = None
+) -> dict:
     bundle = load_bundle(bundle_dir)
     manifest = {
         "schema": RELEASE_SCHEMA,
@@ -61,6 +87,11 @@ def prepare(bundle_dir: Path, output: Path, config: dict) -> dict:
         "commit": bundle.commit,
         "version": bundle.version,
     }
+    if release_notes is not None:
+        if not re.fullmatch(r"0\.2\.[1-9][0-9]*", bundle.version) or len(release_notes) > 16000:
+            raise ValueError("正式发布版本或说明无效")
+        manifest["release_notes"] = release_notes
+        manifest["published_at"] = datetime.now(UTC).isoformat()
     verify_bundle(bundle.root, manifest)
     if output.exists() and any(output.iterdir()):
         raise ValueError("output 必须为空")
@@ -183,6 +214,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "deploy/oss-release.json")
     parser.add_argument("--publish", action="store_true", help="上传并切换 latest；默认仅本地打包")
+    parser.add_argument("--tag", help="正式发布必须指定与 bundle 对应的附注标签")
     parser.add_argument(
         "--aliyun-profile", help="读取本机 ~/.aliyun/config.json；默认使用 OSS 环境凭据"
     )
@@ -193,8 +225,23 @@ def main() -> int:
         https_url(config["public_base_url"])
         if not re.fullmatch(r"[a-z0-9][a-z0-9/\-]*", config["prefix"]):
             raise ValueError("OSS prefix 无效")
-        prepared = prepare(args.bundle_dir, args.output, config)
+        notes = None
         if args.publish:
+            from release_version import release_tag
+
+            if not args.tag:
+                raise ValueError("发布需要 --tag v0.2.x")
+            version, notes = release_tag(args.tag)
+            if load_bundle(args.bundle_dir).version != version:
+                raise ValueError("bundle 版本与附注标签不一致")
+            commit = subprocess.check_output(
+                ["git", "rev-parse", f"refs/tags/{args.tag}^{{commit}}"], cwd=ROOT, text=True
+            ).strip()
+            if load_bundle(args.bundle_dir).commit != commit:
+                raise ValueError("bundle commit 与附注标签不一致")
+        prepared = prepare(args.bundle_dir, args.output, config, release_notes=notes)
+        if args.publish:
+            check_channel_promotion(prepared, config)
             publish(args.output, prepared, config, oss_bucket(config, args.aliyun_profile))
         print(json.dumps({"published": args.publish, **prepared}, ensure_ascii=False))
     except Exception as error:

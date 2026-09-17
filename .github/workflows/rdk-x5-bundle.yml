@@ -8,6 +8,8 @@ on:
         type: boolean
         default: false
   push:
+    tags:
+      - "v*"
     branches:
       - main
       - "ci/**"
@@ -26,15 +28,16 @@ on:
       - "scripts/build_rdk_x5_bundle.py"
       - "scripts/rdk_x5_install.py"
       - "scripts/publish_rdk_x5_oss.py"
+      - "scripts/release_version.py"
       - "deploy/oss-release.json"
       - "src/**"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: rdk-x5-bundle-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.publish_oss) && 'rdk-x5-public-release' || format('rdk-x5-build-{0}', github.ref) }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -45,11 +48,39 @@ jobs:
       RDK_RUNTIME_NAME: cpython-3.11.16+20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
       RDK_RUNTIME_URL: https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.11.16%2B20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
       RDK_RUNTIME_SHA256: 9142c12dd3559eaac58a18d8905b99a293979d5e5a1b4fb5cf4cebbf82ef6f33
-      RDK_WHEEL: dist-aarch64/rp_ylx-0.1.0-cp311-abi3-manylinux_2_28_aarch64.whl
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v10.0.1
+
+      - name: 校验统一版本并解析构建身份
+        env:
+          PUBLISH_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss) }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+          from scripts.release_version import project_version, release_tag
+          version = project_version()
+          if os.environ["PUBLISH_RELEASE"] == "true":
+              if not os.environ["GITHUB_REF"].startswith("refs/tags/"):
+                  raise SystemExit("正式发布必须在附注标签 v0.2.x 上运行，不能发布分支")
+              version, notes = release_tag(os.environ["GITHUB_REF_NAME"])
+              Path("release-notes.txt").write_text(notes + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as stream:
+              stream.write(f"RDK_VERSION={version}\n")
+              stream.write("RDK_COMMIT=" + subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() + "\n")
+              stream.write(f"RDK_WHEEL=dist-aarch64/rp_ylx-{version}-cp311-abi3-manylinux_2_28_aarch64.whl\n")
+          PY
+
+      - name: 正式发布前执行完整无硬件检查
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
+        run: |
+          uv sync --frozen --extra dev
+          uv run python scripts/check.py
 
       - name: 安装 Rust aarch64 target
         run: |
@@ -86,12 +117,12 @@ jobs:
           import zipfile
 
           wheel = Path(os.environ["RDK_WHEEL"])
-          expected_sha = os.environ["GITHUB_SHA"]
+          expected_sha = os.environ["RDK_COMMIT"]
           if not wheel.is_file():
               raise SystemExit(f"missing wheel: {wheel}")
           with zipfile.ZipFile(wheel) as archive:
               build_info = archive.read("rp_ylx/_build_info.py").decode()
-              wheel_metadata = archive.read("rp_ylx-0.1.0.dist-info/WHEEL").decode()
+              wheel_metadata = archive.read(f"rp_ylx-{os.environ['RDK_VERSION']}.dist-info/WHEEL").decode()
           if expected_sha not in build_info:
               sys.stderr.write(build_info)
               raise SystemExit(f"wheel build_info does not contain {expected_sha}")
@@ -114,8 +145,8 @@ jobs:
             --application-wheel "$RDK_WHEEL" \
             --runtime "dist-runtime/$RDK_RUNTIME_NAME" \
             --output dist-rdk-x5 \
-            --version 0.1.0 \
-            --build-info "rp-ylx 0.1.0 (${GITHUB_SHA})"
+            --version "$RDK_VERSION" \
+            --build-info "rp-ylx ${RDK_VERSION} (${RDK_COMMIT})"
 
       - name: 校验 bundle manifest
         run: |
@@ -136,7 +167,7 @@ jobs:
           if-no-files-found: error
 
       - name: 发布到阿里云 OSS 国内下载源
-        if: github.event_name == 'workflow_dispatch' && inputs.publish_oss
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
@@ -144,4 +175,17 @@ jobs:
           uv run scripts/publish_rdk_x5_oss.py \
             --bundle-dir dist-rdk-x5 \
             --output dist-oss-release \
-            --publish
+            --publish --tag "$GITHUB_REF_NAME"
+
+      - name: 创建对应 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "OpenAria $GITHUB_REF_NAME" --notes-file release-notes.txt \
+            dist-oss-release/bundle.tar.gz dist-oss-release/latest.json \
+            dist-oss-release/install.sh

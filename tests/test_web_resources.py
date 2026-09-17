@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import tempfile
+import tomllib
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -37,9 +38,12 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
         self.assertIn(ENTRY_ASSET, WEB_ASSETS)
 
     def test_release_and_source_identity_are_pinned(self) -> None:
-        self.assertEqual(echo_web_release(), ("openaria-echo-web", "0.1.0"))
+        project = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        self.assertEqual(echo_web_release(), ("openaria-echo-web", project["project"]["version"]))
         self.assertEqual(echo_web_source(), (ECHO_WEB_SOURCE_REPOSITORY, ECHO_WEB_SOURCE_COMMIT))
-        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "792e47be4fc370c243d386d28cd9e3e41ea113fe")
+        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "451f32caaf66cf59f94367e39cb459c32afb8910")
 
     def test_manifest_requires_a_device_api_major_provided_by_the_gateway(self) -> None:
         self.assertEqual(echo_web_required_device_api_major(), 4)

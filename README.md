@@ -1,14 +1,18 @@
 # Open Aria Conductor
 
 Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 的双目视频与 IMU
-同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。0.5 代码仍保留
+同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。代码仍保留
 历史 package、CLI、systemd unit 和数据标识作为兼容别名，以兼容现有安装与已录制会话。
+
+当前交付版本为 **0.2.1**。后续仅递增 `0.2.x`；未经用户明确授权不改变版本系列。
+网页顶部版本入口可检查更新、手动升级和回退，设备通过阿里云 OSS 获取完整应用包。
+发版采用附注标签，详细步骤见 [安装与发布手册](docs/one-click-install.md)。
 
 浏览器控制端由 [Open Aria Echo / Web](https://github.com/Alpenl/openaria-echo-web)
 独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
 
 [Score D-049](https://github.com/mirrorbloom/openaria-score/blob/main/docs/DECISIONS.md#d-049-fixed-storage-and-lan-only-delivery-removable-and-interruption-workflows-retired)
-规定当前 0.5 产品向部署配置的固定 `/data` 写入，并通过 LAN 交付封存会话。
+规定产品向部署配置的固定 `/data` 写入，并通过 LAN 交付封存会话。
 2026-09-15 根据录制兜底要求补充了完整前段恢复：录制失败或进程中断后，设备校验已完成的
 连续双目分段并发布可用前段，界面显示“录制已中断，已保存前 … 秒，可导出”。无法确认有效的
 尾段保留在设备上供排查。物理断电持久性、真实 TF `p3`、可移除介质、ENOSPC/inode 耗尽和
@@ -111,6 +115,6 @@ RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援
 
 ## 当前状态
 
-Rewrite MVP 已建立最小可运行基线。0.5 的差量功能按 GitHub Issue 逐项实现与验收。
+Rewrite MVP 已建立最小可运行基线。后续差量功能按 GitHub Issue 逐项实现与验收。
 
 公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。

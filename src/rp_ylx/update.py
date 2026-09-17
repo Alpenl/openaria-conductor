@@ -39,6 +39,40 @@ UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
 
 
+@contextmanager
+def maintenance_lock(*, shared: bool = False):
+    """Capture holds a shared lease; an update holds an exclusive lease.
+
+    The file lives outside the service's lifecycle and must never be unlinked
+    while services restart. Stock Python can use this standalone module too.
+    """
+    path = Path(os.environ.get("OPENARIA_MAINTENANCE_LOCK", "/run/rp-ylx/maintenance.lock"))
+    # Source/mock installations have no system-managed lock. Production tmpfiles
+    # creates it before the capture service starts. Root updates always create it.
+    if (
+        shared
+        and not path.exists()
+        and not CURRENT.exists()
+        and "OPENARIA_MAINTENANCE_LOCK" not in os.environ
+    ):
+        yield
+        return
+    if not shared:
+        # A pristine board has not installed the tmpfiles configuration yet.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("更新维护锁不是普通文件")
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("设备正在录制或更新，请等待当前任务完成") from error
+        yield
+    finally:
+        os.close(fd)
+
+
 def prepare_first_install_network(
     *, state_dir: Path | None = None, profile_dir: Path | None = None
 ) -> None:
@@ -254,7 +288,10 @@ def download(url: str, destination: Path, limit: int) -> None:
     for attempt in range(3):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "openaria-updater/1"})
-            with opener.open(request, timeout=60) as response, destination.open("wb") as out:
+            # Small metadata checks must return before the API's 75 second
+            # deadline, including retries. Large firmware keeps a longer timeout.
+            timeout = 10 if limit <= 128 * 1024 else 60
+            with opener.open(request, timeout=timeout) as response, destination.open("wb") as out:
                 count = 0
                 for block in iter(lambda: response.read(1024 * 1024), b""):
                     count += len(block)
@@ -558,6 +595,7 @@ def main(argv=None) -> int:
     action.add_argument("--status", action="store_true", help="查看本机部署状态（离线）")
     parser.add_argument("--reinstall", action="store_true", help="同一 commit 也重新安装")
     parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--expected-commit", help="要求渠道仍指向用户确认的完整 commit")
     args = parser.parse_args(argv)
     try:
         if args.status:
@@ -571,12 +609,25 @@ def main(argv=None) -> int:
         cache = args.cache_dir or (
             DEFAULT_CACHE if os.geteuid() == 0 else Path.home() / ".cache/openaria"
         )
-        with cache_lock(cache), tempfile.TemporaryDirectory(prefix=".stage-", dir=cache) as temp:
+        from contextlib import nullcontext
+
+        lease = nullcontext() if args.check or args.download_only else maintenance_lock()
+        with (
+            cache_lock(cache),
+            lease,
+            tempfile.TemporaryDirectory(prefix=".stage-", dir=cache) as temp,
+        ):
             if args.rollback:
                 require_idle()
+                if args.expected_commit is not None:
+                    previous = CURRENT.parent / "previous"
+                    if not previous.is_symlink() or previous.resolve().name != args.expected_commit:
+                        raise ValueError("上一版本已变化，请重新确认回退目标")
                 return subprocess.call(["/usr/local/sbin/rp-ylx-deploy", "rollback"])
             directory = Path(temp)
             manifest = fetch_manifest(args.manifest, directory)
+            if args.expected_commit is not None and manifest["commit"] != args.expected_commit:
+                raise ValueError("发布渠道已变化，请重新检查并确认更新版本")
             current = current_commit()
             result = {
                 "current": current,
