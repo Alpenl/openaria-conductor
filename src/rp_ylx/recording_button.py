@@ -58,7 +58,7 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 
 @dataclass(frozen=True)
 class ButtonConfig:
-    enabled: bool = False
+    enabled: bool = True
     physical_pin: int = 37
     active_low: bool = False
     debounce_ms: int = 80

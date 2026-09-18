@@ -76,7 +76,7 @@ class ButtonInputTest(unittest.TestCase):
     def test_disabled_config_does_not_open_gpio_or_api(self) -> None:
         with TemporaryDirectory() as directory:
             config = Path(directory) / "button.json"
-            config.write_text("{}")
+            config.write_text('{"enabled": false}')
             with (
                 patch("rp_ylx.recording_button.load_gpio") as gpio,
                 patch("rp_ylx.recording_button.create_capture_client") as client,
@@ -84,6 +84,12 @@ class ButtonInputTest(unittest.TestCase):
                 self.assertEqual(main(["--config", str(config)]), 0)
                 gpio.assert_not_called()
                 client.assert_not_called()
+
+    def test_missing_enabled_field_starts_the_default_button(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "button.json"
+            path.write_text("{}")
+            self.assertTrue(load_button_config(path).enabled)
 
     def test_config_rejects_supply_ground_bad_types_and_unknown_fields(self) -> None:
         with TemporaryDirectory() as directory:

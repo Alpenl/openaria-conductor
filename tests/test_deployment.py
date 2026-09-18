@@ -322,22 +322,40 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertEqual(advertised.read_bytes(), _avahi_service())
         self.assertEqual(advertised.read_bytes(), _asset_bytes(MDNS_ASSET_NAME))
 
-    def test_optional_recording_button_configuration_survives_upgrade(self) -> None:
+    def test_recording_button_starts_by_default_and_preserves_custom_configuration(self) -> None:
         manager = self.manager()
         manager.install(self.bundle("a"))
         path = self.config_root / "recording-button.json"
         config = json.loads(path.read_bytes())
-        self.assertFalse(config["enabled"])
+        self.assertTrue(config["enabled"])
+        button_start = ("systemctl", "enable", "--now", "rp-ylx-recording-button.service")
+        self.assertIn(button_start, self.commands)
+        self.assertLess(self.commands.index(("health-check",)), self.commands.index(button_start))
         config.update(enabled=True, active_low=True)
         path.write_text(json.dumps(config))
         manager.install(self.bundle("b"))
         self.assertEqual(json.loads(path.read_bytes()), config)
-        self.assertNotIn(
-            ("systemctl", "enable", "--now", "rp-ylx-recording-button.service"), self.commands
-        )
+        self.assertEqual(self.commands.count(button_start), 2)
         unit = self.root / "usr/lib/systemd/system/rp-ylx-recording-button.service"
         self.assertIn("PartOf=rp-ylx.service", unit.read_text())
         self.assertIn("WantedBy=rp-ylx.service", unit.read_text())
+
+    def test_explicitly_disabled_button_stays_disabled_during_upgrade(self) -> None:
+        manager = self.manager()
+        manager.install(self.bundle("a"))
+        path = self.config_root / "recording-button.json"
+        config = json.loads(path.read_bytes())
+        config.update(enabled=False, physical_pin=35, status_led=None)
+        path.write_text(json.dumps(config))
+        self.commands.clear()
+        manager.install(self.bundle("b"))
+        self.assertEqual(json.loads(path.read_bytes()), config)
+        self.assertIn(
+            ("systemctl", "disable", "--now", "rp-ylx-recording-button.service"), self.commands
+        )
+        self.assertNotIn(
+            ("systemctl", "enable", "--now", "rp-ylx-recording-button.service"), self.commands
+        )
 
     def test_bootstrap_root_carries_the_mdns_asset_for_standalone_deploys(self) -> None:
         # deployment.py 会被单独复制到 /usr/local/lib/rp-ylx 运行，其资产也必须一并落地。

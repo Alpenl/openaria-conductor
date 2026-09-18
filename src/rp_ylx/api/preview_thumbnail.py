@@ -1,6 +1,7 @@
-"""Small, demand-driven previews; acquisition never calls the JPEG codec.
+"""Bounded, demand-driven previews; acquisition never calls the JPEG codec.
 
-TurboJPEG performs scaled IDCT and compression in C with the GIL released.
+Native camera JPEGs pass through without decoding or recompression. Oversized
+sources use TurboJPEG scaled IDCT and compression with the GIL released.
 Each viewer shares one latest-only result, with no queue of stale raw frames.
 """
 
@@ -9,6 +10,13 @@ from __future__ import annotations
 import ctypes as c
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Preserve the camera's 3840x1080 stereo JPEG: each eye keeps all 1920x1080
+# pixels, with no extra compression loss or codec cost on the normal path.
+# Keep a bounded scaled-IDCT fallback for larger sources.
+PREVIEW_MAX_WIDTH = 3840
+PREVIEW_JPEG_QUALITY = 85
 
 
 class ThumbnailCodec:
@@ -52,11 +60,11 @@ class ThumbnailCodec:
             raise ValueError("invalid preview JPEG header")
         if not 0 < width.value <= 8192 or not 0 < height.value <= 8192:
             raise ValueError("preview JPEG dimensions exceed limit")
-        if width.value <= 960:
+        if width.value <= PREVIEW_MAX_WIDTH:
             return jpeg
         # Power-of-two IDCT scaling is supported by all deployed TurboJPEG ABIs.
         divisor = 1
-        while (width.value + divisor - 1) // divisor > 960:
+        while (width.value + divisor - 1) // divisor > PREVIEW_MAX_WIDTH:
             divisor *= 2
         divisor = min(divisor, 8)
         w, h = (width.value + divisor - 1) // divisor, (height.value + divisor - 1) // divisor
@@ -68,7 +76,17 @@ class ThumbnailCodec:
         output, size = c.c_void_p(), c.c_ulong()
         try:
             if library.tjCompress2(
-                self.encoder, self.pixels, w, 0, h, 0, c.byref(output), c.byref(size), 2, 75, 2304
+                self.encoder,
+                self.pixels,
+                w,
+                0,
+                h,
+                0,
+                c.byref(output),
+                c.byref(size),
+                2,
+                PREVIEW_JPEG_QUALITY,
+                2304,
             ):
                 raise ValueError("preview JPEG encode failed")
             return c.string_at(output, size.value)
@@ -118,33 +136,59 @@ class PreviewThumbnails:
             self.condition.notify_all()
 
     def _run(self):
-        codec = None
+        codecs = []
         previous = None
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="preview-codec")
         try:
-            codec = self.codec_factory()
+            # HD scaling takes longer than a 40 ms frame period on RDK X5.
+            # Two independent codecs overlap work, with at most one frame per
+            # codec in flight. There is never a queue of waiting camera frames.
+            codecs = [self.codec_factory()]
+            codecs.append(self.codec_factory())
+            pending = [None, None]
             while True:
                 started = time.monotonic()
                 with self.condition:
                     if started - self.requested > 2:
                         return
                     generation = self.generation
-                frame = self.snapshot()
-                if frame.sequence != previous:
-                    jpeg = codec.resize(frame.jpeg)
-                    with self.condition:
-                        if generation == self.generation:
-                            self.latest = type(frame)(frame.sequence, jpeg)
-                            previous = frame.sequence
-                            self.condition.notify_all()
+                for slot, future in enumerate(pending):
+                    if future is not None:
+                        if not future.done():
+                            continue
+                        future.result()
+                    frame = self.snapshot()
+                    if frame.sequence != previous:
+                        pending[slot] = executor.submit(
+                            self._encode, codecs[slot], frame, generation
+                        )
+                        previous = frame.sequence
+                    break
+                deadline = started + 1 / 25
                 with self.condition:
-                    self.condition.wait(max(0.001, 1 / 25 - (time.monotonic() - started)))
+                    # Completion notifications wake initial viewers, but must
+                    # not cause the producer to exceed its shared 25 FPS cap.
+                    self.condition.wait_for(
+                        lambda generation=generation: generation != self.generation,
+                        timeout=max(0.001, deadline - time.monotonic()),
+                    )
         except Exception:
             # Unavailable camera / codec is retried on the next viewer request.
             pass
         finally:
-            if codec is not None:
+            executor.shutdown(wait=True)
+            for codec in codecs:
                 codec.close()
             with self.condition:
                 self.worker = None
                 self.latest = None
+                self.condition.notify_all()
+
+    def _encode(self, codec, frame, generation):
+        jpeg = codec.resize(frame.jpeg)
+        with self.condition:
+            if generation == self.generation and (
+                self.latest is None or frame.sequence > self.latest.sequence
+            ):
+                self.latest = type(frame)(frame.sequence, jpeg)
                 self.condition.notify_all()

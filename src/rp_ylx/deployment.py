@@ -2205,6 +2205,9 @@ class ReleaseManager:
             self.runner(["systemctl", "enable", "--now", unit])
         if check_health:
             self.health_checker()
+        button_config = json.loads((self.config_root / "recording-button.json").read_bytes())
+        button_action = "enable" if button_config.get("enabled", True) is True else "disable"
+        self.runner(["systemctl", button_action, "--now", "rp-ylx-recording-button.service"])
         self.runner(["systemctl", "enable", "--now", WATCHDOG_TIMER])
 
     def _deactivate_systemd_units(self) -> None:

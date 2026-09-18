@@ -43,7 +43,7 @@ class EmbeddedWebResourcesTest(unittest.TestCase):
         )
         self.assertEqual(echo_web_release(), ("openaria-echo-web", project["project"]["version"]))
         self.assertEqual(echo_web_source(), (ECHO_WEB_SOURCE_REPOSITORY, ECHO_WEB_SOURCE_COMMIT))
-        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "a2f64dbd78e78b14a06f994d3695d40bf610244d")
+        self.assertEqual(ECHO_WEB_SOURCE_COMMIT, "975b0fc3d6c02c628807c2379925cf34c1bade20")
 
     def test_manifest_requires_a_device_api_major_provided_by_the_gateway(self) -> None:
         self.assertEqual(echo_web_required_device_api_major(), 4)
