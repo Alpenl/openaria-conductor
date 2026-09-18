@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "physical_pin": 37,
   "active_low": false,
   "debounce_ms": 80,
