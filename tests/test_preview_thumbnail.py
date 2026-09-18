@@ -16,10 +16,10 @@ class PreviewThumbnailTests(unittest.TestCase):
             self.skipTest("libturbojpeg required for codec integration")
         try:
             source = io.BytesIO()
-            Image.new("RGB", (3840, 1080), (100, 50, 200)).save(source, format="JPEG")
+            Image.new("RGB", (7680, 2160), (100, 50, 200)).save(source, format="JPEG")
             output = codec.resize(source.getvalue())
             with Image.open(io.BytesIO(output)) as decoded:
-                self.assertEqual(decoded.size, (1920, 540))
+                self.assertEqual(decoded.size, (3840, 1080))
                 self.assertLess(abs(decoded.getpixel((50, 50))[0] - 100), 5)
             self.assertLess(len(output), len(source.getvalue()))
             with self.assertRaises(ValueError):
@@ -33,16 +33,20 @@ class PreviewThumbnailTests(unittest.TestCase):
         except OSError:
             self.skipTest("libturbojpeg required for codec integration")
         try:
-            # Two-pixel lines in the source should remain distinct at preview
-            # resolution. The old quarter-size preview averages them to grey.
+            # Preserve even one-pixel detail in each native 1920x1080 eye.
+            # Downscaling either eye would average these lines to grey.
             image = Image.new("RGB", (3840, 1080), "black")
             draw = ImageDraw.Draw(image)
-            for x in range(0, image.width, 4):
-                draw.rectangle((x, 0, x + 1, image.height - 1), fill="white")
+            for x in range(0, image.width, 2):
+                draw.line((x, 0, x, image.height - 1), fill="white")
             source = io.BytesIO()
             image.save(source, format="JPEG", quality=95)
-            with Image.open(io.BytesIO(codec.resize(source.getvalue()))) as decoded:
-                for eye_start in (0, 960):
+            jpeg = source.getvalue()
+            output = codec.resize(jpeg)
+            self.assertIs(output, jpeg)
+            with Image.open(io.BytesIO(output)) as decoded:
+                self.assertEqual(decoded.size, (3840, 1080))
+                for eye_start in (0, 1920):
                     bright = decoded.getpixel((eye_start + 100, 100))[0]
                     dark = decoded.getpixel((eye_start + 101, 100))[0]
                     self.assertGreater(bright - dark, 150)

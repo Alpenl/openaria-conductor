@@ -1,6 +1,7 @@
 """Bounded, demand-driven previews; acquisition never calls the JPEG codec.
 
-TurboJPEG performs scaled IDCT and compression in C with the GIL released.
+Native camera JPEGs pass through without decoding or recompression. Oversized
+sources use TurboJPEG scaled IDCT and compression with the GIL released.
 Each viewer shares one latest-only result, with no queue of stale raw frames.
 """
 
@@ -11,10 +12,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# A 3840x1080 stereo source becomes 960x540 per eye. The former 960-wide
-# stereo thumbnail left only 480x270 per eye, losing detail when displayed.
-# Keep scaled IDCT and a bounded frame size instead of decoding full resolution.
-PREVIEW_MAX_WIDTH = 1920
+# Preserve the camera's 3840x1080 stereo JPEG: each eye keeps all 1920x1080
+# pixels, with no extra compression loss or codec cost on the normal path.
+# Keep a bounded scaled-IDCT fallback for larger sources.
+PREVIEW_MAX_WIDTH = 3840
 PREVIEW_JPEG_QUALITY = 85
 
 

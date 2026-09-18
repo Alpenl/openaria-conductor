@@ -1,7 +1,7 @@
 {
   "schema": "openaria.echo-web-artifacts.v2",
   "name": "openaria-echo-web",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "compatibility": {
     "device_api": {
       "required_major": 4
@@ -12,7 +12,7 @@
     {
       "path": "app.js",
       "bytes": 126112,
-      "sha256": "439d308b88f3803ca11f48b0124673c8d34f167ceebf0f8d68d2a976a6e07ee3",
+      "sha256": "5b76ad249b564d47868751cdb4f33ad9b3b7b70b2dcfb365e87d53553b5f204d",
       "content_type": "text/javascript; charset=utf-8"
     },
     {
