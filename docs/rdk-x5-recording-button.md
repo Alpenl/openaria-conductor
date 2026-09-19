@@ -3,7 +3,8 @@
 三线按钮模块可连接 RDK X5 的 40PIN 排针，通过当前 Device API 控制录制。
 短按一次开始，录制时再短按一次停止并保存。从 0.2.5 起，新安装默认启用按钮，
 安装器自动启动服务并设置开机自启；默认使用物理 37 脚、按下高电平。
-升级保留已有配置，包括自定义引脚、极性和显式关闭设置。
+从 0.2.7 起，安装、重装和升级都会恢复按钮启用，修复旧配置中遗留的关闭状态；
+自定义引脚、极性、防抖和指示灯参数仍然保留。
 启用按钮服务后，默认同时使用板载 `ACT` 状态灯显示实际录制状态，无需增加接线。
 
 ## 接线
@@ -40,7 +41,7 @@
 
 先通过正常固件安装流程安装包含 `rp_ylx.recording_button` 的版本。
 安装器提供 `/etc/rp-ylx/recording-button.json` 和 `rp-ylx-recording-button.service`，
-新安装无需手动启用；升级保留已经配置的引脚、极性和启用状态。
+新安装无需手动启用；升级保留已经配置的引脚和极性，并自动恢复启用状态。
 需要系统预置的 `Hobot.GPIO`，无需联网安装 Python 依赖。
 
 接好线并开机后，先运行只读检测。若按钮服务已运行，先停止它，避免两个程序占用同一引脚：
@@ -79,7 +80,8 @@ sudo systemctl enable --now rp-ylx-recording-button.service
 sudo journalctl -u rp-ylx-recording-button.service -f
 ```
 
-关闭按钮控制：`sudo systemctl disable --now rp-ylx-recording-button.service`。
+临时关闭按钮控制：`sudo systemctl disable --now rp-ylx-recording-button.service`。
+下次安装、重装或升级固件时会自动恢复启用。
 
 ## 录制指示灯
 
