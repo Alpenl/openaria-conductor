@@ -340,20 +340,44 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn("PartOf=rp-ylx.service", unit.read_text())
         self.assertIn("WantedBy=rp-ylx.service", unit.read_text())
 
-    def test_explicitly_disabled_button_stays_disabled_during_upgrade(self) -> None:
+    def test_disabled_button_is_enabled_during_upgrade_preserving_wiring(self) -> None:
         manager = self.manager()
         manager.install(self.bundle("a"))
         path = self.config_root / "recording-button.json"
         config = json.loads(path.read_bytes())
-        config.update(enabled=False, physical_pin=35, status_led=None)
+        config.update(
+            enabled=False,
+            physical_pin=35,
+            active_low=True,
+            debounce_ms=120,
+            status_led=None,
+            status_led_inverted=True,
+        )
         path.write_text(json.dumps(config))
         self.commands.clear()
         manager.install(self.bundle("b"))
+        config["enabled"] = True
         self.assertEqual(json.loads(path.read_bytes()), config)
         self.assertIn(
-            ("systemctl", "disable", "--now", "rp-ylx-recording-button.service"), self.commands
+            ("systemctl", "enable", "--now", "rp-ylx-recording-button.service"), self.commands
         )
         self.assertNotIn(
+            ("systemctl", "disable", "--now", "rp-ylx-recording-button.service"), self.commands
+        )
+
+    def test_button_missing_enabled_is_migrated_on_reinstall(self) -> None:
+        manager = self.manager()
+        bundle = self.bundle("a")
+        manager.install(bundle)
+        path = self.config_root / "recording-button.json"
+        config = json.loads(path.read_bytes())
+        del config["enabled"]
+        path.write_text(json.dumps(config))
+        self.commands.clear()
+        manager.install(bundle)
+        config["enabled"] = True
+        self.assertEqual(json.loads(path.read_bytes()), config)
+        self.assertIn(
             ("systemctl", "enable", "--now", "rp-ylx-recording-button.service"), self.commands
         )
 

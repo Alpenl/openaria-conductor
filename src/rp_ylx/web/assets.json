@@ -1,7 +1,7 @@
 {
   "schema": "openaria.echo-web-artifacts.v2",
   "name": "openaria-echo-web",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "compatibility": {
     "device_api": {
       "required_major": 4

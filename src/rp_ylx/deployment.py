@@ -2052,6 +2052,23 @@ class ReleaseManager:
             if name == "rp-ylx.avahi":
                 continue
             if name in PRESERVED_DEPLOYMENT_ASSETS and target.exists():
+                if name == "rp-ylx-recording-button.json":
+                    # Older installs shipped enabled=false. Every deployment
+                    # restores the product default without losing wiring/LED settings.
+                    _require_regular_file(target, code="production_config_invalid")
+                    try:
+                        config = json.loads(target.read_bytes())
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise DeploymentError(
+                            "production_config_invalid", "recording-button.json 不可读"
+                        ) from error
+                    if not isinstance(config, dict):
+                        raise DeploymentError(
+                            "production_config_invalid", "recording-button.json 必须是对象"
+                        )
+                    if config.get("enabled") is not True:
+                        config["enabled"] = True
+                        _write_bytes_atomic(target, _json_bytes(config), mode)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             _write_bytes_atomic(target, _asset_bytes(name), mode)
