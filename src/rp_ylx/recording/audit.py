@@ -7,6 +7,8 @@ from collections import deque
 from pathlib import Path
 from threading import Event
 
+from .cadence import FrameCadence
+
 
 def _journal_lines(stream, finished: Event | None):
     """Tail complete records; a producer may be halfway through one write."""
@@ -31,6 +33,7 @@ def _journal_lines(stream, finished: Event | None):
 def capture_audit(
     root: Path, nominal_fps: float, frame_decimation: int = 1, *, finished: Event | None = None
 ) -> dict:
+    cadence = FrameCadence(nominal_fps)
     first = previous = last = None
     frames = matched = 0
     maximum_interval = 0
@@ -74,6 +77,7 @@ def capture_audit(
         for line in _journal_lines(camera, finished):
             frame = json.loads(line)
             host = frame["host_monotonic_ns"]
+            cadence.observe(host)
             if first is None:
                 first = host
             if previous is not None:
@@ -148,6 +152,7 @@ def capture_audit(
             "last_monotonic_ns": last,
             "actual_fps": (frames - 1) / frame_span if frame_span else None,
             "nominal_fps": nominal_fps,
+            "cadence": cadence.summary(),
             "max_interval_ns": maximum_interval,
             "max_dequeue_delay_ns": maximum_dequeue_delay,
             "clock_sources": sorted(clocks),
