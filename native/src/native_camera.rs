@@ -48,7 +48,7 @@ pub(crate) struct Frame {
     pub(crate) producer_max_read_ns: u64,
     pub(crate) left: Vec<u8>,
     pub(crate) right: Vec<u8>,
-    pub(crate) raw_side_by_side: Vec<u8>,
+    pub(crate) raw_side_by_side: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,7 +512,13 @@ fn run_producer(
             let (source_sequence, host_monotonic_ns, raw_side_by_side) = resources
                 .capture
                 .read_ready_with(|source_sequence, host_monotonic_ns, payload| {
-                    Ok((source_sequence, host_monotonic_ns, payload.to_vec()))
+                    // Own the V4L2 bytes before requeueing its buffer. Recording
+                    // and latest preview then share this immutable allocation.
+                    Ok((
+                        source_sequence,
+                        host_monotonic_ns,
+                        Arc::<[u8]>::from(payload),
+                    ))
                 })?;
             let now = Instant::now();
             timings[timing_index] = (

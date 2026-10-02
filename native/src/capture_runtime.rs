@@ -545,13 +545,6 @@ fn process_frame(
             raw_size,
             u64::from(has_raw),
         );
-        let preview_jpeg = if has_left {
-            Some(frame.left.as_slice())
-        } else if has_raw {
-            Some(frame.raw_side_by_side.as_slice())
-        } else {
-            None
-        };
         let source_sequence = i64::try_from(frame.source_sequence).map_err(|_| {
             RuntimeError::new("bad_frame", "camera source sequence is out of range")
         })?;
@@ -585,16 +578,19 @@ fn process_frame(
             record_loss(metrics, "source_gap", validation.source_gap);
             let decision = state
                 .fanout
-                .begin_frame(validation.dropped_before, preview_jpeg.is_some())
+                .begin_frame(validation.dropped_before, has_left || has_raw)
                 .map_err(RuntimeError::from)?;
             if decision.publish_preview {
-                if let Some(jpeg) = preview_jpeg {
-                    let publish_started = start_stage(metrics);
-                    if let Err(error) = preview.publish(jpeg) {
-                        state.last_preview_error = Some(RuntimeError::from(error));
-                    }
-                    finish_stage(metrics, "native_preview_publish", publish_started);
+                let publish_started = start_stage(metrics);
+                let published = if has_left {
+                    preview.publish(&frame.left)
+                } else {
+                    preview.publish_shared(Arc::clone(&frame.raw_side_by_side))
+                };
+                if let Err(error) = published {
+                    state.last_preview_error = Some(RuntimeError::from(error));
                 }
+                finish_stage(metrics, "native_preview_publish", publish_started);
             }
             let dispatch = if decision.record {
                 state.recording.clone()
@@ -962,6 +958,42 @@ mod tests {
         std::env::temp_dir().join(format!("rp-ylx-{name}-{}-{unique}", std::process::id()))
     }
 
+    #[test]
+    fn capture_preview_shares_the_owned_raw_frame_without_copying() {
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(25).unwrap()),
+            2,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        let raw: Arc<[u8]> = Arc::from(&b"\xff\xd8payload\xff\xd9"[..]);
+        process_frame(
+            &runtime.preview,
+            &runtime.shared,
+            Frame {
+                buffer_flags: 0,
+                dequeue_monotonic_ns: 0,
+                source_sequence: 1,
+                host_monotonic_ns: 1_000_000,
+                application_dropped_before: 0,
+                producer_max_interval_ns: 0,
+                producer_max_control_ns: 0,
+                producer_max_read_ns: 0,
+                left: Vec::new(),
+                right: Vec::new(),
+                raw_side_by_side: Arc::clone(&raw),
+            },
+            None,
+        )
+        .unwrap();
+        let snapshot = runtime.preview.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&raw, &snapshot.jpeg));
+        assert_eq!(snapshot.sequence, 1);
+        assert!(!runtime.snapshot().unwrap().recording_present);
+    }
+
     fn test_recording(py: Python<'_>, root: &std::path::Path) -> SplitSinkRecording {
         fs::create_dir_all(root.join("video")).unwrap();
         SplitSinkRecording {
@@ -1038,7 +1070,7 @@ mod tests {
                     producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
-                    raw_side_by_side: b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
+                    raw_side_by_side: Arc::from(&b"prefix\xff\xd8payload\xff\xd9suffix"[..]),
                 },
                 0,
             )
@@ -1274,7 +1306,7 @@ mod tests {
                     producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
-                    raw_side_by_side: b"\xff\xd8payload\xff\xd9".to_vec(),
+                    raw_side_by_side: Arc::from(&b"\xff\xd8payload\xff\xd9"[..]),
                 },
                 None,
             )
