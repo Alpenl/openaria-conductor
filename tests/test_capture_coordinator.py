@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -596,6 +597,50 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator.latest_preview(fps=None, accept="image/jpeg")
             self.assertEqual(preview.exception.code, "camera_not_connected")
             self.assertEqual(preview.exception.status, 503)
+        finally:
+            coordinator.close()
+
+    def test_network_status_does_not_query_capture_hardware(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        runtime = deepcopy(coordinator._runtime())
+        legacy = {
+            "capabilities": {"second_wifi": False},
+            "mdns": {
+                "hostname": "rp-ylx.local",
+                "service": "_ylx-capture._tcp",
+                "aliases": ["_http._tcp"],
+                "port": 8080,
+            },
+            "devices": [],
+        }
+        try:
+            with (
+                patch.object(coordinator, "_runtime", return_value=runtime),
+                patch("rp_ylx.recording.coordinator.collect_network_status", return_value=legacy),
+                patch("rp_ylx.network._controller_status_projection", return_value=None),
+                patch("rp_ylx.network._state_dir", return_value=self.root / "network-state"),
+                patch.object(sources, "camera_connection_status") as camera,
+                patch.object(sources, "camera_focus_status") as focus,
+                patch.object(sources, "latest_imu_observation") as imu,
+            ):
+                first = coordinator.network_status()
+                self.assertEqual(first["schema"], "ylx.network-status.v1")
+                self.assertEqual(first["observed_at"], runtime["observed_at"])
+                self.assertEqual(first["observed"]["mdns"], legacy["mdns"])
+                self.assertEqual(first["observed"]["devices"], legacy["devices"])
+                for key, value in runtime["network"].items():
+                    self.assertEqual(first["observed"][key], value)
+
+                runtime["observed_at"] = "2026-10-03T00:00:01Z"
+                runtime["network"]["wired"]["addresses"] = ["192.0.2.42/24"]
+                second = coordinator.network_status()
+                self.assertEqual(second["observed_at"], runtime["observed_at"])
+                self.assertEqual(second["observed"]["wired"]["addresses"], ["192.0.2.42/24"])
+                self.assertNotEqual(first["observed_at"], second["observed_at"])
+                camera.assert_not_called()
+                focus.assert_not_called()
+                imu.assert_not_called()
         finally:
             coordinator.close()
 
@@ -1418,6 +1463,52 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_catalog_pages_isolate_nested_responses_and_legacy_projection(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-copy-isolation")
+            summary = coordinator._session_summaries[session_id]
+            summary["verification"]["verdict"] = "unusable"
+            summary["verification"]["diagnostics"] = [
+                {"code": "artifact_digest_mismatch", "summary": "artifact 摘要不匹配"}
+            ]
+            older = deepcopy(summary)
+            older["session_id"] = "01989f69-f000-7c3d-ae4f-5061728394a5"
+            older["started_at"] = older["ended_at"] = "2020-01-01T00:00:00Z"
+            coordinator._session_summaries[older["session_id"]] = older
+            coordinator._session_diagnostics["quarantined"] = coordinator._session_diagnostic(
+                "quarantined", OSError("unreadable")
+            )
+            original_summaries = deepcopy(coordinator._session_summaries)
+            original_diagnostics = deepcopy(coordinator._session_diagnostics)
+            with patch.object(coordinator, "_catalog_sessions", return_value=None):
+                for api_version in ("v2", "v3", "v4"):
+                    with self.subTest(api_version=api_version):
+                        first = coordinator.list_sessions(
+                            cursor=None, limit=1, take_id=None, api_version=api_version
+                        )
+                        continuation = first["next_cursor"]
+                        self.assertIsNotNone(continuation)
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        if api_version != "v4":
+                            self.assertEqual(
+                                first["items"][0]["verification"]["diagnostics"],
+                                ["artifact 摘要不匹配"],
+                            )
+                        first["items"][0]["device"]["device_label"] = "response-only"
+                        first["items"][0]["verification"]["diagnostics"].clear()
+                        last = coordinator.list_sessions(
+                            cursor=continuation, limit=3, take_id=None, api_version=api_version
+                        )
+                        self.assertEqual(last["items"][0]["session_id"], older["session_id"])
+                        self.assertEqual(len(last["diagnostics"]), 1)
+                        last["items"][0]["verification"]["validator"]["name"] = "modified"
+                        last["diagnostics"][0]["message"] = "response-only"
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        self.assertEqual(coordinator._session_diagnostics, original_diagnostics)
+        finally:
+            coordinator.close()
+
     def test_v4_quarantine_only_catalog_is_fully_pageable(self) -> None:
         coordinator = self.coordinator()
         try:
@@ -1651,11 +1742,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(len(listed["items"]), 2)
             roots = set(restarted._require_admission().catalog_roots)
             iterdir = Path.iterdir
+            scandir = os.scandir
 
             def without_catalog_scan(path: Path):
                 if path in roots:
                     raise AssertionError("artifact access must not enumerate other sessions")
                 return iterdir(path)
+
+            def without_catalog_scandir(path):
+                if Path(path) in roots:
+                    raise AssertionError("artifact access must not enumerate other sessions")
+                return scandir(path)
 
             for session_id, root in (
                 (current, self.mountpoint / "recordings"),
@@ -1665,6 +1762,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
                 with (
                     patch.object(Path, "iterdir", without_catalog_scan),
+                    patch.object(os, "scandir", without_catalog_scandir),
                     restarted.open_verified_artifact(
                         session_id, artifact["artifact_id"], "v4"
                     ) as opened,
@@ -1839,7 +1937,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
+    def test_cached_catalog_checks_verified_identity_without_reading_manifest(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
@@ -1848,14 +1946,140 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertGreater(len(list(iter_device_session_v1_artifacts(manifest))), 1)
 
-            with patch(
-                "rp_ylx.api.downloads._read_exact_file",
-                wraps=downloads_module._read_exact_file,
-            ) as read_manifest:
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            with (
+                patch(
+                    "rp_ylx.api.downloads._read_exact_file",
+                    side_effect=AssertionError("unchanged verified manifest must not be read"),
+                ),
+                patch(
+                    "rp_ylx.api.downloads._decode_and_validate_manifest",
+                    side_effect=AssertionError("unchanged manifest must not be revalidated"),
+                ),
+            ):
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
 
             self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
-            self.assertEqual(read_manifest.call_count, 1)
+        finally:
+            coordinator.close()
+
+    def test_cached_catalog_invalidates_manifest_replacement_and_restored_mtime(self) -> None:
+        for change in ("replace", "same_size_edit"):
+            with self.subTest(change=change):
+                coordinator = self.coordinator()
+                try:
+                    session_id = self.seal_one(coordinator, prefix=f"identity-{change}")
+                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    original = manifest_path.read_bytes()
+                    metadata = manifest_path.stat()
+                    if change == "replace":
+                        replacement = manifest_path.with_suffix(".replacement")
+                        replacement.write_bytes(original)
+                        os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                        replacement.replace(manifest_path)
+                    else:
+                        changed = original.replace(b"YLX-12AB34CD", b"YLX-56EF78AB")
+                        self.assertNotEqual(changed, original)
+                        self.assertEqual(len(changed), len(original))
+                        manifest_path.write_bytes(changed)
+                        os.utime(manifest_path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    self.assertEqual(manifest_path.stat().st_mtime_ns, metadata.st_mtime_ns)
+
+                    listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+                    selected = next(
+                        item for item in listed["items"] if item["session_id"] == session_id
+                    )
+                    self.assertIsNone(selected["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                    self.assertNotIn(session_id, coordinator._session_snapshots)
+                    if change == "same_size_edit":
+                        self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                finally:
+                    coordinator.close()
+
+    def test_catalog_scan_ignores_link_loops_and_non_directories(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-loop-filter")
+            root = self.mountpoint / "recordings"
+            (root / "loop").symlink_to("loop", target_is_directory=True)
+            (root / "dangling").symlink_to("absent", target_is_directory=True)
+            (root / "ordinary-file").write_text("not a session")
+            (root / "unfinished.partial").mkdir()
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual([item["session_id"] for item in page["items"]], [session_id])
+            self.assertIsNotNone(page["items"][0]["verification"])
+            self.assertEqual(page["diagnostics"], [])
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_closes_on_manifest_identity_error(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            self.seal_one(coordinator, prefix="catalog-scan-close")
+            descriptors_before = len(os.listdir("/proc/self/fd"))
+            with (
+                patch.object(
+                    coordinator,
+                    "_session_manifest_is_current",
+                    side_effect=RuntimeError("injected identity error"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected identity error"),
+            ):
+                coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors_before)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_checks_fresh_root_after_directory_replacement(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="catalog-root-first")
+            second = self.seal_one(coordinator, prefix="catalog-root-second")
+            root = self.mountpoint / "recordings"
+            check_identity = coordinator._session_manifest_is_current
+            checked: list[str] = []
+
+            def replace_after_first_check(session_id, snapshot):
+                current = check_identity(session_id, snapshot)
+                checked.append(session_id)
+                if len(checked) == 1:
+                    retired = self.mountpoint / "retired-recordings"
+                    root.rename(retired)
+                    shutil.copytree(retired, root)
+                return current
+
+            with patch.object(
+                coordinator, "_session_manifest_is_current", replace_after_first_check
+            ):
+                page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(set(checked), {first, second})
+            summaries = {item["session_id"]: item for item in page["items"]}
+            self.assertIsNotNone(summaries[checked[0]]["verification"])
+            self.assertIsNone(summaries[checked[1]]["verification"])
+            self.assertNotIn(checked[1], coordinator._session_snapshots)
+            self.assertNotIn(checked[1], coordinator._verified)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_rejects_session_replaced_with_symlink(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-session-link")
+            original = self.mountpoint / "recordings" / session_id
+            retired = self.mountpoint / "outside-recordings"
+            original.rename(retired)
+            original.symlink_to(retired, target_is_directory=True)
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual(page["items"], [])
+            self.assertEqual(len(page["diagnostics"]), 1)
+            self.assertNotIn(session_id, coordinator._session_snapshots)
+            self.assertNotIn(session_id, coordinator._verified)
         finally:
             coordinator.close()
 

@@ -16,7 +16,7 @@ import stat
 import uuid
 import wave
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -90,42 +90,105 @@ def _write_records(path: Path, records: Iterable[dict]) -> int:
     return count
 
 
-def _frames(root: Path, plan: SessionPlan, segments: list[dict], decimation: int) -> list[dict]:
-    """Reject an unindexed pair as a unit; a torn last line is not a frame."""
-    rows: list[dict] = []
+@dataclass(frozen=True)
+class _RecoveredFrames:
+    count: int
+    first_monotonic_ns: int
+    last_monotonic_ns: int
+    boundary_monotonic_ns: dict[int, int]
+
+
+def _frames(
+    root: Path, plan: SessionPlan, segments: list[dict], decimation: int, origin: int
+) -> _RecoveredFrames | None:
+    """Stream a canonical index, rolling back any incomplete final segment.
+
+    Keep a byte checkpoint only after an entire independently committed pair
+    has its index. Original journals survive failures and only complete prefixes
+    replace the derived index. Memory grows with segment boundaries, not frames.
+    """
     segment_index = 0
-    with _regular(root, "frames.ndjson").open("rb") as stream:
-        for line in stream:
-            if segment_index >= len(segments):
-                break
-            try:
-                row = json.loads(line)
-                segment = segments[segment_index]
-                if (
-                    not line.endswith(b"\n")
-                    or row["session_id"] != plan.session_id
-                    or row["schema"] not in {"ylx.frame-index.v1", "ylx.frame-index.v2"}
-                    or row["frame"] != len(rows)
-                    or row["segment_index"] != segment_index
-                    or row["segment_frame"] != len(rows) - segment["start_ordinal"]
-                    or type(row["host_monotonic_ns"]) is not int
-                    or row["host_monotonic_ns"] <= 0
-                    or (
-                        rows
-                        and (
-                            row["source_sequence"] - rows[-1]["source_sequence"] != decimation
-                            or row["host_monotonic_ns"] <= rows[-1]["host_monotonic_ns"]
-                        )
-                    )
-                ):
-                    break
-                rows.append(row)
-                if len(rows) == segment["end_ordinal"]:
-                    segment_index += 1
-            except (ValueError, KeyError, TypeError):
-                break
-    del segments[segment_index:]
-    return rows[: segments[-1]["end_ordinal"]] if segments else []
+    count = committed_count = committed_bytes = 0
+    first = last_committed = segment_first = None
+    previous = None
+    serialization_error = None
+    boundaries: dict[int, int] = {}
+    temporary = root / f".recovery-frames.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+        with os.fdopen(descriptor, "wb") as output:
+            with _regular(root, "frames.ndjson").open("rb") as stream:
+                for line in stream:
+                    if segment_index >= len(segments):
+                        break
+                    try:
+                        row = json.loads(line)
+                        segment = segments[segment_index]
+                        if (
+                            not line.endswith(b"\n")
+                            or row["session_id"] != plan.session_id
+                            or row["schema"] not in {"ylx.frame-index.v1", "ylx.frame-index.v2"}
+                            or row["frame"] != count
+                            or row["segment_index"] != segment_index
+                            or row["segment_frame"] != count - segment["start_ordinal"]
+                            or type(row["host_monotonic_ns"]) is not int
+                            or row["host_monotonic_ns"] <= 0
+                            or (
+                                previous is not None
+                                and (
+                                    row["source_sequence"] - previous["source_sequence"]
+                                    != decimation
+                                    or row["host_monotonic_ns"] <= previous["host_monotonic_ns"]
+                                )
+                            )
+                        ):
+                            break
+                    except (ValueError, KeyError, TypeError):
+                        break
+                    if first is None:
+                        first = row["host_monotonic_ns"]
+                    if count == segment["start_ordinal"]:
+                        segment_first = row["host_monotonic_ns"]
+                    # JSON can parse escaped lone surrogates that UTF-8 cannot
+                    # encode. Incomplete segments were previously discarded
+                    # before serialization, so defer this failure until the
+                    # segment is known to be retained.
+                    if serialization_error is None:
+                        try:
+                            payload = json_bytes(row)
+                        except UnicodeEncodeError as error:
+                            serialization_error = error
+                        else:
+                            if output.write(payload) != len(payload):
+                                raise OSError("short recovered frame index write")
+                    count += 1
+                    previous = row
+                    if count == segment["end_ordinal"]:
+                        if serialization_error is not None:
+                            raise serialization_error
+                        committed_count = count
+                        committed_bytes = output.tell()
+                        last_committed = row["host_monotonic_ns"]
+                        boundaries[segment["start_ordinal"]] = segment_first
+                        segment_index += 1
+            del segments[segment_index:]
+            if not committed_count:
+                return None
+            if type(origin) is not int or not 0 < origin <= first:
+                raise ValueError("invalid capture clock origin")
+            output.seek(committed_bytes)
+            output.truncate()
+            output.flush()
+            os.fsync(output.fileno())
+        recovery = root / "recovery"
+        if recovery.is_symlink():
+            raise ValueError("unsafe recovery directory")
+        recovery.mkdir(exist_ok=True, mode=0o750)
+        os.replace(temporary, recovery / "frames.ndjson")
+        fsync_directory(recovery)
+        return _RecoveredFrames(committed_count, first, last_committed, boundaries)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _audio(root: Path, config: DeviceSessionConfig, origin: int, video_end: float) -> dict | None:
@@ -302,20 +365,14 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
             end = record["end_ordinal"]
         except (OSError, ValueError, KeyError, TypeError, DeviceRecordingError):
             break
-    rows = _frames(partial, plan, segments, config.frame_decimation)
-    if not rows:
-        return None
     origin = capture["started_monotonic_ns"]
-    if type(origin) is not int or not 0 < origin <= rows[0]["host_monotonic_ns"]:
-        raise ValueError("invalid capture clock origin")
+    frames = _frames(partial, plan, segments, config.frame_decimation, origin)
+    if frames is None:
+        return None
     video_end = (
-        rows[-1]["host_monotonic_ns"] - origin
+        frames.last_monotonic_ns - origin
     ) / 1e9 + config.frame_decimation / config.sensor_fps
     recovery = partial / "recovery"
-    if recovery.is_symlink():
-        raise ValueError("unsafe recovery directory")
-    recovery.mkdir(exist_ok=True, mode=0o750)
-    _write_records(recovery / "frames.ndjson", rows)
 
     def imu_prefix():
         # IMU data can be much larger than the frame index on long takes.
@@ -365,7 +422,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
     )
     recorder._started_at = datetime.fromisoformat(capture["started_at"].replace("Z", "+00:00"))
     recorder._started_monotonic_ns = origin
-    recorder._frames_written = len(rows)
+    recorder._frames_written = frames.count
     recorder._imu_written = imu_count
     recorder._segment_records = segments
     for record in segments:
@@ -373,8 +430,8 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
             recorder._boundary_record_sequence[ordinal] = ordinal
             recorder._boundary_elapsed[ordinal] = (
                 video_end
-                if ordinal == len(rows)
-                else (rows[ordinal]["host_monotonic_ns"] - origin) / 1e9
+                if ordinal == frames.count
+                else (frames.boundary_monotonic_ns[ordinal] - origin) / 1e9
             )
     now = datetime.now(UTC)
     manifest = recorder._manifest(
@@ -408,7 +465,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         "outcome": "interrupted",
         "recovered_at": now.isoformat(),
         "saved_segments": len(segments),
-        "saved_frames": len(rows),
+        "saved_frames": frames.count,
         "saved_video_seconds": video_end,
         "diagnostics": diagnostics,
         "audio_recovered": audio is not None,

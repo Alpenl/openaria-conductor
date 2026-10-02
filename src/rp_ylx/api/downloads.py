@@ -599,7 +599,7 @@ class DirectorySessionStore:
                 raise RuntimeError("DirectorySessionStore 已关闭")
             return os.dup(self._root_descriptor)
 
-    def _open_manifest_bytes(self, session_id: str) -> tuple[list[int], int, _FileIdentity, bytes]:
+    def _open_manifest_file(self, session_id: str) -> tuple[list[int], int, _FileIdentity]:
         if not _SESSION_ID.fullmatch(session_id):
             raise ArtifactAccessError("not_found", "会话不存在")
         owned = [self._duplicate_root()]
@@ -611,6 +611,30 @@ class DirectorySessionStore:
             identity = _FileIdentity.read(manifest_descriptor)
             if identity.size > self._max_manifest_bytes:
                 raise ArtifactAccessError("not_found", "会话 manifest 无法读取")
+            return owned, manifest_descriptor, identity
+        except ArtifactAccessError:
+            _close_all(owned)
+            raise
+        except OSError as error:
+            _close_all(owned)
+            raise ArtifactAccessError("not_found", "会话不存在或尚未封存") from error
+
+    def manifest_identity(self, session_id: str) -> _ExclusiveFileIdentity:
+        """Stat a freshly opened, non-linked manifest without trusting new bytes.
+
+        This identity is only evidence for an unchanged, previously validated
+        snapshot. Reading a new manifest or serving artifacts still requires the
+        payload validation paths below.
+        """
+        owned, descriptor, _ = self._open_manifest_file(session_id)
+        try:
+            return _exclusive_regular_identity(descriptor)
+        finally:
+            _close_all(owned)
+
+    def _open_manifest_bytes(self, session_id: str) -> tuple[list[int], int, _FileIdentity, bytes]:
+        owned, manifest_descriptor, identity = self._open_manifest_file(session_id)
+        try:
             payload = _read_exact_file(manifest_descriptor, identity)
             return owned, manifest_descriptor, identity, payload
         except ArtifactAccessError:

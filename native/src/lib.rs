@@ -1118,10 +1118,6 @@ fn session_transaction_snapshot_dict(
         Some(audio) => value.set_item("audio", audio_snapshot_dict(py, audio)?)?,
         None => value.set_item("audio", py.None())?,
     }
-    value.set_item(
-        "segments",
-        stereo_encoder_segment_list(py, &snapshot.segments)?,
-    )?;
     value.set_item("submitted_frames", snapshot.submitted_frames)?;
     let encoder_stats = PyDict::new(py);
     for (name, count) in &snapshot.encoder_stats {

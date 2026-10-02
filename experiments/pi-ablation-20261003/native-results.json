@@ -1,0 +1,474 @@
+{
+  "baseline_commit": "e7da4babf1d1f48ebc262b5714497cfabac98801",
+  "compiler": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+  "platform": "Linux-6.8.0-94-generic-x86_64-with-glibc2.35",
+  "source_sha256": {
+    "baseline": "6e8c813ba16eb90f4e4f608abe5e0d1e09b4e85f92d828b4d131d4816c468f99",
+    "a1": "42d0c1bccfb28e5f197246cccbe075db69dacc97c5144a6d7e033e23afdf22f4",
+    "a2": "a3fe46071d79c0597fb1e8377fa6ffc64b92e89218ea6e6d803a41c7a452eae9",
+    "combined": "7f237e8beefda3e9f9221161d89ecf4cad12dcc741b4bdc22bf307184b623f4d",
+    "a3": "1d195ef29274e46198bea140ad2d1153c1872bdf1b0774df2088cc4940fb3e83",
+    "all": "d94ddd7fd83573180720ab2e4c9b3ae39b85ce6dc33a75febaca8786b3d4a89b",
+    "negative": "b2ebaddf8d11f5b193679e37e8854d78000d76d9c82e34cfcab66fe7c81d0db0"
+  },
+  "probe_sha256": "a55957c4235af0185f9d193fcbd305c54cecd234df4e40889e19a82ee815e4c9",
+  "median_ns_per_frame": {
+    "baseline": 37.381884,
+    "a1": 25.415642,
+    "a2": 31.185436,
+    "combined": 18.014835,
+    "a3": 37.160483,
+    "all": 18.325342
+  },
+  "raw_timing": [
+    {
+      "equivalence_traces": 20000,
+      "observed_operations": 543592,
+      "trace_digest": "ae2ca0fd3f813d2a"
+    },
+    {
+      "overlapping_reservations": "baseline accepts two; A2 intentionally rejects second with invalid_state"
+    },
+    {
+      "negative_control": "removing pending-finish guard incorrectly seals with one unfinished frame"
+    },
+    {
+      "writer_size_bytes": {
+        "baseline": 104,
+        "a1": 104,
+        "a2": 96,
+        "a3": 80,
+        "all": 72
+      }
+    },
+    {
+      "variant": "baseline",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 37461312,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 25224928,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 30925512,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 17898578,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 37051890,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 0,
+      "frames": 1000000,
+      "elapsed_ns": 18428814,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 24942713,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 30891490,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 17580686,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 37043144,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 18972716,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 1,
+      "frames": 1000000,
+      "elapsed_ns": 37926447,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 31185436,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 17868753,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 38330409,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 18325342,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 37381884,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 2,
+      "frames": 1000000,
+      "elapsed_ns": 25413278,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 18073324,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 37248255,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 19459692,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 37149572,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 25415642,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 3,
+      "frames": 1000000,
+      "elapsed_ns": 31199793,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 36887274,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 18163491,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 37613725,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 25971096,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 31397671,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 4,
+      "frames": 1000000,
+      "elapsed_ns": 18213544,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 18881647,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 37008610,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 25473992,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 31007445,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 18749481,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 5,
+      "frames": 1000000,
+      "elapsed_ns": 37130587,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 37384769,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 25626965,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 31235940,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 18014835,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 37160483,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 6,
+      "frames": 1000000,
+      "elapsed_ns": 18130228,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 24987716,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 30878926,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 17918244,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 37878397,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 18081288,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 7,
+      "frames": 1000000,
+      "elapsed_ns": 36896211,
+      "result": 514000000
+    },
+    {
+      "variant": "a2",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 31598536,
+      "result": 514000000
+    },
+    {
+      "variant": "combined",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 18301568,
+      "result": 514000000
+    },
+    {
+      "variant": "a3",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 37914796,
+      "result": 514000000
+    },
+    {
+      "variant": "all",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 18059377,
+      "result": 514000000
+    },
+    {
+      "variant": "baseline",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 37327783,
+      "result": 514000000
+    },
+    {
+      "variant": "a1",
+      "round": 8,
+      "frames": 1000000,
+      "elapsed_ns": 25850071,
+      "result": 514000000
+    }
+  ],
+  "allocations": [
+    {
+      "variant": "baseline",
+      "frames": 100000,
+      "allocation_count": 200003,
+      "allocation_bytes": 7200176,
+      "result": 51400000
+    },
+    {
+      "variant": "a1",
+      "frames": 100000,
+      "allocation_count": 100003,
+      "allocation_bytes": 3600176,
+      "result": 51400000
+    },
+    {
+      "variant": "a2",
+      "frames": 100000,
+      "allocation_count": 200002,
+      "allocation_bytes": 7200072,
+      "result": 51400000
+    },
+    {
+      "variant": "combined",
+      "frames": 100000,
+      "allocation_count": 100002,
+      "allocation_bytes": 3600072,
+      "result": 51400000
+    },
+    {
+      "variant": "a3",
+      "frames": 100000,
+      "allocation_count": 200003,
+      "allocation_bytes": 7200176,
+      "result": 51400000
+    },
+    {
+      "variant": "all",
+      "frames": 100000,
+      "allocation_count": 100002,
+      "allocation_bytes": 3600072,
+      "result": 51400000
+    }
+  ],
+  "limits": [
+    "Host microbenchmark only; all variants exclude camera, codec, disk, and Python work.",
+    "At 30 fps these CPU savings are negligible; no device FPS improvement is claimed.",
+    "A2 intentionally rejects overlapping reservations; only single-writer production traces are equivalent.",
+    "The exported engine API does not globally prevent sharing a transaction between engines; overlapping writes from that unsupported setup now fail.",
+    "A3 removes a test-only loss model; exported loss fields and real telemetry remain intact."
+  ]
+}

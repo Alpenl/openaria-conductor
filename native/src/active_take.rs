@@ -1,8 +1,3 @@
-use std::collections::BTreeSet;
-
-#[cfg(test)]
-const WRITE_BACKPRESSURE: &str = "write_backpressure";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveTakeError {
     pub(crate) code: &'static str,
@@ -60,8 +55,7 @@ pub(crate) struct ActiveTakeWriter {
     frame_domain: u64,
     frames_written: u64,
     bytes_written: u64,
-    drop_events: Vec<ActiveDropEvent>,
-    pending_frames: BTreeSet<u64>,
+    pending_frame: Option<u64>,
     closed: bool,
 }
 
@@ -78,8 +72,7 @@ impl ActiveTakeWriter {
             frame_domain: 0,
             frames_written: 0,
             bytes_written: 0,
-            drop_events: Vec::new(),
-            pending_frames: BTreeSet::new(),
+            pending_frame: None,
             closed: false,
         })
     }
@@ -95,12 +88,20 @@ impl ActiveTakeWriter {
                 format!("source frame sequence has a gap of {}", source.source_gap),
             ));
         }
+        // Capture owns one synchronous writer. A failed write remains pending
+        // until teardown; it must not be overwritten by another reservation.
+        if self.pending_frame.is_some() {
+            return Err(ActiveTakeError::new(
+                "invalid_state",
+                "active take already has a pending frame",
+            ));
+        }
         let record_sequence = self.frame_domain;
         let next_frame_domain = self.frame_domain.checked_add(1).ok_or_else(|| {
             ActiveTakeError::new("counter_overflow", "active take frame domain overflow")
         })?;
         self.frame_domain = next_frame_domain;
-        self.pending_frames.insert(record_sequence);
+        self.pending_frame = Some(record_sequence);
         Ok(ReservedFrame {
             session_id: self.session_id.clone(),
             record_sequence,
@@ -113,7 +114,7 @@ impl ActiveTakeWriter {
         &mut self,
         frame: ReservedFrame,
         bytes_written: u64,
-    ) -> Result<ActiveTakeSnapshot, ActiveTakeError> {
+    ) -> Result<(), ActiveTakeError> {
         self.ensure_pending(&frame)?;
         let next_frames_written = self.frames_written.checked_add(1).ok_or_else(|| {
             ActiveTakeError::new("counter_overflow", "active take frame count overflow")
@@ -124,31 +125,15 @@ impl ActiveTakeWriter {
                 .ok_or_else(|| {
                     ActiveTakeError::new("counter_overflow", "active take byte count overflow")
                 })?;
-        self.pending_frames.remove(&frame.record_sequence);
+        self.pending_frame = None;
         self.frames_written = next_frames_written;
         self.bytes_written = next_bytes_written;
-        Ok(self.snapshot())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reject_frame(
-        &mut self,
-        frame: ReservedFrame,
-        at_time_seconds: f64,
-    ) -> Result<ActiveTakeSnapshot, ActiveTakeError> {
-        self.ensure_pending(&frame)?;
-        validate_elapsed(at_time_seconds, "at_time_seconds")?;
-        let end_frame = frame.record_sequence.checked_add(1).ok_or_else(|| {
-            ActiveTakeError::new("counter_overflow", "active take drop frame overflow")
-        })?;
-        self.pending_frames.remove(&frame.record_sequence);
-        self.record_drop(frame.record_sequence, end_frame, at_time_seconds)?;
-        Ok(self.snapshot())
+        Ok(())
     }
 
     pub(crate) fn finish(&mut self) -> Result<ActiveTakeSummary, ActiveTakeError> {
         self.ensure_open()?;
-        if !self.pending_frames.is_empty() {
+        if self.pending_frame.is_some() {
             return Err(ActiveTakeError::new(
                 "invalid_state",
                 "active take has pending frames",
@@ -164,48 +149,13 @@ impl ActiveTakeWriter {
             frame_domain: self.frame_domain,
             frames_written: self.frames_written,
             bytes_written: self.bytes_written,
-            dropped_frames: self.dropped_frames(),
-            pending_frames: u64::try_from(self.pending_frames.len()).unwrap_or(u64::MAX),
-            drop_events: self.drop_events.clone(),
+            // Preserve the exported snapshot shape. Native recording fails on
+            // source/queue gaps instead of accepting dropped record sequences;
+            // FrameValidator, Metrics and the encoder retain the loss evidence.
+            dropped_frames: 0,
+            pending_frames: u64::from(self.pending_frame.is_some()),
+            drop_events: Vec::new(),
         }
-    }
-
-    #[cfg(test)]
-    fn record_drop(
-        &mut self,
-        start_frame: u64,
-        end_frame: u64,
-        at_time_seconds: f64,
-    ) -> Result<(), ActiveTakeError> {
-        if end_frame <= start_frame {
-            return Ok(());
-        }
-        let dropped = end_frame
-            .checked_sub(start_frame)
-            .ok_or_else(|| ActiveTakeError::new("counter_overflow", "active take drop overflow"))?;
-        if let Some(previous) = self.drop_events.last_mut() {
-            if previous.reason == WRITE_BACKPRESSURE && previous.end_frame == start_frame {
-                previous.end_frame = end_frame;
-                previous.dropped = previous.dropped.checked_add(dropped).ok_or_else(|| {
-                    ActiveTakeError::new("counter_overflow", "active take drop count overflow")
-                })?;
-                return Ok(());
-            }
-        }
-        self.drop_events.push(ActiveDropEvent {
-            start_frame,
-            end_frame,
-            at_time_seconds,
-            reason: WRITE_BACKPRESSURE,
-            dropped,
-        });
-        Ok(())
-    }
-
-    fn dropped_frames(&self) -> u64 {
-        self.drop_events
-            .iter()
-            .fold(0, |total, event| total.saturating_add(event.dropped))
     }
 
     fn ensure_open(&self) -> Result<(), ActiveTakeError> {
@@ -227,25 +177,13 @@ impl ActiveTakeWriter {
                 "reserved frame belongs to another session",
             ));
         }
-        if !self.pending_frames.contains(&frame.record_sequence) {
+        if self.pending_frame != Some(frame.record_sequence) {
             return Err(ActiveTakeError::new(
                 "invalid_state",
                 "reserved frame is not pending",
             ));
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-fn validate_elapsed(value: f64, name: &str) -> Result<(), ActiveTakeError> {
-    if value.is_finite() && value >= 0.0 {
-        Ok(())
-    } else {
-        Err(ActiveTakeError::new(
-            "invalid_argument",
-            format!("{name} must be finite and non-negative"),
-        ))
     }
 }
 
@@ -292,29 +230,26 @@ mod tests {
     }
 
     #[test]
-    fn queue_rejections_consume_record_sequences_and_merge_drop_events() {
+    fn overlapping_reservation_preserves_the_pending_frame_and_sequence() {
         let mut writer = ActiveTakeWriter::new("session").unwrap();
         let first = writer.reserve_frame(source_frame(10)).unwrap();
         assert_eq!(first.record_sequence, 0);
-        let snapshot = writer.reject_frame(first, 0.25).unwrap();
-        assert_eq!(snapshot.frame_domain, 1);
-        assert_eq!(snapshot.dropped_frames, 1);
+        let before = writer.snapshot();
+        assert_error_code(
+            writer.reserve_frame(source_frame(11)).unwrap_err(),
+            "invalid_state",
+        );
+        assert_eq!(writer.snapshot(), before);
 
+        writer.finish_frame(first, 64).unwrap();
         let second = writer.reserve_frame(source_frame(11)).unwrap();
         assert_eq!(second.record_sequence, 1);
-        let snapshot = writer.reject_frame(second, 0.50).unwrap();
-
-        assert_eq!(snapshot.frame_domain, 2);
-        assert_eq!(snapshot.frames_written, 0);
-        assert_eq!(snapshot.pending_frames, 0);
-        assert_eq!(snapshot.dropped_frames, 2);
-        assert_eq!(snapshot.drop_events.len(), 1);
-        let event = &snapshot.drop_events[0];
-        assert_eq!(event.start_frame, 0);
-        assert_eq!(event.end_frame, 2);
-        assert_eq!(event.at_time_seconds, 0.25);
-        assert_eq!(event.reason, "write_backpressure");
-        assert_eq!(event.dropped, 2);
+        writer.finish_frame(second, 32).unwrap();
+        let summary = writer.finish().unwrap();
+        assert_eq!(summary.frame_domain, 2);
+        assert_eq!(summary.frames_written, 2);
+        assert_eq!(summary.bytes_written, 96);
+        assert_eq!(summary.pending_frames, 0);
     }
 
     #[test]
@@ -323,13 +258,15 @@ mod tests {
 
         let first = writer.reserve_frame(source_frame(20)).unwrap();
         assert_eq!(first.record_sequence, 0);
-        let snapshot = writer.finish_frame(first, 100).unwrap();
+        writer.finish_frame(first, 100).unwrap();
+        let snapshot = writer.snapshot();
         assert_eq!(snapshot.frames_written, 1);
         assert_eq!(snapshot.bytes_written, 100);
 
         let second = writer.reserve_frame(source_frame(21)).unwrap();
         assert_eq!(second.record_sequence, 1);
-        let snapshot = writer.finish_frame(second, 24).unwrap();
+        writer.finish_frame(second, 24).unwrap();
+        let snapshot = writer.snapshot();
 
         assert_eq!(snapshot.frame_domain, 2);
         assert_eq!(snapshot.frames_written, 2);
@@ -342,24 +279,64 @@ mod tests {
         let mut writer = ActiveTakeWriter::new("session").unwrap();
         let written = writer.reserve_frame(source_frame(30)).unwrap();
         writer.finish_frame(written, 64).unwrap();
-        let rejected = writer.reserve_frame(source_frame(31)).unwrap();
+        let pending = writer.reserve_frame(source_frame(31)).unwrap();
 
         let error = writer.finish().unwrap_err();
         assert_error_code(error, "invalid_state");
 
-        writer.reject_frame(rejected, 1.0).unwrap();
+        writer.finish_frame(pending, 32).unwrap();
         let summary = writer.finish().unwrap();
         assert_eq!(summary.session_id, "session");
         assert_eq!(summary.frame_domain, 2);
-        assert_eq!(summary.frames_written, 1);
-        assert_eq!(summary.bytes_written, 64);
-        assert_eq!(summary.dropped_frames, 1);
+        assert_eq!(summary.frames_written, 2);
+        assert_eq!(summary.bytes_written, 96);
+        assert_eq!(summary.dropped_frames, 0);
         assert_eq!(summary.pending_frames, 0);
-        assert_eq!(summary.drop_events.len(), 1);
-        assert_eq!(summary.drop_events[0].start_frame, 1);
-        assert_eq!(summary.drop_events[0].end_frame, 2);
+        assert!(summary.drop_events.is_empty());
 
         let error = writer.reserve_frame(source_frame(32)).unwrap_err();
         assert_error_code(error, "invalid_state");
+    }
+
+    #[test]
+    fn invalid_and_duplicate_completions_preserve_progress() {
+        let mut writer = ActiveTakeWriter::new("session").unwrap();
+        let reserved = writer.reserve_frame(source_frame(10)).unwrap();
+        let before = writer.snapshot();
+        let mut foreign = reserved.clone();
+        foreign.session_id = "another-session".to_owned();
+        assert_error_code(
+            writer.finish_frame(foreign, 64).unwrap_err(),
+            "invalid_session",
+        );
+        let mut unknown = reserved.clone();
+        unknown.record_sequence += 1;
+        assert_error_code(
+            writer.finish_frame(unknown, 64).unwrap_err(),
+            "invalid_state",
+        );
+        assert_eq!(writer.snapshot(), before);
+
+        writer.finish_frame(reserved.clone(), 64).unwrap();
+        let completed = writer.snapshot();
+        assert_error_code(
+            writer.finish_frame(reserved, 64).unwrap_err(),
+            "invalid_state",
+        );
+        assert_eq!(writer.snapshot(), completed);
+    }
+
+    #[test]
+    fn accounting_overflow_keeps_the_failed_frame_pending() {
+        let mut writer = ActiveTakeWriter::new("session").unwrap();
+        writer.bytes_written = u64::MAX;
+        let pending = writer.reserve_frame(source_frame(10)).unwrap();
+        let before = writer.snapshot();
+        assert_error_code(
+            writer.finish_frame(pending, 1).unwrap_err(),
+            "counter_overflow",
+        );
+        assert_eq!(writer.snapshot(), before);
+        assert_error_code(writer.finish().unwrap_err(), "invalid_state");
     }
 }
