@@ -475,6 +475,15 @@ class _MultiRootSessionStore:
             raise not_found
         raise ArtifactAccessError("not_found", "会话不存在")
 
+    def manifest_identity(self, session_id: str) -> tuple[int, int, int, int, int, int, int]:
+        for store in self._stores:
+            try:
+                return store.manifest_identity(session_id)
+            except ArtifactAccessError as error:
+                if error.code != "not_found":
+                    raise
+        raise ArtifactAccessError("not_found", "会话不存在")
+
     def open_verified_artifact(
         self, session_id: str, artifact_id: str, api_version: str
     ) -> LockedArtifact:
@@ -1075,19 +1084,14 @@ class CaptureCoordinator:
             admission.catalog_roots,
             verified_manifests={session_id: snapshot.manifest_sha256},
         )
-        representation: object | None = None
         try:
-            representation = store.open_manifest(session_id, "v4")
-            return (
-                getattr(representation, "manifest_sha256", None) == snapshot.manifest_sha256
-                and _locked_file_identity(representation) == snapshot.manifest_identity
-            )
+            # The full verification snapshot already binds this exact file
+            # identity to its SHA-256. ctime catches in-place writes even when
+            # size and mtime are restored; fresh no-follow opens reject links.
+            return store.manifest_identity(session_id) == snapshot.manifest_identity
         except (ArtifactAccessError, DeviceRecordingError, OSError):
             return False
         finally:
-            close = getattr(representation, "close", None)
-            if callable(close):
-                close()
             store.close()
 
     def _check_catalog_verification_idle(self) -> None:
@@ -1122,8 +1126,8 @@ class CaptureCoordinator:
         verify_session: str | None = None,
     ) -> None:
         admission = self._require_admission()
-        # Re-read each small manifest to invalidate replaced catalog entries, but do
-        # not stat every large artifact until that artifact is actually downloaded.
+        # Check exact manifest identities to invalidate replaced catalog entries;
+        # defer artifact inspection until that artifact is actually downloaded.
         if verify_session is not None and (
             verify_session in {"", ".", ".."}
             or "\x00" in verify_session

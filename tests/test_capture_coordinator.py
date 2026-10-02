@@ -1839,7 +1839,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
+    def test_cached_catalog_checks_verified_identity_without_reading_manifest(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
@@ -1848,16 +1848,57 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertGreater(len(list(iter_device_session_v1_artifacts(manifest))), 1)
 
-            with patch(
-                "rp_ylx.api.downloads._read_exact_file",
-                wraps=downloads_module._read_exact_file,
-            ) as read_manifest:
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            with (
+                patch(
+                    "rp_ylx.api.downloads._read_exact_file",
+                    side_effect=AssertionError("unchanged verified manifest must not be read"),
+                ),
+                patch(
+                    "rp_ylx.api.downloads._decode_and_validate_manifest",
+                    side_effect=AssertionError("unchanged manifest must not be revalidated"),
+                ),
+            ):
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
 
             self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
-            self.assertEqual(read_manifest.call_count, 1)
         finally:
             coordinator.close()
+
+    def test_cached_catalog_invalidates_manifest_replacement_and_restored_mtime(self) -> None:
+        for change in ("replace", "same_size_edit"):
+            with self.subTest(change=change):
+                coordinator = self.coordinator()
+                try:
+                    session_id = self.seal_one(coordinator, prefix=f"identity-{change}")
+                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    original = manifest_path.read_bytes()
+                    metadata = manifest_path.stat()
+                    if change == "replace":
+                        replacement = manifest_path.with_suffix(".replacement")
+                        replacement.write_bytes(original)
+                        os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                        replacement.replace(manifest_path)
+                    else:
+                        changed = original.replace(b"YLX-12AB34CD", b"YLX-56EF78AB")
+                        self.assertNotEqual(changed, original)
+                        self.assertEqual(len(changed), len(original))
+                        manifest_path.write_bytes(changed)
+                        os.utime(manifest_path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    self.assertEqual(manifest_path.stat().st_mtime_ns, metadata.st_mtime_ns)
+
+                    listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+                    selected = next(
+                        item for item in listed["items"] if item["session_id"] == session_id
+                    )
+                    self.assertIsNone(selected["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                    self.assertNotIn(session_id, coordinator._session_snapshots)
+                    if change == "same_size_edit":
+                        self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                finally:
+                    coordinator.close()
 
     def test_raw_sbs_frame_is_used_for_preview_without_eye_materialization(self) -> None:
         coordinator = self.coordinator()
