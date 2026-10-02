@@ -61,7 +61,7 @@ class _Journal:
         except BaseException:
             self.source.close()
             raise
-        self.pending = b""
+        self.pending = bytearray()
         self.digest = hashlib.sha256()
         self.encoded_digest = hashlib.sha256()
         self.size = 0
@@ -73,9 +73,9 @@ class _Journal:
         while final or passes < 4:
             passes += 1
             data = self.source.read(BLOCK_BYTES - len(self.pending))
-            self.pending += data
+            self.pending.extend(data)
             if len(self.pending) == BLOCK_BYTES or (final and not data and self.pending):
-                block, self.pending = self.pending, b""
+                block, self.pending = self.pending, bytearray()
                 self.digest.update(block)
                 self.size += len(block)
                 encoded = self.compressor.compress(block)
@@ -133,19 +133,25 @@ class LiveSealing:
         self.finished = Event()
         self.cancelled = Event()
         self.prepared: dict[str, PreparedArtifact] = {}
+        self._audio_checkpoint_identity: tuple[int, ...] | None = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="live-seal")
         self.audit = self.executor.submit(
             capture_audit, root, nominal_fps, frame_decimation, finished=self.finished
         )
         self.compaction = self.executor.submit(self._compact)
 
-    def _audio(self) -> None:
+    def _audio(self, *, force: bool = False) -> None:
         # Native checkpoint publication follows WAV close/fsync. Reading only
         # paths explicitly named in this atomic checkpoint avoids open tails.
         import json
 
         checkpoint = self.root / "audio/checkpoint.json"
-        if not checkpoint.exists():
+        try:
+            checkpoint_identity = identity(checkpoint.stat(follow_symlinks=False))
+        except FileNotFoundError:
+            self._audio_checkpoint_identity = None
+            return
+        if not force and checkpoint_identity == self._audio_checkpoint_identity:
             return
         for segment in json.loads(checkpoint.read_bytes())["segments"]:
             relative = segment["path"]
@@ -162,6 +168,10 @@ class LiveSealing:
             self.prepared[relative] = PreparedArtifact(
                 original, target, _read_back(target), compression
             )
+        # Cache the identity from before the read. If native publication races
+        # it, the next poll sees the replacement and reads again; recording the
+        # path's identity after the read could hide a newly published tail.
+        self._audio_checkpoint_identity = checkpoint_identity
 
     def _compact(self) -> None:
         journals: dict[str, _Journal] = {}
@@ -175,7 +185,7 @@ class LiveSealing:
                 if self.finished.is_set():
                     # finish() may race the checkpoint read above. Producers
                     # are now joined, so include the final closed audio tail.
-                    self._audio()
+                    self._audio(force=True)
                     for name, journal in journals.items():
                         self.prepared[name] = journal.finish()
                     return
