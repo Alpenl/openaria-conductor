@@ -1808,7 +1808,9 @@ class CaptureCoordinator:
     def network_status(self) -> Mapping[str, object]:
         try:
             legacy_status = collect_network_status()
-            runtime = self._runtime_snapshot()
+            # Network polling needs only host telemetry. Sampling camera controls
+            # here sends work to the capture thread on every SSE poll.
+            runtime = self._runtime()
             status = project_network_status_v1(runtime, legacy_status=legacy_status)
         except NetworkError as error:
             raise ProviderError(
@@ -2976,8 +2978,10 @@ class CaptureCoordinator:
         # recording volume does not block the initial web UI render.
         self._catalog_sessions()
         with self._catalog_lock:
-            all_items = [copy.deepcopy(item) for item in self._session_summaries.values()]
-            diagnostics = copy.deepcopy(list(self._session_diagnostics.values()))
+            # Keep the catalog stable while selecting the page. Only response
+            # entries need isolated copies; unselected nested data never escapes.
+            all_items = list(self._session_summaries.values())
+            diagnostics = list(self._session_diagnostics.values())
             all_items.sort(
                 key=lambda item: (str(item["started_at"]), str(item["session_id"])),
                 reverse=True,
@@ -2987,17 +2991,6 @@ class CaptureCoordinator:
                 items = [
                     item for item in all_items if take_id is None or item["take_id"] == take_id
                 ]
-                for item in items:
-                    verification = item.get("verification")
-                    if isinstance(verification, dict):
-                        raw_diagnostics = verification.get("diagnostics")
-                        if isinstance(raw_diagnostics, list):
-                            verification["diagnostics"] = [
-                                diagnostic["summary"]
-                                for diagnostic in raw_diagnostics
-                                if isinstance(diagnostic, Mapping)
-                                and isinstance(diagnostic.get("summary"), str)
-                            ]
                 combined: list[tuple[str, dict[str, object]]] = [
                     (str(item["session_id"]), item) for item in items
                 ]
@@ -3011,9 +3004,22 @@ class CaptureCoordinator:
                             status=HTTPStatus.BAD_REQUEST,
                         )
                     start = positions[0] + 1
-                selected_items = [item for _, item in combined[start : start + limit]]
+                selected_items = [
+                    copy.deepcopy(item) for _, item in combined[start : start + limit]
+                ]
+                for item in selected_items:
+                    verification = item.get("verification")
+                    if isinstance(verification, dict):
+                        raw_diagnostics = verification.get("diagnostics")
+                        if isinstance(raw_diagnostics, list):
+                            verification["diagnostics"] = [
+                                diagnostic["summary"]
+                                for diagnostic in raw_diagnostics
+                                if isinstance(diagnostic, Mapping)
+                                and isinstance(diagnostic.get("summary"), str)
+                            ]
                 remaining = limit - len(selected_items)
-                selected_diagnostics = diagnostics[:remaining]
+                selected_diagnostics = copy.deepcopy(diagnostics[:remaining])
                 consumed = start + len(selected_items)
                 next_cursor = None
                 if consumed < len(combined) and selected_items:
@@ -3058,8 +3064,10 @@ class CaptureCoordinator:
                     )
 
             selected = ordered[start : start + limit]
-            selected_items = [value for kind, value in selected if kind == "item"]
-            selected_diagnostics = [value for kind, value in selected if kind == "diagnostic"]
+            selected_items = [copy.deepcopy(value) for kind, value in selected if kind == "item"]
+            selected_diagnostics = [
+                copy.deepcopy(value) for kind, value in selected if kind == "diagnostic"
+            ]
             consumed = start + len(selected)
             next_cursor = (
                 _encode_session_cursor(

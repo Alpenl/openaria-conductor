@@ -599,6 +599,50 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_network_status_does_not_query_capture_hardware(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        runtime = deepcopy(coordinator._runtime())
+        legacy = {
+            "capabilities": {"second_wifi": False},
+            "mdns": {
+                "hostname": "rp-ylx.local",
+                "service": "_ylx-capture._tcp",
+                "aliases": ["_http._tcp"],
+                "port": 8080,
+            },
+            "devices": [],
+        }
+        try:
+            with (
+                patch.object(coordinator, "_runtime", return_value=runtime),
+                patch("rp_ylx.recording.coordinator.collect_network_status", return_value=legacy),
+                patch("rp_ylx.network._controller_status_projection", return_value=None),
+                patch("rp_ylx.network._state_dir", return_value=self.root / "network-state"),
+                patch.object(sources, "camera_connection_status") as camera,
+                patch.object(sources, "camera_focus_status") as focus,
+                patch.object(sources, "latest_imu_observation") as imu,
+            ):
+                first = coordinator.network_status()
+                self.assertEqual(first["schema"], "ylx.network-status.v1")
+                self.assertEqual(first["observed_at"], runtime["observed_at"])
+                self.assertEqual(first["observed"]["mdns"], legacy["mdns"])
+                self.assertEqual(first["observed"]["devices"], legacy["devices"])
+                for key, value in runtime["network"].items():
+                    self.assertEqual(first["observed"][key], value)
+
+                runtime["observed_at"] = "2026-10-03T00:00:01Z"
+                runtime["network"]["wired"]["addresses"] = ["192.0.2.42/24"]
+                second = coordinator.network_status()
+                self.assertEqual(second["observed_at"], runtime["observed_at"])
+                self.assertEqual(second["observed"]["wired"]["addresses"], ["192.0.2.42/24"])
+                self.assertNotEqual(first["observed_at"], second["observed_at"])
+                camera.assert_not_called()
+                focus.assert_not_called()
+                imu.assert_not_called()
+        finally:
+            coordinator.close()
+
     def test_v4_network_mutation_capability_follows_controller_for_both_profiles(self) -> None:
         coordinator = self.coordinator()
         try:
@@ -1415,6 +1459,52 @@ class CaptureCoordinatorTest(unittest.TestCase):
                         api_version="v4",
                     )
                 self.assertEqual(wrong_filter.exception.code, "invalid_cursor")
+        finally:
+            coordinator.close()
+
+    def test_catalog_pages_isolate_nested_responses_and_legacy_projection(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-copy-isolation")
+            summary = coordinator._session_summaries[session_id]
+            summary["verification"]["verdict"] = "unusable"
+            summary["verification"]["diagnostics"] = [
+                {"code": "artifact_digest_mismatch", "summary": "artifact 摘要不匹配"}
+            ]
+            older = deepcopy(summary)
+            older["session_id"] = "01989f69-f000-7c3d-ae4f-5061728394a5"
+            older["started_at"] = older["ended_at"] = "2020-01-01T00:00:00Z"
+            coordinator._session_summaries[older["session_id"]] = older
+            coordinator._session_diagnostics["quarantined"] = coordinator._session_diagnostic(
+                "quarantined", OSError("unreadable")
+            )
+            original_summaries = deepcopy(coordinator._session_summaries)
+            original_diagnostics = deepcopy(coordinator._session_diagnostics)
+            with patch.object(coordinator, "_catalog_sessions", return_value=None):
+                for api_version in ("v2", "v3", "v4"):
+                    with self.subTest(api_version=api_version):
+                        first = coordinator.list_sessions(
+                            cursor=None, limit=1, take_id=None, api_version=api_version
+                        )
+                        continuation = first["next_cursor"]
+                        self.assertIsNotNone(continuation)
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        if api_version != "v4":
+                            self.assertEqual(
+                                first["items"][0]["verification"]["diagnostics"],
+                                ["artifact 摘要不匹配"],
+                            )
+                        first["items"][0]["device"]["device_label"] = "response-only"
+                        first["items"][0]["verification"]["diagnostics"].clear()
+                        last = coordinator.list_sessions(
+                            cursor=continuation, limit=3, take_id=None, api_version=api_version
+                        )
+                        self.assertEqual(last["items"][0]["session_id"], older["session_id"])
+                        self.assertEqual(len(last["diagnostics"]), 1)
+                        last["items"][0]["verification"]["validator"]["name"] = "modified"
+                        last["diagnostics"][0]["message"] = "response-only"
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        self.assertEqual(coordinator._session_diagnostics, original_diagnostics)
         finally:
             coordinator.close()
 
