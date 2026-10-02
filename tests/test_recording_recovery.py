@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 import wave
@@ -16,8 +17,12 @@ from rp_ylx.recording.coordinator import (
     CoordinatorConfig,
     initialize_capture_volume,
 )
-from rp_ylx.recording.device_session import validate_device_session_directory, write_json_atomic
-from rp_ylx.recording.recovery import recover_device_session
+from rp_ylx.recording.device_session import (
+    json_bytes,
+    validate_device_session_directory,
+    write_json_atomic,
+)
+from rp_ylx.recording.recovery import _frames, recover_device_session
 from tests import test_split_eye_recording as fixtures
 
 
@@ -154,6 +159,155 @@ class RecordingRecoveryTests(unittest.TestCase):
             recovered = recover_device_session(recorder.partial_path)
             self.assertEqual(recovered.manifest["frames"]["count"], 27)
 
+    def test_streamed_recovery_preserves_canonical_audited_frames_and_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            root = recorder.partial_path
+            rows = [json.loads(line) for line in (root / "frames.ndjson").read_bytes().splitlines()]
+            for index, row in enumerate(rows):
+                row["schema"] = "ylx.frame-index.v2"
+                row["timestamp_audit"] = {
+                    "schema": "openaria.frame-timestamp-audit.v1",
+                    "camera_counter_raw": index,
+                    "timestamp_clock": "v4l2_monotonic",
+                    "host_dequeue_monotonic_ns": row["host_monotonic_ns"] + 3000,
+                }
+                # Non-uniform capture times make each recovered boundary observable.
+                row["host_monotonic_ns"] += index * 1000
+            original = b"".join((json.dumps(row) + "\n").encode() for row in rows)
+            (root / "frames.ndjson").write_bytes(original)
+            expected = b"".join(json_bytes(row) for row in rows[:30])
+
+            recovered = recover_device_session(root)
+
+            self.assertEqual((recovered.path / "recovery/frames.ndjson").read_bytes(), expected)
+            self.assertEqual((recovered.path / "frames.ndjson").read_bytes(), original)
+            for index, segment in enumerate(recovered.manifest["video"]["segments"]):
+                expected_start = (
+                    rows[index * 3]["host_monotonic_ns"] - recorder._started_monotonic_ns
+                ) / 1e9
+                self.assertEqual(segment["start_time_seconds"], expected_start)
+            validate_device_session_directory(recovered.path)
+
+    def test_late_malformed_index_rolls_back_the_entire_unfinished_segment(self):
+        for failure in ("json", "sequence", "timestamp", "segment_frame", "unterminated"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                path = recorder.partial_path / "frames.ndjson"
+                lines = path.read_bytes().splitlines(keepends=True)
+                expected = b"".join(json_bytes(json.loads(line)) for line in lines[:27])
+                bad = json.loads(lines[28])
+                if failure == "json":
+                    lines[28] = b'{"broken":\n'
+                elif failure == "unterminated":
+                    lines = lines[:28] + [lines[28].rstrip(b"\n")]
+                else:
+                    if failure == "sequence":
+                        bad["source_sequence"] += 2
+                    elif failure == "timestamp":
+                        bad["host_monotonic_ns"] = json.loads(lines[27])["host_monotonic_ns"]
+                    else:
+                        bad["segment_frame"] += 1
+                    lines[28] = json_bytes(bad)
+                original = b"".join(lines)
+                path.write_bytes(original)
+
+                recovered = recover_device_session(recorder.partial_path)
+
+                self.assertEqual(recovered.manifest["frames"]["count"], 27)
+                self.assertEqual((recovered.path / "recovery/frames.ndjson").read_bytes(), expected)
+                self.assertEqual((recovered.path / "frames.ndjson").read_bytes(), original)
+                self.assertEqual(list(recovered.path.glob(".recovery-frames.*.tmp")), [])
+
+    def test_unencodable_frame_is_rejected_only_if_its_segment_is_complete(self):
+        for complete in (False, True):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                root = recorder.partial_path
+                path = root / "frames.ndjson"
+                lines = path.read_bytes().splitlines(keepends=True)
+                expected = b"".join(json_bytes(json.loads(line)) for line in lines[:27])
+                bad = json.loads(lines[27])
+                bad["extension"] = "\ud800"
+                lines[27] = (json.dumps(bad) + "\n").encode()
+                original = b"".join(lines if complete else lines[:29])
+                path.write_bytes(original)
+                recovery = root / "recovery"
+                recovery.mkdir()
+                prior = b"previous derived index\n"
+                (recovery / "frames.ndjson").write_bytes(prior)
+
+                if complete:
+                    with self.assertRaises(UnicodeEncodeError):
+                        recover_device_session(root)
+                    self.assertEqual((recovery / "frames.ndjson").read_bytes(), prior)
+                    self.assertFalse((root / "manifest.json").exists())
+                else:
+                    recovered = recover_device_session(root)
+                    root = recovered.path
+                    self.assertEqual(recovered.manifest["frames"]["count"], 27)
+                    self.assertEqual((root / "recovery/frames.ndjson").read_bytes(), expected)
+                self.assertEqual((root / "frames.ndjson").read_bytes(), original)
+                self.assertEqual(list(root.glob(".recovery-frames.*.tmp")), [])
+
+    def test_failed_frame_spool_keeps_prior_index_and_cleans_temporary_output(self):
+        for failure in ("short_write", "write", "fsync"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                root = recorder.partial_path
+                original = (root / "frames.ndjson").read_bytes()
+                recovery = root / "recovery"
+                recovery.mkdir()
+                prior = b"prior derived index remains until replacement succeeds\n"
+                (recovery / "frames.ndjson").write_bytes(prior)
+                segments = json.loads((root / "segments.json").read_bytes())["segments"]
+                fdopen = os.fdopen
+
+                class FailingOutput:
+                    def __init__(self, descriptor, mode, opener=fdopen, fault=failure):
+                        self.stream = opener(descriptor, mode)
+                        self.fault = fault
+                        self.writes = 0
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self.stream.close()
+
+                    def __getattr__(self, name):
+                        return getattr(self.stream, name)
+
+                    def write(self, payload):
+                        self.writes += 1
+                        if self.writes == 5:
+                            if self.fault == "write":
+                                raise OSError("no space")
+                            if self.fault == "short_write":
+                                return self.stream.write(payload[:-1])
+                        return self.stream.write(payload)
+
+                with patch("rp_ylx.recording.recovery.os.fdopen", FailingOutput):
+                    if failure == "fsync":
+                        with (
+                            patch(
+                                "rp_ylx.recording.recovery.os.fsync", side_effect=OSError("sync")
+                            ),
+                            self.assertRaises(OSError),
+                        ):
+                            _frames(
+                                root, recorder._plan, segments, 2, recorder._started_monotonic_ns
+                            )
+                    else:
+                        with self.assertRaises(OSError):
+                            _frames(
+                                root, recorder._plan, segments, 2, recorder._started_monotonic_ns
+                            )
+                self.assertEqual((root / "frames.ndjson").read_bytes(), original)
+                self.assertEqual((recovery / "frames.ndjson").read_bytes(), prior)
+                self.assertEqual(list(root.glob(".recovery-frames.*.tmp")), [])
+                self.assertIsNotNone(recover_device_session(root))
+
     def test_first_segment_failure_does_not_claim_a_usable_session(self):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary), frames=2)
@@ -161,6 +315,8 @@ class RecordingRecoveryTests(unittest.TestCase):
             self.assertIsNone(recorder.recovered_session)
             self.assertTrue(recorder.partial_path.is_dir())
             self.assertFalse((recorder.partial_path / "manifest.json").exists())
+            self.assertFalse((recorder.partial_path / "recovery/frames.ndjson").exists())
+            self.assertEqual(list(recorder.partial_path.glob(".recovery-frames.*.tmp")), [])
 
     def test_storage_failure_keeps_raw_data_and_retry_is_possible(self):
         with tempfile.TemporaryDirectory() as temporary:
