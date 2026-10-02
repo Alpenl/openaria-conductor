@@ -1137,35 +1137,112 @@ class CaptureCoordinator:
         with self._catalog_lock:
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
-                candidates = (
-                    sessions_root.iterdir()
+                # Directory entries avoid a separate type stat for every child.
+                # Verified sessions still require fresh secure manifest opens.
+                with (
+                    os.scandir(sessions_root)
                     if verify_session is None
-                    else (sessions_root / verify_session,)
-                )
-                for candidate in candidates:
-                    if (
-                        not candidate.is_dir()
-                        or candidate.name.endswith(".partial")
-                        or candidate.name in discovered
-                    ):
-                        continue
-                    discovered.add(candidate.name)
-                    session_id = candidate.name
-                    summary = self._session_summaries.get(session_id)
-                    snapshot = self._session_snapshots.get(session_id)
-                    if summary is not None and snapshot is not None:
-                        if self._session_manifest_is_current(session_id, snapshot):
+                    else nullcontext((sessions_root / verify_session,))
+                ) as candidates:
+                    for candidate in candidates:
+                        # Preserve Path.is_dir's handling of link loops.
+                        if candidate.is_symlink():
+                            candidate = sessions_root / candidate.name
+                        if (
+                            not candidate.is_dir()
+                            or candidate.name.endswith(".partial")
+                            or candidate.name in discovered
+                        ):
                             continue
-                        self._invalidate_session_verification(session_id)
+                        discovered.add(candidate.name)
+                        session_id = candidate.name
+                        summary = self._session_summaries.get(session_id)
+                        snapshot = self._session_snapshots.get(session_id)
+                        if summary is not None and snapshot is not None:
+                            if self._session_manifest_is_current(session_id, snapshot):
+                                continue
+                            self._invalidate_session_verification(session_id)
+                            try:
+                                manifest, payload = inspect_device_session_directory(
+                                    sessions_root / session_id
+                                )
+                                self._session_summaries[session_id] = self._session_summary(
+                                    session_id,
+                                    manifest,
+                                    payload,
+                                    verification_current=False,
+                                )
+                                self._session_diagnostics.pop(session_id, None)
+                            except (
+                                OSError,
+                                DeviceRecordingError,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as error:
+                                self._session_summaries.pop(session_id, None)
+                                self._session_diagnostics[session_id] = self._session_diagnostic(
+                                    session_id,
+                                    error,
+                                )
+                            continue
+
+                        # A summary without a snapshot is already metadata-only.
+                        # Only an explicit artifact request can promote it to verified.
+                        if summary is not None and verify_session is None:
+                            continue
                         try:
-                            manifest, payload = inspect_device_session_directory(candidate)
+                            manifest, payload = inspect_device_session_directory(
+                                sessions_root / session_id
+                            )
+                            recovered = any(
+                                log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
+                            )
+                            if (
+                                session_id in self._retained
+                                and session_id not in self._verified
+                                and not recovered
+                            ):
+                                self._session_diagnostics[session_id] = self._session_diagnostic(
+                                    session_id, "会话发布失败，未进入可下载 catalog"
+                                )
+                                continue
+                            verified_snapshot = None
+                            verification_error = None
+                            if (
+                                verify_session is not None
+                                and self._active is None
+                                and not self._closing
+                            ):
+                                try:
+                                    verified_snapshot, verification_error = (
+                                        self._verify_exact_session_payload(
+                                            sessions_root / session_id,
+                                            session_id,
+                                            manifest,
+                                            payload,
+                                            interrupt_check=self._check_catalog_verification_idle,
+                                        )
+                                    )
+                                except DeviceRecordingError as error:
+                                    if error.code != "verification_changed":
+                                        raise
                             self._session_summaries[session_id] = self._session_summary(
                                 session_id,
                                 manifest,
                                 payload,
-                                verification_current=False,
+                                verification_error=verification_error,
+                                verification_current=verified_snapshot is not None,
                             )
                             self._session_diagnostics.pop(session_id, None)
+                            if verified_snapshot is None:
+                                self._invalidate_session_verification(session_id)
+                                continue
+                            self._session_snapshots[session_id] = verified_snapshot
+                            if verification_error is None:
+                                self._verified[session_id] = verified_snapshot.manifest_sha256
+                            else:
+                                self._verified.pop(session_id, None)
                         except (
                             OSError,
                             DeviceRecordingError,
@@ -1174,84 +1251,16 @@ class CaptureCoordinator:
                             ValueError,
                         ) as error:
                             self._session_summaries.pop(session_id, None)
-                            self._session_diagnostics[session_id] = self._session_diagnostic(
-                                session_id,
-                                error,
-                            )
-                        continue
-
-                    # A summary without a snapshot is already metadata-only.
-                    # Only an explicit artifact request can promote it to verified.
-                    if summary is not None and verify_session is None:
-                        continue
-                    try:
-                        manifest, payload = inspect_device_session_directory(candidate)
-                        recovered = any(
-                            log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
-                        )
-                        if (
-                            session_id in self._retained
-                            and session_id not in self._verified
-                            and not recovered
-                        ):
-                            self._session_diagnostics[session_id] = self._session_diagnostic(
-                                session_id, "会话发布失败，未进入可下载 catalog"
-                            )
-                            continue
-                        verified_snapshot = None
-                        verification_error = None
-                        if (
-                            verify_session is not None
-                            and self._active is None
-                            and not self._closing
-                        ):
-                            try:
-                                verified_snapshot, verification_error = (
-                                    self._verify_exact_session_payload(
-                                        candidate,
-                                        session_id,
-                                        manifest,
-                                        payload,
-                                        interrupt_check=self._check_catalog_verification_idle,
-                                    )
-                                )
-                            except DeviceRecordingError as error:
-                                if error.code != "verification_changed":
-                                    raise
-                        self._session_summaries[session_id] = self._session_summary(
-                            session_id,
-                            manifest,
-                            payload,
-                            verification_error=verification_error,
-                            verification_current=verified_snapshot is not None,
-                        )
-                        self._session_diagnostics.pop(session_id, None)
-                        if verified_snapshot is None:
-                            self._invalidate_session_verification(session_id)
-                            continue
-                        self._session_snapshots[session_id] = verified_snapshot
-                        if verification_error is None:
-                            self._verified[session_id] = verified_snapshot.manifest_sha256
-                        else:
                             self._verified.pop(session_id, None)
-                    except (
-                        OSError,
-                        DeviceRecordingError,
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
-                        self._session_summaries.pop(session_id, None)
-                        self._verified.pop(session_id, None)
-                        self._session_snapshots.pop(session_id, None)
-                        diagnostic = self._session_diagnostic(session_id, error)
-                        current_diagnostic = self._session_diagnostics.get(session_id)
-                        if (
-                            current_diagnostic is not None
-                            and current_diagnostic.get("code") == diagnostic["code"]
-                        ):
-                            diagnostic = current_diagnostic
-                        self._session_diagnostics[session_id] = diagnostic
+                            self._session_snapshots.pop(session_id, None)
+                            diagnostic = self._session_diagnostic(session_id, error)
+                            current_diagnostic = self._session_diagnostics.get(session_id)
+                            if (
+                                current_diagnostic is not None
+                                and current_diagnostic.get("code") == diagnostic["code"]
+                            ):
+                                diagnostic = current_diagnostic
+                            self._session_diagnostics[session_id] = diagnostic
 
             # A targeted catalog refresh must not evict summaries for unrelated
             # sessions. Full discovery performs the stale-entry cleanup.

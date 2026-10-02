@@ -1,0 +1,256 @@
+{
+  "variant": "candidate",
+  "scope": "actual NativeSessionTransaction.snapshot PyO3 call; synthetic encoder events, no camera/media processing",
+  "cases": [
+    {
+      "segments": 0,
+      "equivalent_recording_seconds": 0,
+      "median_snapshot_ns": 737.962,
+      "repeat_snapshot_ns": [
+        728.155,
+        744.114,
+        753.24,
+        1002.875,
+        737.532,
+        729.737,
+        737.962
+      ],
+      "peak_python_bytes": 2069,
+      "snapshot_without_removed_field": {
+        "state": "recording",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {}
+      }
+    },
+    {
+      "segments": 120,
+      "equivalent_recording_seconds": 600,
+      "median_snapshot_ns": 739.786,
+      "repeat_snapshot_ns": [
+        815.066,
+        737.482,
+        739.786,
+        868.175,
+        745.357,
+        737.031,
+        731.521
+      ],
+      "peak_python_bytes": 2069,
+      "snapshot_without_removed_field": {
+        "state": "recording",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {}
+      }
+    },
+    {
+      "segments": 720,
+      "equivalent_recording_seconds": 3600,
+      "median_snapshot_ns": 739.645,
+      "repeat_snapshot_ns": [
+        819.494,
+        739.645,
+        737.021,
+        943.013,
+        735.778,
+        743.633,
+        730.769
+      ],
+      "peak_python_bytes": 2069,
+      "snapshot_without_removed_field": {
+        "state": "recording",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {}
+      }
+    },
+    {
+      "segments": 2880,
+      "equivalent_recording_seconds": 14400,
+      "median_snapshot_ns": 753.412,
+      "repeat_snapshot_ns": [
+        746.749,
+        729.346,
+        753.412,
+        780.762,
+        801.721,
+        777.927,
+        748.763
+      ],
+      "peak_python_bytes": 2069,
+      "snapshot_without_removed_field": {
+        "state": "recording",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {}
+      }
+    }
+  ],
+  "behaviors": {
+    "empty_finish": {
+      "before": {
+        "state": "recording",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {}
+      },
+      "after": {
+        "state": "finished",
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {}
+        },
+        "audio": null,
+        "submitted_frames": 0,
+        "encoder_stats": {
+          "frames": 0
+        }
+      },
+      "outcome": {
+        "active_take": {
+          "session_id": "test-session",
+          "frame_domain": 0,
+          "frames_written": 0,
+          "bytes_written": 0,
+          "dropped_frames": 0,
+          "pending_frames": 0,
+          "drop_events": []
+        },
+        "sink": {
+          "bytes_written": 0,
+          "frames_written": 0,
+          "imu_samples_written": 0,
+          "artifacts": {
+            "frames.index": {
+              "role": "frames.index",
+              "path": "frames.ndjson",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "identity": {
+                "device": 66305,
+                "inode": 21103696,
+                "size": 0,
+                "mtime_ns": 1790965087691412155
+              }
+            },
+            "imu.samples": {
+              "role": "imu.samples",
+              "path": "imu.ndjson",
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "identity": {
+                "device": 66305,
+                "inode": 21103698,
+                "size": 0,
+                "mtime_ns": 1790965087691412155
+              }
+            }
+          }
+        },
+        "audio": null,
+        "segments": [],
+        "encoder_stats": {
+          "frames": 0
+        },
+        "planner": {
+          "segment_frames": 150,
+          "frames_written": 0,
+          "segment_count": 0,
+          "covered_frames": 0,
+          "boundary_count": 1
+        }
+      },
+      "open_handles": 0
+    },
+    "malformed_segments": "segment_invalid: segment index 1 is not contiguous after 0",
+    "malformed_finish": "segment_invalid: segment index 1 is not contiguous after 0",
+    "malformed_open_handles_after_abort": 0
+  }
+}

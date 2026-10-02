@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
+import sys
+import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -296,6 +300,71 @@ class NativeCapabilitiesTest(unittest.TestCase):
             "create_native_session_io",
         }
         self.assertEqual({name for name in removed if hasattr(native_module, name)}, set())
+
+    def test_progress_snapshot_omits_history_but_explicit_segment_inventory_remains(self) -> None:
+        try:
+            extension = importlib.import_module("rp_ylx._native")
+        except ModuleNotFoundError as error:
+            raise unittest.SkipTest("native wheel is not installed") from error
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "video").mkdir()
+            events = [
+                {
+                    "event": "segment",
+                    "index": index,
+                    "start_frame": index * 150,
+                    "end_frame": (index + 1) * 150,
+                    "left": {"path": f"video/left_{index:05d}.mp4", "bytes": 1024},
+                    "right": {"path": f"video/right_{index:05d}.mp4", "bytes": 2048},
+                }
+                for index in range(120)
+            ]
+            (root / "events.ndjson").write_text(
+                "".join(json.dumps(event) + "\n" for event in events)
+            )
+            helper = root / "encoder.py"
+            helper.write_text(
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                'sys.stdout.write(pathlib.Path(__file__).with_name("events.ndjson").read_text())\n'
+                'print(\'{"event":"ready"}\', flush=True)\n'
+                "sys.stdin.buffer.read()\n"
+                'print(\'{"event":"done","frames":0}\', flush=True)\n'
+            )
+            helper.chmod(0o755)
+            transaction = extension.NativeSessionStore().begin_recording(
+                replace(_recording_plan(), session_root=str(root), encoder_executable=str(helper))
+            )
+            try:
+                snapshot = transaction.snapshot()
+                self.assertNotIn("segments", snapshot)
+                self.assertEqual(snapshot["state"], "recording")
+                self.assertEqual(snapshot["sink"]["frames_written"], 0)
+                self.assertEqual(
+                    snapshot["active_take"]["session_id"], _recording_plan().session_id
+                )
+                segments = transaction.segments()
+                self.assertEqual(
+                    segments,
+                    [
+                        {
+                            "index": event["index"],
+                            "start_frame": event["start_frame"],
+                            "end_frame": event["end_frame"],
+                            "left_path": event["left"]["path"],
+                            "left_bytes": 1024,
+                            "right_path": event["right"]["path"],
+                            "right_bytes": 2048,
+                        }
+                        for event in events
+                    ],
+                )
+                self.assertEqual(transaction.snapshot(), snapshot)
+                self.assertEqual(transaction.segments(), segments)
+            finally:
+                transaction.abort("snapshot test complete")
+            self.assertEqual(transaction.open_handle_count(), 0)
 
     def test_abi_six_extension_exports_only_deep_and_support_classes(self) -> None:
         try:

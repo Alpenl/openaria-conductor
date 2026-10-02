@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -1741,11 +1742,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(len(listed["items"]), 2)
             roots = set(restarted._require_admission().catalog_roots)
             iterdir = Path.iterdir
+            scandir = os.scandir
 
             def without_catalog_scan(path: Path):
                 if path in roots:
                     raise AssertionError("artifact access must not enumerate other sessions")
                 return iterdir(path)
+
+            def without_catalog_scandir(path):
+                if Path(path) in roots:
+                    raise AssertionError("artifact access must not enumerate other sessions")
+                return scandir(path)
 
             for session_id, root in (
                 (current, self.mountpoint / "recordings"),
@@ -1755,6 +1762,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
                 with (
                     patch.object(Path, "iterdir", without_catalog_scan),
+                    patch.object(os, "scandir", without_catalog_scandir),
                     restarted.open_verified_artifact(
                         session_id, artifact["artifact_id"], "v4"
                     ) as opened,
@@ -1989,6 +1997,91 @@ class CaptureCoordinatorTest(unittest.TestCase):
                         self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
                 finally:
                     coordinator.close()
+
+    def test_catalog_scan_ignores_link_loops_and_non_directories(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-loop-filter")
+            root = self.mountpoint / "recordings"
+            (root / "loop").symlink_to("loop", target_is_directory=True)
+            (root / "dangling").symlink_to("absent", target_is_directory=True)
+            (root / "ordinary-file").write_text("not a session")
+            (root / "unfinished.partial").mkdir()
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual([item["session_id"] for item in page["items"]], [session_id])
+            self.assertIsNotNone(page["items"][0]["verification"])
+            self.assertEqual(page["diagnostics"], [])
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_closes_on_manifest_identity_error(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            self.seal_one(coordinator, prefix="catalog-scan-close")
+            descriptors_before = len(os.listdir("/proc/self/fd"))
+            with (
+                patch.object(
+                    coordinator,
+                    "_session_manifest_is_current",
+                    side_effect=RuntimeError("injected identity error"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected identity error"),
+            ):
+                coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors_before)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_checks_fresh_root_after_directory_replacement(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="catalog-root-first")
+            second = self.seal_one(coordinator, prefix="catalog-root-second")
+            root = self.mountpoint / "recordings"
+            check_identity = coordinator._session_manifest_is_current
+            checked: list[str] = []
+
+            def replace_after_first_check(session_id, snapshot):
+                current = check_identity(session_id, snapshot)
+                checked.append(session_id)
+                if len(checked) == 1:
+                    retired = self.mountpoint / "retired-recordings"
+                    root.rename(retired)
+                    shutil.copytree(retired, root)
+                return current
+
+            with patch.object(
+                coordinator, "_session_manifest_is_current", replace_after_first_check
+            ):
+                page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(set(checked), {first, second})
+            summaries = {item["session_id"]: item for item in page["items"]}
+            self.assertIsNotNone(summaries[checked[0]]["verification"])
+            self.assertIsNone(summaries[checked[1]]["verification"])
+            self.assertNotIn(checked[1], coordinator._session_snapshots)
+            self.assertNotIn(checked[1], coordinator._verified)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_rejects_session_replaced_with_symlink(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-session-link")
+            original = self.mountpoint / "recordings" / session_id
+            retired = self.mountpoint / "outside-recordings"
+            original.rename(retired)
+            original.symlink_to(retired, target_is_directory=True)
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual(page["items"], [])
+            self.assertEqual(len(page["diagnostics"]), 1)
+            self.assertNotIn(session_id, coordinator._session_snapshots)
+            self.assertNotIn(session_id, coordinator._verified)
+        finally:
+            coordinator.close()
 
     def test_raw_sbs_frame_is_used_for_preview_without_eye_materialization(self) -> None:
         coordinator = self.coordinator()
