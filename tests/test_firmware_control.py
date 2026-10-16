@@ -15,6 +15,17 @@ from rp_ylx.firmware_control import FirmwareError, FirmwareSupervisor, dispatch
 
 
 class FirmwareControlTest(unittest.TestCase):
+    def test_sqlite_migration_blocks_same_version_legacy_update_and_rollback(self):
+        self.manifest["version"] = "0.2.1"
+        with patch("rp_ylx.update.sqlite_state_required", return_value=True):
+            status = self.supervisor.check(force=True)
+            self.assertFalse(status["has_update"])
+            self.assertIn("SQLite", status["warning"])
+            with self.assertRaises(FirmwareError) as error:
+                self.supervisor.start("rollback", str(uuid.uuid4()), "b" * 40)
+            self.assertEqual(error.exception.code, "state_schema_incompatible")
+            self.idle.assert_not_called()
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

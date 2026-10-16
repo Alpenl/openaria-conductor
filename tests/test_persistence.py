@@ -45,6 +45,24 @@ class PersistenceTest(unittest.TestCase):
         with self.assertRaises(PersistenceError):
             store.initialize_document("device", {"v": 0}, "bootstrap")
 
+    def test_updater_rejects_legacy_wheel_after_sqlite_migration(self):
+        import zipfile
+
+        from rp_ylx.update import require_sqlite_wheel
+
+        wheel = self.root / "legacy.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("rp_ylx/daemon.py", "")
+        with (
+            patch("rp_ylx.update.sqlite_state_required", return_value=True),
+            self.assertRaises(ValueError),
+        ):
+            require_sqlite_wheel(wheel)
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("rp_ylx/persistence.py", "SCHEMA_VERSION = 1")
+        with patch("rp_ylx.update.sqlite_state_required", return_value=True):
+            require_sqlite_wheel(wheel)
+
     def test_restore_preserves_previous_authority_and_requires_offline(self):
         from rp_ylx.database_admin import restore
 

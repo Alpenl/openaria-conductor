@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -38,6 +39,21 @@ NETWORK_STATE = Path("/var/lib/rp-ylx-network")
 NETWORK_PROFILES = Path("/etc/NetworkManager/system-connections")
 UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
+
+
+def sqlite_state_required() -> bool:
+    root = Path("/var/lib/rp-ylx")
+    if CONFIG.exists():
+        value = json.loads(CONFIG.read_bytes())
+        root = Path(value.get("state_root", str(root)))
+    return any((root / (name + ".sqlite3.initialized")).exists() for name in ("state", "settings"))
+
+
+def require_sqlite_wheel(path: Path) -> None:
+    if sqlite_state_required():
+        with zipfile.ZipFile(path) as wheel:
+            if "rp_ylx/persistence.py" not in wheel.namelist():
+                raise ValueError("设备已迁移 SQLite，目标固件不支持当前状态；禁止直接降级")
 
 
 @contextmanager
@@ -464,6 +480,7 @@ def verify_bundle(root: Path, manifest: dict) -> None:
         raise ValueError("bundle 应包含唯一应用 wheel")
     if {path.name for path in root.iterdir()} - names:
         raise ValueError("bundle 包含未声明文件")
+    require_sqlite_wheel(root / bundle["application_wheel"])
 
 
 def current_commit() -> str | None:

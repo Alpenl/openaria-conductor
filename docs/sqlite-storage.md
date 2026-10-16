@@ -25,10 +25,19 @@
 
 ## 查看和修改
 
+离线安装使用包内解释器；先在设备 shell 定义以下快捷函数（不依赖全局 console script）：
+
 ```bash
-sudo -u rp-ylx openaria settings show --config /etc/rp-ylx/device.json
-sudo -u rp-ylx openaria settings set --config /etc/rp-ylx/device.json --input /path/patch.json
-sudo -u rp-ylx openaria settings export --config /etc/rp-ylx/device.json --output /path/new-export.json
+oa() {
+  sudo env PYTHONPATH=/opt/rp-ylx/current/site-packages \
+    /opt/rp-ylx/current/runtime/bin/python3 -m rp_ylx "$@"
+}
+```
+
+```bash
+oa settings show --config /etc/rp-ylx/device.json
+oa settings set --config /etc/rp-ylx/device.json --input /path/patch.json
+oa settings export --config /etc/rp-ylx/device.json --output /path/new-export.json
 ```
 
 补丁仅包含需修改的字段，例如 `{"storage":{"minimum_available_bytes":2147483648}}`。
@@ -38,8 +47,8 @@ sudo -u rp-ylx openaria settings export --config /etc/rp-ylx/device.json --outpu
 ## 备份、恢复和重建
 
 ```bash
-sudo openaria database check --database /var/lib/rp-ylx/state.sqlite3
-sudo openaria database backup --database /var/lib/rp-ylx/state.sqlite3 --output /secure/new-state.sqlite3
+oa database check --database /var/lib/rp-ylx/state.sqlite3
+oa database backup --database /var/lib/rp-ylx/state.sqlite3 --output /secure/new-state.sqlite3
 ```
 
 对每个数据库分别备份。命令使用 SQLite 在线备份 API，包含已提交 WAL；不要只复制正在
@@ -50,15 +59,16 @@ sudo openaria database backup --database /var/lib/rp-ylx/state.sqlite3 --output 
 `rp-ylx-network-control.service` 和 `rp-ylx-recover.service`。恢复入口检查这些服务均已停止。
 
 ```bash
-sudo openaria database restore --database /var/lib/rp-ylx/state.sqlite3 --input /secure/new-state.sqlite3
-sudo openaria database rebuild-catalog --database /var/lib/rp-ylx/catalog.sqlite3
+oa database restore --database /var/lib/rp-ylx/state.sqlite3 --input /secure/new-state.sqlite3
+oa database rebuild-catalog --database /var/lib/rp-ylx/catalog.sqlite3
 ```
 
 恢复会保留旧数据库和日志为 `.before-restore-*`，不删除素材。只能重建 `catalog.sqlite3`；
 采集、配置和网络数据库必须恢复正确备份。目录重建后首次列表重新读取清单，原校验历史
 保留在归档数据库中。完成后启动原服务并检查网络、空闲状态、设置和录制列表。
 
-升级到 SQLite 后不得直接运行只读写旧 JSON 的固件。需要回退时，应停止所有写入者，
+升级到 SQLite 后不得直接运行只读写旧 JSON 的固件。网页、独立升级器和安装器拒绝没有 SQLite 支持的目标；迁移后不提供同版本不同提交的在线替换。
+需要回退到旧 JSON 固件时，应停止所有写入者，
 恢复迁移前固件及其配套状态备份，再单独核对迁移之后产生的素材和网络配置。
 
 ## 空间与内存保护

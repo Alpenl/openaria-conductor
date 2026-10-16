@@ -115,6 +115,7 @@ class FirmwareSupervisor:
         with self.lock:
             current, previous = self._release("current"), self._release("previous")
             available = self.cache
+            sqlite_state = updater_module().sqlite_state_required()
             has_update = bool(
                 current
                 and available
@@ -123,6 +124,7 @@ class FirmwareSupervisor:
                     or (
                         available["version"] == current["version"]
                         and available["commit"] != current["commit"]
+                        and not sqlite_state
                     )
                 )
             )
@@ -134,7 +136,16 @@ class FirmwareSupervisor:
                 "available": available,
                 "has_update": has_update,
                 "checked_at": self.checked_at or None,
-                "warning": self.warning,
+                "warning": self.warning
+                or (
+                    "设备已使用 SQLite，同版本旧固件不可直接替换；请使用支持 SQLite 的新版本。"
+                    if sqlite_state
+                    and available
+                    and current
+                    and available["version"] == current["version"]
+                    and available["commit"] != current["commit"]
+                    else None
+                ),
                 "task": dict(self.task) if self.task else None,
             }
 
@@ -205,6 +216,16 @@ class FirmwareSupervisor:
                 previous = self._release("previous")
                 if previous is None or previous["commit"] != commit:
                     raise FirmwareError("rollback_unavailable", "上一版本已变化或不可回退")
+                if (
+                    updater_module().sqlite_state_required()
+                    and not (
+                        self.install / "releases" / commit / "site-packages/rp_ylx/persistence.py"
+                    ).is_file()
+                ):
+                    raise FirmwareError(
+                        "state_schema_incompatible",
+                        "上一版本不支持 SQLite，必须离线恢复配套状态后才能回退",
+                    )
             try:
                 updater_module().require_idle()
             except (OSError, ValueError, KeyError) as error:

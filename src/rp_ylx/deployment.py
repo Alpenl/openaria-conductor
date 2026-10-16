@@ -2333,6 +2333,7 @@ class ReleaseManager:
         self.recover()
         bundle = load_bundle(bundle_path)
         self._prepare_release(bundle)
+        self._require_state_compatible_release(bundle.commit)
         current = self._link_target("current")
         old_current = current
         quiesced = old_current is not None and (activate or old_current != bundle.commit)
@@ -2382,6 +2383,18 @@ class ReleaseManager:
             self._activate(old_current, bundle.commit)
         return self.status()
 
+    def _require_state_compatible_release(self, commit: str) -> None:
+        if any(
+            (self.state_root / (name + ".sqlite3.initialized")).exists()
+            for name in ("state", "settings")
+        ):
+            module = self.install_root / "releases" / commit / "site-packages/rp_ylx/persistence.py"
+            if not module.is_file():
+                raise DeploymentError(
+                    "state_schema_incompatible",
+                    "设备已迁移 SQLite，不能直接运行只支持旧 JSON 的固件",
+                )
+
     def rollback(self, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
         self._ensure_layout()
@@ -2390,6 +2403,7 @@ class ReleaseManager:
         previous = self._link_target("previous")
         if current is None or previous is None:
             raise DeploymentError("rollback_unavailable", "没有可回滚的上一版本")
+        self._require_state_compatible_release(previous)
         self._quiesce_release_services()
         transaction_started = False
         current_snapshot_written = False
