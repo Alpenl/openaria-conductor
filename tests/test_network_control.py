@@ -2944,6 +2944,7 @@ class NetworkControlTest(unittest.TestCase):
         provider._lock = threading.RLock()
         provider._active = None
         provider._network_operation_lease = None
+        provider._pending_focus = None
         command = NetworkCommand(
             "customer",
             "retry-missing",
@@ -2986,6 +2987,7 @@ class NetworkControlTest(unittest.TestCase):
         provider = object.__new__(CaptureCoordinator)
         provider._active = None
         provider._network_operation_lease = None
+        provider._pending_focus = None
         response = {
             "schema": CONTROL_RESPONSE_SCHEMA,
             "ok": True,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import sqlite3
 import tempfile
@@ -150,6 +151,46 @@ class PersistenceTest(unittest.TestCase):
         store = StateDatabase(self.root / "settings.sqlite3")
         store.initialize_document("device", {"camera": {"fps": 25}}, "test")
         self.assertEqual(effective(base)["camera"]["fps"], 25)
+
+    def test_settings_patch_validates_and_survives_bootstrap_change(self):
+        from rp_ylx.daemon import ProductionConfigError, load_production_config
+        from rp_ylx.settings import manage
+
+        base = {
+            "schema": "ylx.production-config.v1",
+            "listen": {"host": "127.0.0.1", "port": 8080},
+            "camera": {
+                "device": "/dev/video0",
+                "width": 3840,
+                "height": 1080,
+                "fps": 60,
+                "data_plane": "rust",
+            },
+            "storage": {
+                "mountpoint": str(self.root / "data"),
+                "minimum_available_bytes": 100,
+                "minimum_available_inodes": 10,
+            },
+            "state_root": str(self.root),
+            "device": {
+                "device_id": "11111111-1111-4111-8111-111111111111",
+                "device_label": "YLX-12AB34CD",
+                "hardware_fingerprint": "sha256:" + "a" * 64,
+            },
+            "security": {"profile": "lab", "isolated_network": True},
+        }
+        config = self.root / "device.json"
+        config.write_text(json.dumps(base))
+        patchfile = self.root / "patch.json"
+        patchfile.write_text(json.dumps({"storage": {"minimum_available_bytes": 200}}))
+        manage(config, "set", source=patchfile)
+        base["storage"]["minimum_available_bytes"] = 999
+        config.write_text(json.dumps(base))
+        self.assertEqual(load_production_config(config).minimum_available_bytes, 200)
+        patchfile.write_text(json.dumps({"camera": {"fps": -1}}))
+        with self.assertRaises(ProductionConfigError):
+            manage(config, "set", source=patchfile)
+        self.assertEqual(load_production_config(config).fps, 60)
 
     def test_catalog_restart_invalidation_and_historical_proof(self):
         directory = self.root / "session"
