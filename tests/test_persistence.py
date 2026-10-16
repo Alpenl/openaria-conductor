@@ -228,6 +228,8 @@ class PersistenceTest(unittest.TestCase):
         patchfile = self.root / "patch.json"
         patchfile.write_text(json.dumps({"storage": {"minimum_available_bytes": 200}}))
         manage(config, "set", source=patchfile)
+        self.assertEqual(manage(config, "show")["settings"]["recording"]["codec"], "hevc")
+        self.assertEqual(manage(config, "show")["settings"]["recording"]["bitrate_kbps"], 12288)
         base["storage"]["minimum_available_bytes"] = 999
         config.write_text(json.dumps(base))
         self.assertEqual(load_production_config(config).minimum_available_bytes, 200)

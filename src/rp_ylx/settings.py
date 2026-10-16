@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
 
 from rp_ylx.persistence import PersistenceError, StateDatabase
@@ -56,13 +57,40 @@ def effective(bootstrap: Mapping[str, object]) -> dict:
     return overlay(bootstrap, dynamic)
 
 
+def resolved_settings(bootstrap: Mapping[str, object]) -> dict:
+    """Persist effective defaults as values so future firmware defaults cannot change a take."""
+    from rp_ylx.daemon import production_config_from_value
+
+    config = production_config_from_value(bootstrap)
+    return {
+        "camera": {
+            "width": config.width,
+            "height": config.height,
+            "fps": config.fps,
+            "exposure_time_absolute": config.exposure_time_absolute,
+        },
+        "audio": {
+            "enabled": config.audio_enabled,
+            "device": config.audio_device,
+            "sample_rate_hz": config.audio_sample_rate_hz,
+            "channels": config.audio_channels,
+            "sample_format": config.audio_sample_format,
+        },
+        "recording": asdict(config.recording_encoding),
+        "storage": {
+            "minimum_available_bytes": config.minimum_available_bytes,
+            "minimum_available_inodes": config.minimum_available_inodes,
+        },
+    }
+
+
 def initialize(path: Path) -> None:
     from rp_ylx.daemon import production_config_from_value
 
     base = json.loads(path.read_bytes())
     production_config_from_value(base)
     db = StateDatabase(settings_path(base))
-    db.initialize_document("device", extract(base), str(path))
+    db.initialize_document("device", resolved_settings(base), str(path))
     production_config_from_value(effective(base))
 
 
