@@ -237,6 +237,7 @@ pub(crate) struct AudioRecordingSnapshot {
 #[derive(Default)]
 struct AudioProgress {
     error: Mutex<Option<AudioError>>,
+    commit_error: Mutex<Option<AudioError>>,
     queued_frames: AtomicU64,
     queue_peak_frames: AtomicU64,
     max_write_ns: AtomicU64,
@@ -260,6 +261,17 @@ struct ClockCheckpoint {
 }
 
 impl AudioProgress {
+    fn check_commit(&self) -> Result<(), AudioError> {
+        match &*self
+            .commit_error
+            .lock()
+            .map_err(|_| AudioError::new("audio_failed", "audio commit error mutex poisoned"))?
+        {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn fail(&self, error: AudioError) {
         if let Ok(mut first) = self.error.lock() {
             first.get_or_insert(error);
@@ -950,6 +962,7 @@ impl CommitWorker {
                 batch.extend(receiver.try_iter().take(MAX_PENDING_COMMITS as usize - 1));
                 let count = batch.len() as u64;
                 if let Err(error) = commit(batch) {
+                    *state.commit_error.lock().unwrap() = Some(error.clone());
                     state.fail(error.clone());
                     return Err(error);
                 }
@@ -965,7 +978,7 @@ impl CommitWorker {
     }
 
     fn submit(&self, segment: PendingSegment) -> Result<(), AudioError> {
-        self.progress.check()?;
+        self.progress.check_commit()?;
         let previous = self
             .progress
             .pending_commits
@@ -980,7 +993,7 @@ impl CommitWorker {
             .fetch_max(previous + 1, Ordering::Relaxed);
         if self.sender.as_ref().unwrap().try_send(segment).is_err() {
             self.progress.pending_commits.fetch_sub(1, Ordering::AcqRel);
-            self.progress.check()?;
+            self.progress.check_commit()?;
             return Err(AudioError::new(
                 "audio_failed",
                 "audio commit worker disconnected",
@@ -995,7 +1008,7 @@ impl CommitWorker {
             Some(worker) => worker
                 .join()
                 .map_err(|_| AudioError::new("audio_failed", "audio commit worker panicked"))?,
-            None => self.progress.check(),
+            None => self.progress.check_commit(),
         }
     }
 }
@@ -1121,7 +1134,9 @@ impl SegmentWriter {
         frames: u64,
         total_written_before: &mut u64,
     ) -> Result<(), AudioError> {
-        self.progress.check()?;
+        // A capture failure must still drain buffers accepted before the fault.
+        // Only a failed durable commit prevents further successful disk writes.
+        self.progress.check_commit()?;
         let mut remaining = frames;
         let mut frame_offset = 0_u64;
         while remaining > 0 {
@@ -1744,6 +1759,40 @@ mod tests {
             8
         );
         assert!(!root.join("audio/checkpoint.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capture_failure_still_drains_previously_accepted_pcm() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root.clone(),
+            device: "hw:0,0".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 0.3,
+        };
+        let progress = std::sync::Arc::new(super::AudioProgress::default());
+        let mut writer = SegmentWriter::with_progress(&config, progress.clone()).unwrap();
+        let mut written = 0;
+        writer.write_frames(&[7; 12], 3, &mut written).unwrap();
+        progress.fail(super::AudioError::new(
+            "audio_failed",
+            "capture disconnected",
+        ));
+        // This buffer was already queued when capture failed. It must be kept.
+        writer.write_frames(&[9; 12], 3, &mut written).unwrap();
+        let records = writer.finish().unwrap();
+        assert_eq!(written, 6);
+        assert_eq!(records.last().unwrap().end_sample, 6);
+        assert_eq!(
+            &std::fs::read(root.join("audio/audio_00001.wav")).unwrap()[44..],
+            &[9; 12]
+        );
+        assert_eq!(
+            progress.check().unwrap_err().message,
+            "capture disconnected"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
