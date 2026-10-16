@@ -1210,9 +1210,12 @@ class CaptureCoordinator:
                                 )
                             except OSError:
                                 cached = None
+                            if session_id in self._retained and session_id not in self._verified:
+                                cached = None
                             if cached is not None:
                                 if summary is None or snapshot is None:
                                     self._session_summaries[session_id] = cached
+                                self._session_diagnostics.pop(session_id, None)
                                 continue
                             # A changed manifest must not keep a stale metadata-only summary.
                             self._session_summaries.pop(session_id, None)

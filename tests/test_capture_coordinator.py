@@ -3657,6 +3657,24 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
+    def test_sqlite_catalog_clears_diagnostic_after_artifact_repair(self):
+        first = self.coordinator()
+        session_id = self.seal_one(first, prefix="catalog-repair")
+        first.close()
+        video = next((self.mountpoint / "recordings" / session_id / "video").glob("left_*.mp4"))
+        original = video.read_bytes()
+        video.write_bytes(b"bad")
+        reopened = self.coordinator()
+        try:
+            invalid = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertTrue(invalid["diagnostics"])
+            video.write_bytes(original)
+            repaired = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(repaired["diagnostics"], [])
+            self.assertEqual(repaired["items"][0]["session_id"], session_id)
+        finally:
+            reopened.close()
+
     def test_digest_error_is_not_listed_as_a_success(self) -> None:
         first = self.coordinator()
         try:

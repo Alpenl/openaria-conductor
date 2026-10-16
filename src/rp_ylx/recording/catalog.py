@@ -97,7 +97,11 @@ class SessionCatalog(StateDatabase):
                     if not stat.S_ISDIR(current.lstat().st_mode):
                         raise OSError("indexed artifact directory is not a regular directory")
                 metadata = (directory / path).lstat()
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_bytes:
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size != expected_bytes
+                    or metadata.st_nlink != 1
+                ):
                     return None
             self._admitted.add(key)
         value = json.loads(row[0])
