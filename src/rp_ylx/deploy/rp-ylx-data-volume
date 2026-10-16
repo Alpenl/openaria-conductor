@@ -53,6 +53,14 @@ install -d -o rp-ylx -g rp-ylx -m 0750 "$MOUNT/recordings"
 # Keep the old generation root readable so upgraded devices can still list and
 # download sessions captured before the /data/recordings migration.
 install -d -o rp-ylx -g rp-ylx -m 0750 "$MOUNT/sessions"
-chown -R rp-ylx:rp-ylx "$MOUNT/.ylx-volume.json" "$MOUNT/sessions" "$MOUNT/recordings" 2>/dev/null || true
+# chown updates ctime even when ownership already matches. Rewriting every
+# manifest on boot invalidates the persistent catalog and forces full validation
+# of all historical recordings on the first list request. Repair only mismatches;
+# do not follow symlinks or cross into another mounted filesystem.
+capture_uid="$(id -u rp-ylx)"
+capture_gid="$(id -g rp-ylx)"
+find -P "$MOUNT/.ylx-volume.json" "$MOUNT/sessions" "$MOUNT/recordings" -xdev \
+    \( ! -uid "$capture_uid" -o ! -gid "$capture_gid" \) \
+    -exec chown -h "$capture_uid:$capture_gid" {} +
 log "ready: $(findmnt -rn --mountpoint "$MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS)"
 df -hT "$MOUNT"
