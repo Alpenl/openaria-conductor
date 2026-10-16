@@ -20,13 +20,52 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Literal
 
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator, FormatChecker, validators
 from jsonschema.exceptions import ValidationError
 
 from rp_ylx.audio_clock import audio_clock_report
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
+
+
+def _unique_json_key(value: object) -> object:
+    # JSON Schema treats 1 and 1.0 as equal, but distinguishes booleans from numbers.
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise TypeError("non-JSON number")
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(_unique_json_key(item) for item in value))
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return ("object", frozenset((key, _unique_json_key(item)) for key, item in value.items()))
+    raise TypeError("non-JSON value")
+
+
+def _unique_items(validator, unique, instance, schema):
+    if not unique or not validator.is_type(instance, "array"):
+        return
+    try:
+        seen = set()
+        for item in instance:
+            key = _unique_json_key(item)
+            if key in seen:
+                yield ValidationError("array contains duplicate elements")
+                return
+            seen.add(key)
+    except TypeError:
+        yield from Draft202012Validator.VALIDATORS["uniqueItems"](
+            validator, unique, instance, schema
+        )
+
+
+_ManifestValidator = validators.extend(Draft202012Validator, {"uniqueItems": _unique_items})
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
@@ -52,7 +91,7 @@ _DEVICE_SESSION_V1_SCHEMA = json.loads(
     .joinpath("ylx-device-session-v1.schema.json")
     .read_text(encoding="utf-8")
 )
-_DEVICE_SESSION_V1_VALIDATOR = Draft202012Validator(
+_DEVICE_SESSION_V1_VALIDATOR = _ManifestValidator(
     _DEVICE_SESSION_V1_SCHEMA,
     format_checker=FormatChecker(),
 )
@@ -67,15 +106,15 @@ _DEVICE_SESSION_V2_SCHEMA["$defs"]["recordedAudio"]["properties"]["capture_clock
     "required": ["schema"],
     "properties": {"schema": {"const": "openaria.audio-clock.v1"}},
 }
-_DEVICE_SESSION_V2_VALIDATOR = Draft202012Validator(
+_DEVICE_SESSION_V2_VALIDATOR = _ManifestValidator(
     _DEVICE_SESSION_V2_SCHEMA,
     format_checker=FormatChecker(),
 )
-_DEVICE_SESSION_V3_VALIDATOR = Draft202012Validator(
+_DEVICE_SESSION_V3_VALIDATOR = _ManifestValidator(
     json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v3.schema.json").read_text()),
     format_checker=FormatChecker(),
 )
-_DEVICE_SESSION_V4_VALIDATOR = Draft202012Validator(
+_DEVICE_SESSION_V4_VALIDATOR = _ManifestValidator(
     json.loads(files("rp_ylx.schemas").joinpath("ylx-device-session-v4.schema.json").read_text()),
     format_checker=FormatChecker(),
 )
@@ -84,11 +123,13 @@ _RECORDING_SESSION_SCHEMA = json.loads(
     .joinpath("recording-session-v0.schema.json")
     .read_text(encoding="utf-8")
 )
-_RECORDING_SESSION_VALIDATOR = Draft202012Validator(
+_RECORDING_SESSION_VALIDATOR = _ManifestValidator(
     _RECORDING_SESSION_SCHEMA,
     format_checker=FormatChecker(),
 )
 _VALIDATED_MANIFEST_CACHE_LIMIT = 32
+_VALIDATED_MANIFEST_CACHE_BYTES = 8 * 1024 * 1024
+_VALIDATED_MANIFEST_SIZES: dict[tuple[str, str, str], int] = {}
 _VALIDATED_MANIFEST_CACHE_LOCK = threading.Lock()
 _VALIDATED_MANIFEST_CACHE: OrderedDict[tuple[str, str, str], Mapping[str, object]] = OrderedDict()
 
@@ -952,9 +993,14 @@ def _validated_manifest(payload: bytes, session_id: str, api_version: str) -> Ma
             return cached
         manifest = _decode_and_validate_manifest(payload, session_id, api_version)
         _VALIDATED_MANIFEST_CACHE[cache_key] = manifest
+        _VALIDATED_MANIFEST_SIZES[cache_key] = len(payload)
         _VALIDATED_MANIFEST_CACHE.move_to_end(cache_key)
-        while len(_VALIDATED_MANIFEST_CACHE) > _VALIDATED_MANIFEST_CACHE_LIMIT:
-            _VALIDATED_MANIFEST_CACHE.popitem(last=False)
+        while (
+            len(_VALIDATED_MANIFEST_CACHE) > _VALIDATED_MANIFEST_CACHE_LIMIT
+            or sum(_VALIDATED_MANIFEST_SIZES.values()) > _VALIDATED_MANIFEST_CACHE_BYTES
+        ):
+            evicted, _ = _VALIDATED_MANIFEST_CACHE.popitem(last=False)
+            _VALIDATED_MANIFEST_SIZES.pop(evicted, None)
         return manifest
 
 
@@ -989,6 +1035,7 @@ def _decode_and_validate_manifest(
 def _clear_validated_manifest_cache_for_tests() -> None:
     with _VALIDATED_MANIFEST_CACHE_LOCK:
         _VALIDATED_MANIFEST_CACHE.clear()
+        _VALIDATED_MANIFEST_SIZES.clear()
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

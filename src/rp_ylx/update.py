@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -87,7 +88,24 @@ def prepare_first_install_network(
     if any((state_dir / name).exists() for name in ("lkg-wlan0.json", "lkg-eth0.json")):
         return
     controller_path = state_dir / "controller-state.json"
-    controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
+    database = state_dir / "controller.sqlite3"
+    if database.exists() or database.with_suffix(".sqlite3.initialized").exists():
+        # This updater also runs standalone, before the application is importable.
+        db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+        try:
+            if (
+                db.execute("PRAGMA application_id").fetchone()[0] != 0x594C5801
+                or db.execute("PRAGMA user_version").fetchone()[0] != 1
+            ):
+                raise ValueError("网络数据库版本无效")
+            row = db.execute("SELECT body FROM documents WHERE name='controller'").fetchone()
+            if row is None:
+                raise ValueError("网络控制器状态缺失")
+            controller = json.loads(row[0])
+        finally:
+            db.close()
+    else:
+        controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
     if controller is not None and not isinstance(controller, dict):
         raise ValueError("网络控制器状态无效，停止继承 Wi-Fi")
     if controller is not None and not (
@@ -244,7 +262,21 @@ def prepare_first_install_network(
                 verified=True,
                 source_revision=controller["source_revision"] + 1,
             )
-            save_state(controller_path, controller)
+            if database.exists():
+                db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+                try:
+                    db.execute("PRAGMA synchronous=FULL")
+                    with db:
+                        db.execute(
+                            "UPDATE documents SET body=?,revision=revision+1,"
+                            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                            "WHERE name='controller'",
+                            (json.dumps(controller),),
+                        )
+                finally:
+                    db.close()
+            else:
+                save_state(controller_path, controller)
     except BaseException:
         (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
         nmcli("connection", "delete", "id", profile)

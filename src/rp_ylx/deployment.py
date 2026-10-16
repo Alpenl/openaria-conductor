@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -1471,6 +1472,26 @@ class ReleaseManager:
                 "无法枚举网络状态目录",
             ) from error
         for entry in entries:
+            if entry.name in {"controller.sqlite3-wal", "controller.sqlite3-shm"}:
+                _require_regular_file(entry, code="network_state_migration_unsafe")
+                continue  # Included by the SQLite backup API, never copied separately.
+            if entry.name == "controller.sqlite3":
+                from rp_ylx.persistence import StateDatabase
+
+                _require_regular_file(entry, code="network_state_migration_unsafe")
+                with tempfile.TemporaryDirectory(prefix="ylx-network-backup-") as directory:
+                    backup = Path(directory) / entry.name
+                    StateDatabase(entry).backup(backup)
+                    payloads[entry.name] = backup.read_bytes()
+                continue
+            if entry.name in {"controller.sqlite3.initialized", "controller-state.json.pre-sqlite"}:
+                metadata = _require_regular_file(entry, code="network_state_migration_unsafe")
+                if metadata.st_mode & 0o077 or metadata.st_size > MAX_NETWORK_STATE_MIGRATION_BYTES:
+                    raise DeploymentError(
+                        "network_state_migration_unsafe", "数据库迁移证据权限或大小无效"
+                    )
+                payloads[entry.name] = entry.read_bytes()
+                continue
             if entry.name == NETWORK_STATE_MIGRATION_MARKER and migration_target:
                 continue
             if entry.name in transient_files:
@@ -1575,6 +1596,9 @@ class ReleaseManager:
                         "lkg-wlan0.json",
                         "lkg-eth0.json",
                         "controller-state.json",
+                        "controller.sqlite3",
+                        "controller.sqlite3.initialized",
+                        "controller-state.json.pre-sqlite",
                     }
                     or re.fullmatch(r"requests/[0-9a-f]{64}\.json", relative) is not None
                 )

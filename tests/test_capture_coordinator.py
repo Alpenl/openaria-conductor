@@ -1107,6 +1107,38 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_storage_reserve_stops_and_seals_active_recording(self):
+        coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
+        try:
+            coordinator.start_capture(start_command("reserve-start"))
+            session_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch("rp_ylx.recording.coordinator._stat_capacity", return_value=(100, 9, 100)):
+                coordinator.enforce_storage_reserve()
+            self.assertIsNone(coordinator._active)
+            manifest = validate_device_session_directory(
+                self.mountpoint / "recordings" / session_id
+            )
+            self.assertTrue(manifest["sealed"])
+        finally:
+            coordinator.close()
+
+    def test_persisted_catalog_avoids_reinspection_after_restart(self):
+        first = self.coordinator()
+        session_id = self.seal_one(first, prefix="sqlite-restart")
+        first.close()
+        reopened = self.coordinator()
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator.inspect_device_session_directory",
+                side_effect=AssertionError("unchanged manifest was revalidated"),
+            ):
+                listed = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
+            self.assertIsNone(listed["items"][0]["verification"])
+        finally:
+            reopened.close()
+
     def test_start_rechecks_thresholds_and_rejects_wrong_volume(self) -> None:
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
         try:
@@ -1662,7 +1694,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
                 first_list_inspections = inspect_session.call_count
-                self.assertGreater(first_list_inspections, 0)
+                self.assertEqual(first_list_inspections, 0)  # SQLite survived the service restart.
                 self.assertEqual(
                     [item["session_id"] for item in listed["items"]],
                     [session_id],

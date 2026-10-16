@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import stat
 import threading
 import time
@@ -50,6 +51,8 @@ from rp_ylx.network_control import CONTROL_RESPONSE_TIMEOUT_SECONDS, NetworkCont
 from rp_ylx.network_control import request_control as request_network_control
 from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
+from rp_ylx.persistence import PersistenceError, StateDatabase
+from rp_ylx.recording.catalog import SessionCatalog
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     DeviceSessionConfig,
@@ -574,8 +577,13 @@ class CaptureCoordinator:
         self._safe_swap_resource: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
+        self._persisted_command_scopes: set[tuple[str, str, str]] = set()
         self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         self._state_path = self._config.state_root / "capture-coordinator.json"
+        self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
+        self._state_db.import_json("capture", self._state_path)
+        self._pending_focus = self._state_db.get("camera_focus")
+        self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
         persisted = self._read_local_state()
         self._authority_epoch = str(persisted.get("authority_epoch") or uuid.uuid4())
         self._revision = int(persisted.get("source_revision", 0))
@@ -592,6 +600,9 @@ class CaptureCoordinator:
             # Full payload verification is data-size dependent; defer it until
             # the catalog is requested so service startup stays bounded.
         self._persist_local_state()
+        if self._sources is not None:
+            with suppress(CameraError, ProviderError):
+                self._require_camera_connected()
 
     @property
     def volume_id(self) -> str:
@@ -612,13 +623,7 @@ class CaptureCoordinator:
         return bool(getattr(self._sources, "keeps_preview_after_stop", False))
 
     def _read_local_state(self) -> Mapping[str, object]:
-        if not self._state_path.exists():
-            return {}
-        try:
-            value = json.loads(self._state_path.read_bytes())
-            return value if isinstance(value, dict) else {}
-        except (OSError, ValueError, json.JSONDecodeError):
-            return {}
+        return self._state_db.capture_state()
 
     def _require_admission(self) -> VolumeAdmission:
         admission = self._admission
@@ -789,9 +794,15 @@ class CaptureCoordinator:
                     operation,
                     idempotency_key,
                 ), (canonical, result) in self._commands.items()
+                if (principal_id, operation, idempotency_key) not in self._persisted_command_scopes
             ],
         }
-        write_json_atomic(self._state_path, value)
+        commands = value.pop("commands")
+        current_scopes = set(self._commands)
+        self._state_db.put_capture_state(
+            value, commands, self._persisted_command_scopes - current_scopes
+        )
+        self._persisted_command_scopes = current_scopes
 
     def _next_revision(self) -> int:
         with self._lock:
@@ -1187,11 +1198,34 @@ class CaptureCoordinator:
                                 )
                             continue
 
+                        if verify_session is None:
+                            try:
+                                signature = self._catalog_db.signature(sessions_root / session_id)
+                                cached = self._catalog_db.cached(
+                                    admission.volume_id,
+                                    session_id,
+                                    signature,
+                                    self._config.session.commit,
+                                    directory=sessions_root / session_id,
+                                )
+                            except OSError:
+                                cached = None
+                            if cached is not None:
+                                if summary is None or snapshot is None:
+                                    self._session_summaries[session_id] = cached
+                                continue
+                            # A changed manifest must not keep a stale metadata-only summary.
+                            self._session_summaries.pop(session_id, None)
+                            summary = None
+
                         # A summary without a snapshot is already metadata-only.
                         # Only an explicit artifact request can promote it to verified.
                         if summary is not None and verify_session is None:
                             continue
                         try:
+                            inspected_signature = self._catalog_db.signature(
+                                sessions_root / session_id
+                            )
                             manifest, payload = inspect_device_session_directory(
                                 sessions_root / session_id
                             )
@@ -1234,6 +1268,14 @@ class CaptureCoordinator:
                                 verification_error=verification_error,
                                 verification_current=verified_snapshot is not None,
                             )
+                            self._catalog_db.remember(
+                                admission.volume_id,
+                                sessions_root / session_id,
+                                self._config.session.commit,
+                                self._session_summaries[session_id],
+                                manifest,
+                                expected_signature=inspected_signature,
+                            )
                             self._session_diagnostics.pop(session_id, None)
                             if verified_snapshot is None:
                                 self._invalidate_session_verification(session_id)
@@ -1265,6 +1307,7 @@ class CaptureCoordinator:
             # A targeted catalog refresh must not evict summaries for unrelated
             # sessions. Full discovery performs the stale-entry cleanup.
             if verify_session is None:
+                self._catalog_db.discard_missing(admission.volume_id, discovered)
                 for session_id in set(self._session_summaries) - discovered:
                     self._session_summaries.pop(session_id, None)
                     self._verified.pop(session_id, None)
@@ -1564,6 +1607,9 @@ class CaptureCoordinator:
     def _require_camera_connected(self) -> None:
         if self._camera_connection_status()["state"] != "connected":
             raise self._camera_not_connected()
+        if self._pending_focus is not None and self._sources is not None:
+            self._sources.set_camera_focus(**self._pending_focus)
+            self._pending_focus = None
 
     def _calibration_source_supported(self) -> bool:
         if self._sources is None:
@@ -2150,6 +2196,11 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from exc
+        self._state_db.put(
+            "camera_focus",
+            {"value": result.get("value"), "auto_enabled": result.get("auto_enabled")},
+            history=True,
+        )
         self._next_revision()
         return result
 
@@ -2379,11 +2430,42 @@ class CaptureCoordinator:
                 return
             self._retain_active_failure(DeviceRecordingError(code, message))
 
-    def stop_capture(self, command: CaptureCommand) -> CaptureCommandResult:
+    def enforce_storage_reserve(self) -> None:
+        """Stop normally before exhausting the finalization reserve; never from a source thread."""
+        with self._lock:
+            if self._active_plan is None or self._closing or self._stop_inflight is not None:
+                return
+            session_id = self._active_plan.session_id
+            self._check_generation(self._active_plan.generation_id, force=True)
+            _, available, inodes = _stat_capacity(self._config.mountpoint)
+            if (
+                available >= self._config.minimum_available_bytes
+                and inodes >= self._config.minimum_available_inodes
+            ):
+                return
+        operational_logger("recording").event(
+            "storage_reserve_stop",
+            transaction_id=session_id,
+            available_bytes=available,
+            available_inodes=inodes,
+        )
+        body = {"reason": "storage_reserve"}
+        self.stop_capture(
+            CaptureCommand("storage-monitor", session_id, body, _canonical_json_bytes(body)),
+            expected_session_id=session_id,
+        )
+
+    def stop_capture(
+        self, command: CaptureCommand, *, expected_session_id: str | None = None
+    ) -> CaptureCommandResult:
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
         with self._stop_condition:
             while True:
+                if expected_session_id is not None and (
+                    self._active_plan is None or self._active_plan.session_id != expected_session_id
+                ):
+                    return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
                 previous = self._commands.get(scope)
                 if previous is not None:
                     previous_body, result = previous
@@ -2500,6 +2582,21 @@ class CaptureCoordinator:
                         verification_error=verification_error,
                         verification_current=verification_current,
                     )
+                    try:
+                        self._catalog_db.remember(
+                            plan.volume_id,
+                            self._require_admission().sessions_root / plan.session_id,
+                            self._config.session.commit,
+                            self._session_summaries[plan.session_id],
+                            sealed.manifest,
+                        )
+                    except (OSError, sqlite3.Error, PersistenceError):
+                        # The sealed files are already durable. Discovery can rebuild this cache.
+                        operational_logger("recording").event(
+                            "catalog_publish_deferred",
+                            level="warning",
+                            transaction_id=plan.session_id,
+                        )
                     if verified_snapshot is not None:
                         self._session_snapshots[plan.session_id] = verified_snapshot
                     else:

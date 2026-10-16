@@ -211,6 +211,14 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ProductionConfigError(f"无法读取生产配置：{error}") from error
+    from rp_ylx.settings import effective
+
+    if not isinstance(value, dict):
+        raise ProductionConfigError("生产配置顶层字段无效")
+    return production_config_from_value(effective(value))
+
+
+def production_config_from_value(value: object) -> ProductionConfig:
     required = {
         "schema",
         "listen",
@@ -453,12 +461,40 @@ class ProductionService:
     server: Any
     event_pump: CaptureEventPump
     mdns_publisher: MdnsPublisher
+    storage_monitor: StorageReserveMonitor | None = None
 
     def close(self) -> None:
+        if self.storage_monitor is not None:
+            self.storage_monitor.close()
         self.server.server_close()
         self.mdns_publisher.close()
         self.event_pump.close()
         self.coordinator.close()
+
+
+class StorageReserveMonitor:
+    """A separate thread keeps a slow finalization off the SSE/status event pump."""
+
+    def __init__(self, coordinator: CaptureCoordinator) -> None:
+        self.coordinator = coordinator
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="storage-reserve", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop.wait(1.0):
+            try:
+                self.coordinator.enforce_storage_reserve()
+            except Exception as error:
+                operational_logger("recording").event(
+                    "storage_reserve_monitor_failed",
+                    level="error",
+                    exception_type=type(error).__name__,
+                )
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join()
 
 
 class CaptureEventPump:
@@ -775,13 +811,18 @@ def build_production_service(
             with suppress(BaseException):
                 sources.close()
         raise
-    return ProductionService(coordinator, server, event_pump, mdns_publisher)
+    return ProductionService(
+        coordinator, server, event_pump, mdns_publisher, StorageReserveMonitor(coordinator)
+    )
 
 
 def run_production_service(config_path: str | Path) -> None:
     started_ns = time.monotonic_ns()
     _OPERATIONAL_LOG.event("production_service_starting")
     try:
+        from rp_ylx.settings import initialize
+
+        initialize(Path(config_path))
         config = load_production_config(config_path)
         service = build_production_service(config)
     except BaseException as error:
