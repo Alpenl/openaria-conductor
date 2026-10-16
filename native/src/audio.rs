@@ -1584,9 +1584,6 @@ fn capture_clock(
         "max_residual_ns": residual.ceil() as u64, "anchors": anchors,
         "queue_capacity_frames": QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,
         "queue_peak_frames": progress.queue_peak_frames.load(Ordering::Relaxed),
-        "durable_commit_capacity_segments": MAX_PENDING_COMMITS,
-        "durable_commit_peak_segments": progress.peak_pending_commits.load(Ordering::Relaxed),
-        "durable_sample_count": progress.durable_samples.load(Ordering::Acquire),
         "max_write_ns": progress.max_write_ns.load(Ordering::Relaxed),
         "xrun_count": 0, "suspend_count": 0,
     }))
@@ -1863,6 +1860,53 @@ mod tests {
         progress.fail(super::AudioError::new("audio_failed", "xrun"));
         progress.fail(super::AudioError::new("write_failed", "cleanup"));
         assert_eq!(progress.check().unwrap_err().message, "xrun");
+    }
+
+    #[test]
+    fn native_clock_is_accepted_by_the_python_sealing_contract() {
+        let config = super::RecorderConfig {
+            session_root: PathBuf::new(),
+            device: "hw:CARD=D2UQ2,DEV=0".into(),
+            sample_rate_hz: 10_000,
+            channels: 2,
+            segment_seconds: 5.0,
+        };
+        let progress = super::AudioProgress::default();
+        progress
+            .queue_peak_frames
+            .store(1024, std::sync::atomic::Ordering::Relaxed);
+        let clock = super::capture_clock(
+            &config,
+            (1024, 8192),
+            20000,
+            1_100_000_000,
+            3_110_000_000,
+            &[
+                [1024, 1_202_400_000],
+                [11024, 2_202_400_000],
+                [20000, 3_100_000_000],
+            ],
+            &progress,
+        )
+        .unwrap();
+        // Exercise the real consumer with actual native output, rather than
+        // duplicating its frozen field set in a second hand-written fixture.
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_owned();
+        let result = std::process::Command::new("python3")
+            .current_dir(&repo)
+            .env("PYTHONPATH", repo.join("src"))
+            .arg("-c")
+            .arg("import json, runpy, sys\nfrom rp_ylx.audio_clock import audio_clock_report\naudio = runpy.run_path('tests/test_audio_clock.py')['audio_fixture']()\naudio['capture_clock'] = json.loads(sys.argv[1])\naudio['capture_clock']['session_start_monotonic_ns'] = 1000000000\nassert audio_clock_report(audio, 3)['continuity'] == 'verified'")
+            .arg(clock.to_string())
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]
