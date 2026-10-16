@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -91,6 +93,19 @@ class PersistenceTest(unittest.TestCase):
         stores[0].put("value", {"n": 1})
         self.assertTrue(all(s.get("value") == {"n": 1} for s in stores))
 
+    def test_process_initializers_share_one_schema(self):
+        code = (
+            "import sys; from pathlib import Path; from rp_ylx.persistence import StateDatabase; "
+            "StateDatabase(Path(sys.argv[1])).put(sys.argv[2], {'ok':True})"
+        )
+        processes = [
+            subprocess.Popen([sys.executable, "-c", code, str(self.path), str(i)]) for i in range(8)
+        ]
+        for process in processes:
+            self.assertEqual(process.wait(timeout=20), 0)
+        store = StateDatabase(self.path)
+        self.assertTrue(all(store.get(str(i)) == {"ok": True} for i in range(8)))
+
     def test_corrupt_foreign_and_future_databases_are_rejected(self):
         for kind in ("corrupt", "foreign", "future", "truncated"):
             with self.subTest(kind=kind):
@@ -145,6 +160,17 @@ class PersistenceTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 store.backup(backup)
         self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+
+    def test_transfer_receipts_distinguish_interrupted_and_served(self):
+        store = StateDatabase(self.path)
+        interrupted = store.begin_transfer("volume", "session", "first")
+        served = store.begin_transfer("volume", "session", "second")
+        store.finish_transfer(served, "served", 100)
+        store.interrupt_transfers()
+        with store.connection() as db:
+            rows = dict(db.execute("SELECT id,status FROM transfers"))
+        self.assertEqual(rows, {interrupted: "interrupted", served: "served"})
+        self.assertNotIn("backed_up", rows.values())
 
     def test_invalid_import_does_not_copy_secrets(self):
         legacy = self.root / "old.json"

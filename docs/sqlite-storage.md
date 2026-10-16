@@ -7,6 +7,8 @@
 
 - `state_root/state.sqlite3`：采集控制状态、焦距设置和幂等回执。回执单独存表，保留既有
   1024 条窗口；检查点只写状态和新增回执，避免反复重写历史请求。
+  同库保存最近 4096 条已结束的素材读取回执，区分 metadata_only、partial、served、failed
+  和进程重启后的 interrupted。served 只说明服务端完整读取/发送成功，不表示客户端已落盘或备份。
 - `state_root/settings.sqlite3`：可修改的相机、音频、录制和空间阈值设置，以及修改历史。
   生效值仍通过完整生产配置校验。修改后应在空闲时重启服务。
 - `state_root/catalog.sqlite3`：录像摘要、分段文件索引和历史校验记录。清单仍是目录事实来源，

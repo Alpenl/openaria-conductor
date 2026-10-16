@@ -401,10 +401,15 @@ class _TrackedRepresentation:
         self,
         representation: LockedBytes,
         release: Callable[[], None],
+        on_close: Callable[[str, int], None] | None = None,
     ) -> None:
         self._representation = representation
         self._release = release
         self._closed = False
+        self._on_close = on_close
+        self._bytes_read = 0
+        self._full_read = False
+        self._failed = False
         self.etag = representation.etag
         self.size = representation.size
         self.content_type = representation.content_type
@@ -430,10 +435,30 @@ class _TrackedRepresentation:
         try:
             self._representation.close()
         finally:
-            self._release()
+            try:
+                if self._on_close is not None:
+                    status = (
+                        "failed"
+                        if self._failed
+                        else "served"
+                        if self._full_read
+                        else "partial"
+                        if self._bytes_read
+                        else "metadata_only"
+                    )
+                    self._on_close(status, self._bytes_read)
+            finally:
+                self._release()
 
     def read(self, offset: int = 0, length: int | None = None) -> bytes:
-        return self._representation.read(offset, length)
+        try:
+            value = self._representation.read(offset, length)
+            self._bytes_read += len(value)
+            self._full_read |= offset == 0 and len(value) == self.size
+            return value
+        except BaseException:
+            self._failed = True
+            raise
 
     def iter_chunks(
         self,
@@ -442,10 +467,28 @@ class _TrackedRepresentation:
         *,
         chunk_size: int = 1024 * 1024,
     ) -> Iterator[bytes]:
-        return self._representation.iter_chunks(offset, length, chunk_size=chunk_size)
+        total = 0
+        try:
+            for chunk in self._representation.iter_chunks(offset, length, chunk_size=chunk_size):
+                total += len(chunk)
+                self._bytes_read += len(chunk)
+                yield chunk
+            self._full_read |= offset == 0 and total == self.size
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self._failed = True
+            raise
 
     def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
-        return self._representation.send_to(output_descriptor, offset, length)
+        try:
+            count = self._representation.send_to(output_descriptor, offset, length)
+            self._bytes_read += count
+            self._full_read |= offset == 0 and count == self.size
+            return count
+        except BaseException:
+            self._failed = True
+            raise
 
 
 class _MultiRootSessionStore:
@@ -582,6 +625,7 @@ class CaptureCoordinator:
         self._state_path = self._config.state_root / "capture-coordinator.json"
         self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
         self._state_db.import_json("capture", self._state_path)
+        self._state_db.interrupt_transfers()
         self._pending_focus = self._state_db.get("camera_focus")
         self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
         persisted = self._read_local_state()
@@ -2982,7 +3026,21 @@ class CaptureCoordinator:
                     "artifact 与独立验证快照不匹配",
                     reason="stale",
                 )
-            return _TrackedRepresentation(representation, release)
+            try:
+                transfer = self._state_db.begin_transfer(self.volume_id, session_id, artifact_id)
+            except BaseException:
+                representation.close()
+                raise
+
+            def record_transfer(status: str, bytes_read: int) -> None:
+                try:
+                    self._state_db.finish_transfer(transfer, status, bytes_read)
+                except (OSError, sqlite3.Error, PersistenceError):
+                    operational_logger("recording").event(
+                        "transfer_receipt_failed", level="error", transaction_id=session_id
+                    )
+
+            return _TrackedRepresentation(representation, release, record_transfer)
         except ArtifactAccessError as error:
             if error.code == "not_verified":
                 with self._catalog_lock:

@@ -1462,7 +1462,7 @@ class ReleaseManager:
             "lkg-eth0.json",
             "controller-state.json",
         }
-        transient_files = {".lock", "operation.lock"}
+        transient_files = {".lock", "operation.lock", "controller.sqlite3.init.lock"}
         payloads: dict[str, bytes] = {}
         try:
             entries = sorted(root.iterdir(), key=lambda path: path.name)

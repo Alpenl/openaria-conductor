@@ -120,4 +120,5 @@ def manage(path: Path, action: str, *, source: Path | None, destination: Path | 
         finally:
             temporary.unlink(missing_ok=True)
             temporary.with_suffix(".sqlite3.initialized").unlink(missing_ok=True)
+            temporary.with_suffix(".sqlite3.init.lock").unlink(missing_ok=True)
     raise ValueError("unknown database operation")

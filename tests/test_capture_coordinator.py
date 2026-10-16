@@ -446,6 +446,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
     def test_tracked_representation_forwards_send_to_fast_path(self) -> None:
         calls: list[tuple[int, int, int | None]] = []
         releases: list[bool] = []
+        receipts: list[tuple[str, int]] = []
 
         class _Representation:
             etag = '"etag"'
@@ -478,12 +479,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 calls.append((output_descriptor, offset, length))
                 return 2
 
-        tracked = _TrackedRepresentation(_Representation(), lambda: releases.append(True))
+        tracked = _TrackedRepresentation(
+            _Representation(),
+            lambda: releases.append(True),
+            lambda status, size: receipts.append((status, size)),
+        )
 
         self.assertEqual(tracked.send_to(7, 1, 2), 2)
         self.assertEqual(calls, [(7, 1, 2)])
         tracked.close()
         self.assertEqual(releases, [True])
+        self.assertEqual(receipts, [("partial", 2)])
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

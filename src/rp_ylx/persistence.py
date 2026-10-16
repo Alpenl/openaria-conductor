@@ -7,10 +7,13 @@ verification proof is reconstructed from this database.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
 import stat
+import time
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -41,21 +44,49 @@ class StateDatabase:
     """Versioned local state with explicit, one-time JSON imports."""
 
     def __init__(self, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = path.with_suffix(path.suffix + ".init.lock")
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise PersistenceError("database initialization lock must be a regular file")
+            if os.geteuid() == 0:
+                parent = path.parent.stat()
+                os.fchown(fd, parent.st_uid, parent.st_gid)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise PersistenceError("database initialization is busy") from None
+                    time.sleep(0.01)
+            self._initialize(path)
+        finally:
+            os.close(fd)
+
+    def _initialize(self, path: Path) -> None:
         self.path = Path(path)
         self.marker = self.path.with_suffix(self.path.suffix + ".initialized")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.path.exists() and self.marker.exists():
             raise PersistenceError(f"missing authoritative database: {self.path}")
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise PersistenceError("database must be a regular file")
-            os.fchmod(fd, 0o600)
-            if os.geteuid() == 0:
-                parent = self.path.parent.stat()
-                os.fchown(fd, parent.st_uid, parent.st_gid)
-        finally:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             os.close(fd)
+            metadata = self.path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PersistenceError("database must be a regular file")
+        # Do not open/close an unrelated descriptor on an existing SQLite file:
+        # closing it could release another connection's process-wide POSIX locks.
+        self.path.chmod(0o600)
+        if os.geteuid() == 0:
+            parent = self.path.parent.stat()
+            os.chown(self.path, parent.st_uid, parent.st_gid, follow_symlinks=False)
         try:
             with self.connection() as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -92,6 +123,12 @@ class StateDatabase:
                         "principal TEXT NOT NULL, operation TEXT NOT NULL, "
                         "idempotency_key TEXT NOT NULL, body TEXT NOT NULL, "
                         "PRIMARY KEY(principal,operation,idempotency_key))"
+                    )
+                    db.execute(
+                        "CREATE TABLE IF NOT EXISTS transfers ("
+                        "id TEXT PRIMARY KEY, volume TEXT NOT NULL, session TEXT NOT NULL, "
+                        "artifact TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, "
+                        "status TEXT NOT NULL, bytes_read INTEGER NOT NULL)"
                     )
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     db.execute(f"PRAGMA application_id={APPLICATION_ID}")
@@ -180,6 +217,33 @@ class StateDatabase:
                     for row in db.execute("SELECT body FROM capture_commands ORDER BY rowid")
                 ]
         return value
+
+    def begin_transfer(self, volume: str, session: str, artifact: str) -> str:
+        identity = str(uuid.uuid4())
+        with self.connection() as db, db:
+            db.execute(
+                "INSERT INTO transfers VALUES (?,?,?,?,?,NULL,'open',0)",
+                (identity, volume, session, artifact, datetime.now(UTC).isoformat()),
+            )
+        return identity
+
+    def finish_transfer(self, identity: str, status: str, bytes_read: int) -> None:
+        with self.connection() as db, db:
+            db.execute(
+                "UPDATE transfers SET finished_at=?,status=?,bytes_read=? WHERE id=?",
+                (datetime.now(UTC).isoformat(), status, bytes_read, identity),
+            )
+            db.execute(
+                "DELETE FROM transfers WHERE status!='open' AND rowid NOT IN "
+                "(SELECT rowid FROM transfers ORDER BY rowid DESC LIMIT 4096)"
+            )
+
+    def interrupt_transfers(self) -> None:
+        with self.connection() as db, db:
+            db.execute(
+                "UPDATE transfers SET status='interrupted',finished_at=? WHERE status='open'",
+                (datetime.now(UTC).isoformat(),),
+            )
 
     def put_capture_state(
         self, value: Mapping[str, Any], commands: list[dict], removed: set
