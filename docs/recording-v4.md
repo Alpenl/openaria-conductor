@@ -53,3 +53,35 @@ IMU 的两个六轴槽位共享一次 USB 读取的中点时间。现有协议�
 固件公开版本限定在 0.2.x，首次公开交付为 0.2.1。网页检查同时比较版本与
 提交身份，以便本地同版本候选升级到公共正式构建；旧版本渠道不提供降级。
 OSS 发布仍拒绝覆盖已公开版本的不同产物，后续变更必须递增补丁号。
+
+
+### Observed frame cadence diagnostics
+
+The capture audit now includes `camera.cadence`: measured rate, interval extrema,
+standard deviation, rolling rate, and explicit tolerances. `status` describes the
+engineering profile printed in `acceptance_limits`. The separate
+`quantized_interval_status` requires every observed interval to lie within 1 us
+of the target period (V4L2 timestamp quantization), with at least 10 seconds of
+observations to pass. Neither result verifies physical exposure timing.
+
+`PYTHONPATH=src python scripts/check_frame_cadence.py frames.ndjson.zst --fps 30
+--strict-intervals` checks an existing journal without modifying it. Exit codes
+are 0 within tolerance, 2 outside tolerance, and 3 insufficient duration.
+Nominal MP4 FPS and gap-free frame sequences do not imply constant exposure cadence.
+
+Native audio diagnostics retain separate file sync and checkpoint timings, plus
+queue peak and maximum whole writer operation duration, including failed captures.
+
+
+Audio segment durability runs on a separate commit worker. The PCM writer queues
+completed file handles, returning its capture buffer before segment `fsync` and
+checkpoint serialization/sync. Pending commits, including an in-flight batch,
+are capped at eight segments (40 s at the default 5 s segment length); capacity
+exhaustion or any I/O error fails explicitly. Accumulated commits may share one
+checkpoint only after all included segment files have synced. The checkpoint is
+still atomically replaced and its directory synced. Stop joins the worker before
+returning the final audio result; compression/recovery must not race that worker.
+An abrupt power loss can lose the uncommitted tail. `durable_sample_count` and
+`durable_commit_peak_segments` in `audio/capture-clock.json` distinguish durable
+progress from successful buffered PCM writes. This does not fix storage media
+that cannot sustain the bitrate, nor does it guarantee unlimited stall tolerance.

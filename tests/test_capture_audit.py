@@ -46,6 +46,8 @@ class CaptureAuditTests(unittest.TestCase):
             self.assertEqual(result["camera"]["counter_wraps"], 1)
             self.assertEqual(result["camera"]["actual_fps"], 25)
             self.assertEqual(result["camera"]["source_missing_frames"], 0)
+            self.assertEqual(result["camera"]["cadence"]["status"], "outside_tolerance")
+            self.assertIn("average_rate", result["camera"]["cadence"]["failed_checks"])
             self.assertFalse(result["imu"]["independent_adc_timestamps"])
             self.assertEqual(result["alignment"]["applied_offset_ns"], 0)
 
