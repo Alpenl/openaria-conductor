@@ -80,9 +80,39 @@ struct SplitSinkRecording {
     imu: Option<Arc<Collector>>,
 }
 
+// Keep scalar evidence only: no extra frame payload ownership or per-frame JSON.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct SourceFrameEvidence {
+    source_sequence: u64,
+    host_monotonic_ns: u64,
+    dequeue_monotonic_ns: u64,
+    buffer_flags: u32,
+    payload_bytes: u64,
+    camera_counter_raw: Option<u32>,
+}
+
+impl SourceFrameEvidence {
+    fn from_frame(frame: &Frame) -> Self {
+        let raw = &frame.raw_side_by_side;
+        let counter = raw
+            .windows(2)
+            .position(|window| window == b"\xff\xd8")
+            .and_then(|start| recording::avi1_counter(&raw[start..]));
+        Self {
+            source_sequence: frame.source_sequence,
+            host_monotonic_ns: frame.host_monotonic_ns,
+            dequeue_monotonic_ns: frame.dequeue_monotonic_ns,
+            buffer_flags: frame.buffer_flags,
+            payload_bytes: usize_to_u64(raw.len()),
+            camera_counter_raw: counter,
+        }
+    }
+}
+
 struct State {
     fanout: CaptureFanoutState,
     validator: FrameValidator,
+    previous_source_frame: Option<SourceFrameEvidence>,
     recording: Option<Arc<SplitSinkRecording>>,
     running: bool,
     terminal_error: Option<RuntimeError>,
@@ -133,6 +163,7 @@ impl Runtime {
                 state: Mutex::new(State {
                     fanout: CaptureFanoutState::new(frame_decimation)?,
                     validator: FrameValidator::new(),
+                    previous_source_frame: None,
                     recording: None,
                     running: false,
                     terminal_error: None,
@@ -170,6 +201,7 @@ impl Runtime {
                 )
             })?;
             state.validator.reset();
+            state.previous_source_frame = None;
             state.running = true;
             state.terminal_error = None;
             state.last_preview_error = None;
@@ -557,7 +589,8 @@ fn process_frame(
                     "application dropped frame count is out of range",
                 )
             })?;
-        let (dropped_before, validation, dispatch) = {
+        let current_source_frame = SourceFrameEvidence::from_frame(&frame);
+        let (dropped_before, validation, previous_source_frame, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
                     "capture_runtime_poisoned",
@@ -574,6 +607,7 @@ fn process_frame(
                     application_dropped_before,
                 )
                 .map_err(RuntimeError::from)?;
+            let previous_source_frame = state.previous_source_frame.replace(current_source_frame);
             record_loss(metrics, "queue_rejected", validation.queue_rejected);
             record_loss(metrics, "source_gap", validation.source_gap);
             let decision = state
@@ -597,7 +631,12 @@ fn process_frame(
             } else {
                 None
             };
-            (decision.dropped_before, validation, dispatch)
+            (
+                decision.dropped_before,
+                validation,
+                previous_source_frame,
+                dispatch,
+            )
         };
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
@@ -607,11 +646,11 @@ fn process_frame(
             if let Err(mut error) = write_result {
                 if error.code == "source_sequence_gap" {
                     error.message = format!(
-                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={}, consumer_max_frame_ns={})",
+                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={}, consumer_max_frame_ns={}); source_frame_evidence={}",
                         error.message,
-                        frame
-                            .source_sequence
-                            .saturating_sub(validation.dropped_before + 1),
+                        previous_source_frame
+                            .map(|previous| previous.source_sequence)
+                            .unwrap_or(frame.source_sequence),
                         frame.source_sequence,
                         validation.source_gap,
                         validation.queue_rejected,
@@ -623,6 +662,11 @@ fn process_frame(
                             .lock()
                             .map(|state| state.max_consumer_frame_ns)
                             .unwrap_or(0),
+                        serde_json::json!({
+                            "schema": "openaria.source-frame-evidence.v1",
+                            "previous": previous_source_frame,
+                            "current": current_source_frame,
+                        }),
                     );
                 }
                 report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
@@ -1023,6 +1067,145 @@ mod tests {
             on_failure: Arc::new(PyBytes::new(py, b"on-failure").into_any().unbind()),
             imu: None,
         }
+    }
+
+    fn evidence_frame(sequence: u64, counter: Option<u32>) -> Frame {
+        let mut raw = b"prefix\xff\xd8".to_vec();
+        if let Some(counter) = counter {
+            raw.extend_from_slice(b"\xff\xe0\x00\x21");
+            let mut app0 = [0; 31];
+            app0[..8].copy_from_slice(b"AVI1\0\x01\x01\x01");
+            app0[10..13].copy_from_slice(&counter.to_be_bytes()[1..]);
+            raw.extend_from_slice(&app0);
+        }
+        raw.extend_from_slice(b"\xff\xd9");
+        Frame {
+            buffer_flags: 0x2000,
+            dequeue_monotonic_ns: sequence * 20_000_000 + 100_000,
+            source_sequence: sequence,
+            host_monotonic_ns: sequence * 20_000_000,
+            application_dropped_before: 0,
+            producer_max_interval_ns: 0,
+            producer_max_control_ns: 0,
+            producer_max_read_ns: 0,
+            left: Vec::new(),
+            right: Vec::new(),
+            raw_side_by_side: raw.into(),
+        }
+    }
+
+    #[test]
+    fn source_gap_callback_keeps_real_adjacent_frames_and_rejects_gap_before_reservation() {
+        pyo3::prepare_freethreaded_python();
+        // A gap on a normally decimated frame must still fail immediately.
+        for decimation in [1, 2, 3] {
+            let root = temp_root("source-gap-evidence");
+            let mut target = Python::with_gil(|py| test_recording(py, &root));
+            let helper = root.join("encoder-helper.sh");
+            fs::write(
+                &helper,
+                "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\n",
+            )
+            .unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut encoder = stereo_encoder::EncoderProcess::new(
+                &root.join("video"),
+                &helper,
+                3840,
+                1080,
+                60,
+                8192,
+                3,
+                "video/",
+            )
+            .unwrap();
+            encoder.start().unwrap();
+            target.encoder = Arc::new(Mutex::new(encoder));
+            let callbacks = Python::with_gil(|py| {
+                let module = pyo3::types::PyModule::from_code(
+                    py,
+                    c"calls = []\ndef on_failure(code, message):\n    calls.append((code, message))\n",
+                    c"source_gap_test.py",
+                    c"source_gap_test",
+                ).unwrap();
+                target.on_failure = Arc::new(module.getattr("on_failure").unwrap().unbind());
+                module.getattr("calls").unwrap().unbind()
+            });
+            let active_take = Arc::clone(&target.active_take);
+            let encoder = Arc::clone(&target.encoder);
+            let runtime = Runtime::new(
+                Arc::new(Stream::test_idle(1)),
+                Arc::new(LatestBuffer::new(25).unwrap()),
+                decimation,
+                Duration::from_millis(10),
+                None,
+            )
+            .unwrap();
+            // Preview-only gap at the recording boundary belongs to preview.
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(1, Some(101)),
+                None,
+            )
+            .unwrap();
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                state.running = true;
+                state.fanout.start_recording().unwrap();
+                state.recording = Some(Arc::new(target));
+            }
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(10, Some(110)),
+                None,
+            )
+            .unwrap();
+            assert!(!runtime.snapshot().unwrap().failure_reported);
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(13, Some(113)),
+                None,
+            )
+            .unwrap();
+            assert!(!runtime.snapshot().unwrap().recording_present);
+            assert_eq!(encoder.lock().unwrap().submitted_frames(), 1);
+            let summary = active_take.lock().unwrap().finish().unwrap();
+            assert_eq!(summary.frames_written, 1);
+            assert_eq!(summary.frame_domain, 1);
+            assert_eq!(summary.pending_frames, 0);
+            Python::with_gil(|py| {
+                let calls: Vec<(String, String)> = callbacks.bind(py).extract().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, "source_sequence_gap");
+                assert!(calls[0].1.contains(
+                    "previous_sequence=10, current_sequence=13, source_gap=2, queue_rejected=0"
+                ));
+                let (_, evidence) = calls[0].1.split_once("; source_frame_evidence=").unwrap();
+                let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
+                assert_eq!(evidence["previous"]["source_sequence"], 10);
+                assert_eq!(evidence["previous"]["camera_counter_raw"], 110);
+                assert_eq!(evidence["current"]["camera_counter_raw"], 113);
+                assert_eq!(evidence["previous"]["host_monotonic_ns"], 200_000_000);
+                assert_eq!(evidence["current"]["host_monotonic_ns"], 260_000_000);
+                assert_eq!(evidence["current"]["dequeue_monotonic_ns"], 260_100_000);
+                assert_eq!(evidence["current"]["buffer_flags"], 0x2000);
+            });
+            drop(runtime);
+            drop(encoder);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn source_frame_evidence_does_not_invent_a_missing_camera_counter() {
+        let frame = evidence_frame(7, None);
+        let evidence = SourceFrameEvidence::from_frame(&frame);
+        assert_eq!(evidence.source_sequence, 7);
+        assert_eq!(evidence.camera_counter_raw, None);
+        assert_eq!(evidence.payload_bytes, frame.raw_side_by_side.len() as u64);
     }
 
     #[test]
