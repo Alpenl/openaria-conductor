@@ -52,6 +52,7 @@ from rp_ylx.network_control import request_control as request_network_control
 from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.persistence import PersistenceError, StateDatabase
+from rp_ylx.recording.backing_storage import backing_capacity, require_backing_reserve
 from rp_ylx.recording.catalog import SessionCatalog
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
@@ -708,6 +709,9 @@ class CaptureCoordinator:
         volume_id = _read_volume_id(mountpoint)
         mount_identity = self._mount_identity(mountpoint)
         total_bytes, available_bytes, available_inodes = _stat_capacity(mountpoint)
+        require_backing_reserve(
+            mountpoint, self._config.minimum_available_bytes, self._config.minimum_available_inodes
+        )
         if available_bytes < self._config.minimum_available_bytes:
             raise DeviceRecordingError(
                 "insufficient_space",
@@ -1819,6 +1823,11 @@ class CaptureCoordinator:
             admission = self._require_admission()
             status = self._check_generation(force=True)
             total_bytes, available_bytes, _ = _stat_capacity(admission.mountpoint)
+            require_backing_reserve(
+                admission.mountpoint,
+                self._config.minimum_available_bytes,
+                self._config.minimum_available_inodes,
+            )
             writable = status.writable
         except DeviceRecordingError:
             total_bytes = 0 if admission is None else admission.total_bytes
@@ -2393,6 +2402,11 @@ class CaptureCoordinator:
         try:
             self._check_generation(force=True)
             _, available_bytes, available_inodes = _stat_capacity(admission.mountpoint)
+            require_backing_reserve(
+                admission.mountpoint,
+                self._config.minimum_available_bytes,
+                self._config.minimum_available_inodes,
+            )
             if available_bytes < self._config.minimum_available_bytes:
                 raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
             if available_inodes < self._config.minimum_available_inodes:
@@ -2555,16 +2569,43 @@ class CaptureCoordinator:
             session_id = self._active_plan.session_id
             self._check_generation(self._active_plan.generation_id, force=True)
             _, available, inodes = _stat_capacity(self._config.mountpoint)
+            backing_error = None
+            try:
+                backing = backing_capacity(self._config.mountpoint)
+            except DeviceRecordingError as error:
+                # An unreadable host budget must not leave the recorder writing
+                # indefinitely while the monitor only logs/retries the error.
+                backing, backing_error = (0, 0), error.code
             if (
-                available >= self._config.minimum_available_bytes
+                backing_error is None
+                and available >= self._config.minimum_available_bytes
                 and inodes >= self._config.minimum_available_inodes
+                and (
+                    backing is None
+                    or (
+                        backing[0] >= self._config.minimum_available_bytes
+                        and backing[1] >= self._config.minimum_available_inodes
+                    )
+                )
             ):
                 return
+            if backing_error is not None:
+                reserve_reason, error_code = "backing_capacity_unavailable", backing_error
+            elif available < self._config.minimum_available_bytes:
+                reserve_reason, error_code = "volume_bytes_low", "insufficient_space"
+            elif inodes < self._config.minimum_available_inodes:
+                reserve_reason, error_code = "volume_inodes_low", "insufficient_inodes"
+            elif backing is not None and backing[0] < self._config.minimum_available_bytes:
+                reserve_reason, error_code = "backing_bytes_low", "insufficient_space"
+            else:
+                reserve_reason, error_code = "backing_inodes_low", "insufficient_inodes"
         operational_logger("recording").event(
             "storage_reserve_stop",
             transaction_id=session_id,
-            available_bytes=available,
-            available_inodes=inodes,
+            # Keep the cause in the existing closed operational-log contract.
+            # Arbitrary byte/inode context keys are otherwise silently redacted.
+            reason=reserve_reason,
+            error_code=error_code,
         )
         body = {"reason": "storage_reserve"}
         self.stop_capture(

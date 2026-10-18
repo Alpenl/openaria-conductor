@@ -1146,6 +1146,65 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             reopened.close()
 
+    def test_loop_host_reserve_rejects_start_even_after_volume_admission(self):
+        coordinator = self.coordinator(minimum_available_bytes=10)
+        try:
+            coordinator.device_descriptor("v3", "customer")
+            with patch("rp_ylx.recording.backing_storage.backing_capacity", return_value=(9, 100)):
+                with self.assertRaises(ProviderError) as error:
+                    coordinator.start_capture(start_command("host-reserve-start"))
+                self.assertEqual(error.exception.code, "insufficient_space")
+                self.assertIsNone(coordinator._active)
+                self.assertFalse(
+                    coordinator.device_descriptor("v3", "customer")["capabilities"]["capture"]
+                )
+            coordinator.start_capture(start_command("host-reserve-recovered"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            coordinator.close()
+
+    def test_loop_host_reserve_stops_normally_without_exhausting_logical_volume(self):
+        for budget in [(9, 100), (100, 9)]:
+            with self.subTest(budget=budget):
+                coordinator = self.coordinator(
+                    minimum_available_bytes=10, minimum_available_inodes=10
+                )
+                try:
+                    coordinator.start_capture(start_command("host-low-" + str(budget)))
+                    session_id = self.active_session_id(coordinator)
+                    coordinator.submit_frame(frame(0))
+                    with patch(
+                        "rp_ylx.recording.coordinator.backing_capacity", return_value=budget
+                    ):
+                        coordinator.enforce_storage_reserve()
+                    self.assertIsNone(coordinator._active)
+                    manifest = validate_device_session_directory(
+                        self.mountpoint / "recordings" / session_id
+                    )
+                    self.assertTrue(manifest["sealed"])
+                finally:
+                    coordinator.close()
+
+    def test_unreadable_loop_host_budget_stops_instead_of_only_retrying_monitor(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("host-unreadable"))
+            session_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch(
+                "rp_ylx.recording.coordinator.backing_capacity",
+                side_effect=DeviceRecordingError("storage_unavailable", "host unavailable"),
+            ):
+                coordinator.enforce_storage_reserve()
+            self.assertIsNone(coordinator._active)
+            self.assertTrue(
+                validate_device_session_directory(self.mountpoint / "recordings" / session_id)[
+                    "sealed"
+                ]
+            )
+        finally:
+            coordinator.close()
+
     def test_start_rechecks_thresholds_and_rejects_wrong_volume(self) -> None:
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
         try:
