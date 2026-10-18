@@ -1143,6 +1143,140 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_reserve_probe_io_does_not_block_status(self):
+        for target in ("_stat_capacity", "backing_capacity"):
+            with self.subTest(target=target):
+                self._check_reserve_probe_io(target)
+
+    def _check_reserve_probe_io(self, target):
+        coordinator = self.coordinator()
+        entered, release, observed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        errors, responses, threads = [], [], []
+        try:
+            coordinator.start_capture(start_command("probe-io-" + target))
+            original = getattr(coordinator_module, target)
+
+            def probe(*args):
+                if threading.current_thread().name == "reserve-probe-test":
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("reserve probe was not released")
+                return original(*args)
+
+            def enforce():
+                try:
+                    coordinator.enforce_storage_reserve()
+                except BaseException as error:
+                    errors.append(error)
+
+            def observe():
+                try:
+                    responses.append(coordinator.capture_status())
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    observed.set()
+
+            with patch("rp_ylx.recording.coordinator." + target, side_effect=probe):
+                monitor = threading.Thread(target=enforce, name="reserve-probe-test")
+                threads.append(monitor)
+                monitor.start()
+                self.assertTrue(entered.wait(1))
+                reader = threading.Thread(target=observe)
+                threads.append(reader)
+                reader.start()
+                self.assertTrue(observed.wait(1), "slow capacity IO held the control lock")
+                self.assertEqual(responses[0]["snapshot"]["device_state"], "recording")
+                self.assertFalse(errors)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+            coordinator.close()
+        self.assertFalse(errors)
+
+    def test_delayed_reserve_result_cannot_stop_or_poison_next_recording(self):
+        for target in ("_stat_capacity", "backing_capacity"):
+            for failed in (False, True):
+                with self.subTest(target=target, failed=failed):
+                    self._check_delayed_reserve_result(target, failed)
+
+    def _check_delayed_reserve_result(self, target, failed):
+        coordinator = self.coordinator(minimum_available_bytes=10)
+        entered, release, replaced = threading.Event(), threading.Event(), threading.Event()
+        errors, next_ids, threads = [], [], []
+        original = getattr(coordinator_module, target)
+        prefix = f"reserve-{target}-{failed}"
+
+        def probe(*args):
+            if threading.current_thread().name != "old-reserve-probe":
+                return original(*args)
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("old reserve probe was not released")
+            if failed:
+                if target == "_stat_capacity":
+                    raise OSError("old volume failed")
+                raise DeviceRecordingError("storage_unavailable", "old backing failed")
+            return (100, 0, 100) if target == "_stat_capacity" else (0, 100)
+
+        def enforce():
+            try:
+                coordinator.enforce_storage_reserve()
+            except BaseException as error:
+                errors.append(error)
+
+        def replace_recording():
+            try:
+                coordinator.stop_capture(stop_command(prefix + "-stop"))
+                coordinator.start_capture(start_command(prefix + "-next"))
+                next_ids.append(self.active_session_id(coordinator))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                replaced.set()
+
+        try:
+            coordinator.start_capture(start_command(prefix + "-start"))
+            old_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch("rp_ylx.recording.coordinator." + target, side_effect=probe):
+                monitor = threading.Thread(target=enforce, name="old-reserve-probe")
+                threads.append(monitor)
+                monitor.start()
+                self.assertTrue(entered.wait(1))
+                replacement = threading.Thread(target=replace_recording)
+                threads.append(replacement)
+                replacement.start()
+                self.assertTrue(replaced.wait(2), "slow probe blocked stopping or starting")
+                self.assertFalse(errors)
+                self.assertNotEqual(next_ids[0], old_id)
+                before = coordinator.capture_status()["snapshot"]["active_recording"][
+                    "recording_state"
+                ]["storage"]
+                release.set()
+                monitor.join(2)
+                self.assertFalse(monitor.is_alive())
+                self.assertFalse(errors)
+                self.assertFalse(coordinator._media_lost)
+                self.assertEqual(self.active_session_id(coordinator), next_ids[0])
+                after = coordinator.capture_status()["snapshot"]["active_recording"][
+                    "recording_state"
+                ]["storage"]
+                self.assertEqual(after, before)
+                self.assertTrue(coordinator.submit_frame(frame(0)))
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+            coordinator.close()
+
     def test_storage_reserve_stops_and_seals_active_recording(self):
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
         try:

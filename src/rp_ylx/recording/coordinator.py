@@ -896,6 +896,24 @@ class CaptureCoordinator:
             self._revision += 1
             return self._revision
 
+    def _probe_storage_capacity(self, admission: VolumeAdmission) -> tuple[StorageStatus, int]:
+        """Read one admitted volume without changing coordinator or cache state."""
+        mountpoint = admission.mountpoint
+        try:
+            if (
+                not self._mount_checker(mountpoint)
+                or mountpoint.stat().st_dev != admission.device
+                or self._mount_identity(mountpoint) != admission.mount_identity
+                or _read_volume_id(mountpoint) != admission.volume_id
+            ):
+                raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
+            _, available_bytes, inodes = _stat_capacity(mountpoint)
+            if not _mount_writable(mountpoint):
+                raise DeviceRecordingError("media_lost", "录制介质变为不可写")
+            return StorageStatus(available_bytes, True), inodes
+        except OSError as error:
+            raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
+
     def _check_generation(
         self,
         generation_id: str | None = None,
@@ -927,22 +945,14 @@ class CaptureCoordinator:
             ):
                 return self._storage_cache
         try:
-            if (
-                self._mount_identity(mountpoint) != admission.mount_identity
-                or _read_volume_id(mountpoint) != admission.volume_id
-            ):
-                self._media_lost = True
-                raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-            _, available_bytes, _ = _stat_capacity(mountpoint)
-            writable = _mount_writable(mountpoint)
-            if not writable:
-                raise DeviceRecordingError("media_lost", "录制介质变为不可写")
-            status = StorageStatus(available_bytes, True)
+            status, _ = self._probe_storage_capacity(admission)
             with self._storage_lock:
                 self._storage_cache = status
                 self._storage_checked_at = now
             return status
-        except DeviceRecordingError:
+        except DeviceRecordingError as error:
+            if error.code == "media_lost":
+                self._media_lost = True
             raise
         except OSError as error:
             raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
@@ -2582,16 +2592,47 @@ class CaptureCoordinator:
                 or self._failure_inflight is not None
             ):
                 return
-            session_id = self._active_plan.session_id
-            self._check_generation(self._active_plan.generation_id, force=True)
-            _, available, inodes = _stat_capacity(self._config.mountpoint)
-            backing_error = None
-            try:
-                backing = backing_capacity(self._config.mountpoint)
-            except DeviceRecordingError as error:
-                # An unreadable host budget must not leave the recorder writing
-                # indefinitely while the monitor only logs/retries the error.
-                backing, backing_error = (0, 0), error.code
+            plan = self._active_plan
+            admission = self._require_admission()
+            if self._released:
+                raise DeviceRecordingError("volume_released", "录制卷已经进入安全移除状态")
+            if self._media_lost:
+                raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
+        # Filesystem and loop-host reads may stall on slow or failing media.
+        # Keep status and stop responsive, then fence every result by the exact
+        # recording plan and admission before publishing it or stopping capture.
+        try:
+            storage, inodes = self._probe_storage_capacity(admission)
+        except DeviceRecordingError as error:
+            with self._lock:
+                if self._active_plan is not plan or self._admission is not admission:
+                    return
+                if error.code == "media_lost":
+                    self._media_lost = True
+            raise
+        observed_at = time.monotonic()
+        available = storage.remaining_bytes
+        backing_error = None
+        try:
+            backing = backing_capacity(admission.mountpoint)
+        except DeviceRecordingError as error:
+            # An unreadable host budget must not leave the recorder writing
+            # indefinitely while the monitor only logs/retries the error.
+            backing, backing_error = (0, 0), error.code
+        with self._lock:
+            if (
+                self._active_plan is not plan
+                or self._admission is not admission
+                or self._closing
+                or self._stop_inflight is not None
+                or self._failure_inflight is not None
+            ):
+                return
+            with self._storage_lock:
+                if observed_at >= self._storage_checked_at:
+                    self._storage_cache = storage
+                    self._storage_checked_at = observed_at
+            session_id = plan.session_id
             if (
                 backing_error is None
                 and available >= self._config.minimum_available_bytes
