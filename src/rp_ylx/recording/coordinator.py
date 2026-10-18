@@ -1904,7 +1904,7 @@ class CaptureCoordinator:
             maintenance.__enter__()
         except (OSError, ValueError) as error:
             raise ProviderError(
-                "maintenance_active", "设备正在更新，暂时不能开始录制", status=HTTPStatus.CONFLICT
+                "maintenance_active", "设备正在维护，暂时不能开始录制", status=HTTPStatus.CONFLICT
             ) from error
         descriptor = -1
         try:

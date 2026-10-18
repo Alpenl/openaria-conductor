@@ -65,6 +65,11 @@ CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
 CUSTOMER_TLS_PRIVATE_KEY_RELATIVE = Path("tls/device.key")
 DEVICE_CONFIG_SNAPSHOT_DIRECTORY = ".release-configs"
 DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "rp-ylx-idle-fstrim": ("usr/local/sbin/rp-ylx-idle-fstrim", 0o755),
+    "openaria-idle-fstrim.conf": (
+        "etc/systemd/system/fstrim.service.d/50-openaria-idle.conf",
+        0o644,
+    ),
     "openaria-update.service": ("usr/lib/systemd/system/openaria-update.service", 0o644),
     "rp-ylx-recover.service": (
         "usr/lib/systemd/system/rp-ylx-recover.service",
