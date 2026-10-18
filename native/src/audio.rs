@@ -1,7 +1,7 @@
 use libloading::Library;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1260,6 +1260,28 @@ impl SegmentWriter {
     }
 }
 
+#[derive(serde::Serialize)]
+struct CheckpointSegment<'a> {
+    end_sample: u64,
+    index: u64,
+    path: &'a str,
+    start_sample: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CheckpointPayload<'a> {
+    anchors: &'a [[u64; 2]],
+    buffer_frames: u64,
+    max_write_ns: u64,
+    period_frames: u64,
+    queue_capacity_frames: u64,
+    queue_peak_frames: u64,
+    sample_count: u64,
+    schema: &'static str,
+    segments: Vec<CheckpointSegment<'a>>,
+    thread_started_monotonic_ns: u64,
+}
+
 fn commit_checkpoint(
     root: &std::path::Path,
     progress: &AudioProgress,
@@ -1281,26 +1303,46 @@ fn commit_checkpoint(
         }
     }
     let sample_count = records.last().map_or(0, |record| record.end_sample);
-    let payload = serde_json::json!({
-        "schema": "openaria.audio-checkpoint.v1",
-        "sample_count": sample_count,
-        "thread_started_monotonic_ns": clock.started,
-        "period_frames": clock.period_frames, "buffer_frames": clock.buffer_frames,
-        "anchors": clock.anchors,
-        "queue_capacity_frames": QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,
-        "queue_peak_frames": progress.queue_peak_frames.load(Ordering::Relaxed),
-        "max_write_ns": progress.max_write_ns.load(Ordering::Relaxed),
-        "segments": records.iter().map(|record| serde_json::json!({
-            "index": record.index, "path": record.relative_path,
-            "start_sample": record.start_sample, "end_sample": record.end_sample,
-        })).collect::<Vec<_>>(),
-    });
+    // Borrow the snapshot instead of allocating a JSON Value for every anchor
+    // and then a second full-document String. Neither serialization nor disk IO
+    // holds the capture clock lock, and every recovery anchor is preserved.
+    let payload = CheckpointPayload {
+        schema: "openaria.audio-checkpoint.v1",
+        sample_count,
+        thread_started_monotonic_ns: clock.started,
+        period_frames: clock.period_frames,
+        buffer_frames: clock.buffer_frames,
+        anchors: &clock.anchors,
+        queue_capacity_frames: QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,
+        queue_peak_frames: progress.queue_peak_frames.load(Ordering::Relaxed),
+        max_write_ns: progress.max_write_ns.load(Ordering::Relaxed),
+        segments: records
+            .iter()
+            .map(|record| CheckpointSegment {
+                index: record.index,
+                path: &record.relative_path,
+                start_sample: record.start_sample,
+                end_sample: record.end_sample,
+            })
+            .collect(),
+    };
     let directory = root.join("audio");
     let temporary = directory.join("checkpoint.tmp");
     let mut file = File::create(&temporary)
         .map_err(|error| AudioError::io("write_failed", "create audio checkpoint", error))?;
-    file.write_all(payload.to_string().as_bytes())
-        .and_then(|_| file.sync_all())
+    let mut output = BufWriter::new(&mut file);
+    serde_json::to_writer(&mut output, &payload).map_err(|error| {
+        AudioError::io(
+            "write_failed",
+            "write audio checkpoint",
+            io::Error::other(error),
+        )
+    })?;
+    output
+        .flush()
+        .map_err(|error| AudioError::io("write_failed", "flush audio checkpoint", error))?;
+    drop(output);
+    file.sync_all()
         .and_then(|_| std::fs::rename(&temporary, directory.join("checkpoint.json")))
         .and_then(|_| File::open(directory)?.sync_all())
         .map_err(|error| AudioError::io("write_failed", "commit audio checkpoint", error))
@@ -2098,6 +2140,153 @@ mod tests {
         assert_eq!(snapshot.sample_count, 2);
         assert_eq!(snapshot.bytes_written, 44 + 2 * 2 * 2);
         assert_eq!(snapshot.segment_count, 1);
+    }
+
+    #[test]
+    fn checkpoint_streaming_preserves_v1_bytes_and_all_clock_anchors() {
+        let root = tempfile_dir();
+        std::fs::create_dir(root.join("audio")).unwrap();
+        let progress = super::AudioProgress::default();
+        progress
+            .queue_peak_frames
+            .store(123, std::sync::atomic::Ordering::Relaxed);
+        progress
+            .max_write_ns
+            .store(456, std::sync::atomic::Ordering::Relaxed);
+        let anchors = vec![[0, 1_000_000_000], [u64::MAX - 1, u64::MAX - 1]];
+        let records = vec![super::AudioSegment {
+            index: 3,
+            relative_path: "audio/引号\"换行\n反斜线\\.wav".to_owned(),
+            start_sample: 0,
+            end_sample: u64::MAX,
+            start_time_seconds: 0.0,
+            end_time_seconds: 5.0,
+        }];
+        for last_anchor in [None, Some(anchors[1]), Some([u64::MAX, u64::MAX])] {
+            *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
+                started: 1_000_000_000,
+                period_frames: 1024,
+                buffer_frames: 8192,
+                anchors: anchors.clone(),
+                last_anchor,
+            });
+            super::commit_checkpoint(&root, &progress, &records).unwrap();
+            let mut expected_anchors = anchors.clone();
+            if let Some(anchor) = last_anchor {
+                if expected_anchors.last() != Some(&anchor) {
+                    expected_anchors.push(anchor);
+                }
+            }
+            let expected = serde_json::json!({
+                "schema": "openaria.audio-checkpoint.v1",
+                "sample_count": u64::MAX,
+                "thread_started_monotonic_ns": 1_000_000_000_u64,
+                "period_frames": 1024, "buffer_frames": 8192,
+                "anchors": expected_anchors,
+                "queue_capacity_frames": super::QUEUE_BLOCKS as u64 * super::DEFAULT_PERIOD_FRAMES,
+                "queue_peak_frames": 123, "max_write_ns": 456,
+                "segments": [{"index": 3, "path": records[0].relative_path,
+                    "start_sample": 0, "end_sample": u64::MAX}],
+            });
+            let saved = std::fs::read_to_string(root.join("audio/checkpoint.json")).unwrap();
+            assert_eq!(saved, expected.to_string());
+            assert_eq!(
+                progress
+                    .clock_checkpoint
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .anchors,
+                anchors
+            );
+            assert!(!root.join("audio/checkpoint.tmp").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn checkpoint_streaming_write_and_flush_failures_preserve_previous_checkpoint() {
+        for anchor_count in [1, 10_000] {
+            let root = tempfile_dir();
+            std::fs::create_dir(root.join("audio")).unwrap();
+            std::fs::write(root.join("audio/checkpoint.json"), b"previous checkpoint").unwrap();
+            std::os::unix::fs::symlink("/dev/full", root.join("audio/checkpoint.tmp")).unwrap();
+            let progress = super::AudioProgress::default();
+            *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
+                started: 1_000_000_000,
+                period_frames: 1024,
+                buffer_frames: 8192,
+                anchors: (0..anchor_count).map(|i| [i, 1_000_000_000 + i]).collect(),
+                last_anchor: None,
+            });
+            let error = super::commit_checkpoint(&root, &progress, &[]).unwrap_err();
+            assert_eq!(error.code, "write_failed");
+            assert!(error.message.contains("audio checkpoint"));
+            assert_eq!(
+                std::fs::read(root.join("audio/checkpoint.json")).unwrap(),
+                b"previous checkpoint"
+            );
+            assert_eq!(
+                progress
+                    .durable_samples
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            assert!(progress.clock_checkpoint.lock().is_ok());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "manual long-recording checkpoint performance measurement"]
+    fn measure_long_recording_checkpoint() {
+        let seconds: u64 = std::env::var("OPENARIA_CHECKPOINT_SECONDS")
+            .unwrap_or_else(|_| "18000".to_owned())
+            .parse()
+            .unwrap();
+        let root = tempfile_dir();
+        std::fs::create_dir(root.join("audio")).unwrap();
+        let progress = super::AudioProgress::default();
+        *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
+            started: 1_000_000_000,
+            period_frames: 1024,
+            buffer_frames: 8192,
+            anchors: (0..seconds * 10)
+                .map(|index| [index * 4800, 1_000_000_000 + index * 100_000_000])
+                .collect(),
+            last_anchor: Some([seconds * 48000, 1_000_000_000 + seconds * 1_000_000_000]),
+        });
+        let records: Vec<_> = (0..seconds / 5)
+            .map(|index| super::AudioSegment {
+                index,
+                relative_path: format!("audio/audio_{index:05}.wav"),
+                start_sample: index * 240000,
+                end_sample: (index + 1) * 240000,
+                start_time_seconds: (index * 5) as f64,
+                end_time_seconds: ((index + 1) * 5) as f64,
+            })
+            .collect();
+        let memory_before = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mut timings = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            super::commit_checkpoint(&root, &progress, &records).unwrap();
+            timings.push(started.elapsed().as_secs_f64());
+        }
+        let memory_after = std::fs::read_to_string("/proc/self/status").unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "seconds": seconds, "anchors": seconds * 10 + 1,
+                "segments": records.len(), "commit_seconds": timings,
+                "checkpoint_bytes": std::fs::metadata(root.join("audio/checkpoint.json")).unwrap().len(),
+                "memory_before": memory_before.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")).collect::<Vec<_>>(),
+                "memory_after": memory_after.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")).collect::<Vec<_>>(),
+            })
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

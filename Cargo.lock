@@ -765,6 +765,7 @@ dependencies = [
  "libc",
  "libloading",
  "pyo3",
+ "serde",
  "serde_json",
  "sha2",
 ]
