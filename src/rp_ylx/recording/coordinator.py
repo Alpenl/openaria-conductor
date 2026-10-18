@@ -2958,16 +2958,15 @@ class CaptureCoordinator:
         )
         state = recorder.current_recording_state
         recovered = recorder.recovered_session
-        if not media_lost and recovered is None and recorder.partial_path.is_dir():
-            with suppress(
-                OSError,
-                ValueError,
-                KeyError,
-                TypeError,
-                DeviceRecordingError,
-                ArtifactAccessError,
-            ):
-                recovered = recover_device_session(recorder.partial_path)
+        if (
+            not media_lost
+            and recovered is None
+            and not recorder.recovery_attempted
+            and recorder.partial_path.is_dir()
+        ):
+            # fail() can return early for an already failed writer. Recover it
+            # once, but do not rescan an unchanged long take after a failed try.
+            recovered = recorder.recover_completed_segments()
         with self._lock:
             if state is None or state.get("state") not in {"recoverable", "failed", "abandoned"}:
                 state = self._local_failure_state(plan, error, media_lost=media_lost)

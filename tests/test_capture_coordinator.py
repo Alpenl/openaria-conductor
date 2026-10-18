@@ -3802,6 +3802,68 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_failed_recovery_is_not_scanned_twice_before_returning_idle(self):
+        for outcome in (None, OSError("no space")):
+            with self.subTest(outcome=outcome):
+                coordinator = self.coordinator()
+                try:
+                    coordinator.start_capture(start_command("one-recovery-" + str(outcome)))
+                    recorder = coordinator._active
+                    partial = recorder.partial_path
+                    options = (
+                        {"side_effect": outcome}
+                        if isinstance(outcome, Exception)
+                        else {"return_value": None}
+                    )
+                    with (
+                        patch(
+                            "rp_ylx.recording.recovery.recover_device_session", **options
+                        ) as first,
+                        patch.object(
+                            coordinator_module, "recover_device_session", **options
+                        ) as fallback,
+                    ):
+                        coordinator._source_failure(
+                            coordinator.generation_id, "encoder_failed", "test fault"
+                        )
+                    self.assertEqual(first.call_count + fallback.call_count, 1)
+                    self.assertTrue(partial.is_dir())
+                    self.assertIsNone(coordinator._active)
+                    self.assertIsNone(coordinator._failure_inflight)
+                    self.assert_network_operation_lock_available()
+                    coordinator.close()
+                    with patch.object(
+                        coordinator_module, "recover_device_session", return_value=None
+                    ) as restarted:
+                        coordinator = self.coordinator()
+                    self.assertIn(partial, [call.args[0] for call in restarted.call_args_list])
+                finally:
+                    coordinator.close()
+
+    def test_already_failed_writer_still_gets_its_first_recovery_attempt(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("already-failed-before-recovery"))
+            recorder = coordinator._active
+            recorder._stop_writer()
+            recorder._abandon_encoder()
+            recorder._close_files(ignore_errors=False)
+            recorder._mark_failed("encoder_failed", "test failure", recoverable=False)
+            self.assertFalse(recorder.recovery_attempted)
+            with patch(
+                "rp_ylx.recording.recovery.recover_device_session", return_value=None
+            ) as recovery:
+                coordinator._source_failure(
+                    coordinator.generation_id, "encoder_failed", "test failure"
+                )
+            recovery.assert_called_once_with(recorder.partial_path)
+            self.assertTrue(recorder.recovery_attempted)
+            self.assertTrue(recorder.partial_path.is_dir())
+            self.assertIsNone(coordinator._active)
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
     def _check_failure_io_stage(self, stage):
         coordinator = self.coordinator()
         entered, release = threading.Event(), threading.Event()
@@ -3866,12 +3928,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     patches.enter_context(patch.object(recorder, "fail", side_effect=fail))
                 elif stage == "recovery":
                     patches.enter_context(
-                        patch.object(recorder, "recover_completed_segments", return_value=None)
-                    )
-                    patches.enter_context(
-                        patch.object(
-                            coordinator_module,
-                            "recover_device_session",
+                        patch(
+                            "rp_ylx.recording.recovery.recover_device_session",
                             side_effect=recover,
                         )
                     )

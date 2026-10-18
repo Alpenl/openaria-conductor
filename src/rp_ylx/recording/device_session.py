@@ -722,6 +722,7 @@ class DeviceSessionRecorder:
         self._current_state: Mapping[str, object] | None = None
         self._last_checkpoint = 0.0
         self.recovered_session: SealedDeviceSession | None = None
+        self.recovery_attempted = False
 
     @property
     def state(self) -> str:
@@ -1625,6 +1626,9 @@ class DeviceSessionRecorder:
     def recover_completed_segments(self) -> SealedDeviceSession | None:
         from rp_ylx.recording.recovery import recover_device_session
 
+        # A failed attempt may have scanned a multi-hour take. The coordinator
+        # must not repeat it immediately; a later explicit retry or boot may.
+        self.recovery_attempted = True
         try:
             self.recovered_session = recover_device_session(self._partial)
             return self.recovered_session
