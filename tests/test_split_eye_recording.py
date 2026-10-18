@@ -25,6 +25,7 @@ from rp_ylx.api.downloads import (
 from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.native import NativeRecordingPlan
+from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -647,6 +648,35 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 self.assertEqual(sync.call_count, 2 if expected else 0)
                 if expected:
                     self.assertEqual(len(checkpoint.call_args.args[1]["segments"]), expected)
+
+    def test_capture_diagnostics_identify_shared_metrics_lifetime(self) -> None:
+        metrics = PerformanceMetrics()
+        metrics.record_loss("source_gap", 2)
+        with tempfile.TemporaryDirectory() as directory:
+            first, _, _ = self.build(Path(directory))
+            second, _, _ = self.build(Path(directory))
+            first._metrics = second._metrics = metrics
+            for recorder in (first, second):
+                result = recorder._capture_diagnostics()
+                self.assertEqual(result["capture_scope"], "metrics_lifetime")
+                self.assertEqual(result["capture"]["loss"]["source_gap"], 2)
+            self.assertEqual(metrics.snapshot().loss["source_gap"], 2)
+
+    def test_metrics_snapshot_failure_preserves_failure_file_and_encoder_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            recorder.start()
+            recorder._metrics = Mock(snapshot=Mock(side_effect=RuntimeError("metrics unavailable")))
+            recorder._encoder.stats = {"frames_submitted": 7}
+            recorder.fail("source_sequence_gap", "source sequence 10 -> 13", media_lost=True)
+            diagnostic = json.loads(
+                (recorder.partial_path / "failure-diagnostics.json").read_text()
+            )
+            self.assertEqual(diagnostic["code"], "source_sequence_gap")
+            self.assertEqual(diagnostic["message"], "source sequence 10 -> 13")
+            self.assertEqual(diagnostic["capture_snapshot_error"], "metrics unavailable")
+            self.assertEqual(diagnostic["encoder"], {"frames_submitted": 7})
+            self.assertNotIn("capture", diagnostic)
 
     def test_audio_failure_does_not_hide_encoder_and_index_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

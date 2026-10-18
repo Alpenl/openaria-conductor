@@ -1583,7 +1583,15 @@ class DeviceSessionRecorder:
     def _capture_diagnostics(self) -> dict[str, object]:
         result: dict[str, object] = {"observed_monotonic_ns": time.monotonic_ns()}
         if self._metrics is not None:
-            result["capture"] = asdict(self._metrics.snapshot())
+            # The daemon shares these counters with preview and every recorder;
+            # they are not losses or histogram percentiles for this session.
+            result["capture_scope"] = "metrics_lifetime"
+            try:
+                result["capture"] = asdict(self._metrics.snapshot())
+            except Exception as error:
+                # Keep the original failure and independent encoder/index
+                # evidence even when the optional metrics snapshot fails.
+                result["capture_snapshot_error"] = str(error)
         if self._native_transaction is not None:
             try:
                 diagnostic_snapshot = getattr(
