@@ -1293,6 +1293,136 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def _retained_catalog_entry(self, *, recovered: bool, prefix: str = "retained-catalog"):
+        coordinator = self.coordinator()
+        coordinator.start_capture(start_command(prefix + "-start"))
+        retained = deepcopy(coordinator.capture_status()["snapshot"]["active_recording"])
+        session_id = retained["recording_state"]["session_id"]
+        coordinator.submit_frame(frame())
+        coordinator.stop_capture(stop_command(prefix + "-stop"))
+        directory = self.mountpoint / "recordings" / session_id
+        if recovered:
+            # A valid published prefix still has a failed retained outcome.
+            payload = b'{"outcome":"interrupted"}\n'
+            log = directory / "recovery" / "interruption.json"
+            log.parent.mkdir()
+            log.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            manifest_path = directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["logs"].append(
+                {
+                    "artifact_id": digest,
+                    "path": "recovery/interruption.json",
+                    "sha256": digest,
+                    "bytes": len(payload),
+                    "role": coordinator_module.RECOVERY_ROLE,
+                    "media_type": "application/json",
+                }
+            )
+            manifest_path.write_text(json.dumps(manifest))
+            validate_device_session_directory(directory)
+        retained["recording_state"]["state"] = "failed"
+        retained["recording_state"]["diagnostics"] = [
+            {
+                "code": "process_interrupted",
+                "severity": "error",
+                "message": "test interrupted recording",
+                "at": retained["recording_state"]["updated_at"],
+                "recoverable": False,
+            }
+        ]
+        coordinator._retained[session_id] = retained
+        coordinator._invalidate_session_verification(session_id)
+        coordinator._persist_local_state()
+        coordinator.list_sessions(cursor=None, limit=50, take_id=None, api_version="v4")
+        return coordinator, session_id
+
+    def test_recovered_retained_catalog_reuses_metadata_cache_after_restart(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=True)
+        try:
+            for restart in (False, True):
+                with self.subTest(restart=restart):
+                    if restart:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    with (
+                        patch(
+                            "rp_ylx.recording.coordinator.inspect_device_session_directory",
+                            side_effect=AssertionError("recovered manifest was revalidated"),
+                        ),
+                        patch.object(
+                            coordinator._catalog_db,
+                            "remember",
+                            side_effect=AssertionError("unchanged recovered catalog was rewritten"),
+                        ),
+                    ):
+                        for _ in range(2):
+                            listed = coordinator.list_sessions(
+                                cursor=None, limit=50, take_id=None, api_version="v4"
+                            )
+                            validate_session_list(listed, limit=50, take_id=None, api_version="v4")
+                            self.assertEqual(
+                                [x["session_id"] for x in listed["items"]], [session_id]
+                            )
+                            self.assertIsNone(listed["items"][0]["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                    retained = coordinator.retained_unsuccessful_outcome(session_id)
+                    self.assertEqual(retained["outcome"]["recording_state"]["state"], "failed")
+        finally:
+            coordinator.close()
+
+    def test_retained_unrecovered_manifest_cannot_reuse_success_catalog(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=False)
+        try:
+            for restart in (False, True):
+                with self.subTest(restart=restart):
+                    if restart:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    listed = coordinator.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    self.assertEqual(listed["items"], [])
+                    self.assertTrue(listed["diagnostics"])
+                    self.assertNotIn(session_id, coordinator._verified)
+        finally:
+            coordinator.close()
+
+    def test_recovered_catalog_marker_is_bound_to_unchanged_manifest(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=True)
+        try:
+            path = self.mountpoint / "recordings" / session_id / "manifest.json"
+            before = path.stat()
+            payload = path.read_bytes()
+            marker = coordinator_module.RECOVERY_ROLE.encode()
+            replacement = b"log." + b"x" * (len(marker) - 4)
+            self.assertIn(marker, payload)
+            path.write_bytes(payload.replace(marker, replacement))
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual(path.stat().st_size, before.st_size)
+            listed = coordinator.list_sessions(
+                cursor=None, limit=50, take_id=None, api_version="v4"
+            )
+            self.assertEqual(listed["items"], [])
+            self.assertTrue(listed["diagnostics"])
+        finally:
+            coordinator.close()
+
+    def test_recovered_catalog_marker_does_not_admit_other_failed_session(self):
+        first, recovered_id = self._retained_catalog_entry(recovered=True, prefix="recovered")
+        first.close()
+        coordinator, failed_id = self._retained_catalog_entry(recovered=False, prefix="unrecovered")
+        try:
+            self.assertNotEqual(recovered_id, failed_id)
+            listed = coordinator.list_sessions(
+                cursor=None, limit=50, take_id=None, api_version="v4"
+            )
+            self.assertEqual([x["session_id"] for x in listed["items"]], [recovered_id])
+            self.assertTrue(listed["diagnostics"])
+        finally:
+            coordinator.close()
+
     def test_persisted_catalog_avoids_reinspection_after_restart(self):
         first = self.coordinator()
         session_id = self.seal_one(first, prefix="sqlite-restart")

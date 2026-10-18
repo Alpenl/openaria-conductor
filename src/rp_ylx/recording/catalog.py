@@ -126,13 +126,23 @@ class SessionCatalog(StateDatabase):
         validator: str,
         *,
         directory: Path | None = None,
+        required_artifact_role: str | None = None,
     ):
+        query = (
+            "SELECT summary FROM sessions WHERE volume=? AND session=? "
+            "AND signature=? AND validator=?"
+        )
+        parameters = (volume, session, signature, validator)
+        if required_artifact_role is not None:
+            # Bind the publication marker to the same indexed manifest row.
+            # This admits metadata only; payload integrity remains unverified.
+            query += (
+                " AND EXISTS (SELECT 1 FROM artifacts AS a WHERE "
+                "a.volume=sessions.volume AND a.session=sessions.session AND a.role=?)"
+            )
+            parameters += (required_artifact_role,)
         with self.connection() as db:
-            row = db.execute(
-                "SELECT summary FROM sessions WHERE volume=? AND session=? "
-                "AND signature=? AND validator=?",
-                (volume, session, signature, validator),
-            ).fetchone()
+            row = db.execute(query, parameters).fetchone()
         if row is None:
             return None
         key = (volume, session, signature)

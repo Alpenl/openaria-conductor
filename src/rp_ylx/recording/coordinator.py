@@ -1307,10 +1307,14 @@ class CaptureCoordinator:
                                     signature,
                                     self._config.session.commit,
                                     directory=sessions_root / session_id,
+                                    required_artifact_role=(
+                                        RECOVERY_ROLE
+                                        if session_id in self._retained
+                                        and session_id not in self._verified
+                                        else None
+                                    ),
                                 )
                             except OSError:
-                                cached = None
-                            if session_id in self._retained and session_id not in self._verified:
                                 cached = None
                             if cached is not None:
                                 if summary is None or snapshot is None:
