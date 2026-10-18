@@ -90,6 +90,15 @@ struct WriterDiagnostics {
 }
 
 impl WriterDiagnostics {
+    fn record_slow_event(&mut self, event: serde_json::Value) {
+        if self.slow_events.len() == MAX_SLOW_IO_EVENTS {
+            // Keep startup context and the latest events preceding a fault.
+            self.slow_events.remove(MAX_SLOW_IO_EVENTS / 2);
+            self.slow_events_omitted += 1;
+        }
+        self.slow_events.push(event);
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "open": self.open.json(), "write": self.write.json(),
@@ -119,15 +128,11 @@ fn measure_io<T, E>(
         };
         timing.record(elapsed, bytes, result.is_err());
         if elapsed >= 100_000_000 {
-            if diagnostics.slow_events.len() < MAX_SLOW_IO_EVENTS {
-                diagnostics.slow_events.push(serde_json::json!({
-                    "operation": name, "elapsed_ns": elapsed,
-                    "ended_monotonic_ns": monotonic_ns().unwrap_or(0),
-                    "bytes": bytes, "failed": result.is_err(),
-                }));
-            } else {
-                diagnostics.slow_events_omitted += 1;
-            }
+            diagnostics.record_slow_event(serde_json::json!({
+                "operation": name, "elapsed_ns": elapsed,
+                "ended_monotonic_ns": monotonic_ns().unwrap_or(0),
+                "bytes": bytes, "failed": result.is_err(),
+            }));
         }
     }
     result
@@ -1668,6 +1673,24 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use std::path::PathBuf;
+
+    #[test]
+    fn slow_io_samples_keep_startup_and_failure_tail_with_bounded_space() {
+        let mut diagnostics = super::WriterDiagnostics::default();
+        for index in 0..100 {
+            diagnostics.record_slow_event(serde_json::json!({"ended_monotonic_ns": index}));
+            assert!(diagnostics.slow_events.len() <= super::MAX_SLOW_IO_EVENTS);
+        }
+        let json = diagnostics.json();
+        let retained: Vec<u64> = json["slow_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["ended_monotonic_ns"].as_u64().unwrap())
+            .collect();
+        assert_eq!(retained, (0..32).chain(68..100).collect::<Vec<_>>());
+        assert_eq!(json["slow_events_omitted"], 36);
+    }
 
     #[test]
     fn io_histogram_preserves_tail_and_failure_counts() {

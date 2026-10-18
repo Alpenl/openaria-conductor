@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import stat
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 from rp_ylx.persistence import StateDatabase
@@ -12,6 +15,7 @@ from rp_ylx.persistence import StateDatabase
 
 class SessionCatalog(StateDatabase):
     def __init__(self, path: Path) -> None:
+        self._scan_state = threading.local()
         super().__init__(path)
         self._admitted: set[tuple[str, str, str]] = set()
         with self.connection() as db, db:
@@ -42,6 +46,57 @@ class SessionCatalog(StateDatabase):
                 "PRIMARY KEY(volume,session,path), FOREIGN KEY(volume,session) "
                 "REFERENCES sessions(volume,session) ON DELETE CASCADE)"
             )
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        current = getattr(self._scan_state, "connection", None)
+        if current is not None:
+            yield current
+        else:
+            with super().connection() as db:
+                yield db
+
+    @contextmanager
+    def scan(self) -> Iterator[None]:
+        """Commit a metadata discovery pass once, keeping FULL durability."""
+        if getattr(self._scan_state, "connection", None) is not None:
+            raise RuntimeError("catalog scans must not be nested")
+        with super().connection() as db:
+            # Reserve the writer before reading: another process must not turn
+            # the later read/write upgrade into SQLITE_BUSY_SNAPSHOT.
+            db.execute("BEGIN IMMEDIATE")
+            self._scan_state.connection = db
+            try:
+                yield
+                db.commit()
+            except BaseException:
+                db.rollback()
+                self._admitted.clear()
+                raise
+            finally:
+                self._scan_state.connection = None
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
+        with self.connection() as db:
+            if getattr(self._scan_state, "connection", None) is None:
+                with db:
+                    yield db
+                return
+            # A malformed session can be skipped by discovery without leaving
+            # half of its cache update in the outer scan transaction.
+            db.execute("SAVEPOINT catalog_entry")
+            try:
+                yield db
+            except BaseException:
+                # SQLITE_FULL can roll back the whole transaction itself.
+                # Do not replace that first error with "no such savepoint".
+                if db.in_transaction:
+                    db.execute("ROLLBACK TO catalog_entry")
+                    db.execute("RELEASE catalog_entry")
+                raise
+            else:
+                db.execute("RELEASE catalog_entry")
 
     @staticmethod
     def signature(directory: Path) -> str:
@@ -135,7 +190,7 @@ class SessionCatalog(StateDatabase):
                     yield from artifacts(child)
 
         sid = str(summary["session_id"])
-        with self.connection() as db, db:
+        with self._write_transaction() as db:
             db.execute(
                 "INSERT INTO sessions VALUES (?,?,?,?,?,?,?) ON CONFLICT(volume,session) "
                 "DO UPDATE SET signature=excluded.signature,validator=excluded.validator,"
@@ -174,7 +229,7 @@ class SessionCatalog(StateDatabase):
 
     def discard_missing(self, volume: str, discovered: set[str]) -> None:
         self._admitted = {key for key in self._admitted if key[0] != volume or key[1] in discovered}
-        with self.connection() as db, db:
+        with self._write_transaction() as db:
             existing = db.execute(
                 "SELECT session FROM sessions WHERE volume=?", (volume,)
             ).fetchall()

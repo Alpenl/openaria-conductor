@@ -1228,7 +1228,10 @@ class CaptureCoordinator:
             or Path(verify_session).name != verify_session
         ):
             return
-        with self._catalog_lock:
+        with (
+            self._catalog_lock,
+            self._catalog_db.scan() if verify_session is None else nullcontext(),
+        ):
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
                 # Directory entries avoid a separate type stat for every child.

@@ -269,6 +269,88 @@ class PersistenceTest(unittest.TestCase):
         reopened.discard_missing("volume", set())
         self.assertEqual(reopened.summaries("volume"), [])
 
+    def _catalog_entry(self, sid):
+        directory = self.root / sid
+        directory.mkdir()
+        (directory / "manifest.json").write_text("{}")
+        summary = {"session_id": sid, "started_at": "2026", "take_id": "take", "verification": None}
+        return directory, summary
+
+    def test_catalog_scan_has_one_durable_commit_and_no_partial_visibility(self):
+        store = SessionCatalog(self.root / "catalog.sqlite3")
+        observer = SessionCatalog(store.path)
+        entries = [self._catalog_entry(f"session-{i}") for i in range(20)]
+        statements = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+
+        with patch("sqlite3.connect", side_effect=traced_connect), store.scan():
+            for directory, summary in entries:
+                store.remember("volume", directory, "commit", summary, {})
+                self.assertIsNotNone(
+                    store.cached("volume", directory.name, store.signature(directory), "commit")
+                )
+            store.discard_missing("volume", {d.name for d, _ in entries})
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                self.assertEqual(pool.submit(observer.summaries, "volume").result(timeout=2), [])
+        self.assertEqual(statements.count("COMMIT"), 1)
+        self.assertEqual(statements.count("BEGIN IMMEDIATE"), 1)
+        self.assertIn("PRAGMA synchronous=FULL", statements)
+        self.assertEqual(len(observer.summaries("volume")), 20)
+
+    def test_catalog_scan_failure_rolls_back_and_releases_connection(self):
+        store = SessionCatalog(self.root / "catalog.sqlite3")
+        directory, summary = self._catalog_entry("rollback")
+        with self.assertRaisesRegex(RuntimeError, "scan failed"), store.scan():
+            store.remember("volume", directory, "commit", summary, {})
+            self.assertIsNotNone(
+                store.cached(
+                    "volume",
+                    directory.name,
+                    store.signature(directory),
+                    "commit",
+                    directory=directory,
+                )
+            )
+            raise RuntimeError("scan failed")
+        self.assertEqual(store.summaries("volume"), [])
+        self.assertEqual(store._admitted, set())
+        store.remember("volume", directory, "commit", summary, {})
+        self.assertEqual(len(store.summaries("volume")), 1)
+
+    def test_catalog_scan_bad_entry_cannot_commit_half_of_its_update(self):
+        store = SessionCatalog(self.root / "catalog.sqlite3")
+        good, good_summary = self._catalog_entry("good")
+        bad, bad_summary = self._catalog_entry("bad")
+        artifact = {"path": "same", "bytes": 1, "sha256": "a" * 64}
+        with store.scan():
+            store.remember("volume", good, "commit", good_summary, {})
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.remember("volume", bad, "commit", bad_summary, {"logs": [artifact, artifact]})
+        self.assertEqual([x["session_id"] for x in store.summaries("volume")], ["good"])
+        self.assertIsNone(store.cached("volume", bad.name, store.signature(bad), "commit"))
+
+    def test_catalog_scan_disk_full_keeps_the_original_error_and_rolls_back(self):
+        store = SessionCatalog(self.root / "catalog.sqlite3")
+        directory, summary = self._catalog_entry("full")
+        summary["take_id"] = "x" * 65536
+        with (
+            self.assertRaisesRegex(sqlite3.OperationalError, "database or disk is full"),
+            store.scan(),
+        ):
+            with store.connection() as db:
+                pages = db.execute("PRAGMA page_count").fetchone()[0]
+                db.execute(f"PRAGMA max_page_count={pages}")
+            store.remember("volume", directory, "commit", summary, {})
+        self.assertEqual(store.summaries("volume"), [])
+        summary["take_id"] = "take"
+        store.remember("volume", directory, "commit", summary, {})
+        self.assertEqual(len(store.summaries("volume")), 1)
+
 
 class ManifestUniquenessTest(unittest.TestCase):
     def test_json_schema_equality_matches_reference(self):
