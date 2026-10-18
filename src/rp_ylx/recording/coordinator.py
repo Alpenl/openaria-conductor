@@ -1537,6 +1537,10 @@ class CaptureCoordinator:
             )
             if recording_state is None:
                 return self._revision, "blocked", None, None
+            if self._failure_projection is None:
+                # Native progress advances between durable state callbacks.
+                # Preserve the last observed live progress for lock-free recovery.
+                self._cached_active_state = copy.deepcopy(recording_state)
             state = str(recording_state["state"])
             return (
                 int(recording_state["state_revision"]),

@@ -648,6 +648,50 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 if expected:
                     self.assertEqual(len(checkpoint.call_args.args[1]["segments"]), expected)
 
+    def test_audio_failure_does_not_hide_encoder_and_index_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            error = {"code": "audio_failed", "message": "audio durable commit backlog exhausted"}
+            encoder_error = {"code": "encoder_failed", "message": "dequeue input failed: -16"}
+            transaction = SimpleNamespace(
+                snapshot=Mock(side_effect=RuntimeError(error["message"])),
+                abort=Mock(),
+                diagnostic_snapshot=Mock(
+                    return_value={
+                        "audio_failure": error,
+                        "encoder_failure": encoder_error,
+                        "encoder_stats": {"frames_submitted": 90},
+                        "sink": {
+                            "frames_written": 90,
+                            "frames_indexed": 83,
+                            "index_pending_bytes": 4096,
+                            "bytes_written": 12345,
+                        },
+                    }
+                ),
+            )
+            recorder._native_transaction = transaction
+            result = recorder._capture_diagnostics()
+            self.assertEqual(result["audio_failure"], error)
+            self.assertEqual(result["encoder_failure"], encoder_error)
+            self.assertEqual(result["encoder"]["frames_submitted"], 90)
+            self.assertEqual(result["index_writer"]["frames_indexed"], 83)
+            self.assertEqual(result["index_writer"]["index_pending_bytes"], 4096)
+            self.assertNotIn("snapshot_error", result)
+            transaction.snapshot.assert_not_called()
+            transaction.diagnostic_snapshot.assert_called_once_with()
+            recorder._native_direct_recording = True
+            live = recorder._live_recording_state_locked({"progress": {"captured_frames": 0}})
+            self.assertEqual(live["progress"]["captured_frames"], 90)
+            self.assertEqual(live["progress"]["bytes_written"], 12345)
+            transaction.snapshot.assert_not_called()
+            recorder._abandon_encoder()
+            self.assertIsNone(recorder._native_transaction)
+            transaction.abort.assert_called_once_with("recording abandoned")
+            final_state = recorder._state_document("failed", diagnostics=[])
+            self.assertEqual(final_state["progress"]["captured_frames"], 90)
+            self.assertEqual(final_state["progress"]["bytes_written"], 12345)
+
     def test_sealed_session_declares_contiguous_split_eye_segments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

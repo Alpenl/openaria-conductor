@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import rp_ylx.api.downloads as downloads_module
 import rp_ylx.recording.coordinator as coordinator_module
@@ -3420,6 +3420,19 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     errors.append(error)
 
             with ExitStack() as patches:
+                live = deepcopy(recorder.current_recording_state)
+                live["progress"].update(
+                    captured_frames=123, elapsed_seconds=4.1, bytes_written=45678
+                )
+                with patch.object(
+                    type(recorder),
+                    "current_recording_state",
+                    new_callable=PropertyMock,
+                    return_value=live,
+                ):
+                    observed = coordinator.capture_status()["snapshot"]["active_recording"][
+                        "recording_state"
+                    ]
                 if stage == "fail":
                     patches.enter_context(patch.object(recorder, "fail", side_effect=fail))
                 elif stage == "recovery":
@@ -3446,6 +3459,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - before, 0.25)
                 validate_capture_status(status)
                 self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                self.assertEqual(
+                    status["snapshot"]["active_recording"]["recording_state"]["progress"],
+                    observed["progress"],
+                )
                 self.assertEqual(coordinator.artifact_io_state(), "finalizing")
                 self.assertGreater(coordinator.open_handle_count, 0)
                 self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))

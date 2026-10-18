@@ -361,6 +361,8 @@ class NativeCapabilitiesTest(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(transaction.snapshot(), snapshot)
+                self.assertEqual(transaction.diagnostic_snapshot(), snapshot)
+                self.assertIsNone(snapshot["audio_failure"])
                 self.assertEqual(transaction.segments(), segments)
             finally:
                 transaction.abort("snapshot test complete")

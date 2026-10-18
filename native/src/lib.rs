@@ -95,6 +95,14 @@ impl NativeSessionTransaction {
         session_transaction_snapshot_dict(py, &snapshot)
     }
 
+    fn diagnostic_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let transaction = Arc::clone(&self.transaction);
+        let snapshot = py
+            .allow_threads(move || transaction.diagnostic_snapshot())
+            .map_err(session_store_error)?;
+        session_transaction_snapshot_dict(py, &snapshot)
+    }
+
     fn segments(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let transaction = Arc::clone(&self.transaction);
         let segments = py
@@ -1124,6 +1132,15 @@ fn session_transaction_snapshot_dict(
         None => value.set_item("audio", py.None())?,
     }
     value.set_item("submitted_frames", snapshot.submitted_frames)?;
+    match &snapshot.audio_failure {
+        Some(error) => {
+            let failure = PyDict::new(py);
+            failure.set_item("code", error.code)?;
+            failure.set_item("message", &error.message)?;
+            value.set_item("audio_failure", failure)?;
+        }
+        None => value.set_item("audio_failure", py.None())?,
+    }
     let encoder_stats = PyDict::new(py);
     for (name, count) in &snapshot.encoder_stats {
         encoder_stats.set_item(name, count)?;

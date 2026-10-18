@@ -520,6 +520,11 @@ impl Recorder {
         self.progress.check()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_failure(&self, error: AudioError) {
+        self.progress.fail(error);
+    }
+
     pub(crate) fn abort(&self) {
         self.stop.store(true, Ordering::Release);
         let worker = self

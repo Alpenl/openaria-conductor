@@ -899,7 +899,8 @@ class DeviceSessionRecorder:
             transaction = self._native_transaction
             if transaction is not None:
                 try:
-                    transaction_snapshot = transaction.snapshot()
+                    snapshot = getattr(transaction, "diagnostic_snapshot", transaction.snapshot)
+                    transaction_snapshot = snapshot()
                 except BaseException:
                     transaction_snapshot = None
                 sink_snapshot = (
@@ -1585,9 +1586,15 @@ class DeviceSessionRecorder:
             result["capture"] = asdict(self._metrics.snapshot())
         if self._native_transaction is not None:
             try:
-                snapshot = self._native_transaction.snapshot()
+                diagnostic_snapshot = getattr(
+                    self._native_transaction,
+                    "diagnostic_snapshot",
+                    self._native_transaction.snapshot,
+                )
+                snapshot = diagnostic_snapshot()
                 result["encoder"] = snapshot.get("encoder_stats", {})
                 result["encoder_failure"] = snapshot.get("encoder_failure")
+                result["audio_failure"] = snapshot.get("audio_failure")
                 sink = snapshot.get("sink", {})
                 result["index_writer"] = {
                     name: sink.get(name)
@@ -2324,7 +2331,12 @@ class DeviceSessionRecorder:
             # Preserve native progress before abort releases the transaction.
             # Failed recordings must not report zero frames after writing media.
             with suppress(BaseException):
-                sink = self._native_transaction.snapshot().get("sink")
+                snapshot = getattr(
+                    self._native_transaction,
+                    "diagnostic_snapshot",
+                    self._native_transaction.snapshot,
+                )
+                sink = snapshot().get("sink")
                 if isinstance(sink, Mapping):
                     self._frames_written = max(
                         self._frames_written,

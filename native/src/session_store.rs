@@ -83,6 +83,7 @@ pub(crate) struct TransactionSnapshot {
     pub(crate) active_take: ActiveTakeSnapshot,
     pub(crate) sink: RecordingSinkSnapshot,
     pub(crate) audio: Option<AudioRecordingSnapshot>,
+    pub(crate) audio_failure: Option<audio::AudioError>,
     pub(crate) submitted_frames: u64,
     pub(crate) encoder_stats: BTreeMap<String, i64>,
     pub(crate) encoder_failure: Option<crate::stereo_encoder::EncoderProcessError>,
@@ -228,6 +229,16 @@ impl SessionTransaction {
         if let Some(audio) = &self.audio {
             audio.check_health()?;
         }
+        self.diagnostic_snapshot()
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> Result<TransactionSnapshot, StoreError> {
+        // Health failures must stop capture, but must not hide other components'
+        // progress and first errors when collecting a failure checkpoint.
+        let audio_failure = self
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.check_health().err());
         let lifecycle = self
             .state
             .lock()
@@ -264,6 +275,7 @@ impl SessionTransaction {
             active_take,
             sink,
             audio: self.audio.as_ref().map(|audio| audio.snapshot()),
+            audio_failure,
             submitted_frames,
             encoder_stats,
             encoder_failure,
@@ -562,6 +574,44 @@ mod tests {
         assert_eq!(first.active_take.frames_written, 0);
         assert_eq!(second.encoder_stats, first.encoder_stats);
         assert_eq!(transaction.open_handle_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_failure_remains_fatal_but_does_not_hide_diagnostics() {
+        let root = temp_root("failed-audio-diagnostics");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = encoder_helper(&root);
+        let mut transaction =
+            SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        let audio =
+            crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap();
+        audio.inject_failure(crate::audio::AudioError::new(
+            "audio_failed",
+            "audio durable commit backlog exhausted",
+        ));
+        transaction.audio = Some(std::sync::Arc::new(audio));
+        let first = transaction.snapshot().unwrap_err();
+        assert_eq!(first.code, "audio_failed");
+        let diagnostics = transaction.diagnostic_snapshot().unwrap();
+        assert_eq!(diagnostics.state, "recording");
+        assert_eq!(diagnostics.sink.frames_indexed, 0);
+        assert_eq!(diagnostics.submitted_frames, 0);
+        assert!(diagnostics.audio.is_some());
+        let failure = diagnostics.audio_failure.unwrap();
+        assert_eq!(failure.code, first.code);
+        assert_eq!(failure.message, first.message);
+        // Diagnostic observation must neither clear the fault nor authorize writes.
+        assert_eq!(transaction.ensure_recording().unwrap_err(), first);
+        assert_eq!(transaction.snapshot().unwrap_err(), first);
+        transaction.abort();
+        assert!(
+            transaction
+                .diagnostic_snapshot()
+                .unwrap()
+                .audio_failure
+                .is_some()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
