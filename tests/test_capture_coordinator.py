@@ -3725,6 +3725,83 @@ class CaptureCoordinatorTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 self._check_failure_io_stage(stage)
 
+    def test_native_failure_callback_returns_while_recovery_keeps_volume_reserved(self):
+        class CallbackSources(FakeSources):
+            keeps_preview_after_stop = True
+
+            def start(self, **kwargs):
+                self.failure_callback = kwargs["on_failure"]
+                super().start(**kwargs)
+
+        sources = CallbackSources()
+        coordinator = self.coordinator(sources=sources)
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        callback = None
+        try:
+            coordinator.start_capture(start_command("native-failure-dispatch"))
+            recorder = coordinator._active
+            original = recorder.fail
+
+            def fail(*args, **kwargs):
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("recovery not released")
+                return original(*args, **kwargs)
+
+            def report():
+                sources.failure_callback("source_sequence_gap", "test source gap")
+                # This is where the same native consumer resumes preview delivery.
+                returned.set()
+
+            with patch.object(recorder, "fail", side_effect=fail) as failed:
+                callback = threading.Thread(target=report)
+                callback.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(returned.wait(0.25), "source callback blocked on recovery")
+                self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                self.assert_network_operation_lock_held()
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("during-native-failure"))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                sources.failure_callback("duplicate", "ignored")
+                self.assertEqual(failed.call_count, 1)
+                release.set()
+                coordinator.stop_capture(stop_command("wait-native-failure"))
+                self.assertIsNone(coordinator._active)
+                self.assertIsNone(coordinator._failure_inflight)
+                self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            if callback is not None:
+                callback.join(4)
+            coordinator.close()
+
+    def test_failure_worker_start_error_still_preserves_failed_recording(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("failure-worker-unavailable"))
+            recorder = coordinator._active
+            with (
+                patch.object(threading.Thread, "start", side_effect=RuntimeError("no threads")),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+            ):
+                coordinator._source_failure(
+                    coordinator.generation_id,
+                    "source_sequence_gap",
+                    "test gap",
+                    defer_recovery=True,
+                )
+            self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._failure_inflight)
+            self.assertIsNone(coordinator._active)
+            status = coordinator.capture_status()["snapshot"]
+            self.assertEqual(status["device_state"], "idle")
+            retained = status["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["code"], "source_sequence_gap")
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
     def _check_failure_io_stage(self, stage):
         coordinator = self.coordinator()
         entered, release = threading.Event(), threading.Event()

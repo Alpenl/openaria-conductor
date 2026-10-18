@@ -2540,6 +2540,7 @@ class CaptureCoordinator:
                         code,
                         message,
                         expected_plan=plan,
+                        defer_recovery=True,
                     ),
                     native_recorder=recorder,
                 )
@@ -2574,6 +2575,7 @@ class CaptureCoordinator:
         message: str,
         *,
         expected_plan: SessionPlan | None = None,
+        defer_recovery: bool = False,
     ) -> None:
         with self._lock:
             if (
@@ -2584,7 +2586,9 @@ class CaptureCoordinator:
             ):
                 return
             plan = self._active_plan
-        self._retain_active_failure(DeviceRecordingError(code, message), plan)
+        self._retain_active_failure(
+            DeviceRecordingError(code, message), plan, defer_recovery=defer_recovery
+        )
 
     def enforce_storage_reserve(self) -> None:
         """Stop normally before exhausting the finalization reserve; never from a source thread."""
@@ -2876,7 +2880,12 @@ class CaptureCoordinator:
         self._persist_local_state()
 
     def _retain_active_failure(
-        self, error: DeviceRecordingError, plan: SessionPlan | None, *, from_stop: bool = False
+        self,
+        error: DeviceRecordingError,
+        plan: SessionPlan | None,
+        *,
+        from_stop: bool = False,
+        defer_recovery: bool = False,
     ) -> None:
         with self._stop_condition:
             recorder = self._active
@@ -2899,13 +2908,41 @@ class CaptureCoordinator:
             projection["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             self._failure_projection = projection
             self._failure_inflight = recorder
-        try:
-            self._finish_active_failure(recorder, plan, error)
-        finally:
-            with self._stop_condition:
-                self._failure_inflight = None
-                self._failure_projection = None
-                self._stop_condition.notify_all()
+
+        def finish() -> None:
+            try:
+                self._finish_active_failure(recorder, plan, error)
+            finally:
+                with self._stop_condition:
+                    self._failure_inflight = None
+                    self._failure_projection = None
+                    self._stop_condition.notify_all()
+
+        if defer_recovery:
+            # The native consumer also feeds preview. Claim the exact recorder
+            # synchronously, but never recover gigabytes on its callback stack.
+            # stop/close and volume operations still wait on _failure_inflight.
+            def background_finish() -> None:
+                try:
+                    finish()
+                except Exception as failure:
+                    operational_logger("recording").event(
+                        "recovery_failed",
+                        level="error",
+                        transaction_id=plan.session_id,
+                        exception_type=type(failure).__name__,
+                    )
+
+            worker = threading.Thread(
+                target=background_finish, name="rp-ylx-failure-recovery", daemon=False
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                # Resource exhaustion must not abandon the reserved recorder.
+                finish()
+            return
+        finish()
 
     def _finish_active_failure(
         self, recorder: DeviceSessionRecorder, plan: SessionPlan, error: DeviceRecordingError
