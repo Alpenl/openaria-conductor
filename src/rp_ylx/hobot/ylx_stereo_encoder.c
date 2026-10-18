@@ -79,11 +79,13 @@ static void emit(const char *format, ...)
 {
     FILE *stream = event_output();
     va_list arguments;
+    flockfile(stream);
     va_start(arguments, format);
     vfprintf(stream, format, arguments);
     va_end(arguments);
     fputc('\n', stream);
     fflush(stream);
+    funlockfile(stream);
 }
 
 static void write_json_string(const char *value)
@@ -130,12 +132,14 @@ static void write_json_string(const char *value)
 static void emit_error_event(const char *code, const char *message)
 {
     FILE *stream = event_output();
+    flockfile(stream);
     fputs("{\"event\":\"error\",\"code\":", stream);
     write_json_string(code);
     fputs(",\"message\":", stream);
     write_json_string(message);
     fputs("}\n", stream);
     fflush(stream);
+    funlockfile(stream);
 }
 
 static void emit_stats(const char *event, const ylx_pipeline_stats_t *stats)
@@ -162,6 +166,7 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
                        unsigned long long right_bytes)
 {
     FILE *stream = event_output();
+    flockfile(stream);
     fprintf(stream,
             "{\"event\":\"segment\",\"index\":%d,\"start_frame\":%llu,\"end_frame\":%llu,"
             "\"left\":{\"path\":",
@@ -171,6 +176,7 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
     write_json_string(right_path);
     fprintf(stream, ",\"bytes\":%llu}}\n", right_bytes);
     fflush(stream);
+    funlockfile(stream);
     if (user != NULL && *(ylx_pipeline_t **)user != NULL) {
         ylx_pipeline_stats_t stats;
         ylx_pipeline_stats(*(ylx_pipeline_t **)user, &stats);
@@ -338,6 +344,13 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Preserve the causal error before filesystem drain can take seconds or
+     * the owner times out and terminates us. Segment events remain atomic. */
+    const bool error_emitted = failure_code != NULL;
+    if (error_emitted) {
+        const char *reason = ylx_pipeline_error(pipeline);
+        emit_error_event(failure_code, reason[0] != '\0' ? reason : failure_code);
+    }
     const int finished = ylx_pipeline_finish(pipeline);
     ylx_pipeline_stats_t stats;
     ylx_pipeline_stats(pipeline, &stats);
@@ -346,7 +359,7 @@ int main(int argc, char **argv)
     if (failure_code == NULL && finished != 0) {
         failure_code = "pipeline_failed";
     }
-    if (failure_code != NULL) {
+    if (failure_code != NULL && !error_emitted) {
         emit_error_event(failure_code, pipeline_error[0] != '\0' ? pipeline_error : failure_code);
     }
     emit_stats("done", &stats);

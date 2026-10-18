@@ -85,6 +85,7 @@ pub(crate) struct TransactionSnapshot {
     pub(crate) audio: Option<AudioRecordingSnapshot>,
     pub(crate) submitted_frames: u64,
     pub(crate) encoder_stats: BTreeMap<String, i64>,
+    pub(crate) encoder_failure: Option<crate::stereo_encoder::EncoderProcessError>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,12 +243,16 @@ impl SessionTransaction {
             .lock()
             .map_err(|_| StoreError::poisoned("sink"))?
             .snapshot();
-        let (submitted_frames, encoder_stats) = {
+        let (submitted_frames, encoder_stats, encoder_failure) = {
             let encoder = self
                 .encoder
                 .lock()
                 .map_err(|_| StoreError::poisoned("encoder"))?;
-            (encoder.submitted_frames(), encoder.stats())
+            (
+                encoder.submitted_frames(),
+                encoder.stats(),
+                encoder.failure(),
+            )
         };
         Ok(TransactionSnapshot {
             state: match lifecycle {
@@ -261,6 +266,7 @@ impl SessionTransaction {
             audio: self.audio.as_ref().map(|audio| audio.snapshot()),
             submitted_frames,
             encoder_stats,
+            encoder_failure,
         })
     }
 

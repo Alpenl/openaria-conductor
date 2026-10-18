@@ -1587,6 +1587,7 @@ class DeviceSessionRecorder:
             try:
                 snapshot = self._native_transaction.snapshot()
                 result["encoder"] = snapshot.get("encoder_stats", {})
+                result["encoder_failure"] = snapshot.get("encoder_failure")
                 sink = snapshot.get("sink", {})
                 result["index_writer"] = {
                     name: sink.get(name)

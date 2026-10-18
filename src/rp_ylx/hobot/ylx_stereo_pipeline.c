@@ -21,6 +21,7 @@
 
 #define DECODER_INPUT_TIMEOUT_MS 200
 #define DECODER_OUTPUT_TIMEOUT_MS 200
+#define DECODER_DRAIN_POLLS 25 /* 5s without output after input stops */
 #define ENCODER_INPUT_TIMEOUT_MS 1000
 #define ENCODER_OUTPUT_TIMEOUT_MS 200
 #define ENCODER_DRAIN_POLLS 25 /* 5s ceiling on a stuck VPU drain */
@@ -748,6 +749,11 @@ static void *encoder_output_thread(void *argument)
             if (atomic_load(&pipeline->split_done) != 0 &&
                 (atomic_load(&pipeline->encoded[eye->eye]) >= atomic_load(&pipeline->fed[eye->eye]) ||
                  ++idle_polls >= ENCODER_DRAIN_POLLS)) {
+                if (atomic_load(&pipeline->encoded[eye->eye]) < atomic_load(&pipeline->fed[eye->eye])) {
+                    fail(pipeline, "encoder_drain_timeout: eye=%s ret=%d fed=%llu encoded=%llu",
+                         EYE_NAMES[eye->eye], ret, atomic_load(&pipeline->fed[eye->eye]),
+                         atomic_load(&pipeline->encoded[eye->eye]));
+                }
                 break;
             }
             continue;
@@ -802,6 +808,7 @@ static void *split_thread_main(void *argument)
     ylx_pipeline_t *pipeline = (ylx_pipeline_t *)argument;
     const int eye_width = pipeline->eye_width;
     const int height = pipeline->config.height;
+    int idle_polls = 0;
 
     for (;;) {
         media_codec_buffer_t frame;
@@ -811,17 +818,24 @@ static void *split_thread_main(void *argument)
         int ret = hb_mm_mc_dequeue_output_buffer(&pipeline->decoder, &frame, &info,
                                                  DECODER_OUTPUT_TIMEOUT_MS);
         if (ret != 0) {
-            if (atomic_load(&pipeline->stopping) != 0 &&
-                atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) {
-                break;
+            if (atomic_load(&pipeline->stopping) != 0) {
+                if (atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) break;
+                if (++idle_polls >= DECODER_DRAIN_POLLS) {
+                    fail(pipeline, "decoder_drain_timeout: ret=%d submitted=%llu decoded=%llu",
+                         ret, atomic_load(&pipeline->submitted), atomic_load(&pipeline->decoded));
+                    break;
+                }
             }
             continue;
         }
+        idle_polls = 0;
         if (frame.type != MC_VIDEO_FRAME_BUFFER || frame.vframe_buf.size == 0 ||
             info.video_frame_info.decode_result == 0) {
             atomic_fetch_add(&pipeline->drop_decoder_output, 1ULL);
+            fail(pipeline, "decoder_output_invalid: type=%d bytes=%u result=%d",
+                 frame.type, frame.vframe_buf.size, info.video_frame_info.decode_result);
             hb_mm_mc_queue_output_buffer(&pipeline->decoder, &frame, 0);
-            continue;
+            break;
         }
         if (frame.vframe_buf.width != pipeline->config.sbs_width ||
             frame.vframe_buf.height != height) {
@@ -837,10 +851,13 @@ static void *split_thread_main(void *argument)
             media_codec_buffer_t input;
             memset(&input, 0, sizeof(input));
             input.type = MC_VIDEO_FRAME_BUFFER;
-            if (hb_mm_mc_dequeue_input_buffer(&pipeline->eyes[eye].codec, &input,
-                                              ENCODER_INPUT_TIMEOUT_MS) != 0) {
+            ret = hb_mm_mc_dequeue_input_buffer(&pipeline->eyes[eye].codec, &input,
+                                                ENCODER_INPUT_TIMEOUT_MS);
+            if (ret != 0) {
                 atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
-                continue;
+                fail(pipeline, "encoder_input_dequeue_failed: eye=%s ret=%d timeout_ms=%d",
+                     EYE_NAMES[eye], ret, ENCODER_INPUT_TIMEOUT_MS);
+                break;
             }
             input.type = MC_VIDEO_FRAME_BUFFER;
             input.vframe_buf.width = eye_width;
@@ -848,14 +865,19 @@ static void *split_thread_main(void *argument)
             input.vframe_buf.pix_fmt = MC_PIXEL_FORMAT_NV12;
             input.vframe_buf.size = (uint32_t)(eye_width * height * 3 / 2);
             split_eye(&frame, &input, eye_width, height, eye * eye_width);
-            if (hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
-                                            ENCODER_INPUT_TIMEOUT_MS) != 0) {
+            ret = hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
+                                              ENCODER_INPUT_TIMEOUT_MS);
+            if (ret != 0) {
                 atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
+                fail(pipeline, "encoder_input_queue_failed: eye=%s ret=%d",
+                     EYE_NAMES[eye], ret);
+                break;
             } else {
                 atomic_fetch_add(&pipeline->fed[eye], 1ULL);
             }
         }
         hb_mm_mc_queue_output_buffer(&pipeline->decoder, &frame, 0);
+        if (atomic_load(&pipeline->failed)) break;
     }
     atomic_store(&pipeline->split_done, 1);
     return NULL;
@@ -951,19 +973,24 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
     }
     if (jpeg == NULL || length == 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_invalid: bytes=%zu", length);
         return -1;
     }
 
     media_codec_buffer_t input;
     memset(&input, 0, sizeof(input));
     input.type = MC_VIDEO_STREAM_BUFFER;
-    if (hb_mm_mc_dequeue_input_buffer(&pipeline->decoder, &input,
-                                      timeout_ms > 0 ? timeout_ms
-                                                     : DECODER_INPUT_TIMEOUT_MS) != 0) {
+    const int timeout = timeout_ms > 0 ? timeout_ms : DECODER_INPUT_TIMEOUT_MS;
+    int ret = hb_mm_mc_dequeue_input_buffer(&pipeline->decoder, &input, timeout);
+    if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_dequeue_failed: ret=%d timeout_ms=%d bytes=%zu",
+             ret, timeout, length);
         return -1;
     }
     if ((size_t)input.vstream_buf.size < length) {
+        fail(pipeline, "decoder_input_capacity: bytes=%zu capacity=%u",
+             length, input.vstream_buf.size);
         hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         return -1;
@@ -972,9 +999,10 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
     input.vstream_buf.size = (uint32_t)length;
     input.vstream_buf.stream_end = 0;
     memcpy(input.vstream_buf.vir_ptr, jpeg, length);
-    if (hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input,
-                                    DECODER_INPUT_TIMEOUT_MS) != 0) {
+    ret = hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
+    if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_queue_failed: ret=%d bytes=%zu", ret, length);
         return -1;
     }
     atomic_fetch_add(&pipeline->submitted, 1ULL);
@@ -1049,5 +1077,12 @@ void ylx_pipeline_stats(const ylx_pipeline_t *pipeline, ylx_pipeline_stats_t *ou
 
 const char *ylx_pipeline_error(const ylx_pipeline_t *pipeline)
 {
-    return pipeline->error;
+    /* An input error is reported before worker drain completes. Copy under the
+     * lock so the caller never races the first error from another thread. */
+    static _Thread_local char error[ERROR_LEN];
+    ylx_pipeline_t *mutable_pipeline = (ylx_pipeline_t *)pipeline;
+    pthread_mutex_lock(&mutable_pipeline->error_lock);
+    memcpy(error, pipeline->error, sizeof(error));
+    pthread_mutex_unlock(&mutable_pipeline->error_lock);
+    return error;
 }

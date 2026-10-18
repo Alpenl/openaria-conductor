@@ -1129,6 +1129,15 @@ fn session_transaction_snapshot_dict(
         encoder_stats.set_item(name, count)?;
     }
     value.set_item("encoder_stats", encoder_stats)?;
+    match &snapshot.encoder_failure {
+        Some(error) => {
+            let failure = PyDict::new(py);
+            failure.set_item("code", &error.code)?;
+            failure.set_item("message", &error.message)?;
+            value.set_item("encoder_failure", failure)?;
+        }
+        None => value.set_item("encoder_failure", py.None())?,
+    }
     Ok(value.unbind())
 }
 
