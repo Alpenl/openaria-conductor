@@ -317,6 +317,8 @@ class FakeSessionTransaction:
         return {
             "frames_written": self.frames_written,
             "imu_samples_written": self.imu_samples_written,
+            "frames_indexed": self.frames_written,
+            "imu_samples_indexed": self.imu_samples_written,
             "bytes_written": sum(
                 int(item["bytes"]) for item in selected.values() if isinstance(item, dict)
             ),
@@ -601,6 +603,50 @@ class SplitEyeRecordingTest(unittest.TestCase):
                     dropped_before=0,
                 )
             )
+
+    def test_native_checkpoint_waits_for_indexed_frames_and_coalesces_ready_pairs(self) -> None:
+        from types import SimpleNamespace
+
+        for indexed, expected in [(0, 0), (3, 1), (6, 2)]:
+            with self.subTest(indexed=indexed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                recorder, _, _ = self.build(root)
+                recorder._partial = root / "partial"
+                recorder._partial.mkdir()
+                for name in ("frames.ndjson", "imu.ndjson"):
+                    (recorder._partial / name).write_bytes(b"")
+                segments = [
+                    {
+                        "index": i,
+                        "start_frame": i * 3,
+                        "end_frame": (i + 1) * 3,
+                        "left_path": f"video/left_{i:05d}.mp4",
+                        "left_bytes": 1,
+                        "right_path": f"video/right_{i:05d}.mp4",
+                        "right_bytes": 1,
+                    }
+                    for i in range(2)
+                ]
+                recorder._native_transaction = SimpleNamespace(
+                    segments=lambda segments=segments: segments,
+                    snapshot=lambda indexed=indexed: {
+                        "sink": {"frames_written": 6, "frames_indexed": indexed}
+                    },
+                )
+                with (
+                    patch.object(
+                        recorder, "_segment_record", side_effect=lambda item: {"index": item.index}
+                    ),
+                    patch.object(recorder, "_capture_diagnostics", return_value={}),
+                    patch("rp_ylx.recording.device_session.write_json_atomic") as checkpoint,
+                    patch("rp_ylx.recording.device_session.os.fsync") as sync,
+                ):
+                    recorder._harvest_segments()
+                self.assertEqual(recorder._harvested_segments, expected)
+                self.assertEqual(checkpoint.call_count, int(expected > 0))
+                self.assertEqual(sync.call_count, 2 if expected else 0)
+                if expected:
+                    self.assertEqual(len(checkpoint.call_args.args[1]["segments"]), expected)
 
     def test_sealed_session_declares_contiguous_split_eye_segments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -41,10 +41,36 @@ class LiveSealingTests(unittest.TestCase):
         temporary.write_text(json.dumps({"segments": segments}))
         temporary.replace(directory / "checkpoint.json")
 
-    def compact_audio(self, source):
+    def compact_audio(self, source, *, durable=True):
         target = source.with_suffix(".flac")
         target.write_bytes(b"compacted audio")
         return target, {"codec": "flac"}
+
+    def test_prepared_audio_requires_durable_admission_and_propagates_sync_failure(self):
+        from rp_ylx.recording.live_seal import PreparedArtifact, _read_back
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.wav"
+            target = root / "source.flac"
+            source.write_bytes(b"raw PCM fixture")
+            target.write_bytes(b"derived FLAC fixture")
+            original = _read_back(source)
+            artifact = PreparedArtifact(original, target, _read_back(target), {})
+            descriptor = {
+                "path": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": original.sha256,
+            }
+            with (
+                patch("rp_ylx.recording.live_seal.os.fsync", side_effect=OSError("sync failed")),
+                self.assertRaisesRegex(OSError, "sync failed"),
+            ):
+                artifact.use(root, descriptor)
+            self.assertTrue(source.exists())
+            with patch("rp_ylx.recording.live_seal.os.fsync") as sync:
+                artifact.use(root, descriptor)
+            sync.assert_called_once()
 
     def test_audio_skips_unchanged_checkpoint_but_forces_final_read(self):
         with tempfile.TemporaryDirectory() as directory:

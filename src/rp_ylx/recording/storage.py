@@ -76,7 +76,7 @@ def compact_metadata(path: Path) -> tuple[Path, dict]:
     }
 
 
-def compact_audio(path: Path) -> tuple[Path, dict]:
+def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
     target = path.with_suffix(".flac")
     temporary = target.with_suffix(".flac.tmp")
     with wave.open(str(path), "rb") as source:
@@ -138,8 +138,9 @@ def compact_audio(path: Path) -> tuple[Path, dict]:
         actual = _digest(process.stdout)
         if process.wait(timeout=120) != 0 or actual != (pcm_bytes, pcm.hexdigest()):
             raise ValueError("FLAC PCM round-trip mismatch")
-    with temporary.open("rb") as stream:
-        os.fsync(stream.fileno())
+    if durable:
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
     os.replace(temporary, target)
     return target, {"codec": "flac", "pcm_bytes": pcm_bytes, "pcm_sha256": pcm.hexdigest()}
 

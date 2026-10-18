@@ -5,6 +5,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordingError {
@@ -44,6 +48,13 @@ pub(crate) struct RecordingSinkSnapshot {
     pub(crate) bytes_written: u64,
     pub(crate) frames_written: u64,
     pub(crate) imu_samples_written: u64,
+    // Accepted records are distinct from completed writes. Checkpoint publication
+    // must gate on completed writes before syncing through a separate descriptor.
+    pub(crate) frames_indexed: u64,
+    pub(crate) imu_samples_indexed: u64,
+    pub(crate) index_pending_bytes: u64,
+    pub(crate) index_peak_bytes: u64,
+    pub(crate) index_max_write_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,6 +618,7 @@ impl RecordingSink {
             bytes_written: self.bytes_written,
             frames_written: self.frames_written,
             imu_samples_written: self.imu_samples_written,
+            ..self.snapshot()
         })
     }
 
@@ -616,6 +628,20 @@ impl RecordingSink {
             bytes_written: self.bytes_written,
             frames_written: self.frames_written,
             imu_samples_written: self.imu_samples_written,
+            frames_indexed: self.frames.progress.records.load(Ordering::Acquire),
+            imu_samples_indexed: self.imu.progress.records.load(Ordering::Acquire),
+            index_pending_bytes: (self.frames.progress.pending.load(Ordering::Relaxed)
+                + self.imu.progress.pending.load(Ordering::Relaxed))
+                as u64,
+            index_peak_bytes: (self.frames.progress.peak.load(Ordering::Relaxed)
+                + self.imu.progress.peak.load(Ordering::Relaxed))
+                as u64,
+            index_max_write_ns: self
+                .frames
+                .progress
+                .max_write_ns
+                .load(Ordering::Relaxed)
+                .max(self.imu.progress.max_write_ns.load(Ordering::Relaxed)),
         }
     }
 
@@ -637,10 +663,26 @@ impl RecordingSink {
     }
 }
 
+// Bounds include the in-flight write, so a stalled disk cannot grow memory
+// without limit. Each artifact has its own worker: IMU IO cannot hold up frames.
+const INDEX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const INDEX_PENDING_RECORDS: usize = 16_384;
+
+#[derive(Default)]
+struct IndexProgress {
+    records: AtomicU64,
+    pending: AtomicUsize,
+    peak: AtomicUsize,
+    max_write_ns: AtomicU64,
+    error: Mutex<Option<RecordingError>>,
+}
+
 struct ArtifactWriter {
     role: &'static str,
     relative_path: &'static str,
-    file: Option<File>,
+    sender: Option<mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<JoinHandle<Result<File, RecordingError>>>,
+    progress: Arc<IndexProgress>,
     hasher: Sha256,
     bytes: u64,
 }
@@ -673,28 +715,96 @@ impl ArtifactWriter {
                     format!("open {} failed: {}", relative_path, error),
                 )
             })?;
+        Self::with_writer(file, role, relative_path, |file, payload| {
+            file.write_all(payload)
+        })
+    }
+
+    fn with_writer(
+        mut file: File,
+        role: &'static str,
+        relative_path: &'static str,
+        mut write: impl FnMut(&mut File, &[u8]) -> std::io::Result<()> + Send + 'static,
+    ) -> Result<Self, RecordingError> {
+        let progress = Arc::new(IndexProgress::default());
+        let state = Arc::clone(&progress);
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(INDEX_PENDING_RECORDS);
+        let worker = thread::Builder::new()
+            .name(format!("index-{role}"))
+            .spawn(move || {
+                for payload in receiver {
+                    let started = Instant::now();
+                    let result = write(&mut file, &payload);
+                    state.max_write_ns.fetch_max(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                    state.pending.fetch_sub(payload.len(), Ordering::AcqRel);
+                    if let Err(error) = result {
+                        let error = RecordingError::new(
+                            "write_failed",
+                            format!("write {relative_path} failed: {error}"),
+                        );
+                        *state.error.lock().unwrap() = Some(error.clone());
+                        return Err(error);
+                    }
+                    state.records.fetch_add(1, Ordering::Release);
+                }
+                Ok(file)
+            })
+            .map_err(|error| {
+                RecordingError::new("write_failed", format!("start index writer: {error}"))
+            })?;
         Ok(Self {
             role,
             relative_path,
-            file: Some(file),
+            sender: Some(sender),
+            worker: Some(worker),
+            progress,
             hasher: Sha256::new(),
             bytes: 0,
         })
     }
 
+    fn check(&self) -> Result<(), RecordingError> {
+        match self.progress.error.lock().unwrap().as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn write(&mut self, payload: &[u8]) -> Result<u64, RecordingError> {
         let written = u64::try_from(payload.len())
             .map_err(|_| RecordingError::new("write_failed", "payload too large"))?;
-        let file = self
-            .file
-            .as_mut()
+        self.check()?;
+        let sender = self
+            .sender
+            .as_ref()
             .ok_or_else(|| RecordingError::new("invalid_state", "artifact writer is closed"))?;
-        file.write_all(payload).map_err(|error| {
-            RecordingError::new(
+        let previous = self
+            .progress
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(payload.len())
+                    .filter(|total| *total <= INDEX_PENDING_BYTES)
+            })
+            .map_err(|_| {
+                RecordingError::new("write_failed", "index writer byte backlog exhausted")
+            })?;
+        self.progress
+            .peak
+            .fetch_max(previous + payload.len(), Ordering::Relaxed);
+        if sender.try_send(payload.to_vec()).is_err() {
+            self.progress
+                .pending
+                .fetch_sub(payload.len(), Ordering::AcqRel);
+            self.check()?;
+            return Err(RecordingError::new(
                 "write_failed",
-                format!("write {} failed: {}", self.relative_path, error),
-            )
-        })?;
+                "index writer queue full or disconnected",
+            ));
+        }
         self.hasher.update(payload);
         self.bytes = self
             .bytes
@@ -704,10 +814,14 @@ impl ArtifactWriter {
     }
 
     fn flush_and_close(&mut self) -> Result<ArtifactSnapshot, RecordingError> {
-        let mut file = self
-            .file
+        self.sender.take();
+        let worker = self
+            .worker
             .take()
             .ok_or_else(|| RecordingError::new("invalid_state", "artifact writer is closed"))?;
+        let mut file = worker
+            .join()
+            .map_err(|_| RecordingError::new("write_failed", "index writer panicked"))??;
         file.flush().map_err(|error| {
             RecordingError::new(
                 "write_failed",
@@ -762,7 +876,21 @@ impl ArtifactWriter {
     }
 
     fn close(&mut self) {
-        let _ = self.file.take();
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            // Drain before recovery can inspect/rename files. Never detach an
+            // outstanding writer, even when another artifact already failed.
+            if worker.join().is_err() {
+                *self.progress.error.lock().unwrap() =
+                    Some(RecordingError::new("write_failed", "index writer panicked"));
+            }
+        }
+    }
+}
+
+impl Drop for ArtifactWriter {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1293,6 +1421,105 @@ mod tests {
         assert_eq!(final_snapshot.frames_written, 1);
         assert_eq!(final_snapshot.imu_samples_written, 1);
         assert_eq!(final_snapshot.bytes_written, frame_bytes + imu_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn blocked_imu_writer_does_not_block_frame_acceptance_or_claim_completion() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = temp_root("async-isolation");
+        let mut sink = RecordingSink::create(&root, "session").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        sink.imu = super::ArtifactWriter::with_writer(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("imu.ndjson"))
+                .unwrap(),
+            "imu.samples",
+            "imu.ndjson",
+            move |file, payload| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(std::io::Error::other)?;
+                file.write_all(payload)
+            },
+        )
+        .unwrap();
+        sink.imu.write(b"imu\n").unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        sink.write_split_frame_index(0, 0, 123, 0, 0).unwrap();
+        let pending = sink.snapshot();
+        release_tx.send(()).unwrap();
+        assert_eq!(pending.frames_written, 1);
+        assert_eq!(pending.imu_samples_indexed, 0);
+        assert!(pending.index_pending_bytes >= 4);
+        let final_state = sink.flush_and_close().unwrap();
+        assert_eq!(final_state.frames_indexed, 1);
+        assert_eq!(final_state.imu_samples_indexed, 1);
+        assert_eq!(final_state.index_pending_bytes, 0);
+        assert_eq!(fs::read(root.join("imu.ndjson")).unwrap(), b"imu\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_index_write_failure_prevents_successful_seal() {
+        let root = temp_root("async-error");
+        let mut writer = super::ArtifactWriter::with_writer(
+            fs::File::create(root.join("frames.ndjson")).unwrap(),
+            "frames.index",
+            "frames.ndjson",
+            |_, _| Err(std::io::Error::other("injected disk error")),
+        )
+        .unwrap();
+        writer.write(b"frame\n").unwrap();
+        let error = writer.flush_and_close().unwrap_err();
+        assert!(error.message.contains("injected disk error"));
+        assert_eq!(
+            writer
+                .progress
+                .records
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_pending_byte_limit_includes_inflight_write_and_drains_on_close() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = temp_root("async-bound");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut writer = super::ArtifactWriter::with_writer(
+            fs::File::create(root.join("frames.ndjson")).unwrap(),
+            "frames.index",
+            "frames.ndjson",
+            move |file, payload| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(std::io::Error::other)?;
+                file.write_all(payload)
+            },
+        )
+        .unwrap();
+        writer
+            .write(&vec![b'x'; super::INDEX_PENDING_BYTES])
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let rejected = writer.write(b"extra");
+        release_tx.send(()).unwrap();
+        assert!(rejected.unwrap_err().message.contains("backlog exhausted"));
+        writer.close();
+        assert_eq!(
+            fs::metadata(root.join("frames.ndjson")).unwrap().len(),
+            super::INDEX_PENDING_BYTES as u64
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

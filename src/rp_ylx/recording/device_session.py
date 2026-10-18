@@ -1174,41 +1174,44 @@ class DeviceSessionRecorder:
             if encoder is None:
                 return
             closed = encoder.segments
+        harvested_before = self._harvested_segments
         while self._harvested_segments < len(closed):
             segment = closed[self._harvested_segments]
             if transaction is not None:
-                available = transaction.snapshot()["sink"]["frames_written"]
+                available = transaction.snapshot()["sink"]["frames_indexed"]
             else:
                 available = self._frames_written
             if available < segment.end_frame:
                 # The helper can announce completion before the last index
                 # write returns. Commit only after that frame has an index.
-                return
+                break
             self._segment_records.append(self._segment_record(segment))
             self._harvested_segments += 1
-            # Commit each pair independently. Index files are append-only; sync
-            # them through separate descriptors so a slow flush never holds the
-            # capture sink mutex. Recovery still verifies the indexed prefix.
-            for relative in ("frames.ndjson", "imu.ndjson"):
-                stream = self._files.get(
-                    "frames.index" if relative == "frames.ndjson" else "imu.samples"
-                )
-                if stream is not None and not stream.closed:
-                    stream.flush()
-                descriptor = os.open(self._partial / relative, os.O_RDONLY | os.O_NOFOLLOW)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            write_json_atomic(
-                self._partial / "segments.json",
-                {
-                    "schema": "openaria.segment-checkpoint.v1",
-                    "session_id": self._plan.session_id,
-                    "segments": self._segment_records,
-                    "diagnostics": self._capture_diagnostics(),
-                },
+        # Publish the eligible contiguous batch in one durable checkpoint.
+        # Replaying several fsync barriers per already-closed pair magnifies
+        # IO stalls while catching up. Never include an frame still queued for indexing.
+        if self._harvested_segments == harvested_before:
+            return
+        for relative in ("frames.ndjson", "imu.ndjson"):
+            stream = self._files.get(
+                "frames.index" if relative == "frames.ndjson" else "imu.samples"
             )
+            if stream is not None and not stream.closed:
+                stream.flush()
+            descriptor = os.open(self._partial / relative, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        write_json_atomic(
+            self._partial / "segments.json",
+            {
+                "schema": "openaria.segment-checkpoint.v1",
+                "session_id": self._plan.session_id,
+                "segments": self._segment_records,
+                "diagnostics": self._capture_diagnostics(),
+            },
+        )
 
     def _segment_record(self, segment: ClosedSegment) -> dict[str, object]:
         artifacts: dict[str, object] = {}
@@ -1582,7 +1585,21 @@ class DeviceSessionRecorder:
             result["capture"] = asdict(self._metrics.snapshot())
         if self._native_transaction is not None:
             try:
-                result["encoder"] = self._native_transaction.snapshot().get("encoder_stats", {})
+                snapshot = self._native_transaction.snapshot()
+                result["encoder"] = snapshot.get("encoder_stats", {})
+                sink = snapshot.get("sink", {})
+                result["index_writer"] = {
+                    name: sink.get(name)
+                    for name in (
+                        "frames_written",
+                        "frames_indexed",
+                        "imu_samples_written",
+                        "imu_samples_indexed",
+                        "index_pending_bytes",
+                        "index_peak_bytes",
+                        "index_max_write_ns",
+                    )
+                }
             except Exception as error:
                 result["snapshot_error"] = str(error)
         elif self._encoder is not None:

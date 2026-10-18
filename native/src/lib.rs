@@ -1074,6 +1074,11 @@ fn recording_sink_snapshot_dict(
     value.set_item("bytes_written", snapshot.bytes_written)?;
     value.set_item("frames_written", snapshot.frames_written)?;
     value.set_item("imu_samples_written", snapshot.imu_samples_written)?;
+    value.set_item("frames_indexed", snapshot.frames_indexed)?;
+    value.set_item("imu_samples_indexed", snapshot.imu_samples_indexed)?;
+    value.set_item("index_pending_bytes", snapshot.index_pending_bytes)?;
+    value.set_item("index_peak_bytes", snapshot.index_peak_bytes)?;
+    value.set_item("index_max_write_ns", snapshot.index_max_write_ns)?;
     let artifacts = PyDict::new(py);
     for artifact in &snapshot.artifacts {
         let item = PyDict::new(py);

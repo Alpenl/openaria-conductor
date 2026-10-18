@@ -37,6 +37,11 @@ class PreparedArtifact:
             raise ValueError("source changed after incremental lossless compaction")
         if not self.output.unchanged(self.target):
             raise ValueError("incremental compacted output changed")
+        if path.suffix == ".wav":
+            with self.target.open("rb") as stream:
+                if identity(os.fstat(stream.fileno())) != self.output.identity:
+                    raise ValueError("prepared audio replaced before durable admission")
+                os.fsync(stream.fileno())
         return self.target, self.compression, descriptor["path"], path.suffix == ".wav"
 
 
@@ -162,7 +167,10 @@ class LiveSealing:
                 continue
             source_path = self.root / path
             original = _read_back(source_path)
-            target, compression = compact_audio(source_path)
+            # WAV + its recovery checkpoint are already durable. This derived
+            # cache is synced on admission after capture stops, not in parallel
+            # with the acquisition commit worker on the same microSD.
+            target, compression = compact_audio(source_path, durable=False)
             if not original.unchanged(source_path):
                 raise ValueError("audio changed during incremental compaction")
             self.prepared[relative] = PreparedArtifact(
