@@ -23,6 +23,7 @@ from typing import Literal
 from jsonschema import Draft202012Validator, FormatChecker, validators
 from jsonschema.exceptions import ValidationError
 
+from rp_ylx.api.schema_validation import validate_manifest_schema
 from rp_ylx.audio_clock import audio_clock_report
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
@@ -1192,7 +1193,7 @@ def iter_device_session_v1_artifacts(
 
 def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
     try:
-        _DEVICE_SESSION_V1_VALIDATOR.validate(manifest)
+        validate_manifest_schema(_DEVICE_SESSION_V1_VALIDATOR, manifest)
     except ValidationError as error:
         raise ArtifactAccessError(
             "not_verified", "manifest 不符合 device-session v1 契约"
@@ -1203,7 +1204,7 @@ def _validate_device_session_v1(manifest: Mapping[str, object]) -> None:
 
 def _validate_device_session_v2(manifest: Mapping[str, object]) -> None:
     try:
-        _DEVICE_SESSION_V2_VALIDATOR.validate(manifest)
+        validate_manifest_schema(_DEVICE_SESSION_V2_VALIDATOR, manifest)
     except ValidationError as error:
         raise ArtifactAccessError(
             "not_verified", "manifest 不符合 device-session v2 契约"
@@ -1227,7 +1228,7 @@ def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
                 if schema == _DEVICE_SESSION_V4_SCHEMA_ID
                 else _DEVICE_SESSION_V3_VALIDATOR
             )
-            validator.validate(manifest)
+            validate_manifest_schema(validator, manifest)
         except ValidationError as error:
             raise ArtifactAccessError(
                 "not_verified", "manifest 不符合 device-session v3 契约"

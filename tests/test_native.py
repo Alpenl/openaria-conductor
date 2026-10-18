@@ -386,6 +386,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 "NativeMultipartPreview",
                 "NativePerformanceMetrics",
                 "NativePreviewBuffer",
+                "NativeSchemaValidator",
                 "NativeSessionStore",
                 "NativeSessionTransaction",
                 "NativeSplitter",

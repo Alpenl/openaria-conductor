@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+jsonschema = { version = "0.50.0", default-features = false }
 libloading = "0.8.9"
 libc = "0.2.189"
 pyo3 = { version = "0.25.1", features = ["abi3-py311"] }

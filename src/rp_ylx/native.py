@@ -6,6 +6,7 @@ import importlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from types import ModuleType
 from typing import Protocol, cast
 
@@ -305,6 +306,22 @@ def _require_native_feature(
     if feature not in _validate_capabilities(module).features:
         raise NativeModuleError(unavailable_code, missing_message)
     return module
+
+
+class NativeSchemaValidator(Protocol):
+    def is_valid(self, payload: str) -> bool: ...
+
+
+@lru_cache(maxsize=4)
+def native_schema_validator_or_none(schema_json: str) -> NativeSchemaValidator | None:
+    """Compile only trusted bundled schemas; missing/older modules use Python."""
+    try:
+        module = _require_native_feature(
+            "schema_validation", "native_schema_unavailable", "清单校验模块", "缺少清单校验能力"
+        )
+        return module.NativeSchemaValidator(schema_json)
+    except Exception:
+        return None
 
 
 def _parse_native_error(exc: Exception, fallback_code: str) -> NativeModuleError:

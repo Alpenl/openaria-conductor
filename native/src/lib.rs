@@ -10,6 +10,7 @@ mod metrics;
 mod native_camera;
 mod preview;
 mod recording;
+mod schema_validation;
 mod session_io;
 mod session_store;
 mod stereo_encoder;
@@ -31,6 +32,7 @@ const V4L2_FOCUS_CONTROL: &str = "v4l2_focus_control";
 const CAPTURE_ENGINE: &str = "capture_engine";
 const NATIVE_AUDIO: &str = "native_audio";
 const SESSION_STORE: &str = "session_store";
+const SCHEMA_VALIDATION: &str = "schema_validation";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
 
@@ -944,6 +946,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
         JPEG_CONTRACT,
         FRAME_STREAM,
         SESSION_STORE,
+        SCHEMA_VALIDATION,
         PREVIEW_BUFFER,
         PERFORMANCE_METRICS,
         V4L2_FOCUS_CONTROL,
@@ -1354,6 +1357,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSplitter>()?;
     module.add_class::<NativeCaptureEngine>()?;
     module.add_class::<NativeSessionStore>()?;
+    module.add_class::<schema_validation::NativeSchemaValidator>()?;
     module.add_class::<NativeSessionTransaction>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;
