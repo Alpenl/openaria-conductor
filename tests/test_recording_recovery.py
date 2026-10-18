@@ -22,11 +22,67 @@ from rp_ylx.recording.device_session import (
     validate_device_session_directory,
     write_json_atomic,
 )
-from rp_ylx.recording.recovery import _frames, recover_device_session
+from rp_ylx.recording.recovery import _frames, _write_records, recover_device_session
 from tests import test_split_eye_recording as fixtures
 
 
 class RecordingRecoveryTests(unittest.TestCase):
+    def test_failed_imu_spool_preserves_prior_output_and_releases_temporary_space(self):
+        for failure in ("iterator", "interrupt", "short_write", "fsync", "replace"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "imu.ndjson"
+                prior = b"prior verified derived index\n"
+                path.write_bytes(prior)
+                rows = [{"sample": index} for index in range(8)]
+                fdopen = os.fdopen
+
+                class ShortOutput:
+                    def __init__(self, descriptor, mode, opener=fdopen):
+                        self.stream = opener(descriptor, mode)
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self.stream.close()
+
+                    def __getattr__(self, name):
+                        return getattr(self.stream, name)
+
+                    def write(self, payload):
+                        return self.stream.write(payload[:-1])
+
+                def interrupted_rows(items=rows, fault=failure):
+                    yield from items[:3]
+                    if fault == "interrupt":
+                        raise KeyboardInterrupt("cancelled")
+                    raise OSError("no space")
+
+                if failure in {"iterator", "interrupt"}:
+                    error_type = KeyboardInterrupt if failure == "interrupt" else OSError
+                    with self.assertRaises(error_type):
+                        _write_records(path, interrupted_rows())
+                else:
+                    target = {
+                        "short_write": "os.fdopen",
+                        "fsync": "os.fsync",
+                        "replace": "os.replace",
+                    }[failure]
+                    options = (
+                        {"new": ShortOutput}
+                        if failure == "short_write"
+                        else {"side_effect": OSError("storage failure")}
+                    )
+                    with (
+                        patch("rp_ylx.recording.recovery." + target, **options),
+                        self.assertRaises(OSError),
+                    ):
+                        _write_records(path, rows)
+                self.assertEqual(path.read_bytes(), prior)
+                self.assertEqual(list(path.parent.glob(".imu.ndjson.*.tmp")), [])
+                self.assertEqual(_write_records(path, iter(rows)), len(rows))
+                self.assertEqual(path.read_bytes(), b"".join(json_bytes(row) for row in rows))
+
     def recording(self, root, frames=32):
         recorder, _, _ = fixtures.SplitEyeRecordingTest().build(root)
         with patch.object(recorder, "_now", return_value=datetime.now(UTC) - timedelta(seconds=10)):

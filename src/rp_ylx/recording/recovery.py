@@ -78,16 +78,23 @@ def _artifact(root: Path, relative: str, role: str, media_type: str) -> dict:
 def _write_records(path: Path, records: Iterable[dict]) -> int:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
-    with os.fdopen(descriptor, "wb") as stream:
-        count = 0
-        for record in records:
-            stream.write(json_bytes(record))
-            count += 1
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    fsync_directory(path.parent)
-    return count
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            count = 0
+            for record in records:
+                payload = json_bytes(record)
+                if stream.write(payload) != len(payload):
+                    raise OSError("short recovery index write")
+                count += 1
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+        return count
+    finally:
+        # Long IMU indexes can be gigabytes. Failed retries must not accumulate
+        # private copies, and only a complete durable index replaces the prior one.
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
