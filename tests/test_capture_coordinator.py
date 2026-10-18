@@ -13,6 +13,7 @@ import unittest
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -3365,6 +3366,266 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(stopped[0].status, 202)
         finally:
             release_checkpoint.set()
+            coordinator.close()
+
+    def test_failure_recovery_and_durable_state_do_not_block_status_or_release_lease(self) -> None:
+        for stage in ("fail", "recovery", "state"):
+            with self.subTest(stage=stage):
+                self._check_failure_io_stage(stage)
+
+    def _check_failure_io_stage(self, stage):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        errors, stopped = [], []
+        threads = []
+        try:
+            coordinator.start_capture(start_command("fault-io-" + stage))
+            sid = self.active_session_id(coordinator)
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+
+            def gate():
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("blocked failure IO was not released")
+
+            original_fail = recorder.fail
+            original_write = coordinator._state_db.put_capture_state
+
+            def fail(*args, **kwargs):
+                # Model storage IO holding the recorder's own lock too.
+                with recorder._lock:
+                    gate()
+                return original_fail(*args, **kwargs)
+
+            def recover(*args, **kwargs):
+                gate()
+                return None
+
+            def write(value, *args):
+                if sid in value["retained"]:
+                    gate()
+                return original_write(value, *args)
+
+            def report():
+                try:
+                    coordinator._source_failure(generation, "encoder_failed", "test fault")
+                except BaseException as error:
+                    errors.append(error)
+
+            def stop():
+                try:
+                    stopped.append(coordinator.stop_capture(stop_command("fault-stop-" + stage)))
+                except BaseException as error:
+                    errors.append(error)
+
+            with ExitStack() as patches:
+                if stage == "fail":
+                    patches.enter_context(patch.object(recorder, "fail", side_effect=fail))
+                elif stage == "recovery":
+                    patches.enter_context(
+                        patch.object(recorder, "recover_completed_segments", return_value=None)
+                    )
+                    patches.enter_context(
+                        patch.object(
+                            coordinator_module,
+                            "recover_device_session",
+                            side_effect=recover,
+                        )
+                    )
+                else:
+                    patches.enter_context(
+                        patch.object(coordinator._state_db, "put_capture_state", side_effect=write)
+                    )
+                fault = threading.Thread(target=report)
+                threads.append(fault)
+                fault.start()
+                self.assertTrue(entered.wait(1))
+                before = time.monotonic()
+                status = coordinator.capture_status()
+                self.assertLess(time.monotonic() - before, 0.25)
+                validate_capture_status(status)
+                self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                self.assertGreater(coordinator.open_handle_count, 0)
+                self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                self.assert_network_operation_lock_held()
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("fault-new-" + stage))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                # Duplicates and stale callbacks must not recover a second time.
+                coordinator._source_failure(generation, "duplicate", "ignored")
+                coordinator._source_failure(str(uuid.uuid4()), "stale", "ignored")
+                stopper = threading.Thread(target=stop)
+                threads.append(stopper)
+                stopper.start()
+                time.sleep(0.02)
+                self.assertTrue(stopper.is_alive())
+                release.set()
+                for thread in threads:
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(stopped[0].status, 204)
+            replay = coordinator.stop_capture(stop_command("fault-stop-" + stage))
+            self.assertTrue(replay.replayed)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]
+            self.assertEqual(
+                retained["recording_state"]["diagnostics"][0]["code"], "encoder_failed"
+            )
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(4)
+            coordinator.close()
+
+    def test_source_failure_during_source_stop_is_owned_by_stop_without_callback_deadlock(self):
+        sources = FakeSources()
+        coordinator = self.coordinator(sources=sources)
+        try:
+            coordinator.start_capture(start_command("fault-from-stop"))
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+
+            def stop_with_callback():
+                callback = threading.Thread(
+                    target=lambda: coordinator._source_failure(
+                        generation, "encoder_failed", "source stopped after codec fault"
+                    )
+                )
+                callback.start()
+                callback.join(1)
+                self.assertFalse(callback.is_alive())
+                sources.open_handle_count = 0
+
+            with (
+                patch.object(sources, "stop", side_effect=stop_with_callback),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+                patch.object(recorder, "stop", wraps=recorder.stop) as stop,
+            ):
+                with self.assertRaises(ProviderError) as failure:
+                    coordinator.stop_capture(stop_command("fault-from-stop-end"))
+                self.assertEqual(failure.exception.code, "encoder_failed")
+                self.assertEqual(fail.call_count, 1)
+                stop.assert_not_called()
+            self.assertIsNone(coordinator._active)
+            self.assertIsNone(coordinator._stop_inflight)
+            self.assertIsNone(coordinator._failure_inflight)
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def test_close_waits_for_failure_owner_without_aborting_the_same_recorder(self):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        fault = closer = None
+        errors = []
+        try:
+            coordinator.start_capture(start_command("close-during-failure"))
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+            original = recorder.fail
+
+            def fail(*args, **kwargs):
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("failure not released")
+                return original(*args, **kwargs)
+
+            def report():
+                try:
+                    coordinator._source_failure(generation, "encoder_failed", "test")
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.object(recorder, "fail", side_effect=fail),
+                patch.object(recorder, "abort", wraps=recorder.abort) as abort,
+            ):
+                fault = threading.Thread(target=report)
+                fault.start()
+                self.assertTrue(entered.wait(1))
+                closer = threading.Thread(target=coordinator.close)
+                closer.start()
+                time.sleep(0.02)
+                self.assertTrue(closer.is_alive())
+                self.assert_network_operation_lock_held()
+                validate_capture_status(coordinator.capture_status())
+                release.set()
+                fault.join(3)
+                closer.join(3)
+                self.assertFalse(fault.is_alive())
+                self.assertFalse(closer.is_alive())
+                abort.assert_not_called()
+            self.assertEqual(errors, [])
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in (fault, closer):
+                if thread is not None:
+                    thread.join(4)
+            coordinator.close()
+
+    def test_old_source_callback_cannot_fail_new_take_on_same_mount_generation(self):
+        callbacks = []
+
+        class Sources(FakeSources):
+            def start(self, **kwargs):
+                callbacks.append(kwargs["on_failure"])
+                super().start(**kwargs)
+
+        coordinator = self.coordinator(sources=Sources())
+        try:
+            self.seal_one(coordinator, prefix="old-callback")
+            generation = coordinator.generation_id
+            coordinator.start_capture(start_command("new-callback-start"))
+            sid = self.active_session_id(coordinator)
+            self.assertEqual(coordinator.generation_id, generation)
+            callbacks[0]("encoder_failed", "late fault from previous take")
+            self.assertEqual(self.active_session_id(coordinator), sid)
+            self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "recording")
+        finally:
+            coordinator.close()
+
+    def test_delayed_state_snapshot_cannot_overwrite_newer_durable_revision(self):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        real_lock = threading.Lock()
+
+        class DelayedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "delayed-state-writer":
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("state write was not released")
+                real_lock.acquire()
+
+            def __exit__(self, *args):
+                real_lock.release()
+
+        thread = None
+        try:
+            with patch.object(coordinator, "_state_persist_lock", DelayedLock()):
+                coordinator._revision = 10
+                thread = threading.Thread(
+                    target=coordinator._persist_local_state, name="delayed-state-writer"
+                )
+                thread.start()
+                self.assertTrue(entered.wait(1))
+                coordinator._revision = 11
+                coordinator._persist_local_state()
+                release.set()
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(coordinator._read_local_state()["source_revision"], 11)
+        finally:
+            release.set()
+            if thread is not None:
+                thread.join(4)
             coordinator.close()
 
     def test_concurrent_same_stop_replays_after_inflight_stop_finishes(self) -> None:

@@ -598,6 +598,9 @@ class CaptureCoordinator:
         self._before_write = before_write
         self._lock = threading.RLock()
         self._stop_condition = threading.Condition(self._lock)
+        self._state_persist_lock = threading.Lock()
+        self._state_write_sequence = 0
+        self._state_persisted_sequence = 0
         self._storage_lock = threading.Lock()
         self._catalog_lock = threading.RLock()
         self._closing = False
@@ -619,6 +622,10 @@ class CaptureCoordinator:
         self._pending_safe_swap: dict[str, object] | None = None
         self._safe_swap_resource: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
+        self._failure_inflight: DeviceSessionRecorder | None = None
+        self._failure_projection: dict[str, object] | None = None
+        self._cached_active_state: Mapping[str, object] | None = None
+        self._pending_source_failure: DeviceRecordingError | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
         self._persisted_command_scopes: set[tuple[str, str, str]] = set()
         self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -659,6 +666,10 @@ class CaptureCoordinator:
     @property
     def open_handle_count(self) -> int:
         with self._lock:
+            if self._failure_inflight is not None:
+                # Recovery owns the volume even while individual handles close.
+                # Do not acquire the recorder lock while it waits for storage.
+                return 1 + self._open_representations
             recorder_handles = 0 if self._active is None else self._active.open_handle_count
             source_handles = 0 if self._sources is None else self._sources.open_handle_count
             return recorder_handles + source_handles + self._open_representations
@@ -808,6 +819,26 @@ class CaptureCoordinator:
                     )
 
     def _persist_local_state(self) -> None:
+        # Snapshot under the command lock, then write independently. Delayed
+        # older callbacks must never overwrite a newer durable command/state.
+        with self._lock:
+            sequence, value, commands, current_scopes = self._local_state_write()
+        with self._state_persist_lock:
+            if sequence <= self._state_persisted_sequence:
+                return
+            new_commands = [
+                item
+                for item in commands
+                if (item["principal_id"], item["operation"], item["idempotency_key"])
+                not in self._persisted_command_scopes
+            ]
+            self._state_db.put_capture_state(
+                value, new_commands, self._persisted_command_scopes - current_scopes
+            )
+            self._persisted_command_scopes = current_scopes
+            self._state_persisted_sequence = sequence
+
+    def _local_state_write(self):
         admission = self._admission
         if admission is not None:
             self._last_volume_binding = {
@@ -838,15 +869,23 @@ class CaptureCoordinator:
                     operation,
                     idempotency_key,
                 ), (canonical, result) in self._commands.items()
-                if (principal_id, operation, idempotency_key) not in self._persisted_command_scopes
             ],
         }
         commands = value.pop("commands")
         current_scopes = set(self._commands)
-        self._state_db.put_capture_state(
-            value, commands, self._persisted_command_scopes - current_scopes
+        self._state_write_sequence += 1
+        return (
+            self._state_write_sequence,
+            copy.deepcopy(value),
+            copy.deepcopy(commands),
+            current_scopes,
         )
-        self._persisted_command_scopes = current_scopes
+
+    def _recording_state_changed(self, plan: SessionPlan, state: Mapping[str, object]) -> None:
+        with self._lock:
+            if self._active_plan is plan:
+                self._cached_active_state = copy.deepcopy(state)
+        self._persist_local_state()
 
     def _next_revision(self) -> int:
         with self._lock:
@@ -1491,7 +1530,11 @@ class CaptureCoordinator:
             with suppress(DeviceRecordingError):
                 self._require_admission()
         if self._active is not None:
-            recording_state = self._active.current_recording_state
+            recording_state = (
+                copy.deepcopy(self._failure_projection)
+                if self._failure_projection is not None
+                else self._active.current_recording_state
+            )
             if recording_state is None:
                 return self._revision, "blocked", None, None
             state = str(recording_state["state"])
@@ -1724,6 +1767,7 @@ class CaptureCoordinator:
                 if (
                     (
                         active is None
+                        or self._failure_inflight is not None
                         or (self._active is not None and self._active.state == "sealed")
                     )
                     and runtime["live_imu"] is not None
@@ -2268,6 +2312,8 @@ class CaptureCoordinator:
                     status=HTTPStatus.CONFLICT,
                 )
             return CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
+        if self._failure_inflight is not None or self._closing:
+            raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
         result = execute()
         self._commands[scope] = (command.canonical_body, copy.deepcopy(result))
         while len(self._commands) > 1024:
@@ -2405,7 +2451,7 @@ class CaptureCoordinator:
             authority_epoch=self._authority_epoch,
             allocate_revision=self._next_revision,
             storage_status=lambda: self._check_generation(plan.generation_id),
-            state_sink=lambda state: self._persist_local_state(),
+            state_sink=lambda state: self._recording_state_changed(plan, state),
             queue_capacity=self._config.queue_capacity,
             enqueue_timeout=self._config.enqueue_timeout,
             checkpoint_interval=self._config.checkpoint_interval,
@@ -2415,6 +2461,8 @@ class CaptureCoordinator:
         )
         self._active = recorder
         self._active_plan = plan
+        self._cached_active_state = None
+        self._pending_source_failure = None
         self._latest_imu = None
         self._safe_swap_resource = None
         self._pending_safe_swap = None
@@ -2440,6 +2488,7 @@ class CaptureCoordinator:
                         plan.generation_id,
                         code,
                         message,
+                        expected_plan=plan,
                     ),
                     native_recorder=recorder,
                 )
@@ -2467,20 +2516,34 @@ class CaptureCoordinator:
         self._persist_local_state()
         return CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
 
-    def _source_failure(self, generation_id: str, code: str, message: str) -> None:
+    def _source_failure(
+        self,
+        generation_id: str,
+        code: str,
+        message: str,
+        *,
+        expected_plan: SessionPlan | None = None,
+    ) -> None:
         with self._lock:
             if (
                 self._active is None
                 or self._active_plan is None
                 or self._active_plan.generation_id != generation_id
+                or (expected_plan is not None and self._active_plan is not expected_plan)
             ):
                 return
-            self._retain_active_failure(DeviceRecordingError(code, message))
+            plan = self._active_plan
+        self._retain_active_failure(DeviceRecordingError(code, message), plan)
 
     def enforce_storage_reserve(self) -> None:
         """Stop normally before exhausting the finalization reserve; never from a source thread."""
         with self._lock:
-            if self._active_plan is None or self._closing or self._stop_inflight is not None:
+            if (
+                self._active_plan is None
+                or self._closing
+                or self._stop_inflight is not None
+                or self._failure_inflight is not None
+            ):
                 return
             session_id = self._active_plan.session_id
             self._check_generation(self._active_plan.generation_id, force=True)
@@ -2525,7 +2588,7 @@ class CaptureCoordinator:
                     return CaptureCommandResult(
                         result.status, copy.deepcopy(result.body), replayed=True
                     )
-                if self._stop_inflight is None:
+                if self._stop_inflight is None and self._failure_inflight is None:
                     break
                 self._stop_condition.wait()
             if self._admission is None:
@@ -2556,13 +2619,11 @@ class CaptureCoordinator:
                 try:
                     self._sources.stop()
                 except BaseException as error:
-                    with self._lock:
-                        if self._active is recorder:
-                            failure = DeviceRecordingError(
-                                "source_stop_failed",
-                                f"采集来源未能释放：{error}",
-                            )
-                            self._retain_active_failure(failure)
+                    failure = DeviceRecordingError(
+                        "source_stop_failed",
+                        f"采集来源未能释放：{error}",
+                    )
+                    self._retain_active_failure(failure, plan, from_stop=True)
                     raise ProviderError(
                         "source_stop_failed",
                         f"采集来源未能释放：{error}",
@@ -2578,6 +2639,10 @@ class CaptureCoordinator:
             )
 
             try:
+                with self._lock:
+                    pending_failure = self._pending_source_failure
+                if pending_failure is not None:
+                    raise pending_failure
                 sealed = recorder.stop(
                     before_publish=lambda: self._check_generation(
                         plan.generation_id,
@@ -2585,9 +2650,7 @@ class CaptureCoordinator:
                     )
                 )
             except DeviceRecordingError as error:
-                with self._lock:
-                    if self._active is recorder:
-                        self._retain_active_failure(error)
+                self._retain_active_failure(error, plan, from_stop=True)
                 raise ProviderError(
                     error.code, error.message, status=HTTPStatus.CONFLICT
                 ) from error
@@ -2614,6 +2677,8 @@ class CaptureCoordinator:
             )
 
             with self._lock:
+                if self._pending_source_failure is not None:
+                    raise self._pending_source_failure
                 if self._active is not recorder:
                     raise ProviderError(
                         "capture_state_changed",
@@ -2674,10 +2739,14 @@ class CaptureCoordinator:
                 self._remember_command(scope, command, result)
                 self._release_network_operation_lease()
                 return result
+        except DeviceRecordingError as error:
+            self._retain_active_failure(error, plan, from_stop=True)
+            raise ProviderError(error.code, error.message, status=HTTPStatus.CONFLICT) from error
         finally:
             with self._stop_condition:
                 if self._stop_inflight == scope:
                     self._stop_inflight = None
+                    self._pending_source_failure = None
                 if self._active is None:
                     self._release_network_operation_lease()
                 self._stop_condition.notify_all()
@@ -2697,11 +2766,41 @@ class CaptureCoordinator:
             self._commands.pop(next(iter(self._commands)))
         self._persist_local_state()
 
-    def _retain_active_failure(self, error: DeviceRecordingError) -> None:
-        recorder = self._active
-        plan = self._active_plan
-        if recorder is None or plan is None:
-            return
+    def _retain_active_failure(
+        self, error: DeviceRecordingError, plan: SessionPlan | None, *, from_stop: bool = False
+    ) -> None:
+        with self._stop_condition:
+            recorder = self._active
+            if recorder is None or plan is None or self._active_plan is not plan:
+                return
+            if self._failure_inflight is not None:
+                return
+            if self._stop_inflight is not None and not from_stop:
+                # stop() may join this callback's source thread. Its owner will
+                # handle the failure; never wait for that owner from here.
+                self._pending_source_failure = self._pending_source_failure or error
+                return
+            error = self._pending_source_failure or error
+            self._pending_source_failure = None
+            projection = copy.deepcopy(self._cached_active_state)
+            if projection is None:
+                projection = dict(self._local_failure_state(plan, error, media_lost=False))
+            projection["state"] = "finalizing"
+            projection["state_revision"] = self._next_revision()
+            projection["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            self._failure_projection = projection
+            self._failure_inflight = recorder
+        try:
+            self._finish_active_failure(recorder, plan, error)
+        finally:
+            with self._stop_condition:
+                self._failure_inflight = None
+                self._failure_projection = None
+                self._stop_condition.notify_all()
+
+    def _finish_active_failure(
+        self, recorder: DeviceSessionRecorder, plan: SessionPlan, error: DeviceRecordingError
+    ) -> None:
         if not self._sources_keep_preview():
             self._preview.clear()
         media_lost = error.code == "media_lost"
@@ -2712,24 +2811,37 @@ class CaptureCoordinator:
             media_lost=media_lost,
         )
         state = recorder.current_recording_state
-        if state is None or state.get("state") not in {"recoverable", "failed", "abandoned"}:
-            state = self._local_failure_state(plan, error, media_lost=media_lost)
-        self._retained[plan.session_id] = {
-            "generation_id": plan.generation_id,
-            "recording_state": copy.deepcopy(state),
-        }
-        if not media_lost:
-            if recorder.recovered_session is not None:
-                self._verified[plan.session_id] = recorder.recovered_session.manifest_sha256
-                self._record_saved_prefix(plan.session_id, recorder.recovered_session.manifest)
-            elif recorder.partial_path.is_dir():
-                self._recover_completed_prefix(recorder.partial_path, plan.session_id)
-        self._active = None
-        self._active_plan = None
-        self._latest_imu = None
+        recovered = recorder.recovered_session
+        if not media_lost and recovered is None and recorder.partial_path.is_dir():
+            with suppress(
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                DeviceRecordingError,
+                ArtifactAccessError,
+            ):
+                recovered = recover_device_session(recorder.partial_path)
+        with self._lock:
+            if state is None or state.get("state") not in {"recoverable", "failed", "abandoned"}:
+                state = self._local_failure_state(plan, error, media_lost=media_lost)
+            self._retained[plan.session_id] = {
+                "generation_id": plan.generation_id,
+                "recording_state": copy.deepcopy(state),
+            }
+            if not media_lost and recovered is not None:
+                self._verified[plan.session_id] = recovered.manifest_sha256
+                self._record_saved_prefix(plan.session_id, recovered.manifest)
+        # Active/lease remain reserved until the durable state is committed.
+        # Status uses the finalizing projection while recovery and SQLite wait.
         self._persist_local_state()
-        if self._stop_inflight is None:
-            self._release_network_operation_lease()
+        with self._lock:
+            self._active = None
+            self._active_plan = None
+            self._cached_active_state = None
+            self._latest_imu = None
+            if self._stop_inflight is None:
+                self._release_network_operation_lease()
 
     def _local_failure_state(
         self,
@@ -2798,6 +2910,8 @@ class CaptureCoordinator:
         with self._lock:
             if self._active is None:
                 raise DeviceRecordingError("invalid_state", "当前没有活动录制")
+            if self._failure_inflight is not None:
+                raise DeviceRecordingError("invalid_state", "录制正在收尾")
             try:
                 self._check_generation(generation_id or self._active_plan.generation_id)
                 accepted = self._active.submit_frame(observation)
@@ -2814,9 +2928,8 @@ class CaptureCoordinator:
         if self._sources is not None:
             with suppress(BaseException):
                 self._sources.stop()
-        with self._lock:
-            if self._active_plan is active_plan and failure is not None:
-                self._retain_active_failure(failure)
+        if failure is not None:
+            self._retain_active_failure(failure, active_plan)
         assert failure is not None
         raise failure
 
@@ -2844,6 +2957,8 @@ class CaptureCoordinator:
         with self._lock:
             if self._active is None:
                 raise DeviceRecordingError("invalid_state", "当前没有活动录制")
+            if self._failure_inflight is not None:
+                raise DeviceRecordingError("invalid_state", "录制正在收尾")
             try:
                 self._check_generation(generation_id or self._active_plan.generation_id)
                 accepted = self._active.submit_imu(observation)
@@ -2862,9 +2977,8 @@ class CaptureCoordinator:
         if self._sources is not None:
             with suppress(BaseException):
                 self._sources.stop()
-        with self._lock:
-            if self._active_plan is active_plan and failure is not None:
-                self._retain_active_failure(failure)
+        if failure is not None:
+            self._retain_active_failure(failure, active_plan)
         assert failure is not None
         raise failure
 
@@ -2880,10 +2994,8 @@ class CaptureCoordinator:
         if self._sources is not None:
             with suppress(BaseException):
                 self._sources.stop()
-        with self._lock:
-            if self._active_plan is active_plan:
-                error = DeviceRecordingError("media_lost", "录制介质在安全交接前被移除")
-                self._retain_active_failure(error)
+        error = DeviceRecordingError("media_lost", "录制介质在安全交接前被移除")
+        self._retain_active_failure(error, active_plan)
 
     def _publish_safe_swap(self) -> None:
         if self._pending_safe_swap is None:
@@ -2934,6 +3046,8 @@ class CaptureCoordinator:
 
     def artifact_io_state(self) -> str | None:
         with self._lock:
+            if self._failure_inflight is not None:
+                return "finalizing"
             if self._active is not None:
                 return self._active.state
             if self._released or self._pending_safe_swap is not None:
@@ -3111,6 +3225,10 @@ class CaptureCoordinator:
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
         with self._lock:
+            if self._active_plan is not None and self._active_plan.session_id == session_id:
+                # The failure owner publishes the outcome only after recovery
+                # and its durable coordinator state have both completed.
+                return None
             outcome = self._retained.get(session_id)
             if outcome is None:
                 return None
@@ -3285,7 +3403,8 @@ class CaptureCoordinator:
             ) from error
 
     def close(self) -> None:
-        self._closing = True
+        with self._stop_condition:
+            self._closing = True
         if self._sources is not None:
             close_sources = getattr(self._sources, "close", None)
             if callable(close_sources):
@@ -3295,7 +3414,9 @@ class CaptureCoordinator:
                 with suppress(BaseException):
                     self._sources.stop()
         self._preview.clear()
-        with self._lock:
+        with self._stop_condition:
+            while self._failure_inflight is not None or self._stop_inflight is not None:
+                self._stop_condition.wait()
             try:
                 if self._active is not None:
                     self._active.abort()
