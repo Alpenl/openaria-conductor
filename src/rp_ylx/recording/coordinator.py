@@ -1545,6 +1545,22 @@ class CaptureCoordinator:
             if recording_state is None:
                 return self._revision, "blocked", None, None
             if self._failure_projection is None:
+                # Recording state is persisted only at lifecycle checkpoints.
+                # Project the latest background capacity observation just like
+                # live frame progress; a status request must not perform disk I/O.
+                if recording_state["state"] == "recording":
+                    with self._storage_lock:
+                        storage = self._storage_cache
+                    if storage is not None:
+                        recording_state = {
+                            **recording_state,
+                            "storage": {
+                                **recording_state["storage"],
+                                "remaining_bytes": storage.remaining_bytes,
+                                "status": storage.status,
+                                "writable": storage.writable,
+                            },
+                        }
                 # Native progress advances between durable state callbacks.
                 # Preserve the last observed live progress for lock-free recovery.
                 self._cached_active_state = copy.deepcopy(recording_state)

@@ -1114,6 +1114,35 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_live_storage_uses_latest_monitor_sample_without_query_io(self):
+        coordinator = self.coordinator()
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity", return_value=(1000, 800, 1000)
+            ):
+                coordinator.start_capture(start_command("live-storage"))
+            before = coordinator.capture_status()["snapshot"]["active_recording"]["recording_state"]
+            self.assertEqual(before["storage"]["remaining_bytes"], 800)
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity", return_value=(1000, 500, 1000)
+            ):
+                coordinator.enforce_storage_reserve()
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity",
+                side_effect=AssertionError("status queries must not probe the filesystem"),
+            ):
+                status = coordinator.capture_status()
+                validate_capture_status(status)
+                after = status["snapshot"]["active_recording"]["recording_state"]
+                self.assertEqual(after["storage"]["remaining_bytes"], 500)
+                self.assertEqual(after["storage"]["volume_id"], self.volume_id)
+                # A subsequent projection must not mutate a previously returned response.
+                self.assertEqual(before["storage"]["remaining_bytes"], 800)
+                _, _, progress = coordinator.capture_recording_progress()
+                self.assertEqual(progress["storage"]["remaining_bytes"], 500)
+        finally:
+            coordinator.close()
+
     def test_storage_reserve_stops_and_seals_active_recording(self):
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
         try:
