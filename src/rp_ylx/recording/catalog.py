@@ -9,7 +9,8 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from itertools import groupby
 from pathlib import Path
 
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
@@ -188,30 +189,70 @@ class SessionCatalog(StateDatabase):
         if directory is not None and key not in self._admitted:
             with self.connection() as db:
                 artifacts = db.execute(
-                    "SELECT path,bytes FROM artifacts WHERE volume=? AND session=?",
+                    "SELECT path,bytes FROM artifacts WHERE volume=? AND session=? ORDER BY path",
                     (volume, session),
                 ).fetchall()
-            for relative, expected_bytes in artifacts:
-                path = Path(relative)
-                if path.is_absolute() or ".." in path.parts:
-                    raise OSError("invalid indexed artifact path")
-                current = directory
-                for part in path.parts[:-1]:
-                    current = current / part
-                    if not stat.S_ISDIR(current.lstat().st_mode):
-                        raise OSError("indexed artifact directory is not a regular directory")
-                metadata = (directory / path).lstat()
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_size != expected_bytes
-                    or metadata.st_nlink != 1
-                ):
-                    return None
+            if not self._artifacts_match(directory, artifacts):
+                return None
+            # Bind the admission to the manifest inspected before the scan,
+            # including replacement of the session root during that scan.
+            if self.signature(directory) != signature:
+                return None
             self._admitted.add(key)
         value = json.loads(row[0])
         # A persisted digest is historical metadata, not proof about current payloads.
         value["verification"] = None
         return value
+
+    @staticmethod
+    def _artifacts_match(directory: Path, artifacts: list[tuple[str, int]]) -> bool:
+        def paths():
+            for relative, expected_bytes in artifacts:
+                path = Path(relative)
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    raise OSError("invalid indexed artifact path")
+                yield path.parts, expected_bytes
+
+        def identity(metadata):
+            return (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        with ExitStack() as root_stack:
+            root_fd = os.open(directory, flags)
+            root_stack.callback(os.close, root_fd)
+            root_identity = identity(os.fstat(root_fd))
+            # Retain descriptors only for one parent chain at a time, not one
+            # per artifact or per unique directory in a long recording.
+            for parent, entries in groupby(paths(), key=lambda entry: entry[0][:-1]):
+                with ExitStack() as parent_stack:
+                    parent_fd = root_fd
+                    opened = []
+                    for part in parent:
+                        child_fd = os.open(part, flags, dir_fd=parent_fd)
+                        parent_stack.callback(os.close, child_fd)
+                        opened.append((parent_fd, part, identity(os.fstat(child_fd))))
+                        parent_fd = child_fd
+                    for parts, expected_bytes in entries:
+                        metadata = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                        if (
+                            not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_size != expected_bytes
+                            or metadata.st_nlink != 1
+                        ):
+                            return False
+                    # An open directory remains readable after a rename; do not
+                    # admit its artifacts if the indexed path changed meanwhile.
+                    for ancestor_fd, name, expected_identity in opened:
+                        current = os.stat(name, dir_fd=ancestor_fd, follow_symlinks=False)
+                        if identity(current) != expected_identity:
+                            return False
+            return identity(directory.lstat()) == root_identity
 
     def remember(
         self,
