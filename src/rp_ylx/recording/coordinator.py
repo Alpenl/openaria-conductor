@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import nullcontext, suppress
+from contextlib import ExitStack, closing, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -501,13 +501,19 @@ class _MultiRootSessionStore:
         *,
         verified_manifests: Mapping[str, str],
     ) -> None:
-        self._stores = [
-            DirectorySessionStore(root, verified_manifests=verified_manifests) for root in roots
-        ]
+        self._stores = []
+        with ExitStack() as cleanup:
+            for root in roots:
+                store = DirectorySessionStore(root, verified_manifests=verified_manifests)
+                cleanup.callback(store.close)
+                self._stores.append(store)
+            cleanup.pop_all()
 
     def close(self) -> None:
-        for store in self._stores:
-            store.close()
+        stores, self._stores = self._stores, []
+        with ExitStack() as cleanup:
+            for store in stores:
+                cleanup.callback(store.close)
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedManifest:
         not_found: ArtifactAccessError | None = None
@@ -3244,16 +3250,15 @@ class CaptureCoordinator:
         )
 
     def open_manifest(self, session_id: str, api_version: str) -> object:
-        release = self._acquire_representation()
-        store = self._open_store()
-        try:
-            representation = store.open_manifest(session_id, api_version)
-            return _TrackedRepresentation(representation, release)
-        except Exception:
-            release()
-            raise
-        finally:
-            store.close()
+        with ExitStack() as cleanup:
+            release = self._acquire_representation()
+            cleanup.callback(release)
+            with closing(self._open_store()) as store:
+                representation = store.open_manifest(session_id, api_version)
+                cleanup.callback(representation.close)
+            tracked = _TrackedRepresentation(representation, release)
+            cleanup.pop_all()
+            return tracked
 
     def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
         # Verify only the requested session, including direct access without listing first.
@@ -3274,51 +3279,52 @@ class CaptureCoordinator:
                 )
             expected_identities = dict(snapshot.artifact_identities)
 
-        release = self._acquire_representation()
-        store = self._open_store()
-        try:
-            representation = store.open_verified_artifact(session_id, artifact_id, api_version)
-            expected_identity = expected_identities.get(artifact_id)
-            if (
-                expected_identity is None
-                or _locked_file_identity(representation) != expected_identity
-            ):
-                representation.close()
-                with self._catalog_lock:
-                    if self._session_snapshots.get(session_id) == snapshot:
-                        self._invalidate_session_verification(session_id)
-                raise ArtifactAccessError(
-                    "not_verified",
-                    "artifact 与独立验证快照不匹配",
-                    reason="stale",
-                )
+        with ExitStack() as cleanup:
+            release = self._acquire_representation()
+            cleanup.callback(release)
             try:
-                transfer = self._state_db.begin_transfer(self.volume_id, session_id, artifact_id)
-            except BaseException:
-                representation.close()
-                raise
-
-            def record_transfer(status: str, bytes_read: int) -> None:
-                try:
-                    self._state_db.finish_transfer(transfer, status, bytes_read)
-                except (OSError, sqlite3.Error, PersistenceError):
-                    operational_logger("recording").event(
-                        "transfer_receipt_failed", level="error", transaction_id=session_id
+                with closing(self._open_store()) as store:
+                    representation = store.open_verified_artifact(
+                        session_id, artifact_id, api_version
+                    )
+                    cleanup.callback(representation.close)
+                    expected_identity = expected_identities.get(artifact_id)
+                    if (
+                        expected_identity is None
+                        or _locked_file_identity(representation) != expected_identity
+                    ):
+                        raise ArtifactAccessError(
+                            "not_verified",
+                            "artifact 与独立验证快照不匹配",
+                            reason="stale",
+                        )
+                    transfer = self._state_db.begin_transfer(
+                        self.volume_id, session_id, artifact_id
                     )
 
-            return _TrackedRepresentation(representation, release, record_transfer)
-        except ArtifactAccessError as error:
-            if error.code == "not_verified":
-                with self._catalog_lock:
-                    if self._session_snapshots.get(session_id) == snapshot:
-                        self._invalidate_session_verification(session_id)
-            release()
-            raise
-        except Exception:
-            release()
-            raise
-        finally:
-            store.close()
+                    def record_transfer(status: str, bytes_read: int) -> None:
+                        try:
+                            self._state_db.finish_transfer(transfer, status, bytes_read)
+                        except (OSError, sqlite3.Error, PersistenceError):
+                            operational_logger("recording").event(
+                                "transfer_receipt_failed", level="error", transaction_id=session_id
+                            )
+
+                    # An admitted receipt whose response cannot be handed off
+                    # must not remain open just because later setup failed.
+                    cleanup.callback(record_transfer, "failed", 0)
+
+                tracked = _TrackedRepresentation(representation, release, record_transfer)
+                # Only the returned representation now owns the file, receipt
+                # and reservation. Every earlier failure/cancellation unwinds.
+                cleanup.pop_all()
+                return tracked
+            except ArtifactAccessError as error:
+                if error.code == "not_verified":
+                    with self._catalog_lock:
+                        if self._session_snapshots.get(session_id) == snapshot:
+                            self._invalidate_session_verification(session_id)
+                raise
 
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
         admission = self._require_admission()
