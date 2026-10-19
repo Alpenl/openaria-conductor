@@ -127,7 +127,9 @@ class GatewayConnectionsTest(unittest.TestCase):
         self.check_blocked_download(native=False)
 
     def test_shutdown_releases_blocked_native_download(self) -> None:
-        self.check_blocked_download(native=True)
+        with patch.object(ThreadingHTTPServer, "handle_error") as unexpected:
+            self.check_blocked_download(native=True)
+        unexpected.assert_not_called()
 
     def check_blocked_download(self, *, native: bool) -> None:
         store = native_session_store_or_none() if native else None

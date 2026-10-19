@@ -53,7 +53,14 @@ fn imu_error(error: imu::ImuError) -> PyErr {
 }
 
 fn session_io_error(error: session_io::SessionIoError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+    let message = format!("{}: {}", error.code, error.message);
+    match error.code {
+        "send_broken_pipe" => pyo3::exceptions::PyBrokenPipeError::new_err((libc::EPIPE, message)),
+        "send_connection_reset" => {
+            pyo3::exceptions::PyConnectionResetError::new_err((libc::ECONNRESET, message))
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(message),
+    }
 }
 
 fn session_store_error(error: session_store::StoreError) -> PyErr {
