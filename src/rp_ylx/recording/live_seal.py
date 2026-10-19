@@ -33,7 +33,7 @@ class PreparedArtifact:
         path = root / descriptor["path"]
         if not self.source.matches(
             path.stat(follow_symlinks=False), descriptor["bytes"], descriptor["sha256"]
-        ):
+        ) or not self.source.unchanged(path):
             raise ValueError("source changed after incremental lossless compaction")
         if not self.output.unchanged(self.target):
             raise ValueError("incremental compacted output changed")

@@ -352,7 +352,7 @@ class LiveSealingTests(unittest.TestCase):
             self.assertTrue((root / "frames.ndjson").exists())
             self.assertTrue((root / "imu.ndjson").exists())
 
-    def test_verified_files_avoid_second_read_but_detect_restored_mtime_tamper(self):
+    def test_verified_files_still_read_content_and_detect_restored_mtime_tamper(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = fixtures.SplitEyeRecordingTest()
             recorder, _, _ = fixture.build(Path(directory))
@@ -372,7 +372,8 @@ class LiveSealingTests(unittest.TestCase):
                 cached_reads = read.call_count
             with patch.object(device_session, "_verify_artifact_fd", wraps=original) as read:
                 validate_device_session_directory(sealed.path)
-                self.assertGreater(read.call_count, cached_reads)
+                self.assertGreater(cached_reads, 0)
+                self.assertEqual(read.call_count, cached_reads)
             path = sealed.path / video
             metadata = path.stat()
             payload = bytearray(path.read_bytes())

@@ -2057,13 +2057,8 @@ class DeviceSessionRecorder:
     ) -> _FinalizedArtifact:
         relative = path.relative_to(self._partial).as_posix()
         before = verified_identity(path.stat(follow_symlinks=False))
-        proof = self._verified_artifacts.get(relative)
-        if proof is not None and proof.identity == before:
-            if expected_bytes is not None and expected_bytes != before[4]:
-                raise DeviceRecordingError(code, "closed artifact size changed")
-            return _FinalizedArtifact(
-                proof.sha256, before[4], (before[0], before[1], before[4], before[5])
-            )
+        # Same inode/size/mtime/ctime does not imply identical bytes on the
+        # camera's coarse-timestamp filesystem. Always read before admission.
         result = _finalize_artifact(path, expected_bytes, code=code)
         if verified_identity(path.stat(follow_symlinks=False)) != before:
             raise DeviceRecordingError(code, "artifact changed during independent verification")
@@ -2559,10 +2554,10 @@ def validate_device_session_directory(
     interrupt_check: Callable[[], None] | None = None,
     verified_artifacts: Mapping[str, VerifiedArtifact] | None = None,
 ) -> Mapping[str, object]:
-    """校验 manifest 和所有 artifact；仅本次封存/恢复的独立读回证明可复用。
+    """校验 manifest 和所有 artifact 的当前内容。
 
-    CLI和历史会话不提供缓存，仍逐字节读取。恢复证明也必须在本次调用中
-    完整读回后新建，且包括ctime的文件身份保持不变；缓存从不从磁盘加载。
+    保留 verified_artifacts 参数以兼容调用方，但文件属性相同不能证明
+    内容不变：包括本次封存/恢复在内，每次发布校验都完整读回。
     """
 
     root = Path(path)
@@ -2605,11 +2600,6 @@ def validate_device_session_directory(
                     code="artifact_invalid",
                 )
                 try:
-                    proof = None if verified_artifacts is None else verified_artifacts.get(relative)
-                    if proof is not None and proof.matches(
-                        os.fstat(artifact_fd), expected_bytes, expected_sha256
-                    ):
-                        return
                     _verify_artifact_fd(
                         artifact_fd,
                         expected_bytes,

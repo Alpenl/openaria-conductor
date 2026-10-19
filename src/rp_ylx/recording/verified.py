@@ -1,12 +1,13 @@
-"""Reuse independent reads of closed files, only while their exact identity holds.
+"""Remember independently read digests without treating stat as content proof.
 
-This cache is private to one live recorder or recovery attempt. It is never loaded from a manifest,
-checkpoint or disk. A changed ctime, link count, inode or digest forces a new
-full read, including changes that restore the original mtime.
+Coarse filesystem timestamps can remain identical across an in-place write.
+Identity checks reject replacements cheaply; admitting content still needs a
+fresh read, even for a private, in-memory verification record.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class VerifiedArtifact:
     sha256: str
 
     def matches(self, metadata: os.stat_result, size: int, digest: str) -> bool:
+        """Compare descriptor metadata only; this does not verify current bytes."""
         return (
             metadata.st_size == size
             and self.sha256 == digest
@@ -40,4 +42,17 @@ class VerifiedArtifact:
         )
 
     def unchanged(self, path: Path) -> bool:
-        return identity(path.stat(follow_symlinks=False)) == self.identity
+        if identity(path.stat(follow_symlinks=False)) != self.identity:
+            return False
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            if identity(os.fstat(source.fileno())) != self.identity:
+                return False
+            digest = hashlib.sha256()
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+            return (
+                digest.hexdigest() == self.sha256
+                and identity(os.fstat(source.fileno())) == self.identity
+                and identity(path.stat(follow_symlinks=False)) == self.identity
+            )

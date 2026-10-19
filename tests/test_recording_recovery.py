@@ -40,7 +40,10 @@ class RecordingRecoveryTests(unittest.TestCase):
 
             def mutate_after_read(*args, **kwargs):
                 result = finalize(*args, **kwargs)
-                path.write_bytes(b"modified")
+                # Visible size changes must be rejected at the readback
+                # boundary. Equal-stat corruption is checked at publication
+                # by test_artifact_content_checks, without timing assumptions.
+                path.write_bytes(b"modified length")
                 os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
                 return result
 
@@ -53,7 +56,7 @@ class RecordingRecoveryTests(unittest.TestCase):
                 )
             self.assertEqual(verified, {})
 
-    def test_recovery_reuses_only_its_own_fresh_readbacks(self):
+    def test_recovery_and_later_validation_both_read_current_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary))
             with (
@@ -69,8 +72,8 @@ class RecordingRecoveryTests(unittest.TestCase):
             paths = [call.args[0] for call in reads.call_args_list]
             self.assertIn(recorder.partial_path / "video/left_00000.mp4", paths)
             self.assertIn(recorder.partial_path / "recovery/imu.ndjson", paths)
-            self.assertEqual(rereads.call_count, 0)
-            # A later standalone validation never inherits the recovery proofs.
+            self.assertGreater(rereads.call_count, 0)
+            # A later standalone validation also checks current bytes.
             with patch.object(
                 session_module, "_verify_artifact_fd", wraps=session_module._verify_artifact_fd
             ) as later:
