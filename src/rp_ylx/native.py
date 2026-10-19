@@ -154,6 +154,8 @@ class NativeSessionTransaction(Protocol):
 
     def segments(self) -> list[dict[str, object]]: ...
 
+    def segments_since(self, offset: int) -> list[dict[str, object]]: ...
+
     def finish(
         self,
         duration_seconds: float,

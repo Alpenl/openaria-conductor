@@ -1174,10 +1174,16 @@ class DeviceSessionRecorder:
         transaction = self._native_transaction
         closed_offset = 0
         if transaction is not None:
-            raw_segments = transaction.segments()
             closed_offset = self._harvested_segments
-            if len(raw_segments) < closed_offset:
-                raise DeviceRecordingError("segment_invalid", "encoder segment list regressed")
+            incremental = getattr(transaction, "segments_since", None)
+            if incremental is not None:
+                raw_segments = incremental(closed_offset)
+            else:
+                # Older native builds expose only the complete inventory.
+                raw_segments = transaction.segments()
+                if len(raw_segments) < closed_offset:
+                    raise DeviceRecordingError("segment_invalid", "encoder segment list regressed")
+                raw_segments = raw_segments[closed_offset:]
             # Native closed segments are append-only and previously harvested
             # records already have sealed identities. Revalidating their fields
             # every 200 ms made Python work grow with the recording's duration.
@@ -1196,7 +1202,7 @@ class DeviceSessionRecorder:
                         item.get("right_bytes"), "segment.right_bytes"
                     ),
                 )
-                for item in raw_segments[closed_offset:]
+                for item in raw_segments
             )
         else:
             encoder = self._encoder

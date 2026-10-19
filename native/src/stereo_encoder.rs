@@ -314,6 +314,19 @@ impl EncoderProcess {
         }
     }
 
+    pub(crate) fn segments_since(
+        &self,
+        offset: usize,
+    ) -> Result<Vec<SegmentEvent>, EncoderProcessError> {
+        let state = self.shared.state.lock().map_err(|_| {
+            EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        let tail = state.segments.get(offset..).ok_or_else(|| {
+            EncoderProcessError::new("segment_invalid", "encoder segment list regressed")
+        })?;
+        Ok(tail.to_vec())
+    }
+
     pub(crate) fn stats(&self) -> BTreeMap<String, i64> {
         match self.shared.state.lock() {
             Ok(state) => state.stats.clone(),

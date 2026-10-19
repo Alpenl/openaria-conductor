@@ -39,6 +39,35 @@ class SegmentHarvestTailTests(unittest.TestCase):
             "right_bytes": 1,
         }
 
+    def test_incremental_native_interface_fetches_only_unharvested_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("frames.ndjson", "imu.ndjson"):
+                (root / name).write_bytes(b"")
+            segments = [self.segment(i) for i in range(1002)]
+            indexed = [3003]
+            recorder = self.recorder(root, segments, indexed)
+            offsets = []
+
+            def tail(offset):
+                offsets.append(offset)
+                return segments[offset:]
+
+            def full():
+                raise AssertionError("full inventory must not be fetched by incremental harvesting")
+
+            recorder._native_transaction.segments = full
+            recorder._native_transaction.segments_since = tail
+            with patch.object(d, "write_json_atomic") as checkpoint, patch.object(d.os, "fsync"):
+                recorder._harvest_segments()
+                self.assertEqual(recorder._harvested_segments, 1001)
+                indexed[0] = 3006
+                recorder._harvest_segments()
+                recorder._harvest_segments()
+                self.assertEqual(recorder._harvested_segments, 1002)
+                self.assertEqual(checkpoint.call_count, 2)
+            self.assertEqual(offsets, [1000, 1001, 1002])
+
     def test_idle_poll_does_not_revisit_sealed_record_fields(self):
         recorder = self.recorder(Path("/not-used"), [_PreviouslySealed()] * 1000, [3000])
         with patch.object(d, "write_json_atomic") as checkpoint:

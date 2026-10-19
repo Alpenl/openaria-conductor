@@ -113,6 +113,14 @@ impl NativeSessionTransaction {
         stereo_encoder_segment_list(py, &segments)
     }
 
+    fn segments_since(&self, py: Python<'_>, offset: usize) -> PyResult<Py<PyList>> {
+        let transaction = Arc::clone(&self.transaction);
+        let segments = py
+            .allow_threads(move || transaction.segments_since(offset))
+            .map_err(session_store_error)?;
+        stereo_encoder_segment_list(py, &segments)
+    }
+
     #[pyo3(signature = (duration_seconds, timeout_seconds=30.0))]
     fn finish(
         &self,
