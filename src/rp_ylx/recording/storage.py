@@ -232,7 +232,16 @@ def compact_manifest(
         pending = deque(executor.submit(compact, descriptor) for descriptor in descriptors[:2])
         for completed, descriptor in enumerate(descriptors, 1):
             target, compression, relative, audio = pending.popleft().result()
-            descriptor.update(finalize(target))
+            finalized = finalize(target)
+            if prepared is not None and relative in prepared:
+                proof = prepared[relative].output
+                if not proof.matches(
+                    target.stat(follow_symlinks=False),
+                    finalized.get("bytes"),
+                    finalized.get("sha256"),
+                ):
+                    raise ValueError("prepared compacted output changed before final admission")
+            descriptor.update(finalized)
             descriptor["media_type"] = "audio/flac" if audio else "application/zstd"
             descriptor["storage_encoding"] = compression
             originals.append(relative)
