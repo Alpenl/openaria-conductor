@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,10 +153,17 @@ class LiveSealing:
 
         checkpoint = self.root / "audio/checkpoint.json"
         try:
-            checkpoint_identity = identity(checkpoint.stat(follow_symlinks=False))
+            metadata = checkpoint.stat(follow_symlinks=False)
         except FileNotFoundError:
             self._audio_checkpoint_identity = None
             return
+        # Native atomically replaces this checkpoint while capture is running.
+        # stat() can resolve the old inode just before rename unlinks it, then
+        # report nlink=0. Retry on the next poll without caching that snapshot.
+        # The forced final poll runs after producers join and remains strict.
+        if not force and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+            return
+        checkpoint_identity = identity(metadata)
         if not force and checkpoint_identity == self._audio_checkpoint_identity:
             return
         for segment in json.loads(checkpoint.read_bytes())["segments"]:

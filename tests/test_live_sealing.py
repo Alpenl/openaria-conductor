@@ -92,6 +92,50 @@ class LiveSealingTests(unittest.TestCase):
                 self.assertEqual(decode.call_count, 2)
                 self.assertEqual(compact.call_count, 1)
 
+    def test_audio_retries_checkpoint_unlinked_during_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sealing = self.audio_sealing(root)
+            self.publish_checkpoint(root, [0])
+            checkpoint = root / "audio/checkpoint.json"
+            with checkpoint.open("rb") as old:
+                self.publish_checkpoint(root, [0, 1])
+                unlinked = os.fstat(old.fileno())
+            self.assertEqual(unlinked.st_nlink, 0)
+            with patch.object(Path, "stat", return_value=unlinked):
+                sealing._audio()
+            self.assertIsNone(sealing._audio_checkpoint_identity)
+            self.assertEqual(sealing.prepared, {})
+            with patch("rp_ylx.recording.live_seal.compact_audio", side_effect=self.compact_audio):
+                sealing._audio()
+            self.assertEqual(len(sealing.prepared), 2)
+
+    def test_audio_final_poll_rejects_unlinked_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sealing = self.audio_sealing(root)
+            self.publish_checkpoint(root, [])
+            checkpoint = root / "audio/checkpoint.json"
+            with checkpoint.open("rb") as old:
+                checkpoint.unlink()
+                unlinked = os.fstat(old.fileno())
+            with patch.object(Path, "stat", return_value=unlinked), self.assertRaises(ValueError):
+                sealing._audio(force=True)
+
+    def test_audio_poll_still_rejects_linked_or_special_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sealing = self.audio_sealing(root)
+            self.publish_checkpoint(root, [])
+            checkpoint = root / "audio/checkpoint.json"
+            os.link(checkpoint, checkpoint.with_suffix(".link"))
+            with self.assertRaises(ValueError):
+                sealing._audio()
+            checkpoint.unlink()
+            os.mkfifo(checkpoint)
+            with self.assertRaises(ValueError):
+                sealing._audio()
+
     def test_audio_reads_replacement_with_same_size_and_restored_mtime(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
