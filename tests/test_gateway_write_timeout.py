@@ -135,7 +135,7 @@ class GatewayWriteTimeoutTest(unittest.TestCase):
                 )
 
     def test_write_monitor_stops_with_server(self) -> None:
-        watcher = self.server._write_watcher
+        watcher = self.server._deadline_watcher
         self.assertTrue(watcher.is_alive())
         self.server.shutdown()
         self.server.server_close()

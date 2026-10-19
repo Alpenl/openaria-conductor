@@ -15,14 +15,14 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import RLock
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 from rp_ylx.api.downloads import (
@@ -687,7 +687,7 @@ _RESPONSE_WRITE_CHUNK = 16 * 1024
 
 
 @dataclass
-class _WriteDeadline:
+class _IODeadline:
     expires_at: float
     expired: bool = False
 
@@ -749,9 +749,9 @@ class GatewayServer(ThreadingHTTPServer):
         self._http_condition = threading.Condition()
         self._http_connections: set[socket.socket] = set()
         self._http_closing = False
-        self._write_deadlines: dict[socket.socket, _WriteDeadline] = {}
-        self._write_watcher: threading.Thread | None = None
-        self._write_next_check: float | None = None
+        self._io_deadlines: dict[tuple[socket.socket, str], _IODeadline] = {}
+        self._deadline_watcher: threading.Thread | None = None
+        self._deadline_next_check: float | None = None
         self.request_timeout_seconds = request_timeout_seconds
         self.provider = provider
         self.security = security
@@ -766,54 +766,72 @@ class GatewayServer(ThreadingHTTPServer):
         )
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
-        self._write_watcher = threading.Thread(
-            target=self._watch_response_writes, name="gateway-write-deadlines", daemon=True
+        self._deadline_watcher = threading.Thread(
+            target=self._watch_io_deadlines, name="gateway-io-deadlines", daemon=True
         )
         try:
-            self._write_watcher.start()
+            self._deadline_watcher.start()
         except BaseException:
             self.server_close()
             raise
 
+    def response_write(self, connection: socket.socket) -> AbstractContextManager[None]:
+        return self._io_deadline(connection, "write", time.monotonic() + self.write_timeout_seconds)
+
+    def request_read(
+        self, connection: socket.socket, expires_at: float
+    ) -> AbstractContextManager[None]:
+        return self._io_deadline(connection, "read", expires_at)
+
     @contextmanager
-    def response_write(self, connection: socket.socket) -> Iterator[None]:
-        deadline = _WriteDeadline(time.monotonic() + self.write_timeout_seconds)
+    def _io_deadline(
+        self, connection: socket.socket, kind: Literal["read", "write"], expires_at: float
+    ) -> Iterator[None]:
+        deadline = _IODeadline(expires_at)
+        key = (connection, kind)
         with self._http_condition:
             if self._http_closing:
                 raise ConnectionResetError("gateway is closing")
-            self._write_deadlines[connection] = deadline
-            if self._write_next_check is None or deadline.expires_at < self._write_next_check:
+            if expires_at <= time.monotonic():
+                raise TimeoutError(f"HTTP {kind} exceeded its deadline")
+            self._io_deadlines[key] = deadline
+            if self._deadline_next_check is None or expires_at < self._deadline_next_check:
                 self._http_condition.notify_all()
         try:
             yield
         finally:
             with self._http_condition:
-                if self._write_deadlines.get(connection) is deadline:
-                    self._write_deadlines.pop(connection)
+                if not deadline.expired and time.monotonic() >= expires_at:
+                    deadline.expired = True
+                    with suppress(OSError):
+                        connection.shutdown(socket.SHUT_RDWR)
+                if self._io_deadlines.get(key) is deadline:
+                    self._io_deadlines.pop(key)
             if deadline.expired:
-                raise TimeoutError("HTTP response write exceeded its deadline")
+                raise TimeoutError(f"HTTP {kind} exceeded its deadline")
 
-    def _watch_response_writes(self) -> None:
+    def _watch_io_deadlines(self) -> None:
         with self._http_condition:
             while not self._http_closing:
-                if not self._write_deadlines:
-                    self._write_next_check = None
+                if not self._io_deadlines:
+                    self._deadline_next_check = None
                     self._http_condition.wait()
                     continue
                 now = time.monotonic()
-                for connection, deadline in tuple(self._write_deadlines.items()):
+                for key, deadline in tuple(self._io_deadlines.items()):
+                    connection, _kind = key
                     if deadline.expires_at <= now:
                         deadline.expired = True
-                        self._write_deadlines.pop(connection)
+                        self._io_deadlines.pop(key)
                         # Cancel under the same lock as completion/new writes so a late
                         # deadline cannot shut down a subsequent keepalive response.
                         with suppress(OSError):
                             connection.shutdown(socket.SHUT_RDWR)
-                if self._write_deadlines:
-                    self._write_next_check = min(
-                        d.expires_at for d in self._write_deadlines.values()
+                if self._io_deadlines:
+                    self._deadline_next_check = min(
+                        d.expires_at for d in self._io_deadlines.values()
                     )
-                    self._http_condition.wait(max(0, self._write_next_check - time.monotonic()))
+                    self._http_condition.wait(max(0, self._deadline_next_check - time.monotonic()))
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         with self._http_condition:
@@ -888,8 +906,8 @@ class GatewayServer(ThreadingHTTPServer):
         super().server_close()
         self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
-        if self._write_watcher is not None and self._write_watcher.is_alive():
-            self._write_watcher.join(timeout=2.0)
+        if self._deadline_watcher is not None and self._deadline_watcher.is_alive():
+            self._deadline_watcher.join(timeout=2.0)
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -901,11 +919,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile = _BoundedResponseWriter(self.wfile, self.connection, self.server)
 
     def handle_one_request(self) -> None:
+        self._header_read_context: AbstractContextManager[None] | None = None
         self.connection.settimeout(self.server.request_timeout_seconds)
         try:
-            super().handle_one_request()
+            try:
+                # Waiting for the first byte is an idle timeout, separate from the
+                # total request-input budget. peek keeps pipelined bytes intact.
+                if not self.rfile.peek(1):
+                    self.close_connection = True
+                    return
+                self._request_read_expires_at = (
+                    time.monotonic() + self.server.request_timeout_seconds
+                )
+                context = self.server.request_read(self.connection, self._request_read_expires_at)
+                context.__enter__()
+                self._header_read_context = context
+                super().handle_one_request()
+            finally:
+                self._finish_header_read()
+        except TimeoutError:
+            self.close_connection = True
         finally:
             self.connection.settimeout(None)
+
+    def _finish_header_read(self) -> None:
+        context = self._header_read_context
+        self._header_read_context = None
+        if context is not None:
+            context.__exit__(None, None, None)
 
     def parse_request(self) -> bool:
         try:
@@ -913,6 +954,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         finally:
             # Native sendfile and raw-fd writers require blocking response sockets.
             self.connection.settimeout(None)
+            self._finish_header_read()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -2867,11 +2909,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体大小无效")
             return None
         try:
-            self.connection.settimeout(self.server.request_timeout_seconds)
-            try:
-                payload = self.rfile.read(length)
-            finally:
-                self.connection.settimeout(None)
+            with self.server.request_read(self.connection, self._request_read_expires_at):
+                self.connection.settimeout(self.server.request_timeout_seconds)
+                try:
+                    payload = self.rfile.read(length)
+                finally:
+                    self.connection.settimeout(None)
         except OSError:
             self.close_connection = True
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体读取失败")

@@ -55,7 +55,10 @@ class GatewayIdleTest(unittest.TestCase):
             while chunk := client.recv(4096):
                 response.extend(chunk)
             if body:
-                self.assertTrue(response.startswith(b"HTTP/1.1 400 "), response)
+                # An absolute input deadline may shut down the socket before
+                # the idle-timeout error response can be written.
+                self.assertTrue(not response or response.startswith(b"HTTP/1.1 400 "), response)
+                self.assertEqual(self.server.provider.commands, {})
             else:
                 self.assertEqual(response, b"")
 
