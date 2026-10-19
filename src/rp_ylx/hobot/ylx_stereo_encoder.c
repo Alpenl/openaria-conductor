@@ -184,24 +184,32 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
     }
 }
 
-static bool read_exact(void *destination, size_t length)
+typedef enum {
+    INPUT_COMPLETE,
+    INPUT_EOF,
+    INPUT_TRUNCATED,
+    INPUT_ERROR
+} input_result_t;
+
+static input_result_t read_exact(void *destination, size_t length)
 {
     unsigned char *cursor = destination;
+    const size_t requested = length;
     while (length > 0) {
         ssize_t chunk = read(STDIN_FILENO, cursor, length);
         if (chunk == 0) {
-            return false;
+            return length == requested ? INPUT_EOF : INPUT_TRUNCATED;
         }
         if (chunk < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            return false;
+            return INPUT_ERROR;
         }
         cursor += chunk;
         length -= (size_t)chunk;
     }
-    return true;
+    return INPUT_COMPLETE;
 }
 
 static int parse_integer(const char *value)
@@ -316,9 +324,16 @@ int main(int argc, char **argv)
     }
 
     const char *failure_code = NULL;
+    int input_errno = 0;
     for (;;) {
         uint32_t header[2];
-        if (!read_exact(header, sizeof(header))) {
+        input_result_t input_result = read_exact(header, sizeof(header));
+        if (input_result == INPUT_EOF) {
+            break;
+        }
+        if (input_result != INPUT_COMPLETE) {
+            input_errno = input_result == INPUT_ERROR ? errno : 0;
+            failure_code = input_result == INPUT_ERROR ? "frame_read_failed" : "frame_header_truncated";
             break;
         }
         if (header[0] != FRAME_MAGIC) {
@@ -333,8 +348,10 @@ int main(int argc, char **argv)
             failure_code = "frame_too_large";
             break;
         }
-        if (!read_exact(payload, length)) {
-            failure_code = "frame_truncated";
+        input_result = read_exact(payload, length);
+        if (input_result != INPUT_COMPLETE) {
+            input_errno = input_result == INPUT_ERROR ? errno : 0;
+            failure_code = input_result == INPUT_ERROR ? "frame_read_failed" : "frame_truncated";
             break;
         }
         if (ylx_pipeline_submit(pipeline, payload, length, 0) != 0) {
@@ -348,8 +365,13 @@ int main(int argc, char **argv)
      * the owner times out and terminates us. Segment events remain atomic. */
     const bool error_emitted = failure_code != NULL;
     if (error_emitted) {
+        char input_reason[256] = {0};
+        if (input_errno != 0) {
+            snprintf(input_reason, sizeof(input_reason), "%s: %s", failure_code, strerror(input_errno));
+        }
         const char *reason = ylx_pipeline_error(pipeline);
-        emit_error_event(failure_code, reason[0] != '\0' ? reason : failure_code);
+        emit_error_event(failure_code, reason[0] != '\0' ? reason :
+                         input_reason[0] != '\0' ? input_reason : failure_code);
     }
     const int finished = ylx_pipeline_finish(pipeline);
     ylx_pipeline_stats_t stats;
