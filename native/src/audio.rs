@@ -1042,6 +1042,8 @@ struct SegmentWriter {
     next_index: u64,
     active: Option<ActiveSegment>,
     records: Vec<AudioSegment>,
+    // Accepted by the commit queue, not necessarily durable yet.
+    completed_snapshot: AudioRecordingSnapshot,
     progress: Arc<AudioProgress>,
     committer: CommitWorker,
 }
@@ -1104,21 +1106,22 @@ impl SegmentWriter {
             next_index: 0,
             active: None,
             records: Vec::new(),
+            completed_snapshot: AudioRecordingSnapshot {
+                sample_count: 0,
+                bytes_written: 0,
+                segment_count: 0,
+            },
             progress,
             committer,
         })
     }
 
     fn snapshot(&self) -> AudioRecordingSnapshot {
-        let mut sample_count = 0_u64;
-        let mut bytes_written = 0_u64;
-        let mut segment_count = 0_u64;
-        for record in &self.records {
-            sample_count = sample_count.max(record.end_sample);
-            bytes_written +=
-                WAV_HEADER_BYTES + (record.end_sample - record.start_sample) * self.bytes_per_frame;
-            segment_count += 1;
-        }
+        let AudioRecordingSnapshot {
+            mut sample_count,
+            mut bytes_written,
+            mut segment_count,
+        } = self.completed_snapshot.clone();
         if let Some(active) = &self.active {
             if active.data_bytes > 0 {
                 let active_samples = active.data_bytes / self.bytes_per_frame;
@@ -1254,6 +1257,12 @@ impl SegmentWriter {
             file: segment.file,
             record: record.clone(),
         })?;
+        // Update only after successful submission so rejected tails do not
+        // inflate the completed inventory. Durable progress stays independent.
+        self.completed_snapshot.sample_count =
+            self.completed_snapshot.sample_count.max(record.end_sample);
+        self.completed_snapshot.bytes_written += WAV_HEADER_BYTES + segment.data_bytes;
+        self.completed_snapshot.segment_count += 1;
         self.records.push(record);
         self.publish_snapshot();
         Ok(())
@@ -2140,6 +2149,111 @@ mod tests {
         assert_eq!(snapshot.sample_count, 2);
         assert_eq!(snapshot.bytes_written, 44 + 2 * 2 * 2);
         assert_eq!(snapshot.segment_count, 1);
+    }
+
+    #[test]
+    fn writer_progress_counts_boundaries_partial_tail_and_empty_tail() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root.clone(),
+            device: "unused".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 0.3,
+        };
+        let mut writer = SegmentWriter::new(&config).unwrap();
+        let mut total = 0;
+        for (frames, samples, segments, bytes) in [
+            (0, 0, 0, 0),
+            (2, 2, 1, 52),
+            (1, 3, 1, 56),
+            (4, 7, 3, 160),
+            (0, 7, 3, 160),
+            (2, 9, 3, 168),
+        ] {
+            writer
+                .write_frames(&vec![7; frames * 4], frames as u64, &mut total)
+                .unwrap();
+            let expected = super::AudioRecordingSnapshot {
+                sample_count: samples,
+                segment_count: segments,
+                bytes_written: bytes,
+            };
+            assert_eq!(writer.snapshot(), expected);
+            assert_eq!(writer.progress.snapshot(), expected);
+        }
+        // Opening an empty next file must not count a header or a segment.
+        writer.open_segment(total).unwrap();
+        assert_eq!(writer.snapshot().segment_count, 3);
+        writer.finish_active().unwrap();
+        assert_eq!(writer.snapshot().bytes_written, 168);
+        let records = writer.finish().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records.last().unwrap().end_sample, 9);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writer_progress_does_not_count_tail_rejected_by_commit_worker() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root.clone(),
+            device: "unused".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 0.3,
+        };
+        let mut writer = SegmentWriter::new(&config).unwrap();
+        writer.write_frames(&[7; 20], 5, &mut 0).unwrap();
+        assert_eq!(writer.snapshot().sample_count, 5);
+        *writer.progress.commit_error.lock().unwrap() = Some(super::AudioError::new(
+            "write_failed",
+            "injected rejected commit",
+        ));
+        assert!(
+            writer
+                .finish_active()
+                .unwrap_err()
+                .message
+                .contains("injected")
+        );
+        assert_eq!(
+            writer.snapshot(),
+            super::AudioRecordingSnapshot {
+                sample_count: 3,
+                segment_count: 1,
+                bytes_written: 56,
+            }
+        );
+        assert_eq!(writer.records.len(), 1);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writer_progress_counts_writes_independently_of_sample_position() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root.clone(),
+            device: "unused".to_owned(),
+            sample_rate_hz: 10,
+            channels: 1,
+            segment_seconds: 0.2,
+        };
+        let mut writer = SegmentWriter::new(&config).unwrap();
+        // Preserve maximum sample position, not a sum or just the last record.
+        writer.write_frames(&[7; 4], 2, &mut 100).unwrap();
+        writer.write_frames(&[7; 4], 2, &mut 0).unwrap();
+        assert_eq!(
+            writer.snapshot(),
+            super::AudioRecordingSnapshot {
+                sample_count: 102,
+                segment_count: 2,
+                bytes_written: 96,
+            }
+        );
+        writer.finish().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
