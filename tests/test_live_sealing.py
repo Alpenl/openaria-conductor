@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from rp_ylx.native import audio_checkpoint_segments
 from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.device_session import DeviceRecordingError, validate_device_session_directory
 from rp_ylx.recording.live_seal import LiveSealing, _Journal
@@ -79,7 +80,10 @@ class LiveSealingTests(unittest.TestCase):
             sealing._audio()  # The recorder may not have published audio yet.
             self.publish_checkpoint(root, [0])
             with (
-                patch("json.loads", wraps=json.loads) as decode,
+                patch(
+                    "rp_ylx.recording.live_seal.audio_checkpoint_segments",
+                    wraps=audio_checkpoint_segments,
+                ) as decode,
                 patch(
                     "rp_ylx.recording.live_seal.compact_audio", side_effect=self.compact_audio
                 ) as compact,
@@ -160,7 +164,10 @@ class LiveSealingTests(unittest.TestCase):
             sealing = self.audio_sealing(root)
             self.publish_checkpoint(root, [])
             checkpoint = root / "audio/checkpoint.json"
-            with patch("json.loads", wraps=json.loads) as decode:
+            with patch(
+                "rp_ylx.recording.live_seal.audio_checkpoint_segments",
+                wraps=audio_checkpoint_segments,
+            ) as decode:
                 sealing._audio()
                 metadata = checkpoint.stat()
                 # Changing the same inode and restoring mtime must invalidate
@@ -184,14 +191,16 @@ class LiveSealingTests(unittest.TestCase):
             root = Path(directory)
             sealing = self.audio_sealing(root)
             self.publish_checkpoint(root, [0])
-            decode = json.loads
+            decode = audio_checkpoint_segments
 
             def publish_before_decode(payload):
                 self.publish_checkpoint(root, [0, 1])
                 return decode(payload)
 
             with patch("rp_ylx.recording.live_seal.compact_audio", side_effect=self.compact_audio):
-                with patch("json.loads", publish_before_decode):
+                with patch(
+                    "rp_ylx.recording.live_seal.audio_checkpoint_segments", publish_before_decode
+                ):
                     sealing._audio()
                 self.assertEqual(set(sealing.prepared), {"audio/audio_00000.wav"})
                 sealing._audio()

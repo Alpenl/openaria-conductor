@@ -1,5 +1,6 @@
 mod active_take;
 mod audio;
+mod audio_checkpoint;
 mod bounded;
 mod capture_runtime;
 mod frame_stream;
@@ -1356,6 +1357,22 @@ fn device_session_seal_result_dict(
     Ok(value.unbind())
 }
 
+#[pyfunction]
+fn audio_checkpoint_segments(py: Python<'_>, payload: &[u8]) -> PyResult<Py<PyList>> {
+    // bytes is immutable and borrowed for this call; parsing need not hold GIL.
+    let segments = py
+        .allow_threads(|| audio_checkpoint::segments(payload))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let result = PyList::empty(py);
+    for segment in segments {
+        let record = PyDict::new(py);
+        record.set_item("index", segment.index)?;
+        record.set_item("path", segment.path)?;
+        result.append(record)?;
+    }
+    Ok(result.unbind())
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("NATIVE_ABI", NATIVE_ABI)?;
@@ -1365,6 +1382,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(module.py(), frame_stream::MAGIC),
     )?;
     module.add_function(wrap_pyfunction!(capabilities, module)?)?;
+    module.add_function(wrap_pyfunction!(audio_checkpoint_segments, module)?)?;
     module.add_function(wrap_pyfunction!(jpeg_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(encode_frame, module)?)?;
     module.add_function(wrap_pyfunction!(v4l2_focus_status, module)?)?;

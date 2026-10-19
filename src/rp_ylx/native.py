@@ -314,6 +314,25 @@ class NativeSchemaValidator(Protocol):
     def is_valid(self, payload: str) -> bool: ...
 
 
+def audio_checkpoint_segments(payload: bytes) -> list[dict[str, object]]:
+    """Read live compaction inputs without allocating historical clock arrays.
+
+    Older/source-only builds keep their full JSON reader. Native parse errors
+    propagate: a malformed checkpoint must not silently take another path.
+    """
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except ImportError:
+        module = None
+    parser = getattr(module, "audio_checkpoint_segments", None)
+    if parser is not None:
+        _validate_capabilities(module)
+        return parser(payload)
+    import json
+
+    return json.loads(payload)["segments"]
+
+
 @lru_cache(maxsize=4)
 def native_schema_validator_or_none(schema_json: str) -> NativeSchemaValidator | None:
     """Compile only trusted bundled schemas; missing/older modules use Python."""

@@ -19,6 +19,7 @@ from threading import Event
 
 import zstandard
 
+from rp_ylx.native import audio_checkpoint_segments
 from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.storage import BLOCK_BYTES, _digest, compact_audio
 from rp_ylx.recording.verified import VerifiedArtifact, identity, open_regular
@@ -202,8 +203,6 @@ class LiveSealing:
     def _audio(self, *, force: bool = False) -> None:
         # Native checkpoint publication follows WAV close/fsync. Reading only
         # paths explicitly named in this atomic checkpoint avoids open tails.
-        import json
-
         checkpoint = self.root / "audio/checkpoint.json"
         try:
             metadata = checkpoint.stat(follow_symlinks=False)
@@ -222,7 +221,7 @@ class LiveSealing:
         payload = _read_audio_checkpoint(checkpoint, checkpoint_identity, force=force)
         if payload is None:
             return
-        for segment in json.loads(payload)["segments"]:
+        for segment in audio_checkpoint_segments(payload):
             relative = segment["path"]
             filename = f"audio_{segment['index']:05d}.wav"
             # Native emits canonical paths. Avoid rebuilding every historical
