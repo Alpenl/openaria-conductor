@@ -396,6 +396,12 @@ def validate_device_descriptor(
     _validate_runtime(descriptor["runtime"], api_version=api_version)
 
 
+def validate_session_summary(value: object) -> None:
+    """Validate one canonical v4 summary before admitting a persisted cache row."""
+    _validate_finite_json(value)
+    _validate_session_summary(value, take_id=None, api_version="v4")
+
+
 def validate_session_list(
     resource: object,
     *,

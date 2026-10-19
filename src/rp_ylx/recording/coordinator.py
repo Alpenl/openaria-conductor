@@ -32,7 +32,11 @@ from rp_ylx.api.downloads import (
     LockedManifest,
     iter_device_session_v1_artifacts,
 )
-from rp_ylx.api.events import project_device_descriptor, validate_safe_swap_v3_receipt
+from rp_ylx.api.events import (
+    project_device_descriptor,
+    validate_safe_swap_v3_receipt,
+    validate_session_summary,
+)
 from rp_ylx.api.gateway import (
     CaptureCommand,
     CaptureCommandResult,
@@ -1319,6 +1323,7 @@ class CaptureCoordinator:
                                     signature,
                                     self._config.session.commit,
                                     directory=sessions_root / session_id,
+                                    validate_summary=validate_session_summary,
                                     required_artifact_role=(
                                         RECOVERY_ROLE
                                         if session_id in self._retained

@@ -8,7 +8,7 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from itertools import groupby
 from pathlib import Path
@@ -167,6 +167,7 @@ class SessionCatalog(StateDatabase):
         *,
         directory: Path | None = None,
         required_artifact_role: str | None = None,
+        validate_summary: Callable[[object], None] | None = None,
     ):
         query = (
             "SELECT summary FROM sessions WHERE volume=? AND session=? "
@@ -186,6 +187,19 @@ class SessionCatalog(StateDatabase):
         if row is None:
             return None
         key = (volume, session, signature)
+        try:
+            value = json.loads(row[0])
+            if not isinstance(value, dict) or value.get("session_id") != session:
+                raise ValueError("cached summary does not identify the indexed session")
+            # A persisted digest is historical metadata, not proof about current payloads.
+            value["verification"] = None
+            if validate_summary is not None:
+                validate_summary(value)
+        except (TypeError, ValueError, RecursionError):
+            # Only this rebuildable row is invalid. Leave database I/O/schema
+            # failures visible; never replace or reinitialize state authority.
+            self._admitted.discard(key)
+            return None
         if directory is not None and key not in self._admitted:
             with self.connection() as db:
                 artifacts = db.execute(
@@ -199,15 +213,14 @@ class SessionCatalog(StateDatabase):
             if self.signature(directory) != signature:
                 return None
             self._admitted.add(key)
-        value = json.loads(row[0])
-        # A persisted digest is historical metadata, not proof about current payloads.
-        value["verification"] = None
         return value
 
     @staticmethod
     def _artifacts_match(directory: Path, artifacts: list[tuple[str, int]]) -> bool:
         def paths():
             for relative, expected_bytes in artifacts:
+                if not isinstance(relative, str) or "\x00" in relative:
+                    raise OSError("invalid indexed artifact path")
                 path = Path(relative)
                 if path.is_absolute() or ".." in path.parts or not path.parts:
                     raise OSError("invalid indexed artifact path")
