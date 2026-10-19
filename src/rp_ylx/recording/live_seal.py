@@ -171,12 +171,15 @@ class LiveSealing:
             return
         for segment in json.loads(checkpoint.read_bytes())["segments"]:
             relative = segment["path"]
-            path = Path(relative)
-            if path.parts != ("audio", f"audio_{segment['index']:05d}.wav"):
+            filename = f"audio_{segment['index']:05d}.wav"
+            # Native emits canonical paths. Avoid rebuilding every historical
+            # Path on each checkpoint, but still validate its index binding.
+            # Keep the prior normalization rules for noncanonical spellings.
+            if relative != f"audio/{filename}" and Path(relative).parts != ("audio", filename):
                 raise ValueError("invalid incremental audio checkpoint path")
             if relative in self.prepared:
                 continue
-            source_path = self.root / path
+            source_path = self.root / relative
             original = _read_back(source_path)
             # WAV + its recovery checkpoint are already durable. This derived
             # cache is synced on admission after capture stops, not in parallel
