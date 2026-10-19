@@ -84,25 +84,41 @@ def resolved_settings(bootstrap: Mapping[str, object]) -> dict:
     }
 
 
-def initialize(path: Path) -> None:
-    from rp_ylx.daemon import production_config_from_value
+def _initialize(base: object, source: Path) -> StateDatabase:
+    from rp_ylx.daemon import ProductionConfigError, production_config_from_value
 
-    base = json.loads(path.read_bytes())
-    production_config_from_value(base)
-    db = StateDatabase(settings_path(base))
-    db.initialize_document("device", resolved_settings(base), str(path))
-    production_config_from_value(effective(base))
+    if not isinstance(base, dict):
+        raise ProductionConfigError("生产配置顶层字段无效")
+    path = settings_path(base)
+    if not path.exists() and not path.with_suffix(".sqlite3.initialized").exists():
+        # Reject an invalid first import before creating any database files.
+        production_config_from_value(base)
+    db = StateDatabase(path)
+    current = db.get("device")
+    if current is None:
+        # A crash after schema creation but before import may finish here.
+        # initialize_document still refuses a missing previously imported row;
+        # StateDatabase refuses a missing marked, corrupt or future database.
+        db.initialize_document("device", resolved_settings(base), str(source))
+        current = db.get("device")
+    if current is None:
+        raise PersistenceError("dynamic device settings are missing")
+    # Persisted values override legacy JSON defaults before validation, exactly
+    # as load_production_config does. Bootstrap identity and paths still apply.
+    production_config_from_value(overlay(base, current))
+    return db
+
+
+def initialize(path: Path) -> None:
+    _initialize(json.loads(path.read_bytes()), path)
 
 
 def manage(
     config: Path, action: str, *, source: Path | None = None, destination: Path | None = None
 ) -> dict:
-    from rp_ylx.daemon import production_config_from_value
-
+    # Use the same bootstrap snapshot for initialization, validation and patching.
     base = json.loads(config.read_bytes())
-    production_config_from_value(base)
-    initialize(config)
-    db = StateDatabase(settings_path(base))
+    db = _initialize(base, config)
     current = db.get("device")
     if action == "set":
         if source is None:
