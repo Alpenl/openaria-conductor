@@ -23,6 +23,7 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 APPLICATION_ID = 0x594C5801
+BACKUP_TIMEOUT_SECONDS = 30
 
 _STATE_TABLES = {
     "documents": "name TEXT PRIMARY KEY, body TEXT NOT NULL, "
@@ -379,7 +380,17 @@ class StateDatabase:
             with self.connection() as source:
                 target = sqlite3.connect(destination)
                 try:
-                    source.backup(target)
+                    # SQLite's backup API retries BUSY/LOCKED independently of
+                    # connect(timeout=...). Check one deadline between bounded
+                    # page batches, including while writers keep restarting it.
+                    source.execute("PRAGMA busy_timeout=0")
+                    deadline = time.monotonic() + BACKUP_TIMEOUT_SECONDS
+
+                    def check_deadline(_status, _remaining, _total):
+                        if time.monotonic() >= deadline:
+                            raise PersistenceError("state database backup copy deadline exceeded")
+
+                    source.backup(target, pages=128, progress=check_deadline, sleep=0.05)
                     if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                         raise PersistenceError("backup integrity check failed")
                 finally:
