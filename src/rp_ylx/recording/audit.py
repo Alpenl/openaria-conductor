@@ -106,7 +106,12 @@ def capture_audit(
             counter = audit.get("camera_counter_raw")
             if counter is not None:
                 counter_available += 1
-                matched += int(any(c == counter and abs(t - host) < 100_000_000 for c, t in recent))
+                # Matching packets normally sit near the newly consumed tail.
+                # Scan newest first but retain the full window for repeats,
+                # wraps and regressing IMU timestamps.
+                matched += int(
+                    any(c == counter and abs(t - host) < 100_000_000 for c, t in reversed(recent))
+                )
                 if previous_counter is not None and counter < previous_counter:
                     if previous_counter - counter > 2**23:
                         counter_wraps += 1
