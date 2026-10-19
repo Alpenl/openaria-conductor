@@ -23,6 +23,7 @@ const fn ioc(direction: u32, number: u32, size: u32) -> c_ulong {
 
 const QUERYCAP: c_ulong = ioc(IOC_READ, 0, 104);
 const SET_FORMAT: c_ulong = ioc(IOC_READ | IOC_WRITE, 5, 208);
+const GET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 21, 204);
 const SET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 22, 204);
 const REQUEST_BUFFERS: c_ulong = ioc(IOC_READ | IOC_WRITE, 8, 20);
 const QUERY_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 9, 88);
@@ -605,21 +606,27 @@ impl Capture {
         write_u32(&mut parameters, 12, 1);
         write_u32(&mut parameters, 16, fps);
         match self.io.ioctl(self.fd()?, SET_PARM, &mut parameters) {
-            Ok(()) => {
-                let numerator = read_u32(&parameters, 12);
-                let denominator = read_u32(&parameters, 16);
-                if numerator == 0 || denominator == 0 || denominator / numerator != fps {
-                    return Err(CaptureError::new(
-                        "unsupported_mode",
-                        "driver did not accept the exact frame rate",
-                    ));
-                }
-            }
+            Ok(()) => {}
             Err(error)
                 if matches!(
                     error.raw_os_error(),
                     Some(libc::EINVAL) | Some(libc::ENOTTY)
-                ) => {}
+                ) =>
+            {
+                // A fixed-rate driver may not implement S_PARM. Read its
+                // actual interval instead of treating our request as fact.
+                parameters.fill(0);
+                write_u32(&mut parameters, 0, BUF_TYPE_CAPTURE);
+                self.io
+                    .ioctl(self.fd()?, GET_PARM, &mut parameters)
+                    .map_err(|error| {
+                        CaptureError::io(
+                            "unsupported_mode",
+                            "cannot verify frame rate with VIDIOC_G_PARM",
+                            error,
+                        )
+                    })?;
+            }
             Err(error) => {
                 return Err(CaptureError::io(
                     "v4l2_ioctl_failed",
@@ -627,6 +634,22 @@ impl Capture {
                     error,
                 ));
             }
+        }
+
+        let numerator = read_u32(&parameters, 12);
+        let denominator = read_u32(&parameters, 16);
+        // u32 cross-products fit u64; division would silently truncate rates
+        // such as 121/2 to 60 and accept a different capture cadence.
+        if numerator == 0
+            || denominator == 0
+            || u64::from(denominator) != u64::from(numerator) * u64::from(fps)
+        {
+            return Err(CaptureError::new(
+                "unsupported_mode",
+                format!(
+                    "driver returned frame interval {numerator}/{denominator}s, expected 1/{fps}s"
+                ),
+            ));
         }
 
         let mut request = [0; 20];
@@ -915,6 +938,9 @@ mod tests {
         frames: Mutex<VecDeque<FakeFrame>>,
         focus: Mutex<i32>,
         auto_focus: Mutex<i32>,
+        frame_interval: (u32, u32),
+        set_parm_error: Option<i32>,
+        get_parm_error: Option<i32>,
     }
 
     type FakeFrame = (u32, u64, Vec<u8>, u32);
@@ -928,6 +954,9 @@ mod tests {
                 frames: Mutex::new(frames.into()),
                 focus: Mutex::new(32),
                 auto_focus: Mutex::new(1),
+                frame_interval: (1, 60),
+                set_parm_error: None,
+                get_parm_error: None,
             }
         }
     }
@@ -948,9 +977,17 @@ mod tests {
             match request {
                 QUERYCAP => write_u32(payload, 84, CAP_VIDEO_CAPTURE | CAP_STREAMING),
                 SET_FORMAT => {}
-                SET_PARM => {
-                    write_u32(payload, 12, 1);
-                    write_u32(payload, 16, 60);
+                request if request == SET_PARM || request == ioc(IOC_READ | IOC_WRITE, 21, 204) => {
+                    let error = if request == SET_PARM {
+                        self.set_parm_error
+                    } else {
+                        self.get_parm_error
+                    };
+                    if let Some(errno) = error {
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
+                    write_u32(payload, 12, self.frame_interval.0);
+                    write_u32(payload, 16, self.frame_interval.1);
                 }
                 REQUEST_BUFFERS => write_u32(payload, 0, 2),
                 QUERY_BUFFER => {
@@ -1038,6 +1075,63 @@ mod tests {
 
         fn monotonic_ns(&self) -> io::Result<u64> {
             Ok(99)
+        }
+    }
+
+    #[test]
+    fn negotiated_rate_requires_exact_rational_equality() {
+        for interval in [(2, 121), (1000, 60001), (0, 60), (1, 0), (u32::MAX, 60)] {
+            let io = Arc::new(FakeIo {
+                frame_interval: interval,
+                ..FakeIo::new(vec![])
+            });
+            let result = Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2);
+            assert!(
+                matches!(result, Err(ref error) if error.code == "unsupported_mode"),
+                "accepted {interval:?}"
+            );
+            assert_eq!(*io.closed.lock().unwrap(), 1);
+            assert!(!io.calls.lock().unwrap().contains(&REQUEST_BUFFERS));
+        }
+        let io = Arc::new(FakeIo {
+            frame_interval: (1001, 60060),
+            ..FakeIo::new(vec![])
+        });
+        let mut capture =
+            Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
+        capture.close();
+        assert_eq!(*io.closed.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn unsupported_rate_setter_requires_verified_current_rate() {
+        for errno in [libc::EINVAL, libc::ENOTTY] {
+            for (interval, get_error, accepted) in [
+                ((1, 60), None, true),
+                ((1, 30), None, false),
+                ((1, 60), Some(libc::ENOTTY), false),
+            ] {
+                let io = Arc::new(FakeIo {
+                    frame_interval: interval,
+                    set_parm_error: Some(errno),
+                    get_parm_error: get_error,
+                    ..FakeIo::new(vec![])
+                });
+                let result = Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "interval={interval:?}, get_error={get_error:?}"
+                );
+                drop(result);
+                assert_eq!(*io.closed.lock().unwrap(), 1);
+                assert!(
+                    io.calls
+                        .lock()
+                        .unwrap()
+                        .contains(&ioc(IOC_READ | IOC_WRITE, 21, 204))
+                );
+            }
         }
     }
 

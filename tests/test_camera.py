@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -414,6 +416,86 @@ class V4L2StreamTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "bad_frame")
         lossless_crop.assert_not_called()
+
+    def test_exact_frame_rate_negotiation(self) -> None:
+        cases = [
+            (30.0, (2, 61), None, None, False),
+            (30.0, (1001, 30000), None, None, False),
+            (30.0, (1001, 30030), None, None, True),
+            (30000 / 1001, (1001, 30000), None, None, True),
+            (30.0, (1, 30), errno.EINVAL, None, True),
+            (30.0, (1, 60), errno.EINVAL, None, False),
+            (30.0, (1, 30), errno.ENOTTY, errno.ENOTTY, False),
+        ]
+        get_parm = v4l2._ioc(v4l2._IOC_READ | v4l2._IOC_WRITE, 21, 204)
+        for fps, interval, set_error, get_error, accepted in cases:
+            with self.subTest(fps=fps, interval=interval, set_error=set_error, get_error=get_error):
+                fake = _FakeV4L2Device([])
+                requested = []
+
+                def ioctl(
+                    fd: int,
+                    request: int,
+                    payload: bytearray,
+                    *,
+                    fake=fake,
+                    requested=requested,
+                    set_error=set_error,
+                    get_error=get_error,
+                    interval=interval,
+                ) -> None:
+                    if request in (VIDIOC_S_PARM, get_parm):
+                        fake.ioctls.append(request)
+                        if request == VIDIOC_S_PARM:
+                            requested.append(struct.unpack_from("<II", payload, 12))
+                        error = set_error if request == VIDIOC_S_PARM else get_error
+                        if error is not None:
+                            raise OSError(error, "injected unavailable parameter ioctl")
+                        struct.pack_into("<II", payload, 12, *interval)
+                    else:
+                        fake.ioctl(fd, request, payload)
+
+                def open_stream(fps=fps, fake=fake, ioctl=ioctl) -> V4L2CameraStream:
+                    return V4L2CameraStream(
+                        "/dev/video-test",
+                        CameraMode(3840, 1080, fps, "mjpg"),
+                        ioctl=ioctl,
+                        mmap_factory=fake.mmap,
+                        open_file=lambda path, flags: 7,
+                        close_file=fake.closed_fds.append,
+                    )
+
+                if accepted:
+                    stream = open_stream()
+                    stream.close()
+                else:
+                    with self.assertRaises(CameraError) as raised:
+                        open_stream()
+                    self.assertEqual(raised.exception.code, "unsupported_mode")
+                    self.assertNotIn(VIDIOC_REQBUFS, fake.ioctls)
+                self.assertEqual(fake.closed_fds, [7])
+                if fps == 30000 / 1001:
+                    self.assertEqual(requested, [(1001, 30000)])
+                if set_error is not None:
+                    self.assertIn(get_parm, fake.ioctls)
+
+    def test_unrepresentable_requested_rate_is_rejected_before_stream_setup(self) -> None:
+        for fps in (float("nan"), float("inf"), 1e-12, 2**32, 30.000000000000004):
+            with self.subTest(fps=fps):
+                fake = _FakeV4L2Device([])
+                with self.assertRaises(CameraError) as raised:
+                    V4L2CameraStream(
+                        "/dev/video-test",
+                        CameraMode(3840, 1080, fps, "mjpg"),
+                        ioctl=fake.ioctl,
+                        mmap_factory=fake.mmap,
+                        open_file=lambda path, flags: 7,
+                        close_file=fake.closed_fds.append,
+                    )
+                self.assertEqual(raised.exception.code, "unsupported_mode")
+                self.assertEqual(fake.closed_fds, [7])
+                self.assertNotIn(VIDIOC_S_PARM, fake.ioctls)
+                self.assertNotIn(VIDIOC_REQBUFS, fake.ioctls)
 
     def test_mmap_lifecycle_sequence_timestamp_and_stereo_payload(self) -> None:
         fake = _FakeV4L2Device([self.SBS, self.SBS])

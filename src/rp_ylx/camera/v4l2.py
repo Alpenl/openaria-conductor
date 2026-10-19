@@ -15,6 +15,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from fractions import Fraction
 from pathlib import Path
 
 from rp_ylx.camera.models import (
@@ -48,6 +49,7 @@ def _ioc(direction: int, number: int, size: int) -> int:
 # These are the videodev2 ABI sizes for the target 64-bit Linux userspace (validated on RDK X5).
 VIDIOC_QUERYCAP = _ioc(_IOC_READ, 0, 104)
 VIDIOC_S_FMT = _ioc(_IOC_READ | _IOC_WRITE, 5, 208)
+VIDIOC_G_PARM = _ioc(_IOC_READ | _IOC_WRITE, 21, 204)
 VIDIOC_S_PARM = _ioc(_IOC_READ | _IOC_WRITE, 22, 204)
 VIDIOC_REQBUFS = _ioc(_IOC_READ | _IOC_WRITE, 8, 20)
 VIDIOC_QUERYBUF = _ioc(_IOC_READ | _IOC_WRITE, 9, 88)
@@ -401,22 +403,41 @@ class V4L2CameraStream:
 
         parm = bytearray(204)
         struct.pack_into("<I", parm, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
-        struct.pack_into("<II", parm, 12, 1, max(1, round(self._mode.fps)))
+        try:
+            rate = Fraction(self._mode.fps).limit_denominator(1_000_000)
+        except (ValueError, OverflowError) as exc:
+            raise CameraError("unsupported_mode", "V4L2 请求帧率必须有限且为正数") from exc
+        if not (
+            0 < rate.numerator <= 0xFFFFFFFF
+            and 0 < rate.denominator <= 0xFFFFFFFF
+            and float(rate) == self._mode.fps
+        ):
+            raise CameraError("unsupported_mode", "V4L2 请求帧率无法表示为有效帧周期")
+        struct.pack_into("<II", parm, 12, rate.denominator, rate.numerator)
         try:
             self._ioctl(fd, VIDIOC_S_PARM, parm)
         except OSError as exc:
             if exc.errno not in {errno.EINVAL, errno.ENOTTY}:
                 raise
-        else:
-            numerator, denominator = struct.unpack_from("<II", parm, 12)
-            if numerator <= 0 or denominator <= 0:
-                raise CameraError("unsupported_mode", "V4L2 驱动返回无效帧率")
-            actual_fps = denominator / numerator
-            if abs(actual_fps - self._mode.fps) > max(0.5, self._mode.fps * 0.02):
+            # Fixed-rate drivers can omit S_PARM; verify G_PARM rather than
+            # silently trusting the requested period in the rejected buffer.
+            parm = bytearray(204)
+            struct.pack_into("<I", parm, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
+            try:
+                self._ioctl(fd, VIDIOC_G_PARM, parm)
+            except OSError as read_error:
                 raise CameraError(
-                    "unsupported_mode",
-                    f"V4L2 驱动返回帧率 {actual_fps:g}，期望 {self._mode.fps:g}",
-                )
+                    "unsupported_mode", "V4L2 无法读回并确认实际帧周期"
+                ) from read_error
+        numerator, denominator = struct.unpack_from("<II", parm, 12)
+        if numerator <= 0 or denominator <= 0:
+            raise CameraError("unsupported_mode", "V4L2 驱动返回无效帧率")
+        if denominator * rate.denominator != numerator * rate.numerator:
+            raise CameraError(
+                "unsupported_mode",
+                f"V4L2 驱动返回帧周期 {numerator}/{denominator}s，"
+                f"期望 {rate.denominator}/{rate.numerator}s",
+            )
 
         request = bytearray(20)
         struct.pack_into(

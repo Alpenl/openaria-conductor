@@ -647,6 +647,15 @@ class CaptureSourcesTest(unittest.TestCase):
         )
         self.assertEqual(preview_payloads, [f"left-{index}".encode() for index in range(6)])
 
+    def test_native_source_rejects_rate_rounding_before_opening_devices(self) -> None:
+        for fps in (60.01, 29.99, 30.000000000000004, float("nan"), float("inf"), 2**32):
+            with self.subTest(fps=fps), self.assertRaisesRegex(ValueError, "整数帧率"):
+                NativeContinuousCaptureSources(
+                    "/dev/not-opened",
+                    CameraMode(3840, 1080, fps, "mjpg"),
+                    preview=SimpleNamespace(native_owner=object()),
+                )
+
     def test_native_capture_engine_receives_one_immutable_plan(self) -> None:
         engine = FakeNativeCaptureEngine()
         native_preview = object()

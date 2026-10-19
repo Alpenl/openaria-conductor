@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
 from contextlib import suppress
@@ -76,8 +77,11 @@ class NativeContinuousCaptureSources:
             raise ValueError("采集来源 frame_decimation 必须大于零")
         if buffer_count <= 0 or queue_capacity <= 0:
             raise ValueError("原生采集 buffer_count 和 queue_capacity 必须大于零")
-        rounded_fps = round(camera_mode.fps)
-        if abs(camera_mode.fps - rounded_fps) > max(0.01, camera_mode.fps * 0.001):
+        if (
+            not math.isfinite(camera_mode.fps)
+            or not 0 < camera_mode.fps <= 0xFFFFFFFF
+            or camera_mode.fps != int(camera_mode.fps)
+        ):
             raise ValueError("原生连续采集只接受整数帧率")
         self._device = device
         self._camera_mode = camera_mode
@@ -140,13 +144,12 @@ class NativeContinuousCaptureSources:
         native_preview = self._preview.native_owner
         if native_preview is None:
             raise RuntimeError("正式连续采集需要 Rust preview buffer")
-        rounded_fps = round(self._camera_mode.fps)
         self.exposure_readback = configure_exposure(self._device, self._exposure_time_absolute)
         plan = NativeCapturePlan(
             device=self._device,
             width=self._camera_mode.width,
             height=self._camera_mode.height,
-            fps=rounded_fps,
+            fps=int(self._camera_mode.fps),
             encoding=self._camera_mode.encoding,
             buffer_count=self._buffer_count,
             queue_capacity=self._queue_capacity,
