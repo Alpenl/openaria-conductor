@@ -14,7 +14,7 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from functools import cache
@@ -227,7 +227,9 @@ class StateDatabase:
         return value
 
     def capture_state(self) -> dict[str, Any]:
-        value = self.get("capture") or {}
+        value = self.get("capture")
+        if value is None:
+            raise PersistenceError("missing authoritative document: capture")
         if "commands" not in value:
             with self.connection() as db:
                 value["commands"] = [
@@ -272,6 +274,8 @@ class StateDatabase:
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT body,revision FROM documents WHERE name='capture'").fetchone()
+            if old is None and db.execute("SELECT 1 FROM imports WHERE name='capture'").fetchone():
+                raise PersistenceError("missing authoritative document: capture")
             if old is None or body != old[0]:
                 revision = 1 if old is None else old[1] + 1
                 db.execute(
@@ -299,6 +303,8 @@ class StateDatabase:
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT body,revision FROM documents WHERE name=?", (name,)).fetchone()
+            if old is None and db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
+                raise PersistenceError(f"missing authoritative document: {name}")
             if old is not None and old[0] == body:
                 return
             revision = 1 if old is None else old[1] + 1
@@ -314,23 +320,35 @@ class StateDatabase:
                     (name, revision, body, now),
                 )
 
-    def import_json(self, name: str, source: Path, *, validate=None) -> dict[str, Any] | None:
-        """Import only once; retain source bytes as legacy evidence, never a live mirror."""
+    def import_json(
+        self,
+        name: str,
+        source: Path,
+        *,
+        validate=None,
+        default_factory: Callable[[], Mapping[str, Any]] = dict,
+    ) -> dict[str, Any]:
+        """Commit the first state and receipt together; never reset a missing authority."""
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT body FROM documents WHERE name=?", (name,)).fetchone()
             if row is not None:
                 return json.loads(row[0])
             if db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
-                return None
-            value = None
+                raise PersistenceError(f"missing authoritative document: {name}")
+            raw = None
             if source.exists():
                 raw = source.read_bytes()
                 value = json.loads(raw)
-                if not isinstance(value, dict):
-                    raise PersistenceError(f"legacy state must be an object: {source}")
-                if validate is not None:
-                    validate(value)
+            else:
+                value = default_factory()
+            if not isinstance(value, Mapping):
+                raise PersistenceError(f"initial state must be an object: {name}")
+            value = dict(value)
+            if validate is not None:
+                validate(value)
+            body = _json(value)
+            if raw is not None:
                 backup = source.with_suffix(source.suffix + ".pre-sqlite")
                 if not backup.exists():
                     fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -339,10 +357,10 @@ class StateDatabase:
                         stream.flush()
                         os.fsync(stream.fileno())
                     _sync_parent(backup)
-                db.execute(
-                    "INSERT INTO documents VALUES (?,?,1,?)",
-                    (name, _json(value), datetime.now(UTC).isoformat()),
-                )
+            db.execute(
+                "INSERT INTO documents VALUES (?,?,1,?)",
+                (name, body, datetime.now(UTC).isoformat()),
+            )
             db.execute("INSERT INTO imports VALUES (?,?)", (name, str(source)))
             return value
 

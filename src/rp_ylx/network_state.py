@@ -352,42 +352,40 @@ class NetworkStateStore:
             migrated.setdefault("rescue_boot_id", None)
             self._validate(migrated)
 
-        self._database.import_json("controller", self._path, validate=validate_import)
+        def initial_state():
+            desired = _desired_state_from_disk(self._state_dir)
+            saved = desired.get("mode") == "wifi-client"
+            return {
+                "schema": CONTROLLER_STATE_SCHEMA,
+                "authority_epoch": str(uuid.uuid4()),
+                "source_revision": 0,
+                "saved": saved,
+                "verified": saved,
+                "desired": desired,
+                "transaction": {"current": None, "latest": None},
+                "receipts": {},
+                "work": {},
+                "execution_release": {},
+                "rescue_boot_id": None,
+            }
+
         with self._thread_lock, _network_lock(self._state_dir):
-            state = self._database.get("controller")
-            if state is None:
-                desired = _desired_state_from_disk(self._state_dir)
-                saved = desired.get("mode") == "wifi-client"
-                state = {
-                    "schema": CONTROLLER_STATE_SCHEMA,
-                    "authority_epoch": str(uuid.uuid4()),
-                    "source_revision": 0,
-                    "saved": saved,
-                    "verified": saved,
-                    "desired": desired,
-                    "transaction": {"current": None, "latest": None},
-                    "receipts": {},
-                    "work": {},
-                    "execution_release": {},
-                    "rescue_boot_id": None,
-                }
+            state = self._database.import_json(
+                "controller", self._path, validate=validate_import, default_factory=initial_state
+            )
+            migrated = False
+            if "execution_release" not in state:
+                current = state.get("transaction", {}).get("current")
+                state["execution_release"] = (
+                    {str(current["transaction_id"]): True} if isinstance(current, Mapping) else {}
+                )
+                migrated = True
+            if "rescue_boot_id" not in state:
+                state["rescue_boot_id"] = None
+                migrated = True
+            if migrated:
+                self._validate(state)
                 self._write_locked(state)
-            else:
-                migrated = False
-                if "execution_release" not in state:
-                    current = state.get("transaction", {}).get("current")
-                    state["execution_release"] = (
-                        {str(current["transaction_id"]): True}
-                        if isinstance(current, Mapping)
-                        else {}
-                    )
-                    migrated = True
-                if "rescue_boot_id" not in state:
-                    state["rescue_boot_id"] = None
-                    migrated = True
-                if migrated:
-                    self._validate(state)
-                    self._write_locked(state)
             self._validate(state)
 
     @staticmethod
