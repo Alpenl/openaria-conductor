@@ -14,6 +14,7 @@ import selectors
 import subprocess
 import time
 import wave
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -223,19 +224,21 @@ def compact_manifest(
             raise ValueError("metadata compaction did not preserve the sealed source")
         return target, compression, relative, audio
 
-    # Two bounded workers overlap codec startup / disk waits. All descriptor
-    # mutation and finalization stays on the calling thread. Originals survive
-    # any failure, and executor shutdown joins outstanding work before recovery.
+    # Keep at most two results pending admission. Unlike eager Executor.map,
+    # this cannot queue the whole recording before seeing the first failure.
+    # Refill after ordered caller-side admission so a slow file does not stall
+    # both workers, while a failed finalizer/progress callback submits no more.
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="lossless-seal") as executor:
-        for completed, (descriptor, result) in enumerate(
-            zip(descriptors, executor.map(compact, descriptors), strict=True), 1
-        ):
-            target, compression, relative, audio = result
+        pending = deque(executor.submit(compact, descriptor) for descriptor in descriptors[:2])
+        for completed, descriptor in enumerate(descriptors, 1):
+            target, compression, relative, audio = pending.popleft().result()
             descriptor.update(finalize(target))
             descriptor["media_type"] = "audio/flac" if audio else "application/zstd"
             descriptor["storage_encoding"] = compression
             originals.append(relative)
             if progress is not None:
                 progress(completed, len(descriptors))
+            if completed + 1 < len(descriptors):
+                pending.append(executor.submit(compact, descriptors[completed + 1]))
     manifest["schema"] = "ylx.device-session.v4"
     return manifest, originals

@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -2675,9 +2676,20 @@ def validate_device_session_directory(
                 with ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="session-verify"
                 ) as executor:
-                    for completed, _ in enumerate(executor.map(verify_artifact, descriptors), 1):
+                    # Keep queued reads bounded too. A bad digest or failed
+                    # progress callback must not enqueue the entire recording.
+                    pending = deque(
+                        executor.submit(verify_artifact, descriptor)
+                        for descriptor in descriptors[:2]
+                    )
+                    for completed in range(1, len(descriptors) + 1):
+                        pending.popleft().result()
                         if progress is not None:
                             progress(completed, len(descriptors))
+                        if completed + 1 < len(descriptors):
+                            pending.append(
+                                executor.submit(verify_artifact, descriptors[completed + 1])
+                            )
             return manifest
         finally:
             os.close(root_fd)
