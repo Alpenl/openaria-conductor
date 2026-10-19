@@ -35,6 +35,8 @@ from rp_ylx.recording.device_session import (
     write_json_atomic,
 )
 from rp_ylx.recording.encoding import RecordingEncoding
+from rp_ylx.recording.verified import VerifiedArtifact
+from rp_ylx.recording.verified import identity as verified_identity
 
 RECOVERY_ROLE = "log.recording-recovery"
 
@@ -63,8 +65,22 @@ def _read_json(root: Path, relative: str) -> dict:
     return value
 
 
-def _artifact(root: Path, relative: str, role: str, media_type: str) -> dict:
-    finalized = _finalize_artifact(_regular(root, relative), None, code="recovery_invalid")
+def _artifact(
+    root: Path,
+    relative: str,
+    role: str,
+    media_type: str,
+    *,
+    verified: dict[str, VerifiedArtifact] | None = None,
+) -> dict:
+    path = _regular(root, relative)
+    before = None if verified is None else verified_identity(path.stat(follow_symlinks=False))
+    finalized = _finalize_artifact(path, None, code="recovery_invalid")
+    if verified is not None:
+        assert before is not None
+        if verified_identity(path.stat(follow_symlinks=False)) != before:
+            raise ValueError("recovery artifact changed during independent readback")
+        verified[relative] = VerifiedArtifact(before, finalized.sha256)
     return {
         "artifact_id": finalized.sha256,
         "sha256": finalized.sha256,
@@ -198,7 +214,14 @@ def _frames(
         temporary.unlink(missing_ok=True)
 
 
-def _audio(root: Path, config: DeviceSessionConfig, origin: int, video_end: float) -> dict | None:
+def _audio(
+    root: Path,
+    config: DeviceSessionConfig,
+    origin: int,
+    video_end: float,
+    *,
+    verified: dict[str, VerifiedArtifact] | None = None,
+) -> dict | None:
     """Use sealed PCM and hardware clock observations; never invent silence."""
     if not config.audio_enabled:
         return None
@@ -265,7 +288,9 @@ def _audio(root: Path, config: DeviceSessionConfig, origin: int, video_end: floa
                     "end_time_seconds": (samples + selected) / rate,
                     "pcm_payload_bytes": selected * channels * 2,
                     "wav_header_bytes": 44,
-                    "artifact": _artifact(root, relative, "audio.wav", "audio/wav"),
+                    "artifact": _artifact(
+                        root, relative, "audio.wav", "audio/wav", verified=verified
+                    ),
                 }
             )
             samples += selected
@@ -352,6 +377,9 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
     final = partial.parent / plan.session_id
     if final.exists():
         raise ValueError("recovery target already exists")
+    # Every proof starts with an independent full read in this invocation. Never
+    # trust a checkpoint's digest or a prior attempt as proof of current bytes.
+    verified: dict[str, VerifiedArtifact] = {}
     segments = []
     end = 0
     for record in checkpoint["segments"]:
@@ -365,7 +393,9 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                 break
             for eye in ("left", "right"):
                 descriptor = record["artifacts"][eye]
-                actual = _artifact(partial, descriptor["path"], f"video.{eye}", "video/mp4")
+                actual = _artifact(
+                    partial, descriptor["path"], f"video.{eye}", "video/mp4", verified=verified
+                )
                 if actual != descriptor:
                     raise ValueError("committed segment digest mismatch")
             segments.append(record)
@@ -399,7 +429,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
     imu_count = _write_records(recovery / "imu.ndjson", imu_prefix())
     audio_error = None
     try:
-        audio = _audio(partial, config, origin, video_end)
+        audio = _audio(partial, config, origin, video_end, verified=verified)
         if audio is not None:
             audio_clock_report(
                 audio,
@@ -445,10 +475,10 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         recorder._started_at + timedelta(seconds=duration), now, now, duration
     )
     manifest["frames"]["artifact"] = _artifact(
-        partial, "recovery/frames.ndjson", "frames.index", "application/x-ndjson"
+        partial, "recovery/frames.ndjson", "frames.index", "application/x-ndjson", verified=verified
     )
     manifest["imu"]["artifact"] = _artifact(
-        partial, "recovery/imu.ndjson", "imu.samples", "application/x-ndjson"
+        partial, "recovery/imu.ndjson", "imu.samples", "application/x-ndjson", verified=verified
     )
     if audio is not None:
         manifest["audio"] = audio
@@ -481,10 +511,18 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
     }
     write_json_atomic(recovery / "interruption.json", receipt)
     manifest["logs"] = [
-        _artifact(partial, "recovery/interruption.json", RECOVERY_ROLE, "application/json")
+        _artifact(
+            partial,
+            "recovery/interruption.json",
+            RECOVERY_ROLE,
+            "application/json",
+            verified=verified,
+        )
     ]
     write_json_atomic(partial / "manifest.json", manifest)
-    validate_device_session_directory(partial, expected_session_id=plan.session_id)
+    validate_device_session_directory(
+        partial, expected_session_id=plan.session_id, verified_artifacts=verified
+    )
     # Archive controls only after the independent validator accepts every byte.
     # If power fails here, startup can finish the ordinary publish transaction.
     for name in ("capture.json", "recording.json"):

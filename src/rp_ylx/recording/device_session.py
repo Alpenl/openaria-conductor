@@ -2559,9 +2559,10 @@ def validate_device_session_directory(
     interrupt_check: Callable[[], None] | None = None,
     verified_artifacts: Mapping[str, VerifiedArtifact] | None = None,
 ) -> Mapping[str, object]:
-    """校验 manifest 和所有 artifact；仅本次录制的独立读回证明可复用。
+    """校验 manifest 和所有 artifact；仅本次封存/恢复的独立读回证明可复用。
 
-    CLI、恢复和历史会话均不提供缓存，仍逐字节读取。缓存从不从磁盘加载。
+    CLI和历史会话不提供缓存，仍逐字节读取。恢复证明也必须在本次调用中
+    完整读回后新建，且包括ctime的文件身份保持不变；缓存从不从磁盘加载。
     """
 
     root = Path(path)

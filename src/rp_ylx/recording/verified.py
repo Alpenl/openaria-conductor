@@ -1,6 +1,6 @@
 """Reuse independent reads of closed files, only while their exact identity holds.
 
-This cache is private to one live recorder. It is never loaded from a manifest,
+This cache is private to one live recorder or recovery attempt. It is never loaded from a manifest,
 checkpoint or disk. A changed ctime, link count, inode or digest forces a new
 full read, including changes that restore the original mtime.
 """

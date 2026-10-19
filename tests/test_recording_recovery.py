@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import rp_ylx.recording.device_session as session_module
+import rp_ylx.recording.recovery as recovery_module
 from rp_ylx.audio_clock import audio_clock_report
 from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.recording.coordinator import (
@@ -27,6 +29,112 @@ from tests import test_split_eye_recording as fixtures
 
 
 class RecordingRecoveryTests(unittest.TestCase):
+    def test_recovery_readback_proof_rejects_change_during_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "artifact.bin"
+            path.write_bytes(b"original")
+            metadata = path.stat()
+            finalize = recovery_module._finalize_artifact
+            verified = {}
+
+            def mutate_after_read(*args, **kwargs):
+                result = finalize(*args, **kwargs)
+                path.write_bytes(b"modified")
+                os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                return result
+
+            with (
+                patch.object(recovery_module, "_finalize_artifact", side_effect=mutate_after_read),
+                self.assertRaisesRegex(ValueError, "changed during independent readback"),
+            ):
+                recovery_module._artifact(
+                    root, path.name, "test", "application/octet-stream", verified=verified
+                )
+            self.assertEqual(verified, {})
+
+    def test_recovery_reuses_only_its_own_fresh_readbacks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            with (
+                patch.object(
+                    recovery_module, "_finalize_artifact", wraps=recovery_module._finalize_artifact
+                ) as reads,
+                patch.object(
+                    session_module, "_verify_artifact_fd", wraps=session_module._verify_artifact_fd
+                ) as rereads,
+            ):
+                recovered = recover_device_session(recorder.partial_path)
+            self.assertIsNotNone(recovered)
+            paths = [call.args[0] for call in reads.call_args_list]
+            self.assertIn(recorder.partial_path / "video/left_00000.mp4", paths)
+            self.assertIn(recorder.partial_path / "recovery/imu.ndjson", paths)
+            self.assertEqual(rereads.call_count, 0)
+            # A later standalone validation never inherits the recovery proofs.
+            with patch.object(
+                session_module, "_verify_artifact_fd", wraps=session_module._verify_artifact_fd
+            ) as later:
+                validate_device_session_directory(recovered.path)
+            self.assertGreater(later.call_count, 0)
+
+    def test_recovery_rejects_changes_after_independent_readback(self):
+        for mutation in ("same_size_restored_mtime", "replacement", "symlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                partial = recorder.partial_path
+                target = partial / "video/left_00000.mp4"
+                original = target.read_bytes()
+                metadata = target.stat()
+                validate = recovery_module.validate_device_session_directory
+
+                def mutate_then_validate(
+                    *args,
+                    mutation=mutation,
+                    target=target,
+                    original=original,
+                    metadata=metadata,
+                    validate=validate,
+                    **kwargs,
+                ):
+                    if mutation == "same_size_restored_mtime":
+                        target.write_bytes(b"x" * len(original))
+                        os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    elif mutation == "replacement":
+                        alternate = target.with_suffix(".replaced")
+                        alternate.write_bytes(b"x" * len(original))
+                        os.replace(alternate, target)
+                        os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    else:
+                        alternate = target.with_suffix(".original")
+                        target.rename(alternate)
+                        target.symlink_to(alternate.name)
+                    return validate(*args, **kwargs)
+
+                with (
+                    patch.object(
+                        recovery_module,
+                        "validate_device_session_directory",
+                        side_effect=mutate_then_validate,
+                    ),
+                    self.assertRaises((session_module.DeviceRecordingError, ValueError)),
+                ):
+                    recover_device_session(partial)
+                self.assertTrue(partial.exists())
+                self.assertFalse((partial.parent / recorder._plan.session_id).exists())
+
+    def test_recovery_hardlinked_artifact_is_not_published(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            target = recorder.partial_path / "video/left_00000.mp4"
+            os.link(target, target.with_suffix(".link"))
+            try:
+                recovered = recover_device_session(recorder.partial_path)
+            except (session_module.DeviceRecordingError, ValueError):
+                recovered = None
+            self.assertIsNone(recovered)
+            self.assertTrue(recorder.partial_path.exists())
+            self.assertFalse((recorder.partial_path.parent / recorder._plan.session_id).exists())
+
     def test_failed_imu_spool_preserves_prior_output_and_releases_temporary_space(self):
         for failure in ("iterator", "interrupt", "short_write", "fsync", "replace"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
