@@ -661,6 +661,9 @@ class DirectorySessionStore:
         except OSError as error:
             _close_all(owned)
             raise ArtifactAccessError("not_found", "会话不存在或尚未封存") from error
+        except BaseException:
+            _close_all(owned)
+            raise
 
     def manifest_identity(
         self, session_id: str, *, expected_sha256: str | None = None
@@ -696,6 +699,9 @@ class DirectorySessionStore:
         except OSError as error:
             _close_all(owned)
             raise ArtifactAccessError("not_found", "会话不存在或尚未封存") from error
+        except BaseException:
+            _close_all(owned)
+            raise
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedManifest:
         owned, manifest_descriptor, identity, payload = self._open_manifest_bytes(session_id)
@@ -709,7 +715,7 @@ class DirectorySessionStore:
                 manifest_sha256=manifest_sha256,
                 payload=payload,
             )
-        except ArtifactAccessError:
+        except BaseException:
             _close_all(owned)
             raise
 
@@ -871,7 +877,7 @@ def _open_absolute_directory(path: str | Path) -> int:
             os.close(current)
             current = following
         return current
-    except Exception:
+    except BaseException:
         os.close(current)
         raise
 
@@ -903,7 +909,7 @@ def _open_regular_component(component: str, parent_descriptor: int) -> int:
     try:
         _FileIdentity.read(descriptor)
         return descriptor
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
 
@@ -922,7 +928,7 @@ def _open_relative_regular(path: str, session_descriptor: int) -> int:
         result = _open_regular_component(components[-1], current)
         os.close(current)
         return result
-    except Exception:
+    except BaseException:
         os.close(current)
         raise
 
@@ -1026,21 +1032,28 @@ def _decode_and_validate_manifest(
             object_pairs_hook=_unique_object,
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
         )
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    except (ValueError, RecursionError) as error:
         raise ArtifactAccessError("not_found", "会话 manifest 无效") from error
     if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
         raise ArtifactAccessError("not_found", "会话 manifest 身份不匹配")
     schema = manifest.get("schema")
-    is_device_session = schema in _DEVICE_SESSION_SCHEMA_IDS and manifest.get("sealed") is True
+    is_device_session = (
+        isinstance(schema, str)
+        and schema in _DEVICE_SESSION_SCHEMA_IDS
+        and manifest.get("sealed") is True
+    )
     is_v0 = (
         manifest.get("format") == "ylx.recording-session.v0" and manifest.get("state") == "sealed"
     )
     if not is_device_session and not (api_version == "v2" and is_v0):
         raise ArtifactAccessError("not_found", "会话不存在或尚未封存")
-    if is_device_session:
-        _validate_device_session_manifest(manifest)
-    else:
-        _validate_recording_session_v0(manifest)
+    try:
+        if is_device_session:
+            _validate_device_session_manifest(manifest)
+        else:
+            _validate_recording_session_v0(manifest)
+    except RecursionError as error:
+        raise ArtifactAccessError("not_verified", "manifest 嵌套结构过深") from error
     return manifest
 
 
@@ -1226,6 +1239,8 @@ def _validate_device_session_v2(manifest: Mapping[str, object]) -> None:
 
 def _validate_device_session_manifest(manifest: Mapping[str, object]) -> None:
     schema = manifest.get("schema")
+    if not isinstance(schema, str):
+        raise ArtifactAccessError("not_verified", "manifest schema 必须是字符串")
     if schema == _DEVICE_SESSION_V1_SCHEMA_ID:
         _validate_device_session_v1(manifest)
         return
