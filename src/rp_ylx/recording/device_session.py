@@ -1774,51 +1774,61 @@ class DeviceSessionRecorder:
         proofs = {}
         identities = {}
         audio_bytes = 0
-        # At most two reads are submitted at a time. Workers only return data;
+        # Keep at most two unconsumed reads, replenishing after ordered assembly.
+        # A stalled read must not impose a separate two-file batch barrier.
+        # Workers only return data;
         # ordered assembly and recorder mutation remain on the calling thread.
         # The context joins both workers even if a read or assembly fails.
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-inventory") as pool:
-            for offset in range(0, len(inventory), 2):
-                batch = inventory[offset : offset + 2]
-                futures = [
-                    pool.submit(
-                        _verified_finalization,
-                        self._partial / segment[3],
-                        None,
-                        code="audio_invalid",
+            pending = deque(
+                pool.submit(
+                    _verified_finalization,
+                    self._partial / segment[3],
+                    None,
+                    code="audio_invalid",
+                )
+                for segment in inventory[:2]
+            )
+            for offset, segment in enumerate(inventory):
+                future = pending.popleft()
+                index, start_sample, end_sample, relative, raw_segment = segment
+                finalized, proof = future.result()
+                pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
+                wav_header_bytes = finalized.bytes - pcm_payload_bytes
+                if wav_header_bytes < 44 or wav_header_bytes > 65_536:
+                    raise DeviceRecordingError(
+                        "audio_invalid", "音频 WAV header 与采样字节数不一致"
                     )
-                    for segment in batch
-                ]
-                for segment, future in zip(batch, futures, strict=True):
-                    index, start_sample, end_sample, relative, raw_segment = segment
-                    finalized, proof = future.result()
-                    pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
-                    wav_header_bytes = finalized.bytes - pcm_payload_bytes
-                    if wav_header_bytes < 44 or wav_header_bytes > 65_536:
-                        raise DeviceRecordingError(
-                            "audio_invalid", "音频 WAV header 与采样字节数不一致"
+                identities[relative] = finalized.identity
+                proofs[relative] = proof
+                audio_bytes += finalized.bytes
+                records.append(
+                    {
+                        "index": index,
+                        "start_sample": start_sample,
+                        "end_sample": end_sample,
+                        "start_time_seconds": float(raw_segment["start_time_seconds"]),
+                        "end_time_seconds": float(raw_segment["end_time_seconds"]),
+                        "pcm_payload_bytes": pcm_payload_bytes,
+                        "wav_header_bytes": wav_header_bytes,
+                        "artifact": {
+                            "artifact_id": finalized.sha256,
+                            "role": "audio.wav",
+                            "path": relative,
+                            "media_type": "audio/wav",
+                            "bytes": finalized.bytes,
+                            "sha256": finalized.sha256,
+                        },
+                    }
+                )
+                if offset + 2 < len(inventory):
+                    pending.append(
+                        pool.submit(
+                            _verified_finalization,
+                            self._partial / inventory[offset + 2][3],
+                            None,
+                            code="audio_invalid",
                         )
-                    identities[relative] = finalized.identity
-                    proofs[relative] = proof
-                    audio_bytes += finalized.bytes
-                    records.append(
-                        {
-                            "index": index,
-                            "start_sample": start_sample,
-                            "end_sample": end_sample,
-                            "start_time_seconds": float(raw_segment["start_time_seconds"]),
-                            "end_time_seconds": float(raw_segment["end_time_seconds"]),
-                            "pcm_payload_bytes": pcm_payload_bytes,
-                            "wav_header_bytes": wav_header_bytes,
-                            "artifact": {
-                                "artifact_id": finalized.sha256,
-                                "role": "audio.wav",
-                                "path": relative,
-                                "media_type": "audio/wav",
-                                "bytes": finalized.bytes,
-                                "sha256": finalized.sha256,
-                            },
-                        }
                     )
         # Publish only a complete inventory; failures leave existing state intact.
         self._audio_result = dict(result)
