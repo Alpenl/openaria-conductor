@@ -50,6 +50,9 @@ class HobotThreadStartTests(unittest.TestCase):
 #include <unistd.h>
 #include "ylx_stereo_pipeline.h"
 static int fail_thread, create_calls, join_calls, live_mutexes, live_conditions;
+static int fail_init, init_calls;
+static pthread_mutex_t *mutexes[8];
+static pthread_cond_t *conditions[8];
 static int fail_codec, codec_calls, codecs_started, codecs_stopped, next_encoder;
 static atomic_int live_workers;
 static pthread_t created[6];
@@ -66,16 +69,39 @@ static int checked_join(pthread_t thread,void **result) {
     assert(known==1);join_calls++;return pthread_join(thread,result);
 }
 static int checked_mutex_init(pthread_mutex_t *lock,const pthread_mutexattr_t *attr) {
-    int result=pthread_mutex_init(lock,attr);assert(result==0);live_mutexes++;return result;
+    if(++init_calls==fail_init)return EAGAIN;
+    int result=pthread_mutex_init(lock,attr);assert(result==0);
+    for(int i=0;i<8;i++)if(!mutexes[i]){mutexes[i]=lock;live_mutexes++;return result;}
+    abort();
+}
+static int mutex_slot(pthread_mutex_t *lock) {
+    for(int i=0;i<8;i++)if(mutexes[i]==lock)return i;
+    assert(!"using uninitialized mutex");abort();
+}
+static int cond_slot(pthread_cond_t *condition) {
+    for(int i=0;i<8;i++)if(conditions[i]==condition)return i;
+    assert(!"using uninitialized condition");abort();
 }
 static int checked_mutex_destroy(pthread_mutex_t *lock) {
-    int result=pthread_mutex_destroy(lock);assert(result==0);live_mutexes--;return result;
+    int slot=mutex_slot(lock);
+    int result=pthread_mutex_destroy(lock);assert(result==0);mutexes[slot]=NULL;live_mutexes--;return result;
 }
 static int checked_cond_init(pthread_cond_t *condition,const pthread_condattr_t *attr) {
-    int result=pthread_cond_init(condition,attr);assert(result==0);live_conditions++;return result;
+    if(++init_calls==fail_init)return EAGAIN;
+    int result=pthread_cond_init(condition,attr);assert(result==0);
+    for(int i=0;i<8;i++)if(!conditions[i]){conditions[i]=condition;live_conditions++;return result;}
+    abort();
 }
 static int checked_cond_destroy(pthread_cond_t *condition) {
-    int result=pthread_cond_destroy(condition);assert(result==0);live_conditions--;return result;
+    int slot=cond_slot(condition);
+    int result=pthread_cond_destroy(condition);assert(result==0);conditions[slot]=NULL;live_conditions--;return result;
+}
+static int checked_mutex_lock(pthread_mutex_t *lock) {(void)mutex_slot(lock);return pthread_mutex_lock(lock);}
+static int checked_mutex_unlock(pthread_mutex_t *lock) {(void)mutex_slot(lock);return pthread_mutex_unlock(lock);}
+static int checked_cond_signal(pthread_cond_t *condition) {(void)cond_slot(condition);return pthread_cond_signal(condition);}
+static int checked_cond_broadcast(pthread_cond_t *condition) {(void)cond_slot(condition);return pthread_cond_broadcast(condition);}
+static int checked_cond_wait(pthread_cond_t *condition,pthread_mutex_t *lock) {
+    (void)cond_slot(condition);(void)mutex_slot(lock);return pthread_cond_wait(condition,lock);
 }
 #define pthread_create checked_create
 #define pthread_join checked_join
@@ -83,6 +109,11 @@ static int checked_cond_destroy(pthread_cond_t *condition) {
 #define pthread_mutex_destroy checked_mutex_destroy
 #define pthread_cond_init checked_cond_init
 #define pthread_cond_destroy checked_cond_destroy
+#define pthread_mutex_lock checked_mutex_lock
+#define pthread_mutex_unlock checked_mutex_unlock
+#define pthread_cond_signal checked_cond_signal
+#define pthread_cond_broadcast checked_cond_broadcast
+#define pthread_cond_wait checked_cond_wait
 #include "ylx_packet_queue.h"
 typedef struct {int id;} media_codec_context_t;
 typedef struct {int unused;} media_muxer_context_t;
@@ -127,6 +158,7 @@ int main(int argc,char **argv) {
     assert(argc==2);int test=atoi(argv[1]);
     if(test>0 && test<7)fail_thread=test;
     if(test<0)fail_codec=-test;
+    if(test>=101 && test<=108)fail_init=test-100;
     ylx_pipeline_config_t config={.sbs_width=3840,.height=1080,.fps=30,.bitrate_kbps=12288,
         .hevc=1,.rate_control=0,.intra_period=30,.min_qp=18,.max_qp=32,.intra_qp=20,
         .initial_qp=22,.vbv_ms=3000,.segment_frames=150,.out_dir="unused"};
@@ -145,6 +177,10 @@ int main(int argc,char **argv) {
             assert(join_calls==fail_thread-1);
         }
         if(fail_codec)assert(strstr(error,"unavailable") && create_calls==0);
+        if(fail_init) {
+            assert(strstr(error,"sync_init_failed") && init_calls==fail_init);
+            assert(create_calls==0 && codec_calls==0);
+        }
         if(test==99)assert(strstr(error,"invalid_configuration") && create_calls==0);
     }
     assert(codecs_started==codecs_stopped);
@@ -184,6 +220,11 @@ int main(int argc,char **argv) {
 
     def test_invalid_configuration_clears_output_without_starting_resources(self):
         self.run_case(99)
+
+    def test_each_synchronization_init_failure_avoids_invalid_use_and_leaks(self):
+        for number in range(1, 9):
+            with self.subTest(initializer=number):
+                self.run_case(100 + number)
 
 
 if __name__ == "__main__":

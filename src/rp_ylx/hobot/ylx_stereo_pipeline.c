@@ -70,6 +70,8 @@ struct ylx_pipeline {
     eye_t eyes[YLX_EYES];
     pthread_t split_thread;
     int decoder_started, split_started, closer_started;
+    int ledger_initialized, error_initialized;
+    int closer_lock_initialized, closer_signal_initialized;
 
     ylx_segment_closed_fn on_segment;
     void *user;
@@ -921,22 +923,36 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     pipeline->segment_frames = config->segment_frames;
     pipeline->on_segment = on_segment;
     pipeline->user = user;
-    pthread_mutex_init(&pipeline->ledger_lock, NULL);
-    pthread_mutex_init(&pipeline->error_lock, NULL);
-    pthread_mutex_init(&pipeline->closer_lock, NULL);
-    pthread_cond_init(&pipeline->closer_signal, NULL);
+    const char *resource = "ledger lock";
+    int ret = pthread_mutex_init(&pipeline->ledger_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->ledger_initialized = 1;
+    resource = "error lock";
+    ret = pthread_mutex_init(&pipeline->error_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->error_initialized = 1;
+    resource = "closer lock";
+    ret = pthread_mutex_init(&pipeline->closer_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->closer_lock_initialized = 1;
+    resource = "closer condition";
+    ret = pthread_cond_init(&pipeline->closer_signal, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->closer_signal_initialized = 1;
 
     /* Complete shared queue setup before any worker can observe an eye. */
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
         pipeline->eyes[eye].pipeline = pipeline;
         pipeline->eyes[eye].eye = eye;
-        ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
-                             config->fps * MUX_QUEUE_SECONDS);
+        resource = eye == 0 ? "left queue" : "right queue";
+        ret = ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
+                                    config->fps * MUX_QUEUE_SECONDS);
+        if (ret != 0) goto sync_failed;
         pipeline->eyes[eye].packets_initialized = 1;
     }
 
     configure_decoder(&pipeline->decoder, &pipeline->config);
-    int ret = codec_start(&pipeline->decoder);
+    ret = codec_start(&pipeline->decoder);
     if (ret != 0) {
         snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
         goto open_failed;
@@ -981,6 +997,9 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
 
 thread_failed:
     snprintf(error, error_len, "thread_start_failed: %s (%d)", worker, ret);
+    goto open_failed;
+sync_failed:
+    snprintf(error, error_len, "sync_init_failed: %s (%d)", resource, ret);
 open_failed:
     atomic_store(&pipeline->failed, 1);
     ylx_pipeline_close(pipeline);
@@ -1046,11 +1065,13 @@ int ylx_pipeline_finish(ylx_pipeline_t *pipeline)
         if (pipeline->eyes[eye].writer_started) pthread_join(pipeline->eyes[eye].writer_thread, NULL);
     }
     /* Only once both eyes stopped queueing can the closer drain to empty. */
-    pthread_mutex_lock(&pipeline->closer_lock);
-    pipeline->closer_stop = 1;
-    pthread_cond_signal(&pipeline->closer_signal);
-    pthread_mutex_unlock(&pipeline->closer_lock);
-    if (pipeline->closer_started) pthread_join(pipeline->closer_thread, NULL);
+    if (pipeline->closer_started) {
+        pthread_mutex_lock(&pipeline->closer_lock);
+        pipeline->closer_stop = 1;
+        pthread_cond_signal(&pipeline->closer_signal);
+        pthread_mutex_unlock(&pipeline->closer_lock);
+        pthread_join(pipeline->closer_thread, NULL);
+    }
     return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
 }
 
@@ -1070,10 +1091,10 @@ void ylx_pipeline_close(ylx_pipeline_t *pipeline)
         free(pair);
     }
     if (pipeline->decoder_started) codec_stop(&pipeline->decoder);
-    pthread_mutex_destroy(&pipeline->ledger_lock);
-    pthread_mutex_destroy(&pipeline->error_lock);
-    pthread_mutex_destroy(&pipeline->closer_lock);
-    pthread_cond_destroy(&pipeline->closer_signal);
+    if (pipeline->ledger_initialized) pthread_mutex_destroy(&pipeline->ledger_lock);
+    if (pipeline->error_initialized) pthread_mutex_destroy(&pipeline->error_lock);
+    if (pipeline->closer_lock_initialized) pthread_mutex_destroy(&pipeline->closer_lock);
+    if (pipeline->closer_signal_initialized) pthread_cond_destroy(&pipeline->closer_signal);
     free(pipeline);
 }
 
