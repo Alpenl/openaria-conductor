@@ -496,6 +496,9 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
         self.start()
         baseline_fds = len(os.listdir("/proc/self/fd"))
         baseline_threads = threading.active_count()
+        baseline_gateway_threads = {
+            thread.ident for thread in threading.enumerate() if thread.name.startswith("gateway-")
+        }
         openers = (self.open_preview, self.open_events, self.open_network_events)
         for index in range(1000):
             opener = openers[index % len(openers)]
@@ -506,11 +509,17 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
 
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline and any(
-            thread.name.startswith("gateway-") for thread in threading.enumerate()
+            thread.name.startswith("gateway-") and thread.ident not in baseline_gateway_threads
+            for thread in threading.enumerate()
         ):
             time.sleep(0.01)
         self.assertFalse(
-            [thread.name for thread in threading.enumerate() if thread.name.startswith("gateway-")]
+            [
+                thread.name
+                for thread in threading.enumerate()
+                if thread.name.startswith("gateway-")
+                and thread.ident not in baseline_gateway_threads
+            ]
         )
         self.assertLessEqual(len(os.listdir("/proc/self/fd")), baseline_fds + 2)
         self.assertLessEqual(threading.active_count(), baseline_threads + 2)

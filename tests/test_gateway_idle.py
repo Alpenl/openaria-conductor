@@ -119,7 +119,8 @@ class GatewayIdleTest(unittest.TestCase):
                         errors.append(repr(exc))
                         raise
                     finally:
-                        finished_send.set()
+                        if offset + length == len(payload):
+                            finished_send.set()
 
             self.server.provider.artifact_io_state = lambda: None
             self.server.provider.open_verified_artifact = lambda *args: FileRepresentation(payload)

@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -683,6 +683,32 @@ class _StreamRegistry:
             self._condition.notify_all()
 
 
+_RESPONSE_WRITE_CHUNK = 16 * 1024
+
+
+@dataclass
+class _WriteDeadline:
+    expires_at: float
+    expired: bool = False
+
+
+class _BoundedResponseWriter:
+    def __init__(self, writer: object, connection: socket.socket, server: GatewayServer) -> None:
+        self._writer = writer
+        self._connection = connection
+        self._server = server
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._writer, name)
+
+    def write(self, payload: bytes) -> int:
+        view = memoryview(payload).cast("B")
+        for offset in range(0, len(view), _RESPONSE_WRITE_CHUNK):
+            with self._server.response_write(self._connection):
+                self._writer.write(view[offset : offset + _RESPONSE_WRITE_CHUNK])
+        return len(view)
+
+
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -700,6 +726,7 @@ class GatewayServer(ThreadingHTTPServer):
         external_scheme: str = "http",
         request_timeout_seconds: float = 30.0,
         max_http_connections: int = 32,
+        write_timeout_seconds: float = 30.0,
     ) -> None:
         if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
             raise ValueError("SSE 心跳和轮询间隔必须大于零")
@@ -715,10 +742,16 @@ class GatewayServer(ThreadingHTTPServer):
             or max_http_connections < 1
         ):
             raise ValueError("HTTP 连接总上限必须是正整数")
+        if not math.isfinite(write_timeout_seconds) or not 0 < write_timeout_seconds <= 3600:
+            raise ValueError("HTTP 发送等待上限必须在 (0, 3600] 秒内")
+        self.write_timeout_seconds = write_timeout_seconds
         self.max_http_connections = max_http_connections
         self._http_condition = threading.Condition()
         self._http_connections: set[socket.socket] = set()
         self._http_closing = False
+        self._write_deadlines: dict[socket.socket, _WriteDeadline] = {}
+        self._write_watcher: threading.Thread | None = None
+        self._write_next_check: float | None = None
         self.request_timeout_seconds = request_timeout_seconds
         self.provider = provider
         self.security = security
@@ -733,6 +766,54 @@ class GatewayServer(ThreadingHTTPServer):
         )
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
+        self._write_watcher = threading.Thread(
+            target=self._watch_response_writes, name="gateway-write-deadlines", daemon=True
+        )
+        try:
+            self._write_watcher.start()
+        except BaseException:
+            self.server_close()
+            raise
+
+    @contextmanager
+    def response_write(self, connection: socket.socket) -> Iterator[None]:
+        deadline = _WriteDeadline(time.monotonic() + self.write_timeout_seconds)
+        with self._http_condition:
+            if self._http_closing:
+                raise ConnectionResetError("gateway is closing")
+            self._write_deadlines[connection] = deadline
+            if self._write_next_check is None or deadline.expires_at < self._write_next_check:
+                self._http_condition.notify_all()
+        try:
+            yield
+        finally:
+            with self._http_condition:
+                if self._write_deadlines.get(connection) is deadline:
+                    self._write_deadlines.pop(connection)
+            if deadline.expired:
+                raise TimeoutError("HTTP response write exceeded its deadline")
+
+    def _watch_response_writes(self) -> None:
+        with self._http_condition:
+            while not self._http_closing:
+                if not self._write_deadlines:
+                    self._write_next_check = None
+                    self._http_condition.wait()
+                    continue
+                now = time.monotonic()
+                for connection, deadline in tuple(self._write_deadlines.items()):
+                    if deadline.expires_at <= now:
+                        deadline.expired = True
+                        self._write_deadlines.pop(connection)
+                        # Cancel under the same lock as completion/new writes so a late
+                        # deadline cannot shut down a subsequent keepalive response.
+                        with suppress(OSError):
+                            connection.shutdown(socket.SHUT_RDWR)
+                if self._write_deadlines:
+                    self._write_next_check = min(
+                        d.expires_at for d in self._write_deadlines.values()
+                    )
+                    self._http_condition.wait(max(0, self._write_next_check - time.monotonic()))
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         with self._http_condition:
@@ -767,6 +848,7 @@ class GatewayServer(ThreadingHTTPServer):
     def _cancel_http_connections(self) -> None:
         with self._http_condition:
             self._http_closing = True
+            self._http_condition.notify_all()
             connections = tuple(self._http_connections)
         for connection in connections:
             # The handler owns close(); shutdown wakes both reads and raw-fd writes.
@@ -806,11 +888,17 @@ class GatewayServer(ThreadingHTTPServer):
         super().server_close()
         self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
+        if self._write_watcher is not None and self._write_watcher.is_alive():
+            self._write_watcher.join(timeout=2.0)
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.wfile = _BoundedResponseWriter(self.wfile, self.connection, self.server)
 
     def handle_one_request(self) -> None:
         self.connection.settimeout(self.server.request_timeout_seconds)
@@ -960,7 +1048,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             send_to = getattr(representation, "send_to", None)
             if callable(send_to):
                 self.wfile.flush()
-                send_to(self.connection.fileno(), offset, selected_length)
+                for position in range(0, selected_length, _RESPONSE_WRITE_CHUNK):
+                    count = min(_RESPONSE_WRITE_CHUNK, selected_length - position)
+                    with self.server.response_write(self.connection):
+                        sent = send_to(self.connection.fileno(), offset + position, count)
+                    if sent != count:
+                        raise OSError("representation sender returned a short write")
             else:
                 for chunk in representation.iter_chunks(offset, selected_length):
                     self.wfile.write(chunk)
@@ -3085,6 +3178,7 @@ def create_gateway_server(
     external_scheme: str = "http",
     request_timeout_seconds: float = 30.0,
     max_http_connections: int = 32,
+    write_timeout_seconds: float = 30.0,
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -3099,4 +3193,5 @@ def create_gateway_server(
         external_scheme,
         request_timeout_seconds,
         max_http_connections,
+        write_timeout_seconds,
     )
