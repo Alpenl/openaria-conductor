@@ -12,6 +12,7 @@ import hashlib
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -129,8 +130,10 @@ class _Journal:
         )
 
     def close(self) -> None:
-        self.source.close()
-        self.output.close()
+        try:
+            self.source.close()
+        finally:
+            self.output.close()
 
 
 class LiveSealing:
@@ -191,9 +194,10 @@ class LiveSealing:
 
     def _compact(self) -> None:
         journals: dict[str, _Journal] = {}
-        try:
+        with ExitStack() as resources:
             for name in ("frames.ndjson", "imu.ndjson"):
                 journals[name] = _Journal(self.root / name)
+                resources.callback(journals[name].close)
             while not self.cancelled.is_set():
                 for journal in journals.values():
                     journal.pump()
@@ -206,9 +210,6 @@ class LiveSealing:
                         self.prepared[name] = journal.finish()
                     return
                 self.finished.wait(0.1)
-        finally:
-            for journal in journals.values():
-                journal.close()
 
     def finish(self) -> dict:
         # The caller has already stopped and joined every producer.
