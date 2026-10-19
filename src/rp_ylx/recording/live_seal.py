@@ -32,12 +32,24 @@ class PreparedArtifact:
     compression: dict
 
     def use(self, root: Path, descriptor: dict):
+        result = self.prepare_for_finalization(root, descriptor)
+        if not self.output.unchanged(self.target):
+            raise ValueError("incremental compacted output changed")
+        return result
+
+    def prepare_for_finalization(self, root: Path, descriptor: dict):
+        """Check the source and sync output; caller must read and match output proof.
+
+        compact_manifest performs the fresh final read on the owning thread,
+        then compares bytes, digest and identity before updating its descriptor.
+        This preparation alone never admits the output's current content.
+        """
         path = root / descriptor["path"]
         if not self.source.matches(
             path.stat(follow_symlinks=False), descriptor["bytes"], descriptor["sha256"]
         ) or not self.source.unchanged(path):
             raise ValueError("source changed after incremental lossless compaction")
-        if not self.output.unchanged(self.target):
+        if identity(self.target.stat(follow_symlinks=False)) != self.output.identity:
             raise ValueError("incremental compacted output changed")
         if path.suffix == ".wav":
             with open_regular(self.target) as stream:

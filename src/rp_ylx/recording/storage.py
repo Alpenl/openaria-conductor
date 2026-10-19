@@ -205,7 +205,7 @@ def compact_manifest(
     def compact(descriptor):
         relative = descriptor["path"]
         if prepared is not None and relative in prepared:
-            return prepared[relative].use(root, descriptor)
+            return prepared[relative].prepare_for_finalization(root, descriptor)
         path = root / relative
         audio = descriptor["media_type"] == "audio/wav"
         with open_regular(path) as source:
