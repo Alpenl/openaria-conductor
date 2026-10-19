@@ -640,7 +640,9 @@ class CaptureCoordinator:
         self._cached_active_state: Mapping[str, object] | None = None
         self._pending_source_failure: DeviceRecordingError | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
-        self._persisted_command_scopes: set[tuple[str, str, str]] = set()
+        self._persisted_commands: dict[
+            tuple[str, str, str], tuple[bytes, CaptureCommandResult]
+        ] = {}
         self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         self._state_path = self._config.state_root / "capture-coordinator.json"
         self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
@@ -838,20 +840,29 @@ class CaptureCoordinator:
         # Snapshot under the command lock, then write independently. Delayed
         # older callbacks must never overwrite a newer durable command/state.
         with self._lock:
-            sequence, value, commands, current_scopes = self._local_state_write()
+            sequence, value, commands = self._local_state_write()
         with self._state_persist_lock:
             if sequence <= self._state_persisted_sequence:
                 return
+            # Cached receipt tuples are private and never mutated after insertion.
+            # Identity distinguishes a reused key even if its canonical body is
+            # unchanged. A failed write must not mark its receipt durable.
             new_commands = [
-                item
-                for item in commands
-                if (item["principal_id"], item["operation"], item["idempotency_key"])
-                not in self._persisted_command_scopes
+                {
+                    "principal_id": scope[0],
+                    "operation": scope[1],
+                    "idempotency_key": scope[2],
+                    "canonical_body": receipt[0].decode("utf-8"),
+                    "status": int(receipt[1].status),
+                    "body": receipt[1].body,
+                }
+                for scope, receipt in commands.items()
+                if self._persisted_commands.get(scope) is not receipt
             ]
             self._state_db.put_capture_state(
-                value, new_commands, self._persisted_command_scopes - current_scopes
+                value, new_commands, self._persisted_commands.keys() - commands.keys()
             )
-            self._persisted_command_scopes = current_scopes
+            self._persisted_commands = commands
             self._state_persisted_sequence = sequence
 
     def _local_state_write(self):
@@ -871,30 +882,12 @@ class CaptureCoordinator:
             "retained": self._retained,
             "pending_safe_swap": self._pending_safe_swap,
             "safe_swap_resource": self._safe_swap_resource,
-            "commands": [
-                {
-                    "principal_id": principal_id,
-                    "operation": operation,
-                    "idempotency_key": idempotency_key,
-                    "canonical_body": canonical.decode("utf-8"),
-                    "status": int(result.status),
-                    "body": result.body,
-                }
-                for (
-                    principal_id,
-                    operation,
-                    idempotency_key,
-                ), (canonical, result) in self._commands.items()
-            ],
         }
-        commands = value.pop("commands")
-        current_scopes = set(self._commands)
         self._state_write_sequence += 1
         return (
             self._state_write_sequence,
             copy.deepcopy(value),
-            copy.deepcopy(commands),
-            current_scopes,
+            dict(self._commands),
         )
 
     def _recording_state_changed(self, plan: SessionPlan, state: Mapping[str, object]) -> None:
@@ -2374,6 +2367,8 @@ class CaptureCoordinator:
                     "幂等键已经用于不同请求",
                     status=HTTPStatus.CONFLICT,
                 )
+            if self._persisted_commands.get(scope) is not previous:
+                self._persist_local_state()
             return CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
         if self._failure_inflight is not None or self._closing:
             raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
@@ -2715,6 +2710,8 @@ class CaptureCoordinator:
                             "幂等键已经用于不同请求",
                             status=HTTPStatus.CONFLICT,
                         )
+                    if self._persisted_commands.get(scope) is not previous:
+                        self._persist_local_state()
                     return CaptureCommandResult(
                         result.status, copy.deepcopy(result.body), replayed=True
                     )
