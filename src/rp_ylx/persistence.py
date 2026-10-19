@@ -227,16 +227,23 @@ class StateDatabase:
         return value
 
     def capture_state(self) -> dict[str, Any]:
-        value = self.get("capture")
-        if value is None:
-            raise PersistenceError("missing authoritative document: capture")
-        if "commands" not in value:
-            with self.connection() as db:
+        # Lifecycle and receipts are committed together. Read both from the
+        # same WAL snapshot even if a checkpoint writer commits between SELECTs.
+        # A deferred read transaction does not reserve the SQLite writer.
+        with self.connection() as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT body FROM documents WHERE name='capture'").fetchone()
+            if row is None:
+                raise PersistenceError("missing authoritative document: capture")
+            value = json.loads(row[0])
+            if not isinstance(value, dict):
+                raise PersistenceError("invalid state document: capture")
+            if "commands" not in value:
                 value["commands"] = [
                     json.loads(row[0])
                     for row in db.execute("SELECT body FROM capture_commands ORDER BY rowid")
                 ]
-        return value
+            return value
 
     def begin_transfer(self, volume: str, session: str, artifact: str) -> str:
         identity = str(uuid.uuid4())
