@@ -113,8 +113,17 @@ def manage(
 
         def validated_update(current):
             merged = overlay(overlay(base, current), patch)
-            production_config_from_value(merged)
-            return extract(merged)
+            recording = patch.get("recording")
+            if isinstance(recording, dict) and "preset" in recording:
+                # Stored settings contain every resolved encoder field. Merging
+                # a new preset into them leaves the old values overriding it.
+                # An explicit preset starts a fresh recording profile; only
+                # overrides supplied in this same patch take precedence.
+                merged["recording"] = dict(recording)
+            # Persist actual values, never a preset whose defaults can drift
+            # with later firmware or bootstrap changes. Validation and history
+            # remain inside the same serialized SQLite update transaction.
+            return resolved_settings(merged)
 
         db.update("device", validated_update)
         return {"saved": True, "activation": "restart service while idle"}
