@@ -1246,6 +1246,7 @@ class DeviceSessionRecorder:
                 "segments": self._segment_records,
                 "diagnostics": self._capture_diagnostics(),
             },
+            pretty=False,
         )
 
     def _segment_record(self, segment: ClosedSegment) -> dict[str, object]:
