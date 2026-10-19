@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import select
 import socket
@@ -697,6 +698,7 @@ class GatewayServer(ThreadingHTTPServer):
         max_sse_connections: int = 4,
         max_preview_streams: int = 2,
         external_scheme: str = "http",
+        request_timeout_seconds: float = 30.0,
     ) -> None:
         if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
             raise ValueError("SSE 心跳和轮询间隔必须大于零")
@@ -704,6 +706,9 @@ class GatewayServer(ThreadingHTTPServer):
             raise ValueError("长连接并发上限必须大于零")
         if external_scheme not in {"http", "https"}:
             raise ValueError("external_scheme 必须是 http 或 https")
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("HTTP 连接超时必须是有限正数")
+        self.request_timeout_seconds = request_timeout_seconds
         self.provider = provider
         self.security = security
         self.audit_sink = audit_sink or (lambda event: None)
@@ -748,6 +753,20 @@ class GatewayServer(ThreadingHTTPServer):
 class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        self.connection.settimeout(self.server.request_timeout_seconds)
+        try:
+            super().handle_one_request()
+        finally:
+            self.connection.settimeout(None)
+
+    def parse_request(self) -> bool:
+        try:
+            return super().parse_request()
+        finally:
+            # Native sendfile and raw-fd writers require blocking response sockets.
+            self.connection.settimeout(None)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -2697,7 +2716,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体大小无效")
             return None
         try:
-            payload = self.rfile.read(length)
+            self.connection.settimeout(self.server.request_timeout_seconds)
+            try:
+                payload = self.rfile.read(length)
+            finally:
+                self.connection.settimeout(None)
         except OSError:
             self.close_connection = True
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体读取失败")
@@ -3002,6 +3025,7 @@ def create_gateway_server(
     max_sse_connections: int = 4,
     max_preview_streams: int = 2,
     external_scheme: str = "http",
+    request_timeout_seconds: float = 30.0,
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -3014,4 +3038,5 @@ def create_gateway_server(
         max_sse_connections,
         max_preview_streams,
         external_scheme,
+        request_timeout_seconds,
     )

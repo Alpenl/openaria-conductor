@@ -272,6 +272,39 @@ class GatewayStreamLifecycleTest(unittest.TestCase):
             time.sleep(0.005)
         self.fail(f"stream sessions did not drain: {self.server.stream_lifecycle_snapshot()}")
 
+    def test_idle_timeout_does_not_expire_quiet_preview(self) -> None:
+        self.server.request_timeout_seconds = 0.1
+        self.start()
+        client, response = self.open_preview()
+        try:
+            self.assert_ok(response)
+            time.sleep(0.35)
+            self.assertEqual(self.server.stream_lifecycle_snapshot()["preview"]["active"], 1)
+            latest = b"\xff\xd8after-idle-timeout\xff\xd9"
+            self.provider.preview.publish(latest)
+            received = bytearray()
+            while latest not in received:
+                chunk = client.socket.recv(4096)
+                self.assertTrue(chunk, "quiet preview was closed by request timeout")
+                received.extend(chunk)
+        finally:
+            client.abort()
+        self.wait_for_no_streams()
+
+    def test_idle_timeout_does_not_expire_waiting_sse(self) -> None:
+        self.server.request_timeout_seconds = 0.1
+        self.server.sse_heartbeat_seconds = 0.35
+        self.start()
+        client, response = self.open_events()
+        try:
+            self.assert_ok(response)
+            time.sleep(0.45)
+            self.assertEqual(self.server.stream_lifecycle_snapshot()["sse"]["active"], 1)
+            self.assertTrue(client.socket.recv(4096), "SSE closed before next heartbeat")
+        finally:
+            client.abort()
+        self.wait_for_no_streams()
+
     def test_frozen_preview_abort_reconnects_within_250_ms(self) -> None:
         self.start()
         first, first_response = self.open_preview()
