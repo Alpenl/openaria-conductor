@@ -699,6 +699,7 @@ class GatewayServer(ThreadingHTTPServer):
         max_preview_streams: int = 2,
         external_scheme: str = "http",
         request_timeout_seconds: float = 30.0,
+        max_http_connections: int = 32,
     ) -> None:
         if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
             raise ValueError("SSE 心跳和轮询间隔必须大于零")
@@ -708,6 +709,16 @@ class GatewayServer(ThreadingHTTPServer):
             raise ValueError("external_scheme 必须是 http 或 https")
         if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
             raise ValueError("HTTP 连接超时必须是有限正数")
+        if (
+            not isinstance(max_http_connections, int)
+            or isinstance(max_http_connections, bool)
+            or max_http_connections < 1
+        ):
+            raise ValueError("HTTP 连接总上限必须是正整数")
+        self.max_http_connections = max_http_connections
+        self._http_condition = threading.Condition()
+        self._http_connections: set[socket.socket] = set()
+        self._http_closing = False
         self.request_timeout_seconds = request_timeout_seconds
         self.provider = provider
         self.security = security
@@ -722,6 +733,49 @@ class GatewayServer(ThreadingHTTPServer):
         )
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        with self._http_condition:
+            admitted = (
+                not self._http_closing and len(self._http_connections) < self.max_http_connections
+            )
+            if admitted:
+                self._http_connections.add(request)
+        if not admitted:
+            # Do not read or write on the accept thread for a client beyond capacity.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._http_finished(request)
+            raise
+
+    def process_request_thread(
+        self, request: socket.socket, client_address: tuple[str, int]
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._http_finished(request)
+
+    def _http_finished(self, request: socket.socket) -> None:
+        with self._http_condition:
+            self._http_connections.discard(request)
+            self._http_condition.notify_all()
+
+    def _cancel_http_connections(self) -> None:
+        with self._http_condition:
+            self._http_closing = True
+            connections = tuple(self._http_connections)
+        for connection in connections:
+            # The handler owns close(); shutdown wakes both reads and raw-fd writes.
+            with suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+
+    def _wait_http_connections(self) -> None:
+        with self._http_condition:
+            self._http_condition.wait_for(lambda: not self._http_connections, timeout=2.0)
 
     def handle_error(self, request: object, client_address: object) -> None:
         if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
@@ -741,12 +795,16 @@ class GatewayServer(ThreadingHTTPServer):
 
     def shutdown(self) -> None:
         self._streams.cancel_all("server_shutdown")
+        self._cancel_http_connections()
         super().shutdown()
+        self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
 
     def server_close(self) -> None:
         self._streams.cancel_all("server_shutdown")
+        self._cancel_http_connections()
         super().server_close()
+        self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
 
 
@@ -3026,6 +3084,7 @@ def create_gateway_server(
     max_preview_streams: int = 2,
     external_scheme: str = "http",
     request_timeout_seconds: float = 30.0,
+    max_http_connections: int = 32,
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -3039,4 +3098,5 @@ def create_gateway_server(
         max_preview_streams,
         external_scheme,
         request_timeout_seconds,
+        max_http_connections,
     )
