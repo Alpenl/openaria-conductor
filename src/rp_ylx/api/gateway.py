@@ -727,6 +727,7 @@ class GatewayServer(ThreadingHTTPServer):
         request_timeout_seconds: float = 30.0,
         max_http_connections: int = 32,
         write_timeout_seconds: float = 30.0,
+        max_session_downloads: int = 8,
     ) -> None:
         if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
             raise ValueError("SSE 心跳和轮询间隔必须大于零")
@@ -744,6 +745,14 @@ class GatewayServer(ThreadingHTTPServer):
             raise ValueError("HTTP 连接总上限必须是正整数")
         if not math.isfinite(write_timeout_seconds) or not 0 < write_timeout_seconds <= 3600:
             raise ValueError("HTTP 发送等待上限必须在 (0, 3600] 秒内")
+        if (
+            not isinstance(max_session_downloads, int)
+            or isinstance(max_session_downloads, bool)
+            or max_session_downloads < 1
+        ):
+            raise ValueError("HTTP 录制下载并发上限必须是正整数")
+        self.max_session_downloads = max_session_downloads
+        self._session_downloads: set[socket.socket] = set()
         self.write_timeout_seconds = write_timeout_seconds
         self.max_http_connections = max_http_connections
         self._http_condition = threading.Condition()
@@ -894,7 +903,25 @@ class GatewayServer(ThreadingHTTPServer):
             self._http_connections.discard(request)
             self._http_reclaimable.pop(request, None)
             self._http_cancelled.discard(request)
+            self._session_downloads.discard(request)
             self._http_condition.notify_all()
+
+    def begin_session_download(self, connection: socket.socket) -> bool:
+        with self._http_condition:
+            # Leave an HTTP slot for control whenever the configured total allows.
+            limit = min(self.max_session_downloads, max(1, self.max_http_connections - 1))
+            if (
+                self._http_closing
+                or connection in self._http_cancelled
+                or len(self._session_downloads) >= limit
+            ):
+                return False
+            self._session_downloads.add(connection)
+            return True
+
+    def end_session_download(self, connection: socket.socket) -> None:
+        with self._http_condition:
+            self._session_downloads.discard(connection)
 
     def begin_request_input(self, connection: socket.socket) -> None:
         with self._http_condition:
@@ -2601,9 +2628,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, result)
 
+    def _admit_session_download(self, *, head: bool = False) -> bool:
+        if self.server.begin_session_download(self.connection):
+            return True
+        self.close_connection = True
+        headers = {"Retry-After": "1", "YLX-Error-Code": "download_capacity_exhausted"}
+        if head:
+            self._send_empty(HTTPStatus.SERVICE_UNAVAILABLE, headers=headers)
+        else:
+            self._problem(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "download_capacity_exhausted",
+                "录制下载并发已达上限，请稍后重试",
+                retryable=True,
+                headers=headers,
+            )
+        return False
+
     def _get_manifest(self, api_version: str, session_id: str) -> None:
         if self._principal("getSession", session_id) is None:
             return
+        if not self._admit_session_download():
+            return
+        try:
+            self._send_manifest(api_version, session_id)
+        finally:
+            self.server.end_session_download(self.connection)
+
+    def _send_manifest(self, api_version: str, session_id: str) -> None:
         try:
             locked = self.server.provider.open_manifest(session_id, api_version)
             with locked as manifest:
@@ -2850,6 +2902,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        if not self._admit_session_download(head=head):
+            return
+        try:
+            self._send_session_artifact(api_version, session_id, artifact_id, head=head)
+        finally:
+            self.server.end_session_download(self.connection)
+
+    def _send_session_artifact(
+        self, api_version: str, session_id: str, artifact_id: str, *, head: bool
+    ) -> None:
         try:
             locked = self.server.provider.open_verified_artifact(
                 session_id, artifact_id, api_version
@@ -3262,6 +3324,7 @@ def create_gateway_server(
     request_timeout_seconds: float = 30.0,
     max_http_connections: int = 32,
     write_timeout_seconds: float = 30.0,
+    max_session_downloads: int = 8,
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -3277,4 +3340,5 @@ def create_gateway_server(
         request_timeout_seconds,
         max_http_connections,
         write_timeout_seconds,
+        max_session_downloads,
     )
