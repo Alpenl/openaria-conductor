@@ -136,6 +136,44 @@ class _Journal:
             self.output.close()
 
 
+def _checkpoint_identity(metadata: os.stat_result, *, force: bool) -> tuple[int, ...] | None:
+    # Atomic publication can unlink the old regular inode at any read boundary.
+    # Skip it during capture; the forced post-producer read remains strict.
+    if not force and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+        return None
+    return identity(metadata)
+
+
+def _read_audio_checkpoint(path: Path, expected: tuple[int, ...], *, force: bool) -> bytes | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if force:
+            raise
+        return None
+    try:
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with source:
+        metadata = os.fstat(source.fileno())
+        before = _checkpoint_identity(metadata, force=force)
+        if before is None:
+            return None
+        if force and before != expected:
+            raise ValueError("audio checkpoint changed before final read")
+        # Read at most the observed size plus one; concurrent growth cannot
+        # keep this read chasing an ever-growing file.
+        payload = source.read(metadata.st_size + 1)
+        after = _checkpoint_identity(os.fstat(source.fileno()), force=force)
+        if after is None:
+            return None
+        if after != before or len(payload) != metadata.st_size:
+            raise ValueError("audio checkpoint changed during read")
+        return payload
+
+
 class LiveSealing:
     def __init__(self, root: Path, nominal_fps: float, frame_decimation: int):
         self.root = root
@@ -164,12 +202,15 @@ class LiveSealing:
         # stat() can resolve the old inode just before rename unlinks it, then
         # report nlink=0. Retry on the next poll without caching that snapshot.
         # The forced final poll runs after producers join and remains strict.
-        if not force and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
+        checkpoint_identity = _checkpoint_identity(metadata, force=force)
+        if checkpoint_identity is None:
             return
-        checkpoint_identity = identity(metadata)
         if not force and checkpoint_identity == self._audio_checkpoint_identity:
             return
-        for segment in json.loads(checkpoint.read_bytes())["segments"]:
+        payload = _read_audio_checkpoint(checkpoint, checkpoint_identity, force=force)
+        if payload is None:
+            return
+        for segment in json.loads(payload)["segments"]:
             relative = segment["path"]
             filename = f"audio_{segment['index']:05d}.wav"
             # Native emits canonical paths. Avoid rebuilding every historical

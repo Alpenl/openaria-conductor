@@ -184,15 +184,14 @@ class LiveSealingTests(unittest.TestCase):
             root = Path(directory)
             sealing = self.audio_sealing(root)
             self.publish_checkpoint(root, [0])
-            read_bytes = Path.read_bytes
+            decode = json.loads
 
-            def publish_after_read(path):
-                payload = read_bytes(path)
+            def publish_before_decode(payload):
                 self.publish_checkpoint(root, [0, 1])
-                return payload
+                return decode(payload)
 
             with patch("rp_ylx.recording.live_seal.compact_audio", side_effect=self.compact_audio):
-                with patch.object(Path, "read_bytes", publish_after_read):
+                with patch("json.loads", publish_before_decode):
                     sealing._audio()
                 self.assertEqual(set(sealing.prepared), {"audio/audio_00000.wav"})
                 sealing._audio()
