@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import selectors
 import subprocess
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -21,6 +23,7 @@ import zstandard
 from rp_ylx.recording.verified import open_regular
 
 BLOCK_BYTES = 1024 * 1024
+AUDIO_CODEC_TIMEOUT_SECONDS = 120
 
 
 @contextmanager
@@ -78,6 +81,50 @@ def compact_metadata(path: Path) -> tuple[Path, dict]:
     }
 
 
+def _pcm_readback(command: list[str], *, expected_bytes: int) -> tuple[int, str]:
+    """Bound both pipe consumption and process exit with one wall-clock deadline."""
+    timeout = AUDIO_CODEC_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    size, digest = 0, hashlib.sha256()
+    try:
+        assert process.stdout is not None
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    block = os.read(descriptor, BLOCK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not block:
+                    break
+                size += len(block)
+                if size > expected_bytes:
+                    raise ValueError("FLAC PCM readback exceeds source length")
+                digest.update(block)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if process.wait(timeout=remaining) != 0:
+            raise ValueError("FLAC PCM decoder failed")
+        return size, digest.hexdigest()
+    finally:
+        # Popen.__exit__ waits without a timeout, including on TimeoutExpired.
+        # Explicitly terminate and reap our decoder before closing its pipe.
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
 def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
     target = path.with_suffix(".flac")
     temporary = target.with_suffix(".flac.tmp")
@@ -111,11 +158,11 @@ def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
             str(temporary),
         ],
         check=True,
-        timeout=120,
+        timeout=AUDIO_CODEC_TIMEOUT_SECONDS,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    with subprocess.Popen(
+    actual = _pcm_readback(
         [
             "ffmpeg",
             "-nostdin",
@@ -133,13 +180,10 @@ def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
             "pcm_s16le",
             "-",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    ) as process:
-        assert process.stdout is not None
-        actual = _digest(process.stdout)
-        if process.wait(timeout=120) != 0 or actual != (pcm_bytes, pcm.hexdigest()):
-            raise ValueError("FLAC PCM round-trip mismatch")
+        expected_bytes=pcm_bytes,
+    )
+    if actual != (pcm_bytes, pcm.hexdigest()):
+        raise ValueError("FLAC PCM round-trip mismatch")
     if durable:
         with open_regular(temporary) as stream:
             os.fsync(stream.fileno())
