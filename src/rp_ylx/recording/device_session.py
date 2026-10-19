@@ -372,6 +372,19 @@ def _finalize_artifact(
     return _FinalizedArtifact(sha256=digest, bytes=metadata.st_size, identity=after)
 
 
+def _verified_finalization(
+    path: Path, expected_bytes: int | None, *, code: str
+) -> tuple[_FinalizedArtifact, VerifiedArtifact]:
+    """Read fresh bytes and return a proof without mutating recorder state."""
+    before = verified_identity(path.stat(follow_symlinks=False))
+    # Same inode/size/mtime/ctime does not imply identical bytes on the
+    # camera's coarse-timestamp filesystem. Always read before admission.
+    result = _finalize_artifact(path, expected_bytes, code=code)
+    if verified_identity(path.stat(follow_symlinks=False)) != before:
+        raise DeviceRecordingError(code, "artifact changed during independent verification")
+    return result, VerifiedArtifact(before, result.sha256)
+
+
 def _jpeg_payload(payload: bytes) -> bytes:
     start = payload.find(b"\xff\xd8")
     end = payload.rfind(b"\xff\xd9")
@@ -1728,9 +1741,8 @@ class DeviceSessionRecorder:
         if sample_format != "S16_LE":
             raise DeviceRecordingError("audio_invalid", "audio.sample_format 必须是 S16_LE")
         bytes_per_sample_frame = channels * 2
-        self._audio_result = dict(result)
-        self._audio_segment_records = []
-        self._audio_bytes = 0
+        # Validate the entire producer inventory before submitting any reads.
+        inventory = []
         expected_sample = 0
         for expected_index, raw_segment in enumerate(segments):
             if not isinstance(raw_segment, Mapping):
@@ -1740,46 +1752,79 @@ class DeviceSessionRecorder:
                 raw_segment.get("start_sample"), "audio.segments[].start_sample"
             )
             end_sample = _strict_int(raw_segment.get("end_sample"), "audio.segments[].end_sample")
-            relative = str(raw_segment.get("path"))
+            relative = raw_segment.get("path")
             if (
                 index != expected_index
                 or start_sample != expected_sample
                 or end_sample <= start_sample
             ):
                 raise DeviceRecordingError("audio_invalid", "音频分段序号或采样域不连续")
-            if not relative.startswith("audio/") or not relative.endswith(".wav"):
+            # Match the native producer's assigned path before any file I/O.
+            # Prefix/suffix checks also admit traversal and another segment.
+            if not isinstance(relative, str) or relative != f"audio/audio_{index:05d}.wav":
                 raise DeviceRecordingError("audio_invalid", "音频 artifact 路径无效")
-            path = self._partial / relative
-            finalized = self._finalize_for_seal(path, None, code="audio_invalid")
-            pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
-            wav_header_bytes = finalized.bytes - pcm_payload_bytes
-            if wav_header_bytes < 44 or wav_header_bytes > 65_536:
-                raise DeviceRecordingError("audio_invalid", "音频 WAV header 与采样字节数不一致")
-            self._artifact_identities[relative] = finalized.identity
-            self._audio_bytes += finalized.bytes
-            self._audio_segment_records.append(
-                {
-                    "index": index,
-                    "start_sample": start_sample,
-                    "end_sample": end_sample,
-                    "start_time_seconds": float(raw_segment["start_time_seconds"]),
-                    "end_time_seconds": float(raw_segment["end_time_seconds"]),
-                    "pcm_payload_bytes": pcm_payload_bytes,
-                    "wav_header_bytes": wav_header_bytes,
-                    "artifact": {
-                        "artifact_id": finalized.sha256,
-                        "role": "audio.wav",
-                        "path": relative,
-                        "media_type": "audio/wav",
-                        "bytes": finalized.bytes,
-                        "sha256": finalized.sha256,
-                    },
-                }
-            )
+            inventory.append((index, start_sample, end_sample, relative, raw_segment))
             expected_sample = end_sample
         sample_count = _strict_int(result.get("sample_count"), "audio.sample_count")
         if sample_count != expected_sample:
             raise DeviceRecordingError("audio_invalid", "音频总采样数与分段不一致")
+
+        records = []
+        proofs = {}
+        identities = {}
+        audio_bytes = 0
+        # At most two reads are submitted at a time. Workers only return data;
+        # ordered assembly and recorder mutation remain on the calling thread.
+        # The context joins both workers even if a read or assembly fails.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-inventory") as pool:
+            for offset in range(0, len(inventory), 2):
+                batch = inventory[offset : offset + 2]
+                futures = [
+                    pool.submit(
+                        _verified_finalization,
+                        self._partial / segment[3],
+                        None,
+                        code="audio_invalid",
+                    )
+                    for segment in batch
+                ]
+                for segment, future in zip(batch, futures, strict=True):
+                    index, start_sample, end_sample, relative, raw_segment = segment
+                    finalized, proof = future.result()
+                    pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
+                    wav_header_bytes = finalized.bytes - pcm_payload_bytes
+                    if wav_header_bytes < 44 or wav_header_bytes > 65_536:
+                        raise DeviceRecordingError(
+                            "audio_invalid", "音频 WAV header 与采样字节数不一致"
+                        )
+                    identities[relative] = finalized.identity
+                    proofs[relative] = proof
+                    audio_bytes += finalized.bytes
+                    records.append(
+                        {
+                            "index": index,
+                            "start_sample": start_sample,
+                            "end_sample": end_sample,
+                            "start_time_seconds": float(raw_segment["start_time_seconds"]),
+                            "end_time_seconds": float(raw_segment["end_time_seconds"]),
+                            "pcm_payload_bytes": pcm_payload_bytes,
+                            "wav_header_bytes": wav_header_bytes,
+                            "artifact": {
+                                "artifact_id": finalized.sha256,
+                                "role": "audio.wav",
+                                "path": relative,
+                                "media_type": "audio/wav",
+                                "bytes": finalized.bytes,
+                                "sha256": finalized.sha256,
+                            },
+                        }
+                    )
+        # Publish only a complete inventory; failures leave existing state intact.
+        self._audio_result = dict(result)
+        self._audio_segment_records = records
+        self._audio_bytes = audio_bytes
+        self._artifact_identities.update(identities)
+        self._verified_artifacts.update(proofs)
 
     def _audio_block(self) -> dict[str, object]:
         if self._audio_result is None or not self._audio_segment_records:
@@ -2060,13 +2105,8 @@ class DeviceSessionRecorder:
         self, path: Path, expected_bytes: int | None, *, code: str
     ) -> _FinalizedArtifact:
         relative = path.relative_to(self._partial).as_posix()
-        before = verified_identity(path.stat(follow_symlinks=False))
-        # Same inode/size/mtime/ctime does not imply identical bytes on the
-        # camera's coarse-timestamp filesystem. Always read before admission.
-        result = _finalize_artifact(path, expected_bytes, code=code)
-        if verified_identity(path.stat(follow_symlinks=False)) != before:
-            raise DeviceRecordingError(code, "artifact changed during independent verification")
-        self._verified_artifacts[relative] = VerifiedArtifact(before, result.sha256)
+        result, proof = _verified_finalization(path, expected_bytes, code=code)
+        self._verified_artifacts[relative] = proof
         return result
 
     def stop(self, *, before_publish: Callable[[], None] | None = None) -> SealedDeviceSession:
