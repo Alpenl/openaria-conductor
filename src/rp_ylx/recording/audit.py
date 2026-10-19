@@ -12,16 +12,16 @@ from .cadence import FrameCadence
 
 def _journal_lines(stream, finished: Event | None):
     """Tail complete records; a producer may be halfway through one write."""
-    pending = b""
+    pending = bytearray()
     while True:
-        line = stream.readline()
+        line = stream.readline(1_048_577 - len(pending))
         if line:
-            pending += line
+            pending.extend(line)
             if len(pending) > 1_048_576:
                 raise ValueError("capture audit record exceeds limit")
             if pending.endswith(b"\n"):
-                yield pending
-                pending = b""
+                yield bytes(pending)
+                pending.clear()
             continue
         if finished is None or finished.is_set():
             if pending:
