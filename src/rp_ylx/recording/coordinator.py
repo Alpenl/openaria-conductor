@@ -1105,6 +1105,7 @@ class CaptureCoordinator:
         *,
         interrupt_check: Callable[[], None] | None = None,
         verified_artifacts=None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
         manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
         admission = self._require_admission()
@@ -1156,6 +1157,7 @@ class CaptureCoordinator:
                     expected_session_id=session_id,
                     interrupt_check=interrupt_check,
                     **({"verified_artifacts": verified_artifacts} if verified_artifacts else {}),
+                    **({"progress": progress} if progress is not None else {}),
                 )
             except DeviceRecordingError as error:
                 if error.code != "digest_mismatch":
@@ -2783,6 +2785,7 @@ class CaptureCoordinator:
                     sealed.manifest,
                     sealed.manifest_bytes,
                     verified_artifacts=sealed.verified_artifacts,
+                    progress=recorder.independent_verification_progress,
                 )
             except DeviceRecordingError:
                 verification_current = False

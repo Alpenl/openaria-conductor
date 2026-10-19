@@ -707,6 +707,7 @@ class DeviceSessionRecorder:
         self._verified_artifacts: dict[str, VerifiedArtifact] = {}
         self._live_sealing: LiveSealing | None = None
         self._stopped_elapsed: float | None = None
+        self._verification_compaction_total = 0
         self._writer: threading.Thread | None = None
         self._writer_error: BaseException | None = None
         self._started_at: datetime | None = None
@@ -853,6 +854,11 @@ class DeviceSessionRecorder:
         # sink fsyncs coordinator recovery data; doing that per artifact adds
         # a disk barrier for every five-second audio segment. State transitions
         # and the final command result remain durable through _persist_state.
+
+    def independent_verification_progress(self, completed: int, total: int) -> None:
+        """Include full-content admission in live progress, retaining one final unit."""
+        offset = self._verification_compaction_total
+        self._verification_progress(offset + completed, offset + total + 1)
 
     def _live_audio_bytes(self) -> int:
         recorder = self._audio_recorder
@@ -2160,6 +2166,15 @@ class DeviceSessionRecorder:
             sealed_at = self._now()
             manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
             compacted_originals: list[str] = []
+            artifact_count = len(_manifest_artifacts(manifest))
+
+            def compaction_progress(completed: int, total: int) -> None:
+                self._verification_compaction_total = total
+                # Compaction replaces descriptors one-for-one. Count the full
+                # independent content readback too; reserve only publication
+                # and the final identity recheck as the last unit.
+                self._verification_progress(completed, total + artifact_count + 1)
+
             if self._config.lossless_storage:
                 from rp_ylx.recording.audit import capture_audit
                 from rp_ylx.recording.storage import compact_manifest
@@ -2194,11 +2209,7 @@ class DeviceSessionRecorder:
                         manifest,
                         finalize_compacted,
                         prepared=prepared,
-                        # Reserve the last unit for audit, publication and the
-                        # coordinator's independent verification admission.
-                        progress=lambda completed, total: self._verification_progress(
-                            completed, total + 1
-                        ),
+                        progress=compaction_progress,
                     )
                     manifest["capture_audit"] = live_audit if audited is None else audited.result()
                 for relative in compacted_originals:
@@ -2551,6 +2562,7 @@ def validate_device_session_directory(
     expected_session_id: str | None = None,
     interrupt_check: Callable[[], None] | None = None,
     verified_artifacts: Mapping[str, VerifiedArtifact] | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> Mapping[str, object]:
     """校验 manifest 和所有 artifact 的当前内容。
 
@@ -2581,6 +2593,8 @@ def validate_device_session_directory(
             selected_session_id = root.name if expected_session_id is None else expected_session_id
             manifest = validated_device_session_payload(payload, selected_session_id)
             descriptors = _manifest_artifacts(manifest)
+            if progress is not None:
+                progress(0, len(descriptors))
 
             def verify_artifact(artifact_descriptor):
                 if interrupt_check is not None:
@@ -2610,8 +2624,10 @@ def validate_device_session_directory(
             if interrupt_check is not None:
                 # Catalog verification must yield promptly to a new recording;
                 # keep its existing sequential interruption semantics.
-                for descriptor in descriptors:
+                for completed, descriptor in enumerate(descriptors, 1):
                     verify_artifact(descriptor)
+                    if progress is not None:
+                        progress(completed, len(descriptors))
             else:
                 # Each worker owns its artifact fd; the pinned root stays open
                 # until both have joined. Uncached or changed files are fully
@@ -2619,8 +2635,9 @@ def validate_device_session_directory(
                 with ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="session-verify"
                 ) as executor:
-                    for _ in executor.map(verify_artifact, descriptors):
-                        pass
+                    for completed, _ in enumerate(executor.map(verify_artifact, descriptors), 1):
+                        if progress is not None:
+                            progress(completed, len(descriptors))
             return manifest
         finally:
             os.close(root_fd)
