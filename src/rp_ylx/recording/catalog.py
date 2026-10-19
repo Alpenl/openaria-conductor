@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.persistence import StateDatabase
 
 
@@ -122,7 +123,7 @@ class SessionCatalog(StateDatabase):
                 if (
                     not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_nlink != 1
-                    or metadata.st_size > 16 * 1024 * 1024
+                    or metadata.st_size > MAX_MANIFEST_BYTES
                 ):
                     raise OSError("catalog manifest must be a bounded exclusively linked file")
 

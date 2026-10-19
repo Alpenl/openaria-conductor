@@ -519,7 +519,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
             verified=verified,
         )
     ]
-    write_json_atomic(partial / "manifest.json", manifest)
+    write_json_atomic(partial / "manifest.json", manifest, pretty=False)
     validate_device_session_directory(
         partial, expected_session_id=plan.session_id, verified_artifacts=verified
     )

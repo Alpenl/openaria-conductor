@@ -10,13 +10,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from rp_ylx.frame_index import valid_frame_record
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     validate_device_session_directory,
 )
 from rp_ylx.recording.storage import open_metadata
 
-MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NDJSON_LINE_BYTES = 1024 * 1024
 
 
@@ -168,7 +168,11 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise CaptureValidationError(f"{label} exceeds the bounded size")
     try:
-        value = _loads_json(path.read_text(encoding="utf-8"), label)
+        with path.open("rb") as stream:
+            payload = stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise CaptureValidationError(f"{label} grew beyond the bounded size")
+        value = _loads_json(payload.decode("utf-8"), label)
     except OSError as error:
         raise CaptureValidationError(f"cannot read {label}: {error}") from error
     return _mapping(value, label)

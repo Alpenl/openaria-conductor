@@ -29,6 +29,7 @@ from rp_ylx.api.downloads import (
 )
 from rp_ylx.camera import FrameObservation
 from rp_ylx.imu import ImuObservation
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.native import (
     NativeModuleError,
     NativeRecordingPlan,
@@ -72,9 +73,6 @@ class _AudioRecorderAdapter(Protocol):
     def abort(self) -> None: ...
 
     def close(self) -> None: ...
-
-
-MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,11 +282,11 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def write_json_atomic(path: Path, value: object) -> None:
+def write_json_atomic(path: Path, value: object, *, pretty: bool = True) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("xb") as stream:
-            payload = json_bytes(value, pretty=True)
+            payload = json_bytes(value, pretty=pretty)
             if stream.write(payload) != len(payload):
                 raise OSError(f"{path.name} 发生短写")
             stream.flush()

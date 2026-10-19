@@ -2439,6 +2439,49 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 finally:
                     coordinator.close()
 
+    def test_twenty_mib_manifest_is_readable_without_revalidating_unchanged_json(self):
+        from rp_ylx.recording.catalog import SessionCatalog
+        from rp_ylx.spectacular.adapter import _read_json_object
+        from rp_ylx.validation import _read_discriminator
+
+        coordinator = self.coordinator()
+        try:
+            sid = self.seal_one(coordinator, prefix="large-recovery-manifest")
+            directory = self.mountpoint / "recordings" / sid
+            path = directory / "manifest.json"
+            original = path.read_bytes()
+            payload = original + b" " * (20 * 1024 * 1024 - len(original))
+            path.write_bytes(payload)
+            manifest = json.loads(original)
+            for label, read in (
+                ("public validation", lambda: _read_discriminator(directory)),
+                ("recording inspection", lambda: inspect_device_session_directory(directory)[0]),
+                ("calibration adapter", lambda: _read_json_object(path, "manifest")),
+            ):
+                with self.subTest(reader=label):
+                    self.assertEqual(read(), manifest)
+            with self.subTest(reader="sqlite fingerprint"):
+                self.assertEqual(
+                    json.loads(SessionCatalog.signature(directory))[-1],
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            with (
+                DirectorySessionStore(directory.parent) as store,
+                patch.object(
+                    downloads_module,
+                    "_decode_and_validate_manifest",
+                    wraps=downloads_module._decode_and_validate_manifest,
+                ) as decode,
+            ):
+                for _ in range(2):
+                    with store.open_manifest(sid, "v4") as opened:
+                        self.assertEqual(opened.read(), payload)
+                self.assertEqual(decode.call_count, 1)
+        finally:
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            coordinator.close()
+
     def test_catalog_scan_ignores_link_loops_and_non_directories(self) -> None:
         coordinator = self.coordinator()
         try:

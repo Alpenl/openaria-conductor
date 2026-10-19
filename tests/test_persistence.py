@@ -255,7 +255,7 @@ class PersistenceTest(unittest.TestCase):
             SessionCatalog.signature(directory)
         manifest.unlink()
         with manifest.open("wb") as stream:
-            stream.truncate(16 * 1024 * 1024 + 1)
+            stream.truncate(32 * 1024 * 1024 + 1)
         with self.assertRaises(OSError):
             SessionCatalog.signature(directory)
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)

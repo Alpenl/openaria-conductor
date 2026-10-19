@@ -29,6 +29,15 @@ from tests import test_split_eye_recording as fixtures
 
 
 class RecordingRecoveryTests(unittest.TestCase):
+    def test_recovery_manifest_uses_lossless_compact_serialization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            recovered = recover_device_session(recorder.partial_path)
+            self.assertIsNotNone(recovered)
+            raw = (recovered.path / "manifest.json").read_bytes()
+            self.assertEqual(raw, json_bytes(json.loads(raw)))
+            validate_device_session_directory(recovered.path)
+
     def test_recovery_readback_proof_rejects_change_during_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -10,9 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from rp_ylx.contracts import SessionValidationError, validate_session
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.recording import DeviceRecordingError, validate_device_session_directory
-
-MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,18 +39,22 @@ def _read_discriminator(directory: Path) -> dict[str, Any]:
                 raise PublicValidationError(
                     "manifest_invalid", "manifest.json", "manifest must be a bounded regular file"
                 )
-            payload = b""
+            payload = bytearray()
             while len(payload) <= MAX_MANIFEST_BYTES:
                 block = os.read(descriptor, min(1024 * 1024, MAX_MANIFEST_BYTES + 1 - len(payload)))
                 if not block:
                     break
-                payload += block
+                payload.extend(block)
         finally:
             os.close(descriptor)
     except PublicValidationError:
         raise
     except OSError as error:
         raise PublicValidationError("manifest_unreadable", "manifest.json", str(error)) from error
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise PublicValidationError(
+            "manifest_invalid", "manifest.json", "manifest grew beyond the bounded size"
+        )
     try:
         manifest = json.loads(payload)
     except (UnicodeError, json.JSONDecodeError) as error:

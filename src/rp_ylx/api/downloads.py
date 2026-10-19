@@ -25,6 +25,7 @@ from jsonschema.exceptions import ValidationError
 
 from rp_ylx.api.schema_validation import validate_manifest_schema
 from rp_ylx.audio_clock import audio_clock_report
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
@@ -129,7 +130,7 @@ _RECORDING_SESSION_VALIDATOR = _ManifestValidator(
     format_checker=FormatChecker(),
 )
 _VALIDATED_MANIFEST_CACHE_LIMIT = 32
-_VALIDATED_MANIFEST_CACHE_BYTES = 8 * 1024 * 1024
+_VALIDATED_MANIFEST_CACHE_BYTES = MAX_MANIFEST_BYTES
 _VALIDATED_MANIFEST_SIZES: dict[tuple[str, str, str], int] = {}
 _VALIDATED_MANIFEST_CACHE_LOCK = threading.Lock()
 _VALIDATED_MANIFEST_CACHE: OrderedDict[tuple[str, str, str], Mapping[str, object]] = OrderedDict()
@@ -606,7 +607,7 @@ class DirectorySessionStore:
         generation_root: str | Path,
         *,
         verified_manifests: Mapping[str, str] | None = None,
-        max_manifest_bytes: int = 16 * 1024 * 1024,
+        max_manifest_bytes: int = MAX_MANIFEST_BYTES,
     ) -> None:
         if max_manifest_bytes <= 0:
             raise ValueError("max_manifest_bytes 必须大于零")
