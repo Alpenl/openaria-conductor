@@ -16,6 +16,7 @@ from rp_ylx.recording.device_session import (
     validate_device_session_directory,
 )
 from rp_ylx.recording.storage import open_metadata
+from rp_ylx.recording.verified import open_regular
 
 MAX_NDJSON_LINE_BYTES = 1024 * 1024
 
@@ -168,12 +169,12 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise CaptureValidationError(f"{label} exceeds the bounded size")
     try:
-        with path.open("rb") as stream:
+        with open_regular(path) as stream:
             payload = stream.read(MAX_MANIFEST_BYTES + 1)
         if len(payload) > MAX_MANIFEST_BYTES:
             raise CaptureValidationError(f"{label} grew beyond the bounded size")
         value = _loads_json(payload.decode("utf-8"), label)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise CaptureValidationError(f"cannot read {label}: {error}") from error
     return _mapping(value, label)
 

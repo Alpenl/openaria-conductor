@@ -19,7 +19,7 @@ import zstandard
 
 from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.storage import BLOCK_BYTES, _digest, compact_audio
-from rp_ylx.recording.verified import VerifiedArtifact, identity
+from rp_ylx.recording.verified import VerifiedArtifact, identity, open_regular
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ class PreparedArtifact:
         if not self.output.unchanged(self.target):
             raise ValueError("incremental compacted output changed")
         if path.suffix == ".wav":
-            with self.target.open("rb") as stream:
+            with open_regular(self.target) as stream:
                 if identity(os.fstat(stream.fileno())) != self.output.identity:
                     raise ValueError("prepared audio replaced before durable admission")
                 os.fsync(stream.fileno())
@@ -46,7 +46,7 @@ class PreparedArtifact:
 
 
 def _read_back(path: Path) -> VerifiedArtifact:
-    with path.open("rb") as source:
+    with open_regular(path) as source:
         before = identity(os.fstat(source.fileno()))
         _, digest = _digest(source)
         if identity(os.fstat(source.fileno())) != before:
@@ -59,9 +59,9 @@ class _Journal:
         self.path = path
         self.target = path.with_suffix(path.suffix + ".zst")
         self.temporary = self.target.with_suffix(self.target.suffix + ".tmp")
-        self.source = path.open("rb")
-        self.source_id = identity(os.fstat(self.source.fileno()))[:2]
+        self.source = open_regular(path)
         try:
+            self.source_id = identity(os.fstat(self.source.fileno()))[:2]
             self.output = self.temporary.open("x+b")
         except BaseException:
             self.source.close()

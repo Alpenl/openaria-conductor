@@ -12,6 +12,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 
 def identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -26,6 +27,17 @@ def identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def open_regular(path: Path) -> BinaryIO:
+    """Reject links and special files on the opened fd without waiting on a FIFO."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        identity(os.fstat(descriptor))
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 @dataclass(frozen=True)
@@ -44,8 +56,7 @@ class VerifiedArtifact:
     def unchanged(self, path: Path) -> bool:
         if identity(path.stat(follow_symlinks=False)) != self.identity:
             return False
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(descriptor, "rb") as source:
+        with open_regular(path) as source:
             if identity(os.fstat(source.fileno())) != self.identity:
                 return False
             digest = hashlib.sha256()

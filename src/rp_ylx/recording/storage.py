@@ -18,12 +18,14 @@ from pathlib import Path
 
 import zstandard
 
+from rp_ylx.recording.verified import open_regular
+
 BLOCK_BYTES = 1024 * 1024
 
 
 @contextmanager
 def open_metadata(path: Path):
-    with path.open("rb") as raw:
+    with open_regular(path) as raw:
         if path.suffix == ".zst":
             with (
                 zstandard.ZstdDecompressor(max_window_size=BLOCK_BYTES).stream_reader(
@@ -50,7 +52,7 @@ def compact_metadata(path: Path) -> tuple[Path, dict]:
     temporary = target.with_suffix(target.suffix + ".tmp")
     compressor = zstandard.ZstdCompressor(level=1, write_checksum=True)
     size, digest = 0, hashlib.sha256()
-    with path.open("rb") as source, temporary.open("xb") as output:
+    with open_regular(path) as source, temporary.open("xb") as output:
         while block := source.read(BLOCK_BYTES):
             size += len(block)
             digest.update(block)
@@ -61,7 +63,7 @@ def compact_metadata(path: Path) -> tuple[Path, dict]:
         os.fsync(output.fileno())
     # Name remains temporary until the complete byte-for-byte round trip passes.
     with (
-        temporary.open("rb") as raw,
+        open_regular(temporary) as raw,
         zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True) as decoded,
     ):
         if _digest(decoded) != (size, digest.hexdigest()):
@@ -79,7 +81,7 @@ def compact_metadata(path: Path) -> tuple[Path, dict]:
 def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
     target = path.with_suffix(".flac")
     temporary = target.with_suffix(".flac.tmp")
-    with wave.open(str(path), "rb") as source:
+    with open_regular(path) as raw, wave.open(raw, "rb") as source:
         if source.getsampwidth() != 2 or source.getcomptype() != "NONE":
             raise ValueError("lossless audio requires signed 16-bit PCM")
         pcm = hashlib.sha256()
@@ -139,7 +141,7 @@ def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
         if process.wait(timeout=120) != 0 or actual != (pcm_bytes, pcm.hexdigest()):
             raise ValueError("FLAC PCM round-trip mismatch")
     if durable:
-        with temporary.open("rb") as stream:
+        with open_regular(temporary) as stream:
             os.fsync(stream.fileno())
     os.replace(temporary, target)
     return target, {"codec": "flac", "pcm_bytes": pcm_bytes, "pcm_sha256": pcm.hexdigest()}
@@ -161,12 +163,12 @@ def compact_manifest(
             return prepared[relative].use(root, descriptor)
         path = root / relative
         audio = descriptor["media_type"] == "audio/wav"
-        with path.open("rb") as source:
+        with open_regular(path) as source:
             expected_source = _digest(source)
         if expected_source != (descriptor["bytes"], descriptor["sha256"]):
             raise ValueError("source changed before lossless compaction")
         target, compression = compact_audio(path) if audio else compact_metadata(path)
-        with path.open("rb") as source:
+        with open_regular(path) as source:
             if _digest(source) != expected_source:
                 raise ValueError("source changed during lossless compaction")
         if (
