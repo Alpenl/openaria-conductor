@@ -748,6 +748,8 @@ class GatewayServer(ThreadingHTTPServer):
         self.max_http_connections = max_http_connections
         self._http_condition = threading.Condition()
         self._http_connections: set[socket.socket] = set()
+        self._http_reclaimable: dict[socket.socket, float] = {}
+        self._http_cancelled: set[socket.socket] = set()
         self._http_closing = False
         self._io_deadlines: dict[tuple[socket.socket, str], _IODeadline] = {}
         self._deadline_watcher: threading.Thread | None = None
@@ -790,11 +792,13 @@ class GatewayServer(ThreadingHTTPServer):
         deadline = _IODeadline(expires_at)
         key = (connection, kind)
         with self._http_condition:
-            if self._http_closing:
-                raise ConnectionResetError("gateway is closing")
+            if self._http_closing or connection in self._http_cancelled:
+                raise ConnectionResetError("gateway connection is closing")
             if expires_at <= time.monotonic():
                 raise TimeoutError(f"HTTP {kind} exceeded its deadline")
             self._io_deadlines[key] = deadline
+            if kind == "read":
+                self._http_reclaimable[connection] = expires_at - self.request_timeout_seconds
             if self._deadline_next_check is None or expires_at < self._deadline_next_check:
                 self._http_condition.notify_all()
         try:
@@ -807,8 +811,13 @@ class GatewayServer(ThreadingHTTPServer):
                         connection.shutdown(socket.SHUT_RDWR)
                 if self._io_deadlines.get(key) is deadline:
                     self._io_deadlines.pop(key)
+                if kind == "read":
+                    self._http_reclaimable.pop(connection, None)
+                cancelled = connection in self._http_cancelled
             if deadline.expired:
                 raise TimeoutError(f"HTTP {kind} exceeded its deadline")
+            if cancelled:
+                raise ConnectionResetError("incomplete request yielded connection capacity")
 
     def _watch_io_deadlines(self) -> None:
         with self._http_condition:
@@ -835,13 +844,35 @@ class GatewayServer(ThreadingHTTPServer):
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         with self._http_condition:
+            if not self._http_closing and len(self._http_connections) >= self.max_http_connections:
+                # Reclaim only idle or incomplete-input clients, never a command or
+                # response already in progress. Keep the old handler counted until
+                # it actually exits; no replacement thread may exceed the hard cap.
+                candidates = {
+                    connection: started
+                    for connection, started in self._http_reclaimable.items()
+                    if connection not in self._http_cancelled
+                }
+                if candidates:
+                    oldest = min(candidates, key=candidates.__getitem__)
+                    self._http_cancelled.add(oldest)
+                    with suppress(OSError):
+                        oldest.shutdown(socket.SHUT_RDWR)
+                    self._http_condition.wait_for(
+                        lambda: (
+                            self._http_closing
+                            or len(self._http_connections) < self.max_http_connections
+                        ),
+                        timeout=0.1,
+                    )
             admitted = (
                 not self._http_closing and len(self._http_connections) < self.max_http_connections
             )
             if admitted:
                 self._http_connections.add(request)
+                self._http_reclaimable[request] = time.monotonic()
         if not admitted:
-            # Do not read or write on the accept thread for a client beyond capacity.
+            # Never read or write client data on the accept thread.
             self.shutdown_request(request)
             return
         try:
@@ -861,7 +892,15 @@ class GatewayServer(ThreadingHTTPServer):
     def _http_finished(self, request: socket.socket) -> None:
         with self._http_condition:
             self._http_connections.discard(request)
+            self._http_reclaimable.pop(request, None)
+            self._http_cancelled.discard(request)
             self._http_condition.notify_all()
+
+    def begin_request_input(self, connection: socket.socket) -> None:
+        with self._http_condition:
+            if self._http_closing or connection in self._http_cancelled:
+                raise ConnectionResetError("gateway connection is closing")
+            self._http_reclaimable[connection] = time.monotonic()
 
     def _cancel_http_connections(self) -> None:
         with self._http_condition:
@@ -925,6 +964,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             try:
                 # Waiting for the first byte is an idle timeout, separate from the
                 # total request-input budget. peek keeps pipelined bytes intact.
+                self.server.begin_request_input(self.connection)
                 if not self.rfile.peek(1):
                     self.close_connection = True
                     return

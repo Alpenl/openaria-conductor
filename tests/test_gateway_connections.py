@@ -71,19 +71,43 @@ class GatewayConnectionsTest(unittest.TestCase):
             client.close()
 
     def test_excess_connections_rejected_and_capacity_reused(self) -> None:
+        # Active provider calls retain their slots; idle inputs may be reclaimed.
         clients = []
+        release = threading.Event()
+        entered = 0
+        original = self.server.provider.device_descriptor
+
+        def gated(*args):
+            nonlocal entered
+            with self.condition:
+                entered += 1
+                self.condition.notify_all()
+            release.wait(3)
+            return original(*args)
+
+        self.server.provider.device_descriptor = gated
         try:
             for count in range(1, 3):
-                clients.append(socket.create_connection(self.server.server_address, timeout=1))
-                self.wait_active(count)
+                client = socket.create_connection(self.server.server_address, timeout=1)
+                clients.append(client)
+                client.sendall(
+                    b"GET /api/v4/device HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+                )
+                with self.condition:
+                    self.assertTrue(
+                        self.condition.wait_for(
+                            lambda expected=count: entered == expected, timeout=1
+                        )
+                    )
             with socket.create_connection(self.server.server_address, timeout=0.5) as excess:
                 self.assertEqual(excess.recv(1), b"", "excess connection was not rejected")
             self.assertEqual(self.peak, 2)
-            clients.pop().close()
-            self.wait_active(1)
+            release.set()
+            self.wait_active(0)
             self.request_device()
             self.assertLessEqual(self.peak, 2)
         finally:
+            release.set()
             for client in clients:
                 client.close()
         self.wait_active(0)
