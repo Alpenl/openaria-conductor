@@ -3027,7 +3027,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         try:
             body = json.loads(payload)
-        except (UnicodeError, json.JSONDecodeError):
+        except (ValueError, RecursionError):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不是有效 JSON")
             return None
         if not isinstance(body, dict):
@@ -3040,7 +3040,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             allowed = {"schema", "mode", "volume_id", "display_name", "take"}
             if set(body) - allowed or body.get("schema") != "ylx.capture-start.v2":
                 return False
-            if body.get("mode") not in {"production", "calibration"}:
+            mode = body.get("mode")
+            if not isinstance(mode, str) or mode not in {"production", "calibration"}:
                 return False
             volume_id = body.get("volume_id")
             if volume_id is not None and (
@@ -3067,6 +3068,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return (
             set(body) == {"schema", "reason"}
             and body.get("schema") == "ylx.capture-stop.v2"
+            and isinstance(body.get("reason"), str)
             and body.get("reason") in {"user", "safe_swap"}
         )
 
