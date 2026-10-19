@@ -8,7 +8,13 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from rp_ylx.persistence import APPLICATION_ID, SCHEMA_VERSION, PersistenceError, StateDatabase
+from rp_ylx.persistence import (
+    APPLICATION_ID,
+    SCHEMA_VERSION,
+    PersistenceError,
+    StateDatabase,
+    validate_state_schema,
+)
 from rp_ylx.recording.catalog import SessionCatalog
 
 
@@ -41,6 +47,7 @@ def inspect(path: Path) -> dict:
             or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
         ):
             raise PersistenceError("unsupported database identity or schema")
+        validate_state_schema(db)
         checks = [row[0] for row in db.execute("PRAGMA integrity_check")]
         if checks != ["ok"]:
             raise PersistenceError("database integrity check failed")

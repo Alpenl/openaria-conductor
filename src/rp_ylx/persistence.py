@@ -15,17 +15,53 @@ import stat
 import time
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
 APPLICATION_ID = 0x594C5801
 
+_STATE_TABLES = {
+    "documents": "name TEXT PRIMARY KEY, body TEXT NOT NULL, "
+    "revision INTEGER NOT NULL, updated_at TEXT NOT NULL",
+    "imports": "name TEXT PRIMARY KEY, source TEXT NOT NULL",
+    "changes": "id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+    "revision INTEGER NOT NULL, body TEXT NOT NULL, updated_at TEXT NOT NULL",
+    "capture_commands": "principal TEXT NOT NULL, operation TEXT NOT NULL, "
+    "idempotency_key TEXT NOT NULL, body TEXT NOT NULL, "
+    "PRIMARY KEY(principal,operation,idempotency_key)",
+    "transfers": "id TEXT PRIMARY KEY, volume TEXT NOT NULL, session TEXT NOT NULL, "
+    "artifact TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, "
+    "status TEXT NOT NULL, bytes_read INTEGER NOT NULL",
+}
+
 
 class PersistenceError(RuntimeError):
     """Persistent authority cannot safely be loaded or updated."""
+
+
+@cache
+def _schema_columns() -> dict[str, tuple]:
+    # Derive SQLite's column/primary-key metadata from the same declarations
+    # used for a fresh database. Do not duplicate a second schema definition.
+    with closing(sqlite3.connect(":memory:")) as db:
+        for name, columns in _STATE_TABLES.items():
+            db.execute(f"CREATE TABLE {name} ({columns})")
+        return {name: tuple(db.execute(f"PRAGMA table_xinfo({name})")) for name in _STATE_TABLES}
+
+
+def validate_state_schema(db: sqlite3.Connection) -> None:
+    """Reject incomplete version-1 authority; extra catalog tables are allowed."""
+    objects = dict(db.execute("SELECT name,type FROM sqlite_master"))
+    for name, columns in _schema_columns().items():
+        if (
+            objects.get(name) != "table"
+            or tuple(db.execute(f"PRAGMA table_xinfo({name})")) != columns
+        ):
+            raise PersistenceError(f"incompatible or missing authoritative table: {name}")
 
 
 def _json(value: object) -> str:
@@ -91,47 +127,29 @@ class StateDatabase:
             with self.connection() as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
                 application = db.execute("PRAGMA application_id").fetchone()[0]
-                tables = db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                objects = db.execute("SELECT name FROM sqlite_master").fetchall()
                 if self.marker.exists() and version == 0:
                     raise PersistenceError("initialized database has lost its schema")
-                if application != APPLICATION_ID and (application or version or tables):
+                if application != APPLICATION_ID and (application or version or objects):
                     raise PersistenceError("not an OpenAria state database")
                 if version not in (0, SCHEMA_VERSION):
                     raise PersistenceError(f"unsupported database schema: {version}")
+                if version == SCHEMA_VERSION:
+                    validate_state_schema(db)
+                elif objects:
+                    # Schema creation and its version commit together. Existing
+                    # tables with version zero cannot be an interrupted creation.
+                    raise PersistenceError("unversioned state database contains existing schema")
                 if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise PersistenceError("state database integrity check failed")
                 db.execute("PRAGMA journal_mode=WAL")
                 with db:
-                    db.execute("BEGIN IMMEDIATE")
-                    db.execute(
-                        "CREATE TABLE IF NOT EXISTS documents ("
-                        "name TEXT PRIMARY KEY, body TEXT NOT NULL, "
-                        "revision INTEGER NOT NULL, updated_at TEXT NOT NULL)"
-                    )
-                    db.execute(
-                        "CREATE TABLE IF NOT EXISTS imports ("
-                        "name TEXT PRIMARY KEY, source TEXT NOT NULL)"
-                    )
-                    db.execute(
-                        "CREATE TABLE IF NOT EXISTS changes ("
-                        "id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
-                        "revision INTEGER NOT NULL, body TEXT NOT NULL, "
-                        "updated_at TEXT NOT NULL)"
-                    )
-                    db.execute(
-                        "CREATE TABLE IF NOT EXISTS capture_commands ("
-                        "principal TEXT NOT NULL, operation TEXT NOT NULL, "
-                        "idempotency_key TEXT NOT NULL, body TEXT NOT NULL, "
-                        "PRIMARY KEY(principal,operation,idempotency_key))"
-                    )
-                    db.execute(
-                        "CREATE TABLE IF NOT EXISTS transfers ("
-                        "id TEXT PRIMARY KEY, volume TEXT NOT NULL, session TEXT NOT NULL, "
-                        "artifact TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, "
-                        "status TEXT NOT NULL, bytes_read INTEGER NOT NULL)"
-                    )
-                    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                    db.execute(f"PRAGMA application_id={APPLICATION_ID}")
+                    if version == 0:
+                        db.execute("BEGIN IMMEDIATE")
+                        for name, columns in _STATE_TABLES.items():
+                            db.execute(f"CREATE TABLE {name} ({columns})")
+                        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                        db.execute(f"PRAGMA application_id={APPLICATION_ID}")
             if not self.marker.exists():
                 try:
                     fd = os.open(self.marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
