@@ -48,6 +48,7 @@ typedef struct {
     pthread_t thread;
     pthread_t writer_thread;
     ylx_packet_queue_t packets;
+    int codec_started, output_started, writer_started, packets_initialized;
     atomic_ullong max_write_ns;
     segment_t *current;
     unsigned long long ordinal; /* encoded frames emitted so far */
@@ -68,6 +69,7 @@ struct ylx_pipeline {
     media_codec_context_t decoder;
     eye_t eyes[YLX_EYES];
     pthread_t split_thread;
+    int decoder_started, split_started, closer_started;
 
     ylx_segment_closed_fn on_segment;
     void *user;
@@ -889,6 +891,7 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
                       ylx_segment_closed_fn on_segment, void *user,
                       ylx_pipeline_t **out, char *error, size_t error_len)
 {
+    if (out != NULL) *out = NULL;
     if (config == NULL || out == NULL || config->out_dir == NULL ||
         config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->height <= 0 ||
         config->fps <= 0 || config->fps > 60 || config->segment_frames < 0 || config->intra_period < 0 ||
@@ -923,45 +926,65 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     pthread_mutex_init(&pipeline->closer_lock, NULL);
     pthread_cond_init(&pipeline->closer_signal, NULL);
 
+    /* Complete shared queue setup before any worker can observe an eye. */
+    for (int eye = 0; eye < YLX_EYES; eye += 1) {
+        pipeline->eyes[eye].pipeline = pipeline;
+        pipeline->eyes[eye].eye = eye;
+        ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
+                             config->fps * MUX_QUEUE_SECONDS);
+        pipeline->eyes[eye].packets_initialized = 1;
+    }
+
     configure_decoder(&pipeline->decoder, &pipeline->config);
     int ret = codec_start(&pipeline->decoder);
     if (ret != 0) {
         snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
-        free(pipeline);
-        return -1;
+        goto open_failed;
     }
+    pipeline->decoder_started = 1;
 
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        pipeline->eyes[eye].pipeline = pipeline;
-        pipeline->eyes[eye].eye = eye;
         ret = configure_encoder(&pipeline->eyes[eye].codec, &pipeline->config,
                           pipeline->eye_width);
         if (ret == 0) ret = codec_start(&pipeline->eyes[eye].codec);
         if (ret != 0) {
             snprintf(error, error_len, "vpu_unavailable: %s video encoder start failed (%d)",
                      EYE_NAMES[eye], ret);
-            for (int done = 0; done < eye; done += 1) {
-                codec_stop(&pipeline->eyes[done].codec);
-            }
-            codec_stop(&pipeline->decoder);
-            free(pipeline);
-            return -1;
+            goto open_failed;
         }
+        pipeline->eyes[eye].codec_started = 1;
     }
 
-    pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
-    pthread_create(&pipeline->split_thread, NULL, split_thread_main, pipeline);
+    const char *worker = "closer";
+    ret = pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
+    if (ret != 0) goto thread_failed;
+    pipeline->closer_started = 1;
+    worker = "splitter";
+    ret = pthread_create(&pipeline->split_thread, NULL, split_thread_main, pipeline);
+    if (ret != 0) goto thread_failed;
+    pipeline->split_started = 1;
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
-                             config->fps * MUX_QUEUE_SECONDS);
-        pthread_create(&pipeline->eyes[eye].writer_thread, NULL, mux_writer_thread,
-                       &pipeline->eyes[eye]);
-        pthread_create(&pipeline->eyes[eye].thread, NULL, encoder_output_thread,
-                       &pipeline->eyes[eye]);
+        worker = eye == 0 ? "left writer" : "right writer";
+        ret = pthread_create(&pipeline->eyes[eye].writer_thread, NULL, mux_writer_thread,
+                             &pipeline->eyes[eye]);
+        if (ret != 0) goto thread_failed;
+        pipeline->eyes[eye].writer_started = 1;
+        worker = eye == 0 ? "left output" : "right output";
+        ret = pthread_create(&pipeline->eyes[eye].thread, NULL, encoder_output_thread,
+                             &pipeline->eyes[eye]);
+        if (ret != 0) goto thread_failed;
+        pipeline->eyes[eye].output_started = 1;
     }
 
     *out = pipeline;
     return 0;
+
+thread_failed:
+    snprintf(error, error_len, "thread_start_failed: %s (%d)", worker, ret);
+open_failed:
+    atomic_store(&pipeline->failed, 1);
+    ylx_pipeline_close(pipeline);
+    return -1;
 }
 
 int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
@@ -1014,17 +1037,20 @@ int ylx_pipeline_finish(ylx_pipeline_t *pipeline)
     if (atomic_exchange(&pipeline->stopping, 1) != 0) {
         return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
     }
-    pthread_join(pipeline->split_thread, NULL);
+    if (pipeline->split_started) pthread_join(pipeline->split_thread, NULL);
+    else atomic_store(&pipeline->split_done, 1);
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        pthread_join(pipeline->eyes[eye].thread, NULL);
-        pthread_join(pipeline->eyes[eye].writer_thread, NULL);
+        if (pipeline->eyes[eye].output_started) pthread_join(pipeline->eyes[eye].thread, NULL);
+        /* Startup can fail after a writer starts but before its producer does. */
+        if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_close(&pipeline->eyes[eye].packets);
+        if (pipeline->eyes[eye].writer_started) pthread_join(pipeline->eyes[eye].writer_thread, NULL);
     }
     /* Only once both eyes stopped queueing can the closer drain to empty. */
     pthread_mutex_lock(&pipeline->closer_lock);
     pipeline->closer_stop = 1;
     pthread_cond_signal(&pipeline->closer_signal);
     pthread_mutex_unlock(&pipeline->closer_lock);
-    pthread_join(pipeline->closer_thread, NULL);
+    if (pipeline->closer_started) pthread_join(pipeline->closer_thread, NULL);
     return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
 }
 
@@ -1035,15 +1061,15 @@ void ylx_pipeline_close(ylx_pipeline_t *pipeline)
     }
     ylx_pipeline_finish(pipeline);
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        codec_stop(&pipeline->eyes[eye].codec);
-        ylx_packet_queue_destroy(&pipeline->eyes[eye].packets);
+        if (pipeline->eyes[eye].codec_started) codec_stop(&pipeline->eyes[eye].codec);
+        if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_destroy(&pipeline->eyes[eye].packets);
     }
     while (pipeline->closed_pairs) {
         closed_pair_t *pair = pipeline->closed_pairs;
         pipeline->closed_pairs = pair->next;
         free(pair);
     }
-    codec_stop(&pipeline->decoder);
+    if (pipeline->decoder_started) codec_stop(&pipeline->decoder);
     pthread_mutex_destroy(&pipeline->ledger_lock);
     pthread_mutex_destroy(&pipeline->error_lock);
     pthread_mutex_destroy(&pipeline->closer_lock);
