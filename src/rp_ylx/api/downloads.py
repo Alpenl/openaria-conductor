@@ -661,16 +661,26 @@ class DirectorySessionStore:
             _close_all(owned)
             raise ArtifactAccessError("not_found", "会话不存在或尚未封存") from error
 
-    def manifest_identity(self, session_id: str) -> _ExclusiveFileIdentity:
-        """Stat a freshly opened, non-linked manifest without trusting new bytes.
+    def manifest_identity(
+        self, session_id: str, *, expected_sha256: str | None = None
+    ) -> _ExclusiveFileIdentity:
+        """Read current content when checking a previously validated manifest.
 
-        This identity is only evidence for an unchanged, previously validated
-        snapshot. Reading a new manifest or serving artifacts still requires the
-        payload validation paths below.
+        File identity alone is not content proof on coarse-timestamp filesystems.
+        Hashing the small manifest avoids reparsing unchanged JSON or reading
+        historical video payloads on a catalog request.
         """
-        owned, descriptor, _ = self._open_manifest_file(session_id)
+        owned, descriptor, file_identity = self._open_manifest_file(session_id)
         try:
-            return _exclusive_regular_identity(descriptor)
+            before = _exclusive_regular_identity(descriptor)
+            if expected_sha256 is not None:
+                payload = _read_exact_file(descriptor, file_identity)
+                if (
+                    hashlib.sha256(payload).hexdigest() != expected_sha256
+                    or _exclusive_regular_identity(descriptor) != before
+                ):
+                    raise ArtifactAccessError("not_verified", "manifest 内容已变化", reason="stale")
+            return before
         finally:
             _close_all(owned)
 

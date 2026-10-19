@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
 import subprocess
@@ -237,6 +238,45 @@ class PersistenceTest(unittest.TestCase):
         with self.assertRaises(ProductionConfigError):
             manage(config, "set", source=patchfile)
         self.assertEqual(load_production_config(config).fps, 60)
+
+    def test_catalog_signature_rejects_linked_and_oversized_manifests(self):
+        directory = self.root / "signature-boundaries"
+        directory.mkdir()
+        manifest = directory / "manifest.json"
+        source = self.root / "source.json"
+        source.write_text("{}")
+        before = len(os.listdir("/proc/self/fd"))
+        manifest.symlink_to(source)
+        with self.assertRaises(OSError):
+            SessionCatalog.signature(directory)
+        manifest.unlink()
+        os.link(source, manifest)
+        with self.assertRaises(OSError):
+            SessionCatalog.signature(directory)
+        manifest.unlink()
+        with manifest.open("wb") as stream:
+            stream.truncate(16 * 1024 * 1024 + 1)
+        with self.assertRaises(OSError):
+            SessionCatalog.signature(directory)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_catalog_signature_rejects_fifo_without_waiting_for_writer(self):
+        directory = self.root / "fifo-manifest"
+        directory.mkdir()
+        os.mkfifo(directory / "manifest.json")
+        code = (
+            "from pathlib import Path; import sys; "
+            "from rp_ylx.recording.catalog import SessionCatalog; "
+            "SessionCatalog.signature(Path(sys.argv[1]))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(directory)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bounded exclusively linked file", result.stderr)
 
     def test_catalog_restart_invalidation_and_historical_proof(self):
         directory = self.root / "session"

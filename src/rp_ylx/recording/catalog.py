@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import stat
 import threading
@@ -100,23 +102,59 @@ class SessionCatalog(StateDatabase):
 
     @staticmethod
     def signature(directory: Path) -> str:
-        # Include ctime and inode so same-size/restored-mtime replacement invalidates.
+        # SQLite caches metadata, but stat equality cannot establish that the
+        # manifest is unchanged. Hash only its bounded bytes, never the media.
         parent = directory.lstat()
-        metadata = (directory / "manifest.json").lstat()
-        if not stat.S_ISDIR(parent.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise OSError("catalog paths must not be symbolic links")
-        return json.dumps(
-            [
-                parent.st_dev,
-                parent.st_ino,
-                metadata.st_dev,
-                metadata.st_ino,
-                metadata.st_size,
-                metadata.st_mtime_ns,
-                metadata.st_ctime_ns,
-                metadata.st_nlink,
-            ]
-        )
+        if not stat.S_ISDIR(parent.st_mode):
+            raise OSError("catalog directory must not be a symbolic link")
+        parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            opened_parent = os.fstat(parent_fd)
+            if (parent.st_dev, parent.st_ino) != (opened_parent.st_dev, opened_parent.st_ino):
+                raise OSError("catalog directory changed during open")
+            fd = os.open(
+                "manifest.json",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+            with os.fdopen(fd, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_size > 16 * 1024 * 1024
+                ):
+                    raise OSError("catalog manifest must be a bounded exclusively linked file")
+
+                def fields(value):
+                    return (
+                        value.st_dev,
+                        value.st_ino,
+                        value.st_mode,
+                        value.st_nlink,
+                        value.st_size,
+                        value.st_mtime_ns,
+                        value.st_ctime_ns,
+                    )
+
+                digest = hashlib.sha256()
+                remaining = metadata.st_size
+                while remaining:
+                    block = stream.read(min(remaining, 1024 * 1024))
+                    if not block:
+                        raise OSError("catalog manifest truncated during read")
+                    digest.update(block)
+                    remaining -= len(block)
+                if stream.read(1) or fields(os.fstat(stream.fileno())) != fields(metadata):
+                    raise OSError("catalog manifest changed during read")
+                current = os.stat("manifest.json", dir_fd=parent_fd, follow_symlinks=False)
+                if fields(current) != fields(metadata):
+                    raise OSError("catalog manifest replaced during read")
+                return json.dumps(
+                    [parent.st_dev, parent.st_ino, *fields(metadata), digest.hexdigest()]
+                )
+        finally:
+            os.close(parent_fd)
 
     def cached(
         self,

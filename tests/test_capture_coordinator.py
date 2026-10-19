@@ -2328,7 +2328,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_cached_catalog_checks_verified_identity_without_reading_manifest(self) -> None:
+    def test_cached_catalog_rehashes_manifest_without_revalidating_json(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
@@ -2341,8 +2341,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             with (
                 patch(
                     "rp_ylx.api.downloads._read_exact_file",
-                    side_effect=AssertionError("unchanged verified manifest must not be read"),
-                ),
+                    wraps=downloads_module._read_exact_file,
+                ) as read_manifest,
                 patch(
                     "rp_ylx.api.downloads._decode_and_validate_manifest",
                     side_effect=AssertionError("unchanged manifest must not be revalidated"),
@@ -2351,6 +2351,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
 
             self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
+            self.assertEqual(read_manifest.call_count, 1)
         finally:
             coordinator.close()
 
@@ -2386,6 +2387,55 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     self.assertNotIn(session_id, coordinator._session_snapshots)
                     if change == "same_size_edit":
                         self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                finally:
+                    coordinator.close()
+
+    def test_catalog_manifest_content_changes_with_identical_filesystem_metadata(self):
+        for restarted in (False, True):
+            with self.subTest(restarted=restarted):
+                coordinator = self.coordinator()
+                try:
+                    session_id = self.seal_one(coordinator, prefix=f"coarse-manifest-{restarted}")
+                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    original = manifest_path.read_bytes()
+                    metadata = manifest_path.stat()
+                    if restarted:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+                    changed = original.replace(b"YLX-12AB34CD", b"YLX-56EF78AB")
+                    self.assertNotEqual(changed, original)
+                    self.assertEqual(len(changed), len(original))
+                    manifest_path.write_bytes(changed)
+                    real_fstat, real_stat, real_os_stat = os.fstat, Path.stat, os.stat
+
+                    def collide(current, metadata=metadata):
+                        return (
+                            metadata
+                            if (current.st_dev, current.st_ino)
+                            == (metadata.st_dev, metadata.st_ino)
+                            else current
+                        )
+
+                    def stat_path(path, *args, read=real_stat, **kwargs):
+                        return collide(read(path, *args, **kwargs))
+
+                    with (
+                        patch.object(
+                            os, "fstat", side_effect=lambda fd, read=real_fstat: collide(read(fd))
+                        ),
+                        patch.object(Path, "stat", stat_path),
+                        patch.object(
+                            os,
+                            "stat",
+                            side_effect=lambda *a, read=real_os_stat, **kw: collide(read(*a, **kw)),
+                        ),
+                    ):
+                        listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+                    selected = next(x for x in listed["items"] if x["session_id"] == session_id)
+                    self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                    self.assertIsNone(selected["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
                 finally:
                     coordinator.close()
 

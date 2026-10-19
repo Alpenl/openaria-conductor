@@ -522,10 +522,12 @@ class _MultiRootSessionStore:
             raise not_found
         raise ArtifactAccessError("not_found", "会话不存在")
 
-    def manifest_identity(self, session_id: str) -> tuple[int, int, int, int, int, int, int]:
+    def manifest_identity(
+        self, session_id: str, *, expected_sha256: str | None = None
+    ) -> tuple[int, int, int, int, int, int, int]:
         for store in self._stores:
             try:
-                return store.manifest_identity(session_id)
+                return store.manifest_identity(session_id, expected_sha256=expected_sha256)
             except ArtifactAccessError as error:
                 if error.code != "not_found":
                     raise
@@ -1193,10 +1195,12 @@ class CaptureCoordinator:
             verified_manifests={session_id: snapshot.manifest_sha256},
         )
         try:
-            # The full verification snapshot already binds this exact file
-            # identity to its SHA-256. ctime catches in-place writes even when
-            # size and mtime are restored; fresh no-follow opens reject links.
-            return store.manifest_identity(session_id) == snapshot.manifest_identity
+            # Coarse timestamps can collide across same-size writes. Recheck
+            # manifest bytes without decoding JSON or hashing video payloads.
+            return (
+                store.manifest_identity(session_id, expected_sha256=snapshot.manifest_sha256)
+                == snapshot.manifest_identity
+            )
         except (ArtifactAccessError, DeviceRecordingError, OSError):
             return False
         finally:
