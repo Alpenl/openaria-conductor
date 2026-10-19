@@ -25,6 +25,7 @@ from rp_ylx.api import (
     create_gateway_server,
 )
 from rp_ylx.api.gateway import _NetworkEventReplayBuffer
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.web import read_asset
 
 WEB_ASSET_EXPECTATIONS = {
@@ -2443,6 +2444,40 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(payload)["error"]["code"], "not_found")
 
+    def test_manifest_http_accepts_long_recording_metadata_up_to_shared_bound(self) -> None:
+        for size in (20 * 1024 * 1024, MAX_MANIFEST_BYTES):
+            with self.subTest(size=size):
+                payload = MANIFEST_BYTES + b" " * (size - len(MANIFEST_BYTES))
+                self.server.provider.manifest_representation = MemoryRepresentation(payload)
+                status, body, headers = self.request(
+                    f"/api/v4/sessions/{SESSION_ID}", token="reader-token"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body, payload)
+                self.assertEqual(int(headers["Content-Length"]), size)
+                self.assertEqual(
+                    headers["YLX-Manifest-SHA256"], hashlib.sha256(payload).hexdigest()
+                )
+
+    def test_manifest_http_refuses_over_shared_bound_before_reading(self) -> None:
+        reads = []
+
+        class OversizedManifest(MemoryRepresentation):
+            def iter_chunks(self, *args, **kwargs):
+                reads.append(True)
+                yield from super().iter_chunks(*args, **kwargs)
+
+        representation = OversizedManifest(MANIFEST_BYTES)
+        representation.size = MAX_MANIFEST_BYTES + 1
+        self.server.provider.manifest_representation = representation
+        status, body, headers = self.request(
+            f"/api/v4/sessions/{SESSION_ID}", token="reader-token"
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"]["code"], "invalid_source_state")
+        self.assertEqual(reads, [])
+        self.assertIsNone(headers["ETag"])
+
     def test_manifest_representation_metadata_and_body_mismatch_fail_closed(self) -> None:
         missing_etag = MemoryRepresentation(MANIFEST_BYTES)
         del missing_etag.etag
@@ -2453,7 +2488,7 @@ class GatewayHttpTest(unittest.TestCase):
         wrong_length = MemoryRepresentation(MANIFEST_BYTES)
         wrong_length.size += 1
         oversized = MemoryRepresentation(MANIFEST_BYTES)
-        oversized.size = 8 * 1024 * 1024 + 1
+        oversized.size = MAX_MANIFEST_BYTES + 1
         read_failed = FaultingManifestRepresentation(MANIFEST_BYTES)
 
         for label, representation in (

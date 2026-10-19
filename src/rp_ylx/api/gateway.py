@@ -49,6 +49,7 @@ from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
 from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.clock_sync import valid_clock_request, valid_clock_response
 from rp_ylx.firmware_control import FirmwareError, request_firmware
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network_validation import (
     NETWORK_CREDENTIAL_REF,
     NETWORK_MODES,
@@ -65,7 +66,6 @@ from rp_ylx.web import (
 )
 
 MAX_BODY_BYTES = 64 * 1024
-MAX_MANIFEST_RESPONSE_BYTES = 8 * 1024 * 1024
 UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 QUOTED_SHA256 = re.compile(r'^"([0-9a-f]{64})"$')
@@ -2364,7 +2364,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     etag_match is None
                     or content_type != "application/json"
                     or type(size) is not int
-                    or not 0 < size <= MAX_MANIFEST_RESPONSE_BYTES
+                    or not 0 < size <= MAX_MANIFEST_BYTES
                     or not callable(iter_chunks)
                 ):
                     self._invalid_source_state("daemon manifest representation 元数据无效")
@@ -2378,7 +2378,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             return
                         payload_chunk = bytes(chunk)
                         received += len(payload_chunk)
-                        if received > size or received > MAX_MANIFEST_RESPONSE_BYTES:
+                        if received > size or received > MAX_MANIFEST_BYTES:
                             self._invalid_source_state("daemon manifest representation 长度无效")
                             return
                         chunks.append(payload_chunk)
