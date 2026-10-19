@@ -1172,7 +1172,16 @@ class DeviceSessionRecorder:
         """对助手已封好的分段计算 SHA-256 并登记封存身份。"""
 
         transaction = self._native_transaction
+        closed_offset = 0
         if transaction is not None:
+            raw_segments = transaction.segments()
+            closed_offset = self._harvested_segments
+            if len(raw_segments) < closed_offset:
+                raise DeviceRecordingError("segment_invalid", "encoder segment list regressed")
+            # Native closed segments are append-only and previously harvested
+            # records already have sealed identities. Revalidating their fields
+            # every 200 ms made Python work grow with the recording's duration.
+            # Validate every unharvested entry, including an unindexed tail.
             closed = tuple(
                 ClosedSegment(
                     index=_native_segment_uint(item.get("index"), "segment.index"),
@@ -1187,7 +1196,7 @@ class DeviceSessionRecorder:
                         item.get("right_bytes"), "segment.right_bytes"
                     ),
                 )
-                for item in transaction.segments()
+                for item in raw_segments[closed_offset:]
             )
         else:
             encoder = self._encoder
@@ -1195,8 +1204,8 @@ class DeviceSessionRecorder:
                 return
             closed = encoder.segments
         harvested_before = self._harvested_segments
-        while self._harvested_segments < len(closed):
-            segment = closed[self._harvested_segments]
+        while self._harvested_segments < closed_offset + len(closed):
+            segment = closed[self._harvested_segments - closed_offset]
             if transaction is not None:
                 available = transaction.snapshot()["sink"]["frames_indexed"]
             else:
