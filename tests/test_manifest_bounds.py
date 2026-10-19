@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,21 @@ import rp_ylx.validation as validation
 
 
 class ManifestBoundsTests(unittest.TestCase):
+    def test_public_cli_rejects_fifo_manifest_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.mkfifo(root / "manifest.json")
+            result = subprocess.run(
+                [sys.executable, "-m", "rp_ylx", "validate", str(root)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        rendered = json.loads(result.stderr)
+        self.assertFalse(rendered["valid"])
+        self.assertEqual(rendered["error"]["code"], "manifest_invalid")
+
     def test_public_reader_rejects_growth_after_initial_stat(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

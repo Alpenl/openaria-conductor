@@ -26,7 +26,10 @@ class PublicValidationError(RuntimeError):
 
 def _read_discriminator(directory: Path) -> dict[str, Any]:
     root_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
-    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    # Opening a FIFO must not wait for a writer before fstat can reject it.
+    file_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         root_fd = os.open(directory, root_flags)
         try:
