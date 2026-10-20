@@ -29,6 +29,11 @@
 #define PATH_LEN 512
 #define MUX_QUEUE_BYTES (32u * 1024u * 1024u) /* per eye, compressed packets */
 #define MUX_QUEUE_SECONDS 16u
+/* Include both writable eyes, queued segments and the in-flight disk sealer.
+ * Otherwise a stalled fsync can retain muxers indefinitely while writers keep
+ * opening files. At five seconds per segment this permits over a minute of
+ * backlog before reporting an explicit storage failure. */
+#define MAX_PENDING_SEGMENTS 32u
 
 typedef struct segment {
     struct segment *next;
@@ -85,6 +90,7 @@ struct ylx_pipeline {
     segment_t *closer_head;
     segment_t *closer_tail;
     int closer_stop;
+    atomic_uint pending_segments;
 
     pthread_mutex_t ledger_lock;
     /* Eyes can seal at different speeds. Keep all pending pairs until the
@@ -488,8 +494,18 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
 static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
                         unsigned long long start_frame)
 {
+    unsigned pending = atomic_load(&pipeline->pending_segments);
+    do {
+        if (pending >= MAX_PENDING_SEGMENTS) {
+            fail(pipeline, "segment_queue_exhausted: pending=%u limit=%u",
+                 pending, MAX_PENDING_SEGMENTS);
+            return -1;
+        }
+    } while (!atomic_compare_exchange_weak(&pipeline->pending_segments, &pending,
+                                           pending + 1));
     segment_t *segment = calloc(1, sizeof(*segment));
     if (segment == NULL) {
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         fail(pipeline, "out_of_memory: segment %d", index);
         return -1;
     }
@@ -504,6 +520,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     if (hb_mm_mx_get_default_context(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: default context for %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
     segment->muxer.output_file_name = segment->absolute;
@@ -511,6 +528,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     if (hb_mm_mx_initialize(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: initialize %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
 
@@ -528,6 +546,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
         hb_mm_mx_start(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: start %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
     eye->current = segment;
@@ -669,6 +688,7 @@ static void *closer_thread_main(void *argument)
         segment_seal(pipeline, segment);
         observe_max(&pipeline->max_seal_ns, monotonic_time_ns() - started);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
     }
 }
 
@@ -730,6 +750,7 @@ static void *mux_writer_thread(void *argument)
     else if (eye->current) {
         hb_mm_mx_stop(&eye->current->muxer);
         free(eye->current);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         eye->current = NULL;
     }
     return NULL;
