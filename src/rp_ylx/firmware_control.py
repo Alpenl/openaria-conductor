@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 SOCKET = "/run/rp-ylx/firmware-control.sock"
@@ -83,6 +84,10 @@ class FirmwareSupervisor:
         self.checked_at = 0.0
         self.warning = None
         self.task = None
+        self._worker = None
+        self._task_save_pending = False
+        self._success_notification_pending = False
+        self._callback_active = False
         path = self.state / "task.json"
         if path.exists():
             self.task = json.loads(path.read_bytes())
@@ -92,12 +97,16 @@ class FirmwareSupervisor:
                     message="更新服务曾中断，请检查当前版本后重试",
                     finished_at=int(time.time()),
                 )
-                self._save_task()
+            # Repair both copies, including a terminal task whose receipt
+            # publication was interrupted before the supervisor restarted.
+            self._task_save_pending = True
+            self._try_save_task()
 
     def _release(self, name):
         return installed_release(name, self.install)
 
     def status(self) -> dict:
+        self._repair_task_state()
         with self.lock:
             current, previous = self._release("current"), self._release("previous")
             available = self.cache
@@ -122,7 +131,13 @@ class FirmwareSupervisor:
                 "available": available,
                 "has_update": has_update,
                 "checked_at": self.checked_at or None,
-                "warning": self.warning
+                "warning": (
+                    "更新任务状态尚未完成持久保存，请检查存储后重试"
+                    if self._task_save_pending
+                    else "更新已完成，但更新服务重新加载尚未完成"
+                    if self._success_notification_pending or self._callback_active
+                    else self.warning
+                )
                 or (
                     "设备已使用 SQLite，同版本旧固件不可直接替换；请使用支持 SQLite 的新版本。"
                     if sqlite_state
@@ -180,16 +195,33 @@ class FirmwareSupervisor:
         ):
             raise FirmwareError("invalid_request", "更新请求无效", 400)
         with self.start_lock:
-            # Retain bounded receipts separately so a delayed retry cannot start
-            # an old operation again after another operation has completed.
-            receipt = self.state / "receipts" / (key + ".json")
-            if receipt.exists():
-                old = json.loads(receipt.read_bytes())
-                if old["action"] != action or old["target_commit"] != commit:
-                    raise FirmwareError("idempotency_conflict", "该请求标识已用于不同任务")
-                return old
-            if self.task and self.task["status"] in {"accepted", "running"}:
-                raise FirmwareError("update_busy", "已有更新任务正在执行")
+            self._repair_task_state()
+            with self.lock:
+                # The in-memory task is authoritative while an I/O repair is
+                # pending; a stale accepted receipt must never win over it.
+                if self.task and self.task["id"] == key:
+                    self._check_task_identity(self.task, action, commit)
+                    return dict(self.task)
+                receipt = self.state / "receipts" / (key + ".json")
+                if receipt.exists():
+                    old = json.loads(receipt.read_bytes())
+                    self._check_task_identity(old, action, commit)
+                    if old["status"] in {"accepted", "running"}:
+                        # No current worker owns this historical task. Keep
+                        # its idempotency receipt, but never replay ghost work.
+                        old.update(
+                            status="failed",
+                            message="更新任务曾中断，请检查当前版本后重试",
+                            finished_at=int(time.time()),
+                        )
+                        atomic_json(receipt, old)
+                    return old
+                if self._task_save_pending or self._success_notification_pending:
+                    raise FirmwareError(
+                        "update_state_unavailable", "更新任务状态尚未恢复，请稍后重试", 503
+                    )
+                if self._worker is not None or self._callback_active:
+                    raise FirmwareError("update_busy", "已有更新任务正在执行")
             if self._release("current") is None:
                 raise FirmwareError("update_unsupported", "当前安装方式不支持在线更新")
             if action == "update":
@@ -216,47 +248,127 @@ class FirmwareSupervisor:
                 updater_module().require_idle()
             except (OSError, ValueError, KeyError) as error:
                 raise FirmwareError("capture_active", "请先停止录制并等待设备空闲") from error
-            self.task = {
-                "id": key,
-                "action": action,
-                "target_commit": commit,
-                "status": "accepted",
-                "message": "更新任务已接收",
-                "started_at": int(time.time()),
-                "finished_at": None,
-            }
-            self._save_task()
-            result = dict(self.task)
-            threading.Thread(target=self._execute, daemon=True).start()
-            return result
+            gate = threading.Event()
+            admitted = False
+
+            def run_admitted():
+                try:
+                    gate.wait()
+                    if admitted:
+                        self._execute()
+                finally:
+                    with self.lock:
+                        if self._worker is threading.current_thread():
+                            self._worker = None
+
+            with self.lock:
+                self.task = {
+                    "id": key,
+                    "action": action,
+                    "target_commit": commit,
+                    "status": "accepted",
+                    "message": "更新任务已接收",
+                    "started_at": int(time.time()),
+                    "finished_at": None,
+                }
+                try:
+                    self._save_task()
+                    worker = threading.Thread(target=run_admitted, daemon=True)
+                    self._worker = worker
+                    worker.start()
+                except BaseException as error:
+                    self._worker = None
+                    self._finish_task("failed", "更新任务未能启动，请检查设备状态后重试")
+                    # Preserve the primary failure/cancellation even when the
+                    # terminal receipt cannot currently be saved.
+                    with suppress(BaseException):
+                        self._save_task()
+                    if isinstance(error, Exception):
+                        raise FirmwareError(
+                            "update_start_failed", "更新任务未能启动，请稍后重试", 503
+                        ) from error
+                    raise
+                else:
+                    result = dict(self.task)
+                    admitted = True
+                    return result
+                finally:
+                    # A start() that raises after creating a real thread must
+                    # release it without ever granting permission to install.
+                    gate.set()
+
+    @staticmethod
+    def _check_task_identity(task, action, commit):
+        if task["action"] != action or task["target_commit"] != commit:
+            raise FirmwareError("idempotency_conflict", "该请求标识已用于不同任务")
+
+    def _finish_task(self, status, message):
+        self.task.update(status=status, message=message, finished_at=int(time.time()))
+        self._task_save_pending = True
 
     def _save_task(self):
+        self._task_save_pending = True
         atomic_json(self.state / "task.json", self.task)
         receipts = self.state / "receipts"
         atomic_json(receipts / (self.task["id"] + ".json"), self.task)
-        # Keep receipts for 30 days, including failures. Never prune active work.
-        for path in receipts.glob("*.json"):
-            if path.stem != self.task["id"] and path.stat().st_mtime < time.time() - 30 * 86400:
-                path.unlink()
+        self._task_save_pending = False
+        # Pruning old history is best-effort; failure must not invalidate an
+        # already published task or prevent its worker from being admitted.
+        with suppress(OSError):
+            for path in receipts.glob("*.json"):
+                if path.stem != self.task["id"] and path.stat().st_mtime < time.time() - 30 * 86400:
+                    path.unlink()
+
+    def _try_save_task(self):
+        try:
+            self._save_task()
+        except Exception:
+            return False
+        return True
+
+    def _repair_task_state(self):
+        with self.lock:
+            if self._task_save_pending and not self._try_save_task():
+                return
+            if not self._success_notification_pending or self._callback_active:
+                return
+            self._callback_active = True
+            self._success_notification_pending = False
+        try:
+            self.on_success()
+        except BaseException as error:
+            with self.lock:
+                self._success_notification_pending = True
+            if not isinstance(error, Exception):
+                raise
+        finally:
+            with self.lock:
+                self._callback_active = False
 
     def _execute(self):
-        with self.lock:
-            self.task.update(status="running", message="正在下载、校验并安装；设备服务将自动重启")
-            self._save_task()
-            task = dict(self.task)
         try:
+            with self.lock:
+                self.task.update(
+                    status="running", message="正在下载、校验并安装；设备服务将自动重启"
+                )
+                self._save_task()
+                task = dict(self.task)
             self.runner(task)
             current = self._release("current")
             if not current or current["commit"] != task["target_commit"]:
                 raise RuntimeError("installed identity mismatch")
-            status, message = "succeeded", "更新完成，设备服务已启动"
-        except Exception:
-            status, message = "failed", "更新未完成；已保留失败记录，请检查当前版本后重试"
-        with self.lock:
-            self.task.update(status=status, message=message, finished_at=int(time.time()))
-            self._save_task()
-        if status == "succeeded":
-            self.on_success()
+        except BaseException as error:
+            with self.lock:
+                self._finish_task("failed", "更新未完成；请检查当前版本和设备存储后重试")
+                with suppress(BaseException):
+                    self._save_task()
+            if not isinstance(error, Exception):
+                raise
+        else:
+            with self.lock:
+                self._finish_task("succeeded", "更新完成，设备服务已启动")
+                self._success_notification_pending = True
+            self._repair_task_state()
 
     def _run_update(self, task):
         command = ["/usr/bin/python3", "/usr/local/lib/openaria/update.py"]
@@ -363,7 +475,7 @@ def main():
         server.supervisor = FirmwareSupervisor(
             on_success=lambda: subprocess.run(
                 ["systemctl", "--no-block", "try-restart", "openaria-update.service"],
-                check=False,
+                check=True,
                 timeout=10,
             )
         )
