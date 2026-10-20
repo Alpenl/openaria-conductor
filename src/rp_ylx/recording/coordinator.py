@@ -795,7 +795,19 @@ class CaptureCoordinator:
         self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
         self._state_db.import_json("capture", self._state_path)
         self._state_db.interrupt_transfers()
-        self._pending_focus = self._state_db.get("camera_focus")
+        self._focus_restore_invalid = False
+        try:
+            self._pending_focus = self._state_db.get("camera_focus")
+        except (ValueError, TypeError, RecursionError, PersistenceError) as error:
+            # Preserve corrupt optional settings for explicit correction. An
+            # actual database I/O error still propagates instead of being ignored.
+            self._pending_focus = None
+            self._focus_restore_invalid = True
+            operational_logger("recording").event(
+                "camera_focus_restore_rejected",
+                level="warning",
+                exception_type=type(error).__name__,
+            )
         self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
         persisted = self._read_local_state()
         self._authority_epoch = str(persisted.get("authority_epoch") or uuid.uuid4())
@@ -2244,11 +2256,73 @@ class CaptureCoordinator:
             retryable=True,
         )
 
-    def _require_camera_connected(self) -> None:
+    def _require_camera_connected(self, *, restore_focus: bool = True) -> None:
         if self._camera_connection_status()["state"] != "connected":
             raise self._camera_not_connected()
-        if self._pending_focus is not None and self._sources is not None:
-            self._sources.set_camera_focus(**self._pending_focus)
+        if not restore_focus:
+            return
+        pending = self._pending_focus
+        if pending is not None and (
+            not isinstance(pending, dict)
+            or not set(pending) <= {"value", "auto_enabled"}
+            or (pending.get("value") is not None and type(pending["value"]) is not int)
+            or (
+                pending.get("auto_enabled") is not None
+                and type(pending["auto_enabled"]) is not bool
+            )
+            or all(pending.get(key) is None for key in ("value", "auto_enabled"))
+        ):
+            if not self._focus_restore_invalid:
+                operational_logger("recording").event(
+                    "camera_focus_restore_rejected",
+                    level="warning",
+                    error_code="invalid_camera_focus",
+                )
+            self._focus_restore_invalid = True
+        if getattr(self, "_focus_restore_invalid", False):
+            raise ProviderError(
+                "camera_focus_restore_failed",
+                "已保存的焦距设置损坏，请重新设置焦距",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=False,
+            )
+        if pending is not None and self._sources is not None:
+            try:
+                result = self._sources.set_camera_focus(**pending)
+                if not valid_camera_focus_status(result):
+                    raise CameraError(
+                        "camera_focus_unavailable", "焦距恢复响应无效", retryable=True
+                    )
+            except CameraError as error:
+                if error.code == "camera_focus_unsupported":
+                    # A fixed-focus camera has no setting to restore. Keep the
+                    # stored preference for a future capable camera.
+                    self._pending_focus = None
+                    operational_logger("recording").event(
+                        "camera_focus_restore_skipped", level="warning", error_code=error.code
+                    )
+                    return
+                operational_logger("recording").event(
+                    "camera_focus_restore_failed", level="warning", error_code=error.code
+                )
+                raise ProviderError(
+                    "camera_focus_restore_failed",
+                    "已保存的焦距设置未能恢复，请重试或重新设置焦距",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=error.retryable,
+                ) from error
+            except Exception as error:
+                operational_logger("recording").event(
+                    "camera_focus_restore_failed",
+                    level="warning",
+                    exception_type=type(error).__name__,
+                )
+                raise ProviderError(
+                    "camera_focus_restore_failed",
+                    "已保存的焦距设置暂时无法恢复",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                ) from error
             self._pending_focus = None
 
     def _calibration_source_supported(self) -> bool:
@@ -2421,7 +2495,7 @@ class CaptureCoordinator:
         return projected
 
     def camera_focus_status(self) -> dict[str, object] | None:
-        self._require_camera_connected()
+        self._require_camera_connected(restore_focus=False)
         try:
             return self._camera_focus_status(raise_errors=True)
         except CameraError as error:
@@ -2791,7 +2865,7 @@ class CaptureCoordinator:
             )
 
     def _set_camera_focus(self, body: Mapping[str, object]) -> dict[str, object]:
-        self._require_camera_connected()
+        self._require_camera_connected(restore_focus=False)
         value = body.get("value")
         auto_enabled = body.get("auto_enabled")
         if value is None and auto_enabled is None:
@@ -2842,11 +2916,20 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from exc
+        if not valid_camera_focus_status(result):
+            raise ProviderError(
+                "camera_focus_unavailable",
+                "相机返回的焦距状态无效",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            )
         self._state_db.put(
             "camera_focus",
             {"value": result.get("value"), "auto_enabled": result.get("auto_enabled")},
             history=True,
         )
+        self._pending_focus = None
+        self._focus_restore_invalid = False
         self._next_revision()
         return result
 
@@ -4465,7 +4548,7 @@ class CaptureCoordinator:
             }
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
-        self._require_camera_connected()
+        self._require_camera_connected(restore_focus=False)
         start_preview = getattr(self._sources, "start_preview", None)
         try:
             if callable(start_preview):
