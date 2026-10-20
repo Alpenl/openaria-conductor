@@ -2731,7 +2731,7 @@ class CaptureCoordinator:
                     and accepted_active.get("recording_state", {}).get("session_id")
                     == self._pending_safe_swap["session_id"]
                 ):
-                    self._publish_safe_swap()
+                    return self._request_pending_safe_swap(command, scope, replay=result)
                 return CaptureCommandResult(
                     result.status, copy.deepcopy(result.body), replayed=True
                 )
@@ -2751,6 +2751,8 @@ class CaptureCoordinator:
                     "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
                 )
             if self._active is None:
+                if reason == "safe_swap" and self._pending_safe_swap is not None:
+                    return self._request_pending_safe_swap(command, scope)
                 return self.stop_capture(command)
             if reason == "safe_swap" and self._open_representations:
                 raise ProviderError(
@@ -2828,6 +2830,82 @@ class CaptureCoordinator:
                 self._stop_condition.notify_all()
                 raise
             return result
+
+    def _request_pending_safe_swap(
+        self,
+        command: CaptureCommand,
+        scope: tuple[str, str, str],
+        *,
+        replay: CaptureCommandResult | None = None,
+    ) -> CaptureCommandResult:
+        """Resume a durable handoff intent without hashing under the HTTP lock."""
+        pending = self._pending_safe_swap
+        assert pending is not None and self._async_stop_worker is None
+        result = (
+            CaptureCommandResult(replay.status, copy.deepcopy(replay.body), replayed=True)
+            if replay is not None
+            else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+        )
+        old_commands = dict(self._commands)
+        self._acquire_network_operation_lease()
+
+        def finish() -> None:
+            with self._stop_condition:
+                if self._async_stop_worker is not threading.current_thread():
+                    return
+            try:
+                self._verify_pending_safe_swap(pending)
+                with self._stop_condition:
+                    if self._pending_safe_swap is not pending:
+                        raise ProviderError("capture_state_changed", "待交接录制已变化", status=409)
+                    self._publish_safe_swap()
+            except BaseException as error:
+                operational_logger("recording").event(
+                    "safe_swap_resume_failed",
+                    level="error",
+                    transaction_id=str(pending["session_id"]),
+                    exception_type=type(error).__name__,
+                    code=getattr(error, "code", "safe_swap_resume_failed"),
+                )
+            finally:
+                with self._stop_condition:
+                    if self._async_stop_worker is threading.current_thread():
+                        self._async_stop_worker = None
+                        self._async_stop_reason = None
+                        self._stop_inflight = None
+                        self._release_network_operation_lease()
+                    self._stop_condition.notify_all()
+
+        worker = threading.Thread(target=finish, name="rp-ylx-safe-swap-resume", daemon=False)
+        self._async_stop_worker = worker
+        self._async_stop_reason = "safe_swap"
+        self._stop_inflight = scope
+        try:
+            worker.start()
+        except RuntimeError as error:
+            self._async_stop_worker = None
+            self._async_stop_reason = None
+            self._stop_inflight = None
+            self._release_network_operation_lease()
+            self._stop_condition.notify_all()
+            raise ProviderError(
+                "stop_worker_unavailable",
+                "无法启动存储交接复核任务",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from error
+        if replay is None:
+            try:
+                self._remember_command(scope, command, result)
+            except BaseException:
+                self._commands = old_commands
+                self._async_stop_worker = None
+                self._async_stop_reason = None
+                self._stop_inflight = None
+                self._release_network_operation_lease()
+                self._stop_condition.notify_all()
+                raise
+        return result
 
     def stop_capture(
         self, command: CaptureCommand, *, expected_session_id: str | None = None
@@ -3364,6 +3442,7 @@ class CaptureCoordinator:
                 retryable=True,
                 details={"open_handle_count": self.open_handle_count},
             )
+        self._verify_pending_safe_swap(self._pending_safe_swap)
         released_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         receipt = {
             "schema": "ylx.safe-swap-receipt.v3",
@@ -3395,6 +3474,36 @@ class CaptureCoordinator:
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 retryable=True,
             ) from error
+
+    def _verify_pending_safe_swap(self, pending: Mapping[str, object]) -> None:
+        # A durable pending intent is not durable proof of the current files.
+        # In particular, a process restart discards verified file identities.
+        # Require the original manifest AND every payload to be verified before
+        # turning that intent into a durable device-released receipt.
+        session_id = str(pending["session_id"])
+        expected_digest = pending["manifest_sha256"]
+        with self._catalog_lock:
+            snapshot = self._session_snapshots.get(session_id)
+            if (
+                snapshot is None
+                or self._verified.get(session_id) != snapshot.manifest_sha256
+                or not self._session_payload_is_current(session_id, snapshot)
+            ):
+                self._invalidate_session_verification(session_id)
+                self._catalog_sessions(verify_session=session_id)
+                snapshot = self._session_snapshots.get(session_id)
+            if (
+                snapshot is None
+                or snapshot.manifest_sha256 != expected_digest
+                or self._verified.get(session_id) != expected_digest
+                or not self._session_payload_is_current(session_id, snapshot)
+            ):
+                raise ProviderError(
+                    "safe_swap_unverified",
+                    "待交接录制内容尚未通过当前完整校验，不能发布安全移除回执",
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                )
 
     def current_safe_swap_receipt(self) -> object | None:
         with self._lock:
