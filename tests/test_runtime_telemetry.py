@@ -62,7 +62,7 @@ class LinuxRuntimeTelemetryTest(unittest.TestCase):
                 encoding="ascii",
             )
             thermal = root / "temp"
-            thermal.write_text("52\n", encoding="ascii")
+            thermal.write_text("52000\n", encoding="ascii")
 
             runtime = collect_linux_runtime(
                 net_root=net_root,

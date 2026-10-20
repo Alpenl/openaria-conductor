@@ -71,8 +71,9 @@ def _temperature(thermal_paths: Sequence[Path]) -> float:
             value = float(path.read_text(encoding="ascii").strip())
         except (OSError, ValueError):
             continue
-        if abs(value) >= 1000:
-            value /= 1000
+        # Linux thermal_zone*/temp always uses millidegrees Celsius, including
+        # readings between -1 and +1 degrees. Never infer units from magnitude.
+        value /= 1000
         if -40 <= value <= 125:
             readings.append(value)
     return max(readings, default=0.0)
