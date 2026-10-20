@@ -993,8 +993,8 @@ class DeviceSessionRecorder:
                     }
                 if self._native_transaction is None:
                     encoder = self._encoder_factory(self._partial)
-                    encoder.start()
                     self._encoder = encoder
+                    encoder.start()
                     if self._config.audio_enabled:
                         if self._audio_recorder_factory is None:
                             raise DeviceRecordingError(
@@ -1002,8 +1002,8 @@ class DeviceSessionRecorder:
                                 "源码测试音频路径必须显式注入 audio_recorder_factory",
                             )
                         audio = self._audio_recorder_factory(self._partial)
-                        audio.start()
                         self._audio_recorder = audio
+                        audio.start()
                 fsync_directory(self._partial)
                 fsync_directory(self._root)
                 if self._native_transaction is not None and self._config.lossless_storage:
@@ -1012,7 +1012,30 @@ class DeviceSessionRecorder:
                         self._config.sensor_fps / self._config.frame_decimation,
                         self._config.frame_decimation,
                     )
+                # start() still owns the admission lock, so callbacks cannot
+                # enqueue work before both workers have started. Only retain
+                # threads after start succeeds: an unstarted thread cannot join.
+                self._state = "recording"
+                if self._native_transaction is None:
+                    writer = threading.Thread(
+                        target=self._writer_loop,
+                        name=f"rp-ylx-session-writer-{self._plan.session_id[:8]}",
+                        daemon=True,
+                    )
+                    writer.start()
+                    self._writer = writer
+                if self._encoder is not None or self._native_transaction is not None:
+                    # Segment hashes accumulate while recording so that stop() only
+                    # has to seal the trailing segment.
+                    harvester = threading.Thread(
+                        target=self._harvest_loop,
+                        name=f"rp-ylx-v1-segments-{self._plan.session_id[:8]}",
+                        daemon=True,
+                    )
+                    harvester.start()
+                    self._harvester = harvester
             except Exception as error:
+                self._stop_writer()
                 self._abandon_audio()
                 self._abandon_encoder()
                 self._close_files(ignore_errors=True)
@@ -1021,23 +1044,6 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError(
                     "start_failed", f"创建 device-session 会话失败：{error}"
                 ) from error
-            self._state = "recording"
-            if self._native_transaction is None:
-                self._writer = threading.Thread(
-                    target=self._writer_loop,
-                    name=f"rp-ylx-session-writer-{self._plan.session_id[:8]}",
-                    daemon=True,
-                )
-                self._writer.start()
-            if self._encoder is not None or self._native_transaction is not None:
-                # Segment hashes accumulate while recording so that stop() only
-                # has to seal the trailing segment.
-                self._harvester = threading.Thread(
-                    target=self._harvest_loop,
-                    name=f"rp-ylx-v1-segments-{self._plan.session_id[:8]}",
-                    daemon=True,
-                )
-                self._harvester.start()
             return self._partial
 
     def _write(self, role: str, payload: bytes) -> None:
