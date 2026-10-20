@@ -2913,17 +2913,21 @@ class CaptureCoordinator:
                             self._async_stop_reason = None
                         self._stop_condition.notify_all()
 
-            worker = threading.Thread(target=finish, name="rp-ylx-stop-finalization", daemon=False)
-            self._stop_inflight = scope
-            self._async_stop_worker = worker
-            self._async_stop_reason = str(reason)
             try:
+                worker = threading.Thread(
+                    target=finish, name="rp-ylx-stop-finalization", daemon=False
+                )
+                self._stop_inflight = scope
+                self._async_stop_worker = worker
+                self._async_stop_reason = str(reason)
                 worker.start()
-            except RuntimeError as error:
+            except BaseException as error:
                 self._stop_inflight = None
                 self._async_stop_worker = None
                 self._async_stop_reason = None
                 self._stop_condition.notify_all()
+                if not isinstance(error, (RuntimeError, MemoryError)):
+                    raise
                 raise ProviderError(
                     "stop_worker_unavailable",
                     "无法启动录制收尾任务",
@@ -2991,18 +2995,20 @@ class CaptureCoordinator:
                         self._release_network_operation_lease()
                     self._stop_condition.notify_all()
 
-        worker = threading.Thread(target=finish, name="rp-ylx-safe-swap-resume", daemon=False)
-        self._async_stop_worker = worker
-        self._async_stop_reason = "safe_swap"
-        self._stop_inflight = scope
         try:
+            worker = threading.Thread(target=finish, name="rp-ylx-safe-swap-resume", daemon=False)
+            self._async_stop_worker = worker
+            self._async_stop_reason = "safe_swap"
+            self._stop_inflight = scope
             worker.start()
-        except RuntimeError as error:
+        except BaseException as error:
             self._async_stop_worker = None
             self._async_stop_reason = None
             self._stop_inflight = None
             self._release_network_operation_lease()
             self._stop_condition.notify_all()
+            if not isinstance(error, (RuntimeError, MemoryError)):
+                raise
             raise ProviderError(
                 "stop_worker_unavailable",
                 "无法启动存储交接复核任务",

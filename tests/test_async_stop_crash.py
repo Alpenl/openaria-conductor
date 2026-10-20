@@ -13,6 +13,10 @@ from unittest.mock import patch
 from rp_ylx.api import ProviderError
 from rp_ylx.recording import validate_device_session_directory
 from tests import test_capture_coordinator as fixtures
+from tests.test_async_stop import (
+    check_started_worker_cancellation,
+    check_worker_initialization_failures,
+)
 
 
 class AsyncStopCrashTest(unittest.TestCase):
@@ -292,6 +296,64 @@ class AsyncStopCrashTest(unittest.TestCase):
             )
             result = coordinator.request_stop_capture(command)
             self.assertFalse(result.replayed)
+            self.wait_finished(coordinator)
+            self.assertIsNotNone(coordinator.current_safe_swap_receipt())
+        finally:
+            coordinator.close()
+
+    def test_pending_worker_initialization_resource_errors_release_lease_and_retry(self):
+        self._check_pending_worker_initialization(interrupted=False)
+
+    def test_pending_worker_initialization_cancellation_releases_lease_and_retry(self):
+        self._check_pending_worker_initialization(interrupted=True)
+
+    def _check_pending_worker_initialization(self, *, interrupted):
+        self.kill_at("before_release", "safe_swap")
+        coordinator = self.fixture.coordinator()
+        command = fixtures.stop_command("pending-worker-init", reason="safe_swap")
+        try:
+            check_worker_initialization_failures(
+                self, coordinator, command, recording=False, interrupted=interrupted
+            )
+            self.assertFalse(coordinator.request_stop_capture(command).replayed)
+            self.wait_finished(coordinator)
+            self.assertIsNotNone(coordinator.current_safe_swap_receipt())
+        finally:
+            coordinator.close()
+
+    def test_pending_started_worker_cancellation_cannot_release_unaccepted_swap(self):
+        self.kill_at("before_release", "safe_swap")
+        coordinator = self.fixture.coordinator()
+        command = fixtures.stop_command("pending-worker-start-cancel", reason="safe_swap")
+        try:
+            check_started_worker_cancellation(self, coordinator, command, recording=False)
+            self.assertFalse(coordinator.request_stop_capture(command).replayed)
+            self.wait_finished(coordinator)
+            self.assertIsNotNone(coordinator.current_safe_swap_receipt())
+        finally:
+            coordinator.close()
+
+    def test_pending_replayed_worker_init_error_preserves_accepted_receipt(self):
+        command, accepted = self.kill_at("before_release", "safe_swap")
+        coordinator = self.fixture.coordinator()
+        scope = (command.principal_id, "stop", command.idempotency_key)
+        original_receipt = coordinator._commands[scope]
+        pending = coordinator._pending_safe_swap
+        try:
+            with (
+                patch("rp_ylx.recording.coordinator.threading.Thread", side_effect=MemoryError),
+                self.assertRaises(ProviderError) as raised,
+            ):
+                coordinator.request_stop_capture(command)
+            self.assertEqual(raised.exception.code, "stop_worker_unavailable")
+            self.assertIs(coordinator._commands[scope], original_receipt)
+            self.assertIs(coordinator._pending_safe_swap, pending)
+            self.assertIsNone(coordinator._async_stop_worker)
+            self.fixture.assert_network_operation_lock_available()
+            self.assertIsNone(coordinator.current_safe_swap_receipt())
+            replay = coordinator.request_stop_capture(command)
+            self.assertTrue(replay.replayed)
+            self.assertEqual(replay.body, accepted["accepted"])
             self.wait_finished(coordinator)
             self.assertIsNotNone(coordinator.current_safe_swap_receipt())
         finally:
