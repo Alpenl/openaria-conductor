@@ -133,7 +133,9 @@ def _restore_prepared(prepared: Path, destination: Path, required: str | None, t
     # Make the authority marker durable before any old file moves. A
     # missing database after interruption must not bootstrap empty state.
     _sync_parent(marker)
-    for suffix in ("", "-wal", "-shm"):
+    # A hot rollback journal belongs to the old database just like WAL/SHM.
+    # Leaving it at the live name can replay old pages into the restored copy.
+    for suffix in ("", "-wal", "-shm", "-journal"):
         old = Path(str(destination) + suffix)
         if os.path.lexists(old):
             saved = old.with_name(old.name + ".before-restore-" + token)
