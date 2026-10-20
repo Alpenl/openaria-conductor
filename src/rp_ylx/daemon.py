@@ -500,6 +500,24 @@ def _close_service_components(
     return first_error
 
 
+def _report_worker_failure(
+    component: str, event: str, error: Exception, next_report_at: float | None
+) -> float:
+    now = time.monotonic()
+    if next_report_at is not None and now < next_report_at:
+        return next_report_at
+    # Advance before logging, so a failing sink also has a bounded retry rate.
+    next_report_at = now + 30.0
+    with suppress(Exception):
+        operational_logger(component).event(
+            event,
+            level="error",
+            exception_type=type(error).__name__,
+            retryable=True,
+        )
+    return next_report_at
+
+
 class StorageReserveMonitor:
     """A separate thread keeps a slow finalization off the SSE/status event pump."""
 
@@ -510,14 +528,13 @@ class StorageReserveMonitor:
         self.thread.start()
 
     def _run(self) -> None:
+        next_report_at: float | None = None
         while not self.stop.wait(1.0):
             try:
                 self.coordinator.enforce_storage_reserve()
             except Exception as error:
-                operational_logger("recording").event(
-                    "storage_reserve_monitor_failed",
-                    level="error",
-                    exception_type=type(error).__name__,
+                next_report_at = _report_worker_failure(
+                    "recording", "storage_reserve_monitor_failed", error, next_report_at
                 )
 
     def close(self) -> None:
@@ -555,36 +572,45 @@ class CaptureEventPump:
         self._thread.start()
 
     def _run(self) -> None:
+        next_report_at: float | None = None
         while not self._stop.wait(
             self._progress_interval if self._last_progress_key is not None else self._interval
         ):
-            now = time.monotonic()
-            epoch, revision, state = self._coordinator.capture_recording_progress()
-            source = (epoch, revision)
-            # Idle sampling also retries preview startup when a camera reconnects.
-            if source != self._last_source or state is None:
-                event = self._coordinator.capture_snapshot_event()
-                source = (event["authority_epoch"], event["source_revision"])
-                state = self._recording_state(event)
-                if source != self._last_source:
-                    self._event_buffer.publish(event)
-                    self._last_source = source
-                    self._last_progress_key = self._progress_key(source, state)
-                    self._last_progress_at = now
-                    continue
-            progress_event = self._progress_event(source, state)
-            progress_key = self._progress_key(source, state)
-            if (
-                progress_event is not None
-                and progress_key != self._last_progress_key
-                and (
-                    self._last_progress_at == 0.0
-                    or now - self._last_progress_at >= self._progress_interval
+            try:
+                self._poll()
+            except Exception as error:
+                next_report_at = _report_worker_failure(
+                    "recording", "capture_event_pump_failed", error, next_report_at
                 )
-            ):
-                self._event_buffer.publish(progress_event)
-                self._last_progress_key = progress_key
+
+    def _poll(self) -> None:
+        now = time.monotonic()
+        epoch, revision, state = self._coordinator.capture_recording_progress()
+        source = (epoch, revision)
+        # Idle sampling also retries preview startup when a camera reconnects.
+        if source != self._last_source or state is None:
+            event = self._coordinator.capture_snapshot_event()
+            source = (event["authority_epoch"], event["source_revision"])
+            state = self._recording_state(event)
+            if source != self._last_source:
+                self._event_buffer.publish(event)
+                self._last_source = source
+                self._last_progress_key = self._progress_key(source, state)
                 self._last_progress_at = now
+                return
+        progress_event = self._progress_event(source, state)
+        progress_key = self._progress_key(source, state)
+        if (
+            progress_event is not None
+            and progress_key != self._last_progress_key
+            and (
+                self._last_progress_at == 0.0
+                or now - self._last_progress_at >= self._progress_interval
+            )
+        ):
+            self._event_buffer.publish(progress_event)
+            self._last_progress_key = progress_key
+            self._last_progress_at = now
 
     @staticmethod
     def _recording_state(event: Mapping[str, object]) -> Mapping[str, object] | None:
