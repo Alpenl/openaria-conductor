@@ -139,6 +139,9 @@ class MdnsPublisher:
         with self._lifecycle_lock:
             if self._thread is not None:
                 raise RuntimeError("mDNS publisher has already been started")
+            # A prior worker may have stopped with cleanup still pending.
+            # Do not admit another worker until that responder has closed.
+            self._unpublish()
             # Each attempt owns its stop signal. A target delayed past a failed
             # admission must not inherit the cleared signal of a later retry.
             stop = threading.Event()
@@ -229,31 +232,35 @@ class MdnsPublisher:
                     self._record_recovered()
                 stop.wait(self._interval)
         finally:
-            self._unpublish()
+            try:
+                self._unpublish()
+            except Exception as error:
+                # Keep the responder owned for close() to retry after joining.
+                self._record_failure(error)
 
     def _reconcile(self) -> None:
+        if self._responder is not None and not self._addresses:
+            self._unpublish()
         addresses = self._address_provider()
-        if addresses == self._addresses and self._responder is not None:
+        if addresses and addresses == self._addresses and self._responder is not None:
             return
         self._unpublish()
         if not addresses:
             return
         responder = self._responder_factory(addresses)
-        registered: list[ServiceInfo] = []
+        self._responder = responder
+        self._services = ()
         try:
             for service in _service_infos(self._port, addresses, self._scheme):
+                # A register call may publish before it raises. Own the attempt
+                # before calling out, so rollback also unregisters that service.
+                self._services = (*self._services, service)
                 responder.register_service(service, allow_name_change=True)
-                registered.append(service)
-        except Exception:
-            for service in reversed(registered):
-                with suppress(Exception):
-                    responder.unregister_service(service)
-            with suppress(Exception):
-                responder.close()
+        except BaseException:
+            with suppress(BaseException):
+                self._unpublish()
             raise
         self._addresses = addresses
-        self._responder = responder
-        self._services = tuple(registered)
         with suppress(Exception):
             _OPERATIONAL_LOG.event(
                 "mdns_publication_ready",
@@ -265,28 +272,55 @@ class MdnsPublisher:
     def _unpublish(self) -> None:
         responder, services = self._responder, self._services
         self._addresses = ()
+        if responder is None:
+            self._services = ()
+            return
+        pending: list[ServiceInfo] = []
+        interruption: BaseException | None = None
+        for service in reversed(services):
+            try:
+                responder.unregister_service(service)
+            except BaseException as error:
+                pending.append(service)
+                if not isinstance(error, Exception) and interruption is None:
+                    interruption = error
+                with suppress(BaseException):
+                    _OPERATIONAL_LOG.event(
+                        "mdns_unregister_failed",
+                        level="warning",
+                        exception_type=type(error).__name__,
+                    )
+        self._services = tuple(reversed(pending))
+        try:
+            responder.close()
+        except BaseException as close_error:
+            if interruption is not None:
+                with suppress(BaseException):
+                    _OPERATIONAL_LOG.event(
+                        "mdns_close_failed",
+                        level="error",
+                        exception_type=type(close_error).__name__,
+                    )
+                raise interruption from None
+            raise
         self._responder = None
         self._services = ()
-        if responder is None:
-            return
-        for service in reversed(services):
-            with suppress(Exception):
-                responder.unregister_service(service)
-        with suppress(Exception):
-            responder.close()
+        if interruption is not None:
+            raise interruption
 
     def close(self) -> None:
         with self._lifecycle_lock:
             self._stop.set()
             thread = self._thread
-            if thread is None:
-                self._unpublish()
-                return
-            thread.join(timeout=self._interval + 2.0)
-            if thread.is_alive():
-                raise RuntimeError("mDNS publisher did not stop before its deadline")
-            self._thread = None
-            _OPERATIONAL_LOG.event("mdns_publisher_stopped", outcome="closed")
+            had_resources = thread is not None or self._responder is not None
+            if thread is not None:
+                thread.join(timeout=self._interval + 2.0)
+                if thread.is_alive():
+                    raise RuntimeError("mDNS publisher did not stop before its deadline")
+                self._thread = None
+            self._unpublish()
+            if had_resources:
+                _OPERATIONAL_LOG.event("mdns_publisher_stopped", outcome="closed")
 
 
 __all__ = [
