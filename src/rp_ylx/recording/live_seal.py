@@ -77,6 +77,13 @@ class _Journal:
         self.path = path
         self.target = path.with_suffix(path.suffix + ".zst")
         self.temporary = self.target.with_suffix(self.target.suffix + ".tmp")
+        # Allocation can fail and its traceback may be retained by a Future.
+        # Do it before acquiring files or creating an exclusive retry barrier.
+        self.pending = bytearray()
+        self.digest = hashlib.sha256()
+        self.encoded_digest = hashlib.sha256()
+        self.size = 0
+        self.compressor = zstandard.ZstdCompressor(level=1, write_checksum=True)
         self.source = open_regular(path)
         try:
             self.source_id = identity(os.fstat(self.source.fileno()))[:2]
@@ -84,11 +91,6 @@ class _Journal:
         except BaseException:
             self.source.close()
             raise
-        self.pending = bytearray()
-        self.digest = hashlib.sha256()
-        self.encoded_digest = hashlib.sha256()
-        self.size = 0
-        self.compressor = zstandard.ZstdCompressor(level=1, write_checksum=True)
 
     def pump(self, *, final: bool = False) -> None:
         # Normally a few KB arrive per poll; bound a catch-up pass to 4 MiB.
