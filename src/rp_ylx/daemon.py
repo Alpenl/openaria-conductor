@@ -518,14 +518,64 @@ def _report_worker_failure(
     return next_report_at
 
 
+def _start_background_worker(
+    target: Callable[[], None], stop: threading.Event, *, name: str, daemon: bool
+) -> threading.Thread:
+    admitted = threading.Event()
+    thread: threading.Thread | None = None
+
+    def run_admitted() -> None:
+        admitted.wait()
+        if not stop.is_set():
+            target()
+
+    try:
+        thread = threading.Thread(target=run_admitted, name=name, daemon=daemon)
+        thread.start()
+        admitted.set()
+        return thread
+    except BaseException as error:
+        # The constructor has not returned an owner to its caller. Stop even a
+        # target that is scheduled only after this failed admission unwinds.
+        with suppress(BaseException):
+            stop.set()
+        with suppress(BaseException):
+            admitted.set()
+        outcome = "start_not_confirmed"
+        try:
+            if thread is not None and thread.ident is not None:
+                outcome = "stop_requested"
+                thread.join(timeout=2.0)
+                if not thread.is_alive():
+                    outcome = "stopped"
+        except BaseException as cleanup_error:
+            with suppress(BaseException):
+                _OPERATIONAL_LOG.event(
+                    "background_worker_cleanup_failed",
+                    level="error",
+                    stage=name,
+                    exception_type=type(cleanup_error).__name__,
+                )
+        with suppress(BaseException):
+            _OPERATIONAL_LOG.event(
+                "background_worker_start_failed",
+                level="error",
+                stage=name,
+                exception_type=type(error).__name__,
+                outcome=outcome,
+            )
+        raise
+
+
 class StorageReserveMonitor:
     """A separate thread keeps a slow finalization off the SSE/status event pump."""
 
     def __init__(self, coordinator: CaptureCoordinator) -> None:
         self.coordinator = coordinator
         self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="storage-reserve", daemon=True)
-        self.thread.start()
+        self.thread = _start_background_worker(
+            self._run, self.stop, name="storage-reserve", daemon=True
+        )
 
     def _run(self) -> None:
         next_report_at: float | None = None
@@ -564,12 +614,9 @@ class CaptureEventPump:
         self._last_source = (epoch, revision)
         self._last_progress_key = self._progress_key(self._last_source, state)
         self._last_progress_at = 0.0
-        self._thread = threading.Thread(
-            target=self._run,
-            name="rp-ylx-capture-events",
-            daemon=False,
+        self._thread = _start_background_worker(
+            self._run, self._stop, name="rp-ylx-capture-events", daemon=False
         )
-        self._thread.start()
 
     def _run(self) -> None:
         next_report_at: float | None = None
