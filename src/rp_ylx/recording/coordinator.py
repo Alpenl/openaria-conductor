@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -33,7 +34,9 @@ from rp_ylx.api.downloads import (
     iter_device_session_v1_artifacts,
 )
 from rp_ylx.api.events import (
+    InvalidSourceEvent,
     project_device_descriptor,
+    validate_retained_unsuccessful_outcome,
     validate_safe_swap_v3_receipt,
     validate_session_summary,
 )
@@ -48,6 +51,7 @@ from rp_ylx.api.gateway import (
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network import NetworkError, network_operation_lock_path
 from rp_ylx.network import network_status as collect_network_status
 from rp_ylx.network import network_status_v1 as project_network_status_v1
@@ -73,6 +77,50 @@ from rp_ylx.recording.device_session import (
 )
 from rp_ylx.recording.recovery import RECOVERY_ROLE, recover_device_session
 from rp_ylx.runtime import collect_linux_runtime
+
+
+def _read_recovery_metadata(root_fd: int, parts: tuple[str, ...], limit: int) -> tuple[dict, bytes]:
+    """Read only bounded regular metadata beneath an already opened session."""
+    with ExitStack() as cleanup:
+        current = root_fd
+        for component in parts[:-1]:
+            current = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+            cleanup.callback(os.close, current)
+            if os.fstat(current).st_dev != os.fstat(root_fd).st_dev:
+                raise ValueError("recovery metadata directory is on a different device")
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=current,
+        )
+        cleanup.callback(os.close, descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_dev != os.fstat(root_fd).st_dev
+            or before.st_size > limit
+        ):
+            raise ValueError("unsafe or oversized recovery metadata")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            payload = stream.read(limit + 1)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or len(payload) > limit
+            or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise ValueError("recovery metadata changed during read")
+        value = json.loads(payload)
+        if not isinstance(value, dict):
+            raise ValueError("invalid recovery metadata object")
+        return value, payload
+
 
 VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
@@ -644,6 +692,7 @@ class CaptureCoordinator:
         self._active_plan: SessionPlan | None = None
         self._network_operation_lease: int | None = None
         self._retained: dict[str, dict[str, object]] = {}
+        self._recovery_session: dict[str, str] | None = None
         self._verified: dict[str, str] = {}
         self._session_snapshots: dict[str, _VerifiedSessionSnapshot] = {}
         self._session_summaries: dict[str, dict[str, object]] = {}
@@ -813,6 +862,22 @@ class CaptureCoordinator:
 
     def _restore_local_state(self, persisted: Mapping[str, object]) -> None:
         admission = self._admission
+        self._recovery_session = None
+        identity = persisted.get("active_session")
+        if isinstance(identity, dict) and set(identity) == {
+            "session_id",
+            "volume_id",
+            "generation_id",
+        }:
+            try:
+                for key, version in (("session_id", 7), ("volume_id", 4), ("generation_id", 4)):
+                    parsed = uuid.UUID(identity[key])
+                    if parsed.version != version or str(parsed) != identity[key]:
+                        raise ValueError("invalid active session identity")
+            except (ValueError, TypeError, AttributeError):
+                pass
+            else:
+                self._recovery_session = dict(identity)
         retained = persisted.get("retained")
         if isinstance(retained, Mapping):
             self._retained = {
@@ -941,6 +1006,18 @@ class CaptureCoordinator:
             "authority_epoch": self._authority_epoch,
             "source_revision": self._revision,
             "volume_binding": copy.deepcopy(self._last_volume_binding),
+            # Persisted by the existing recording-start checkpoint, before
+            # sources start. It locates a published prefix if final state commit
+            # never happens; no scan of every completed recording is required.
+            "active_session": (
+                {
+                    "session_id": self._active_plan.session_id,
+                    "volume_id": self._active_plan.volume_id,
+                    "generation_id": self._active_plan.generation_id,
+                }
+                if self._active is not None and self._active_plan is not None
+                else self._recovery_session
+            ),
             "retained": self._retained,
             "pending_safe_swap": self._pending_safe_swap,
             "pending_safe_swap_failure": self._pending_safe_swap_failure,
@@ -1085,7 +1162,10 @@ class CaptureCoordinator:
         # Publication may have finished just before a crash, before the local
         # retained state was saved. Reconcile here without taking the catalog
         # lock: catalog reads must never acquire the capture-state lock.
+        restored = self._restore_published_failure(admission)
         for session_id in tuple(self._retained):
+            if session_id == restored:
+                continue
             for sessions_root in admission.catalog_roots:
                 try:
                     recovered, _ = inspect_device_session_directory(sessions_root / session_id)
@@ -1093,6 +1173,103 @@ class CaptureCoordinator:
                     continue
                 if any(log.get("role") == RECOVERY_ROLE for log in recovered["logs"]):
                     self._record_saved_prefix(session_id, recovered)
+
+    def _restore_published_failure(self, admission: VolumeAdmission) -> str | None:
+        identity = self._recovery_session
+        if identity is None or identity["volume_id"] != admission.volume_id:
+            return None
+        session_id = identity["session_id"]
+        if session_id in self._retained:
+            self._recovery_session = None
+            return None
+        retryable_read = False
+        for sessions_root in admission.catalog_roots:
+            try:
+                with ExitStack() as cleanup:
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    root_fd = os.open(sessions_root, flags)
+                    cleanup.callback(os.close, root_fd)
+                    session_fd = os.open(session_id, flags, dir_fd=root_fd)
+                    cleanup.callback(os.close, session_fd)
+                    if os.fstat(session_fd).st_dev != admission.device:
+                        raise ValueError("recovery session is on a different device")
+                    state, _ = _read_recovery_metadata(
+                        session_fd, ("recovery", "recording.json"), 1024 * 1024
+                    )
+                    receipt, receipt_bytes = _read_recovery_metadata(
+                        session_fd, ("recovery", "interruption.json"), 1024 * 1024
+                    )
+                    manifest, _ = _read_recovery_metadata(
+                        session_fd, ("manifest.json",), MAX_MANIFEST_BYTES
+                    )
+                outcome = {"generation_id": admission.generation_id, "recording_state": state}
+                validate_retained_unsuccessful_outcome(
+                    {
+                        "schema": "ylx.retained-unsuccessful-session-resource.v2",
+                        "authority_epoch": state.get("authority_epoch"),
+                        "source_revision": state.get("state_revision"),
+                        "outcome": outcome,
+                    },
+                    session_id=session_id,
+                )
+                if (
+                    state["authority_epoch"] != self._authority_epoch
+                    or state["storage"]["volume_id"] != admission.volume_id
+                    or state["device"]["device_id"] != self._config.session.device_id
+                    or manifest.get("schema")
+                    not in {"ylx.device-session.v2", "ylx.device-session.v3"}
+                    or manifest.get("sealed") is not True
+                    or manifest.get("session_id") != session_id
+                    or manifest.get("volume_id") != admission.volume_id
+                    or receipt.get("schema") != "openaria.recording-recovery.v1"
+                    or receipt.get("session_id") != session_id
+                    or receipt.get("outcome") != "interrupted"
+                ):
+                    raise ValueError("published recovery identity mismatch")
+                duration = manifest["time"]["duration_seconds"]
+                saved = receipt["saved_video_seconds"]
+                if (
+                    type(duration) not in (int, float)
+                    or not math.isfinite(duration)
+                    or type(saved) not in (int, float)
+                    or not math.isfinite(saved)
+                    or not 0 < saved <= duration
+                ):
+                    raise ValueError("invalid recovery duration")
+                digest = hashlib.sha256(receipt_bytes).hexdigest()
+                expected_log = {
+                    "artifact_id": digest,
+                    "sha256": digest,
+                    "bytes": len(receipt_bytes),
+                    "path": "recovery/interruption.json",
+                    "role": RECOVERY_ROLE,
+                    "media_type": "application/json",
+                }
+                if expected_log not in manifest["logs"]:
+                    raise ValueError("recovery receipt is not bound to the published manifest")
+            except FileNotFoundError:
+                continue
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                OverflowError,
+                RecursionError,
+                InvalidSourceEvent,
+            ):
+                retryable_read = True
+                continue
+            # Restore historical outcome only, never grant payload verification.
+            # Listing/export keeps its independent content-admission checks.
+            self._retained[session_id] = outcome
+            self._revision = max(self._revision, state["state_revision"])
+            self._record_saved_prefix(session_id, manifest)
+            self._recovery_session = None
+            return session_id
+        if not retryable_read:
+            self._recovery_session = None
+        return None
 
     def _recover_completed_prefix(self, partial: Path, session_id: str) -> None:
         try:
@@ -3329,10 +3506,7 @@ class CaptureCoordinator:
             recorder = self._active
             if recorder is None or plan is None or self._active_plan is not plan:
                 return
-            if (
-                self._failure_inflight is not None
-                or self._failure_pending_commit is recorder
-            ):
+            if self._failure_inflight is not None or self._failure_pending_commit is recorder:
                 return
             if self._stop_inflight is not None and not from_stop:
                 # stop() may join this callback's source thread. Its owner will
