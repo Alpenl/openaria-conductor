@@ -81,6 +81,7 @@ class SessionCatalog(StateDatabase):
             # the later read/write upgrade into SQLITE_BUSY_SNAPSHOT.
             db.execute("BEGIN IMMEDIATE")
             self._scan_state.connection = db
+            self._scan_state.validations_seen = set()
             try:
                 yield
                 db.commit()
@@ -93,6 +94,7 @@ class SessionCatalog(StateDatabase):
                 raise
             finally:
                 self._scan_state.connection = None
+                self._scan_state.validations_seen = None
 
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -188,6 +190,9 @@ class SessionCatalog(StateDatabase):
                 and previous[2] is validate
             ):
                 self._validated_summaries.move_to_end(key)
+                seen = getattr(self._scan_state, "validations_seen", None)
+                if seen is not None and len(seen) < self._VALIDATION_CACHE_ENTRIES:
+                    seen.add(key)
                 return True
             self._forget_summary_validation(key)
             return False
@@ -198,13 +203,25 @@ class SessionCatalog(StateDatabase):
             self._forget_summary_validation(key)
             if size > self._VALIDATION_CACHE_BYTES or self._VALIDATION_CACHE_ENTRIES <= 0:
                 return
+            seen = getattr(self._scan_state, "validations_seen", None)
+            if seen is not None and key not in seen and len(seen) >= self._VALIDATION_CACHE_ENTRIES:
+                return
             while self._validated_summaries and (
                 len(self._validated_summaries) >= self._VALIDATION_CACHE_ENTRIES
                 or self._validated_summary_bytes + size > self._VALIDATION_CACHE_BYTES
             ):
-                self._forget_summary_validation(next(iter(self._validated_summaries)))
+                oldest = next(iter(self._validated_summaries))
+                # A full scan visits every row. Evicting entries already used
+                # in this scan would make a directory larger than the cache
+                # miss on every subsequent page. Keep that working subset;
+                # unused entries (including another volume) remain evictable.
+                if seen is not None and oldest in seen:
+                    return
+                self._forget_summary_validation(oldest)
             self._validated_summaries[key] = (validator, raw, validate)
             self._validated_summary_bytes += size
+            if seen is not None:
+                seen.add(key)
 
     def cached(
         self,

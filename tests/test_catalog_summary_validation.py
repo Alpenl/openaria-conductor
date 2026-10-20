@@ -170,6 +170,80 @@ class CatalogSummaryValidationTest(unittest.TestCase):
         self.cached()
         self.assertEqual(self.validate.call_count, 3)
 
+    def add_rows(self, volume, keys):
+        with self.store.connection() as db, db:
+            for key in keys:
+                db.execute(
+                    "INSERT INTO sessions SELECT ?,?,signature,validator,started_at,take_id,? "
+                    "FROM sessions WHERE volume='volume' AND session='session'",
+                    (volume, key, json.dumps({**self.summary, "session_id": key})),
+                )
+
+    def read_rows(self, volume, keys):
+        for key in keys:
+            self.assertIsNotNone(self.store.cached(
+                volume, key, self.signature, "commit",
+                validate_summary=self.validate, cache_validation=True,
+            ))
+
+    def test_full_scan_larger_than_entry_capacity_keeps_a_reusable_subset(self):
+        keys = [f"row-{i}" for i in range(20)]
+        self.add_rows("large", keys)
+        with patch.object(self.store, "_VALIDATION_CACHE_ENTRIES", 3):
+            for expected_calls in (20, 37, 54):
+                with self.store.scan():
+                    self.read_rows("large", keys)
+                    self.assertLessEqual(len(self.store._scan_state.validations_seen), 3)
+                self.assertEqual(self.validate.call_count, expected_calls)
+                self.assertEqual(len(self.store._validated_summaries), 3)
+                self.assertIsNone(self.store._scan_state.validations_seen)
+
+    def test_full_scan_larger_than_byte_capacity_keeps_a_reusable_subset(self):
+        keys = ["aaaaaaa", "bbbbbbb", "ccccccc"]
+        self.add_rows("large", keys)
+        budget = 2 * sys.getsizeof(json.dumps(self.summary))
+        with patch.object(self.store, "_VALIDATION_CACHE_BYTES", budget):
+            for expected_calls in (3, 4, 5):
+                with self.store.scan():
+                    self.read_rows("large", keys)
+                self.assertEqual(self.validate.call_count, expected_calls)
+                self.assertLessEqual(self.store._validated_summary_bytes, budget)
+                self.assertEqual(len(self.store._validated_summaries), 2)
+
+    def test_new_volume_can_replace_unused_rows_from_an_earlier_scan(self):
+        keys = ["row-a", "row-b", "row-c"]
+        for volume in ("old", "new"):
+            self.add_rows(volume, keys)
+        with patch.object(self.store, "_VALIDATION_CACHE_ENTRIES", 2):
+            for volume, calls in (("old", 3), ("new", 6), ("new", 7)):
+                with self.store.scan():
+                    self.read_rows(volume, keys)
+                self.assertEqual(self.validate.call_count, calls)
+                self.assertTrue(all(key[0] == volume for key in self.store._validated_summaries))
+
+    def test_row_used_earlier_in_scan_is_revalidated_when_its_content_changes(self):
+        with patch.object(self.store, "_VALIDATION_CACHE_ENTRIES", 1), self.store.scan():
+            self.cached()
+            changed = {**self.summary, "nested": {"value": [2]}}
+            with self.store.connection() as db:
+                db.execute("UPDATE sessions SET summary=?", (json.dumps(changed),))
+            self.assertEqual(self.cached(), changed)
+            self.assertEqual(self.cached(), changed)
+        self.assertEqual(self.validate.call_count, 2)
+        self.assertEqual(self.cached(), changed)
+        self.assertEqual(self.validate.call_count, 2)
+
+    def test_failed_scan_does_not_leave_admission_protection_on_later_reads(self):
+        with self.assertRaisesRegex(RuntimeError, "rollback"), self.store.scan():
+            self.cached()
+            raise RuntimeError("rollback")
+        self.assertIsNone(self.store._scan_state.validations_seen)
+        keys = ["row-a", "row-b", "row-c"]
+        self.add_rows("direct", keys)
+        with patch.object(self.store, "_VALIDATION_CACHE_ENTRIES", 2):
+            self.read_rows("direct", keys)
+            self.assertNotIn(("direct", "row-a"), self.store._validated_summaries)
+
     def test_scan_rollback_and_deletion_release_cached_validation(self):
         with self.assertRaisesRegex(RuntimeError, "rollback"), self.store.scan():
             self.cached()
