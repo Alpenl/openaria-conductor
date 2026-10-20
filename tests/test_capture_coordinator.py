@@ -4368,7 +4368,18 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 )
                 threads = [first, late]
                 first.start()
-                self.assertTrue(manifest_blocked.wait(2))
+                # This selects a concurrency schedule, not a stop latency SLA.
+                # Real finalization includes durable I/O before the manifest
+                # barrier. Fail promptly if the worker exits without reaching
+                # it, and retain a bounded test setup budget for deadlocks.
+                manifest_deadline = time.monotonic() + 30
+                while not manifest_blocked.wait(0.05):
+                    self.assertTrue(
+                        first.is_alive(), f"first stop missed manifest barrier: {errors!r}"
+                    )
+                    self.assertLess(
+                        time.monotonic(), manifest_deadline, "manifest test barrier timed out"
+                    )
                 late.start()
                 self.assertTrue(waiter_entered.wait(2))
                 release_manifest.set()
@@ -4425,6 +4436,23 @@ class CaptureCoordinatorTest(unittest.TestCase):
         self.assertEqual(results["late"].status, 204)
         self.assertEqual(results["repeated_late"].status, 204)
         self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_same_stop_survives_slow_old_take_finalization(self):
+        original = coordinator_module.DeviceSessionRecorder.stop
+
+        def slow_stop(recorder, **kwargs):
+            # Delay normal storage finalization, not the public request receipt.
+            # The scheduling fixture must await its manifest barrier rather
+            # than impose a two-second total finalization requirement.
+            time.sleep(2.2)
+            return original(recorder, **kwargs)
+
+        with patch.object(coordinator_module.DeviceSessionRecorder, "stop", slow_stop):
+            results, errors = self._queued_stop_after_new_take(same_key=True)
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 202)
+        self.assertTrue(results["late"].replayed)
+        self.assertEqual(results["late"].body, results["first"].body)
 
     def test_queued_stop_cleanup_preserves_early_failure(self):
         with (
