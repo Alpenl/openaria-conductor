@@ -4188,6 +4188,27 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_failure_checkpoint_revision_is_durable_before_recovery(self):
+        coordinator = self.coordinator()
+        observed = []
+        try:
+            coordinator.start_capture(start_command("failure-checkpoint-order"))
+            recorder = coordinator._active
+            original = recorder.recover_completed_segments
+
+            def recover():
+                state = recorder.current_recording_state
+                durable = coordinator._state_db.capture_state()
+                observed.append((durable["source_revision"], state["state_revision"]))
+                return original()
+
+            with patch.object(recorder, "recover_completed_segments", side_effect=recover):
+                coordinator._source_failure(coordinator.generation_id, "encoder_failed", "fault")
+            self.assertEqual(len(observed), 1)
+            self.assertGreaterEqual(observed[0][0], observed[0][1])
+        finally:
+            coordinator.close()
+
     def _check_failed_recovery_commit_retry(self, injected):
         coordinator = self.coordinator()
         try:

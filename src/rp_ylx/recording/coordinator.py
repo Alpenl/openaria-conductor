@@ -955,14 +955,23 @@ class CaptureCoordinator:
 
     def _recording_state_changed(self, plan: SessionPlan, state: Mapping[str, object]) -> None:
         with self._lock:
+            recovering = self._active_plan is plan and self._failure_inflight is not None
             if self._active_plan is plan:
                 self._cached_active_state = copy.deepcopy(state)
-                if self._failure_inflight is not None:
-                    # The recorder checkpoint is already written separately.
-                    # Publish coordinator state once recovery has its outcome;
-                    # an intermediate DB error must not abort that recovery.
-                    return
-        self._persist_local_state()
+        try:
+            self._persist_local_state()
+        except (OSError, sqlite3.Error, PersistenceError) as error:
+            if not recovering:
+                raise
+            # Keep the normal checkpoint ordering when storage works. Its
+            # recording.json is already durable; defer only this failed DB
+            # write to the final recovery commit, whose failure retains ownership.
+            operational_logger("recording").event(
+                "failure_checkpoint_commit_deferred",
+                level="warning",
+                transaction_id=plan.session_id,
+                exception_type=type(error).__name__,
+            )
 
     def _next_revision(self) -> int:
         with self._lock:
