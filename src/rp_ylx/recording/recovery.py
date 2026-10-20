@@ -41,6 +41,21 @@ from rp_ylx.recording.verified import VerifiedArtifact
 from rp_ylx.recording.verified import identity as verified_identity
 
 RECOVERY_ROLE = "log.recording-recovery"
+# Match the live capture audit limit, including the terminating newline.
+_MAX_JOURNAL_LINE_BYTES = 1024 * 1024
+
+
+def _journal_lines(stream):
+    """Read a stopped writer's complete prefix without allocating a torn tail.
+
+    Never skip a bad row and resume later: only a contiguous prefix can be
+    recovered. The source journal is retained unchanged for diagnosis.
+    """
+    while True:
+        line = stream.readline(_MAX_JOURNAL_LINE_BYTES + 1)
+        if len(line) > _MAX_JOURNAL_LINE_BYTES or not line.endswith(b"\n"):
+            return
+        yield line
 
 
 def _regular(root: Path, relative: str) -> Path:
@@ -61,7 +76,10 @@ def _read_json(root: Path, relative: str) -> dict:
     path = _regular(root, relative)
     if path.stat().st_size > 8 * 1024 * 1024:
         raise ValueError("recovery metadata is too large")
-    value = json.loads(path.read_bytes())
+    try:
+        value = json.loads(path.read_bytes())
+    except RecursionError as error:
+        raise ValueError("recovery metadata nesting exceeds parser limit") from error
     if not isinstance(value, dict):
         raise ValueError("invalid recovery metadata")
     return value
@@ -143,7 +161,7 @@ def _frames(
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
         with os.fdopen(descriptor, "wb") as output:
             with _regular(root, "frames.ndjson").open("rb") as stream:
-                for line in stream:
+                for line in _journal_lines(stream):
                     if segment_index >= len(segments):
                         break
                     try:
@@ -168,7 +186,7 @@ def _frames(
                             )
                         ):
                             break
-                    except (ValueError, KeyError, TypeError):
+                    except (ValueError, KeyError, TypeError, RecursionError):
                         break
                     if first is None:
                         first = row["host_monotonic_ns"]
@@ -196,6 +214,8 @@ def _frames(
                         last_committed = row["host_monotonic_ns"]
                         boundaries[segment["start_ordinal"]] = segment_first
                         segment_index += 1
+                        if segment_index == len(segments):
+                            break
             del segments[segment_index:]
             if not committed_count:
                 return None
@@ -453,7 +473,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         # IMU data can be much larger than the frame index on long takes.
         # Stream it through recovery so memory does not grow with sample count.
         with _regular(partial, "imu.ndjson").open("rb") as stream:
-            for line in stream:
+            for line in _journal_lines(stream):
                 try:
                     sample = json.loads(line)
                     timestamp = sample["host_monotonic_ns"]
@@ -461,7 +481,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                         break
                     if origin <= timestamp <= origin + video_end * 1e9:
                         yield sample
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, RecursionError):
                     break
 
     imu_count = _write_records(recovery / "imu.ndjson", imu_prefix())
@@ -476,7 +496,15 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                     (audio["capture_clock"]["thread_stopped_monotonic_ns"] - origin) / 1e9,
                 ),
             )
-    except (OSError, ValueError, KeyError, TypeError, wave.Error, DeviceRecordingError) as error:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        RecursionError,
+        wave.Error,
+        DeviceRecordingError,
+    ) as error:
         # Bad/missing audio never invalidates already committed video pairs.
         audio = None
         audio_error = str(error)
