@@ -1144,6 +1144,11 @@ class CaptureCoordinator:
             )
             self._persisted_commands = commands
             self._state_persisted_sequence = sequence
+            # The same successful transaction has preserved any inline evidence
+            # in capture_commands. Quarantine identities never change during a
+            # coordinator lifetime; replace the mapping without reacquiring the
+            # command lock while holding the persistence lock.
+            self._invalid_commands = dict.fromkeys(self._invalid_commands)
 
     def _local_state_write(self):
         admission = self._admission
@@ -1157,7 +1162,10 @@ class CaptureCoordinator:
         value = {
             "schema": "ylx.capture-coordinator-state.v1",
             "invalid_commands": [
-                {"scope": list(scope), "receipt": copy.deepcopy(receipt)}
+                {
+                    "scope": list(scope),
+                    **({"receipt": copy.deepcopy(receipt)} if receipt is not None else {}),
+                }
                 for scope, receipt in self._invalid_commands.items()
             ],
             "authority_epoch": self._authority_epoch,

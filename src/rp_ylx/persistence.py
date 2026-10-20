@@ -348,6 +348,37 @@ class StateDatabase:
         self, value: Mapping[str, Any], commands: list[dict], removed: set
     ) -> None:
         """Commit lifecycle and new receipts together; do not rewrite old receipts."""
+        # Keep large corrupt receipt evidence in the receipt table, once. The
+        # lifecycle document only needs identities to keep replay fail-closed.
+        # This also migrates the previous inline quarantine representation.
+        quarantined: set[tuple[str, str, str]] = set()
+        evidence = []
+        if "invalid_commands" in value:
+            invalid = value["invalid_commands"]
+            if not isinstance(invalid, list):
+                raise PersistenceError("invalid quarantined command identities")
+            compact = []
+            for entry in invalid:
+                if not isinstance(entry, dict) or not isinstance(entry.get("scope"), list):
+                    raise PersistenceError("invalid quarantined command identity")
+                scope = tuple(entry["scope"])
+                if len(scope) != 3 or not all(isinstance(part, str) and part for part in scope):
+                    raise PersistenceError("invalid quarantined command identity")
+                quarantined.add(scope)
+                compact.append({"scope": list(scope)})
+                raw = entry.get("receipt")
+                if raw is not None:
+                    # Escaped text preserves invalid Unicode from old parsed
+                    # receipts without making the SQLite TEXT binding fail.
+                    if not isinstance(raw, str):
+                        raw = json.dumps(raw, ensure_ascii=True)
+                    evidence.append((*scope, raw))
+            value = {**value, "invalid_commands": compact}
+        if any(
+            (c["principal_id"], c["operation"], c["idempotency_key"]) in quarantined
+            for c in commands
+        ):
+            raise PersistenceError("cannot replace a quarantined command receipt")
         body = _json(value)
         now = datetime.now(UTC).isoformat()
         with self.connection() as db, db:
@@ -355,6 +386,9 @@ class StateDatabase:
             old = db.execute("SELECT body,revision FROM documents WHERE name='capture'").fetchone()
             if old is None and db.execute("SELECT 1 FROM imports WHERE name='capture'").fetchone():
                 raise PersistenceError("missing authoritative document: capture")
+            # Publish evidence and compact state atomically. A failed insert
+            # rolls back the document too; existing SQL evidence is never replaced.
+            db.executemany("INSERT OR IGNORE INTO capture_commands VALUES (?,?,?,?)", evidence)
             if old is None or body != old[0]:
                 revision = 1 if old is None else old[1] + 1
                 db.execute(
@@ -366,7 +400,7 @@ class StateDatabase:
             db.executemany(
                 "DELETE FROM capture_commands WHERE principal=? AND operation=? "
                 "AND idempotency_key=?",
-                list(removed),
+                list(set(removed) - quarantined),
             )
             db.executemany(
                 "INSERT OR REPLACE INTO capture_commands VALUES (?,?,?,?)",
