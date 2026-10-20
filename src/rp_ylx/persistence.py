@@ -128,6 +128,27 @@ def _preserve_import_source(source: Path, raw: bytes) -> None:
     _sync_parent(backup)
 
 
+@contextmanager
+def _readonly_database_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    _require_regular_database_file(path)
+    db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
+        if (
+            db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
+            or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+        ):
+            raise PersistenceError("unsupported backup source identity or schema")
+        validate_state_schema(db)
+        yield db
+    finally:
+        db.close()
+
+
+def _remove_private_snapshot(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
 class StateDatabase:
     """Versioned local state with explicit, one-time JSON imports."""
 
@@ -502,37 +523,36 @@ class StateDatabase:
     @staticmethod
     def backup_readonly(source_path: Path, destination: Path) -> None:
         """Copy existing authority without initializing or changing source permissions."""
-
-        @contextmanager
-        def connection() -> Iterator[sqlite3.Connection]:
-            _require_regular_database_file(source_path)
-            db = sqlite3.connect(source_path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
-            try:
-                if (
-                    db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-                    or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-                ):
-                    raise PersistenceError("unsupported backup source identity or schema")
-                validate_state_schema(db)
-                yield db
-            finally:
-                db.close()
-
-        StateDatabase._backup(destination, connection)
+        StateDatabase._backup(destination, lambda: _readonly_database_connection(source_path))
 
     @staticmethod
-    def _backup(
+    @contextmanager
+    def readonly_snapshot(source_path: Path, destination: Path) -> Iterator[None]:
+        """Own a private recovery snapshot from exclusive creation through cleanup."""
+        with StateDatabase._snapshot(
+            destination, lambda: _readonly_database_connection(source_path)
+        ):
+            yield
+
+    @staticmethod
+    @contextmanager
+    def _snapshot(
         destination: Path,
         connection: Callable[[], AbstractContextManager[sqlite3.Connection]],
-    ) -> None:
-        if os.path.lexists(destination):
-            raise FileExistsError(errno.EEXIST, "backup destination already exists", destination)
-        temporary = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}.tmp")
-        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    ) -> Iterator[None]:
+        # Do not enter cleanup unless this call exclusively created the file.
+        # In particular, a colliding name must never delete someone else's data.
+        for suffix in ("-wal", "-shm", "-journal"):
+            journal = Path(str(destination) + suffix)
+            if os.path.lexists(journal):
+                raise FileExistsError(
+                    errno.EEXIST, "private snapshot journal already exists", journal
+                )
+        fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         try:
             with connection() as source:
-                target = sqlite3.connect(temporary)
+                target = sqlite3.connect(destination)
                 try:
                     # SQLite's backup API retries BUSY/LOCKED independently of
                     # connect(timeout=...). Check one deadline between bounded
@@ -561,19 +581,28 @@ class StateDatabase:
                         raise PersistenceError("backup snapshot is not self-contained")
                 finally:
                     target.close()
-            with temporary.open("rb") as stream:
+            with destination.open("rb") as stream:
                 os.fsync(stream.fileno())
-            # A competing destination must never be overwritten. Unlike a
-            # placeholder final file, only this complete, synced copy is visible.
-            os.link(temporary, destination, follow_symlinks=False)
+            yield
         except BaseException:
-            # The final name may belong to a concurrent producer. Clean up only
-            # our private staging name and preserve the original exception.
             with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+                _remove_private_snapshot(destination)
             raise
         else:
-            temporary.unlink()
-            # If this barrier fails, report failure but retain the complete
-            # published copy; never unlink a final name after publication.
-            _sync_parent(destination)
+            _remove_private_snapshot(destination)
+
+    @staticmethod
+    def _backup(
+        destination: Path,
+        connection: Callable[[], AbstractContextManager[sqlite3.Connection]],
+    ) -> None:
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "backup destination already exists", destination)
+        temporary = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}.tmp")
+        with StateDatabase._snapshot(temporary, connection):
+            # A competing final name must never be overwritten or cleaned up.
+            # Only the private snapshot belongs to this call.
+            os.link(temporary, destination, follow_symlinks=False)
+        # If this barrier fails, retain the complete published backup and report
+        # failure. Private recovery snapshots instead stay inside their context.
+        _sync_parent(destination)

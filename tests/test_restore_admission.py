@@ -3,7 +3,7 @@
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,15 +65,17 @@ class RestoreAdmissionTest(unittest.TestCase):
 
     def test_schema_damage_in_actual_copy_is_rejected_before_archival(self):
         target = self.target("state.sqlite3", "capture")
-        original = StateDatabase.backup_readonly
+        original = StateDatabase.readonly_snapshot
 
+        @contextmanager
         def corrupted_backup(source, destination):
-            original(source, destination)
-            with closing(sqlite3.connect(destination)) as db, db:
-                db.execute("DROP TABLE transfers")
+            with original(source, destination):
+                with closing(sqlite3.connect(destination)) as db, db:
+                    db.execute("DROP TABLE transfers")
+                yield
 
         with (
-            patch.object(StateDatabase, "backup_readonly", corrupted_backup),
+            patch.object(StateDatabase, "readonly_snapshot", corrupted_backup),
             self.assertRaises(PersistenceError),
         ):
             database_admin.restore(self.source.path, target.path)
@@ -81,20 +83,22 @@ class RestoreAdmissionTest(unittest.TestCase):
 
     def test_wrong_identity_of_actual_copy_is_rejected_before_archival(self):
         target = self.target("state.sqlite3", "capture")
-        original = StateDatabase.backup_readonly
+        original = StateDatabase.readonly_snapshot
         for pragma, value in (
             ("application_id", APPLICATION_ID + 1),
             ("user_version", SCHEMA_VERSION + 1),
         ):
             with self.subTest(pragma=pragma):
 
+                @contextmanager
                 def wrong_identity(source, destination, pragma=pragma, value=value):
-                    original(source, destination)
-                    with closing(sqlite3.connect(destination)) as db, db:
-                        db.execute(f"PRAGMA {pragma}={value}")
+                    with original(source, destination):
+                        with closing(sqlite3.connect(destination)) as db, db:
+                            db.execute(f"PRAGMA {pragma}={value}")
+                        yield
 
                 with (
-                    patch.object(StateDatabase, "backup_readonly", wrong_identity),
+                    patch.object(StateDatabase, "readonly_snapshot", wrong_identity),
                     self.assertRaises(PersistenceError),
                 ):
                     database_admin.restore(self.source.path, target.path)

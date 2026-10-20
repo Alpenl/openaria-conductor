@@ -116,7 +116,7 @@ class RestoreConcurrencyTest(unittest.TestCase):
 
     def test_failed_copy_releases_lock_for_same_target_retry(self):
         with (
-            patch.object(StateDatabase, "backup_readonly", side_effect=OSError("copy denied")),
+            patch.object(StateDatabase, "readonly_snapshot", side_effect=OSError("copy denied")),
             self.assertRaisesRegex(OSError, "copy denied"),
         ):
             database_admin.restore(self.sources[0], self.target)

@@ -9,7 +9,7 @@ import stat
 import subprocess
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 
 from rp_ylx.persistence import (
@@ -70,13 +70,6 @@ def inspect(path: Path) -> dict:
         db.close()
 
 
-def _remove_restore_staging(prepared: Path) -> None:
-    # Read-only inspection of a WAL database may leave empty WAL/SHM files.
-    # These names belong to the private snapshot, never to the active database.
-    for suffix in ("", "-wal", "-shm"):
-        Path(str(prepared) + suffix).unlink(missing_ok=True)
-
-
 @contextmanager
 def _restore_lock(destination: Path) -> Iterator[None]:
     # Keep this inode after release. Unlinking a lock file permits waiters and
@@ -116,49 +109,45 @@ def _restore_locked(source: Path, destination: Path) -> dict:
         raise ValueError("source and destination must differ")
     token = uuid.uuid4().hex
     prepared = destination.with_name(destination.name + ".restore-" + token)
-    StateDatabase.backup_readonly(source, prepared)
+    with StateDatabase.readonly_snapshot(source, prepared):
+        return _restore_prepared(prepared, destination, required, token)
+
+
+def _restore_prepared(prepared: Path, destination: Path, required: str | None, token: str) -> dict:
     archived = []
-    try:
-        # The source can change after its initial inspection. Only the copied
-        # snapshot will be published, so admit that exact database before any
-        # mutation of the existing authority or its marker.
-        prepared_info = inspect(prepared)
-        if required and required not in {d["name"] for d in prepared_info["documents"]}:
-            raise PersistenceError("backup does not contain the required authoritative document")
-        # Preserve even corrupt databases and their journals for diagnosis.
-        # Never remove the authority marker: interruption must fail closed.
-        marker = destination.with_suffix(destination.suffix + ".initialized")
-        if not marker.exists():
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                stream.write(str(SCHEMA_VERSION))
-                stream.flush()
-                os.fsync(stream.fileno())
-        # Make the authority marker durable before any old file moves. A
-        # missing database after interruption must not bootstrap empty state.
-        _sync_parent(marker)
-        for suffix in ("", "-wal", "-shm"):
-            old = Path(str(destination) + suffix)
-            if os.path.lexists(old):
-                saved = old.with_name(old.name + ".before-restore-" + token)
-                old.rename(saved)
-                archived.append(str(saved))
-        # Old database and journals must be durably named before publication.
-        # On failure, retain their archived names and the authority marker.
-        _sync_parent(destination)
-        prepared.replace(destination)
-        # The prepared file's contents were synced by backup(); its new name
-        # needs its own barrier. A failure preserves both new and archived data.
-        _sync_parent(destination)
-        StateDatabase(destination)
-        result = {"restored": str(destination), "preserved": archived, **inspect(destination)}
-    except BaseException:
-        with suppress(OSError):
-            _remove_restore_staging(prepared)
-        raise
-    else:
-        _remove_restore_staging(prepared)
-        return result
+    # The source can change after its initial inspection. Only the copied
+    # snapshot will be published, so admit that exact database before any
+    # mutation of the existing authority or its marker.
+    prepared_info = inspect(prepared)
+    if required and required not in {d["name"] for d in prepared_info["documents"]}:
+        raise PersistenceError("backup does not contain the required authoritative document")
+    # Preserve even corrupt databases and their journals for diagnosis.
+    # Never remove the authority marker: interruption must fail closed.
+    marker = destination.with_suffix(destination.suffix + ".initialized")
+    if not marker.exists():
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(str(SCHEMA_VERSION))
+            stream.flush()
+            os.fsync(stream.fileno())
+    # Make the authority marker durable before any old file moves. A
+    # missing database after interruption must not bootstrap empty state.
+    _sync_parent(marker)
+    for suffix in ("", "-wal", "-shm"):
+        old = Path(str(destination) + suffix)
+        if os.path.lexists(old):
+            saved = old.with_name(old.name + ".before-restore-" + token)
+            old.rename(saved)
+            archived.append(str(saved))
+    # Old database and journals must be durably named before publication.
+    # On failure, retain their archived names and the authority marker.
+    _sync_parent(destination)
+    prepared.replace(destination)
+    # The private snapshot's contents were synced before admission; its new name
+    # needs its own barrier. A failure preserves both new and archived data.
+    _sync_parent(destination)
+    StateDatabase(destination)
+    return {"restored": str(destination), "preserved": archived, **inspect(destination)}
 
 
 def manage(path: Path, action: str, *, source: Path | None, destination: Path | None) -> dict:
