@@ -2727,7 +2727,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _get_safe_swap(self, api_version: str) -> None:
         if self._principal("getCurrentSafeSwapReceipt") is None:
             return
-        resource = self.server.provider.current_safe_swap_receipt()
+        try:
+            resource = self.server.provider.current_safe_swap_receipt()
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
         if not isinstance(resource, Mapping) or set(resource) != {"schema", "receipt"}:
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "当前没有可读取的安全换盘回执")
             return

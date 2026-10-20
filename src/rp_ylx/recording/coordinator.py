@@ -78,6 +78,26 @@ VOLUME_MARKER = ".ylx-volume.json"
 SESSIONS_DIRECTORY = "recordings"
 LEGACY_SESSIONS_DIRECTORY = "sessions"
 LIVE_IMU_STALE_SECONDS = 2.0
+# The frozen receipt GET contract exposes InternalError for failed operations;
+# conflict statuses remain on the command endpoints, not this resource query.
+SAFE_SWAP_FAILURES = {
+    "safe_swap_unverified": (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "待交接录制内容未通过完整校验，请检查后重试",
+    ),
+    "safe_swap_publish_failed": (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "安全换盘回执未能持久发布，请重试",
+    ),
+    "safe_swap_blocked": (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "仍有读取句柄未释放，请稍后重试",
+    ),
+    "safe_swap_resume_failed": (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "存储交接复核失败，请检查设备日志后重试",
+    ),
+}
 CALIBRATION_CAPTURE_DISABLED_REASONS = {
     "capture_source_unsupported",
     "storage_unavailable",
@@ -633,6 +653,7 @@ class CaptureCoordinator:
         self._released = False
         self._media_lost = False
         self._pending_safe_swap: dict[str, object] | None = None
+        self._pending_safe_swap_failure: dict[str, object] | None = None
         self._safe_swap_resource: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
         self._async_stop_worker: threading.Thread | None = None
@@ -816,6 +837,16 @@ class CaptureCoordinator:
             and pending.get("generation_id") == admission.generation_id
         ):
             self._pending_safe_swap = copy.deepcopy(pending)
+            failure = persisted.get("pending_safe_swap_failure")
+            if (
+                isinstance(failure, Mapping)
+                and set(failure) == {"session_id", "manifest_sha256", "code"}
+                and isinstance(failure.get("code"), str)
+                and failure["code"] in SAFE_SWAP_FAILURES
+                and failure["session_id"] == pending.get("session_id")
+                and failure["manifest_sha256"] == pending.get("manifest_sha256")
+            ):
+                self._pending_safe_swap_failure = copy.deepcopy(dict(failure))
         commands = persisted.get("commands")
         if isinstance(commands, list):
             for item in commands[-1024:]:
@@ -883,6 +914,7 @@ class CaptureCoordinator:
             "volume_binding": copy.deepcopy(self._last_volume_binding),
             "retained": self._retained,
             "pending_safe_swap": self._pending_safe_swap,
+            "pending_safe_swap_failure": self._pending_safe_swap_failure,
             "safe_swap_resource": self._safe_swap_resource,
         }
         self._state_write_sequence += 1
@@ -2535,6 +2567,7 @@ class CaptureCoordinator:
         self._latest_imu = None
         self._safe_swap_resource = None
         self._pending_safe_swap = None
+        self._pending_safe_swap_failure = None
         if not self._sources_keep_preview():
             self._preview.clear()
         try:
@@ -2788,12 +2821,19 @@ class CaptureCoordinator:
                     # visible through capture status, not disappear in a thread.
                     with self._stop_condition:
                         still_owned = self._active is recorder and self._active_plan is plan
+                        pending = self._pending_safe_swap
                     if still_owned:
                         self._retain_active_failure(
                             DeviceRecordingError("stop_finalization_failed", str(error)),
                             plan,
                             from_stop=True,
                         )
+                    elif (
+                        reason == "safe_swap"
+                        and pending is not None
+                        and pending["session_id"] == plan.session_id
+                    ):
+                        self._record_safe_swap_failure(pending, error)
                 finally:
                     with self._stop_condition:
                         if self._async_stop_worker is threading.current_thread():
@@ -2847,6 +2887,7 @@ class CaptureCoordinator:
             else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
         )
         old_commands = dict(self._commands)
+        previous_failure = self._pending_safe_swap_failure
         self._acquire_network_operation_lease()
 
         def finish() -> None:
@@ -2867,6 +2908,7 @@ class CaptureCoordinator:
                     exception_type=type(error).__name__,
                     code=getattr(error, "code", "safe_swap_resume_failed"),
                 )
+                self._record_safe_swap_failure(pending, error)
             finally:
                 with self._stop_condition:
                     if self._async_stop_worker is threading.current_thread():
@@ -2894,18 +2936,49 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
-        if replay is None:
-            try:
+        self._pending_safe_swap_failure = None
+        try:
+            if replay is None:
                 self._remember_command(scope, command, result)
-            except BaseException:
-                self._commands = old_commands
-                self._async_stop_worker = None
-                self._async_stop_reason = None
-                self._stop_inflight = None
-                self._release_network_operation_lease()
-                self._stop_condition.notify_all()
-                raise
+            elif previous_failure is not None:
+                self._persist_local_state()
+        except BaseException:
+            self._commands = old_commands
+            self._pending_safe_swap_failure = previous_failure
+            self._async_stop_worker = None
+            self._async_stop_reason = None
+            self._stop_inflight = None
+            self._release_network_operation_lease()
+            self._stop_condition.notify_all()
+            raise
         return result
+
+    def _record_safe_swap_failure(
+        self, pending: Mapping[str, object], error: BaseException
+    ) -> None:
+        code = getattr(error, "code", "safe_swap_resume_failed")
+        if not isinstance(code, str) or code not in SAFE_SWAP_FAILURES:
+            code = "safe_swap_resume_failed"
+        with self._lock:
+            if self._pending_safe_swap is not pending:
+                return
+            self._pending_safe_swap_failure = {
+                "session_id": pending["session_id"],
+                "manifest_sha256": pending["manifest_sha256"],
+                "code": code,
+            }
+            self._next_revision()
+        try:
+            self._persist_local_state()
+        except BaseException as persist_error:
+            # A storage failure must not hide the original failure in this
+            # process, nor strand the worker/lease while trying to report it.
+            operational_logger("recording").event(
+                "safe_swap_failure_persist_failed",
+                level="error",
+                transaction_id=str(pending["session_id"]),
+                exception_type=type(persist_error).__name__,
+            )
 
     def stop_capture(
         self, command: CaptureCommand, *, expected_session_id: str | None = None
@@ -3098,6 +3171,14 @@ class CaptureCoordinator:
                 self._latest_imu = None
                 self._next_revision()
                 if reason == "safe_swap":
+                    self._pending_safe_swap = {
+                        "session_id": plan.session_id,
+                        "volume_id": plan.volume_id,
+                        "generation_id": plan.generation_id,
+                        "manifest_id": sealed.manifest["manifest_id"],
+                        "manifest_sha256": sealed.manifest_sha256,
+                        "sealed_at": sealed.manifest["sealed_at"],
+                    }
                     if (
                         not verification_current
                         or verified_snapshot is None
@@ -3109,14 +3190,6 @@ class CaptureCoordinator:
                             "录制内容尚未通过完整校验，不能发布安全移除回执",
                             status=HTTPStatus.CONFLICT,
                         )
-                    self._pending_safe_swap = {
-                        "session_id": plan.session_id,
-                        "volume_id": plan.volume_id,
-                        "generation_id": plan.generation_id,
-                        "manifest_id": sealed.manifest["manifest_id"],
-                        "manifest_sha256": sealed.manifest_sha256,
-                        "sealed_at": sealed.manifest["sealed_at"],
-                    }
                     self._persist_local_state()
                     result = self._publish_safe_swap_command()
                 else:
@@ -3454,6 +3527,7 @@ class CaptureCoordinator:
         validate_safe_swap_v3_receipt(receipt)
         previous_resource = self._safe_swap_resource
         previous_pending = self._pending_safe_swap
+        previous_failure = self._pending_safe_swap_failure
         resource = {
             "schema": "ylx.safe-swap-receipt-resource.v3",
             "receipt": receipt,
@@ -3461,6 +3535,7 @@ class CaptureCoordinator:
         self._released = True
         self._safe_swap_resource = resource
         self._pending_safe_swap = None
+        self._pending_safe_swap_failure = None
         self._next_revision()
         try:
             self._persist_local_state()
@@ -3468,6 +3543,7 @@ class CaptureCoordinator:
             self._released = False
             self._safe_swap_resource = previous_resource
             self._pending_safe_swap = previous_pending
+            self._pending_safe_swap_failure = previous_failure
             raise ProviderError(
                 "safe_swap_publish_failed",
                 "安全换盘回执未能持久发布",
@@ -3507,6 +3583,16 @@ class CaptureCoordinator:
 
     def current_safe_swap_receipt(self) -> object | None:
         with self._lock:
+            failure = self._pending_safe_swap_failure
+            if self._pending_safe_swap is not None and failure is not None:
+                status, message = SAFE_SWAP_FAILURES[str(failure["code"])]
+                raise ProviderError(
+                    str(failure["code"]),
+                    message,
+                    status=status,
+                    retryable=True,
+                    details={"session_id": failure["session_id"]},
+                )
             return copy.deepcopy(self._safe_swap_resource)
 
     def artifact_io_state(self) -> str | None:

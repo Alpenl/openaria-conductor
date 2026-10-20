@@ -235,8 +235,10 @@ class AsyncStopTest(unittest.TestCase):
                 fixtures.stop_command("bad-safe-swap", reason="safe_swap")
             )
             self.wait_finished()
-        self.assertIsNone(self.coordinator.current_safe_swap_receipt())
-        self.assertIsNone(self.coordinator._pending_safe_swap)
+        with self.assertRaises(ProviderError) as failed:
+            self.coordinator.current_safe_swap_receipt()
+        self.assertEqual(failed.exception.code, "safe_swap_unverified")
+        self.assertIsNotNone(self.coordinator._pending_safe_swap)
         self.assertFalse(self.coordinator._released)
 
     def test_safe_swap_rejects_existing_reader_before_acceptance(self):

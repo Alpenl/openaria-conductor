@@ -176,7 +176,9 @@ class AsyncStopCrashTest(unittest.TestCase):
             self.assertIsNone(coordinator.current_safe_swap_receipt())
             coordinator.request_stop_capture(command)
             self.wait_finished(coordinator)
-            self.assertIsNone(coordinator.current_safe_swap_receipt())
+            with self.assertRaises(ProviderError) as failed:
+                coordinator.current_safe_swap_receipt()
+            self.assertEqual(failed.exception.code, "safe_swap_unverified")
             self.assertFalse(coordinator._released)
             self.assertNotIn(accepted["session_id"], coordinator._verified)
             # The synchronous internal path must enforce the same content rule.
@@ -205,7 +207,9 @@ class AsyncStopCrashTest(unittest.TestCase):
         try:
             coordinator.request_stop_capture(command)
             self.wait_finished(coordinator)
-            self.assertIsNone(coordinator.current_safe_swap_receipt())
+            with self.assertRaises(ProviderError) as failed:
+                coordinator.current_safe_swap_receipt()
+            self.assertEqual(failed.exception.code, "safe_swap_unverified")
             path.write_bytes(original)
             coordinator.request_stop_capture(command)
             self.wait_finished(coordinator)
