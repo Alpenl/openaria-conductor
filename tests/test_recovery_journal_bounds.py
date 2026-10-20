@@ -170,3 +170,70 @@ class RecoveryJournalBoundsTests(unittest.TestCase):
                 self.assertEqual((root / name).read_bytes(), damaged)
                 self.assertFalse((root.parent / recorder._plan.session_id).exists())
                 self.assertFalse((root / "manifest.json").exists())
+
+    def test_invalid_imu_timestamp_ends_prefix_instead_of_skipping_corruption(self):
+        for timestamp in (float("nan"), float("inf"), -1, 0, True, False, None, "invalid", 1.5):
+            with self.subTest(timestamp=timestamp), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                root = recorder.partial_path
+                row = {
+                    "session_id": recorder._plan.session_id,
+                    "host_monotonic_ns": recorder._started_monotonic_ns + 20_000_000,
+                }
+                prefix = json_bytes(row)
+                bad = dict(row, host_monotonic_ns=timestamp)
+                original = prefix + (json.dumps(bad) + "\n").encode() + prefix
+                (root / "imu.ndjson").write_bytes(original)
+                recovered = recover_device_session(root)
+                self.assertEqual(recovered.manifest["frames"]["count"], 30)
+                self.assertEqual(recovered.manifest["imu"]["sample_count"], 1)
+                self.assertEqual((recovered.path / "recovery/imu.ndjson").read_bytes(), prefix)
+                self.assertEqual((recovered.path / "imu.ndjson").read_bytes(), original)
+                validate_device_session_directory(recovered.path)
+
+    def test_unencodable_imu_tail_keeps_valid_prefix_and_verified_video(self):
+        for extension in ("\ud800", {"nested": ["\udfff"]}):
+            with (
+                self.subTest(extension=repr(extension)),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                recorder = self.recording(Path(temporary))
+                root = recorder.partial_path
+                row = {
+                    "session_id": recorder._plan.session_id,
+                    "host_monotonic_ns": recorder._started_monotonic_ns + 20_000_000,
+                }
+                prefix = json_bytes(row)
+                bad = dict(row, extension=extension)
+                original = prefix + (json.dumps(bad) + "\n").encode() + prefix
+                (root / "imu.ndjson").write_bytes(original)
+                recovered = recover_device_session(root)
+                self.assertEqual(recovered.manifest["frames"]["count"], 30)
+                self.assertEqual(recovered.manifest["imu"]["sample_count"], 1)
+                self.assertEqual((recovered.path / "recovery/imu.ndjson").read_bytes(), prefix)
+                self.assertEqual((recovered.path / "imu.ndjson").read_bytes(), original)
+                validate_device_session_directory(recovered.path)
+
+    def test_valid_imu_unicode_and_time_window_remain_recoverable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            root = recorder.partial_path
+            origin = recorder._started_monotonic_ns
+            rows = [
+                {
+                    "session_id": recorder._plan.session_id,
+                    "host_monotonic_ns": t,
+                    "extension": "传感器😀",
+                }
+                for t in (origin - 1, origin, origin + 20_000_000, origin + 100_000_000_000)
+            ]
+            original = b"".join((json.dumps(row) + "\n").encode() for row in rows)
+            (root / "imu.ndjson").write_bytes(original)
+            recovered = recover_device_session(root)
+            self.assertEqual(recovered.manifest["imu"]["sample_count"], 2)
+            self.assertEqual(
+                (recovered.path / "recovery/imu.ndjson").read_bytes(),
+                b"".join(json_bytes(row) for row in rows[1:3]),
+            )
+            self.assertEqual((recovered.path / "imu.ndjson").read_bytes(), original)
+            validate_device_session_directory(recovered.path)

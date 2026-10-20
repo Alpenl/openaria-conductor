@@ -118,7 +118,13 @@ def _write_records(path: Path, records: Iterable[dict]) -> int:
         with os.fdopen(descriptor, "wb") as stream:
             count = 0
             for record in records:
-                payload = json_bytes(record)
+                try:
+                    payload = json_bytes(record)
+                except UnicodeEncodeError:
+                    # Escaped lone surrogates parse as JSON but cannot be
+                    # written to our UTF-8 index. End the recoverable IMU
+                    # prefix here; never skip corruption or lose valid video.
+                    break
                 if stream.write(payload) != len(payload):
                     raise OSError("short recovery index write")
                 count += 1
@@ -477,7 +483,12 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                 try:
                     sample = json.loads(line)
                     timestamp = sample["host_monotonic_ns"]
-                    if not line.endswith(b"\n") or sample["session_id"] != plan.session_id:
+                    if (
+                        not line.endswith(b"\n")
+                        or sample["session_id"] != plan.session_id
+                        or type(timestamp) is not int
+                        or timestamp <= 0
+                    ):
                         break
                     if origin <= timestamp <= origin + video_end * 1e9:
                         yield sample
