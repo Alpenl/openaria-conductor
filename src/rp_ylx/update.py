@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 DEFAULT_MANIFEST = "https://openaria-firmware-cn.oss-cn-beijing.aliyuncs.com/rdk-x5/latest.json"
@@ -39,6 +39,34 @@ NETWORK_STATE = Path("/var/lib/rp-ylx-network")
 NETWORK_PROFILES = Path("/etc/NetworkManager/system-connections")
 UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    """Publish a durable JSON file, cleaning only our unpublished temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        # Cleanup covers serialization and file fsync too, not just replace.
+        # A failed cleanup must not hide the original I/O or cancellation error.
+        # Once replace succeeds, never remove or roll back the published path.
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
 
 
 def sqlite_state_required() -> bool:
@@ -249,18 +277,7 @@ def prepare_first_install_network(
             "config": {"mode": "wifi-client", "ssid": ssid, "security": security},
         }
 
-        def save_state(path: Path, value: dict) -> None:
-            with tempfile.NamedTemporaryFile(mode="w", dir=state_dir, delete=False) as stream:
-                temporary = Path(stream.name)
-                json.dump(value, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
-
-        save_state(state_dir / "lkg-wlan0.json", record)
+        atomic_json(state_dir / "lkg-wlan0.json", record)
         if controller is not None:
             # Migrate only untouched first-boot hotspot defaults. An explicit
             # user transaction or previously saved network always takes priority.
@@ -292,7 +309,7 @@ def prepare_first_install_network(
                 finally:
                     db.close()
             else:
-                save_state(controller_path, controller)
+                atomic_json(controller_path, controller)
     except BaseException:
         (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
         nmcli("connection", "delete", "id", profile)
