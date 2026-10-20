@@ -222,3 +222,13 @@ class CommandReceiptAdmissionTest(unittest.TestCase):
                 with self.assertRaises(PersistenceError):
                     self.fixture.coordinator()
                 self.assertEqual(self.database.get("capture")["commands"], [bad])
+
+    def test_non_list_legacy_receipt_collection_is_not_silently_discarded(self):
+        for invalid in (None, {}, "invalid", True):
+            with self.subTest(value=invalid):
+                value = copy.deepcopy(self.durable)
+                value["commands"] = invalid
+                self.database.put("capture", value)
+                with self.assertRaises(PersistenceError):
+                    self.fixture.coordinator()
+                self.assertEqual(self.database.get("capture")["commands"], invalid)

@@ -39,7 +39,7 @@ class CaptureSnapshotTests(unittest.TestCase):
         errors = []
 
         def trace(sql):
-            if "SELECT body FROM capture_commands" in sql and not committed:
+            if "FROM capture_commands" in sql and sql.startswith("SELECT") and not committed:
                 committed.append(True)
                 try:
                     self.writer.put_capture_state({"source_revision": 2}, [command(2)], {scope(1)})
@@ -79,11 +79,14 @@ class CaptureSnapshotTests(unittest.TestCase):
             self.store.capture_state(), {"source_revision": 2, "commands": [command(2)]}
         )
 
-    def test_decode_failure_releases_snapshot_for_checkpoint_and_future_reads(self):
+    def test_rejected_receipt_releases_snapshot_for_checkpoint_and_future_reads(self):
         with self.writer.connection() as db, db:
             db.execute("UPDATE capture_commands SET body='{' ")
-        with self.assertRaises(json.JSONDecodeError):
-            self.store.capture_state()
+        result = self.store.capture_state()
+        self.assertEqual(result["commands"], [])
+        self.assertEqual(result["invalid_commands"], [{"scope": list(scope(1)), "receipt": "{"}])
+        with self.writer.connection() as db:
+            self.assertEqual(db.execute("SELECT body FROM capture_commands").fetchone()[0], "{")
         self.writer.put_capture_state({"source_revision": 2}, [command(2)], {scope(1)})
         with self.writer.connection() as db:
             db.execute("PRAGMA busy_timeout=50")

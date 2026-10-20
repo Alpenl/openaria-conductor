@@ -282,7 +282,7 @@ class StateDatabase:
                 raise PersistenceError("invalid state document: capture")
             if "commands" not in value:
                 value["commands"] = []
-                invalid = value.setdefault("invalid_commands", [])
+                invalid = value.get("invalid_commands", [])
                 if not isinstance(invalid, list):
                     raise PersistenceError("invalid quarantined command identities")
                 for principal, operation, key, raw in db.execute(
@@ -313,6 +313,8 @@ class StateDatabase:
                         invalid.append({"scope": scope, "receipt": evidence})
                     else:
                         value["commands"].append(item)
+                if invalid:
+                    value["invalid_commands"] = invalid
             return value
 
     def begin_transfer(self, volume: str, session: str, artifact: str) -> str:

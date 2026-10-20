@@ -28,10 +28,20 @@ class CommandReceiptRetryTests(unittest.TestCase):
     def fill_receipts(self, operation):
         c = self.coordinator
         for index in range(1024):
-            cmd = fixtures.stop_command(f"cached-{index}")
+            cmd = (
+                fixtures.command(
+                    f"cached-{index}", {"schema": "ylx.camera-focus-set.v1", "value": 42}
+                )
+                if operation == "set_camera_focus"
+                else fixtures.stop_command(f"cached-{index}")
+            )
             c._commands[(cmd.principal_id, operation, cmd.idempotency_key)] = (
                 cmd.canonical_body,
-                CaptureCommandResult(204, {"receipt": index}),
+                CaptureCommandResult(204, None)
+                if operation == "stop"
+                else CaptureCommandResult(
+                    200, {**fixtures.CAMERA_FOCUS_STATUS, "value": index % 256}
+                ),
             )
         c._persist_local_state()
         self.assertEqual(len(self.rows()), 1024)
@@ -101,7 +111,7 @@ class CommandReceiptRetryTests(unittest.TestCase):
         self.assertEqual(len(restarted._read_local_state()["commands"]), 1024)
 
     def test_same_body_reused_key_persists_the_new_result(self):
-        self.fill_receipts("receipt-test")
+        self.fill_receipts("set_camera_focus")
         c = self.coordinator
         with (
             patch.object(
@@ -110,13 +120,15 @@ class CommandReceiptRetryTests(unittest.TestCase):
             self.assertRaises(OSError),
         ):
             self.invoke(
-                "receipt-test",
-                fixtures.stop_command("overflow"),
-                lambda: CaptureCommandResult(200, None),
+                "set_camera_focus",
+                fixtures.command("overflow", {"schema": "ylx.camera-focus-set.v1", "value": 42}),
+                lambda: CaptureCommandResult(200, dict(fixtures.CAMERA_FOCUS_STATUS)),
             )
-        reused = fixtures.stop_command("cached-0")
+        reused = fixtures.command("cached-0", {"schema": "ylx.camera-focus-set.v1", "value": 42})
         result = self.invoke(
-            "receipt-test", reused, lambda: CaptureCommandResult(200, {"receipt": "replacement"})
+            "set_camera_focus",
+            reused,
+            lambda: CaptureCommandResult(200, {**fixtures.CAMERA_FOCUS_STATUS, "value": 99}),
         )
         self.assertFalse(result.replayed)
         c.close()
@@ -124,8 +136,8 @@ class CommandReceiptRetryTests(unittest.TestCase):
         self.addCleanup(restarted.close)
         execute = Mock(side_effect=AssertionError("must replay without side effect"))
         with restarted._lock:
-            replay = restarted._idempotent("receipt-test", reused, execute)
-        self.assertEqual(replay.body, {"receipt": "replacement"})
+            replay = restarted._idempotent("set_camera_focus", reused, execute)
+        self.assertEqual(replay.body, {**fixtures.CAMERA_FOCUS_STATUS, "value": 99})
         self.assertTrue(replay.replayed)
         execute.assert_not_called()
 

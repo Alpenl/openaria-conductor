@@ -1060,6 +1060,8 @@ class CaptureCoordinator:
                 raise PersistenceError("invalid quarantined command identity")
             self._invalid_commands[scope] = copy.deepcopy(entry.get("receipt"))
         commands = persisted.get("commands")
+        if "commands" in persisted and not isinstance(commands, list):
+            raise PersistenceError("invalid legacy command receipt collection")
         if isinstance(commands, list):
             for item in commands[-1024:]:
                 if not isinstance(item, Mapping):
