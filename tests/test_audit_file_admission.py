@@ -199,10 +199,11 @@ sys.exit(1)
                     client = http.client.HTTPConnection(*server.server_address, timeout=2)
                     try:
                         client.request("GET", "/api/v4/device", headers={"Connection": "close"})
-                        with self.assertRaises(
-                            (http.client.RemoteDisconnected, ConnectionResetError)
-                        ):
-                            client.getresponse()
+                        response = client.getresponse()
+                        self.assertEqual(response.status, 503)
+                        self.assertEqual(
+                            json.loads(response.read())["error"]["code"], "audit_unavailable"
+                        )
                     finally:
                         client.close()
                     with server._http_condition:
@@ -220,7 +221,7 @@ sys.exit(1)
                 finally:
                     client.close()
                 self.assertEqual(get.call_count, 1)
-                self.assertEqual(errors, ["OSError"] * 4)
+                self.assertEqual(errors, [])
         finally:
             # Also let an old blocking implementation exit if this is used as
             # a negative test; never strand its FIFO writer in the test process.

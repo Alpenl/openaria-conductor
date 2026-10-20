@@ -58,6 +58,7 @@ from rp_ylx.network_validation import (
     valid_network_ethernet,
     valid_network_request,
 )
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.web import (
     WEB_ASSETS,
     EchoWebArtifactError,
@@ -766,6 +767,8 @@ class GatewayServer(ThreadingHTTPServer):
         self.write_timeout_seconds = write_timeout_seconds
         self.max_http_connections = max_http_connections
         self._http_condition = threading.Condition()
+        self._audit_next_report_at: float | None = None
+        self._audit_suppressed = 0
         self._http_connections: set[socket.socket] = set()
         self._http_reclaimable: dict[socket.socket, float] = {}
         self._http_cancelled: set[socket.socket] = set()
@@ -795,6 +798,27 @@ class GatewayServer(ThreadingHTTPServer):
         except BaseException:
             self.server_close()
             raise
+
+    def report_audit_failure(self, operation: str, outcome: str, error: Exception) -> None:
+        now = time.monotonic()
+        with self._http_condition:
+            if self._audit_next_report_at is not None and now < self._audit_next_report_at:
+                self._audit_suppressed += 1
+                return
+            suppressed = self._audit_suppressed
+            self._audit_suppressed = 0
+            self._audit_next_report_at = now + 30.0
+        # A broken diagnostic destination must not replace the operation result.
+        # Advance the deadline before logging to bound repeated logger failures too.
+        with suppress(Exception):
+            operational_logger("gateway").event(
+                "api_audit_failed",
+                level="error",
+                operation=operation,
+                outcome=outcome,
+                exception_type=type(error).__name__,
+                suppressed_count=suppressed,
+            )
 
     def response_write(self, connection: socket.socket) -> AbstractContextManager[None]:
         return self._io_deadline(connection, "write", time.monotonic() + self.write_timeout_seconds)
@@ -1076,7 +1100,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "Access-Control-Expose-Headers",
                 (
                     "Accept-Ranges, Content-Range, ETag, Idempotency-Replayed, Retry-After, "
-                    "YLX-Error-Code, YLX-Manifest-SHA256, YLX-Wait-State"
+                    "YLX-Audit-Status, YLX-Error-Code, YLX-Manifest-SHA256, YLX-Wait-State"
                 ),
             )
             self.send_header("Vary", "Origin")
@@ -1094,6 +1118,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_audit_failed", False):
+            self.send_header("YLX-Audit-Status", "unavailable")
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -1113,6 +1139,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_audit_failed", False):
+            self.send_header("YLX-Audit-Status", "unavailable")
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -1214,16 +1242,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
         resource_id: str | None,
         outcome: str,
         principal: Principal | None = None,
-    ) -> None:
-        self.server.audit_sink(
-            AuditEvent(
-                request_id=self.request_id,
-                principal_id=None if principal is None else principal.principal_id,
-                operation_id=operation_id,
-                resource_id=resource_id,
-                outcome=outcome,
+    ) -> bool:
+        try:
+            self.server.audit_sink(
+                AuditEvent(
+                    request_id=self.request_id,
+                    principal_id=None if principal is None else principal.principal_id,
+                    operation_id=operation_id,
+                    resource_id=resource_id,
+                    outcome=outcome,
+                )
             )
-        )
+        except Exception as error:
+            self._audit_failed = True
+            self.server.report_audit_failure(operation_id, outcome, error)
+            return False
+        return True
 
     def _close_if_request_body_is_unread(self) -> None:
         content_length = getattr(self, "_request_content_length", None)
@@ -1270,11 +1304,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 self._problem(HTTPStatus.FORBIDDEN, "forbidden", "调用方无权访问此资源")
             return None
-        self._audit(operation_id, resource_id, "allowed", principal)
+        if not self._audit(operation_id, resource_id, "allowed", principal):
+            self._close_if_request_body_is_unread()
+            headers = {"Retry-After": "1", "YLX-Error-Code": "audit_unavailable"}
+            if self.command == "HEAD":
+                self._send_empty(HTTPStatus.SERVICE_UNAVAILABLE, headers=headers)
+            else:
+                self._problem(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    "审计记录暂不可用，请稍后重试",
+                    retryable=True,
+                    headers=headers,
+                )
+            return None
         return principal
 
     def _begin_request(self, *, body_allowed: bool) -> bool:
         self._request_id = str(uuid.uuid4())
+        self._audit_failed = False
         self._request_content_length: int | None = None
         try:
             urlsplit(self.path)
