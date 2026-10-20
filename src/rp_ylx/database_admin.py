@@ -13,6 +13,7 @@ from rp_ylx.persistence import (
     SCHEMA_VERSION,
     PersistenceError,
     StateDatabase,
+    _sync_parent,
     validate_state_schema,
 )
 from rp_ylx.recording.catalog import SessionCatalog
@@ -89,13 +90,22 @@ def restore(source: Path, destination: Path) -> dict:
                 stream.write(str(SCHEMA_VERSION))
                 stream.flush()
                 os.fsync(stream.fileno())
+        # Make the authority marker durable before any old file moves. A
+        # missing database after interruption must not bootstrap empty state.
+        _sync_parent(marker)
         for suffix in ("", "-wal", "-shm"):
             old = Path(str(destination) + suffix)
             if os.path.lexists(old):
                 saved = old.with_name(old.name + ".before-restore-" + token)
                 old.rename(saved)
                 archived.append(str(saved))
+        # Old database and journals must be durably named before publication.
+        # On failure, retain their archived names and the authority marker.
+        _sync_parent(destination)
         prepared.replace(destination)
+        # The prepared file's contents were synced by backup(); its new name
+        # needs its own barrier. A failure preserves both new and archived data.
+        _sync_parent(destination)
         StateDatabase(destination)
         return {"restored": str(destination), "preserved": archived, **inspect(destination)}
     finally:
