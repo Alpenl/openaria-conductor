@@ -3213,11 +3213,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ).encode()
         command = CaptureCommand(principal.principal_id, key, body, canonical)
         try:
-            result = (
-                self.server.provider.start_capture(command)
-                if operation == "start"
-                else self.server.provider.stop_capture(command)
-            )
+            if operation == "start":
+                result = self.server.provider.start_capture(command)
+            else:
+                request_stop = getattr(self.server.provider, "request_stop_capture", None)
+                result = (
+                    request_stop(command)
+                    if callable(request_stop)
+                    else self.server.provider.stop_capture(command)
+                )
         except ProviderError as error:
             self._send_camera_provider_error(error)
             return
