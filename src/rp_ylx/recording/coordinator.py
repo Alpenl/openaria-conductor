@@ -2696,6 +2696,7 @@ class CaptureCoordinator:
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
         with self._stop_condition:
+            requested_plan = self._active_plan
             while True:
                 if expected_session_id is not None and (
                     self._active_plan is None or self._active_plan.session_id != expected_session_id
@@ -2715,6 +2716,19 @@ class CaptureCoordinator:
                     return CaptureCommandResult(
                         result.status, copy.deepcopy(result.body), replayed=True
                     )
+                if self._active_plan is not None and self._active_plan is not requested_plan:
+                    # A waiter belongs to the take present when it arrived.
+                    # A new take may acquire the lock before this waiter wakes.
+                    # Replayed receipts above still retain their original body.
+                    if reason == "safe_swap":
+                        raise ProviderError(
+                            "capture_state_changed",
+                            "等待停止期间已开始新的录制，不能安全移除当前存储卷",
+                            status=HTTPStatus.CONFLICT,
+                        )
+                    result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                    self._remember_command(scope, command, result)
+                    return result
                 if self._stop_inflight is None and self._failure_inflight is None:
                     break
                 self._stop_condition.wait()

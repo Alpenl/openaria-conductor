@@ -32,11 +32,14 @@ class HobotThreadStartTests(unittest.TestCase):
                 "/* -------------------------------------------------------------- threads"
             )
         ]
-        lifetime = source[
-            source.index("int ylx_pipeline_open(") : source.index("int ylx_pipeline_submit(")
-        ] + source[
-            source.index("int ylx_pipeline_finish(") : source.index("void ylx_pipeline_stats(")
-        ]
+        lifetime = (
+            source[
+                source.index("int ylx_pipeline_open(") : source.index("int ylx_pipeline_submit(")
+            ]
+            + source[
+                source.index("int ylx_pipeline_finish(") : source.index("void ylx_pipeline_stats(")
+            ]
+        )
         harness = r"""
 #define _GNU_SOURCE
 #include <assert.h>
@@ -84,7 +87,8 @@ static int cond_slot(pthread_cond_t *condition) {
 }
 static int checked_mutex_destroy(pthread_mutex_t *lock) {
     int slot=mutex_slot(lock);
-    int result=pthread_mutex_destroy(lock);assert(result==0);mutexes[slot]=NULL;live_mutexes--;return result;
+    int result=pthread_mutex_destroy(lock);
+    assert(result==0);mutexes[slot]=NULL;live_mutexes--;return result;
 }
 static int checked_cond_init(pthread_cond_t *condition,const pthread_condattr_t *attr) {
     if(++init_calls==fail_init)return EAGAIN;
@@ -94,12 +98,21 @@ static int checked_cond_init(pthread_cond_t *condition,const pthread_condattr_t 
 }
 static int checked_cond_destroy(pthread_cond_t *condition) {
     int slot=cond_slot(condition);
-    int result=pthread_cond_destroy(condition);assert(result==0);conditions[slot]=NULL;live_conditions--;return result;
+    int result=pthread_cond_destroy(condition);
+    assert(result==0);conditions[slot]=NULL;live_conditions--;return result;
 }
-static int checked_mutex_lock(pthread_mutex_t *lock) {(void)mutex_slot(lock);return pthread_mutex_lock(lock);}
-static int checked_mutex_unlock(pthread_mutex_t *lock) {(void)mutex_slot(lock);return pthread_mutex_unlock(lock);}
-static int checked_cond_signal(pthread_cond_t *condition) {(void)cond_slot(condition);return pthread_cond_signal(condition);}
-static int checked_cond_broadcast(pthread_cond_t *condition) {(void)cond_slot(condition);return pthread_cond_broadcast(condition);}
+static int checked_mutex_lock(pthread_mutex_t *lock) {
+    (void)mutex_slot(lock);return pthread_mutex_lock(lock);
+}
+static int checked_mutex_unlock(pthread_mutex_t *lock) {
+    (void)mutex_slot(lock);return pthread_mutex_unlock(lock);
+}
+static int checked_cond_signal(pthread_cond_t *condition) {
+    (void)cond_slot(condition);return pthread_cond_signal(condition);
+}
+static int checked_cond_broadcast(pthread_cond_t *condition) {
+    (void)cond_slot(condition);return pthread_cond_broadcast(condition);
+}
 static int checked_cond_wait(pthread_cond_t *condition,pthread_mutex_t *lock) {
     (void)cond_slot(condition);(void)mutex_slot(lock);return pthread_cond_wait(condition,lock);
 }
@@ -126,7 +139,8 @@ typedef struct {int unused;} media_muxer_context_t;
 static void configure_decoder(media_codec_context_t *codec,const ylx_pipeline_config_t *config) {
     (void)config;codec->id=0;
 }
-static int configure_encoder(media_codec_context_t *codec,const ylx_pipeline_config_t *config,int width) {
+static int configure_encoder(media_codec_context_t *codec,
+                             const ylx_pipeline_config_t *config,int width) {
     (void)config;(void)width;codec->id=++next_encoder;return 0;
 }
 static int codec_start(media_codec_context_t *codec) {
@@ -134,8 +148,12 @@ static int codec_start(media_codec_context_t *codec) {
 }
 static void codec_stop(media_codec_context_t *codec) {(void)codec;codecs_stopped++;}
 static unsigned long long monotonic_time_ns(void) {return 1;}
-static void observe_max(atomic_ullong *value,unsigned long long elapsed) {(void)value;(void)elapsed;}
-static void segment_seal(ylx_pipeline_t *pipeline,segment_t *segment) {(void)pipeline;(void)segment;}
+static void observe_max(atomic_ullong *value,unsigned long long elapsed) {
+    (void)value;(void)elapsed;
+}
+static void segment_seal(ylx_pipeline_t *pipeline,segment_t *segment) {
+    (void)pipeline;(void)segment;
+}
 static void *split_thread_main(void *argument) {
     ylx_pipeline_t *pipeline=argument;atomic_fetch_add(&live_workers,1);
     while(!atomic_load(&pipeline->stopping))usleep(50);
@@ -194,9 +212,22 @@ int main(int argc,char **argv) {
         path.write_text(harness + structures + stubs + closer + lifetime + main)
         cls.binary = directory / "case"
         subprocess.run(
-            [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-pthread", "-I", str(root),
-             str(path), "-o", str(cls.binary)],
-            check=True, capture_output=True, text=True,
+            [
+                compiler,
+                "-std=gnu11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-I",
+                str(root),
+                str(path),
+                "-o",
+                str(cls.binary),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
     def run_case(self, number):

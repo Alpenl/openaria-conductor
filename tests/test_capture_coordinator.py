@@ -4312,6 +4312,112 @@ class CaptureCoordinatorTest(unittest.TestCase):
             release_manifest.set()
             coordinator.close()
 
+    def _queued_stop_after_new_take(self, *, same_key=False, reason="user"):
+        manifest_blocked = threading.Event()
+        release_manifest = threading.Event()
+        waiter_entered = threading.Event()
+        waiter_awake = threading.Event()
+        release_waiter = threading.Event()
+
+        def before_write(role, payload):
+            del payload
+            if role == "manifest":
+                manifest_blocked.set()
+                if not release_manifest.wait(4):
+                    raise TimeoutError("first take did not finish")
+
+        coordinator = self.coordinator(before_write=before_write)
+        results, errors, threads = {}, {}, []
+        condition = coordinator._stop_condition
+        original_wait = condition.wait
+
+        def delayed_wait(timeout=None):
+            late = threading.current_thread().name == "queued-old-stop"
+            if late:
+                waiter_entered.set()
+            result = original_wait(timeout)
+            if late:
+                # Force the valid scheduling order: the first stop completes,
+                # another client starts a new take, then this waiter resumes.
+                condition.release()
+                try:
+                    waiter_awake.set()
+                    if not release_waiter.wait(4):
+                        raise TimeoutError("queued stop did not resume")
+                finally:
+                    condition.acquire()
+            return result
+
+        def stop(name, command):
+            try:
+                results[name] = coordinator.stop_capture(command)
+            except BaseException as error:
+                errors[name] = error
+
+        try:
+            coordinator.start_capture(start_command("queued-old-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            first_command = stop_command("queued-first")
+            late_command = first_command if same_key else stop_command("queued-late", reason=reason)
+            with patch.object(condition, "wait", side_effect=delayed_wait):
+                first = threading.Thread(target=stop, args=("first", first_command))
+                late = threading.Thread(
+                    target=stop, args=("late", late_command), name="queued-old-stop"
+                )
+                threads = [first, late]
+                first.start()
+                self.assertTrue(manifest_blocked.wait(2))
+                late.start()
+                self.assertTrue(waiter_entered.wait(2))
+                release_manifest.set()
+                first.join(4)
+                self.assertFalse(first.is_alive())
+                self.assertNotIn("first", errors)
+                self.assertTrue(waiter_awake.wait(2))
+                coordinator.start_capture(start_command("queued-new-start"))
+                new_session = self.active_session_id(coordinator)
+                self.assertTrue(coordinator.submit_frame(frame()))
+                release_waiter.set()
+                late.join(4)
+                self.assertFalse(late.is_alive())
+                self.assertIsNotNone(coordinator._active_plan, "queued stop affected the new take")
+                self.assertEqual(self.active_session_id(coordinator), new_session)
+                self.assertEqual(
+                    coordinator.capture_status()["snapshot"]["device_state"], "recording"
+                )
+                self.assert_network_operation_lock_held()
+                if not same_key and reason == "user":
+                    results["repeated_late"] = coordinator.stop_capture(late_command)
+                    self.assertEqual(self.active_session_id(coordinator), new_session)
+            return results, errors
+        finally:
+            release_manifest.set()
+            release_waiter.set()
+            for thread in threads:
+                thread.join(5)
+            coordinator.close()
+
+    def test_queued_old_stop_does_not_stop_a_new_take(self):
+        results, errors = self._queued_stop_after_new_take()
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 204)
+        self.assertEqual(results["repeated_late"].status, 204)
+        self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_safe_swap_cannot_release_a_new_take(self):
+        results, errors = self._queued_stop_after_new_take(reason="safe_swap")
+        self.assertNotIn("late", results)
+        self.assertIsInstance(errors.get("late"), ProviderError)
+        self.assertEqual(errors["late"].code, "capture_state_changed")
+        self.assertFalse(errors["late"].retryable)
+
+    def test_queued_same_stop_replays_original_receipt_after_new_take(self):
+        results, errors = self._queued_stop_after_new_take(same_key=True)
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 202)
+        self.assertTrue(results["late"].replayed)
+        self.assertEqual(results["late"].body, results["first"].body)
+
     def test_remount_at_same_path_rotates_generation_and_rejects_stale_submitter(self) -> None:
         mount_identity = "mount-a"
         first = CaptureCoordinator(
