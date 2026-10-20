@@ -2507,9 +2507,12 @@ def _open_regular_at(root_fd: int, relative: str, *, code: str) -> int:
     directory_flags = (
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
-    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
     current_fd = root_fd
     owned_directory_fd: int | None = None
+    descriptor: int | None = None
     try:
         for component in path.parts[:-1]:
             next_fd = os.open(component, directory_flags, dir_fd=current_fd)
@@ -2520,14 +2523,17 @@ def _open_regular_at(root_fd: int, relative: str, *, code: str) -> int:
         descriptor = os.open(path.parts[-1], file_flags, dir_fd=current_fd)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            os.close(descriptor)
             raise DeviceRecordingError(code, f"不是独占普通文件：{relative}")
-        return descriptor
+        result = descriptor
+        descriptor = None  # Ownership transfers to the caller only after validation.
+        return result
     except DeviceRecordingError:
         raise
     except OSError as error:
         raise DeviceRecordingError(code, f"无法安全打开 {relative}：{error}") from error
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if owned_directory_fd is not None:
             os.close(owned_directory_fd)
 
