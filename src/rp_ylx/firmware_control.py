@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -26,6 +27,8 @@ SOCKET = "/run/rp-ylx/firmware-control.sock"
 STATE = Path("/var/lib/openaria-update")
 INSTALL = Path("/opt/rp-ylx")
 LIMIT = 64 * 1024
+MAX_CONTROL_DEPTH = 64
+ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 TTL = 1200
 SEMVER = re.compile(r"^0\.2\.([1-9][0-9]*|0)$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -393,23 +396,114 @@ class FirmwareSupervisor:
                 raise RuntimeError("updater exited unsuccessfully")
 
 
+def _unique_control_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate control field")
+        value[key] = item
+    return value
+
+
+def _reject_control_constant(_value):
+    raise ValueError("non-finite control number")
+
+
+def _validate_control_json(value):
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > MAX_CONTROL_DEPTH:
+            raise ValueError("control JSON nesting is too deep")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError("invalid control object key")
+                key.encode("utf-8")
+                pending.append((child, depth + 1))
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            item.encode("utf-8")
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("non-finite control number")
+        elif item is not None and type(item) not in {bool, int}:
+            raise ValueError("invalid control JSON value")
+
+
+def _decode_control_frame(raw):
+    if len(raw) > LIMIT or not raw.endswith(b"\n"):
+        raise ValueError("oversized or incomplete control frame")
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_unique_control_object,
+        parse_constant=_reject_control_constant,
+    )
+    _validate_control_json(value)
+    return value
+
+
+def _validate_control_response(value):
+    if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+        raise ValueError("invalid control response envelope")
+    if value["ok"]:
+        if set(value) != {"ok", "body"} or not isinstance(value["body"], dict):
+            raise ValueError("invalid control response body")
+        return
+    error = value.get("error")
+    if (
+        set(value) != {"ok", "error"}
+        or not isinstance(error, dict)
+        or set(error) != {"code", "message", "status"}
+        or not isinstance(error["code"], str)
+        or ERROR_CODE.fullmatch(error["code"]) is None
+        or not isinstance(error["message"], str)
+        or not error["message"]
+        or type(error["status"]) is not int
+        or not 400 <= error["status"] <= 599
+    ):
+        raise ValueError("invalid control error response")
+
+
+def _control_failure_response():
+    return {
+        "ok": False,
+        "error": {
+            "code": "update_request_failed",
+            "message": "更新服务无法处理该请求",
+            "status": 503,
+        },
+    }
+
+
+def _encode_control_response(value):
+    _validate_control_json(value)
+    _validate_control_response(value)
+    raw = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+    if len(raw) > LIMIT:
+        raise ValueError("oversized control response")
+    return raw
+
+
 def request_firmware(operation: str, **fields) -> dict:
-    payload = json.dumps({"operation": operation, **fields}).encode() + b"\n"
     try:
+        payload = json.dumps({"operation": operation, **fields}, allow_nan=False).encode() + b"\n"
+        if len(payload) > LIMIT:
+            raise ValueError("oversized control request")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(75 if operation in {"check", "update"} else 20)
             client.connect(SOCKET)
             client.sendall(payload)
             with client.makefile("rb") as stream:
                 raw = stream.readline(LIMIT + 1)
-        if len(raw) > LIMIT:
-            raise ValueError("oversized firmware response")
-        value = json.loads(raw)
-        if not value.get("ok"):
+        value = _decode_control_frame(raw)
+        _validate_control_response(value)
+        if not value["ok"]:
             error = value["error"]
             raise FirmwareError(error["code"], error["message"], error["status"])
         return value["body"]
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
         raise FirmwareError("update_service_unavailable", "设备更新服务暂时不可用", 503) from error
 
 
@@ -440,24 +534,20 @@ class ControlHandler(socketserver.StreamRequestHandler):
         self.connection.settimeout(10)
         try:
             raw = self.rfile.readline(LIMIT + 1)
-            if len(raw) > LIMIT:
-                raise ValueError("request too large")
-            result = {"ok": True, "body": dispatch(self.server.supervisor, json.loads(raw))}
+            request = _decode_control_frame(raw)
+            result = {"ok": True, "body": dispatch(self.server.supervisor, request)}
         except FirmwareError as error:
             result = {
                 "ok": False,
                 "error": {"code": error.code, "message": error.message, "status": error.status},
             }
         except Exception:
-            result = {
-                "ok": False,
-                "error": {
-                    "code": "update_request_failed",
-                    "message": "更新服务无法处理该请求",
-                    "status": 503,
-                },
-            }
-        self.wfile.write(json.dumps(result, ensure_ascii=False).encode() + b"\n")
+            result = _control_failure_response()
+        try:
+            raw = _encode_control_response(result)
+        except (ValueError, TypeError, RecursionError):
+            raw = _encode_control_response(_control_failure_response())
+        self.wfile.write(raw)
 
 
 class ControlServer(socketserver.ThreadingUnixStreamServer):
