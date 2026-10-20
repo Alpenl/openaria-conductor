@@ -36,6 +36,7 @@ from rp_ylx.api.downloads import (
 from rp_ylx.api.events import (
     InvalidSourceEvent,
     project_device_descriptor,
+    validate_capture_status,
     validate_recording_state,
     validate_retained_unsuccessful_outcome,
     validate_safe_swap_v3_receipt,
@@ -51,6 +52,7 @@ from rp_ylx.api.gateway import (
 )
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
+from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network import NetworkError, network_operation_lock_path
@@ -82,6 +84,68 @@ from rp_ylx.recording.recovery import (
     recover_device_session,
 )
 from rp_ylx.runtime import collect_linux_runtime
+
+
+def _validated_command_receipt(item: Mapping[str, object]) -> tuple[bytes, CaptureCommandResult]:
+    """Validate a durable response before replaying it or deriving side effects."""
+    if set(item) != {
+        "principal_id",
+        "operation",
+        "idempotency_key",
+        "canonical_body",
+        "status",
+        "body",
+    }:
+        raise ValueError("invalid command receipt fields")
+    canonical = item["canonical_body"]
+    if not isinstance(canonical, str) or not canonical:
+        raise ValueError("invalid canonical request")
+    payload = canonical.encode("utf-8")
+    request = json.loads(payload)
+    if not isinstance(request, dict):
+        raise ValueError("invalid canonical request object")
+    json.dumps(request, allow_nan=False, ensure_ascii=False).encode("utf-8")
+    json.dumps(item["body"], allow_nan=False, ensure_ascii=False).encode("utf-8")
+    status, body, operation = item["status"], item["body"], item["operation"]
+    if type(status) is not int:
+        raise ValueError("invalid command response status")
+    if operation in {"start", "stop"} and status == HTTPStatus.ACCEPTED:
+        validate_capture_status(body)
+    elif operation == "stop" and status == HTTPStatus.NO_CONTENT and body is None:
+        pass
+    elif operation == "set_camera_focus" and status == HTTPStatus.OK:
+        if not valid_camera_focus_status(body):
+            raise ValueError("invalid focus receipt")
+    elif operation == "delete" and status == HTTPStatus.OK:
+        from rp_ylx.recording.deletion import valid_delete_request
+
+        if (
+            not valid_delete_request(request)
+            or not isinstance(body, dict)
+            or set(body) != {"schema", "deleted_session_ids", "failed_sessions"}
+            or body["schema"] != "ylx.session-delete-result.v1"
+            or not isinstance(body["deleted_session_ids"], list)
+            or not all(isinstance(sid, str) for sid in body["deleted_session_ids"])
+            or not isinstance(body["failed_sessions"], list)
+        ):
+            raise ValueError("invalid deletion receipt")
+        sessions = list(body["deleted_session_ids"])
+        for failure in body["failed_sessions"]:
+            if (
+                not isinstance(failure, dict)
+                or set(failure) != {"session_id", "error"}
+                or not isinstance(failure["session_id"], str)
+                or not isinstance(failure["error"], str)
+                or not failure["error"]
+            ):
+                raise ValueError("invalid deletion failure")
+            sessions.append(failure["session_id"])
+        expected = {entry["session_id"] for entry in request["sessions"]}
+        if len(sessions) != len(set(sessions)) or set(sessions) != expected:
+            raise ValueError("deletion receipt differs from request")
+    else:
+        raise ValueError("invalid command operation or status")
+    return payload, CaptureCommandResult(status, copy.deepcopy(body), replayed=False)
 
 
 def _read_recovery_metadata(root_fd: int, parts: tuple[str, ...], limit: int) -> tuple[dict, bytes]:
@@ -722,6 +786,7 @@ class CaptureCoordinator:
         self._cached_active_state: Mapping[str, object] | None = None
         self._pending_source_failure: DeviceRecordingError | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
+        self._invalid_commands: dict[tuple[str, str, str], object] = {}
         self._persisted_commands: dict[
             tuple[str, str, str], tuple[bytes, CaptureCommandResult]
         ] = {}
@@ -984,27 +1049,43 @@ class CaptureCoordinator:
                 and failure["manifest_sha256"] == pending.get("manifest_sha256")
             ):
                 self._pending_safe_swap_failure = copy.deepcopy(dict(failure))
+        invalid = persisted.get("invalid_commands", [])
+        if not isinstance(invalid, list):
+            raise PersistenceError("invalid quarantined command identities")
+        for entry in invalid:
+            if not isinstance(entry, dict) or not isinstance(entry.get("scope"), list):
+                raise PersistenceError("invalid quarantined command identity")
+            scope = tuple(entry["scope"])
+            if len(scope) != 3 or not all(isinstance(part, str) and part for part in scope):
+                raise PersistenceError("invalid quarantined command identity")
+            self._invalid_commands[scope] = copy.deepcopy(entry.get("receipt"))
         commands = persisted.get("commands")
         if isinstance(commands, list):
             for item in commands[-1024:]:
                 if not isinstance(item, Mapping):
-                    continue
+                    raise PersistenceError("unidentifiable legacy command receipt")
+                scope = tuple(
+                    item.get(key)
+                    for key in (
+                        "principal_id",
+                        "operation",
+                        "idempotency_key",
+                    )
+                )
+                if not all(isinstance(part, str) and part for part in scope):
+                    raise PersistenceError("unidentifiable legacy command receipt")
                 try:
-                    scope = (
-                        str(item["principal_id"]),
-                        str(item["operation"]),
-                        str(item["idempotency_key"]),
-                    )
-                    canonical = str(item["canonical_body"]).encode("utf-8")
-                    status = int(item["status"])
-                    body = copy.deepcopy(item.get("body"))
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if all(scope) and canonical:
-                    self._commands[scope] = (
-                        canonical,
-                        CaptureCommandResult(status, body, replayed=False),
-                    )
+                    receipt = _validated_command_receipt(item)
+                except (ValueError, KeyError, TypeError, RecursionError, OverflowError):
+                    self._invalid_commands[scope] = json.dumps(item, ensure_ascii=True)
+                    self._commands.pop(scope, None)
+                else:
+                    if scope not in self._invalid_commands:
+                        self._commands[scope] = receipt
+        if self._invalid_commands:
+            operational_logger("recording").event(
+                "command_receipts_rejected", level="warning", count=len(self._invalid_commands)
+            )
 
         # Older firmware persisted deletion receipts without retiring retained
         # failures. Only successful deletions are evidence to remove an outcome;
@@ -1073,6 +1154,10 @@ class CaptureCoordinator:
             }
         value = {
             "schema": "ylx.capture-coordinator-state.v1",
+            "invalid_commands": [
+                {"scope": list(scope), "receipt": copy.deepcopy(receipt)}
+                for scope, receipt in self._invalid_commands.items()
+            ],
             "authority_epoch": self._authority_epoch,
             "source_revision": self._revision,
             "volume_binding": copy.deepcopy(self._last_volume_binding),
@@ -2755,6 +2840,15 @@ class CaptureCoordinator:
         self._next_revision()
         return result
 
+    def _require_valid_command_receipt(self, scope: tuple[str, str, str]) -> None:
+        if scope in self._invalid_commands:
+            raise ProviderError(
+                "command_receipt_invalid",
+                "该请求的持久化回执损坏，无法安全重放；请先核对实际操作结果",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                retryable=False,
+            )
+
     def _idempotent(
         self,
         operation: str,
@@ -2762,6 +2856,7 @@ class CaptureCoordinator:
         execute: Callable[[], CaptureCommandResult],
     ) -> CaptureCommandResult:
         scope = (command.principal_id, operation, command.idempotency_key)
+        self._require_valid_command_receipt(scope)
         previous = self._commands.get(scope)
         if previous is not None:
             previous_body, result = previous
@@ -3117,6 +3212,7 @@ class CaptureCoordinator:
                 raise ProviderError(
                     "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
                 )
+            self._require_valid_command_receipt(scope)
             previous = self._commands.get(scope)
             if previous is not None:
                 previous_body, result = previous
@@ -3398,6 +3494,7 @@ class CaptureCoordinator:
                     self._active_plan is None or self._active_plan.session_id != expected_session_id
                 ):
                     return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                self._require_valid_command_receipt(scope)
                 previous = self._commands.get(scope)
                 if previous is not None:
                     previous_body, result = previous

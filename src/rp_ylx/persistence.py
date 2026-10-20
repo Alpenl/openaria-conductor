@@ -281,10 +281,38 @@ class StateDatabase:
             if not isinstance(value, dict):
                 raise PersistenceError("invalid state document: capture")
             if "commands" not in value:
-                value["commands"] = [
-                    json.loads(row[0])
-                    for row in db.execute("SELECT body FROM capture_commands ORDER BY rowid")
-                ]
+                value["commands"] = []
+                invalid = value.setdefault("invalid_commands", [])
+                if not isinstance(invalid, list):
+                    raise PersistenceError("invalid quarantined command identities")
+                for principal, operation, key, raw in db.execute(
+                    "SELECT principal,operation,idempotency_key,body "
+                    "FROM capture_commands ORDER BY rowid"
+                ):
+                    scope = [principal, operation, key]
+                    if not all(isinstance(part, str) and part for part in scope):
+                        raise PersistenceError("invalid command table identity")
+                    try:
+                        if not isinstance(raw, str):
+                            raise ValueError("command row body is not text")
+                        item = json.loads(raw)
+                        if (
+                            not isinstance(item, dict)
+                            or [
+                                item.get("principal_id"),
+                                item.get("operation"),
+                                item.get("idempotency_key"),
+                            ]
+                            != scope
+                        ):
+                            raise ValueError("command body differs from table identity")
+                    except (ValueError, TypeError, RecursionError):
+                        # Preserve the original row and use its SQL primary key,
+                        # never a potentially forged identity inside the body.
+                        evidence = raw if isinstance(raw, str) else repr(raw)
+                        invalid.append({"scope": scope, "receipt": evidence})
+                    else:
+                        value["commands"].append(item)
             return value
 
     def begin_transfer(self, volume: str, session: str, artifact: str) -> str:
