@@ -3819,6 +3819,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 with self.subTest(stage=stage, cached=cached):
                     self._check_failure_io_stage(stage, cached=cached)
 
+    def test_failure_io_probe_waits_for_slow_recovery_entry(self):
+        original = coordinator_module.DeviceSessionRecorder.fail
+
+        def slow_fail(recorder, code, *args, **kwargs):
+            if code == "encoder_failed":
+                time.sleep(1.2)
+            return original(recorder, code, *args, **kwargs)
+
+        with patch.object(coordinator_module.DeviceSessionRecorder, "fail", slow_fail):
+            self._check_failure_io_stage("recovery", cached=False)
+
     def test_media_lost_diagnostic_visible_during_recovery_with_or_without_cache(self):
         for cached in (True, False):
             with self.subTest(cached=cached):
@@ -4064,7 +4075,14 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 fault = threading.Thread(target=report)
                 threads.append(fault)
                 fault.start()
-                self.assertTrue(entered.wait(1))
+                # This gate marks setup completion, not a recovery latency SLA.
+                # Storage before the injected pause can legitimately take >1s.
+                deadline = time.monotonic() + 30
+                while not entered.wait(0.05):
+                    self.assertTrue(
+                        fault.is_alive(), f"failure worker exited before gate: {errors}"
+                    )
+                    self.assertLess(time.monotonic(), deadline, "failure IO gate was not reached")
                 before = time.monotonic()
                 status = coordinator.capture_status()
                 self.assertLess(time.monotonic() - before, 0.25)
