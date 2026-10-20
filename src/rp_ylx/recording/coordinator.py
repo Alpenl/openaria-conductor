@@ -1120,8 +1120,6 @@ class CaptureCoordinator:
         admission = self._require_admission()
         for sessions_root in admission.catalog_roots:
             for partial in sorted(sessions_root.glob("*.partial")):
-                if not partial.is_dir():
-                    continue
                 session_id = partial.name.removesuffix(".partial")
                 try:
                     parsed = uuid.UUID(session_id)
@@ -1129,36 +1127,17 @@ class CaptureCoordinator:
                     continue
                 if parsed.version != 7 or str(parsed) != session_id:
                     continue
-                manifest = partial / "manifest.json"
-                if manifest.is_file():
-                    final = sessions_root / session_id
-                    try:
-                        validate_device_session_directory(
-                            partial,
-                            expected_session_id=session_id,
-                        )
-                        if final.exists():
-                            raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
-                        for control in ("capture.json", "recording.json"):
-                            path = partial / control
-                            if path.exists():
-                                recovery = partial / "recovery"
-                                if recovery.is_symlink():
-                                    raise DeviceRecordingError("artifact_invalid", "恢复目录无效")
-                                recovery.mkdir(exist_ok=True)
-                                os.replace(path, recovery / control)
-                                fsync_directory(recovery)
-                        fsync_directory(partial)
-                        os.rename(partial, final)
-                        fsync_directory(sessions_root)
-                        payload = (final / "manifest.json").read_bytes()
-                        self._verified[session_id] = hashlib.sha256(payload).hexdigest()
+                try:
+                    descriptor = os.open(
+                        partial, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    )
+                except OSError:
+                    continue
+                with ExitStack() as cleanup:
+                    cleanup.callback(os.close, descriptor)
+                    if os.fstat(descriptor).st_dev != admission.device:
                         continue
-                    except (OSError, DeviceRecordingError):
-                        with suppress(OSError):
-                            manifest.unlink(missing_ok=True)
-                self._settle_partial(partial, session_id)
-                self._recover_completed_prefix(partial, session_id)
+                    self._recover_partial_directory(partial, session_id, descriptor)
         # Publication may have finished just before a crash, before the local
         # retained state was saved. Reconcile here without taking the catalog
         # lock: catalog reads must never acquire the capture-state lock.
@@ -1173,6 +1152,78 @@ class CaptureCoordinator:
                     continue
                 if any(log.get("role") == RECOVERY_ROLE for log in recovered["logs"]):
                     self._record_saved_prefix(session_id, recovered)
+
+    @staticmethod
+    def _partial_directory_current(partial: Path, descriptor: int) -> bool:
+        try:
+            entry = partial.stat(follow_symlinks=False)
+            opened = os.fstat(descriptor)
+        except OSError:
+            return False
+        return stat.S_ISDIR(entry.st_mode) and (entry.st_dev, entry.st_ino) == (
+            opened.st_dev,
+            opened.st_ino,
+        )
+
+    def _recover_partial_directory(self, partial: Path, session_id: str, descriptor: int) -> None:
+        # RDK runs Linux. Pin metadata mutations to this descriptor rather than
+        # re-resolving a directory name that may have been replaced meanwhile.
+        anchored = Path("/proc/self/fd") / str(descriptor)
+        manifest = anchored / "manifest.json"
+        if manifest.is_file():
+            final = partial.parent / session_id
+            published = False
+            try:
+                validate_device_session_directory(partial, expected_session_id=session_id)
+                if not self._partial_directory_current(partial, descriptor):
+                    return
+                if final.exists():
+                    raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
+                for control in ("capture.json", "recording.json"):
+                    try:
+                        os.stat(control, dir_fd=descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    with suppress(FileExistsError):
+                        os.mkdir("recovery", dir_fd=descriptor)
+                    recovery_fd = os.open(
+                        "recovery",
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        os.replace(control, control, src_dir_fd=descriptor, dst_dir_fd=recovery_fd)
+                        os.fsync(recovery_fd)
+                    finally:
+                        os.close(recovery_fd)
+                os.fsync(descriptor)
+                if not self._partial_directory_current(partial, descriptor):
+                    return
+                os.rename(partial, final)
+                published = True
+                fsync_directory(final.parent)
+                if not self._partial_directory_current(final, descriptor):
+                    return
+                _, payload = _read_recovery_metadata(
+                    descriptor, ("manifest.json",), MAX_MANIFEST_BYTES
+                )
+                self._verified[session_id] = hashlib.sha256(payload).hexdigest()
+                return
+            except (OSError, ValueError, RecursionError, DeviceRecordingError):
+                if published or self._partial_directory_current(final, descriptor):
+                    # Renaming already made the session visible. Leave its
+                    # evidence intact; catalog verification can retry later.
+                    operational_logger("recording").event(
+                        "recovery_publication_check_deferred",
+                        level="warning",
+                        transaction_id=session_id,
+                    )
+                    return
+                with suppress(OSError):
+                    os.unlink("manifest.json", dir_fd=descriptor)
+        self._settle_partial(anchored, session_id)
+        if self._partial_directory_current(partial, descriptor):
+            self._recover_completed_prefix(partial, session_id)
 
     def _restore_published_failure(self, admission: VolumeAdmission) -> str | None:
         identity = self._recovery_session
