@@ -3920,6 +3920,64 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_failure_worker_constructor_runtime_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("construct", RuntimeError("no locks"))
+
+    def test_failure_worker_constructor_memory_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("construct", MemoryError("no memory"))
+
+    def test_failure_worker_start_memory_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("start", MemoryError("no memory"))
+
+    def _check_failure_worker_initialization_error(self, stage, injected):
+        coordinator = self.coordinator()
+        recorder = None
+        try:
+            coordinator.start_capture(start_command("worker-init-" + stage))
+            recorder = coordinator._active
+            sid = self.active_session_id(coordinator)
+            target = (
+                patch.object(threading, "Thread", side_effect=injected)
+                if stage == "construct"
+                else patch.object(threading.Thread, "start", side_effect=injected)
+            )
+            escaped = []
+            with target, patch.object(recorder, "fail", wraps=recorder.fail) as fail:
+                try:
+                    coordinator._source_failure(
+                        coordinator.generation_id,
+                        "source_sequence_gap",
+                        "original source fault",
+                        defer_recovery=True,
+                    )
+                except Exception as error:
+                    escaped.append(error)
+            self.assertIsNone(coordinator._failure_inflight, "recovery ownership stranded")
+            self.assertEqual(escaped, [])
+            self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._failure_projection)
+            self.assertIsNone(coordinator._active)
+            self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "idle")
+            self.assertIsNotNone(coordinator.retained_unsuccessful_outcome(sid))
+            retained = coordinator.capture_status()["snapshot"]["retained_unsuccessful"][
+                "recording_state"
+            ]
+            self.assertEqual(retained["diagnostics"][0]["code"], "source_sequence_gap")
+            self.assertEqual(retained["diagnostics"][0]["message"], "original source fault")
+            self.assert_network_operation_lock_available()
+            self.assertEqual(coordinator.stop_capture(stop_command("worker-init-stop")).status, 204)
+            coordinator.start_capture(start_command("worker-init-next"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            # All injected failures occur before a worker exists. Release only
+            # a stranded test latch so the pre-fix regression can fail, not hang.
+            with coordinator._stop_condition:
+                if coordinator._failure_inflight is recorder:
+                    coordinator._failure_inflight = None
+                    coordinator._failure_projection = None
+                    coordinator._stop_condition.notify_all()
+            coordinator.close()
+
     def test_failed_recovery_is_not_scanned_twice_before_returning_idle(self):
         for outcome in (None, OSError("no space")):
             with self.subTest(outcome=outcome):

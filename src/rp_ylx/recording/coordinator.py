@@ -3325,12 +3325,12 @@ class CaptureCoordinator:
                         exception_type=type(failure).__name__,
                     )
 
-            worker = threading.Thread(
-                target=background_finish, name="rp-ylx-failure-recovery", daemon=False
-            )
             try:
+                worker = threading.Thread(
+                    target=background_finish, name="rp-ylx-failure-recovery", daemon=False
+                )
                 worker.start()
-            except RuntimeError:
+            except (RuntimeError, MemoryError):
                 # Resource exhaustion must not abandon the reserved recorder.
                 finish()
             return
