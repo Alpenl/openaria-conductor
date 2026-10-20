@@ -1046,7 +1046,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         host, host_is_single = self._single_header("Host")
         if not host_is_single or host is None:
             return False
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False
         return (
             parsed.scheme == self.server.external_scheme
             and parsed.netloc.casefold() == host.casefold()
@@ -1263,6 +1266,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _begin_request(self, *, body_allowed: bool) -> bool:
         self._request_id = str(uuid.uuid4())
         self._request_content_length: int | None = None
+        try:
+            urlsplit(self.path)
+        except ValueError:
+            # Reject before dispatch; any declared body remains unread.
+            self.close_connection = True
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求目标 URL 无效")
+            return False
         transfer_encodings = self.headers.get_all("Transfer-Encoding", failobj=[])
         content_lengths = self.headers.get_all("Content-Length", failobj=[])
         if transfer_encodings:
