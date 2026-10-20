@@ -345,9 +345,14 @@ class StateDatabase:
             )
 
     def put_capture_state(
-        self, value: Mapping[str, Any], commands: list[dict], removed: set
+        self,
+        value: Mapping[str, Any],
+        commands: list[dict],
+        removed: set,
+        *,
+        camera_focus: Mapping[str, Any] | None = None,
     ) -> None:
-        """Commit lifecycle and new receipts together; do not rewrite old receipts."""
+        """Commit lifecycle, new receipts and an optional focus preference together."""
         # Keep large corrupt receipt evidence in the receipt table, once. The
         # lifecycle document only needs identities to keep replay fail-closed.
         # This also migrates the previous inline quarantine representation.
@@ -409,29 +414,37 @@ class StateDatabase:
                     for c in commands
                 ],
             )
+            if camera_focus is not None:
+                self._put_document(db, "camera_focus", _json(camera_focus), now, history=True)
+
+    @staticmethod
+    def _put_document(
+        db: sqlite3.Connection, name: str, body: str, now: str, *, history: bool
+    ) -> None:
+        old = db.execute("SELECT body,revision FROM documents WHERE name=?", (name,)).fetchone()
+        if old is None and db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
+            raise PersistenceError(f"missing authoritative document: {name}")
+        if old is not None and old[0] == body:
+            return
+        revision = 1 if old is None else old[1] + 1
+        db.execute(
+            "INSERT INTO documents VALUES (?,?,?,?) ON CONFLICT(name) "
+            "DO UPDATE SET body=excluded.body,revision=excluded.revision,"
+            "updated_at=excluded.updated_at",
+            (name, body, revision, now),
+        )
+        if history:
+            db.execute(
+                "INSERT INTO changes(name,revision,body,updated_at) VALUES (?,?,?,?)",
+                (name, revision, body, now),
+            )
 
     def put(self, name: str, value: Mapping[str, Any], *, history: bool = False) -> None:
         body = _json(value)
         now = datetime.now(UTC).isoformat()
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
-            old = db.execute("SELECT body,revision FROM documents WHERE name=?", (name,)).fetchone()
-            if old is None and db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
-                raise PersistenceError(f"missing authoritative document: {name}")
-            if old is not None and old[0] == body:
-                return
-            revision = 1 if old is None else old[1] + 1
-            db.execute(
-                "INSERT INTO documents VALUES (?,?,?,?) ON CONFLICT(name) "
-                "DO UPDATE SET body=excluded.body,revision=excluded.revision,"
-                "updated_at=excluded.updated_at",
-                (name, body, revision, now),
-            )
-            if history:
-                db.execute(
-                    "INSERT INTO changes(name,revision,body,updated_at) VALUES (?,?,?,?)",
-                    (name, revision, body, now),
-                )
+            self._put_document(db, name, body, now, history=history)
 
     def import_json(
         self,

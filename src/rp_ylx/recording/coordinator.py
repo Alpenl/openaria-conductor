@@ -796,6 +796,8 @@ class CaptureCoordinator:
         self._state_db.import_json("capture", self._state_path)
         self._state_db.interrupt_transfers()
         self._focus_restore_invalid = False
+        self._focus_to_persist: dict[str, object] | None = None
+        self._persisted_focus: dict[str, object] | None = None
         try:
             self._pending_focus = self._state_db.get("camera_focus")
         except (ValueError, TypeError, RecursionError, PersistenceError) as error:
@@ -1133,6 +1135,7 @@ class CaptureCoordinator:
         # older callbacks must never overwrite a newer durable command/state.
         with self._lock:
             sequence, value, commands = self._local_state_write()
+            focus = self._focus_to_persist
         with self._state_persist_lock:
             if sequence <= self._state_persisted_sequence:
                 return
@@ -1151,9 +1154,12 @@ class CaptureCoordinator:
                 for scope, receipt in commands.items()
                 if self._persisted_commands.get(scope) is not receipt
             ]
-            self._state_db.put_capture_state(
-                value, new_commands, self._persisted_commands.keys() - commands.keys()
-            )
+            removed = self._persisted_commands.keys() - commands.keys()
+            if focus is not None and focus is not self._persisted_focus:
+                self._state_db.put_capture_state(value, new_commands, removed, camera_focus=focus)
+            else:
+                self._state_db.put_capture_state(value, new_commands, removed)
+            self._persisted_focus = focus
             self._persisted_commands = commands
             self._state_persisted_sequence = sequence
             # The same successful transaction has preserved any inline evidence
@@ -2923,11 +2929,13 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             )
-        self._state_db.put(
-            "camera_focus",
-            {"value": result.get("value"), "auto_enabled": result.get("auto_enabled")},
-            history=True,
-        )
+        # The hardware write cannot be rolled back transactionally. Keep its
+        # validated result private so receipt retries only retry the SQLite
+        # commit; the preference and success receipt must become durable together.
+        self._focus_to_persist = {
+            "value": result["value"],
+            "auto_enabled": result["auto_enabled"],
+        }
         self._pending_focus = None
         self._focus_restore_invalid = False
         self._next_revision()
