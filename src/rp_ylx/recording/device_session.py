@@ -2348,6 +2348,10 @@ class DeviceSessionRecorder:
                 self._validate_artifact_bytes(manifest, root=self._final)
             finished_stage("publication")
         except BaseException as error:
+            # The finalizing checkpoint can fail before the normal writer join.
+            # Its accepted writes still own the encoder and journal streams;
+            # drain them before any failure cleanup closes those resources.
+            self._stop_writer()
             if self._native_transaction is not None:
                 with suppress(BaseException):
                     self._native_transaction.abort(str(error))
