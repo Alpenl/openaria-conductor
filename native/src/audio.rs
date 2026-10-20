@@ -1,7 +1,8 @@
 use libloading::Library;
+use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1093,6 +1094,7 @@ impl SegmentWriter {
         let root = config.session_root.clone();
         let state = Arc::clone(&progress);
         let mut durable_records = Vec::new();
+        let mut journal = CheckpointJournal::default();
         let committer = CommitWorker::spawn(Arc::clone(&progress), move |batch| {
             for pending in batch {
                 measure_io(
@@ -1105,7 +1107,7 @@ impl SegmentWriter {
                 durable_records.push(pending.record);
             }
             measure_io(&state, IoOperation::Checkpoint, 0, || {
-                commit_checkpoint(&root, &state, &durable_records)
+                commit_checkpoint(&root, &state, &durable_records, &mut journal)
             })?;
             state.durable_samples.store(
                 durable_records.last().map_or(0, |record| record.end_sample),
@@ -1293,55 +1295,92 @@ struct CheckpointSegment<'a> {
     start_sample: u64,
 }
 
+#[derive(Default)]
+struct CheckpointJournal {
+    file: Option<File>,
+    digest: Sha256,
+    bytes: u64,
+    records: u64,
+    anchors: usize,
+    segments: usize,
+    failed: bool,
+}
+
 #[derive(serde::Serialize)]
-struct CheckpointPayload<'a> {
+struct CheckpointDelta<'a> {
+    sequence: u64,
     anchors: &'a [crate::audio_clock::Anchor],
-    buffer_frames: u64,
-    max_write_ns: u64,
+    segments: Vec<CheckpointSegment<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct CheckpointHeader {
+    schema: &'static str,
+    journal_bytes: u64,
+    journal_records: u64,
+    journal_sha256: String,
+    anchor_count: usize,
+    segment_count: usize,
+    last_anchor: Option<crate::audio_clock::Anchor>,
+    sample_count: u64,
+    thread_started_monotonic_ns: u64,
     period_frames: u64,
+    buffer_frames: u64,
     queue_capacity_frames: u64,
     queue_peak_frames: u64,
-    sample_count: u64,
-    schema: &'static str,
-    segments: Vec<CheckpointSegment<'a>>,
-    thread_started_monotonic_ns: u64,
+    max_write_ns: u64,
 }
 
 fn commit_checkpoint(
     root: &std::path::Path,
     progress: &AudioProgress,
     records: &[AudioSegment],
+    journal: &mut CheckpointJournal,
 ) -> Result<(), AudioError> {
-    // The ALSA thread only updates memory. All serialization, rename and
-    // fsync work stays on the commit thread, outside the capture clock lock.
-    let clock = progress
+    if journal.failed {
+        return Err(AudioError::new(
+            "write_failed",
+            "audio checkpoint writer previously failed",
+        ));
+    }
+    // Copy only the new observations while holding the capture lock. Neither
+    // JSON encoding nor filesystem operations hold that lock or revisit history.
+    let guard = progress
         .clock_checkpoint
         .lock()
-        .ok()
-        .and_then(|clock| clock.clone());
-    let Some(mut clock) = clock else {
+        .map_err(|_| AudioError::new("audio_failed", "audio checkpoint mutex poisoned"))?;
+    let Some(clock) = guard.as_ref() else {
         return Ok(());
     };
-    if let Some(anchor) = clock.last_anchor {
-        if clock.anchors.last() != Some(&anchor) {
-            clock.anchors.push(anchor);
-        }
-    }
-    let sample_count = records.last().map_or(0, |record| record.end_sample);
-    // Borrow the snapshot instead of allocating a JSON Value for every anchor
-    // and then a second full-document String. Neither serialization nor disk IO
-    // holds the capture clock lock, and every recovery anchor is preserved.
-    let payload = CheckpointPayload {
-        schema: "openaria.audio-checkpoint.v2",
-        sample_count,
+    let anchors = clock
+        .anchors
+        .get(journal.anchors..)
+        .ok_or_else(|| AudioError::new("audio_failed", "audio checkpoint anchors regressed"))?
+        .to_vec();
+    let mut head = CheckpointHeader {
+        schema: "openaria.audio-checkpoint.v3",
+        journal_bytes: 0,
+        journal_records: journal.records + 1,
+        journal_sha256: String::new(),
+        anchor_count: clock.anchors.len(),
+        segment_count: records.len(),
+        last_anchor: clock.last_anchor,
+        sample_count: records.last().map_or(0, |record| record.end_sample),
         thread_started_monotonic_ns: clock.started,
         period_frames: clock.period_frames,
         buffer_frames: clock.buffer_frames,
-        anchors: &clock.anchors,
         queue_capacity_frames: QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,
         queue_peak_frames: progress.queue_peak_frames.load(Ordering::Relaxed),
         max_write_ns: progress.max_write_ns.load(Ordering::Relaxed),
+    };
+    // Release the guard, not just its borrowed ClockCheckpoint reference.
+    drop(guard);
+    let delta = CheckpointDelta {
+        sequence: journal.records,
+        anchors: &anchors,
         segments: records
+            .get(journal.segments..)
+            .ok_or_else(|| AudioError::new("audio_failed", "audio checkpoint segments regressed"))?
             .iter()
             .map(|record| CheckpointSegment {
                 index: record.index,
@@ -1351,26 +1390,61 @@ fn commit_checkpoint(
             })
             .collect(),
     };
-    let directory = root.join("audio");
-    let temporary = directory.join("checkpoint.tmp");
-    let mut file = File::create(&temporary)
-        .map_err(|error| AudioError::io("write_failed", "create audio checkpoint", error))?;
-    let mut output = BufWriter::new(&mut file);
-    serde_json::to_writer(&mut output, &payload).map_err(|error| {
+    let mut bytes = serde_json::to_vec(&delta).map_err(|e| {
         AudioError::io(
             "write_failed",
-            "write audio checkpoint",
-            io::Error::other(error),
+            "encode audio checkpoint",
+            io::Error::other(e),
         )
     })?;
+    bytes.push(b'\n');
+    let directory = root.join("audio");
+    journal.failed = true; // Any failed append/publication is terminal; never reuse an unpublished tail.
+    if journal.file.is_none() {
+        journal.file = Some(
+            OpenOptions::new()
+                .append(true)
+                .create_new(true)
+                .open(directory.join("checkpoint.ndjson"))
+                .map_err(|e| {
+                    AudioError::io("write_failed", "create audio checkpoint journal", e)
+                })?,
+        );
+    }
+    let file = journal.file.as_mut().unwrap();
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| AudioError::io("write_failed", "sync audio checkpoint journal", e))?;
+    let mut digest = journal.digest.clone();
+    digest.update(&bytes);
+    head.journal_bytes = journal.bytes + bytes.len() as u64;
+    head.journal_sha256 = format!("{:x}", digest.clone().finalize());
+    let encoded = serde_json::to_vec(&head).map_err(|e| {
+        AudioError::io(
+            "write_failed",
+            "encode audio checkpoint header",
+            io::Error::other(e),
+        )
+    })?;
+    let temporary = directory.join("checkpoint.tmp");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| AudioError::io("write_failed", "create audio checkpoint header", e))?;
     output
-        .flush()
-        .map_err(|error| AudioError::io("write_failed", "flush audio checkpoint", error))?;
-    drop(output);
-    file.sync_all()
+        .write_all(&encoded)
+        .and_then(|_| output.sync_all())
         .and_then(|_| std::fs::rename(&temporary, directory.join("checkpoint.json")))
-        .and_then(|_| File::open(directory)?.sync_all())
-        .map_err(|error| AudioError::io("write_failed", "commit audio checkpoint", error))
+        .and_then(|_| File::open(&directory)?.sync_all())
+        .map_err(|e| AudioError::io("write_failed", "commit audio checkpoint header", e))?;
+    journal.bytes = head.journal_bytes;
+    journal.records = head.journal_records;
+    journal.anchors = head.anchor_count;
+    journal.segments = head.segment_count;
+    journal.digest = digest;
+    journal.failed = false;
+    Ok(())
 }
 
 fn start_and_capture(
@@ -2078,6 +2152,118 @@ mod tests {
     }
 
     #[test]
+    fn incremental_checkpoint_io_and_failed_publication_preserve_recoverable_prefix() {
+        let root = tempfile_dir();
+        std::fs::create_dir(root.join("audio")).unwrap();
+        let progress = super::AudioProgress::default();
+        let mut journal = super::CheckpointJournal::default();
+        let mut records = Vec::new();
+        let mut previous_bytes = 0;
+        for index in 0..20_u64 {
+            *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
+                started: 1_000_000_000,
+                period_frames: 1024,
+                buffer_frames: 8192,
+                anchors: (0..(index + 1) * 50)
+                    .map(|n| anchor(n * 4800, 1_000_000_000 + n * 100_000_000))
+                    .collect(),
+                last_anchor: Some(anchor(
+                    (index + 1) * 240000,
+                    1_000_000_000 + (index + 1) * 5_000_000_000,
+                )),
+            });
+            records.push(super::AudioSegment {
+                index,
+                relative_path: format!("audio/audio_{index:05}.wav"),
+                start_sample: index * 240000,
+                end_sample: (index + 1) * 240000,
+                start_time_seconds: (index * 5) as f64,
+                end_time_seconds: ((index + 1) * 5) as f64,
+            });
+            super::commit_checkpoint(&root, &progress, &records, &mut journal).unwrap();
+            assert!(
+                journal.bytes - previous_bytes < 10000,
+                "a commit rewrote prior observations"
+            );
+            assert!(
+                std::fs::metadata(root.join("audio/checkpoint.json"))
+                    .unwrap()
+                    .len()
+                    < 1024
+            );
+            previous_bytes = journal.bytes;
+        }
+        let head = std::fs::read(root.join("audio/checkpoint.json")).unwrap();
+        std::fs::create_dir(root.join("audio/checkpoint.tmp")).unwrap();
+        // The delta reaches disk, but publication fails. An old header must
+        // still select precisely its old prefix, never the uncommitted tail.
+        super::commit_checkpoint(&root, &progress, &records, &mut journal).unwrap_err();
+        assert_eq!(
+            std::fs::read(root.join("audio/checkpoint.json")).unwrap(),
+            head
+        );
+        assert!(
+            std::fs::metadata(root.join("audio/checkpoint.ndjson"))
+                .unwrap()
+                .len()
+                > previous_bytes
+        );
+        assert!(super::commit_checkpoint(&root, &progress, &records, &mut journal).is_err());
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_owned();
+        let result = std::process::Command::new(std::env::var("PYO3_PYTHON").unwrap_or_else(|_| "python3".to_owned())).current_dir(&repo)
+            .env("PYTHONPATH", repo.join("src")).arg("-c")
+            .arg("import json,sys; from pathlib import Path; from rp_ylx.recording.audio_journal import AudioJournalReader; p=Path(sys.argv[1]); h=json.loads((p/'audio/checkpoint.json').read_bytes()); v=AudioJournalReader(p).read(h); assert len(v['anchors']) == 1001; assert len(v['segments']) == 20; assert v['sample_count'] == 4800000; assert v['anchors'][-1][0] == 4800000")
+            .arg(&root).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_recording_checkpoint_publication_is_bounded() {
+        let root = tempfile_dir();
+        let config = super::RecorderConfig {
+            session_root: root.clone(),
+            device: "hw:0,0".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 0.3,
+        };
+        let progress = std::sync::Arc::new(super::AudioProgress::default());
+        *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
+            started: 1_000_000_000,
+            period_frames: 1,
+            buffer_frames: 8,
+            anchors: (0..100_000).map(|i| anchor(i, 1_000_000_000 + i)).collect(),
+            last_anchor: Some(anchor(100_000, 1_000_100_000)),
+        });
+        let mut writer = SegmentWriter::with_progress(&config, progress.clone()).unwrap();
+        let mut written = 0;
+        writer.write_frames(&[7; 20], 5, &mut written).unwrap();
+        drop(writer);
+        let bytes = std::fs::metadata(root.join("audio/checkpoint.json"))
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 4096,
+            "commit header rewrites historical anchors: {bytes} bytes"
+        );
+        assert_eq!(
+            progress
+                .durable_samples
+                .load(std::sync::atomic::Ordering::Acquire),
+            3
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn committed_audio_checkpoint_survives_without_finishing_recorder() {
         let root = tempfile_dir();
         let config = super::RecorderConfig {
@@ -2101,9 +2287,7 @@ mod tests {
         // Dropping drains pending commits but does not seal the active tail.
         // Only the completed three-sample segment enters the checkpoint.
         drop(writer);
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("audio/checkpoint.json")).unwrap())
-                .unwrap();
+        let value = expanded_checkpoint(&root);
         assert_eq!(value["sample_count"], 3);
         assert_eq!(value["segments"].as_array().unwrap().len(), 1);
         assert_eq!(value["anchors"][1][0], 5);
@@ -2272,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_streaming_preserves_v2_bytes_and_all_clock_anchors() {
+    fn checkpoint_journal_preserves_all_clock_anchors_and_segment_fields() {
         let root = tempfile_dir();
         std::fs::create_dir(root.join("audio")).unwrap();
         let progress = super::AudioProgress::default();
@@ -2291,6 +2475,7 @@ mod tests {
             start_time_seconds: 0.0,
             end_time_seconds: 5.0,
         }];
+        let mut journal = super::CheckpointJournal::default();
         for last_anchor in [None, Some(anchors[1]), Some(anchor(u64::MAX, u64::MAX))] {
             *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
                 started: 1_000_000_000,
@@ -2299,7 +2484,7 @@ mod tests {
                 anchors: anchors.clone(),
                 last_anchor,
             });
-            super::commit_checkpoint(&root, &progress, &records).unwrap();
+            super::commit_checkpoint(&root, &progress, &records, &mut journal).unwrap();
             let mut expected_anchors = anchors.clone();
             if let Some(anchor) = last_anchor {
                 if expected_anchors.last() != Some(&anchor) {
@@ -2317,8 +2502,8 @@ mod tests {
                 "segments": [{"index": 3, "path": records[0].relative_path,
                     "start_sample": 0, "end_sample": u64::MAX}],
             });
-            let saved = std::fs::read_to_string(root.join("audio/checkpoint.json")).unwrap();
-            assert_eq!(saved, expected.to_string());
+            let saved = expanded_checkpoint(&root);
+            assert_eq!(saved, expected);
             assert_eq!(
                 progress
                     .clock_checkpoint
@@ -2352,7 +2537,13 @@ mod tests {
                     .collect(),
                 last_anchor: None,
             });
-            let error = super::commit_checkpoint(&root, &progress, &[]).unwrap_err();
+            let error = super::commit_checkpoint(
+                &root,
+                &progress,
+                &[],
+                &mut super::CheckpointJournal::default(),
+            )
+            .unwrap_err();
             assert_eq!(error.code, "write_failed");
             assert!(error.message.contains("audio checkpoint"));
             assert_eq!(
@@ -2404,9 +2595,10 @@ mod tests {
             .collect();
         let memory_before = std::fs::read_to_string("/proc/self/status").unwrap();
         let mut timings = Vec::new();
+        let mut journal = super::CheckpointJournal::default();
         for _ in 0..5 {
             let started = std::time::Instant::now();
-            super::commit_checkpoint(&root, &progress, &records).unwrap();
+            super::commit_checkpoint(&root, &progress, &records, &mut journal).unwrap();
             timings.push(started.elapsed().as_secs_f64());
         }
         let memory_after = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -2421,6 +2613,56 @@ mod tests {
             })
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn expanded_checkpoint(root: &std::path::Path) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let mut head: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("audio/checkpoint.json")).unwrap())
+                .unwrap();
+        let journal = std::fs::read(root.join("audio/checkpoint.ndjson")).unwrap();
+        let prefix = &journal[..head["journal_bytes"].as_u64().unwrap() as usize];
+        assert_eq!(
+            format!("{:x}", Sha256::digest(prefix)),
+            head["journal_sha256"]
+        );
+        let mut anchors = Vec::new();
+        let mut segments = Vec::new();
+        for (i, line) in prefix
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .enumerate()
+        {
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(row["sequence"], i);
+            anchors.extend(row["anchors"].as_array().unwrap().clone());
+            segments.extend(row["segments"].as_array().unwrap().clone());
+        }
+        assert_eq!(
+            anchors.len(),
+            head["anchor_count"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            segments.len(),
+            head["segment_count"].as_u64().unwrap() as usize
+        );
+        if !head["last_anchor"].is_null() && anchors.last() != Some(&head["last_anchor"]) {
+            anchors.push(head["last_anchor"].clone());
+        }
+        for key in [
+            "journal_bytes",
+            "journal_records",
+            "journal_sha256",
+            "anchor_count",
+            "segment_count",
+            "last_anchor",
+        ] {
+            head.as_object_mut().unwrap().remove(key);
+        }
+        head["schema"] = serde_json::json!("openaria.audio-checkpoint.v2");
+        head["anchors"] = serde_json::json!(anchors);
+        head["segments"] = serde_json::json!(segments);
+        head
     }
 
     fn anchor(sample: u64, time: u64) -> crate::audio_clock::Anchor {

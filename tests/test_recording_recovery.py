@@ -524,7 +524,10 @@ class RecordingRecoveryTests(unittest.TestCase):
     def test_raw_audio_prefix_keeps_pcm_and_piecewise_clock_through_slew(self):
         self._check_audio_prefix(True)
 
-    def _check_audio_prefix(self, raw_clock):
+    def test_journal_audio_prefix_keeps_pcm_and_piecewise_clock(self):
+        self._check_audio_prefix(True, journal=True)
+
+    def _check_audio_prefix(self, raw_clock, journal=False):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary))
             root = recorder.partial_path
@@ -572,6 +575,19 @@ class RecordingRecoveryTests(unittest.TestCase):
                     ],
                 },
             )
+            if journal:
+                from tests.test_audio_journal import publish
+
+                head = json.loads((root / "audio/checkpoint.json").read_bytes())
+                head["segments"][0]["index"] = 0
+                published = publish(
+                    root, [{"sequence": 0, "anchors": anchors, "segments": head["segments"]}]
+                )
+                published["thread_started_monotonic_ns"] = head["thread_started_monotonic_ns"]
+                write_json_atomic(root / "audio/checkpoint.json", published)
+                # Uncommitted bytes after a simulated crash must not be read.
+                with (root / "audio/checkpoint.ndjson").open("ab") as output:
+                    output.write(b'{"partial":')
             recovered = recover_device_session(root)
             audio = recovered.manifest["audio"]
             report = audio_clock_report(audio, recovered.manifest["time"]["duration_seconds"])

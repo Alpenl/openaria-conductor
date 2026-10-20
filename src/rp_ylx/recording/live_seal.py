@@ -9,6 +9,7 @@ with the complete stream consumed here before any compacted output is used.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,8 @@ from threading import Event
 import zstandard
 
 from rp_ylx.native import audio_checkpoint_segments
+from rp_ylx.recording.audio_journal import SCHEMA as AUDIO_JOURNAL_SCHEMA
+from rp_ylx.recording.audio_journal import AudioJournalReader
 from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.storage import BLOCK_BYTES, _digest, compact_audio
 from rp_ylx.recording.verified import VerifiedArtifact, identity, open_regular
@@ -221,7 +224,18 @@ class LiveSealing:
         payload = _read_audio_checkpoint(checkpoint, checkpoint_identity, force=force)
         if payload is None:
             return
-        for segment in audio_checkpoint_segments(payload):
+        head = json.loads(payload)
+        if isinstance(head, dict) and head.get("schema") == AUDIO_JOURNAL_SCHEMA:
+            reader = getattr(self, "_audio_journal", None)
+            # A fresh final read verifies the entire prefix, even if a previously
+            # consumed region was modified after live compaction read it.
+            if reader is None or force:
+                reader = AudioJournalReader(self.root)
+            segments = reader.read(head)["segments"]
+            self._audio_journal = reader
+        else:
+            segments = audio_checkpoint_segments(payload)
+        for segment in segments:
             relative = segment["path"]
             filename = f"audio_{segment['index']:05d}.wav"
             # Native emits canonical paths. Avoid rebuilding every historical

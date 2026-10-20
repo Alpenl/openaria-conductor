@@ -21,6 +21,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from rp_ylx.audio_clock import audio_clock_report, audio_sample_time_ns, raw_audio_clock_model
+from rp_ylx.recording.audio_journal import SCHEMA as AUDIO_JOURNAL_SCHEMA
+from rp_ylx.recording.audio_journal import AudioJournalReader
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     DeviceSessionConfig,
@@ -229,6 +231,8 @@ def _audio(
         clock = _read_json(root, "audio/checkpoint.json")
     except (OSError, ValueError):
         return None
+    if clock.get("schema") == AUDIO_JOURNAL_SCHEMA:
+        clock = AudioJournalReader(root).read(clock)
     rate, channels = config.audio_sample_rate_hz, config.audio_channels
     anchors = clock.get("anchors", [])
     raw_clock = clock.get("schema") == "openaria.audio-checkpoint.v2"
