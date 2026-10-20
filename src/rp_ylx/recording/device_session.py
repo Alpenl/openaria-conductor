@@ -1432,8 +1432,14 @@ class DeviceSessionRecorder:
             if self._queue_put(_STOP, 0.1):
                 break
         writer.join(timeout=10)
-        if writer.is_alive() and self._writer_error is None:
-            self._writer_error = TimeoutError("v1 writer 未在期限内停止")
+        if writer.is_alive():
+            if self._writer_error is None:
+                self._writer_error = TimeoutError("v1 writer 未在期限内停止")
+            # A join timeout cannot cancel filesystem I/O. Keep ownership until
+            # the writer exits: callers close its streams and may recover the
+            # same files immediately after this method returns. The error also
+            # makes the writer discard queued work after its current write.
+            writer.join()
         self._writer = None
 
     _ROLE_PATHS = {

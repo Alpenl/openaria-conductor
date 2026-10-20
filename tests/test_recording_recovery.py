@@ -224,6 +224,8 @@ class RecordingRecoveryTests(unittest.TestCase):
         recorder._stop_writer()
         recorder._abandon_encoder()
         recorder._close_files(ignore_errors=False)
+        self.assertIsNone(recorder._writer_error, "recovery fixture writer failed")
+        self.assertEqual(recorder._frames_written, frames)
         return recorder
 
     def test_ten_committed_pairs_survive_failed_eleventh_and_are_downloadable(self):
