@@ -175,31 +175,44 @@ class MdnsPublisher:
         if exception_type == self._failure_type:
             self._suppressed_failures += 1
             return
-        if self._logger is not None:
-            self._logger.error("mDNS publication failed: %s", error)
-        code = getattr(error, "code", "mdns_publication_failed")
-        _OPERATIONAL_LOG.event(
-            "mdns_publication_failed",
-            level="warning",
-            error_code=code if isinstance(code, str) else "mdns_publication_failed",
-            exception_type=exception_type,
-            suppressed_count=self._suppressed_failures,
-        )
+        suppressed_failures = self._suppressed_failures
         self._failure_type = exception_type
         self._suppressed_failures = 0
+        # Diagnostics must not terminate the publication loop or control its
+        # failure/recovery bookkeeping. Keep the two sinks independent.
+        if self._logger is not None:
+            with suppress(Exception):
+                self._logger.error("mDNS publication failed: %s", exception_type)
+        code = "mdns_publication_failed"
+        with suppress(Exception):
+            candidate = getattr(error, "code", code)
+            if isinstance(candidate, str):
+                code = candidate
+        with suppress(Exception):
+            _OPERATIONAL_LOG.event(
+                "mdns_publication_failed",
+                level="warning",
+                error_code=code,
+                exception_type=exception_type,
+                suppressed_count=suppressed_failures,
+            )
 
     def _record_recovered(self) -> None:
         if self._failure_type is None:
             return
-        if self._logger is not None:
-            self._logger.info("mDNS publication recovered")
-        _OPERATIONAL_LOG.event(
-            "mdns_publication_recovered",
-            exception_type=self._failure_type,
-            suppressed_count=self._suppressed_failures,
-        )
+        failure_type = self._failure_type
+        suppressed_failures = self._suppressed_failures
         self._failure_type = None
         self._suppressed_failures = 0
+        if self._logger is not None:
+            with suppress(Exception):
+                self._logger.info("mDNS publication recovered")
+        with suppress(Exception):
+            _OPERATIONAL_LOG.event(
+                "mdns_publication_recovered",
+                exception_type=failure_type,
+                suppressed_count=suppressed_failures,
+            )
 
     def _run(self, stop: threading.Event) -> None:
         # A failed admission may deliver its target only after a retry starts.
@@ -241,12 +254,13 @@ class MdnsPublisher:
         self._addresses = addresses
         self._responder = responder
         self._services = tuple(registered)
-        _OPERATIONAL_LOG.event(
-            "mdns_publication_ready",
-            port=self._port,
-            scheme=self._scheme,
-            address_count=len(addresses),
-        )
+        with suppress(Exception):
+            _OPERATIONAL_LOG.event(
+                "mdns_publication_ready",
+                port=self._port,
+                scheme=self._scheme,
+                address_count=len(addresses),
+            )
 
     def _unpublish(self) -> None:
         responder, services = self._responder, self._services
