@@ -146,9 +146,12 @@ class DeletedRecordingOutcomesTest(unittest.TestCase):
     def test_delete_receipt_persistence_retry_does_not_repeat_removal(self):
         coordinator, sid = self.recovered("receipt-retry")
         command = self.command(coordinator, {sid})
-        with patch.object(
-            coordinator._state_db, "put_capture_state", side_effect=OSError("disk full")
-        ), self.assertRaises(OSError):
+        with (
+            patch.object(
+                coordinator._state_db, "put_capture_state", side_effect=OSError("disk full")
+            ),
+            self.assertRaises(OSError),
+        ):
             coordinator.delete_sessions(command)
         self.assertFalse((self.fixture.mountpoint / "recordings" / sid).exists())
         self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
