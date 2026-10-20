@@ -7,6 +7,7 @@ verification proof is reconstructed from this database.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -484,12 +485,15 @@ class StateDatabase:
             return value
 
     def backup(self, destination: Path) -> None:
-        """Online backup includes committed WAL data; destination must be new."""
-        fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        """Copy committed WAL data, then publish a complete, non-overwriting backup."""
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "backup destination already exists", destination)
+        temporary = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         try:
             with self.connection() as source:
-                target = sqlite3.connect(destination)
+                target = sqlite3.connect(temporary)
                 try:
                     # SQLite's backup API retries BUSY/LOCKED independently of
                     # connect(timeout=...). Check one deadline between bounded
@@ -506,9 +510,19 @@ class StateDatabase:
                         raise PersistenceError("backup integrity check failed")
                 finally:
                     target.close()
-            with destination.open("rb") as stream:
+            with temporary.open("rb") as stream:
                 os.fsync(stream.fileno())
-            _sync_parent(destination)
+            # A competing destination must never be overwritten. Unlike a
+            # placeholder final file, only this complete, synced copy is visible.
+            os.link(temporary, destination, follow_symlinks=False)
         except BaseException:
-            destination.unlink(missing_ok=True)
+            # The final name may belong to a concurrent producer. Clean up only
+            # our private staging name and preserve the original exception.
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
             raise
+        else:
+            temporary.unlink()
+            # If this barrier fails, report failure but retain the complete
+            # published copy; never unlink a final name after publication.
+            _sync_parent(destination)
