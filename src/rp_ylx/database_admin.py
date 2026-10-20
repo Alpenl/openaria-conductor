@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 from rp_ylx.persistence import (
@@ -64,6 +65,13 @@ def inspect(path: Path) -> dict:
         db.close()
 
 
+def _remove_restore_staging(prepared: Path) -> None:
+    # Read-only inspection of a WAL database may leave empty WAL/SHM files.
+    # These names belong to the private snapshot, never to the active database.
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(prepared) + suffix).unlink(missing_ok=True)
+
+
 def restore(source: Path, destination: Path) -> dict:
     require_offline()
     info = inspect(source)
@@ -81,6 +89,12 @@ def restore(source: Path, destination: Path) -> dict:
     StateDatabase(source).backup(prepared)
     archived = []
     try:
+        # The source can change after its initial inspection. Only the copied
+        # snapshot will be published, so admit that exact database before any
+        # mutation of the existing authority or its marker.
+        prepared_info = inspect(prepared)
+        if required and required not in {d["name"] for d in prepared_info["documents"]}:
+            raise PersistenceError("backup does not contain the required authoritative document")
         # Preserve even corrupt databases and their journals for diagnosis.
         # Never remove the authority marker: interruption must fail closed.
         marker = destination.with_suffix(destination.suffix + ".initialized")
@@ -107,9 +121,14 @@ def restore(source: Path, destination: Path) -> dict:
         # needs its own barrier. A failure preserves both new and archived data.
         _sync_parent(destination)
         StateDatabase(destination)
-        return {"restored": str(destination), "preserved": archived, **inspect(destination)}
-    finally:
-        prepared.unlink(missing_ok=True)
+        result = {"restored": str(destination), "preserved": archived, **inspect(destination)}
+    except BaseException:
+        with suppress(OSError):
+            _remove_restore_staging(prepared)
+        raise
+    else:
+        _remove_restore_staging(prepared)
+        return result
 
 
 def manage(path: Path, action: str, *, source: Path | None, destination: Path | None) -> dict:
