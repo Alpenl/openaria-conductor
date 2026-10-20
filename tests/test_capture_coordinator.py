@@ -3815,8 +3815,14 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def test_failure_recovery_and_durable_state_do_not_block_status_or_release_lease(self) -> None:
         for stage in ("fail", "recovery", "state"):
-            with self.subTest(stage=stage):
-                self._check_failure_io_stage(stage)
+            for cached in (True, False):
+                with self.subTest(stage=stage, cached=cached):
+                    self._check_failure_io_stage(stage, cached=cached)
+
+    def test_media_lost_diagnostic_visible_during_recovery_with_or_without_cache(self):
+        for cached in (True, False):
+            with self.subTest(cached=cached):
+                self._check_failure_io_stage("fail", cached=cached, error_code="media_lost")
 
     def test_native_failure_callback_returns_while_recovery_keeps_volume_reserved(self):
         class CallbackSources(FakeSources):
@@ -3851,6 +3857,14 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 callback.start()
                 self.assertTrue(entered.wait(1))
                 self.assertTrue(returned.wait(0.25), "source callback blocked on recovery")
+                status = coordinator.capture_status()
+                validate_capture_status(status)
+                diagnostic = status["snapshot"]["active_recording"]["recording_state"][
+                    "diagnostics"
+                ][-1]
+                self.assertEqual(diagnostic["code"], "source_sequence_gap")
+                self.assertEqual(diagnostic["message"], "test source gap")
+                self.assertEqual(diagnostic["severity"], "error")
                 self.assertEqual(coordinator.artifact_io_state(), "finalizing")
                 self.assert_network_operation_lock_held()
                 with self.assertRaises(ProviderError) as busy:
@@ -3957,13 +3971,13 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def _check_failure_io_stage(self, stage):
+    def _check_failure_io_stage(self, stage, *, cached=True, error_code="encoder_failed"):
         coordinator = self.coordinator()
         entered, release = threading.Event(), threading.Event()
         errors, stopped = [], []
         threads = []
         try:
-            coordinator.start_capture(start_command("fault-io-" + stage))
+            coordinator.start_capture(start_command(f"fault-io-{stage}-{cached}-{error_code}"))
             sid = self.active_session_id(coordinator)
             recorder = coordinator._active
             generation = coordinator.generation_id
@@ -3993,13 +4007,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
             def report():
                 try:
-                    coordinator._source_failure(generation, "encoder_failed", "test fault")
+                    coordinator._source_failure(generation, error_code, "test fault")
                 except BaseException as error:
                     errors.append(error)
 
             def stop():
                 try:
-                    stopped.append(coordinator.stop_capture(stop_command("fault-stop-" + stage)))
+                    stopped.append(
+                        coordinator.stop_capture(
+                            stop_command(f"fault-stop-{stage}-{cached}-{error_code}")
+                        )
+                    )
                 except BaseException as error:
                     errors.append(error)
 
@@ -4017,6 +4035,19 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     observed = coordinator.capture_status()["snapshot"]["active_recording"][
                         "recording_state"
                     ]
+                warning = {
+                    "code": "test_warning",
+                    "severity": "warning",
+                    "message": "earlier warning",
+                    "at": live["updated_at"],
+                    "recoverable": True,
+                }
+                if cached:
+                    coordinator._cached_active_state["diagnostics"].append(warning)
+                else:
+                    coordinator._cached_active_state = None
+                original_cache = coordinator._cached_active_state
+                cached_before = deepcopy(original_cache)
                 if stage == "fail":
                     patches.enter_context(patch.object(recorder, "fail", side_effect=fail))
                 elif stage == "recovery":
@@ -4039,9 +4070,21 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - before, 0.25)
                 validate_capture_status(status)
                 self.assertEqual(status["snapshot"]["device_state"], "finalizing")
-                self.assertEqual(
-                    status["snapshot"]["active_recording"]["recording_state"]["progress"],
-                    observed["progress"],
+                projected = status["snapshot"]["active_recording"]["recording_state"]
+                if cached:
+                    self.assertEqual(projected["progress"], observed["progress"])
+                    self.assertEqual(projected["diagnostics"][0], warning)
+                errors_visible = [d for d in projected["diagnostics"] if d["severity"] == "error"]
+                self.assertEqual(len(errors_visible), 1)
+                self.assertEqual(errors_visible[0]["code"], error_code)
+                self.assertEqual(errors_visible[0]["message"], "test fault")
+                self.assertEqual(errors_visible[0]["recoverable"], error_code == "media_lost")
+                self.assertEqual(original_cache, cached_before)
+                projected["diagnostics"].clear()
+                self.assertTrue(
+                    coordinator.capture_status()["snapshot"]["active_recording"]["recording_state"][
+                        "diagnostics"
+                    ]
                 )
                 self.assertEqual(coordinator.artifact_io_state(), "finalizing")
                 self.assertGreater(coordinator.open_handle_count, 0)
@@ -4064,15 +4107,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(stopped[0].status, 204)
-            replay = coordinator.stop_capture(stop_command("fault-stop-" + stage))
+            replay = coordinator.stop_capture(
+                stop_command(f"fault-stop-{stage}-{cached}-{error_code}")
+            )
             self.assertTrue(replay.replayed)
             status = coordinator.capture_status()
             validate_capture_status(status)
             self.assertEqual(status["snapshot"]["device_state"], "idle")
             retained = status["snapshot"]["retained_unsuccessful"]
-            self.assertEqual(
-                retained["recording_state"]["diagnostics"][0]["code"], "encoder_failed"
-            )
+            self.assertEqual(retained["recording_state"]["diagnostics"][0]["code"], error_code)
             self.assert_network_operation_lock_available()
         finally:
             release.set()

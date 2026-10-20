@@ -2916,11 +2916,26 @@ class CaptureCoordinator:
             error = self._pending_source_failure or error
             self._pending_source_failure = None
             projection = copy.deepcopy(self._cached_active_state)
+            now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             if projection is None:
+                # The protocol reserves storage.media_lost for terminal states.
                 projection = dict(self._local_failure_state(plan, error, media_lost=False))
+                projection["diagnostics"][0]["recoverable"] = error.code == "media_lost"
+            else:
+                # Recovery can take minutes. Publish the cause before any IO,
+                # while keeping progress, earlier diagnostics and the volume lease.
+                projection.setdefault("diagnostics", []).append(
+                    {
+                        "code": error.code,
+                        "severity": "error",
+                        "message": error.message,
+                        "at": now,
+                        "recoverable": error.code == "media_lost",
+                    }
+                )
             projection["state"] = "finalizing"
             projection["state_revision"] = self._next_revision()
-            projection["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            projection["updated_at"] = now
             self._failure_projection = projection
             self._failure_inflight = recorder
 
