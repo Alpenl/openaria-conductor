@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -75,6 +75,47 @@ def _sync_parent(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _preserve_import_source(source: Path, raw: bytes) -> None:
+    """Publish an exact recovery copy without replacing any existing evidence."""
+    backup = source.with_suffix(source.suffix + ".pre-sqlite")
+    if not os.path.lexists(backup):
+        temporary = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                if stream.write(raw) != len(raw):
+                    raise OSError("short legacy import backup write")
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Unlike replace(), link() cannot overwrite a competing backup.
+            # A crash before publication leaves only a private temporary;
+            # after publication the final name already holds complete bytes.
+            with suppress(FileExistsError):
+                os.link(temporary, backup, follow_symlinks=False)
+            # Independently verify a competing winning copy below.
+        finally:
+            temporary.unlink(missing_ok=True)
+    fd = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != len(raw):
+            raise PersistenceError("legacy import backup does not match the source")
+        offset = 0
+        while offset < len(raw):
+            chunk = os.read(fd, min(64 * 1024, len(raw) - offset))
+            if not chunk or chunk != raw[offset : offset + len(chunk)]:
+                raise PersistenceError("legacy import backup does not match the source")
+            offset += len(chunk)
+        if os.read(fd, 1):
+            raise PersistenceError("legacy import backup changed during verification")
+        # A previous attempt may have failed before either durability barrier.
+        # Existence alone must never turn that failure into a successful import.
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _sync_parent(backup)
 
 
 class StateDatabase:
@@ -357,14 +398,7 @@ class StateDatabase:
                 validate(value)
             body = _json(value)
             if raw is not None:
-                backup = source.with_suffix(source.suffix + ".pre-sqlite")
-                if not backup.exists():
-                    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(fd, "wb") as stream:
-                        stream.write(raw)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    _sync_parent(backup)
+                _preserve_import_source(source, raw)
             db.execute(
                 "INSERT INTO documents VALUES (?,?,1,?)",
                 (name, body, datetime.now(UTC).isoformat()),
