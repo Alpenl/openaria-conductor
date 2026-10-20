@@ -435,12 +435,22 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NONBLOCK
         with lock:
+            # Reject special files before open can block or affect a device.
+            # The descriptor check below also covers replacement after lstat.
+            try:
+                existing = path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                    raise OSError("API audit target must be an exclusively linked regular file")
             descriptor = os.open(path, flags, 0o600)
             try:
                 metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise OSError("API audit target is not a regular file")
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise OSError("API audit target must be an exclusively linked regular file")
                 if metadata.st_mode & 0o777 != 0o600:
                     os.fchmod(descriptor, 0o600)
                 remaining = memoryview(payload)
