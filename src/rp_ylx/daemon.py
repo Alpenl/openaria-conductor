@@ -464,12 +464,40 @@ class ProductionService:
     storage_monitor: StorageReserveMonitor | None = None
 
     def close(self) -> None:
-        if self.storage_monitor is not None:
-            self.storage_monitor.close()
-        self.server.server_close()
-        self.mdns_publisher.close()
-        self.event_pump.close()
-        self.coordinator.close()
+        error = _close_service_components(
+            (
+                ("storage_monitor", self.storage_monitor, "close"),
+                ("server", self.server, "server_close"),
+                ("mdns_publisher", self.mdns_publisher, "close"),
+                ("event_pump", self.event_pump, "close"),
+                ("coordinator", self.coordinator, "close"),
+            )
+        )
+        if error is not None:
+            raise error
+
+
+def _close_service_components(
+    components: tuple[tuple[str, Any, str], ...],
+) -> BaseException | None:
+    """Attempt every owned cleanup, preserving the first failure for the caller."""
+    first_error: BaseException | None = None
+    for stage, component, method in components:
+        if component is None:
+            continue
+        try:
+            getattr(component, method)()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+            with suppress(BaseException):
+                _OPERATIONAL_LOG.event(
+                    "production_service_component_close_failed",
+                    level="error",
+                    stage=stage,
+                    exception_type=type(error).__name__,
+                )
+    return first_error
 
 
 class StorageReserveMonitor:
@@ -724,6 +752,7 @@ def build_production_service(
     server = None
     event_pump = None
     mdns_publisher = None
+    storage_monitor = None
     try:
         try:
             sources.start_preview()
@@ -794,26 +823,20 @@ def build_production_service(
             scheme="https" if config.security_profile == "customer" else "http",
         )
         mdns_publisher.start()
+        storage_monitor = StorageReserveMonitor(coordinator)
+        return ProductionService(coordinator, server, event_pump, mdns_publisher, storage_monitor)
     except BaseException:
-        if mdns_publisher is not None:
-            with suppress(BaseException):
-                mdns_publisher.close()
-        if event_pump is not None:
-            with suppress(BaseException):
-                event_pump.close()
-        if server is not None:
-            with suppress(BaseException):
-                server.server_close()
-        if coordinator is not None:
-            with suppress(BaseException):
-                coordinator.close()
-        else:
-            with suppress(BaseException):
-                sources.close()
+        _close_service_components(
+            (
+                ("storage_monitor", storage_monitor, "close"),
+                ("mdns_publisher", mdns_publisher, "close"),
+                ("event_pump", event_pump, "close"),
+                ("server", server, "server_close"),
+                ("coordinator", coordinator, "close"),
+                ("sources", sources if coordinator is None else None, "close"),
+            )
+        )
         raise
-    return ProductionService(
-        coordinator, server, event_pump, mdns_publisher, StorageReserveMonitor(coordinator)
-    )
 
 
 def run_production_service(config_path: str | Path) -> None:
@@ -826,24 +849,19 @@ def run_production_service(config_path: str | Path) -> None:
         config = load_production_config(config_path)
         service = build_production_service(config)
     except BaseException as error:
-        code = getattr(error, "code", "service_start_failed")
-        _OPERATIONAL_LOG.event(
-            "production_service_start_failed",
-            level="error",
-            error_code=code if isinstance(code, str) else "service_start_failed",
-            exception_type=type(error).__name__,
-            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-        )
+        with suppress(BaseException):
+            code = getattr(error, "code", "service_start_failed")
+            _OPERATIONAL_LOG.event(
+                "production_service_start_failed",
+                level="error",
+                error_code=code if isinstance(code, str) else "service_start_failed",
+                exception_type=type(error).__name__,
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            )
         raise
-    _OPERATIONAL_LOG.event(
-        "production_service_ready",
-        security_profile=config.security_profile,
-        data_plane=config.data_plane,
-        port=config.port,
-        duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-    )
     previous: dict[int, Any] = {}
     stop_signal: str | None = None
+    primary_error: BaseException | None = None
 
     def stop(signum: int, frame: object) -> None:
         nonlocal stop_signal
@@ -851,28 +869,52 @@ def run_production_service(config_path: str | Path) -> None:
         stop_signal = signal.Signals(signum).name
         raise KeyboardInterrupt
 
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous[signum] = signal.signal(signum, stop)
-    try:
-        with suppress(KeyboardInterrupt):
-            service.server.serve_forever()
-    finally:
-        context: dict[str, object] = {"outcome": "shutdown_requested"}
-        if stop_signal is not None:
-            context["signal"] = stop_signal
-        _OPERATIONAL_LOG.event("production_service_stopping", **context)
-        try:
-            service.close()
-        except BaseException as error:
+    def cleanup_failed(stage: str, error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        with suppress(BaseException):
             code = getattr(error, "code", "service_shutdown_failed")
             _OPERATIONAL_LOG.event(
                 "production_service_shutdown_failed",
                 level="error",
+                stage=stage,
                 error_code=code if isinstance(code, str) else "service_shutdown_failed",
                 exception_type=type(error).__name__,
             )
-            raise
-        finally:
-            for signum, handler in previous.items():
+
+    try:
+        _OPERATIONAL_LOG.event(
+            "production_service_ready",
+            security_profile=config.security_profile,
+            data_plane=config.data_plane,
+            port=config.port,
+            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+        )
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, stop)
+        with suppress(KeyboardInterrupt):
+            service.server.serve_forever()
+    except BaseException as error:
+        primary_error = error
+    finally:
+        try:
+            context: dict[str, object] = {"outcome": "shutdown_requested"}
+            if stop_signal is not None:
+                context["signal"] = stop_signal
+            _OPERATIONAL_LOG.event("production_service_stopping", **context)
+        except BaseException as error:
+            cleanup_failed("stopping_log", error)
+        try:
+            service.close()
+        except BaseException as error:
+            cleanup_failed("service_close", error)
+        for signum, handler in previous.items():
+            try:
                 signal.signal(signum, handler)
-        _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
+            except BaseException as error:
+                cleanup_failed(f"restore_{signal.Signals(signum).name}", error)
+        if primary_error is None:
+            _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
+    if primary_error is not None:
+        raise primary_error
