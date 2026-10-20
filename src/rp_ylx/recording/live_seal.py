@@ -198,10 +198,19 @@ class LiveSealing:
         self.prepared: dict[str, PreparedArtifact] = {}
         self._audio_checkpoint_identity: tuple[int, ...] | None = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="live-seal")
-        self.audit = self.executor.submit(
-            capture_audit, root, nominal_fps, frame_decimation, finished=self.finished
-        )
-        self.compaction = self.executor.submit(self._compact)
+        try:
+            self.audit = self.executor.submit(
+                capture_audit, root, nominal_fps, frame_decimation, finished=self.finished
+            )
+            self.compaction = self.executor.submit(self._compact)
+        except BaseException:
+            # A submit can enqueue work before failing to start its thread.
+            # The caller cannot close an object whose constructor never returned.
+            # Release any running audit first, then cancel queued work and join.
+            self.cancelled.set()
+            self.finished.set()
+            self.executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
     def _audio(self, *, force: bool = False) -> None:
         # Native checkpoint publication follows WAV close/fsync. Reading only
