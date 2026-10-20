@@ -1834,6 +1834,7 @@ class CaptureCoordinator:
                                     self._config.session.commit,
                                     directory=sessions_root / session_id,
                                     validate_summary=validate_session_summary,
+                                    cache_validation=True,
                                     required_artifact_role=(
                                         RECOVERY_ROLE
                                         if session_id in self._retained

@@ -7,7 +7,9 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from itertools import groupby
@@ -18,8 +20,17 @@ from rp_ylx.persistence import StateDatabase
 
 
 class SessionCatalog(StateDatabase):
+    # Bound retained serialized summaries separately from dictionary overhead.
+    _VALIDATION_CACHE_ENTRIES = 8192
+    _VALIDATION_CACHE_BYTES = 8 * 1024 * 1024
+
     def __init__(self, path: Path) -> None:
         self._scan_state = threading.local()
+        self._validation_lock = threading.Lock()
+        self._validated_summaries: OrderedDict[
+            tuple[str, str], tuple[str, str | bytes, Callable[[object], None]]
+        ] = OrderedDict()
+        self._validated_summary_bytes = 0
         super().__init__(path)
         self._admitted: set[tuple[str, str, str]] = set()
         with self.connection() as db, db:
@@ -76,6 +87,9 @@ class SessionCatalog(StateDatabase):
             except BaseException:
                 db.rollback()
                 self._admitted.clear()
+                with self._validation_lock:
+                    self._validated_summaries.clear()
+                    self._validated_summary_bytes = 0
                 raise
             finally:
                 self._scan_state.connection = None
@@ -158,6 +172,40 @@ class SessionCatalog(StateDatabase):
         finally:
             os.close(parent_fd)
 
+    def _forget_summary_validation(self, key: tuple[str, str]) -> None:
+        # The caller holds _validation_lock.
+        previous = self._validated_summaries.pop(key, None)
+        if previous is not None:
+            self._validated_summary_bytes -= sys.getsizeof(previous[1])
+
+    def _summary_was_validated(self, key, validator, raw, validate) -> bool:
+        with self._validation_lock:
+            previous = self._validated_summaries.get(key)
+            if (
+                previous is not None
+                and previous[0] == validator
+                and previous[1] == raw
+                and previous[2] is validate
+            ):
+                self._validated_summaries.move_to_end(key)
+                return True
+            self._forget_summary_validation(key)
+            return False
+
+    def _remember_summary_validation(self, key, validator, raw, validate) -> None:
+        size = sys.getsizeof(raw)
+        with self._validation_lock:
+            self._forget_summary_validation(key)
+            if size > self._VALIDATION_CACHE_BYTES or self._VALIDATION_CACHE_ENTRIES <= 0:
+                return
+            while self._validated_summaries and (
+                len(self._validated_summaries) >= self._VALIDATION_CACHE_ENTRIES
+                or self._validated_summary_bytes + size > self._VALIDATION_CACHE_BYTES
+            ):
+                self._forget_summary_validation(next(iter(self._validated_summaries)))
+            self._validated_summaries[key] = (validator, raw, validate)
+            self._validated_summary_bytes += size
+
     def cached(
         self,
         volume: str,
@@ -168,7 +216,11 @@ class SessionCatalog(StateDatabase):
         directory: Path | None = None,
         required_artifact_role: str | None = None,
         validate_summary: Callable[[object], None] | None = None,
+        cache_validation: bool = False,
     ):
+        # Opt in only for a pure summary validator. Each call still reads the
+        # current SQLite row and decodes a fresh response; no mutable value is
+        # shared, and filesystem admission is independent of this cache.
         query = (
             "SELECT summary FROM sessions WHERE volume=? AND session=? "
             "AND signature=? AND validator=?"
@@ -193,12 +245,23 @@ class SessionCatalog(StateDatabase):
                 raise ValueError("cached summary does not identify the indexed session")
             # A persisted digest is historical metadata, not proof about current payloads.
             value["verification"] = None
-            if validate_summary is not None:
+            if validate_summary is not None and not (
+                cache_validation
+                and self._summary_was_validated(
+                    (volume, session), validator, row[0], validate_summary
+                )
+            ):
                 validate_summary(value)
+                if cache_validation:
+                    self._remember_summary_validation(
+                        (volume, session), validator, row[0], validate_summary
+                    )
         except (TypeError, ValueError, RecursionError):
             # Only this rebuildable row is invalid. Leave database I/O/schema
             # failures visible; never replace or reinitialize state authority.
             self._admitted.discard(key)
+            with self._validation_lock:
+                self._forget_summary_validation((volume, session))
             return None
         if directory is not None and key not in self._admitted:
             with self.connection() as db:
@@ -332,6 +395,10 @@ class SessionCatalog(StateDatabase):
 
     def discard_missing(self, volume: str, discovered: set[str]) -> None:
         self._admitted = {key for key in self._admitted if key[0] != volume or key[1] in discovered}
+        with self._validation_lock:
+            for key in list(self._validated_summaries):
+                if key[0] == volume and key[1] not in discovered:
+                    self._forget_summary_validation(key)
         with self._write_transaction() as db:
             existing = db.execute(
                 "SELECT session FROM sessions WHERE volume=?", (volume,)
