@@ -3050,6 +3050,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         try:
             body = json.loads(payload)
+            # JSON escapes can represent lone surrogates that UTF-8 storage and
+            # command canonicalization cannot encode. Reject before dispatch.
+            pending = [body]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, str):
+                    value.encode("utf-8")
+                elif isinstance(value, dict):
+                    pending.extend(value)
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
         except (ValueError, RecursionError):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不是有效 JSON")
             return None
