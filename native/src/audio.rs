@@ -261,8 +261,8 @@ struct ClockCheckpoint {
     started: u64,
     period_frames: u64,
     buffer_frames: u64,
-    anchors: Vec<[u64; 2]>,
-    last_anchor: Option<[u64; 2]>,
+    anchors: Vec<crate::audio_clock::Anchor>,
+    last_anchor: Option<crate::audio_clock::Anchor>,
 }
 
 impl AudioProgress {
@@ -568,6 +568,7 @@ struct Alsa {
     sw_apply: SwApply,
     sw_mode: SwSet,
     sw_type: SwSet,
+    sw_get_type: unsafe extern "C" fn(*const c_void, *mut c_int) -> c_int,
     sw_free: SwFree,
     htimestamp: Htimestamp,
     get_params: GetParams,
@@ -606,6 +607,7 @@ impl Alsa {
                 sw_apply: load_symbol(&library, b"snd_pcm_sw_params\0")?,
                 sw_mode: load_symbol(&library, b"snd_pcm_sw_params_set_tstamp_mode\0")?,
                 sw_type: load_symbol(&library, b"snd_pcm_sw_params_set_tstamp_type\0")?,
+                sw_get_type: load_symbol(&library, b"snd_pcm_sw_params_get_tstamp_type\0")?,
                 sw_free: load_symbol(&library, b"snd_pcm_sw_params_free\0")?,
                 htimestamp: load_symbol(&library, b"snd_pcm_htimestamp\0")?,
                 get_params: load_symbol(&library, b"snd_pcm_get_params\0")?,
@@ -825,12 +827,26 @@ impl Pcm {
             self.check("audio_failed", "timestamp_enable", unsafe {
                 (self.alsa.sw_mode)(self.handle, sw, 1)
             })?;
-            self.check("audio_failed", "timestamp_monotonic", unsafe {
-                (self.alsa.sw_type)(self.handle, sw, 1)
+            self.check("audio_failed", "timestamp_monotonic_raw", unsafe {
+                (self.alsa.sw_type)(self.handle, sw, 2)
             })?;
             self.check("audio_failed", "sw_params", unsafe {
                 (self.alsa.sw_apply)(self.handle, sw)
-            })
+            })?;
+            self.check("audio_failed", "sw_params_readback", unsafe {
+                (self.alsa.sw_current)(self.handle, sw)
+            })?;
+            let mut timestamp_type = -1;
+            self.check("audio_failed", "timestamp_type_readback", unsafe {
+                (self.alsa.sw_get_type)(sw, &mut timestamp_type)
+            })?;
+            if timestamp_type != 2 {
+                return Err(AudioError::new(
+                    "audio_failed",
+                    "ALSA did not retain MONOTONIC_RAW timestamps",
+                ));
+            }
+            Ok(())
         })();
         unsafe { (self.alsa.sw_free)(sw) };
         configured?;
@@ -1279,7 +1295,7 @@ struct CheckpointSegment<'a> {
 
 #[derive(serde::Serialize)]
 struct CheckpointPayload<'a> {
-    anchors: &'a [[u64; 2]],
+    anchors: &'a [crate::audio_clock::Anchor],
     buffer_frames: u64,
     max_write_ns: u64,
     period_frames: u64,
@@ -1316,7 +1332,7 @@ fn commit_checkpoint(
     // and then a second full-document String. Neither serialization nor disk IO
     // holds the capture clock lock, and every recovery anchor is preserved.
     let payload = CheckpointPayload {
-        schema: "openaria.audio-checkpoint.v1",
+        schema: "openaria.audio-checkpoint.v2",
         sample_count,
         thread_started_monotonic_ns: clock.started,
         period_frames: clock.period_frames,
@@ -1426,7 +1442,7 @@ fn start_and_capture(
     });
     let _ = ready.send(Ok(()));
     let mut sample_count = 0_u64;
-    let mut anchors: Vec<[u64; 2]> = Vec::new();
+    let mut anchors: Vec<crate::audio_clock::Anchor> = Vec::new();
     let mut last_anchor = None;
     // Diagnostic observations never replace or smooth the authoritative anchors.
     let mut clock_observations: Vec<[u64; 5]> = Vec::new();
@@ -1458,7 +1474,12 @@ fn start_and_capture(
                     if timestamp == 0 {
                         return Err(AudioError::new("audio_failed", "missing ALSA timestamp"));
                     }
-                    let anchor = [position, timestamp];
+                    let before_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
+                    let observed_mono = monotonic_ns()?;
+                    let after_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
+                    let anchor = [position, timestamp, observed_mono, before_raw, after_raw];
+                    let mapped_mono = crate::audio_clock::mapped_ns(&anchor)
+                        .map_err(|message| AudioError::new("audio_failed", message))?;
                     if let Some(clock) = progress.clock_checkpoint.lock().unwrap().as_mut() {
                         clock.last_anchor = Some(anchor);
                     }
@@ -1470,9 +1491,9 @@ fn start_and_capture(
                         if clock_observations.len() < MAX_CLOCK_OBSERVATIONS {
                             clock_observations.push([
                                 position,
-                                timestamp,
-                                monotonic_ns()?,
-                                clock_ns(libc::CLOCK_MONOTONIC_RAW)?,
+                                mapped_mono,
+                                observed_mono,
+                                before_raw + (after_raw - before_raw) / 2,
                                 sample_count,
                             ]);
                         } else {
@@ -1541,11 +1562,11 @@ fn start_and_capture(
         .or(disk_result.as_ref().err())
         .or(clock_result.as_ref().err());
     let diagnostic = serde_json::json!({
-        "schema": "openaria.audio-capture-diagnostic.v2", "sample_count": sample_count,
-        "anchors": anchors, "thread_started_monotonic_ns": started_monotonic_ns,
+        "schema": "openaria.audio-capture-diagnostic.v3", "sample_count": sample_count,
+        "anchors": anchors, "anchor_fields": ["sample_position", "alsa_raw_ns", "observed_monotonic_ns", "raw_before_ns", "raw_after_ns"], "thread_started_monotonic_ns": started_monotonic_ns,
         "thread_stopped_monotonic_ns": stopped_monotonic_ns,
         "error": failure.map(|error| serde_json::json!({"code": error.code, "message": error.message})),
-        "clock_observation_fields": ["sample_position", "alsa_monotonic_ns", "observed_monotonic_ns", "observed_raw_ns", "read_samples"],
+        "clock_observation_fields": ["sample_position", "mapped_monotonic_ns", "observed_monotonic_ns", "observed_raw_ns", "read_samples"],
         "clock_observations": clock_observations,
         "clock_observations_omitted": observations_omitted,
         "io_histogram_upper_bounds_ns": IO_BUCKET_NS,
@@ -1598,37 +1619,20 @@ fn capture_clock(
     samples: u64,
     started: u64,
     stopped: u64,
-    anchors: &[[u64; 2]],
+    anchors: &[crate::audio_clock::Anchor],
     progress: &AudioProgress,
 ) -> Result<serde_json::Value, AudioError> {
-    if anchors.len() < 2
-        || anchors
-            .windows(2)
-            .any(|pair| pair[1][0] <= pair[0][0] || pair[1][1] <= pair[0][1])
-    {
-        return Err(AudioError::new(
-            "audio_failed",
-            "audio clock anchors are missing or nonmonotonic",
-        ));
-    }
-    let first = anchors[0];
-    let last = anchors[anchors.len() - 1];
-    let ns_per_sample = (last[1] - first[1]) as f64 / (last[0] - first[0]) as f64;
-    let actual_rate = 1e9 / ns_per_sample;
-    let residual = anchors
-        .iter()
-        .map(|a| ((a[1] - first[1]) as f64 - (a[0] - first[0]) as f64 * ns_per_sample).abs())
-        .fold(0.0_f64, f64::max);
-    if (actual_rate / f64::from(config.sample_rate_hz) - 1.0).abs() > 0.01
-        || residual > 20_000_000.0
-    {
-        return Err(AudioError::new(
-            "audio_failed",
-            format!("audio clock discontinuity: rate={actual_rate}, residual_ns={residual}"),
-        ));
-    }
-    let sample_start = first[1] as f64 - first[0] as f64 * ns_per_sample;
-    let sample_end = sample_start + samples as f64 * ns_per_sample;
+    let model = crate::audio_clock::evaluate(
+        anchors,
+        config.sample_rate_hz,
+        samples,
+        hardware_frames.0,
+        hardware_frames.1,
+    )
+    .map_err(|message| AudioError::new("audio_failed", message))?;
+    let sample_start = model.start_ns;
+    let sample_end = model.end_ns;
+    let residual = model.residual_ns;
     if sample_start < started as f64 - 20_000_000.0 || sample_end > stopped as f64 + 20_000_000.0 {
         return Err(AudioError::new(
             "audio_failed",
@@ -1636,8 +1640,8 @@ fn capture_clock(
         ));
     }
     Ok(serde_json::json!({
-        "schema": "openaria.audio-clock.v1", "clock": "host_monotonic",
-        "timestamp_source": "alsa_htimestamp_dma", "continuity": "verified",
+        "schema": "openaria.audio-clock.v2", "clock": "host_monotonic",
+        "timestamp_source": "alsa_htimestamp_dma_raw", "continuity": "verified",
         "device": config.device, "period_frames": hardware_frames.0, "buffer_frames": hardware_frames.1,
         "thread_started_monotonic_ns": started, "thread_stopped_monotonic_ns": stopped,
         "sample_start_monotonic_ns": sample_start.round() as u64,
@@ -1888,8 +1892,8 @@ mod tests {
             started: 1_000_000_000,
             period_frames: 1,
             buffer_frames: 8,
-            anchors: vec![[1, 1_100_000_000]],
-            last_anchor: Some([3, 1_300_000_000]),
+            anchors: vec![anchor(1, 1_100_000_000)],
+            last_anchor: Some(anchor(3, 1_300_000_000)),
         });
         let mut writer = SegmentWriter::with_progress(&config, progress.clone()).unwrap();
         writer.write_frames(&[7; 12], 3, &mut 0).unwrap();
@@ -1961,9 +1965,9 @@ mod tests {
             1_100_000_000,
             3_110_000_000,
             &[
-                [1024, 1_202_400_000],
-                [11024, 2_202_400_000],
-                [20000, 3_100_000_000],
+                anchor(1024, 1_202_400_000),
+                anchor(11024, 2_202_400_000),
+                anchor(20000, 3_100_000_000),
             ],
             &progress,
         )
@@ -1999,9 +2003,9 @@ mod tests {
         };
         let progress = super::AudioProgress::default();
         let anchors = [
-            [1024, 1_202_400_000],
-            [11024, 2_202_400_000],
-            [20000, 3_100_000_000],
+            anchor(1024, 1_202_400_000),
+            anchor(11024, 2_202_400_000),
+            anchor(20000, 3_100_000_000),
         ];
         let clock = super::capture_clock(
             &config,
@@ -2077,8 +2081,8 @@ mod tests {
             started: 1_000_000_000,
             period_frames: 1,
             buffer_frames: 8,
-            anchors: vec![[1, 1_100_000_000]],
-            last_anchor: Some([5, 1_500_000_000]),
+            anchors: vec![anchor(1, 1_100_000_000)],
+            last_anchor: Some(anchor(5, 1_500_000_000)),
         });
         let mut writer = SegmentWriter::with_progress(&config, progress.clone()).unwrap();
         let mut written = 0;
@@ -2257,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_streaming_preserves_v1_bytes_and_all_clock_anchors() {
+    fn checkpoint_streaming_preserves_v2_bytes_and_all_clock_anchors() {
         let root = tempfile_dir();
         std::fs::create_dir(root.join("audio")).unwrap();
         let progress = super::AudioProgress::default();
@@ -2267,7 +2271,7 @@ mod tests {
         progress
             .max_write_ns
             .store(456, std::sync::atomic::Ordering::Relaxed);
-        let anchors = vec![[0, 1_000_000_000], [u64::MAX - 1, u64::MAX - 1]];
+        let anchors = vec![anchor(0, 1_000_000_000), anchor(u64::MAX - 1, u64::MAX - 1)];
         let records = vec![super::AudioSegment {
             index: 3,
             relative_path: "audio/引号\"换行\n反斜线\\.wav".to_owned(),
@@ -2276,7 +2280,7 @@ mod tests {
             start_time_seconds: 0.0,
             end_time_seconds: 5.0,
         }];
-        for last_anchor in [None, Some(anchors[1]), Some([u64::MAX, u64::MAX])] {
+        for last_anchor in [None, Some(anchors[1]), Some(anchor(u64::MAX, u64::MAX))] {
             *progress.clock_checkpoint.lock().unwrap() = Some(super::ClockCheckpoint {
                 started: 1_000_000_000,
                 period_frames: 1024,
@@ -2292,7 +2296,7 @@ mod tests {
                 }
             }
             let expected = serde_json::json!({
-                "schema": "openaria.audio-checkpoint.v1",
+                "schema": "openaria.audio-checkpoint.v2",
                 "sample_count": u64::MAX,
                 "thread_started_monotonic_ns": 1_000_000_000_u64,
                 "period_frames": 1024, "buffer_frames": 8192,
@@ -2332,7 +2336,9 @@ mod tests {
                 started: 1_000_000_000,
                 period_frames: 1024,
                 buffer_frames: 8192,
-                anchors: (0..anchor_count).map(|i| [i, 1_000_000_000 + i]).collect(),
+                anchors: (0..anchor_count)
+                    .map(|i| anchor(i, 1_000_000_000 + i))
+                    .collect(),
                 last_anchor: None,
             });
             let error = super::commit_checkpoint(&root, &progress, &[]).unwrap_err();
@@ -2368,9 +2374,12 @@ mod tests {
             period_frames: 1024,
             buffer_frames: 8192,
             anchors: (0..seconds * 10)
-                .map(|index| [index * 4800, 1_000_000_000 + index * 100_000_000])
+                .map(|index| anchor(index * 4800, 1_000_000_000 + index * 100_000_000))
                 .collect(),
-            last_anchor: Some([seconds * 48000, 1_000_000_000 + seconds * 1_000_000_000]),
+            last_anchor: Some(anchor(
+                seconds * 48000,
+                1_000_000_000 + seconds * 1_000_000_000,
+            )),
         });
         let records: Vec<_> = (0..seconds / 5)
             .map(|index| super::AudioSegment {
@@ -2401,6 +2410,10 @@ mod tests {
             })
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn anchor(sample: u64, time: u64) -> crate::audio_clock::Anchor {
+        [sample, time, time, time, time]
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

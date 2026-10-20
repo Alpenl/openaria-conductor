@@ -519,6 +519,12 @@ class RecordingRecoveryTests(unittest.TestCase):
             validate_device_session_directory(recovered.path)
 
     def test_audio_prefix_keeps_real_pcm_samples_and_verified_clock(self):
+        self._check_audio_prefix(False)
+
+    def test_raw_audio_prefix_keeps_pcm_and_piecewise_clock_through_slew(self):
+        self._check_audio_prefix(True)
+
+    def _check_audio_prefix(self, raw_clock):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary))
             root = recorder.partial_path
@@ -533,6 +539,20 @@ class RecordingRecoveryTests(unittest.TestCase):
                 output.writeframes(pcm)
             origin = recorder._started_monotonic_ns
             start = origin + 20_000_000
+            anchors = [
+                [n, start + round(n * 1e9 / rate)] for n in range(1024, 2 * rate + 1024, 4800)
+            ]
+            if raw_clock:
+                anchors = [
+                    [
+                        n,
+                        t + 1_000_000_000,
+                        t - round(min(max(n / rate - 0.3, 0), 0.4) * 500_000),
+                        t + 1_000_000_000,
+                        t + 1_000_000_000,
+                    ]
+                    for n, t in anchors
+                ]
             write_json_atomic(
                 root / "audio/checkpoint.json",
                 {
@@ -540,10 +560,10 @@ class RecordingRecoveryTests(unittest.TestCase):
                     "thread_started_monotonic_ns": start,
                     "period_frames": 1024,
                     "buffer_frames": 8192,
-                    "anchors": [
-                        [n, start + round(n * 1e9 / rate)]
-                        for n in range(1024, 2 * rate + 1024, 4800)
-                    ],
+                    "schema": "openaria.audio-checkpoint.v2"
+                    if raw_clock
+                    else "openaria.audio-checkpoint.v1",
+                    "anchors": anchors,
                     "queue_capacity_frames": 786432,
                     "queue_peak_frames": 1024,
                     "max_write_ns": 400000,
@@ -556,6 +576,9 @@ class RecordingRecoveryTests(unittest.TestCase):
             audio = recovered.manifest["audio"]
             report = audio_clock_report(audio, recovered.manifest["time"]["duration_seconds"])
             self.assertEqual(report["continuity"], "verified")
+            if raw_clock:
+                self.assertEqual(audio["capture_clock"]["schema"], "openaria.audio-clock.v2")
+                self.assertEqual(report["mapping"], "piecewise-linear")
             self.assertLess(audio["sample_count"], 2 * rate)
             with wave.open(
                 str(recovered.path / audio["segments"][0]["artifact"]["path"]), "rb"

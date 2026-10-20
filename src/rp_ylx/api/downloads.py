@@ -106,7 +106,8 @@ _DEVICE_SESSION_V2_SCHEMA = json.loads(
 _DEVICE_SESSION_V2_SCHEMA["$defs"]["recordedAudio"]["properties"]["capture_clock"] = {
     "type": "object",
     "required": ["schema"],
-    "properties": {"schema": {"const": "openaria.audio-clock.v1"}},
+    # Exact field, source and anchor validation is performed by audio_clock_report.
+    "properties": {"schema": {"enum": ["openaria.audio-clock.v1", "openaria.audio-clock.v2"]}},
 }
 _DEVICE_SESSION_V2_VALIDATOR = _ManifestValidator(
     _DEVICE_SESSION_V2_SCHEMA,

@@ -1,5 +1,6 @@
 mod active_take;
 mod audio;
+mod audio_clock;
 mod audio_checkpoint;
 mod bounded;
 mod capture_runtime;

@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from rp_ylx.audio_clock import audio_clock_report
+from rp_ylx.audio_clock import audio_clock_report, audio_sample_time_ns, raw_audio_clock_model
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     DeviceSessionConfig,
@@ -231,15 +231,41 @@ def _audio(
         return None
     rate, channels = config.audio_sample_rate_hz, config.audio_channels
     anchors = clock.get("anchors", [])
+    raw_clock = clock.get("schema") == "openaria.audio-checkpoint.v2"
+    if clock.get("schema") not in (
+        None,
+        "openaria.audio-checkpoint.v1",
+        "openaria.audio-checkpoint.v2",
+    ):
+        raise ValueError("unsupported audio checkpoint")
     if len(anchors) < 2 or any(
         b[0] <= a[0] or b[1] <= a[1] for a, b in zip(anchors, anchors[1:], strict=False)
     ):
         return None
-    first, last = anchors[0], anchors[-1]
-    slope = (last[1] - first[1]) / (last[0] - first[0])
-    start = first[1] - first[0] * slope
-    target = min(clock["sample_count"], math.floor((origin + video_end * 1e9 - start) / slope))
-    if target <= 0 or abs(1e9 / slope / rate - 1) > 0.01:
+    if raw_clock:
+        # The capture thread may be ahead of the last durable PCM segment.
+        # Validate its observation range, then limit recovery to durable samples
+        # and the observed video boundary using the piecewise host timeline.
+        model = raw_audio_clock_model(
+            anchors, rate, anchors[-1][0], clock["period_frames"], clock["buffer_frames"]
+        )
+        low, high = 0, min(clock["sample_count"], anchors[-1][0])
+        boundary = origin + video_end * 1e9
+        while low < high:
+            middle = (low + high + 1) // 2
+            if audio_sample_time_ns(model["points"], middle) <= boundary:
+                low = middle
+            else:
+                high = middle - 1
+        target = low
+    else:
+        first, last = anchors[0], anchors[-1]
+        slope = (last[1] - first[1]) / (last[0] - first[0])
+        start = first[1] - first[0] * slope
+        target = min(clock["sample_count"], math.floor((origin + video_end * 1e9 - start) / slope))
+        if abs(1e9 / slope / rate - 1) > 0.01:
+            return None
+    if target <= 0:
         return None
     records = []
     samples = 0
@@ -304,14 +330,24 @@ def _audio(
             break
     if len(selected_anchors) < 2 or selected_anchors[-1][0] < samples:
         return None
-    first, last = selected_anchors[0], selected_anchors[-1]
-    slope = (last[1] - first[1]) / (last[0] - first[0])
-    start = first[1] - first[0] * slope
-    end = start + samples * slope
+    if raw_clock:
+        model = raw_audio_clock_model(
+            selected_anchors, rate, samples, clock["period_frames"], clock["buffer_frames"]
+        )
+        start, end = model["start_ns"], model["end_ns"]
+        observed_stop = model["points"][-1][1]
+        residual = model["max_residual_ns"]
+    else:
+        first, last = selected_anchors[0], selected_anchors[-1]
+        slope = (last[1] - first[1]) / (last[0] - first[0])
+        start = first[1] - first[0] * slope
+        end = start + samples * slope
+        observed_stop = last[1]
+        residual = max(abs((t - first[1]) - (n - first[0]) * slope) for n, t in selected_anchors)
     proof = {
-        "schema": "openaria.audio-clock.v1",
+        "schema": "openaria.audio-clock.v2" if raw_clock else "openaria.audio-clock.v1",
         "clock": "host_monotonic",
-        "timestamp_source": "alsa_htimestamp_dma",
+        "timestamp_source": "alsa_htimestamp_dma_raw" if raw_clock else "alsa_htimestamp_dma",
         "continuity": "verified",
         "device": config.audio_device,
         "period_frames": clock["period_frames"],
@@ -320,13 +356,11 @@ def _audio(
         "thread_started_monotonic_ns": clock["thread_started_monotonic_ns"],
         # This is the observed end of the recovered capture window. The full
         # checkpoint keeps the original, longer capture window for diagnosis.
-        "thread_stopped_monotonic_ns": max(last[1], math.ceil(end)),
+        "thread_stopped_monotonic_ns": max(observed_stop, math.ceil(end)),
         "sample_start_monotonic_ns": round(start),
         "sample_end_monotonic_ns": round(end),
         "session_start_monotonic_ns": origin,
-        "max_residual_ns": math.ceil(
-            max(abs((t - first[1]) - (n - first[0]) * slope) for n, t in selected_anchors)
-        ),
+        "max_residual_ns": math.ceil(residual),
         "queue_capacity_frames": clock["queue_capacity_frames"],
         "queue_peak_frames": clock["queue_peak_frames"],
         "max_write_ns": clock["max_write_ns"],
