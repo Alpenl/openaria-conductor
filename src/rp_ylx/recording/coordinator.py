@@ -2616,7 +2616,9 @@ class CaptureCoordinator:
             code = getattr(error, "code", "source_start_failed")
             message = getattr(error, "message", str(error))
             raise ProviderError(str(code), str(message), status=HTTPStatus.CONFLICT) from error
-        self._persist_local_state()
+        # _idempotent persists this state together with the accepted start receipt.
+        # Writing here can fail after sources have started but before that receipt
+        # is remembered, so a same-key retry would incorrectly report capture_busy.
         return CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
 
     def _source_failure(
