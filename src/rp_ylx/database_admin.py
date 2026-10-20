@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
+import stat
 import subprocess
 import uuid
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from rp_ylx.persistence import (
@@ -74,7 +77,32 @@ def _remove_restore_staging(prepared: Path) -> None:
         Path(str(prepared) + suffix).unlink(missing_ok=True)
 
 
+@contextmanager
+def _restore_lock(destination: Path) -> Iterator[None]:
+    # Keep this inode after release. Unlinking a lock file permits waiters and
+    # new callers to lock different inodes for the same destination.
+    lock = destination.with_suffix(destination.suffix + ".restore.lock")
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise PersistenceError("database restore lock must be a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise PersistenceError("database restore is busy; retry after it finishes") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def restore(source: Path, destination: Path) -> dict:
+    # SQLite locks protect transactions, not renames of database and journal
+    # files. Serialize maintenance through final inspection and cleanup.
+    with _restore_lock(destination):
+        return _restore_locked(source, destination)
+
+
+def _restore_locked(source: Path, destination: Path) -> dict:
     require_offline()
     info = inspect(source)
     required = {
