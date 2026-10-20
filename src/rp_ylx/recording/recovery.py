@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from rp_ylx.api.events import validate_recording_state
 from rp_ylx.audio_clock import audio_clock_report, audio_sample_time_ns, raw_audio_clock_model
 from rp_ylx.recording.audio_journal import SCHEMA as AUDIO_JOURNAL_SCHEMA
 from rp_ylx.recording.audio_journal import AudioJournalReader
@@ -41,6 +42,7 @@ from rp_ylx.recording.verified import VerifiedArtifact
 from rp_ylx.recording.verified import identity as verified_identity
 
 RECOVERY_ROLE = "log.recording-recovery"
+MAX_RECOVERY_METADATA_BYTES = 8 * 1024 * 1024
 # Match the live capture audit limit, including the terminating newline.
 _MAX_JOURNAL_LINE_BYTES = 1024 * 1024
 
@@ -74,7 +76,7 @@ def _regular(root: Path, relative: str) -> Path:
 
 def _read_json(root: Path, relative: str) -> dict:
     path = _regular(root, relative)
-    if path.stat().st_size > 8 * 1024 * 1024:
+    if path.stat().st_size > MAX_RECOVERY_METADATA_BYTES:
         raise ValueError("recovery metadata is too large")
     try:
         value = json.loads(path.read_bytes())
@@ -568,7 +570,14 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         }
     try:
         state = _read_json(partial, "recording.json")
-    except (OSError, ValueError):
+        validate_recording_state(state)
+        if (
+            state["session_id"] != plan.session_id
+            or state["storage"]["volume_id"] != plan.volume_id
+            or state["device"]["device_id"] != config.device_id
+        ):
+            raise ValueError("recovery state identity mismatch")
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         state = {}
     diagnostics = state.get("diagnostics") or [
         {"code": "process_interrupted", "message": "录制进程在正常封存前退出"}

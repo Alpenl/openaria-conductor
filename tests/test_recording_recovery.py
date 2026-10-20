@@ -271,6 +271,10 @@ class RecordingRecoveryTests(unittest.TestCase):
             capture = json.loads(capture_path.read_bytes())
             capture["plan"]["volume_id"] = volume_id
             write_json_atomic(capture_path, capture)
+            recording_path = recorder.partial_path / "recording.json"
+            recording = json.loads(recording_path.read_bytes())
+            recording["storage"]["volume_id"] = volume_id
+            write_json_atomic(recording_path, recording)
             config = CoordinatorConfig(
                 volume,
                 root / "state",

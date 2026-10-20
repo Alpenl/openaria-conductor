@@ -670,7 +670,7 @@ def _validate_snapshot_recording(
         recording_state.get("state"), expected_states
     ):
         raise InvalidSourceEvent("snapshot recording_state 与 device_state 不一致")
-    _validate_recording_state(recording_state)
+    validate_recording_state(recording_state)
     if (
         recording_state["authority_epoch"] != source_authority_epoch
         or recording_state["state_revision"] != source_revision
@@ -680,7 +680,8 @@ def _validate_snapshot_recording(
         raise InvalidSourceEvent("snapshot recording_state session_id 与 source event 不一致")
 
 
-def _validate_recording_state(state: Mapping[str, object]) -> None:
+def validate_recording_state(state: object) -> None:
+    """Validate one complete recording checkpoint before using its fields."""
     _validate_finite_json(state)
     try:
         _RECORDING_STATE_VALIDATOR.validate(state)

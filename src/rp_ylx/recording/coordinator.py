@@ -36,6 +36,7 @@ from rp_ylx.api.downloads import (
 from rp_ylx.api.events import (
     InvalidSourceEvent,
     project_device_descriptor,
+    validate_recording_state,
     validate_retained_unsuccessful_outcome,
     validate_safe_swap_v3_receipt,
     validate_session_summary,
@@ -75,7 +76,11 @@ from rp_ylx.recording.device_session import (
     validate_device_session_directory,
     write_json_atomic,
 )
-from rp_ylx.recording.recovery import RECOVERY_ROLE, recover_device_session
+from rp_ylx.recording.recovery import (
+    MAX_RECOVERY_METADATA_BYTES,
+    RECOVERY_ROLE,
+    recover_device_session,
+)
 from rp_ylx.runtime import collect_linux_runtime
 
 
@@ -880,11 +885,31 @@ class CaptureCoordinator:
                 self._recovery_session = dict(identity)
         retained = persisted.get("retained")
         if isinstance(retained, Mapping):
-            self._retained = {
-                str(key): copy.deepcopy(value)
-                for key, value in retained.items()
-                if isinstance(key, str) and isinstance(value, dict)
-            }
+            self._retained = {}
+            rejected = 0
+            for key, value in retained.items():
+                state = value.get("recording_state") if isinstance(value, dict) else None
+                if not isinstance(key, str) or not isinstance(state, Mapping):
+                    rejected += 1
+                    continue
+                try:
+                    validate_retained_unsuccessful_outcome(
+                        {
+                            "schema": "ylx.retained-unsuccessful-session-resource.v2",
+                            "authority_epoch": state.get("authority_epoch"),
+                            "source_revision": state.get("state_revision"),
+                            "outcome": value,
+                        },
+                        session_id=key,
+                    )
+                except (ValueError, KeyError, TypeError, RecursionError):
+                    rejected += 1
+                    continue
+                self._retained[key] = copy.deepcopy(value)
+            if rejected:
+                operational_logger("recording").event(
+                    "retained_outcomes_rejected", level="warning", count=rejected
+                )
         safe_swap = persisted.get("safe_swap_resource")
         if isinstance(safe_swap, dict):
             receipt = safe_swap.get("receipt")
@@ -1221,7 +1246,7 @@ class CaptureCoordinator:
                     return
                 with suppress(OSError):
                     os.unlink("manifest.json", dir_fd=descriptor)
-        self._settle_partial(anchored, session_id)
+        self._settle_partial(anchored, session_id, descriptor=descriptor)
         if self._partial_directory_current(partial, descriptor):
             self._recover_completed_prefix(partial, session_id)
 
@@ -1245,7 +1270,7 @@ class CaptureCoordinator:
                     if os.fstat(session_fd).st_dev != admission.device:
                         raise ValueError("recovery session is on a different device")
                     state, _ = _read_recovery_metadata(
-                        session_fd, ("recovery", "recording.json"), 1024 * 1024
+                        session_fd, ("recovery", "recording.json"), MAX_RECOVERY_METADATA_BYTES
                     )
                     receipt, receipt_bytes = _read_recovery_metadata(
                         session_fd, ("recovery", "interruption.json"), 1024 * 1024
@@ -1360,15 +1385,41 @@ class CaptureCoordinator:
         state["updated_at"] = state["diagnostics"][-1]["at"]
         retained["recording_state"] = state
 
-    def _settle_partial(self, partial: Path, session_id: str) -> None:
+    def _settle_partial(self, partial: Path, session_id: str, *, descriptor: int) -> None:
         admission = self._require_admission()
         with suppress(OSError):
             (partial / "manifest.json").unlink(missing_ok=True)
         try:
-            current = json.loads((partial / "recording.json").read_bytes())
-        except (OSError, ValueError, json.JSONDecodeError):
-            current = None
-        if not isinstance(current, dict):
+            current, _ = _read_recovery_metadata(
+                descriptor, ("recording.json",), MAX_RECOVERY_METADATA_BYTES
+            )
+            validate_recording_state(current)
+            if current["session_id"] != session_id:
+                raise ValueError("partial recording state identity mismatch")
+            # A historical take may have moved to another admitted volume or
+            # device. Compare with its own capture plan, not this daemon's ID.
+            try:
+                capture, _ = _read_recovery_metadata(
+                    descriptor, ("capture.json",), MAX_RECOVERY_METADATA_BYTES
+                )
+            except FileNotFoundError:
+                capture = None
+            if capture is not None and (
+                capture["session_id"] != session_id
+                or capture["plan"]["session_id"] != session_id
+                or current["storage"]["volume_id"] != capture["plan"]["volume_id"]
+                or current["device"]["device_id"] != capture["config"]["device_id"]
+            ):
+                raise ValueError("partial recording state differs from capture plan")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
+            operational_logger("recording").event(
+                "recovery_state_rejected",
+                level="warning",
+                transaction_id=session_id,
+                exception_type=type(error).__name__,
+            )
             return
         if (
             current.get("authority_epoch") == self._authority_epoch
