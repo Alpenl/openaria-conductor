@@ -1447,6 +1447,8 @@ fn start_and_capture(
     // Diagnostic observations never replace or smooth the authoritative anchors.
     let mut clock_observations: Vec<[u64; 5]> = Vec::new();
     let mut observations_omitted = 0_u64;
+    let mut bridge_rejections = 0_u64;
+    let mut rejected_bridges: Vec<crate::audio_clock::Anchor> = Vec::new();
     let mut next_observation_ns = 0;
     let enqueue = |buffer, frames| {
         let queued = progress.queued_frames.fetch_add(frames, Ordering::AcqRel) + frames;
@@ -1470,16 +1472,22 @@ fn start_and_capture(
                 ReadOutcome::Frames(frames) => {
                     sample_count += frames;
                     buffered_frames += frames;
-                    let (position, timestamp) = pcm.clock_anchor(sample_count)?;
-                    if timestamp == 0 {
-                        return Err(AudioError::new("audio_failed", "missing ALSA timestamp"));
-                    }
-                    let before_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
-                    let observed_mono = monotonic_ns()?;
-                    let after_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
-                    let anchor = [position, timestamp, observed_mono, before_raw, after_raw];
-                    let mapped_mono = crate::audio_clock::mapped_ns(&anchor)
-                        .map_err(|message| AudioError::new("audio_failed", message))?;
+                    let (anchor, mapped_mono) = crate::audio_clock::observe_anchor(
+                        || {
+                            let (position, timestamp) = pcm.clock_anchor(sample_count)?;
+                            let before_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
+                            let observed_mono = monotonic_ns()?;
+                            let after_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
+                            Ok([position, timestamp, observed_mono, before_raw, after_raw])
+                        },
+                        |row| {
+                            bridge_rejections += 1;
+                            if rejected_bridges.len() < 64 {
+                                rejected_bridges.push(row);
+                            }
+                        },
+                    )?;
+                    let [position, timestamp, observed_mono, before_raw, after_raw] = anchor;
                     if let Some(clock) = progress.clock_checkpoint.lock().unwrap().as_mut() {
                         clock.last_anchor = Some(anchor);
                     }
@@ -1569,6 +1577,9 @@ fn start_and_capture(
         "clock_observation_fields": ["sample_position", "mapped_monotonic_ns", "observed_monotonic_ns", "observed_raw_ns", "read_samples"],
         "clock_observations": clock_observations,
         "clock_observations_omitted": observations_omitted,
+        "clock_bridge_rejections": bridge_rejections,
+        "rejected_clock_bridges": rejected_bridges,
+        "rejected_clock_bridges_omitted": bridge_rejections.saturating_sub(rejected_bridges.len() as u64),
         "io_histogram_upper_bounds_ns": IO_BUCKET_NS,
         "writer_io": progress.writer_diagnostics.lock().ok().map(|value| value.json()),
         "queue_capacity_frames": QUEUE_BLOCKS as u64 * DEFAULT_PERIOD_FRAMES,

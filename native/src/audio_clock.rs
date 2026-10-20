@@ -30,6 +30,39 @@ pub(crate) fn mapped_ns(anchor: &Anchor) -> Result<u64, String> {
         .ok_or_else(|| "invalid mapped audio clock".into())
 }
 
+/// A delayed clock observation is not itself evidence of lost PCM. Refresh the
+/// ALSA position/timestamp together with the host bracket, at most three times.
+/// Invalid clocks and ALSA errors still fail immediately. Every rejected row is
+/// reported before returning or retrying; continuity is checked independently.
+pub(crate) fn observe_anchor(
+    mut sample: impl FnMut() -> Result<Anchor, crate::audio::AudioError>,
+    mut rejected: impl FnMut(Anchor),
+) -> Result<(Anchor, u64), crate::audio::AudioError> {
+    for attempt in 1..=3 {
+        let anchor = sample()?;
+        match mapped_ns(&anchor) {
+            Ok(mapped) => return Ok((anchor, mapped)),
+            Err(message) => {
+                rejected(anchor);
+                let [position, raw, mono, before, after] = anchor;
+                let retryable = position > 0
+                    && raw > 0
+                    && mono > 0
+                    && raw <= before
+                    && before <= after
+                    && (after - before > 1_000_000 || after - raw > 20_000_000);
+                if !retryable || attempt == 3 {
+                    return Err(crate::audio::AudioError::new(
+                        "audio_failed",
+                        format!("{message}; attempt={attempt}; anchor={anchor:?}"),
+                    ));
+                }
+            }
+        }
+    }
+    unreachable!("bounded clock sampling always returns")
+}
+
 fn sample_time(points: &[[u64; 2]], sample: u64) -> f64 {
     let index = points
         .partition_point(|point| point[0] <= sample)
@@ -162,5 +195,82 @@ mod tests {
         let mut anchors = fixture();
         anchors.drain(100..110);
         assert!(evaluate(&anchors, 48000, 600 * 48000, 1024, 8192).is_err());
+    }
+
+    #[test]
+    fn delayed_observation_refreshes_alsa_position_and_clock_pair() {
+        for wide_bracket in [false, true] {
+            let good = fixture()[1];
+            let mut delayed = fixture()[0];
+            if wide_bracket {
+                delayed[4] += 2_000_000;
+            } else {
+                for value in &mut delayed[2..] {
+                    *value += 30_000_000;
+                }
+            }
+            let mut observations = [delayed, good].into_iter();
+            let mut rejected = Vec::new();
+            let (actual, mapped) = observe_anchor(
+                || Ok(observations.next().expect("unexpected sampling")),
+                |row| rejected.push(row),
+            )
+            .unwrap();
+            assert_eq!(actual, good);
+            assert_eq!(mapped, mapped_ns(&good).unwrap());
+            assert_eq!(rejected, [delayed]);
+        }
+    }
+
+    #[test]
+    fn persistent_observation_delay_is_bounded_and_retains_last_row() {
+        let mut delayed = fixture()[0];
+        delayed[4] += 2_000_000;
+        let mut calls = 0;
+        let mut rejected = Vec::new();
+        let error = observe_anchor(
+            || {
+                calls += 1;
+                Ok(delayed)
+            },
+            |row| rejected.push(row),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        assert_eq!(rejected, [delayed; 3]);
+        assert!(error.message.contains("attempt=3"));
+        assert!(error.message.contains(&format!("anchor={delayed:?}")));
+    }
+
+    #[test]
+    fn invalid_clock_and_pcm_error_are_not_retried() {
+        let mut future = fixture()[0];
+        future[1] = future[4] + 1;
+        let mut calls = 0;
+        let mut rejected = Vec::new();
+        assert!(
+            observe_anchor(
+                || {
+                    calls += 1;
+                    Ok(future)
+                },
+                |row| rejected.push(row),
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(rejected, [future]);
+        let failure = crate::audio::AudioError::new("audio_failed", "ALSA overrun");
+        calls = 0;
+        let error = observe_anchor(
+            || {
+                calls += 1;
+                Err(failure.clone())
+            },
+            |_| panic!("ALSA failure has no clock row"),
+        )
+        .unwrap_err();
+        assert_eq!(error, failure);
+        assert_eq!(calls, 1);
     }
 }
