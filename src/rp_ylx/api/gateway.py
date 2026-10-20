@@ -629,14 +629,24 @@ class _StreamRegistry:
         with self._condition:
             session_id = self._next_id
             self._next_id += 1
-            session = _StreamSession(
-                self,
-                session_id,
-                kind,
-                connection,
-                slot,
-                wake_waiters,
-            )
+            try:
+                session = _StreamSession(
+                    self,
+                    session_id,
+                    kind,
+                    connection,
+                    slot,
+                    wake_waiters,
+                )
+            except RuntimeError:
+                # Thread creation can fail transiently. No session owns the
+                # admission slot yet, so return it and use the existing 503.
+                slot.release()
+                self._rejected[kind] += 1
+                return None
+            except BaseException:
+                slot.release()
+                raise
             self._active[session_id] = session
             return session
 
