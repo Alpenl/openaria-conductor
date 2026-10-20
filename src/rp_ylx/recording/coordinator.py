@@ -631,6 +631,7 @@ class CaptureCoordinator:
         self._before_write = before_write
         self._lock = threading.RLock()
         self._stop_condition = threading.Condition(self._lock)
+        self._close_lock = threading.Lock()
         self._state_persist_lock = threading.Lock()
         self._state_write_sequence = 0
         self._state_persisted_sequence = 0
@@ -3988,6 +3989,12 @@ class CaptureCoordinator:
             ) from error
 
     def close(self) -> None:
+        # Serialize close callers without holding the lock used by recorder
+        # checkpoint revision callbacks while joining the recorder's threads.
+        with self._close_lock:
+            self._close_capture()
+
+    def _close_capture(self) -> None:
         with self._stop_condition:
             self._closing = True
         if self._sources is not None:
@@ -4006,10 +4013,15 @@ class CaptureCoordinator:
                 or self._async_stop_worker is not None
             ):
                 self._stop_condition.wait()
-            try:
-                if self._active is not None:
-                    self._active.abort()
-                    state = self._active.current_recording_state
+            active = self._active
+            if active is not None:
+                self._stop_inflight = ("internal", "close", "shutdown")
+        try:
+            if active is not None:
+                active.abort()
+            with self._stop_condition:
+                if active is not None:
+                    state = active.current_recording_state
                     if state is not None and self._active_plan is not None:
                         self._retained[self._active_plan.session_id] = {
                             "generation_id": self._active_plan.generation_id,
@@ -4019,8 +4031,11 @@ class CaptureCoordinator:
                     self._active_plan = None
                     self._latest_imu = None
                 self._persist_local_state()
-            finally:
+        finally:
+            with self._stop_condition:
+                self._stop_inflight = None
                 self._release_network_operation_lease()
+                self._stop_condition.notify_all()
 
     def __enter__(self) -> CaptureCoordinator:
         return self
