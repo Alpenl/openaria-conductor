@@ -687,6 +687,11 @@ class DeviceSessionRecorder:
         self._enqueue_timeout = enqueue_timeout
         self._checkpoint_interval = checkpoint_interval
         self._lock = threading.RLock()
+        # Serialize durable state and its callback without holding the status
+        # lock during filesystem I/O. A late checkpoint must not replace a
+        # newer finalizing state, either on disk or in the coordinator cache.
+        self._state_write_lock = threading.RLock()
+        self._writer_stopping = threading.Event()
         self._counter_lock = threading.Lock()
         self._state = "new"
         self._partial = self._root / f"{plan.session_id}.partial"
@@ -838,16 +843,17 @@ class DeviceSessionRecorder:
         diagnostics: list[Mapping[str, object]] | None = None,
         storage: StorageStatus | None = None,
     ) -> Mapping[str, object]:
-        document = self._state_document(
-            state,
-            diagnostics=[] if diagnostics is None else diagnostics,
-            storage=storage,
-        )
-        write_json_atomic(self._partial / "recording.json", document)
-        with self._lock:
-            self._current_state = document
-        self._state_sink(document)
-        return document
+        with self._state_write_lock:
+            document = self._state_document(
+                state,
+                diagnostics=[] if diagnostics is None else diagnostics,
+                storage=storage,
+            )
+            write_json_atomic(self._partial / "recording.json", document)
+            with self._lock:
+                self._current_state = document
+            self._state_sink(document)
+            return document
 
     def _verification_progress(self, completed: int, total: int) -> None:
         # This is live progress, not a recovery checkpoint. Avoid fsync for each
@@ -1411,23 +1417,30 @@ class DeviceSessionRecorder:
             raise failure
 
     def _checkpoint_if_due(self) -> None:
-        now = time.monotonic()
-        if (
-            self._checkpoint_interval > 0
-            and now - self._last_checkpoint < self._checkpoint_interval
-        ):
-            return
-        try:
-            self._persist_state("recording")
-        except BaseException as error:
-            code, _, _ = _failure_details(error)
-            raise DeviceRecordingError(code, f"录制状态 checkpoint 失败：{error}") from error
-        self._last_checkpoint = now
+        with self._state_write_lock:
+            if self._writer_stopping.is_set() or self._state != "recording":
+                return
+            now = time.monotonic()
+            if (
+                self._checkpoint_interval > 0
+                and now - self._last_checkpoint < self._checkpoint_interval
+            ):
+                return
+            try:
+                self._persist_state("recording")
+            except BaseException as error:
+                code, _, _ = _failure_details(error)
+                raise DeviceRecordingError(code, f"录制状态 checkpoint 失败：{error}") from error
+            # Slow storage must not cause an immediate catch-up checkpoint.
+            self._last_checkpoint = time.monotonic()
 
     def _stop_writer(self) -> None:
         writer = self._writer
         if writer is None:
             return
+        # Drain accepted media; lifecycle transitions and segment checkpoints
+        # retain durability without writing recording progress for every item.
+        self._writer_stopping.set()
         while writer.is_alive():
             if self._queue_put(_STOP, 0.1):
                 break
