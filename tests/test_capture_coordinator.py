@@ -4342,8 +4342,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 condition.release()
                 try:
                     waiter_awake.set()
-                    if not release_waiter.wait(4):
-                        raise TimeoutError("queued stop did not resume")
+                    # This gate selects a schedule, not a product timeout.
+                    # The owner releases it after new-take admission or in
+                    # finally; slow storage must not cancel the old request.
+                    release_waiter.wait()
                 finally:
                     condition.acquire()
             return result
@@ -4380,6 +4382,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 release_waiter.set()
                 late.join(4)
                 self.assertFalse(late.is_alive())
+                if reason != "safe_swap":
+                    self.assertNotIn("late", errors)
                 self.assertIsNotNone(coordinator._active_plan, "queued stop affected the new take")
                 self.assertEqual(self.active_session_id(coordinator), new_session)
                 self.assertEqual(
@@ -4394,7 +4398,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             release_manifest.set()
             release_waiter.set()
             for thread in threads:
-                thread.join(5)
+                if thread.ident is not None:
+                    thread.join(5)
             coordinator.close()
 
     def test_queued_old_stop_does_not_stop_a_new_take(self):
@@ -4403,6 +4408,30 @@ class CaptureCoordinatorTest(unittest.TestCase):
         self.assertEqual(results["late"].status, 204)
         self.assertEqual(results["repeated_late"].status, 204)
         self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_stop_survives_slow_new_take_start(self):
+        original = CaptureCoordinator.start_capture
+
+        def slow_new_start(coordinator, command):
+            if command.idempotency_key == "queued-new-start":
+                # The test controls when the queued request resumes. Storage
+                # latency while admitting the next take must not expire it.
+                time.sleep(4.2)
+            return original(coordinator, command)
+
+        with patch.object(CaptureCoordinator, "start_capture", slow_new_start):
+            results, errors = self._queued_stop_after_new_take()
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 204)
+        self.assertEqual(results["repeated_late"].status, 204)
+        self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_stop_cleanup_preserves_early_failure(self):
+        with (
+            patch.object(CaptureCoordinator, "stop_capture", side_effect=OSError("early stop")),
+            self.assertRaises(AssertionError),
+        ):
+            self._queued_stop_after_new_take()
 
     def test_queued_safe_swap_cannot_release_a_new_take(self):
         results, errors = self._queued_stop_after_new_take(reason="safe_swap")
