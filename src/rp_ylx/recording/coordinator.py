@@ -185,6 +185,9 @@ GATEWAY_VERIFICATION_DIAGNOSTICS = {
 @dataclass(frozen=True, slots=True)
 class _VerifiedSessionSnapshot:
     manifest_sha256: str
+    manifest_id: str
+    volume_id: str
+    sealed_at: str
     manifest_identity: tuple[int, int, int, int, int, int, int]
     artifact_identities: tuple[tuple[str, tuple[int, int, int, int, int, int, int]], ...]
 
@@ -911,6 +914,21 @@ class CaptureCoordinator:
                     "retained_outcomes_rejected", level="warning", count=rejected
                 )
         safe_swap = persisted.get("safe_swap_resource")
+        if safe_swap is not None:
+            try:
+                if (
+                    not isinstance(safe_swap, dict)
+                    or set(safe_swap) != {"schema", "receipt"}
+                    or safe_swap["schema"] != "ylx.safe-swap-receipt-resource.v3"
+                    or not isinstance(safe_swap["receipt"], dict)
+                ):
+                    raise ValueError("invalid persisted safe-swap resource")
+                validate_safe_swap_v3_receipt(safe_swap["receipt"])
+            except (ValueError, KeyError, TypeError, RecursionError):
+                operational_logger("recording").event(
+                    "safe_swap_state_rejected", level="warning", field="safe_swap_resource"
+                )
+                safe_swap = None
         if isinstance(safe_swap, dict):
             receipt = safe_swap.get("receipt")
             if (
@@ -922,6 +940,33 @@ class CaptureCoordinator:
                 self._safe_swap_resource = copy.deepcopy(safe_swap)
                 self._released = True
         pending = persisted.get("pending_safe_swap")
+        if pending is not None:
+            try:
+                if not isinstance(pending, dict) or set(pending) != {
+                    "session_id",
+                    "volume_id",
+                    "generation_id",
+                    "manifest_id",
+                    "manifest_sha256",
+                    "sealed_at",
+                }:
+                    raise ValueError("invalid persisted safe-swap intent")
+                # Reuse the frozen receipt field rules for the six intent fields.
+                # This validates metadata only; publication still verifies media.
+                validate_safe_swap_v3_receipt(
+                    {
+                        **pending,
+                        "schema": "ylx.safe-swap-receipt.v3",
+                        "released_at": pending["sealed_at"],
+                        "release_state": "device-released",
+                        "open_handle_count": 0,
+                    }
+                )
+            except (ValueError, KeyError, TypeError, RecursionError):
+                operational_logger("recording").event(
+                    "safe_swap_state_rejected", level="warning", field="pending_safe_swap"
+                )
+                pending = None
         if (
             admission is not None
             and isinstance(pending, dict)
@@ -1504,6 +1549,9 @@ class CaptureCoordinator:
                     ) from error
                 return _VerifiedSessionSnapshot(
                     manifest_sha256=manifest_sha256,
+                    manifest_id=manifest["manifest_id"],
+                    volume_id=manifest["volume_id"],
+                    sealed_at=manifest["sealed_at"],
                     manifest_identity=manifest_identity,
                     artifact_identities=artifact_identities,
                 )
@@ -3950,6 +3998,9 @@ class CaptureCoordinator:
             if (
                 snapshot is None
                 or snapshot.manifest_sha256 != expected_digest
+                or snapshot.manifest_id != pending["manifest_id"]
+                or snapshot.volume_id != pending["volume_id"]
+                or snapshot.sealed_at != pending["sealed_at"]
                 or self._verified.get(session_id) != expected_digest
                 or not self._session_payload_is_current(session_id, snapshot)
             ):
