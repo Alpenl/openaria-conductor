@@ -661,6 +661,7 @@ class CaptureCoordinator:
         self._async_stop_reason: str | None = None
         self._failure_inflight: DeviceSessionRecorder | None = None
         self._failure_projection: dict[str, object] | None = None
+        self._failure_pending_commit: DeviceSessionRecorder | None = None
         self._cached_active_state: Mapping[str, object] | None = None
         self._pending_source_failure: DeviceRecordingError | None = None
         self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
@@ -705,7 +706,7 @@ class CaptureCoordinator:
     @property
     def open_handle_count(self) -> int:
         with self._lock:
-            if self._failure_inflight is not None:
+            if self._failure_projection is not None:
                 # Recovery owns the volume even while individual handles close.
                 # Do not acquire the recorder lock while it waits for storage.
                 return 1 + self._open_representations
@@ -956,6 +957,11 @@ class CaptureCoordinator:
         with self._lock:
             if self._active_plan is plan:
                 self._cached_active_state = copy.deepcopy(state)
+                if self._failure_inflight is not None:
+                    # The recorder checkpoint is already written separately.
+                    # Publish coordinator state once recovery has its outcome;
+                    # an intermediate DB error must not abort that recovery.
+                    return
         self._persist_local_state()
 
     def _next_revision(self) -> int:
@@ -1880,7 +1886,7 @@ class CaptureCoordinator:
                 if (
                     (
                         active is None
-                        or self._failure_inflight is not None
+                        or self._failure_projection is not None
                         or (self._active is not None and self._active.state == "sealed")
                     )
                     and runtime["live_imu"] is not None
@@ -2434,6 +2440,7 @@ class CaptureCoordinator:
             return CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
         if (
             self._failure_inflight is not None
+            or self._failure_projection is not None
             or self._async_stop_worker is not None
             or self._closing
         ):
@@ -2678,7 +2685,7 @@ class CaptureCoordinator:
                 self._active_plan is None
                 or self._closing
                 or self._stop_inflight is not None
-                or self._failure_inflight is not None
+                or self._failure_projection is not None
             ):
                 return
             plan = self._active_plan
@@ -2768,6 +2775,7 @@ class CaptureCoordinator:
         """
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
+        retry_receipt: CaptureCommandResult | None = None
         with self._stop_condition:
             if self._closing:
                 raise ProviderError(
@@ -2795,9 +2803,28 @@ class CaptureCoordinator:
                     == self._pending_safe_swap["session_id"]
                 ):
                     return self._request_pending_safe_swap(command, scope, replay=result)
-                return CaptureCommandResult(
-                    result.status, copy.deepcopy(result.body), replayed=True
-                )
+                if (
+                    self._failure_pending_commit is self._active
+                    and self._active_plan is not None
+                    and self._async_stop_worker is None
+                    and self._stop_inflight is None
+                    and self._failure_inflight is None
+                    and result.status == HTTPStatus.ACCEPTED
+                    and isinstance(result.body, Mapping)
+                    and isinstance(
+                        retry_active := result.body.get("snapshot", {}).get("active_recording"),
+                        Mapping,
+                    )
+                    and retry_active.get("recording_state", {}).get("session_id")
+                    == self._active_plan.session_id
+                ):
+                    # The receipt accepted this exact take's stop, but its
+                    # background commit failed. Re-arm only that unfinished work.
+                    retry_receipt = result
+                else:
+                    return CaptureCommandResult(
+                        result.status, copy.deepcopy(result.body), replayed=True
+                    )
             if self._async_stop_worker is not None:
                 if reason != self._async_stop_reason:
                     raise ProviderError(
@@ -2827,7 +2854,13 @@ class CaptureCoordinator:
                 )
             recorder, plan = self._active, self._active_plan
             assert plan is not None
-            result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+            result = (
+                CaptureCommandResult(
+                    retry_receipt.status, copy.deepcopy(retry_receipt.body), replayed=True
+                )
+                if retry_receipt is not None
+                else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+            )
             old_commands = dict(self._commands)
 
             def finish() -> None:
@@ -2889,7 +2922,8 @@ class CaptureCoordinator:
                     retryable=True,
                 ) from error
             try:
-                self._remember_command(scope, command, result)
+                if retry_receipt is None:
+                    self._remember_command(scope, command, result)
             except BaseException:
                 # The gated worker observes cancellation when this lock exits.
                 # Keep the active recorder and its leases available for retry.
@@ -3115,6 +3149,18 @@ class CaptureCoordinator:
                 duration_ms=(time.monotonic() - stop_started) * 1000,
             )
 
+            with self._lock:
+                retry_failure_commit = self._failure_pending_commit is recorder
+            if retry_failure_commit:
+                # Recovery already completed. Retry its durable publication,
+                # never call stop() on the failed recorder or recover it twice.
+                self._commit_active_failure(recorder)
+                result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                if remember_result:
+                    with self._lock:
+                        self._remember_command(scope, command, result)
+                return result
+
             try:
                 with self._lock:
                     pending_failure = self._pending_source_failure
@@ -3268,7 +3314,10 @@ class CaptureCoordinator:
             recorder = self._active
             if recorder is None or plan is None or self._active_plan is not plan:
                 return
-            if self._failure_inflight is not None:
+            if (
+                self._failure_inflight is not None
+                or self._failure_pending_commit is recorder
+            ):
                 return
             if self._stop_inflight is not None and not from_stop:
                 # stop() may join this callback's source thread. Its owner will
@@ -3307,7 +3356,8 @@ class CaptureCoordinator:
             finally:
                 with self._stop_condition:
                     self._failure_inflight = None
-                    self._failure_projection = None
+                    if self._failure_pending_commit is not recorder:
+                        self._failure_projection = None
                     self._stop_condition.notify_all()
 
         if defer_recovery:
@@ -3369,10 +3419,18 @@ class CaptureCoordinator:
             if not media_lost and recovered is not None:
                 self._verified[plan.session_id] = recovered.manifest_sha256
                 self._record_saved_prefix(plan.session_id, recovered.manifest)
-        # Active/lease remain reserved until the durable state is committed.
-        # Status uses the finalizing projection while recovery and SQLite wait.
+            self._failure_pending_commit = recorder
+        self._commit_active_failure(recorder)
+
+    def _commit_active_failure(self, recorder: DeviceSessionRecorder) -> None:
+        # A failed write retains the projection and ownership for an explicit
+        # stop retry. No worker is claimed while storage is unavailable.
         self._persist_local_state()
         with self._lock:
+            assert self._active is recorder and self._failure_pending_commit is recorder
+            self._failure_pending_commit = None
+            if self._failure_inflight is None:
+                self._failure_projection = None
             self._active = None
             self._active_plan = None
             self._cached_active_state = None
@@ -3447,7 +3505,7 @@ class CaptureCoordinator:
         with self._lock:
             if self._active is None:
                 raise DeviceRecordingError("invalid_state", "当前没有活动录制")
-            if self._failure_inflight is not None:
+            if self._failure_projection is not None:
                 raise DeviceRecordingError("invalid_state", "录制正在收尾")
             try:
                 self._check_generation(generation_id or self._active_plan.generation_id)
@@ -3494,7 +3552,7 @@ class CaptureCoordinator:
         with self._lock:
             if self._active is None:
                 raise DeviceRecordingError("invalid_state", "当前没有活动录制")
-            if self._failure_inflight is not None:
+            if self._failure_projection is not None:
                 raise DeviceRecordingError("invalid_state", "录制正在收尾")
             try:
                 self._check_generation(generation_id or self._active_plan.generation_id)
@@ -3627,7 +3685,7 @@ class CaptureCoordinator:
 
     def artifact_io_state(self) -> str | None:
         with self._lock:
-            if self._failure_inflight is not None:
+            if self._failure_projection is not None:
                 return "finalizing"
             if self._active is not None:
                 return self._active.state
@@ -4030,6 +4088,8 @@ class CaptureCoordinator:
                     self._active = None
                     self._active_plan = None
                     self._latest_imu = None
+                    self._failure_pending_commit = None
+                    self._failure_projection = None
                 self._persist_local_state()
         finally:
             with self._stop_condition:

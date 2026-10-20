@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -3976,6 +3977,279 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     coordinator._failure_inflight = None
                     coordinator._failure_projection = None
                     coordinator._stop_condition.notify_all()
+            coordinator.close()
+
+    def test_failed_recovery_sqlite_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(sqlite3.OperationalError("database full"))
+
+    def test_failed_recovery_io_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(OSError("state storage unavailable"))
+
+    def test_failed_recovery_persistence_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(coordinator_module.PersistenceError("state write"))
+
+    def test_failed_recovery_commit_retry_keeps_status_responsive_and_waiters_ordered(self):
+        coordinator = self.coordinator()
+        entered, release, waiter_blocked = threading.Event(), threading.Event(), threading.Event()
+        threads, errors, results = [], [], []
+        try:
+            coordinator.start_capture(start_command("slow-failure-commit"))
+            sid = self.active_session_id(coordinator)
+            recorder = coordinator._active
+            original = coordinator._state_db.put_capture_state
+            original_wait = coordinator._stop_condition.wait
+            first = True
+
+            def write(value, *args):
+                nonlocal first
+                if sid in value["retained"]:
+                    if first:
+                        first = False
+                        raise sqlite3.OperationalError("injected failure")
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("commit retry was not released")
+                return original(value, *args)
+
+            def wait(timeout=None):
+                waiter_blocked.set()
+                return original_wait(timeout)
+
+            def stop(key):
+                try:
+                    results.append(coordinator.stop_capture(stop_command(key)))
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.object(coordinator._state_db, "put_capture_state", side_effect=write),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "slow commit fault"
+                    )
+                owner = threading.Thread(target=stop, args=("commit-owner",))
+                threads.append(owner)
+                owner.start()
+                self.assertTrue(entered.wait(1))
+                with patch.object(coordinator._stop_condition, "wait", side_effect=wait):
+                    waiter = threading.Thread(target=stop, args=("commit-waiter",))
+                    threads.append(waiter)
+                    waiter.start()
+                    self.assertTrue(waiter_blocked.wait(1))
+                    before = time.monotonic()
+                    status = coordinator.capture_status()
+                    self.assertLess(time.monotonic() - before, 0.25)
+                    validate_capture_status(status)
+                    self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                    self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                    self.assert_network_operation_lock_held()
+                    with self.assertRaises(ProviderError) as busy:
+                        coordinator.start_capture(start_command("during-commit-retry"))
+                    self.assertEqual(busy.exception.code, "capture_busy")
+                    self.assertTrue(owner.is_alive())
+                    self.assertTrue(waiter.is_alive())
+                    release.set()
+                    for thread in threads:
+                        thread.join(3)
+                        self.assertFalse(thread.is_alive())
+                self.assertEqual(fail.call_count, 1)
+            self.assertEqual(errors, [])
+            self.assertEqual([result.status for result in results], [204, 204])
+            validate_capture_status(coordinator.capture_status())
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(4)
+            coordinator.close()
+
+    def test_failure_commit_does_not_admit_new_capture_before_owner_exits(self):
+        coordinator = self.coordinator()
+        committed, release = threading.Event(), threading.Event()
+        errors, worker = [], None
+        try:
+            coordinator.start_capture(start_command("failure-owner-handoff"))
+            original = coordinator._commit_active_failure
+
+            def commit(recorder):
+                original(recorder)
+                committed.set()
+                if not release.wait(5):
+                    raise TimeoutError("failure owner not released")
+
+            def fail():
+                try:
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "fault"
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch.object(coordinator, "_commit_active_failure", side_effect=commit):
+                worker = threading.Thread(target=fail)
+                worker.start()
+                self.assertTrue(committed.wait(1))
+                self.assertIsNone(coordinator._active)
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("before-failure-owner-exits"))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                release.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            coordinator.start_capture(start_command("after-failure-owner-exits"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            release.set()
+            if worker is not None:
+                worker.join(4)
+            coordinator.close()
+
+    def test_async_stop_replay_retries_uncommitted_failure_without_changing_receipt(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("async-failure-commit"))
+            recorder = coordinator._active
+            original = coordinator._state_db.put_capture_state
+            command = stop_command("async-failure-commit-stop")
+            worker_failures = 0
+
+            def write(value, *args):
+                nonlocal worker_failures
+                if threading.current_thread().name == "rp-ylx-stop-finalization":
+                    worker_failures += 1
+                    if worker_failures == 1:
+                        raise sqlite3.OperationalError("first background commit failed")
+                return original(value, *args)
+
+            def wait_worker():
+                deadline = time.monotonic() + 5
+                with coordinator._stop_condition:
+                    while coordinator._async_stop_worker is not None:
+                        remaining = deadline - time.monotonic()
+                        self.assertGreater(remaining, 0, "stop worker did not finish")
+                        coordinator._stop_condition.wait(remaining)
+
+            with patch.object(recorder, "fail", wraps=recorder.fail) as failed:
+                with (
+                    patch.object(
+                        coordinator._state_db,
+                        "put_capture_state",
+                        side_effect=sqlite3.OperationalError("initial failure commit"),
+                    ),
+                    self.assertRaises(sqlite3.OperationalError),
+                ):
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "original async fault"
+                    )
+                with patch.object(coordinator._state_db, "put_capture_state", side_effect=write):
+                    accepted = coordinator.request_stop_capture(command)
+                    self.assertEqual(accepted.status, 202)
+                    wait_worker()
+                    self.assertIs(coordinator._active, recorder)
+                    validate_capture_status(coordinator.capture_status())
+                    replay = coordinator.request_stop_capture(command)
+                    self.assertTrue(replay.replayed)
+                    self.assertEqual(replay.body, accepted.body)
+                    wait_worker()
+                    self.assertIsNone(coordinator._active)
+                self.assertEqual(failed.call_count, 1)
+            self.assertEqual(worker_failures, 2)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["message"], "original async fault")
+            self.assert_network_operation_lock_available()
+            coordinator.start_capture(start_command("new-take-after-async-retry"))
+            next_recorder = coordinator._active
+            with (
+                patch.object(
+                    coordinator._state_db,
+                    "put_capture_state",
+                    side_effect=sqlite3.OperationalError("next take commit"),
+                ),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                coordinator._source_failure(
+                    coordinator.generation_id, "audio_failed", "next take fault"
+                )
+            stale = coordinator.request_stop_capture(command)
+            self.assertTrue(stale.replayed)
+            self.assertEqual(stale.body, accepted.body)
+            self.assertIs(coordinator._active, next_recorder)
+            self.assertIsNone(coordinator._async_stop_worker)
+            self.assert_network_operation_lock_held()
+            self.assertEqual(
+                coordinator.stop_capture(stop_command("next-take-failure-commit")).status, 204
+            )
+        finally:
+            coordinator.close()
+
+    def _check_failed_recovery_commit_retry(self, injected):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("failure-state-commit"))
+            recorder = coordinator._active
+            sid = self.active_session_id(coordinator)
+            original = coordinator._state_db.put_capture_state
+            command = stop_command("retry-failure-state")
+
+            def fail_retained(value, *args):
+                if sid in value["retained"]:
+                    raise injected
+                return original(value, *args)
+
+            with patch.object(recorder, "fail", wraps=recorder.fail) as fail:
+                with patch.object(
+                    coordinator._state_db, "put_capture_state", side_effect=fail_retained
+                ):
+                    with self.assertRaises(type(injected)):
+                        coordinator._source_failure(
+                            coordinator.generation_id, "encoder_failed", "original encoder fault"
+                        )
+                    status = coordinator.capture_status()
+                    validate_capture_status(status)
+                    self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                    self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                    self.assertIsNone(coordinator._failure_inflight)
+                    self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                    self.assert_network_operation_lock_held()
+                    with self.assertRaises(ProviderError) as busy:
+                        coordinator.start_capture(start_command("must-wait-for-failure-commit"))
+                    self.assertEqual(busy.exception.code, "capture_busy")
+                    # Duplicate source callbacks must not repeat recovery or replace its cause.
+                    coordinator._source_failure(coordinator.generation_id, "duplicate", "ignored")
+                    for _ in range(2):
+                        with self.assertRaises(type(injected)):
+                            coordinator.stop_capture(command)
+                        validate_capture_status(coordinator.capture_status())
+                        self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                        self.assert_network_operation_lock_held()
+                        self.assertIsNone(coordinator._stop_inflight)
+                    self.assertEqual(fail.call_count, 1)
+                self.assertEqual(coordinator.stop_capture(command).status, 204)
+                self.assertTrue(coordinator.stop_capture(command).replayed)
+                self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._active)
+            self.assertIsNone(coordinator._failure_projection)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["code"], "encoder_failed")
+            self.assertEqual(retained["diagnostics"][0]["message"], "original encoder fault")
+            self.assert_network_operation_lock_available()
+            coordinator.close()
+            coordinator = self.coordinator()
+            self.assertTrue(coordinator.stop_capture(command).replayed)
+            persisted = coordinator.retained_unsuccessful_outcome(sid)["outcome"]["recording_state"]
+            self.assertEqual(persisted["diagnostics"][0]["message"], "original encoder fault")
+            coordinator.start_capture(start_command("after-failure-state-commit"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
             coordinator.close()
 
     def test_failed_recovery_is_not_scanned_twice_before_returning_idle(self):
