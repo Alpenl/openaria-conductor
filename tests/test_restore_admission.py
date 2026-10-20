@@ -65,7 +65,7 @@ class RestoreAdmissionTest(unittest.TestCase):
 
     def test_schema_damage_in_actual_copy_is_rejected_before_archival(self):
         target = self.target("state.sqlite3", "capture")
-        original = StateDatabase.backup
+        original = StateDatabase.backup_readonly
 
         def corrupted_backup(source, destination):
             original(source, destination)
@@ -73,7 +73,7 @@ class RestoreAdmissionTest(unittest.TestCase):
                 db.execute("DROP TABLE transfers")
 
         with (
-            patch.object(StateDatabase, "backup", corrupted_backup),
+            patch.object(StateDatabase, "backup_readonly", corrupted_backup),
             self.assertRaises(PersistenceError),
         ):
             database_admin.restore(self.source.path, target.path)
@@ -81,7 +81,7 @@ class RestoreAdmissionTest(unittest.TestCase):
 
     def test_wrong_identity_of_actual_copy_is_rejected_before_archival(self):
         target = self.target("state.sqlite3", "capture")
-        original = StateDatabase.backup
+        original = StateDatabase.backup_readonly
         for pragma, value in (
             ("application_id", APPLICATION_ID + 1),
             ("user_version", SCHEMA_VERSION + 1),
@@ -94,7 +94,7 @@ class RestoreAdmissionTest(unittest.TestCase):
                         db.execute(f"PRAGMA {pragma}={value}")
 
                 with (
-                    patch.object(StateDatabase, "backup", wrong_identity),
+                    patch.object(StateDatabase, "backup_readonly", wrong_identity),
                     self.assertRaises(PersistenceError),
                 ):
                     database_admin.restore(self.source.path, target.path)

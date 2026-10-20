@@ -16,7 +16,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import closing, contextmanager, suppress
+from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -486,13 +486,40 @@ class StateDatabase:
 
     def backup(self, destination: Path) -> None:
         """Copy committed WAL data, then publish a complete, non-overwriting backup."""
+        self._backup(destination, self.connection)
+
+    @staticmethod
+    def backup_readonly(source_path: Path, destination: Path) -> None:
+        """Copy existing authority without initializing or changing source permissions."""
+
+        @contextmanager
+        def connection() -> Iterator[sqlite3.Connection]:
+            db = sqlite3.connect(source_path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                if (
+                    db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
+                    or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                ):
+                    raise PersistenceError("unsupported backup source identity or schema")
+                validate_state_schema(db)
+                yield db
+            finally:
+                db.close()
+
+        StateDatabase._backup(destination, connection)
+
+    @staticmethod
+    def _backup(
+        destination: Path,
+        connection: Callable[[], AbstractContextManager[sqlite3.Connection]],
+    ) -> None:
         if os.path.lexists(destination):
             raise FileExistsError(errno.EEXIST, "backup destination already exists", destination)
         temporary = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         try:
-            with self.connection() as source:
+            with connection() as source:
                 target = sqlite3.connect(temporary)
                 try:
                     # SQLite's backup API retries BUSY/LOCKED independently of
@@ -506,8 +533,20 @@ class StateDatabase:
                             raise PersistenceError("state database backup copy deadline exceeded")
 
                     source.backup(target, pages=128, progress=check_deadline, sleep=0.05)
+                    if (
+                        target.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
+                        or target.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                    ):
+                        raise PersistenceError("unsupported backup snapshot identity or schema")
+                    validate_state_schema(target)
                     if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                         raise PersistenceError("backup integrity check failed")
+                    # Only the private copy changes journal mode. The source
+                    # may be live WAL; its committed pages are included above.
+                    # A standalone backup must not need writable WAL/SHM files
+                    # merely to inspect or restore it from a read-only location.
+                    if target.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                        raise PersistenceError("backup snapshot is not self-contained")
                 finally:
                     target.close()
             with temporary.open("rb") as stream:

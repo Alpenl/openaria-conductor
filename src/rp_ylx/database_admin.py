@@ -86,7 +86,7 @@ def restore(source: Path, destination: Path) -> dict:
         raise ValueError("source and destination must differ")
     token = uuid.uuid4().hex
     prepared = destination.with_name(destination.name + ".restore-" + token)
-    StateDatabase(source).backup(prepared)
+    StateDatabase.backup_readonly(source, prepared)
     archived = []
     try:
         # The source can change after its initial inspection. Only the copied
@@ -137,7 +137,7 @@ def manage(path: Path, action: str, *, source: Path | None, destination: Path | 
     if action == "backup":
         if destination is None:
             raise ValueError("--output is required")
-        StateDatabase(path).backup(destination)
+        StateDatabase.backup_readonly(path, destination)
         return {"backup": str(destination), **inspect(destination)}
     if action == "restore":
         if source is None:
