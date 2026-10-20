@@ -70,6 +70,15 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _require_regular_database_file(path: Path) -> None:
+    # Inspect metadata only: opening and closing another descriptor for this
+    # inode could release SQLite's process-wide POSIX locks. This rejects
+    # existing special files and final-component links, not hostile concurrent
+    # path replacement; database directories must remain trusted.
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise PersistenceError("database must be a regular file")
+
+
 def _sync_parent(path: Path) -> None:
     fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -212,6 +221,8 @@ class StateDatabase:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
+        # Recheck on every open; the path may have changed since initialization.
+        _require_regular_database_file(self.path)
         # mode=rw prevents a removed authority from being silently recreated.
         db = sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
         try:
@@ -494,6 +505,7 @@ class StateDatabase:
 
         @contextmanager
         def connection() -> Iterator[sqlite3.Connection]:
+            _require_regular_database_file(source_path)
             db = sqlite3.connect(source_path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
             try:
                 if (

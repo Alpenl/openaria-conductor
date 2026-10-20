@@ -14,6 +14,7 @@ from rp_ylx.persistence import (
     SCHEMA_VERSION,
     PersistenceError,
     StateDatabase,
+    _require_regular_database_file,
     _sync_parent,
     validate_state_schema,
 )
@@ -42,6 +43,7 @@ def require_offline() -> None:
 
 
 def inspect(path: Path) -> dict:
+    _require_regular_database_file(path)
     db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)
     try:
         if (
