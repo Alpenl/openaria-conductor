@@ -869,6 +869,33 @@ class CaptureCoordinator:
                         CaptureCommandResult(status, body, replayed=False),
                     )
 
+        # Older firmware persisted deletion receipts without retiring retained
+        # failures. Only successful deletions are evidence to remove an outcome;
+        # absent media alone must not erase a legitimate interrupted recording.
+        for (_, operation, _), (_, result) in self._commands.items():
+            body = result.body
+            if (
+                operation == "delete"
+                and result.status == HTTPStatus.OK
+                and isinstance(body, Mapping)
+                and body.get("schema") == "ylx.session-delete-result.v1"
+            ):
+                deleted = body.get("deleted_session_ids")
+                if isinstance(deleted, list) and all(isinstance(sid, str) for sid in deleted):
+                    self._forget_deleted_outcomes(deleted)
+
+    def _forget_deleted_outcomes(self, session_ids: list[str]) -> None:
+        removed = self._retained.keys() & set(session_ids)
+        if not removed:
+            return
+        visible = self._recording_snapshot()[3]
+        for session_id in removed:
+            del self._retained[session_id]
+        if visible is not None and visible["recording_state"]["session_id"] in removed:
+            # Publish the disappearance to capture-status/event consumers. An
+            # older deleted failure must not hide a different current outcome.
+            self._next_revision()
+
     def _persist_local_state(self) -> None:
         # Snapshot under the command lock, then write independently. Delayed
         # older callbacks must never overwrite a newer durable command/state.
@@ -3775,6 +3802,7 @@ class CaptureCoordinator:
                         self._verified.pop(session_id, None)
                         self._session_diagnostics.pop(session_id, None)
                     self._storage_checked_at = 0.0
+            self._forget_deleted_outcomes(result["deleted_session_ids"])
             return CaptureCommandResult(HTTPStatus.OK, result)
 
         with self._lock:
