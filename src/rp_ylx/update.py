@@ -41,6 +41,10 @@ UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
 
 
+class MaintenanceBusyError(ValueError):
+    """A cooperating capture or maintenance process currently holds the lease."""
+
+
 def atomic_json(path: Path, value: dict) -> None:
     """Publish a durable JSON file, cleaning only our unpublished temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -112,7 +116,7 @@ def maintenance_lock(*, shared: bool = False):
         try:
             fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ValueError("设备正在录制或更新，请等待当前任务完成") from error
+            raise MaintenanceBusyError("设备正在录制或更新，请等待当前任务完成") from error
         yield
     finally:
         os.close(fd)

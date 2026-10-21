@@ -2526,14 +2526,17 @@ class CaptureCoordinator:
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 retryable=True,
             )
-        from rp_ylx.update import maintenance_lock
+        from rp_ylx.update import MaintenanceBusyError, maintenance_lock
 
         maintenance = maintenance_lock(shared=True)
         try:
             maintenance.__enter__()
         except (OSError, ValueError) as error:
             raise ProviderError(
-                "maintenance_active", "设备正在维护，暂时不能开始录制", status=HTTPStatus.CONFLICT
+                "maintenance_active",
+                "设备正在维护，暂时不能开始录制",
+                status=HTTPStatus.CONFLICT,
+                retryable=isinstance(error, MaintenanceBusyError),
             ) from error
         descriptor = -1
         try:

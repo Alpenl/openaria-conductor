@@ -262,6 +262,8 @@ class FirmwareControlTest(unittest.TestCase):
             with update.maintenance_lock(), self.assertRaises(ProviderError) as raised:
                 coordinator._acquire_network_operation_lease()
             self.assertEqual(raised.exception.code, "maintenance_active")
+            self.assertTrue(raised.exception.retryable)
+            self.assertIsInstance(raised.exception.__cause__, update.MaintenanceBusyError)
             coordinator._acquire_network_operation_lease()
             try:
                 with self.assertRaises(ValueError), update.maintenance_lock():
