@@ -199,6 +199,12 @@ def _export_json(destination: Path, value: object) -> None:
         )
         info = os.fstat(fd)
         identity = (info.st_dev, info.st_ino)
+        # Some NFS servers expose newly created files as mode 000 even when
+        # open requested 0600. Set and verify the intended owner access before
+        # writing or publishing; never depend on server-specific create defaults.
+        os.fchmod(fd, 0o600)
+        if os.fstat(fd).st_mode & 0o777 != 0o600:
+            raise PersistenceError("export filesystem did not preserve private permissions")
         # Keep fd ownership even if stream construction, entry, flush or close
         # raises. The final hard link refers to this exact open file on Linux.
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:

@@ -44,6 +44,47 @@ class SettingsExportTest(unittest.TestCase):
         self.assertEqual(self.export(), {"export": str(self.destination)})
         self.assert_export()
 
+    def test_create_mode_zero_is_corrected_before_publication(self):
+        original = os.open
+
+        def restrictive(path, flags, *args, **kwargs):
+            fd = original(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT and str(path).startswith(".openaria-settings-"):
+                os.fchmod(fd, 0)
+            return fd
+
+        with patch.object(settings.os, "open", side_effect=restrictive):
+            self.export()
+        self.assert_export()
+
+    def test_permission_setting_failure_cleans_staging_and_allows_retry(self):
+        self.fails_cleanly(
+            patch.object(settings.os, "fchmod", side_effect=PermissionError("mode denied")),
+            PermissionError,
+        )
+
+    def test_ignored_permission_change_is_rejected_before_publication(self):
+        original_open, original_chmod = os.open, os.fchmod
+
+        def restrictive(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT and str(path).startswith(".openaria-settings-"):
+                original_chmod(fd, 0)
+            return fd
+
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with (
+            patch.object(settings.os, "open", side_effect=restrictive),
+            patch.object(settings.os, "fchmod", return_value=None),
+            self.assertRaises(PersistenceError),
+        ):
+            self.export()
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.staging(), [])
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        self.export()
+        self.assert_export()
+
     def test_stream_allocation_failure_closes_fd_and_allows_retry(self):
         self.fails_cleanly(
             patch.object(settings.os, "fdopen", side_effect=MemoryError()), MemoryError,
