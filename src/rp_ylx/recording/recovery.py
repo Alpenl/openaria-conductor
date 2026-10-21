@@ -16,6 +16,7 @@ import stat
 import uuid
 import wave
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,7 @@ from rp_ylx.recording.device_session import (
     write_json_atomic,
 )
 from rp_ylx.recording.encoding import RecordingEncoding
+from rp_ylx.recording.recovery_index import RecoveryIndex
 from rp_ylx.recording.verified import VerifiedArtifact
 from rp_ylx.recording.verified import identity as verified_identity
 
@@ -113,11 +115,25 @@ def _artifact(
     }
 
 
-def _write_records(path: Path, records: Iterable[dict]) -> int:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+@contextmanager
+def _temporary_output(path: Path):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
+        stream = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
+        yield stream
+
+
+def _write_records(
+    path: Path, records: Iterable[dict], *, storage_encoding: dict | None = None
+) -> int:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    writer = RecoveryIndex(storage_encoding is not None)
+    try:
+        with _temporary_output(temporary) as stream:
             count = 0
             for record in records:
                 try:
@@ -127,13 +143,16 @@ def _write_records(path: Path, records: Iterable[dict]) -> int:
                     # written to our UTF-8 index. End the recoverable IMU
                     # prefix here; never skip corruption or lose valid video.
                     break
-                if stream.write(payload) != len(payload):
-                    raise OSError("short recovery index write")
+                writer.write(stream, payload)
                 count += 1
+            writer.finish(stream)
             stream.flush()
             os.fsync(stream.fileno())
+        encoding = writer.verify(temporary)
         os.replace(temporary, path)
         fsync_directory(path.parent)
+        if storage_encoding is not None:
+            storage_encoding.update(encoding)
         return count
     finally:
         # Long IMU indexes can be gigabytes. Failed retries must not accumulate
@@ -147,10 +166,18 @@ class _RecoveredFrames:
     first_monotonic_ns: int
     last_monotonic_ns: int
     boundary_monotonic_ns: dict[int, int]
+    path: str = "recovery/frames.ndjson"
+    storage_encoding: dict | None = None
 
 
 def _frames(
-    root: Path, plan: SessionPlan, segments: list[dict], decimation: int, origin: int
+    root: Path,
+    plan: SessionPlan,
+    segments: list[dict],
+    decimation: int,
+    origin: int,
+    *,
+    compressed: bool = False,
 ) -> _RecoveredFrames | None:
     """Stream a canonical index, rolling back any incomplete final segment.
 
@@ -159,15 +186,16 @@ def _frames(
     replace the derived index. Memory grows with segment boundaries, not frames.
     """
     segment_index = 0
-    count = committed_count = committed_bytes = 0
+    count = committed_count = 0
+    checkpoint = None
     first = last_committed = segment_first = None
     previous = None
     serialization_error = None
     boundaries: dict[int, int] = {}
     temporary = root / f".recovery-frames.{uuid.uuid4().hex}.tmp"
+    writer = RecoveryIndex(compressed)
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
-        with os.fdopen(descriptor, "wb") as output:
+        with _temporary_output(temporary) as output:
             with _regular(root, "frames.ndjson").open("rb") as stream:
                 for line in _journal_lines(stream):
                     if segment_index >= len(segments):
@@ -210,15 +238,14 @@ def _frames(
                         except UnicodeEncodeError as error:
                             serialization_error = error
                         else:
-                            if output.write(payload) != len(payload):
-                                raise OSError("short recovered frame index write")
+                            writer.write(output, payload)
                     count += 1
                     previous = row
                     if count == segment["end_ordinal"]:
                         if serialization_error is not None:
                             raise serialization_error
                         committed_count = count
-                        committed_bytes = output.tell()
+                        checkpoint = writer.checkpoint(output)
                         last_committed = row["host_monotonic_ns"]
                         boundaries[segment["start_ordinal"]] = segment_first
                         segment_index += 1
@@ -229,17 +256,21 @@ def _frames(
                 return None
             if type(origin) is not int or not 0 < origin <= first:
                 raise ValueError("invalid capture clock origin")
-            output.seek(committed_bytes)
-            output.truncate()
+            writer.rollback(output, checkpoint)
+            writer.finish(output)
             output.flush()
             os.fsync(output.fileno())
+        encoding = writer.verify(temporary)
         recovery = root / "recovery"
         if recovery.is_symlink():
             raise ValueError("unsafe recovery directory")
         recovery.mkdir(exist_ok=True, mode=0o750)
-        os.replace(temporary, recovery / "frames.ndjson")
+        relative = "recovery/frames.ndjson" + (".zst" if compressed else "")
+        os.replace(temporary, root / relative)
         fsync_directory(recovery)
-        return _RecoveredFrames(committed_count, first, last_committed, boundaries)
+        return _RecoveredFrames(
+            committed_count, first, last_committed, boundaries, relative, encoding
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -468,8 +499,13 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
             end = record["end_ordinal"]
         except (OSError, ValueError, KeyError, TypeError, DeviceRecordingError):
             break
+    # v4 requires explicit encoder settings. Legacy captures without them keep
+    # their original manifest contract; never invent settings to enable compression.
+    compress_indexes = config.lossless_storage and config.recording_encoding is not None
     origin = capture["started_monotonic_ns"]
-    frames = _frames(partial, plan, segments, config.frame_decimation, origin)
+    frames = _frames(
+        partial, plan, segments, config.frame_decimation, origin, compressed=compress_indexes
+    )
     if frames is None:
         return None
     video_end = (
@@ -497,7 +533,9 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                 except (ValueError, KeyError, TypeError, RecursionError):
                     break
 
-    imu_count = _write_records(recovery / "imu.ndjson", imu_prefix())
+    imu_relative = "recovery/imu.ndjson" + (".zst" if compress_indexes else "")
+    imu_encoding = {} if compress_indexes else None
+    imu_count = _write_records(partial / imu_relative, imu_prefix(), storage_encoding=imu_encoding)
     audio_error = None
     try:
         audio = _audio(partial, config, origin, video_end, verified=verified)
@@ -553,12 +591,17 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
     manifest = recorder._manifest(
         recorder._started_at + timedelta(seconds=duration), now, now, duration
     )
+    media_type = "application/zstd" if compress_indexes else "application/x-ndjson"
     manifest["frames"]["artifact"] = _artifact(
-        partial, "recovery/frames.ndjson", "frames.index", "application/x-ndjson", verified=verified
+        partial, frames.path, "frames.index", media_type, verified=verified
     )
     manifest["imu"]["artifact"] = _artifact(
-        partial, "recovery/imu.ndjson", "imu.samples", "application/x-ndjson", verified=verified
+        partial, imu_relative, "imu.samples", media_type, verified=verified
     )
+    if compress_indexes:
+        manifest["schema"] = "ylx.device-session.v4"
+        manifest["frames"]["artifact"]["storage_encoding"] = frames.storage_encoding
+        manifest["imu"]["artifact"]["storage_encoding"] = imu_encoding
     if audio is not None:
         manifest["audio"] = audio
     elif config.audio_enabled:

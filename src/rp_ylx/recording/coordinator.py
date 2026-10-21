@@ -1472,7 +1472,11 @@ class CaptureCoordinator:
                     or state["storage"]["volume_id"] != admission.volume_id
                     or state["device"]["device_id"] != self._config.session.device_id
                     or manifest.get("schema")
-                    not in {"ylx.device-session.v2", "ylx.device-session.v3"}
+                    not in {
+                        "ylx.device-session.v2",
+                        "ylx.device-session.v3",
+                        "ylx.device-session.v4",
+                    }
                     or manifest.get("sealed") is not True
                     or manifest.get("session_id") != session_id
                     or manifest.get("volume_id") != admission.volume_id
