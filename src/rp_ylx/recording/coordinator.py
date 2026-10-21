@@ -301,17 +301,31 @@ def _session_catalog_revision(
     items: list[dict[str, object]],
     diagnostics: list[dict[str, object]],
 ) -> str:
-    material = {
-        "schema": "ylx.session-catalog-revision-input.v1",
-        "entries": [
-            *({"kind": "session", "value": item} for item in items),
-            *({"kind": "diagnostic", "value": diagnostic} for diagnostic in diagnostics),
-        ],
-    }
-    digest = hashlib.sha256(
-        SESSION_CATALOG_REVISION_DOMAIN + _canonical_json_bytes(material)
-    ).hexdigest()
-    return f"sha256:{digest}"
+    # Preserve the exact canonical v1 JSON byte stream and existing cursors,
+    # without materializing/encoding the entire catalog in one GIL-held call.
+    # A small batch amortizes JSON encoder overhead while bounding that call
+    # to 64 summaries rather than all sessions in a large recording volume.
+    digest = hashlib.sha256(SESSION_CATALOG_REVISION_DOMAIN)
+    digest.update(b'{"entries":[')
+    batch: list[dict[str, object]] = []
+    separator = b""
+
+    def consume_batch() -> None:
+        nonlocal separator
+        digest.update(separator)
+        digest.update(_canonical_json_bytes(batch)[1:-1])
+        separator = b","
+        batch.clear()
+
+    for kind, values in (("session", items), ("diagnostic", diagnostics)):
+        for value in values:
+            batch.append({"kind": kind, "value": value})
+            if len(batch) == 64:
+                consume_batch()
+    if batch:
+        consume_batch()
+    digest.update(b'],"schema":"ylx.session-catalog-revision-input.v1"}')
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _encode_session_cursor(
@@ -3363,7 +3377,8 @@ class CaptureCoordinator:
         return prepared() if callable(prepared) else prepared
 
     def _prepare_stop_request(
-        self, command: CaptureCommand,
+        self,
+        command: CaptureCommand,
     ) -> CaptureCommandResult | Callable[[], CaptureCommandResult]:
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
@@ -3380,10 +3395,15 @@ class CaptureCoordinator:
             if previous is not None and self._persisted_commands.get(scope) is previous:
                 result = previous[1]
                 return CaptureCommandResult(
-                    result.status, copy.deepcopy(result.body), replayed=True,
+                    result.status,
+                    copy.deepcopy(result.body),
+                    replayed=True,
                 )
             raise ProviderError(
-                "capture_busy", "停止请求正在持久接收，请重试", status=409, retryable=True,
+                "capture_busy",
+                "停止请求正在持久接收，请重试",
+                status=409,
+                retryable=True,
             )
         if previous is not None:
             previous_body, result = previous
@@ -3397,8 +3417,10 @@ class CaptureCoordinator:
                     and (reason != "safe_swap" or self._pending_safe_swap is None)
                 ):
                     raise ProviderError(
-                        "capture_busy", "停止回执正在提交，请重试",
-                        status=HTTPStatus.CONFLICT, retryable=True,
+                        "capture_busy",
+                        "停止回执正在提交，请重试",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
                     )
                 return self._prepare_stop_receipt_commit(command, scope, result, retry=True)
             if (
@@ -3462,10 +3484,15 @@ class CaptureCoordinator:
                     self._require_admission()
                 except DeviceRecordingError as error:
                     raise ProviderError(
-                        error.code, error.message, status=HTTPStatus.CONFLICT, retryable=True,
+                        error.code,
+                        error.message,
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
                     ) from error
             return self._prepare_stop_receipt_commit(
-                command, scope, CaptureCommandResult(HTTPStatus.NO_CONTENT, None),
+                command,
+                scope,
+                CaptureCommandResult(HTTPStatus.NO_CONTENT, None),
             )
         if reason == "safe_swap" and self._open_representations:
             raise ProviderError(
@@ -3530,9 +3557,7 @@ class CaptureCoordinator:
                     self._stop_condition.notify_all()
 
         try:
-            worker = threading.Thread(
-                target=finish, name="rp-ylx-stop-finalization", daemon=False
-            )
+            worker = threading.Thread(target=finish, name="rp-ylx-stop-finalization", daemon=False)
             self._stop_inflight = scope
             self._async_stop_worker = worker
             self._async_stop_reason = str(reason)
@@ -3551,6 +3576,7 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
+
         def rollback() -> None:
             self._commands = old_commands
             self._stop_inflight = None
@@ -3567,12 +3593,21 @@ class CaptureCoordinator:
             self._stop_condition.notify_all()
             raise
         return lambda: self._finish_stop_acceptance(
-            scope, result, rollback, persist=retry_receipt is None, ready=ready, worker=worker,
+            scope,
+            result,
+            rollback,
+            persist=retry_receipt is None,
+            ready=ready,
+            worker=worker,
         )
 
     def _prepare_stop_receipt_commit(
-        self, command: CaptureCommand, scope: tuple[str, str, str],
-        result: CaptureCommandResult, *, retry: bool = False,
+        self,
+        command: CaptureCommand,
+        scope: tuple[str, str, str],
+        result: CaptureCommandResult,
+        *,
+        retry: bool = False,
     ) -> Callable[[], CaptureCommandResult]:
         old_commands = dict(self._commands)
 
@@ -3596,9 +3631,14 @@ class CaptureCoordinator:
         return commit
 
     def _finish_stop_acceptance(
-        self, scope: tuple[str, str, str], result: CaptureCommandResult,
-        rollback: Callable[[], None], *, persist: bool = True,
-        ready: threading.Event | None = None, worker: threading.Thread | None = None,
+        self,
+        scope: tuple[str, str, str],
+        result: CaptureCommandResult,
+        rollback: Callable[[], None],
+        *,
+        persist: bool = True,
+        ready: threading.Event | None = None,
+        worker: threading.Thread | None = None,
         accepted: Callable[[], None] | None = None,
     ) -> CaptureCommandResult:
         try:
@@ -3626,7 +3666,9 @@ class CaptureCoordinator:
                 if source_failure is not None and failed_plan is not None:
                     try:
                         self._retain_active_failure(
-                            source_failure, failed_plan, defer_recovery=True,
+                            source_failure,
+                            failed_plan,
+                            defer_recovery=True,
                         )
                     except BaseException as recovery_error:
                         error.add_note(
@@ -3712,6 +3754,7 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
+
         def rollback() -> None:
             self._commands = old_commands
             self._safe_swap_failure_clear_pending = False
@@ -3735,8 +3778,13 @@ class CaptureCoordinator:
             self._stop_condition.notify_all()
             raise
         return lambda: self._finish_stop_acceptance(
-            scope, result, rollback, persist=replay is None or previous_failure is not None,
-            ready=ready, worker=worker, accepted=accepted,
+            scope,
+            result,
+            rollback,
+            persist=replay is None or previous_failure is not None,
+            ready=ready,
+            worker=worker,
+            accepted=accepted,
         )
 
     def _record_safe_swap_failure(
@@ -3876,7 +3924,9 @@ class CaptureCoordinator:
         return self._finish_stop_capture(command, scope, recorder, plan)
 
     def _commit_stop_replay(
-        self, scope: tuple[str, str, str], result: CaptureCommandResult,
+        self,
+        scope: tuple[str, str, str],
+        result: CaptureCommandResult,
     ) -> CaptureCommandResult:
         pending = self._pending_stop_state_commit
         try:
@@ -3892,7 +3942,10 @@ class CaptureCoordinator:
                 self._stop_condition.notify_all()
 
     def _retry_completed_stop_receipt(
-        self, command: CaptureCommand, *, wait: bool = False,
+        self,
+        command: CaptureCommand,
+        *,
+        wait: bool = False,
     ) -> CaptureCommandResult | None:
         scope = (command.principal_id, "stop", command.idempotency_key)
         with self._stop_condition:
@@ -3906,7 +3959,8 @@ class CaptureCoordinator:
                     return None
                 result = None if previous is None else previous[1]
                 completed_normal_stop = command.body.get("reason") != "safe_swap" and (
-                    pending is not None or (
+                    pending is not None
+                    or (
                         result is not None
                         and isinstance(result.body, Mapping)
                         and result.body.get("snapshot", {}).get("device_state") == "idle"
@@ -3920,9 +3974,7 @@ class CaptureCoordinator:
                     and self._safe_swap_resource is not None
                     and self._released
                 )
-                if not (
-                    self._active is None and (completed_normal_stop or completed_safe_swap)
-                ):
+                if not (self._active is None and (completed_normal_stop or completed_safe_swap)):
                     return None
                 if previous is not None and previous[0] != command.canonical_body:
                     raise ProviderError(
@@ -3946,7 +3998,8 @@ class CaptureCoordinator:
                     )
                 replay = (
                     CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
-                    if result is not None else CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                    if result is not None
+                    else CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
                 )
                 self._stop_inflight = scope
                 break
