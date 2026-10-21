@@ -313,7 +313,8 @@ class FirmwareSupervisor:
                 update = updater_module()
                 with tempfile.TemporaryDirectory() as directory:
                     manifest = update.fetch_manifest(update.DEFAULT_MANIFEST, Path(directory))
-                if not SEMVER.fullmatch(manifest["version"]) or manifest["version"] == "0.2.0":
+                metadata = update.manifest_display_metadata(manifest)
+                if not SEMVER.fullmatch(metadata["version"]) or manifest["version"] == "0.2.0":
                     with self.lock:
                         self.cache = None
                         self._cache_checked_at = None
@@ -323,23 +324,15 @@ class FirmwareSupervisor:
                             "请等待正式发布后重新检查。当前固件不会降级。"
                         )
                     return self.status()
-                notes = manifest.get("release_notes", "")
-                if not isinstance(notes, str) or len(notes) > 16000:
-                    raise ValueError("invalid release notes")
                 with self.lock:
-                    self.cache = {
-                        "version": manifest["version"],
-                        "commit": manifest["commit"],
-                        "release_notes": notes,
-                        "published_at": manifest.get("published_at"),
-                    }
+                    self.cache = metadata
                     self.checked_at = int(time.time())
                     self._cache_checked_at = time.monotonic()
                     self.warning = None
             except OSError:
                 self.warning = "无法连接 OSS 发布源，请检查设备互联网连接后重试"
                 return self.status()
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError, RecursionError):
                 self.warning = "OSS 发布清单校验失败，请联系维护者检查发布内容后重试"
                 return self.status()
             return self.status()

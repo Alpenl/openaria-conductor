@@ -383,17 +383,49 @@ def validate_descriptor(value: dict, maximum: int) -> None:
         raise ValueError("文件大小或 SHA-256 无效")
 
 
+# Reserve half of the 64 KiB control frame for installed releases, task state
+# (including escaped diagnostic text), warnings and the response envelope.
+MAX_DISPLAY_METADATA = 32 * 1024
+
+
+def manifest_display_metadata(value: object) -> dict:
+    """Validate detached display fields before publishing or caching a release."""
+    if not isinstance(value, dict):
+        raise ValueError("发布清单必须是对象")
+    version, commit = value.get("version"), value.get("commit")
+    if not isinstance(version, str) or not re.fullmatch(r"[!-~]{1,64}", version):
+        raise ValueError("发布清单 version 无效")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("发布清单 commit 无效")
+    notes, published = value.get("release_notes", ""), value.get("published_at")
+    if not isinstance(notes, str) or len(notes) > 16000:
+        raise ValueError("发布说明无效")
+    if published is not None and (
+        not isinstance(published, str)
+        or not published
+        or len(published.encode("utf-8")) > 128
+    ):
+        raise ValueError("发布时间无效")
+    metadata = {
+        "version": version,
+        "commit": commit,
+        "release_notes": notes,
+        "published_at": published,
+    }
+    # Encoding also rejects lone surrogates. Count JSON escaping, not just
+    # characters: control characters can expand to six bytes each on the wire.
+    encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if len(encoded) > MAX_DISPLAY_METADATA:
+        raise ValueError("发布元数据超过控制响应容量")
+    return metadata
+
+
 def validate_manifest(value: object) -> dict:
     if not isinstance(value, dict) or value.get("schema") != RELEASE_SCHEMA:
         raise ValueError("发布清单 schema 无效")
     if value.get("platform") != PLATFORM:
         raise ValueError("发布清单不支持 RDK X5")
-    if not isinstance(value.get("commit"), str) or not re.fullmatch(
-        "[0-9a-f]{40}", value["commit"]
-    ):
-        raise ValueError("发布清单 commit 无效")
-    if not isinstance(value.get("version"), str) or not value["version"]:
-        raise ValueError("发布清单 version 无效")
+    manifest_display_metadata(value)
     if not isinstance(value.get("bundle"), dict):
         raise ValueError("发布清单 bundle 无效")
     validate_descriptor(value["bundle"], MAX_ARCHIVE)

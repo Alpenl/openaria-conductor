@@ -27,6 +27,7 @@ from rp_ylx.update import (  # noqa: E402
     download,
     fetch_manifest,
     https_url,
+    manifest_display_metadata,
     sha256,
     verify_bundle,
 )
@@ -88,10 +89,11 @@ def prepare(
         "version": bundle.version,
     }
     if release_notes is not None:
-        if not re.fullmatch(r"0\.2\.[1-9][0-9]*", bundle.version) or len(release_notes) > 16000:
+        if not re.fullmatch(r"0\.2\.[1-9][0-9]*", bundle.version):
             raise ValueError("正式发布版本或说明无效")
         manifest["release_notes"] = release_notes
         manifest["published_at"] = datetime.now(UTC).isoformat()
+    manifest_display_metadata(manifest)
     verify_bundle(bundle.root, manifest)
     if output.exists() and any(output.iterdir()):
         raise ValueError("output 必须为空")
