@@ -777,6 +777,7 @@ class CaptureCoordinator:
         self._pending_safe_swap: dict[str, object] | None = None
         self._pending_safe_swap_failure: dict[str, object] | None = None
         self._safe_swap_resource: dict[str, object] | None = None
+        self._safe_swap_to_persist: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
         self._pending_stop_state_commit: tuple[str, str, str] | None = None
         self._async_stop_worker: threading.Thread | None = None
@@ -1216,6 +1217,12 @@ class CaptureCoordinator:
             "pending_safe_swap_failure": self._pending_safe_swap_failure,
             "safe_swap_resource": self._safe_swap_resource,
         }
+        if self._safe_swap_to_persist is not None:
+            # The handoff owner stages a durable snapshot without exposing an
+            # uncommitted success through status or the safe-swap endpoint.
+            value["safe_swap_resource"] = self._safe_swap_to_persist
+            value["pending_safe_swap"] = None
+            value["pending_safe_swap_failure"] = None
         self._state_write_sequence += 1
         return (
             self._state_write_sequence,
@@ -3359,7 +3366,8 @@ class CaptureCoordinator:
                     )
                 if self._persisted_commands.get(scope) is not previous:
                     if self._stop_inflight is not None or (
-                        self._active is None and reason != "safe_swap"
+                        self._active is None
+                        and (reason != "safe_swap" or self._pending_safe_swap is None)
                     ):
                         raise ProviderError(
                             "capture_busy", "停止回执正在提交，请重试",
@@ -3543,11 +3551,7 @@ class CaptureCoordinator:
                 if self._async_stop_worker is not threading.current_thread():
                     return
             try:
-                self._verify_pending_safe_swap(pending)
-                with self._stop_condition:
-                    if self._pending_safe_swap is not pending:
-                        raise ProviderError("capture_state_changed", "待交接录制已变化", status=409)
-                    self._publish_safe_swap()
+                self._publish_safe_swap()
             except BaseException as error:
                 operational_logger("recording").event(
                     "safe_swap_resume_failed",
@@ -3640,6 +3644,7 @@ class CaptureCoordinator:
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
         pending_replay: CaptureCommandResult | None = None
+        resume_safe_swap = False
         with self._stop_condition:
             requested_plan = self._active_plan
             while True:
@@ -3706,18 +3711,34 @@ class CaptureCoordinator:
                         ) from error
                 if self._active is None:
                     if reason == "safe_swap" and self._pending_safe_swap is not None:
-                        result = self._publish_safe_swap_command()
+                        self._acquire_network_operation_lease()
+                        self._stop_inflight = scope
+                        resume_safe_swap = True
                     else:
                         result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                    self._remember_command(scope, command, result)
-                    return result
-                recorder = self._active
-                plan = self._active_plan
-                assert plan is not None
-                self._stop_inflight = scope
+                        self._remember_command(scope, command, result)
+                        return result
+                else:
+                    recorder = self._active
+                    plan = self._active_plan
+                    assert plan is not None
+                    self._stop_inflight = scope
 
         if pending_replay is not None:
             return self._commit_stop_replay(scope, pending_replay)
+        if resume_safe_swap:
+            try:
+                result = self._publish_safe_swap_command()
+                with self._lock:
+                    self._cache_command(scope, command, result)
+                self._persist_local_state()
+                return result
+            finally:
+                with self._stop_condition:
+                    if self._stop_inflight == scope:
+                        self._stop_inflight = None
+                        self._release_network_operation_lease()
+                    self._stop_condition.notify_all()
         return self._finish_stop_capture(command, scope, recorder, plan)
 
     def _commit_stop_replay(
@@ -3750,14 +3771,23 @@ class CaptureCoordinator:
                 ):
                     return None
                 result = None if previous is None else previous[1]
-                if not (
-                    self._active is None
-                    and command.body.get("reason") != "safe_swap"
-                    and (pending is not None or (
+                completed_normal_stop = command.body.get("reason") != "safe_swap" and (
+                    pending is not None or (
                         result is not None
                         and isinstance(result.body, Mapping)
                         and result.body.get("snapshot", {}).get("device_state") == "idle"
-                    ))
+                    )
+                )
+                completed_safe_swap = (
+                    command.body.get("reason") == "safe_swap"
+                    and result is not None
+                    and result.status == HTTPStatus.NO_CONTENT
+                    and self._pending_safe_swap is None
+                    and self._safe_swap_resource is not None
+                    and self._released
+                )
+                if not (
+                    self._active is None and (completed_normal_stop or completed_safe_swap)
                 ):
                     return None
                 if previous is not None and previous[0] != command.canonical_body:
@@ -3945,27 +3975,31 @@ class CaptureCoordinator:
                         "manifest_sha256": sealed.manifest_sha256,
                         "sealed_at": sealed.manifest["sealed_at"],
                     }
-                    if (
-                        not verification_current
-                        or verified_snapshot is None
-                        or verification_error is not None
-                    ):
-                        self._persist_local_state()
-                        raise ProviderError(
-                            "safe_swap_unverified",
-                            "录制内容尚未通过完整校验，不能发布安全移除回执",
-                            status=HTTPStatus.CONFLICT,
-                        )
-                    self._persist_local_state()
-                    result = self._publish_safe_swap_command()
+                else:
+                    result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
                     if remember_result:
-                        self._remember_command(scope, command, result)
-                    self._release_network_operation_lease()
-                    return result
-                result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+                        self._cache_command(scope, command, result)
+                    self._pending_stop_state_commit = scope
+            if reason == "safe_swap":
+                # Retain the owner and leases while the intent, verification,
+                # release proof and command receipt commit outside the status lock.
+                self._persist_local_state()
+                if (
+                    not verification_current
+                    or verified_snapshot is None
+                    or verification_error is not None
+                ):
+                    raise ProviderError(
+                        "safe_swap_unverified",
+                        "录制内容尚未通过完整校验，不能发布安全移除回执",
+                        status=HTTPStatus.CONFLICT,
+                    )
+                result = self._publish_safe_swap_command()
                 if remember_result:
-                    self._cache_command(scope, command, result)
-                self._pending_stop_state_commit = scope
+                    with self._lock:
+                        self._cache_command(scope, command, result)
+                    self._persist_local_state()
+                return result
             # Keep _stop_inflight and the leases until the state and synchronous
             # completion receipt are durable together. SQLite may wait without
             # preventing status readers from observing the sealed recording.
@@ -4298,51 +4332,55 @@ class CaptureCoordinator:
         self._retain_active_failure(error, active_plan)
 
     def _publish_safe_swap(self) -> None:
-        if self._pending_safe_swap is None:
-            raise ProviderError("safe_swap_not_pending", "没有待发布的安全换盘", status=409)
-        if self.open_handle_count != 0:
-            raise ProviderError(
-                "safe_swap_blocked",
-                "仍有核心录制或读取句柄未释放",
-                status=HTTPStatus.CONFLICT,
-                retryable=True,
-                details={"open_handle_count": self.open_handle_count},
-            )
-        self._verify_pending_safe_swap(self._pending_safe_swap)
-        released_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        receipt = {
-            "schema": "ylx.safe-swap-receipt.v3",
-            **self._pending_safe_swap,
-            "released_at": released_at,
-            "release_state": "device-released",
-            "open_handle_count": 0,
-        }
-        validate_safe_swap_v3_receipt(receipt)
-        previous_resource = self._safe_swap_resource
-        previous_pending = self._pending_safe_swap
-        previous_failure = self._pending_safe_swap_failure
-        resource = {
-            "schema": "ylx.safe-swap-receipt-resource.v3",
-            "receipt": receipt,
-        }
-        self._released = True
-        self._safe_swap_resource = resource
-        self._pending_safe_swap = None
-        self._pending_safe_swap_failure = None
-        self._next_revision()
+        with self._lock:
+            pending = self._pending_safe_swap
+            if pending is None:
+                raise ProviderError("safe_swap_not_pending", "没有待发布的安全换盘", status=409)
+            if self.open_handle_count != 0:
+                raise ProviderError(
+                    "safe_swap_blocked",
+                    "仍有核心录制或读取句柄未释放",
+                    status=HTTPStatus.CONFLICT,
+                    retryable=True,
+                    details={"open_handle_count": self.open_handle_count},
+                )
+        # All callers retain the stop owner, which fences new recordings and
+        # mutation. Pending handoff intent also fences new representation handles.
+        self._verify_pending_safe_swap(pending)
+        with self._lock:
+            if self._pending_safe_swap is not pending:
+                raise ProviderError("capture_state_changed", "待交接录制已变化", status=409)
+            receipt = {
+                "schema": "ylx.safe-swap-receipt.v3",
+                **pending,
+                "released_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "release_state": "device-released",
+                "open_handle_count": 0,
+            }
+            validate_safe_swap_v3_receipt(receipt)
+            resource = {"schema": "ylx.safe-swap-receipt-resource.v3", "receipt": receipt}
+            self._safe_swap_to_persist = resource
+            self._next_revision()
         try:
             self._persist_local_state()
-        except OSError as error:
-            self._released = False
-            self._safe_swap_resource = previous_resource
-            self._pending_safe_swap = previous_pending
-            self._pending_safe_swap_failure = previous_failure
+        except BaseException as error:
+            with self._lock:
+                self._safe_swap_to_persist = None
+            if not isinstance(error, (OSError, sqlite3.Error, PersistenceError)):
+                raise
             raise ProviderError(
                 "safe_swap_publish_failed",
                 "安全换盘回执未能持久发布",
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 retryable=True,
             ) from error
+        with self._lock:
+            self._released = True
+            self._safe_swap_resource = resource
+            self._pending_safe_swap = None
+            self._pending_safe_swap_failure = None
+            self._safe_swap_to_persist = None
+            self._next_revision()
 
     def _verify_pending_safe_swap(self, pending: Mapping[str, object]) -> None:
         # A durable pending intent is not durable proof of the current files.
