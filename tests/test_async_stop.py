@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -36,10 +37,12 @@ def check_worker_initialization_failures(case, coordinator, command, *, recordin
                     case.assertIsNone(coordinator._stop_inflight)
                     case.assertIs(coordinator._active, active)
                     case.assertNotIn(scope, coordinator._commands)
-                    case.assertFalse(any(
-                        receipt["idempotency_key"] == command.idempotency_key
-                        for receipt in coordinator._state_db.capture_state().get("commands", [])
-                    ))
+                    case.assertFalse(
+                        any(
+                            receipt["idempotency_key"] == command.idempotency_key
+                            for receipt in coordinator._state_db.capture_state().get("commands", [])
+                        )
+                    )
                     if recording:
                         case.fixture.assert_network_operation_lock_held()
                         case.assertEqual(
@@ -412,6 +415,19 @@ class AsyncStopTest(unittest.TestCase):
             gateway.tearDown()
 
     def test_sync_stop_waits_for_async_error_recovery(self):
+        self.check_sync_stop_waits_for_async_error_recovery()
+
+    def test_sync_stop_waits_after_slow_finalization_enters_error_recovery(self):
+        original = self.coordinator._finish_stop_capture
+
+        def slow_finalization(*args, **kwargs):
+            time.sleep(2.2)
+            return original(*args, **kwargs)
+
+        with patch.object(self.coordinator, "_finish_stop_capture", slow_finalization):
+            self.check_sync_stop_waits_for_async_error_recovery()
+
+    def check_sync_stop_waits_for_async_error_recovery(self):
         original = self.coordinator._retain_active_failure
         recovering, recover = threading.Event(), threading.Event()
         sync_done = threading.Event()
@@ -431,16 +447,27 @@ class AsyncStopTest(unittest.TestCase):
                 side_effect=OSError("read failure"),
             ),
         ):
-            self.coordinator.request_stop_capture(fixtures.stop_command("async-error"))
-            self.assertTrue(recovering.wait(2))
 
             def sync_stop():
                 results.append(self.coordinator.stop_capture(fixtures.stop_command("sync-wait")))
                 sync_done.set()
 
-            waiter = threading.Thread(target=sync_stop)
-            waiter.start()
+            waiter = None
+            worker = None
             try:
+                self.coordinator.request_stop_capture(fixtures.stop_command("async-error"))
+                worker = self.coordinator._async_stop_worker
+                # This selects the recovery phase for the concurrency test;
+                # durable finalization before it is not a two-second SLA.
+                deadline = time.monotonic() + 30
+                while not recovering.wait(0.05):
+                    self.assertTrue(
+                        worker is not None and worker.is_alive(),
+                        "async stop exited before the recovery gate",
+                    )
+                    self.assertLess(time.monotonic(), deadline, "recovery gate was not reached")
+                waiter = threading.Thread(target=sync_stop)
+                waiter.start()
                 self.assertFalse(sync_done.wait(0.1))
                 recover.set()
                 self.assertTrue(sync_done.wait(4))
@@ -448,7 +475,12 @@ class AsyncStopTest(unittest.TestCase):
                 self.assertEqual(results[0].status, 204)
             finally:
                 recover.set()
-                waiter.join(5)
+                if waiter is not None:
+                    waiter.join(5)
+                    self.assertFalse(waiter.is_alive())
+                if worker is not None:
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":
