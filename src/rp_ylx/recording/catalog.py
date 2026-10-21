@@ -16,6 +16,7 @@ from itertools import groupby
 from pathlib import Path
 
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
+from rp_ylx.native import native_session_store_or_none
 from rp_ylx.persistence import StateDatabase
 
 
@@ -120,6 +121,17 @@ class SessionCatalog(StateDatabase):
 
     @staticmethod
     def signature(directory: Path) -> str:
+        native = native_session_store_or_none()
+        signature = getattr(native, "catalog_manifest_signature", None)
+        if signature is not None:
+            value = signature(os.fsencode(directory), MAX_MANIFEST_BYTES)
+            if not isinstance(value, str):
+                raise OSError("native catalog manifest signature is invalid")
+            return value
+        return SessionCatalog._signature_python(directory)
+
+    @staticmethod
+    def _signature_python(directory: Path) -> str:
         # SQLite caches metadata, but stat equality cannot establish that the
         # manifest is unchanged. Hash only its bounded bytes, never the media.
         parent = directory.lstat()

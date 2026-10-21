@@ -12,6 +12,11 @@ from rp_ylx.recording.catalog import SessionCatalog
 
 class CatalogStreamOwnershipTest(unittest.TestCase):
     def setUp(self):
+        # These fault injections exercise Python stream construction; native
+        # descriptor ownership is verified separately with real file failures.
+        fallback = patch("rp_ylx.recording.catalog.native_session_store_or_none", return_value=None)
+        fallback.start()
+        self.addCleanup(fallback.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

@@ -4,6 +4,7 @@ mod audio_checkpoint;
 mod audio_clock;
 mod bounded;
 mod capture_runtime;
+mod catalog_signature;
 mod frame_stream;
 mod imu;
 mod imu_preview;
@@ -409,6 +410,23 @@ impl NativeSessionStore {
         result.set_item("descriptor", artifact.descriptor)?;
         result.set_item("identity", file_identity_dict(py, &artifact.identity)?)?;
         Ok(result.unbind())
+    }
+
+    fn catalog_manifest_signature(
+        &self,
+        py: Python<'_>,
+        path: &[u8],
+        maximum_bytes: usize,
+    ) -> PyResult<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        py.allow_threads(move || catalog_signature::signature(&path, maximum_bytes))
+            .map_err(|error| {
+                pyo3::exceptions::PyOSError::new_err((
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    error.to_string(),
+                ))
+            })
     }
 
     fn read_bounded_fd<'py>(
