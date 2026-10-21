@@ -259,10 +259,19 @@ class FirmwareWorkerAdmissionTest(unittest.TestCase):
 
     def test_restart_repairs_stale_active_receipt_for_terminal_task(self):
         key = str(uuid.uuid4())
-        task = {"id": key, "action": "update", "target_commit": "c" * 40, "status": "failed"}
+        task = {
+            "id": key,
+            "action": "update",
+            "target_commit": "c" * 40,
+            "status": "failed",
+            "message": "failed",
+            "started_at": 1,
+            "finished_at": 2,
+        }
         control.atomic_json(self.s.state / "task.json", task)
         control.atomic_json(
-            self.s.state / "receipts" / (key + ".json"), {**task, "status": "accepted"}
+            self.s.state / "receipts" / (key + ".json"),
+            {**task, "status": "accepted", "finished_at": None},
         )
         restored = control.FirmwareSupervisor(self.s.state, self.s.install, runner=Mock())
         self.assertEqual(restored.start("update", key, "c" * 40)["status"], "failed")
@@ -270,7 +279,15 @@ class FirmwareWorkerAdmissionTest(unittest.TestCase):
 
     def test_historical_active_receipt_without_owner_is_replayed_as_failed(self):
         key = str(uuid.uuid4())
-        task = {"id": key, "action": "update", "target_commit": "c" * 40, "status": "accepted"}
+        task = {
+            "id": key,
+            "action": "update",
+            "target_commit": "c" * 40,
+            "status": "accepted",
+            "message": "accepted",
+            "started_at": 1,
+            "finished_at": None,
+        }
         receipt = self.s.state / "receipts" / (key + ".json")
         control.atomic_json(receipt, task)
         self.assertEqual(self.start(key)["status"], "failed")
@@ -330,6 +347,9 @@ class FirmwareWorkerAdmissionTest(unittest.TestCase):
             "action": "update",
             "target_commit": "c" * 40,
             "status": "running",
+            "message": "running",
+            "started_at": 1,
+            "finished_at": None,
         }
         control.atomic_json(self.s.state / "task.json", task)
         with patch.object(control, "atomic_json", side_effect=OSError("full")):

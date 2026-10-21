@@ -15,6 +15,7 @@ import re
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,82 @@ def newer(available: str, current: str) -> bool:
     return parts(available) > parts(current)
 
 
+def _validate_task_record(value, expected_key=None):
+    fields = {"id", "action", "target_commit", "status", "message", "started_at", "finished_at"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("invalid firmware task fields")
+    if (
+        not isinstance(value["id"], str)
+        or KEY.fullmatch(value["id"]) is None
+        or (expected_key is not None and value["id"] != expected_key)
+        or value["action"] not in ("update", "rollback")
+        or not isinstance(value["target_commit"], str)
+        or COMMIT.fullmatch(value["target_commit"]) is None
+        or value["status"] not in ("accepted", "running", "failed", "succeeded")
+        or not isinstance(value["message"], str)
+        or not 1 <= len(value["message"]) <= 4096
+        or type(value["started_at"]) is not int
+        or not 0 <= value["started_at"] <= 2**63 - 1
+    ):
+        raise ValueError("invalid firmware task values")
+    value["message"].encode("utf-8")
+    finished = value["finished_at"]
+    if value["status"] in ("accepted", "running"):
+        if finished is not None:
+            raise ValueError("unfinished firmware task has end time")
+    elif type(finished) is not int or not 0 <= finished <= 2**63 - 1:
+        raise ValueError("finished firmware task lacks end time")
+    # Wall-clock corrections can put finished_at before started_at.
+    return value
+
+
+def _read_task_record(path, *, expected_key=None, missing_ok=False):
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+
+    def identity(info):
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > LIMIT:
+            raise ValueError("unsafe firmware task file")
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    expected = identity(before)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if identity(os.fstat(fd)) != expected:
+            raise ValueError("firmware task changed before read")
+        raw = bytearray()
+        while len(raw) <= LIMIT:
+            chunk = os.read(fd, min(8192, LIMIT + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > LIMIT or identity(os.fstat(fd)) != expected:
+            raise ValueError("firmware task changed during read")
+        if identity(path.lstat()) != expected:
+            raise ValueError("firmware task replaced during read")
+    finally:
+        os.close(fd)
+    value = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=_unique_control_object,
+        parse_constant=_reject_control_constant,
+    )
+    _validate_control_json(value)
+    return _validate_task_record(value, expected_key)
+
+
 class FirmwareSupervisor:
     def __init__(self, state: Path = STATE, install: Path = INSTALL, runner=None, on_success=None):
         self.state, self.install = state, install
@@ -91,19 +168,25 @@ class FirmwareSupervisor:
         self._task_save_pending = False
         self._success_notification_pending = False
         self._callback_active = False
-        path = self.state / "task.json"
-        if path.exists():
-            self.task = json.loads(path.read_bytes())
-            if self.task["status"] in {"accepted", "running"}:
-                self.task.update(
-                    status="failed",
-                    message="更新服务曾中断，请检查当前版本后重试",
-                    finished_at=int(time.time()),
-                )
-            # Repair both copies, including a terminal task whose receipt
-            # publication was interrupted before the supervisor restarted.
-            self._task_save_pending = True
-            self._try_save_task()
+        self._task_load_pending = False
+        self._restore_task_state(allow_missing=True)
+
+    def _restore_task_state(self, *, allow_missing=False):
+        try:
+            task = _read_task_record(self.state / "task.json", missing_ok=allow_missing)
+        except (OSError, ValueError, TypeError, RecursionError):
+            self._task_load_pending = True
+            return False
+        self._task_load_pending = False
+        if task is None:
+            return True
+        self.task = task
+        if task["status"] in {"accepted", "running"}:
+            self._finish_task("failed", "更新服务曾中断，请检查当前版本后重试")
+        # Repair task and receipt together, but never execute restored work.
+        self._task_save_pending = True
+        self._try_save_task()
+        return True
 
     def _release(self, name):
         return installed_release(name, self.install)
@@ -115,7 +198,8 @@ class FirmwareSupervisor:
             available = self.cache
             sqlite_state = updater_module().sqlite_state_required()
             has_update = bool(
-                current
+                not self._task_load_pending
+                and current
                 and available
                 and (
                     newer(available["version"], current["version"])
@@ -135,7 +219,9 @@ class FirmwareSupervisor:
                 "has_update": has_update,
                 "checked_at": self.checked_at or None,
                 "warning": (
-                    "更新任务状态尚未完成持久保存，请检查存储后重试"
+                    "更新任务状态无法读取或校验，已暂停更新；请修复保留的任务状态文件"
+                    if self._task_load_pending
+                    else "更新任务状态尚未完成持久保存，请检查存储后重试"
                     if self._task_save_pending
                     else "更新已完成，但更新服务重新加载尚未完成"
                     if self._success_notification_pending or self._callback_active
@@ -200,14 +286,25 @@ class FirmwareSupervisor:
         with self.start_lock:
             self._repair_task_state()
             with self.lock:
+                if self._task_load_pending:
+                    raise FirmwareError(
+                        "update_state_unavailable", "更新任务状态尚未恢复，请检查状态文件", 503
+                    )
                 # The in-memory task is authoritative while an I/O repair is
                 # pending; a stale accepted receipt must never win over it.
                 if self.task and self.task["id"] == key:
                     self._check_task_identity(self.task, action, commit)
                     return dict(self.task)
                 receipt = self.state / "receipts" / (key + ".json")
-                if receipt.exists():
-                    old = json.loads(receipt.read_bytes())
+                try:
+                    old = _read_task_record(receipt, expected_key=key, missing_ok=True)
+                except (OSError, ValueError, TypeError, RecursionError) as error:
+                    raise FirmwareError(
+                        "update_state_unavailable",
+                        "更新任务回执无法读取或校验，请检查状态文件",
+                        503,
+                    ) from error
+                if old is not None:
                     self._check_task_identity(old, action, commit)
                     if old["status"] in {"accepted", "running"}:
                         # No current worker owns this historical task. Keep
@@ -217,7 +314,12 @@ class FirmwareSupervisor:
                             message="更新任务曾中断，请检查当前版本后重试",
                             finished_at=int(time.time()),
                         )
-                        atomic_json(receipt, old)
+                        try:
+                            atomic_json(receipt, old)
+                        except OSError as error:
+                            raise FirmwareError(
+                                "update_state_unavailable", "更新任务回执尚未恢复，请检查存储", 503
+                            ) from error
                     return old
                 if self._task_save_pending or self._success_notification_pending:
                     raise FirmwareError(
@@ -331,6 +433,8 @@ class FirmwareSupervisor:
 
     def _repair_task_state(self):
         with self.lock:
+            if self._task_load_pending and not self._restore_task_state():
+                return
             if self._task_save_pending and not self._try_save_task():
                 return
             if not self._success_notification_pending or self._callback_active:

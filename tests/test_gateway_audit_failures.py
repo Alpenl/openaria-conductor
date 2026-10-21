@@ -38,7 +38,14 @@ class GatewayAuditFailuresTest(unittest.TestCase):
             audit_sink=self.sink,
         )
         self.errors = []
-        self.server.handle_error = lambda *_: self.errors.append("handler_error")
+        # Keep the production filter for ordinary disconnects. Record only
+        # errors that it delegates to the default server error handler.
+        error_reporter = patch(
+            "socketserver.BaseServer.handle_error",
+            side_effect=lambda *_: self.errors.append(type(sys.exception()).__name__),
+        )
+        error_reporter.start()
+        self.addCleanup(error_reporter.stop)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.client = http.client.HTTPConnection(*self.server.server_address, timeout=2)
@@ -256,3 +263,17 @@ class GatewayAuditFailuresTest(unittest.TestCase):
         self.assertTrue(
             all(issubclass(error, (BrokenPipeError, ConnectionResetError)) for error in errors)
         )
+
+    def test_error_observer_preserves_disconnect_filter_and_catches_unknown_errors(self):
+        for error in [ConnectionResetError(), BrokenPipeError()]:
+            try:
+                raise error
+            except OSError:
+                self.server.handle_error(None, None)
+        self.assertEqual(self.errors, [])
+        try:
+            raise ValueError("unexpected handler failure")
+        except ValueError:
+            self.server.handle_error(None, None)
+        self.assertEqual(self.errors, ["ValueError"])
+        self.errors.clear()

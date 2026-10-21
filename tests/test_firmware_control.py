@@ -164,7 +164,17 @@ class FirmwareControlTest(unittest.TestCase):
     def test_restart_marks_unfinished_task_failed_not_successful(self):
         self.state.mkdir()
         (self.state / "task.json").write_text(
-            json.dumps({"id": str(uuid.uuid4()), "status": "running"})
+            json.dumps(
+                {
+                    "id": str(uuid.uuid4()),
+                    "action": "update",
+                    "target_commit": "c" * 40,
+                    "status": "running",
+                    "message": "running",
+                    "started_at": 1,
+                    "finished_at": None,
+                }
+            )
         )
         result = FirmwareSupervisor(self.state, self.install).status()
         self.assertEqual(result["task"]["status"], "failed")
