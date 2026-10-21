@@ -778,6 +778,7 @@ class CaptureCoordinator:
         self._pending_safe_swap_failure: dict[str, object] | None = None
         self._safe_swap_resource: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
+        self._pending_stop_state_commit: tuple[str, str, str] | None = None
         self._async_stop_worker: threading.Thread | None = None
         self._async_stop_reason: str | None = None
         self._failure_inflight: DeviceSessionRecorder | None = None
@@ -1136,6 +1137,7 @@ class CaptureCoordinator:
         with self._lock:
             sequence, value, commands = self._local_state_write()
             focus = self._focus_to_persist
+            pending_stop = self._pending_stop_state_commit
         with self._state_persist_lock:
             if sequence <= self._state_persisted_sequence:
                 return
@@ -1162,6 +1164,14 @@ class CaptureCoordinator:
             self._persisted_focus = focus
             self._persisted_commands = commands
             self._state_persisted_sequence = sequence
+            if (
+                pending_stop is not None
+                and self._pending_stop_state_commit == pending_stop
+                and value["active_session"] is None
+            ):
+                # This exact completed-state snapshot is durable. The stop
+                # owner still fences new mutations until its finally block.
+                self._pending_stop_state_commit = None
             # The same successful transaction has preserved any inline evidence
             # in capture_commands. Quarantine identities never change during a
             # coordinator lifetime; replace the mapping without reacquiring the
@@ -2976,6 +2986,12 @@ class CaptureCoordinator:
         scope = (command.principal_id, operation, command.idempotency_key)
         self._require_valid_command_receipt(scope)
         previous = self._commands.get(scope)
+        if (
+            self._stop_inflight is not None or self._pending_stop_state_commit is not None
+        ) and (previous is None or self._persisted_commands.get(scope) is not previous):
+            raise ProviderError(
+                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+            )
         if previous is not None:
             previous_body, result = previous
             if previous_body != command.canonical_body:
@@ -3322,6 +3338,9 @@ class CaptureCoordinator:
         stable; status/SSE and the typed safe-swap receipt describe completion.
         Internal callers can still use stop_capture to wait for finalization.
         """
+        replay = self._retry_completed_stop_receipt(command)
+        if replay is not None:
+            return replay
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
         retry_receipt: CaptureCommandResult | None = None
@@ -3339,6 +3358,13 @@ class CaptureCoordinator:
                         "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
                     )
                 if self._persisted_commands.get(scope) is not previous:
+                    if self._stop_inflight is not None or (
+                        self._active is None and reason != "safe_swap"
+                    ):
+                        raise ProviderError(
+                            "capture_busy", "停止回执正在提交，请重试",
+                            status=HTTPStatus.CONFLICT, retryable=True,
+                        )
                     self._persist_local_state()
                 if (
                     reason == "safe_swap"
@@ -3375,6 +3401,10 @@ class CaptureCoordinator:
                     return CaptureCommandResult(
                         result.status, copy.deepcopy(result.body), replayed=True
                     )
+            if self._stop_inflight is not None and self._active is None:
+                raise ProviderError(
+                    "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                )
             if self._async_stop_worker is not None:
                 if reason != self._async_stop_reason:
                     raise ProviderError(
@@ -3603,8 +3633,13 @@ class CaptureCoordinator:
     def stop_capture(
         self, command: CaptureCommand, *, expected_session_id: str | None = None
     ) -> CaptureCommandResult:
+        if expected_session_id is None:
+            replay = self._retry_completed_stop_receipt(command, wait=True)
+            if replay is not None:
+                return replay
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
+        pending_replay: CaptureCommandResult | None = None
         with self._stop_condition:
             requested_plan = self._active_plan
             while True:
@@ -3623,7 +3658,18 @@ class CaptureCoordinator:
                             status=HTTPStatus.CONFLICT,
                         )
                     if self._persisted_commands.get(scope) is not previous:
-                        self._persist_local_state()
+                        if (
+                            self._stop_inflight is not None
+                            or self._failure_inflight is not None
+                            or self._async_stop_worker is not None
+                        ):
+                            self._stop_condition.wait()
+                            continue
+                        pending_replay = CaptureCommandResult(
+                            result.status, copy.deepcopy(result.body), replayed=True
+                        )
+                        self._stop_inflight = scope
+                        break
                     return CaptureCommandResult(
                         result.status, copy.deepcopy(result.body), replayed=True
                     )
@@ -3647,29 +3693,102 @@ class CaptureCoordinator:
                 ):
                     break
                 self._stop_condition.wait()
-            if self._admission is None:
-                try:
-                    self._require_admission()
-                except DeviceRecordingError as error:
-                    raise ProviderError(
-                        error.code,
-                        error.message,
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                    ) from error
-            if self._active is None:
-                if reason == "safe_swap" and self._pending_safe_swap is not None:
-                    result = self._publish_safe_swap_command()
-                else:
-                    result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                self._remember_command(scope, command, result)
-                return result
-            recorder = self._active
-            plan = self._active_plan
-            assert plan is not None
-            self._stop_inflight = scope
+            if pending_replay is None:
+                if self._admission is None:
+                    try:
+                        self._require_admission()
+                    except DeviceRecordingError as error:
+                        raise ProviderError(
+                            error.code,
+                            error.message,
+                            status=HTTPStatus.CONFLICT,
+                            retryable=True,
+                        ) from error
+                if self._active is None:
+                    if reason == "safe_swap" and self._pending_safe_swap is not None:
+                        result = self._publish_safe_swap_command()
+                    else:
+                        result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                    self._remember_command(scope, command, result)
+                    return result
+                recorder = self._active
+                plan = self._active_plan
+                assert plan is not None
+                self._stop_inflight = scope
 
+        if pending_replay is not None:
+            return self._commit_stop_replay(scope, pending_replay)
         return self._finish_stop_capture(command, scope, recorder, plan)
+
+    def _commit_stop_replay(
+        self, scope: tuple[str, str, str], result: CaptureCommandResult,
+    ) -> CaptureCommandResult:
+        pending = self._pending_stop_state_commit
+        try:
+            self._persist_local_state()
+            with self._lock:
+                if self._pending_stop_state_commit == pending:
+                    self._pending_stop_state_commit = None
+            return result
+        finally:
+            with self._stop_condition:
+                if self._stop_inflight == scope:
+                    self._stop_inflight = None
+                self._stop_condition.notify_all()
+
+    def _retry_completed_stop_receipt(
+        self, command: CaptureCommand, *, wait: bool = False,
+    ) -> CaptureCommandResult | None:
+        scope = (command.principal_id, "stop", command.idempotency_key)
+        with self._stop_condition:
+            while True:
+                self._require_valid_command_receipt(scope)
+                previous = self._commands.get(scope)
+                pending = self._pending_stop_state_commit
+                if pending is None and (
+                    previous is None or self._persisted_commands.get(scope) is previous
+                ):
+                    return None
+                result = None if previous is None else previous[1]
+                if not (
+                    self._active is None
+                    and command.body.get("reason") != "safe_swap"
+                    and (pending is not None or (
+                        result is not None
+                        and isinstance(result.body, Mapping)
+                        and result.body.get("snapshot", {}).get("device_state") == "idle"
+                    ))
+                ):
+                    return None
+                if previous is not None and previous[0] != command.canonical_body:
+                    raise ProviderError(
+                        "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
+                    )
+                if self._closing:
+                    raise ProviderError(
+                        "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                if (
+                    self._stop_inflight is not None
+                    or self._failure_inflight is not None
+                    or self._async_stop_worker is not None
+                ):
+                    if wait:
+                        self._stop_condition.wait()
+                        continue
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                replay = (
+                    CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
+                    if result is not None else CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
+                )
+                self._stop_inflight = scope
+                break
+        committed = self._commit_stop_replay(scope, replay)
+        # A different key first completes the old transaction, then follows the
+        # usual idle-stop path to persist its own independent receipt.
+        return committed if previous is not None else None
 
     def _finish_stop_capture(
         self,
@@ -3839,11 +3958,21 @@ class CaptureCoordinator:
                         )
                     self._persist_local_state()
                     result = self._publish_safe_swap_command()
-                else:
-                    self._persist_local_state()
-                    result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+                    if remember_result:
+                        self._remember_command(scope, command, result)
+                    self._release_network_operation_lease()
+                    return result
+                result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
                 if remember_result:
-                    self._remember_command(scope, command, result)
+                    self._cache_command(scope, command, result)
+                self._pending_stop_state_commit = scope
+            # Keep _stop_inflight and the leases until the state and synchronous
+            # completion receipt are durable together. SQLite may wait without
+            # preventing status readers from observing the sealed recording.
+            self._persist_local_state()
+            with self._lock:
+                if self._pending_stop_state_commit == scope:
+                    self._pending_stop_state_commit = None
                 self._release_network_operation_lease()
                 return result
         except DeviceRecordingError as error:
@@ -3868,10 +3997,18 @@ class CaptureCoordinator:
         command: CaptureCommand,
         result: CaptureCommandResult,
     ) -> None:
+        self._cache_command(scope, command, result)
+        self._persist_local_state()
+
+    def _cache_command(
+        self,
+        scope: tuple[str, str, str],
+        command: CaptureCommand,
+        result: CaptureCommandResult,
+    ) -> None:
         self._commands[scope] = (command.canonical_body, copy.deepcopy(result))
         while len(self._commands) > 1024:
             self._commands.pop(next(iter(self._commands)))
-        self._persist_local_state()
 
     def _retain_active_failure(
         self,
