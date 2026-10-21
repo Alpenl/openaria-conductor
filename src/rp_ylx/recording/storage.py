@@ -12,6 +12,7 @@ import io
 import os
 import selectors
 import subprocess
+import tempfile
 import time
 import uuid
 import wave
@@ -136,67 +137,75 @@ def _pcm_readback(command: list[str], *, expected_bytes: int) -> tuple[int, str]
 
 def compact_audio(path: Path, *, durable: bool = True) -> tuple[Path, dict]:
     target = path.with_suffix(".flac")
-    temporary = target.with_suffix(".flac.tmp")
     with open_regular(path) as raw, wave.open(raw, "rb") as source:
         if source.getsampwidth() != 2 or source.getcomptype() != "NONE":
             raise ValueError("lossless audio requires signed 16-bit PCM")
         pcm = hashlib.sha256()
         pcm_bytes = 0
+        expected_pcm_bytes = source.getnframes() * source.getnchannels() * 2
         while block := source.readframes(BLOCK_BYTES // (2 * source.getnchannels())):
             pcm.update(block)
             pcm_bytes += len(block)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-v",
-            "error",
-            "-n",
-            "-i",
-            str(path),
-            "-map",
-            "0:a:0",
-            "-c:a",
-            "flac",
-            "-compression_level",
-            "5",
-            "-threads",
-            "1",
-            "-f",
-            "flac",
-            str(temporary),
-        ],
-        check=True,
-        timeout=AUDIO_CODEC_TIMEOUT_SECONDS,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    actual = _pcm_readback(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-v",
-            "error",
-            "-i",
-            str(temporary),
-            "-threads",
-            "1",
-            "-map",
-            "0:a:0",
-            "-f",
-            "s16le",
-            "-c:a",
-            "pcm_s16le",
-            "-",
-        ],
-        expected_bytes=pcm_bytes,
-    )
-    if actual != (pcm_bytes, pcm.hexdigest()):
-        raise ValueError("FLAC PCM round-trip mismatch")
-    if durable:
-        with open_regular(temporary) as stream:
-            os.fsync(stream.fileno())
-    os.replace(temporary, target)
+    if pcm_bytes != expected_pcm_bytes:
+        raise ValueError("truncated WAV PCM payload")
+    # Each attempt owns a private directory on the target filesystem. Failed
+    # encoders, readback, fsync and publication cannot leave a fixed-name retry
+    # barrier or remove another attempt's temporary. The previous target stays
+    # intact until independently verified output is atomically published.
+    with tempfile.TemporaryDirectory(prefix=f".{target.name}.", dir=target.parent) as directory:
+        temporary = Path(directory) / target.name
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-n",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "5",
+                "-threads",
+                "1",
+                "-f",
+                "flac",
+                str(temporary),
+            ],
+            check=True,
+            timeout=AUDIO_CODEC_TIMEOUT_SECONDS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        actual = _pcm_readback(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-i",
+                str(temporary),
+                "-threads",
+                "1",
+                "-map",
+                "0:a:0",
+                "-f",
+                "s16le",
+                "-c:a",
+                "pcm_s16le",
+                "-",
+            ],
+            expected_bytes=pcm_bytes,
+        )
+        if actual != (pcm_bytes, pcm.hexdigest()):
+            raise ValueError("FLAC PCM round-trip mismatch")
+        if durable:
+            with open_regular(temporary) as stream:
+                os.fsync(stream.fileno())
+        os.replace(temporary, target)
     return target, {"codec": "flac", "pcm_bytes": pcm_bytes, "pcm_sha256": pcm.hexdigest()}
 
 
