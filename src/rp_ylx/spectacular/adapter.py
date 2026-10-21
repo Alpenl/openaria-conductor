@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from zstandard import ZstdError
+
 from rp_ylx.frame_index import valid_frame_record
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.recording.device_session import (
@@ -195,7 +197,7 @@ def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
                     )
                 value = _loads_json(line, f"{label}:{line_number}")
                 records.append(_mapping(value, f"{label}:{line_number}"))
-    except OSError as error:
+    except (OSError, ZstdError) as error:
         raise CaptureValidationError(f"cannot read {label}: {error}") from error
     if not records:
         raise CaptureValidationError(f"{label} is empty")

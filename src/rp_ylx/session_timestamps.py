@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 from statistics import fmean, median, pstdev
 from typing import Any
 
+from zstandard import ZstdError
+
 from rp_ylx.frame_index import valid_frame_record
 from rp_ylx.recording.storage import open_metadata
 from rp_ylx.validation import PublicValidationError, validate_public_session
@@ -91,26 +93,31 @@ def _artifact_path(root: Path, descriptor: object, *, role: str, label: str) -> 
 
 def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    with open_metadata(path) as stream:
-        line_number = 0
-        while True:
-            line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
-            if not line:
-                break
-            line_number += 1
-            if len(line) > MAX_NDJSON_LINE_BYTES or not line.endswith(b"\n"):
-                raise SessionTimestampError(
-                    "session_timestamps_invalid",
-                    f"{label}:{line_number} 行过长或缺少换行",
-                )
-            try:
-                value = json.loads(line)
-            except (UnicodeError, json.JSONDecodeError) as error:
-                raise SessionTimestampError(
-                    "session_timestamps_invalid",
-                    f"{label}:{line_number} JSON 无效：{error}",
-                ) from error
-            rows.append(_mapping(value, f"{label}:{line_number}"))
+    try:
+        with open_metadata(path) as stream:
+            line_number = 0
+            while True:
+                line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
+                if not line:
+                    break
+                line_number += 1
+                if len(line) > MAX_NDJSON_LINE_BYTES or not line.endswith(b"\n"):
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid",
+                        f"{label}:{line_number} 行过长或缺少换行",
+                    )
+                try:
+                    value = json.loads(line)
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid",
+                        f"{label}:{line_number} JSON 无效：{error}",
+                    ) from error
+                rows.append(_mapping(value, f"{label}:{line_number}"))
+    except (OSError, ZstdError) as error:
+        raise SessionTimestampError(
+            "session_timestamps_invalid", f"{label} 无法完整读取：{error}"
+        ) from error
     if not rows:
         raise SessionTimestampError("session_timestamps_empty", f"{label} 为空")
     return rows

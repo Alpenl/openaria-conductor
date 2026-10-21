@@ -13,6 +13,7 @@ import os
 import selectors
 import subprocess
 import time
+import uuid
 import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import zstandard
 
+from rp_ylx.recording.metadata_frames import MetadataFrames
 from rp_ylx.recording.verified import open_regular
 
 BLOCK_BYTES = 1024 * 1024
@@ -31,15 +33,14 @@ AUDIO_CODEC_TIMEOUT_SECONDS = 120
 def open_metadata(path: Path):
     with open_regular(path) as raw:
         if path.suffix == ".zst":
-            with (
-                zstandard.ZstdDecompressor(max_window_size=BLOCK_BYTES).stream_reader(
-                    raw, read_across_frames=True
-                ) as reader,
-                io.BufferedReader(reader) as buffered,
-            ):
-                yield buffered
+            with _decoded_metadata(raw) as decoded:
+                yield decoded
         else:
             yield raw
+
+
+def _decoded_metadata(raw):
+    return io.BufferedReader(MetadataFrames(raw, BLOCK_BYTES))
 
 
 def _digest(stream) -> tuple[int, str]:
@@ -53,33 +54,40 @@ def _digest(stream) -> tuple[int, str]:
 
 def compact_metadata(path: Path) -> tuple[Path, dict]:
     target = path.with_suffix(path.suffix + ".zst")
-    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     compressor = zstandard.ZstdCompressor(level=1, write_checksum=True)
     size, digest = 0, hashlib.sha256()
-    with open_regular(path) as source, temporary.open("xb") as output:
-        while block := source.read(BLOCK_BYTES):
-            size += len(block)
-            digest.update(block)
-            output.write(compressor.compress(block))
-        if size == 0:
-            output.write(compressor.compress(b""))
-        output.flush()
-        os.fsync(output.fileno())
-    # Name remains temporary until the complete byte-for-byte round trip passes.
-    with (
-        open_regular(temporary) as raw,
-        zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True) as decoded,
-    ):
-        if _digest(decoded) != (size, digest.hexdigest()):
-            raise ValueError("metadata compression round-trip mismatch")
-    os.replace(temporary, target)
-    return target, {
-        "codec": "zstd",
-        "level": 1,
-        "block_bytes": BLOCK_BYTES,
-        "uncompressed_bytes": size,
-        "uncompressed_sha256": digest.hexdigest(),
-    }
+    try:
+        with open_regular(path) as source, temporary.open("xb") as output:
+            while block := source.read(BLOCK_BYTES):
+                size += len(block)
+                digest.update(block)
+                encoded = compressor.compress(block)
+                if output.write(encoded) != len(encoded):
+                    raise OSError("short metadata compression write")
+            if size == 0:
+                encoded = compressor.compress(b"")
+                if output.write(encoded) != len(encoded):
+                    raise OSError("short metadata compression write")
+            output.flush()
+            os.fsync(output.fileno())
+        # Require complete frames as well as the exact decoded bytes. A generic
+        # stream reader can accept a missing checksum even when the text matches.
+        with open_regular(temporary) as raw, _decoded_metadata(raw) as decoded:
+            if _digest(decoded) != (size, digest.hexdigest()):
+                raise ValueError("metadata compression round-trip mismatch")
+        os.replace(temporary, target)
+        return target, {
+            "codec": "zstd",
+            "level": 1,
+            "block_bytes": BLOCK_BYTES,
+            "uncompressed_bytes": size,
+            "uncompressed_sha256": digest.hexdigest(),
+        }
+    finally:
+        # Only this invocation's private temporary is removed; retries preserve
+        # both the acquisition journal and a previously verified target.
+        temporary.unlink(missing_ok=True)
 
 
 def _pcm_readback(command: list[str], *, expected_bytes: int) -> tuple[int, str]:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import zstandard
 
-from rp_ylx.recording.storage import BLOCK_BYTES, _digest
+from rp_ylx.recording.storage import BLOCK_BYTES, _decoded_metadata, _digest
 from rp_ylx.recording.verified import open_regular
 
 
@@ -89,9 +89,7 @@ class RecoveryIndex:
             if _digest(raw) != (self.encoded_size, self.encoded_digest.hexdigest()):
                 raise ValueError("recovery index compressed-byte readback mismatch")
             raw.seek(0)
-            with zstandard.ZstdDecompressor(max_window_size=BLOCK_BYTES).stream_reader(
-                raw, read_across_frames=True
-            ) as decoded:
+            with _decoded_metadata(raw) as decoded:
                 if _digest(decoded) != (self.size, self.digest.hexdigest()):
                     raise ValueError("recovery index compression round-trip mismatch")
         return {
