@@ -221,6 +221,7 @@ class SealedDeviceSession:
 class _FrameEvent:
     observation: FrameObservation
     record_sequence: int
+    accepted_elapsed: float
     payload_lease: PayloadLease | None = None
 
 
@@ -1104,7 +1105,7 @@ class DeviceSessionRecorder:
         payload = _jpeg_payload(frame.raw_side_by_side)
         ordinal = self._frames_written
         if ordinal % self._segment_frames == 0:
-            self._mark_segment_boundary(ordinal, event.record_sequence)
+            self._mark_segment_boundary(ordinal, event.record_sequence, event.accepted_elapsed)
         segment_index = ordinal // self._segment_frames
         segment_frame = ordinal % self._segment_frames
         try:
@@ -1127,11 +1128,9 @@ class DeviceSessionRecorder:
         if self._metrics is not None:
             self._metrics.finish("recording_frame", started)
 
-    def _mark_segment_boundary(self, ordinal: int, record_sequence: int) -> None:
+    def _mark_segment_boundary(self, ordinal: int, record_sequence: int, elapsed: float) -> None:
         """记录编码序号到帧域序号与经过时长的对应关系，用于封存分段边界。"""
 
-        assert self._started_monotonic_ns is not None
-        elapsed = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
         with self._segment_lock:
             self._boundary_record_sequence.setdefault(ordinal, record_sequence)
             self._boundary_elapsed.setdefault(ordinal, elapsed)
@@ -1386,7 +1385,8 @@ class DeviceSessionRecorder:
                 else None
             )
             if self._queue_put(
-                _FrameEvent(observation, record_sequence, lease), self._enqueue_timeout
+                _FrameEvent(observation, record_sequence, self._elapsed(), lease),
+                self._enqueue_timeout,
             ):
                 if self._metrics is not None:
                     self._metrics.observe_queue(
@@ -1981,6 +1981,8 @@ class DeviceSessionRecorder:
         verified_at: datetime,
         sealed_at: datetime,
         duration: float,
+        *,
+        audio: dict[str, object] | None = None,
     ) -> dict[str, object]:
         video = self._video_block(duration)
         imu = self._artifact("imu.samples", "imu.ndjson", "application/x-ndjson")
@@ -2070,7 +2072,7 @@ class DeviceSessionRecorder:
             },
         }
         manifest["audio"] = (
-            self._audio_block()
+            (audio if audio is not None else self._audio_block())
             if self._config.audio_enabled
             else {
                 "state": "not_recorded",
@@ -2192,6 +2194,7 @@ class DeviceSessionRecorder:
             stage_started = now
 
         try:
+            capture_ended_at = self._now()
             self._persist_state("finalizing")
             finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None
@@ -2204,8 +2207,8 @@ class DeviceSessionRecorder:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
                 self._finish_audio()
                 self._sync_and_close_files()
-            ended_at = self._now()
-            duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
+            ended_at = capture_ended_at
+            duration = self._stopped_elapsed
             if transaction is None:
                 self._finish_encoder(duration)
             else:
@@ -2247,16 +2250,22 @@ class DeviceSessionRecorder:
                 finished_stage("video_tail")
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
-                # Native finish joins audio capture; its final samples can arrive
-                # after the stop request timestamp passed to the video planner.
-                ended_at = self._now()
-                duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
+            audio = self._audio_block() if self._config.audio_enabled else None
+            if audio is not None:
+                # Audio can finish after the video gate closes. Preserve its
+                # actual last sample, excluding durable writes and sealing work.
+                audio_end = float(audio["sync"]["end_time_seconds"])
+                observed_end = (time.monotonic_ns() - self._started_monotonic_ns) / 1e9
+                if not math.isfinite(audio_end) or audio_end > observed_end:
+                    raise DeviceRecordingError("audio_invalid", "音频结束时间超出已观测采集窗口")
+                duration = max(duration, audio_end)
+                ended_at += timedelta(seconds=duration - self._stopped_elapsed)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
             finished_stage("verifying_checkpoint")
             verified_at = self._now()
             sealed_at = self._now()
-            manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
+            manifest = self._manifest(ended_at, verified_at, sealed_at, duration, audio=audio)
             compacted_originals: list[str] = []
             artifact_count = len(_manifest_artifacts(manifest))
 

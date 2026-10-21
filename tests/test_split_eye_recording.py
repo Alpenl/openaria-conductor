@@ -843,7 +843,11 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
                 with patch.object(store.transaction, "finish", side_effect=delayed_finish):
                     sealed = recorder.stop()
-                self.assertGreaterEqual(
+                self.assertEqual(
+                    sealed.manifest["time"]["duration_seconds"],
+                    recorder._stopped_elapsed,
+                )
+                self.assertLess(
                     sealed.manifest["time"]["duration_seconds"],
                     (finished_at_ns[0] - recorder._started_monotonic_ns) / 1e9,
                 )
