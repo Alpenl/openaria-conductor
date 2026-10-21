@@ -3767,38 +3767,52 @@ class CaptureCoordinator:
                         status=HTTPStatus.CONFLICT,
                         retryable=True,
                     )
-                with self._catalog_lock:
-                    self._session_summaries[plan.session_id] = self._session_summary(
-                        plan.session_id,
+            # This rebuildable metadata can wait for an unrelated list scan or
+            # SQLite writer. Keep the stop owner and leases, but leave status
+            # readers free to observe the sealed recorder while it is pending.
+            with self._catalog_lock:
+                self._session_summaries[plan.session_id] = self._session_summary(
+                    plan.session_id,
+                    sealed.manifest,
+                    sealed.manifest_bytes,
+                    verification_error=verification_error,
+                    verification_current=verification_current,
+                )
+                try:
+                    self._catalog_db.remember(
+                        plan.volume_id,
+                        self._require_admission().sessions_root / plan.session_id,
+                        self._config.session.commit,
+                        self._session_summaries[plan.session_id],
                         sealed.manifest,
-                        sealed.manifest_bytes,
-                        verification_error=verification_error,
-                        verification_current=verification_current,
                     )
-                    try:
-                        self._catalog_db.remember(
-                            plan.volume_id,
-                            self._require_admission().sessions_root / plan.session_id,
-                            self._config.session.commit,
-                            self._session_summaries[plan.session_id],
-                            sealed.manifest,
-                        )
-                    except (OSError, sqlite3.Error, PersistenceError):
-                        # The sealed files are already durable. Discovery can rebuild this cache.
-                        operational_logger("recording").event(
-                            "catalog_publish_deferred",
-                            level="warning",
-                            transaction_id=plan.session_id,
-                        )
-                    if verified_snapshot is not None:
-                        self._session_snapshots[plan.session_id] = verified_snapshot
-                    else:
-                        self._session_snapshots.pop(plan.session_id, None)
-                    if verified_snapshot is not None and verification_error is None:
-                        self._verified[plan.session_id] = verified_snapshot.manifest_sha256
-                    else:
-                        self._verified.pop(plan.session_id, None)
-                    self._session_diagnostics.pop(plan.session_id, None)
+                except (OSError, sqlite3.Error, PersistenceError):
+                    # The sealed files are already durable. Discovery can rebuild this cache.
+                    operational_logger("recording").event(
+                        "catalog_publish_deferred",
+                        level="warning",
+                        transaction_id=plan.session_id,
+                    )
+                if verified_snapshot is not None:
+                    self._session_snapshots[plan.session_id] = verified_snapshot
+                else:
+                    self._session_snapshots.pop(plan.session_id, None)
+                if verified_snapshot is not None and verification_error is None:
+                    self._verified[plan.session_id] = verified_snapshot.manifest_sha256
+                else:
+                    self._verified.pop(plan.session_id, None)
+                self._session_diagnostics.pop(plan.session_id, None)
+
+            with self._lock:
+                if self._pending_source_failure is not None:
+                    raise self._pending_source_failure
+                if self._active is not recorder:
+                    raise ProviderError(
+                        "capture_state_changed",
+                        "录制停止期间状态已变化",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    )
                 self._active = None
                 self._active_plan = None
                 self._latest_imu = None
