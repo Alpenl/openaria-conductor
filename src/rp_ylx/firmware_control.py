@@ -494,7 +494,10 @@ def request_firmware(operation: str, **fields) -> dict:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(75 if operation in {"check", "update"} else 20)
             client.connect(SOCKET)
-            client.sendall(payload)
+            # A saturated server can queue a refusal and close before our
+            # write. Preserve that typed response even when send sees EPIPE.
+            with suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                client.sendall(payload)
             with client.makefile("rb") as stream:
                 raw = stream.readline(LIMIT + 1)
         value = _decode_control_frame(raw)

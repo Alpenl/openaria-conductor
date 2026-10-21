@@ -378,3 +378,63 @@ class FirmwareControlCapacityTest(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 control.ControlServer(str(path), control.ControlHandler, **kwargs)
             self.assertFalse(path.exists())
+
+    def test_client_reads_queued_refusal_when_peer_closed_before_send(self):
+        server = self.server(serve=False)
+        request, client = self.pair()
+        server._reject_control_request(request)
+        send_errors = []
+
+        class ConnectedClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                client.close()
+
+            def __getattr__(self, name):
+                return getattr(client, name)
+
+            def connect(self, address):
+                pass  # The real socketpair is already connected.
+
+            def sendall(self, payload):
+                try:
+                    client.sendall(payload)
+                except OSError as error:
+                    send_errors.append(type(error).__name__)
+                    raise
+
+        with (
+            patch.object(control.socket, "socket", return_value=ConnectedClient()),
+            self.assertRaises(control.FirmwareError) as raised,
+        ):
+            control.request_firmware("status")
+        self.assertEqual(send_errors, ["BrokenPipeError"])
+        self.assertEqual(raised.exception.code, "update_service_busy")
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(server.supervisor.mock_calls, [])
+
+    def test_peer_close_without_response_still_reports_unavailable(self):
+        request, client = self.pair()
+        request.close()
+
+        class ConnectedClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                client.close()
+
+            def __getattr__(self, name):
+                return getattr(client, name)
+
+            def connect(self, address):
+                pass
+
+        with (
+            patch.object(control.socket, "socket", return_value=ConnectedClient()),
+            self.assertRaises(control.FirmwareError) as raised,
+        ):
+            control.request_firmware("status")
+        self.assertEqual(raised.exception.code, "update_service_unavailable")
