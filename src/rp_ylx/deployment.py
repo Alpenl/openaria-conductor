@@ -47,6 +47,7 @@ MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_FILES = 100_000
 MAX_RELEASE_METADATA_BYTES = 64 * 1024
 MAX_INSTALL_TRANSACTION_BYTES = 64 * 1024
+MAX_ACTIVATION_DIAGNOSTIC_BYTES = 64 * 1024
 ACTIVATION_HEALTH_TIMEOUT_SECONDS = 300.0
 NETWORK_CONTROL_PROTOCOL = "persistent-listener-notify-v1"
 NETWORK_CONTROL_MAX_REQUEST_BYTES = 64 * 1024
@@ -2565,17 +2566,33 @@ class ReleaseManager:
     def status(self) -> Mapping[str, object]:
         activation_failure: Mapping[str, object] | None = None
         diagnostic_path = self.state_root / "activation-failure.json"
-        if diagnostic_path.exists():
+        try:
             try:
-                diagnostic = json.loads(diagnostic_path.read_bytes())
-                if isinstance(diagnostic, dict):
-                    activation_failure = diagnostic
-            except (OSError, json.JSONDecodeError):
-                activation_failure = {
-                    "schema": "ylx.activation-failure.v1",
-                    "code": "diagnostic_unreadable",
-                    "message": "activation failure diagnostic is unreadable",
-                }
+                diagnostic_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                diagnostic = _read_deployment_json(
+                    diagnostic_path, maximum=MAX_ACTIVATION_DIAGNOSTIC_BYTES
+                )
+                if (
+                    not isinstance(diagnostic, dict)
+                    or diagnostic.get("schema") != "ylx.activation-failure.v1"
+                    or not isinstance(diagnostic.get("code"), str)
+                    or not isinstance(diagnostic.get("message"), str)
+                ):
+                    raise ValueError("invalid activation diagnostic")
+                if "release_commit" in diagnostic:
+                    _canonical_commit(diagnostic["release_commit"])
+                activation_failure = diagnostic
+        except (OSError, ValueError, TypeError, RecursionError, DeploymentError):
+            # Diagnostics are optional: preserve the basic status and the original
+            # file, while making the read failure visible. Retry on every query.
+            activation_failure = {
+                "schema": "ylx.activation-failure.v1",
+                "code": "diagnostic_unreadable",
+                "message": "activation failure diagnostic is unreadable",
+            }
         return {
             "installed": self._link_target("current") is not None,
             "current": self._link_target("current"),
