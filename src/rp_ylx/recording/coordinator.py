@@ -2555,11 +2555,15 @@ class CaptureCoordinator:
             if metadata.st_uid == os.geteuid():
                 os.fchmod(descriptor, 0o660)
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            maintenance.__exit__(None, None, None)
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
+        except BaseException as error:
+            try:
+                self._close_capture_leases(maintenance, descriptor if descriptor >= 0 else None)
+            except BaseException as cleanup_error:
+                if isinstance(error, Exception) and not isinstance(cleanup_error, Exception):
+                    raise cleanup_error from error
+                error.add_note(f"capture lease cleanup failed ({type(cleanup_error).__name__})")
+            if not isinstance(error, OSError):
+                raise
             if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
                 raise ProviderError(
                     "network_mutation_active",
@@ -2579,16 +2583,25 @@ class CaptureCoordinator:
     def _release_network_operation_lease(self) -> None:
         maintenance = getattr(self, "_maintenance_lease", None)
         self._maintenance_lease = None
-        if maintenance is not None:
-            maintenance.__exit__(None, None, None)
         descriptor = self._network_operation_lease
         self._network_operation_lease = None
-        if descriptor is None:
-            return
-        with suppress(OSError):
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        with suppress(OSError):
-            os.close(descriptor)
+        self._close_capture_leases(maintenance, descriptor)
+
+    @staticmethod
+    def _close_capture_leases(maintenance, descriptor: int | None) -> None:
+        # These leases are independently owned. Failure/cancellation while
+        # releasing one must not strand the other or prevent later capture.
+        try:
+            if maintenance is not None:
+                maintenance.__exit__(None, None, None)
+        finally:
+            if descriptor is not None:
+                try:
+                    with suppress(OSError):
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    with suppress(OSError):
+                        os.close(descriptor)
 
     def network_status(self) -> Mapping[str, object]:
         try:
