@@ -161,7 +161,8 @@ class FirmwareSupervisor:
         self.start_lock = threading.Lock()
         self.check_lock = threading.Lock()
         self.cache = None
-        self.checked_at = 0.0
+        self.checked_at = None
+        self._cache_checked_at = None
         self.warning = None
         self.task = None
         self._worker = None
@@ -217,7 +218,7 @@ class FirmwareSupervisor:
                 "previous": previous,
                 "available": available,
                 "has_update": has_update,
-                "checked_at": self.checked_at or None,
+                "checked_at": self.checked_at,
                 "warning": (
                     "更新任务状态无法读取或校验，已暂停更新；请修复保留的任务状态文件"
                     if self._task_load_pending
@@ -241,7 +242,14 @@ class FirmwareSupervisor:
 
     def check(self, force=False) -> dict:
         with self.check_lock:
-            if not force and self.cache and time.time() - self.checked_at < TTL:
+            # Wall time is for API display only. NTP/manual corrections must
+            # neither prolong a cache entry nor expire a fresh one early.
+            if (
+                not force
+                and self.cache
+                and self._cache_checked_at is not None
+                and 0 <= time.monotonic() - self._cache_checked_at < TTL
+            ):
                 return self.status()
             try:
                 update = updater_module()
@@ -250,6 +258,7 @@ class FirmwareSupervisor:
                 if not SEMVER.fullmatch(manifest["version"]) or manifest["version"] == "0.2.0":
                     with self.lock:
                         self.cache = None
+                        self._cache_checked_at = None
                         self.checked_at = int(time.time())
                         self.warning = (
                             "已连接 OSS，但公共渠道尚无兼容的 0.2.x 正式版本；"
@@ -267,6 +276,7 @@ class FirmwareSupervisor:
                         "published_at": manifest.get("published_at"),
                     }
                     self.checked_at = int(time.time())
+                    self._cache_checked_at = time.monotonic()
                     self.warning = None
             except OSError:
                 self.warning = "无法连接 OSS 发布源，请检查设备互联网连接后重试"
