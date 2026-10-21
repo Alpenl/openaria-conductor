@@ -339,6 +339,9 @@ class NativeCapabilitiesTest(unittest.TestCase):
             try:
                 transaction.request_audio_stop()
                 transaction.request_audio_stop()
+                # Audio signalling alone is not proof that the video gate has
+                # closed; direct transaction users retain the observed stop.
+                self.assertIsNone(transaction.capture_stopped_monotonic_ns)
                 snapshot = transaction.snapshot()
                 self.assertNotIn("segments", snapshot)
                 self.assertEqual(snapshot["state"], "recording")

@@ -7,6 +7,7 @@ use crate::recording::{
 use crate::stereo_encoder::{self, EncoderProcess, SegmentEvent};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -119,6 +120,7 @@ pub(crate) struct SessionTransaction {
     pub(crate) encoder: Arc<Mutex<EncoderProcess>>,
     pub(crate) segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     pub(crate) recording_start_monotonic_ns: u64,
+    pub(crate) capture_stopped_monotonic_ns: Arc<AtomicU64>,
     pub(crate) audio: Option<Arc<Recorder>>,
     state: Mutex<State>,
     segment_inventory: Mutex<()>,
@@ -186,6 +188,7 @@ impl SessionTransaction {
             encoder,
             segment_planner,
             recording_start_monotonic_ns: plan.recording_start_monotonic_ns,
+            capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
             audio,
             state: Mutex::new(State {
                 lifecycle: Lifecycle::Recording,
@@ -197,6 +200,12 @@ impl SessionTransaction {
     }
 
     pub(crate) fn ensure_recording(&self) -> Result<(), StoreError> {
+        if self.capture_stopped_monotonic_ns.load(Ordering::Acquire) != 0 {
+            return Err(StoreError::new(
+                "invalid_state",
+                "session transaction capture gate has already closed",
+            ));
+        }
         if let Some(audio) = &self.audio {
             audio.check_health()?;
         }
@@ -659,6 +668,23 @@ printf '{"event":"done","frames":0}\n'
         assert!(transaction.segments_since(3).unwrap().is_empty());
         assert_eq!(transaction.segments().unwrap().len(), 3);
         transaction.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_capture_gate_rejects_reattachment_but_retains_cleanup_ownership() {
+        let root = temp_root("closed-capture-gate");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 0);
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        transaction.ensure_recording().unwrap();
+        transaction
+            .capture_stopped_monotonic_ns
+            .store(10, std::sync::atomic::Ordering::Release);
+        assert_eq!(transaction.ensure_recording().unwrap_err().code, "invalid_state");
+        assert_eq!(transaction.snapshot().unwrap().state, "recording");
+        transaction.abort();
+        assert_eq!(transaction.open_handle_count(), 0);
         let _ = fs::remove_dir_all(root);
     }
 

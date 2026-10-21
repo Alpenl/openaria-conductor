@@ -98,6 +98,15 @@ impl NativeSessionTransaction {
         self.transaction.recording_start_monotonic_ns
     }
 
+    #[getter]
+    fn capture_stopped_monotonic_ns(&self) -> Option<u64> {
+        let value = self
+            .transaction
+            .capture_stopped_monotonic_ns
+            .load(std::sync::atomic::Ordering::Acquire);
+        (value != 0).then_some(value)
+    }
+
     fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let transaction = Arc::clone(&self.transaction);
         let snapshot = py
@@ -563,6 +572,8 @@ impl NativeCaptureEngine {
         let encoder = Arc::clone(&transaction.transaction.encoder);
         let segment_planner = Arc::clone(&transaction.transaction.segment_planner);
         let recording_start_monotonic_ns = transaction.transaction.recording_start_monotonic_ns;
+        let capture_stopped_monotonic_ns =
+            Arc::clone(&transaction.transaction.capture_stopped_monotonic_ns);
         let worker_collector = Arc::clone(&collector);
         let audio = transaction.transaction.audio.clone();
         let imu_timeout = self.imu_config.timeout;
@@ -578,6 +589,7 @@ impl NativeCaptureEngine {
                     Some(worker_collector),
                     imu_timeout,
                     audio,
+                    capture_stopped_monotonic_ns,
                 )
             })
             .map_err(capture_runtime_error);

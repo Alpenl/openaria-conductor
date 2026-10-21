@@ -156,6 +156,9 @@ class NativeSessionTransaction(Protocol):
 
     def segments_since(self, offset: int) -> list[dict[str, object]]: ...
 
+    @property
+    def capture_stopped_monotonic_ns(self) -> int | None: ...
+
     def request_audio_stop(self) -> None: ...
 
     def finish(

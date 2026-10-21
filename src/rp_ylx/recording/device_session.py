@@ -2176,7 +2176,11 @@ class DeviceSessionRecorder:
             if self._state != "recording":
                 raise DeviceRecordingError("invalid_state", "只有 recording 会话可以停止")
             self._state = "finalizing"
-            self._stopped_elapsed = self._elapsed()
+            assert self._started_monotonic_ns is not None
+            stop_observed_ns = time.monotonic_ns()
+            self._stopped_elapsed = max(
+                0.0, (stop_observed_ns - self._started_monotonic_ns) / 1e9
+            )
         published = False
         prepared = None
         live_audit = None
@@ -2198,6 +2202,22 @@ class DeviceSessionRecorder:
             transaction = self._native_transaction
             if transaction is not None:
                 transaction.request_audio_stop()
+                boundary = transaction.capture_stopped_monotonic_ns
+                if boundary is not None:
+                    if (
+                        isinstance(boundary, bool)
+                        or not isinstance(boundary, int)
+                        or not self._started_monotonic_ns <= boundary <= stop_observed_ns
+                    ):
+                        raise DeviceRecordingError(
+                            "native_session_store_failed", "原生采集停止边界超出已观测采集窗口"
+                        )
+                    # The native frame/IMU gate closes before source draining.
+                    # Retain accepted frames and real audio tail, but exclude
+                    # time spent joining workers or waiting on their disk I/O.
+                    with self._lock:
+                        self._stopped_elapsed = (boundary - self._started_monotonic_ns) / 1e9
+                    capture_ended_at -= timedelta(seconds=(stop_observed_ns - boundary) / 1e9)
             self._persist_state("finalizing")
             finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None

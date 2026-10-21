@@ -7,7 +7,7 @@ use crate::recording::{self, CaptureFanoutState, RecordingError};
 use crate::stereo_encoder;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -76,16 +76,41 @@ struct SplitSinkRecording {
     encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
     segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
     recording_start_monotonic_ns: u64,
+    capture_stopped_monotonic_ns: Arc<AtomicU64>,
     on_failure: Arc<Py<PyAny>>,
     imu: Option<Arc<Collector>>,
     audio: Option<Arc<crate::audio::Recorder>>,
 }
 
 impl SplitSinkRecording {
-    fn request_audio_stop(&self) {
+    fn request_capture_stop(&self) {
         if let Some(audio) = &self.audio {
             audio.request_stop();
         }
+        // Preserve the first gate closure across repeated calls, without
+        // waiting for encoder or sink locks held by an in-flight frame.
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: timestamp points to writable storage. A clock failure marks
+        // the boundary invalid but must not prevent resource drain/cleanup.
+        let stopped = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0
+        {
+            (timestamp.tv_sec as u64)
+                .checked_mul(1_000_000_000)
+                .and_then(|seconds| seconds.checked_add(timestamp.tv_nsec as u64))
+                .filter(|value| *value > 0)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        let _ = self.capture_stopped_monotonic_ns.compare_exchange(
+            0,
+            stopped,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -239,11 +264,18 @@ impl Runtime {
         imu: Option<Arc<Collector>>,
         imu_timeout: Duration,
         audio: Option<Arc<crate::audio::Recorder>>,
+        capture_stopped_monotonic_ns: Arc<AtomicU64>,
     ) -> Result<RuntimeSnapshot, RuntimeError> {
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
                 "invalid_argument",
                 "recording start monotonic timestamp must be positive",
+            ));
+        }
+        if capture_stopped_monotonic_ns.load(Ordering::Acquire) != 0 {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "session transaction capture gate has already closed",
             ));
         }
         if imu.is_some() && imu_timeout.is_zero() {
@@ -294,6 +326,7 @@ impl Runtime {
             encoder,
             segment_planner,
             recording_start_monotonic_ns,
+            capture_stopped_monotonic_ns,
             on_failure: Arc::clone(&on_failure),
             imu,
             audio: audio.clone(),
@@ -408,8 +441,9 @@ impl Runtime {
             .as_ref()
             .and_then(|recording| recording.imu.clone());
         let inflight = state.fanout.start_stopping();
+        self.imu_stop.store(true, Ordering::Release);
         if let Some(recording) = &state.recording {
-            recording.request_audio_stop();
+            recording.request_capture_stop();
         }
         self.shared.changed.notify_all();
         Ok((inflight, imu))
@@ -556,7 +590,7 @@ fn run_loop(
     if let Ok(mut state) = shared.state.lock() {
         state.running = false;
         if let Some(recording) = &state.recording {
-            recording.request_audio_stop();
+            recording.request_capture_stop();
         }
         state.recording = None;
         state.fanout.start_stopping();
@@ -940,7 +974,7 @@ fn report_recording_failure(
         };
         let (should_report, _inflight) = state.fanout.mark_failure();
         if let Some(recording) = &state.recording {
-            recording.request_audio_stop();
+            recording.request_capture_stop();
         }
         let callback = if should_report {
             preferred_callback.or_else(|| {
@@ -975,7 +1009,7 @@ fn set_terminal_error(shared: &Shared, error: RuntimeError) {
         state.running = false;
         let (should_report, _inflight) = state.fanout.mark_failure();
         if let Some(recording) = &state.recording {
-            recording.request_audio_stop();
+            recording.request_capture_stop();
         }
         let callback = if should_report {
             state
@@ -1089,6 +1123,7 @@ mod tests {
                 recording::RecordingSegmentPlanner::new(3).unwrap(),
             )),
             recording_start_monotonic_ns: 1,
+            capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
             on_failure: Arc::new(PyBytes::new(py, b"on-failure").into_any().unbind()),
             imu: None,
             audio: None,
@@ -1370,6 +1405,7 @@ mod tests {
                     None,
                     Duration::from_millis(10),
                     None,
+                    Arc::clone(&next.capture_stopped_monotonic_ns),
                 )
                 .unwrap();
             assert!(snapshot.recording_active);
@@ -1379,6 +1415,7 @@ mod tests {
             assert_eq!(error.code, "invalid_state");
             assert!(runtime.snapshot().unwrap().recording_active);
             runtime.stop_recording(Duration::from_secs(1)).unwrap();
+            assert!(next.capture_stopped_monotonic_ns.load(Ordering::Acquire) > 0);
             let _ = fs::remove_dir_all(root);
         });
     }
@@ -1540,6 +1577,7 @@ mod tests {
             None,
         )
         .unwrap();
+        let stopped = Arc::clone(&target.capture_stopped_monotonic_ns);
         let active_take = Arc::clone(&target.active_take);
         let sink = Arc::clone(&target.sink);
         let blocked_writer = active_take.lock().unwrap();
@@ -1579,9 +1617,18 @@ mod tests {
         let (inflight, _) = runtime.begin_recording_stop().unwrap();
         assert_eq!(inflight, 1);
         assert!(!runtime.snapshot().unwrap().recording_active);
+        assert!(runtime.imu_stop.load(Ordering::Acquire));
+        let gate_closed = stopped.load(Ordering::Acquire);
+        assert!(gate_closed > 0 && gate_closed < u64::MAX);
+        thread::sleep(Duration::from_millis(20));
+        // Repeating a stop while a real frame still owns the writer must not
+        // move the boundary to the later drain/retry time.
+        runtime.begin_recording_stop().unwrap();
+        assert_eq!(stopped.load(Ordering::Acquire), gate_closed);
         // Stopping closes admission while the blocked frame still owns its resources.
         drop(blocked_writer);
         worker.join().unwrap().unwrap();
+        assert_eq!(stopped.load(Ordering::Acquire), gate_closed);
         let snapshot = runtime.snapshot().unwrap();
         assert_eq!(snapshot.inflight_frames, 0);
         assert!(!snapshot.recording_present);
