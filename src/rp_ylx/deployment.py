@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes.util
+import fcntl
 import grp
 import hashlib
 import json
@@ -26,8 +27,8 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from email.parser import BytesParser
 from importlib.resources import files
@@ -1290,6 +1291,111 @@ class ReleaseManager:
         self.tls_material_generator = tls_material_generator
         self.group_resolver = group_resolver
         self.unit_load_state_reader = unit_load_state_reader
+        self._recovery_descriptor: int | None = None
+        self._recovery_exclusive = False
+
+    @contextmanager
+    def _deployment_lock(self, name: str, *, shared: bool = False) -> Iterator[int]:
+        # This root-owned directory is shared by every install/state root on the
+        # same system. Never unlink lock files: waiters must use the same inode.
+        root = self.system_root / "var/lib/openaria-update"
+        directory = descriptor = None
+        try:
+            try:
+                root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                directory = os.open(
+                    root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                )
+                owner = self._deployment_owner()[0]
+                parent = os.fstat(directory)
+                if parent.st_uid != owner or parent.st_mode & 0o022:
+                    raise ValueError("untrusted deployment lock directory")
+                filename = f"deployment-{name}.lock"
+                descriptor = os.open(
+                    filename,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=directory,
+                )
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != owner
+                    or metadata.st_mode & 0o077
+                ):
+                    raise ValueError("untrusted deployment lock file")
+                try:
+                    fcntl.flock(
+                        descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+                    )
+                except BlockingIOError as error:
+                    raise DeploymentError(
+                        "deployment_busy", "其他维护操作正在执行，请稍后重试"
+                    ) from error
+                named = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+                current_parent = root.lstat()
+                if (named.st_dev, named.st_ino, named.st_mode, named.st_nlink, named.st_uid) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    1,
+                    owner,
+                ) or (current_parent.st_dev, current_parent.st_ino) != (
+                    parent.st_dev,
+                    parent.st_ino,
+                ):
+                    raise ValueError("deployment lock identity changed")
+            except (OSError, ValueError) as error:
+                raise DeploymentError("deployment_lock_invalid", "无法安全取得维护锁") from error
+            yield descriptor
+        finally:
+            primary = sys.exc_info()[1]
+            cleanup_error = None
+            for fd in (descriptor, directory):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+            if primary is None and cleanup_error is not None:
+                raise cleanup_error
+
+    @contextmanager
+    def _maintenance_operation(self) -> Iterator[None]:
+        with self._deployment_lock("operation"), self._deployment_lock("recovery") as descriptor:
+            self._recovery_descriptor = descriptor
+            self._recovery_exclusive = True
+            try:
+                yield
+            finally:
+                self._recovery_descriptor = None
+                self._recovery_exclusive = False
+
+    @contextmanager
+    def _service_recovery_readers(self) -> Iterator[None]:
+        descriptor = self._recovery_descriptor
+        if descriptor is None:
+            yield
+            return
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        self._recovery_exclusive = False
+        try:
+            yield
+        finally:
+            primary = sys.exc_info()[1]
+            try:
+                # Only read-only service checks can coexist here. Other writers
+                # remain excluded by the operation lock throughout activation.
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                self._recovery_exclusive = True
+            except BaseException as error:
+                if primary is not None:
+                    raise primary from error
+                if isinstance(error, OSError):
+                    raise DeploymentError("deployment_lock_invalid", "无法恢复维护写锁") from error
+                raise
 
     def _require_target(self) -> None:
         self._require_platform()
@@ -1436,8 +1542,26 @@ class ReleaseManager:
         self.transaction.unlink(missing_ok=True)
         _fsync_directory(self.state_root)
 
-    def recover(self) -> Mapping[str, object]:
+    def recover(self, *, service_start: bool = False) -> Mapping[str, object]:
         self._require_platform()
+        try:
+            with self._maintenance_operation():
+                return self._recover_locked()
+        except DeploymentError as error:
+            if not service_start or error.code != "deployment_busy":
+                raise
+        # systemd starts recovery as a dependency of capture/network services.
+        # During activation only, the installer permits this non-mutating check.
+        with self._deployment_lock("recovery", shared=True):
+            if self._read_transaction() is not None:
+                raise DeploymentError("deployment_busy", "版本事务尚未提交，不能启动服务")
+            current = self._link_target("current")
+            if current is None:
+                raise DeploymentError("deployment_busy", "没有可启动的已提交版本")
+            self._release_metadata(self.releases / current)
+            return {**self.status(), "recovery_delegated": True}
+
+    def _recover_locked(self) -> Mapping[str, object]:
         self._ensure_layout()
         transaction = self._read_transaction()
         if transaction is not None:
@@ -2355,17 +2479,18 @@ class ReleaseManager:
         )
 
     def _start_release_services(self, *, check_health: bool) -> None:
-        # Independent of capture/network units: never stop this supervisor while
-        # it is executing the transaction that restarts those services.
-        self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
-        for unit in CORE_SYSTEMD_UNITS:
-            self.runner(["systemctl", "enable", "--now", unit])
-        if check_health:
-            self.health_checker()
-        button_config = json.loads((self.config_root / "recording-button.json").read_bytes())
-        button_action = "enable" if button_config.get("enabled", True) is True else "disable"
-        self.runner(["systemctl", button_action, "--now", "rp-ylx-recording-button.service"])
-        self.runner(["systemctl", "enable", "--now", WATCHDOG_TIMER])
+        with self._service_recovery_readers():
+            # Independent of capture/network units: never stop this supervisor while
+            # it is executing the transaction that restarts those services.
+            self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
+            for unit in CORE_SYSTEMD_UNITS:
+                self.runner(["systemctl", "enable", "--now", unit])
+            if check_health:
+                self.health_checker()
+            button_config = json.loads((self.config_root / "recording-button.json").read_bytes())
+            button_action = "enable" if button_config.get("enabled", True) is True else "disable"
+            self.runner(["systemctl", button_action, "--now", "rp-ylx-recording-button.service"])
+            self.runner(["systemctl", "enable", "--now", WATCHDOG_TIMER])
 
     def _deactivate_systemd_units(self) -> None:
         self._run_unit_commands(
@@ -2425,6 +2550,10 @@ class ReleaseManager:
             self._start_release_services(check_health=True)
             (self.state_root / "activation-failure.json").unlink(missing_ok=True)
         except DeploymentError as error:
+            if self._recovery_descriptor is not None and not self._recovery_exclusive:
+                # Reacquiring the write guard failed: do not mutate state while
+                # a service recovery reader may still be active.
+                raise
             self._record_activation_failure(error, new_current)
             try:
                 if old_current is None:
@@ -2445,8 +2574,14 @@ class ReleaseManager:
 
     def install(self, bundle_path: str | Path, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
+        with self._maintenance_operation():
+            return self._install_locked(bundle_path, activate=activate)
+
+    def _install_locked(
+        self, bundle_path: str | Path, *, activate: bool = True
+    ) -> Mapping[str, object]:
         self._ensure_layout()
-        self.recover()
+        self._recover_locked()
         bundle = load_bundle(bundle_path)
         self._prepare_release(bundle)
         self._require_state_compatible_release(bundle.commit)
@@ -2513,8 +2648,12 @@ class ReleaseManager:
 
     def rollback(self, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
+        with self._maintenance_operation():
+            return self._rollback_locked(activate=activate)
+
+    def _rollback_locked(self, *, activate: bool = True) -> Mapping[str, object]:
         self._ensure_layout()
-        self.recover()
+        self._recover_locked()
         current = self._link_target("current")
         previous = self._link_target("previous")
         if current is None or previous is None:
@@ -2553,6 +2692,10 @@ class ReleaseManager:
 
     def uninstall(self) -> Mapping[str, object]:
         self._require_platform()
+        with self._maintenance_operation():
+            return self._uninstall_locked()
+
+    def _uninstall_locked(self) -> Mapping[str, object]:
         self.runner(["systemctl", "disable", "--now", "openaria-update.service"])
         self._deactivate_systemd_units()
         if self.install_root.exists() and not self.install_root.is_symlink():
@@ -2625,7 +2768,8 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--no-activate", action="store_true")
     rollback = subcommands.add_parser("rollback")
     rollback.add_argument("--no-activate", action="store_true")
-    subcommands.add_parser("recover")
+    recover = subcommands.add_parser("recover")
+    recover.add_argument("--service-start", action="store_true")
     subcommands.add_parser("status")
     subcommands.add_parser("uninstall")
     subcommands.add_parser("network-control-launch", help=argparse.SUPPRESS)
@@ -2647,7 +2791,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rollback":
             result = manager.rollback(activate=not args.no_activate)
         elif args.command == "recover":
-            result = manager.recover()
+            result = manager.recover(service_start=args.service_start)
         elif args.command == "uninstall":
             result = manager.uninstall()
         else:
