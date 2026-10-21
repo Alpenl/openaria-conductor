@@ -7,6 +7,7 @@ import ctypes.util
 import grp
 import hashlib
 import json
+import math
 import os
 import platform
 import posixpath
@@ -44,6 +45,7 @@ MAX_BUNDLE_WHEELS = 128
 MAX_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_FILES = 100_000
+MAX_RELEASE_METADATA_BYTES = 64 * 1024
 ACTIVATION_HEALTH_TIMEOUT_SECONDS = 300.0
 NETWORK_CONTROL_PROTOCOL = "persistent-listener-notify-v1"
 NETWORK_CONTROL_MAX_REQUEST_BYTES = 64 * 1024
@@ -796,6 +798,118 @@ def _notify_systemd_ready(status: str) -> None:
         ) from error
 
 
+def _read_release_metadata(release: Path) -> Mapping[str, object]:
+    """Read a stable bounded file without following release or metadata links.
+
+    Keep this helper self-contained: deployment.py is also installed as a
+    standalone bootstrap, without the rest of the application import tree.
+    """
+    directory = descriptor = None
+    try:
+        try:
+            directory = os.open(
+                release, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+            parent = os.fstat(directory)
+
+            def identity(info):
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_size > MAX_RELEASE_METADATA_BYTES
+                ):
+                    raise ValueError("unsafe release metadata file")
+                return (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                    info.st_nlink,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                )
+
+            expected = identity(os.stat("release.json", dir_fd=directory, follow_symlinks=False))
+            descriptor = os.open(
+                "release.json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+            if identity(os.fstat(descriptor)) != expected:
+                raise ValueError("release metadata changed before read")
+            raw = bytearray()
+            while len(raw) <= MAX_RELEASE_METADATA_BYTES:
+                block = os.read(descriptor, min(8192, MAX_RELEASE_METADATA_BYTES + 1 - len(raw)))
+                if not block:
+                    break
+                raw.extend(block)
+            if len(raw) > MAX_RELEASE_METADATA_BYTES or identity(os.fstat(descriptor)) != expected:
+                raise ValueError("release metadata changed during read")
+            if (
+                identity(os.stat("release.json", dir_fd=directory, follow_symlinks=False))
+                != expected
+            ):
+                raise ValueError("release metadata replaced during read")
+            after = release.lstat()
+            if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != (
+                parent.st_dev,
+                parent.st_ino,
+            ):
+                raise ValueError("release directory replaced during read")
+        finally:
+            primary = sys.exc_info()[1]
+            cleanup_error = None
+            for owned in (descriptor, directory):
+                if owned is not None:
+                    try:
+                        os.close(owned)
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+            if primary is None and cleanup_error is not None:
+                raise cleanup_error
+
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate release metadata key")
+                value[key] = item
+            return value
+
+        def reject_constant(value):
+            raise ValueError("nonfinite release metadata number")
+
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject_constant
+        )
+        pending = [(value, 0)]
+        while pending:
+            item, depth = pending.pop()
+            if depth > 64:
+                raise ValueError("release metadata nesting too deep")
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    key.encode("utf-8")
+                    pending.append((child, depth + 1))
+            elif isinstance(item, list):
+                pending.extend((child, depth + 1) for child in item)
+            elif isinstance(item, str):
+                item.encode("utf-8")
+            elif isinstance(item, float) and not math.isfinite(item):
+                raise ValueError("nonfinite release metadata number")
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", release.name)
+            or not isinstance(value, dict)
+            or value.get("schema") != RELEASE_SCHEMA
+            or value.get("commit") != release.name
+        ):
+            raise ValueError("invalid release metadata identity")
+        return value
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        raise DeploymentError("release_incomplete", "release metadata 不可读或无效") from error
+
+
 def _current_release_metadata(install_root: Path) -> tuple[Path, Mapping[str, object]]:
     current = install_root / "current"
     if not current.is_symlink():
@@ -805,17 +919,7 @@ def _current_release_metadata(install_root: Path) -> tuple[Path, Mapping[str, ob
         raise DeploymentError("install_state_invalid", "current release 链接越界")
     commit = _canonical_commit(target.parts[1])
     release = install_root / "releases" / commit
-    try:
-        metadata = json.loads((release / "release.json").read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise DeploymentError("release_incomplete", "current release metadata 不可读") from error
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("schema") != RELEASE_SCHEMA
-        or metadata.get("commit") != commit
-    ):
-        raise DeploymentError("release_incomplete", "current release metadata 无效")
-    return release, metadata
+    return release, _read_release_metadata(release)
 
 
 def _control_compatibility_error(payload: bytes) -> bytes:
@@ -1300,8 +1404,7 @@ class ReleaseManager:
     def _settle(self, transaction: Mapping[str, object]) -> None:
         old = transaction["old_current"]
         new = str(transaction["new_current"])
-        if not (self.releases / new / "release.json").is_file():
-            raise DeploymentError("release_incomplete", "事务目标 release 不完整")
+        self._release_metadata(self.releases / new)
         if transaction["state"] == "prepared":
             self._switch("current", new)
             switched = dict(transaction)
@@ -1352,17 +1455,7 @@ class ReleaseManager:
         _fsync_directory(self.releases)
 
     def _release_metadata(self, release: Path) -> Mapping[str, object]:
-        try:
-            value = json.loads((release / "release.json").read_bytes())
-        except (OSError, json.JSONDecodeError) as error:
-            raise DeploymentError("release_incomplete", "release metadata 不可读") from error
-        if (
-            not isinstance(value, dict)
-            or value.get("schema") != RELEASE_SCHEMA
-            or value.get("commit") != release.name
-        ):
-            raise DeploymentError("release_incomplete", "release metadata 无效")
-        return value
+        return _read_release_metadata(release)
 
     def _prepare_release(self, bundle: Bundle) -> Path:
         final = self.releases / bundle.commit
@@ -2408,6 +2501,7 @@ class ReleaseManager:
         previous = self._link_target("previous")
         if current is None or previous is None:
             raise DeploymentError("rollback_unavailable", "没有可回滚的上一版本")
+        self._release_metadata(self.releases / previous)
         self._require_state_compatible_release(previous)
         self._quiesce_release_services()
         transaction_started = False
