@@ -33,6 +33,11 @@ class FirmwareControlTest(unittest.TestCase):
         self.install = self.root / "install"
         self.install.mkdir()
         self.state = self.root / "state"
+        config = self.root / "device.json"
+        config.write_text(json.dumps({"state_root": str(self.state)}))
+        p = patch.object(update, "CONFIG", config)
+        p.start()
+        self.addCleanup(p.stop)
         self.make_release("a", "0.2.1", "current")
         self.make_release("b", "0.1.0", "previous")
         self.supervisor = FirmwareSupervisor(self.state, self.install)
@@ -48,6 +53,27 @@ class FirmwareControlTest(unittest.TestCase):
         p = patch("rp_ylx.update.require_idle")
         self.idle = p.start()
         self.addCleanup(p.stop)
+
+    def test_sqlite_migration_uses_fixture_state_and_preserves_guard(self):
+        self.assertFalse(update.sqlite_state_required())
+        self.fetch.return_value = {**self.manifest, "version": "0.2.1"}
+        self.assertTrue(self.supervisor.check(force=True)["has_update"])
+        self.state.mkdir(exist_ok=True)
+        for name in ("state", "settings"):
+            with self.subTest(database=name):
+                marker = self.state / (name + ".sqlite3.initialized")
+                marker.write_text("initialized")
+                try:
+                    self.assertTrue(update.sqlite_state_required())
+                    self.assertFalse(self.supervisor.check(force=True)["has_update"])
+                    with self.assertRaises(FirmwareError) as error:
+                        self.supervisor.start("rollback", str(uuid.uuid4()), "b" * 40)
+                    self.assertEqual(error.exception.code, "state_schema_incompatible")
+                    self.idle.assert_not_called()
+                finally:
+                    marker.unlink()
+                self.assertFalse(update.sqlite_state_required())
+                self.assertTrue(self.supervisor.check(force=True)["has_update"])
 
     def make_release(self, char, version, link):
         target = self.install / "releases" / (char * 40)
