@@ -1342,12 +1342,21 @@ class ReleaseManager:
 
     def _link_target(self, name: str) -> str | None:
         link = self.install_root / name
-        if not link.is_symlink():
+        try:
+            # Read the link itself once. A separate is_symlink check can race
+            # with uninstall; other I/O errors must not masquerade as absence.
+            raw = os.readlink(link)
+        except FileNotFoundError:
             return None
-        target = PurePosixPath(os.readlink(link))
+        except OSError as error:
+            raise DeploymentError("install_state_invalid", f"无法读取 {name} 链接") from error
+        target = PurePosixPath(raw)
         if len(target.parts) != 2 or target.parts[0] != "releases":
             raise DeploymentError("install_state_invalid", f"{name} 链接越界")
-        return _canonical_commit(target.parts[1])
+        try:
+            return _canonical_commit(target.parts[1])
+        except DeploymentError as error:
+            raise DeploymentError("install_state_invalid", f"{name} 链接版本无效") from error
 
     def _switch(self, name: str, release: str | None) -> None:
         link = self.install_root / name
@@ -2593,9 +2602,10 @@ class ReleaseManager:
                 "code": "diagnostic_unreadable",
                 "message": "activation failure diagnostic is unreadable",
             }
+        current = self._link_target("current")
         return {
-            "installed": self._link_target("current") is not None,
-            "current": self._link_target("current"),
+            "installed": current is not None,
+            "current": current,
             "previous": self._link_target("previous"),
             "transaction_pending": os.path.lexists(self.transaction),
             "activation_failure": activation_failure,
