@@ -2544,11 +2544,12 @@ class ReleaseManager:
         self.transaction.unlink(missing_ok=True)
         _fsync_directory(self.state_root)
 
-    def _activate(self, old_current: str | None, new_current: str) -> None:
+    def _activate(
+        self, old_current: str | None, new_current: str
+    ) -> Mapping[str, str] | None:
         release_changed = old_current != new_current
         try:
             self._start_release_services(check_health=True)
-            (self.state_root / "activation-failure.json").unlink(missing_ok=True)
         except DeploymentError as error:
             if self._recovery_descriptor is not None and not self._recovery_exclusive:
                 # Reacquiring the write guard failed: do not mutate state while
@@ -2594,6 +2595,17 @@ class ReleaseManager:
                     raise diagnostic_error from error
                 raise DeploymentError(error.code, f"{error.message}{diagnostic_note}") from error
             raise
+        # Health and release activation have succeeded. Optional diagnostic
+        # cleanup must not send that success through the rollback/error path.
+        try:
+            (self.state_root / "activation-failure.json").unlink(missing_ok=True)
+        except OSError as error:
+            return {
+                "code": "activation_diagnostic_cleanup_failed",
+                "message": "固件已激活，但旧激活失败诊断未能清理"
+                f"（{type(error).__name__}）；保留文件供检查",
+            }
+        return None
 
     def install(self, bundle_path: str | Path, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
@@ -2653,9 +2665,11 @@ class ReleaseManager:
                     f"升级失败，且无法恢复原 release 服务或配置：{detail}",
                 ) from recovery_error
             raise
-        if activate:
-            self._activate(old_current, bundle.commit)
-        return self.status()
+        warning = self._activate(old_current, bundle.commit) if activate else None
+        result = dict(self.status())
+        if warning is not None:
+            result["warnings"] = [warning]
+        return result
 
     def _require_state_compatible_release(self, commit: str) -> None:
         if any(
@@ -2709,9 +2723,11 @@ class ReleaseManager:
                     f"回滚切换失败，且无法恢复原 release 服务或配置：{detail}",
                 ) from recovery_error
             raise
-        if activate:
-            self._activate(current, previous)
-        return self.status()
+        warning = self._activate(current, previous) if activate else None
+        result = dict(self.status())
+        if warning is not None:
+            result["warnings"] = [warning]
+        return result
 
     def uninstall(self) -> Mapping[str, object]:
         self._require_platform()
