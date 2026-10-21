@@ -135,42 +135,47 @@ class SessionCatalog(StateDatabase):
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=parent_fd,
             )
-            with os.fdopen(fd, "rb") as stream:
-                metadata = os.fstat(stream.fileno())
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or metadata.st_size > MAX_MANIFEST_BYTES
-                ):
-                    raise OSError("catalog manifest must be a bounded exclusively linked file")
+            # Keep descriptor ownership here: stream construction and context
+            # entry can fail before the stream can run its own cleanup.
+            try:
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    metadata = os.fstat(stream.fileno())
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or metadata.st_size > MAX_MANIFEST_BYTES
+                    ):
+                        raise OSError("catalog manifest must be a bounded exclusively linked file")
 
-                def fields(value):
-                    return (
-                        value.st_dev,
-                        value.st_ino,
-                        value.st_mode,
-                        value.st_nlink,
-                        value.st_size,
-                        value.st_mtime_ns,
-                        value.st_ctime_ns,
+                    def fields(value):
+                        return (
+                            value.st_dev,
+                            value.st_ino,
+                            value.st_mode,
+                            value.st_nlink,
+                            value.st_size,
+                            value.st_mtime_ns,
+                            value.st_ctime_ns,
+                        )
+
+                    digest = hashlib.sha256()
+                    remaining = metadata.st_size
+                    while remaining:
+                        block = stream.read(min(remaining, 1024 * 1024))
+                        if not block:
+                            raise OSError("catalog manifest truncated during read")
+                        digest.update(block)
+                        remaining -= len(block)
+                    if stream.read(1) or fields(os.fstat(stream.fileno())) != fields(metadata):
+                        raise OSError("catalog manifest changed during read")
+                    current = os.stat("manifest.json", dir_fd=parent_fd, follow_symlinks=False)
+                    if fields(current) != fields(metadata):
+                        raise OSError("catalog manifest replaced during read")
+                    return json.dumps(
+                        [parent.st_dev, parent.st_ino, *fields(metadata), digest.hexdigest()]
                     )
-
-                digest = hashlib.sha256()
-                remaining = metadata.st_size
-                while remaining:
-                    block = stream.read(min(remaining, 1024 * 1024))
-                    if not block:
-                        raise OSError("catalog manifest truncated during read")
-                    digest.update(block)
-                    remaining -= len(block)
-                if stream.read(1) or fields(os.fstat(stream.fileno())) != fields(metadata):
-                    raise OSError("catalog manifest changed during read")
-                current = os.stat("manifest.json", dir_fd=parent_fd, follow_symlinks=False)
-                if fields(current) != fields(metadata):
-                    raise OSError("catalog manifest replaced during read")
-                return json.dumps(
-                    [parent.st_dev, parent.st_ino, *fields(metadata), digest.hexdigest()]
-                )
+            finally:
+                os.close(fd)
         finally:
             os.close(parent_fd)
 
