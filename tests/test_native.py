@@ -337,6 +337,8 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 replace(_recording_plan(), session_root=str(root), encoder_executable=str(helper))
             )
             try:
+                transaction.request_audio_stop()
+                transaction.request_audio_stop()
                 snapshot = transaction.snapshot()
                 self.assertNotIn("segments", snapshot)
                 self.assertEqual(snapshot["state"], "recording")
@@ -366,6 +368,7 @@ class NativeCapabilitiesTest(unittest.TestCase):
                 self.assertEqual(transaction.segments(), segments)
             finally:
                 transaction.abort("snapshot test complete")
+            transaction.request_audio_stop()
             self.assertEqual(transaction.open_handle_count(), 0)
 
     def test_abi_six_extension_exports_only_deep_and_support_classes(self) -> None:

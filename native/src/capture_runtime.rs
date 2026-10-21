@@ -78,6 +78,15 @@ struct SplitSinkRecording {
     recording_start_monotonic_ns: u64,
     on_failure: Arc<Py<PyAny>>,
     imu: Option<Arc<Collector>>,
+    audio: Option<Arc<crate::audio::Recorder>>,
+}
+
+impl SplitSinkRecording {
+    fn request_audio_stop(&self) {
+        if let Some(audio) = &self.audio {
+            audio.request_stop();
+        }
+    }
 }
 
 // Keep scalar evidence only: no extra frame payload ownership or per-frame JSON.
@@ -287,6 +296,7 @@ impl Runtime {
             recording_start_monotonic_ns,
             on_failure: Arc::clone(&on_failure),
             imu,
+            audio: audio.clone(),
         }));
         self.shared.changed.notify_all();
         let snapshot = snapshot_locked(&state);
@@ -398,12 +408,18 @@ impl Runtime {
             .as_ref()
             .and_then(|recording| recording.imu.clone());
         let inflight = state.fanout.start_stopping();
+        if let Some(recording) = &state.recording {
+            recording.request_audio_stop();
+        }
         self.shared.changed.notify_all();
         Ok((inflight, imu))
     }
 
     pub(crate) fn close(&self, timeout: Duration) -> Result<RuntimeSnapshot, RuntimeError> {
         self.stop.store(true, Ordering::Release);
+        // A poisoned state must not bypass the remaining resource cleanup.
+        // The final state read below still returns the original state error.
+        let _ = self.begin_recording_stop();
         self.request_imu_stop()?;
         self.stop_imu_worker(timeout)?;
         let _ = self.stream.close();
@@ -539,6 +555,9 @@ fn run_loop(
     }
     if let Ok(mut state) = shared.state.lock() {
         state.running = false;
+        if let Some(recording) = &state.recording {
+            recording.request_audio_stop();
+        }
         state.recording = None;
         state.fanout.start_stopping();
         shared.changed.notify_all();
@@ -920,6 +939,9 @@ fn report_recording_failure(
             Err(_) => return,
         };
         let (should_report, _inflight) = state.fanout.mark_failure();
+        if let Some(recording) = &state.recording {
+            recording.request_audio_stop();
+        }
         let callback = if should_report {
             preferred_callback.or_else(|| {
                 state
@@ -952,6 +974,9 @@ fn set_terminal_error(shared: &Shared, error: RuntimeError) {
         state.terminal_error = Some(error.clone());
         state.running = false;
         let (should_report, _inflight) = state.fanout.mark_failure();
+        if let Some(recording) = &state.recording {
+            recording.request_audio_stop();
+        }
         let callback = if should_report {
             state
                 .recording
@@ -1066,6 +1091,7 @@ mod tests {
             recording_start_monotonic_ns: 1,
             on_failure: Arc::new(PyBytes::new(py, b"on-failure").into_any().unbind()),
             imu: None,
+            audio: None,
         }
     }
 
@@ -1409,13 +1435,20 @@ mod tests {
                 None,
             )
             .unwrap();
+            let audio = Arc::new(
+                crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap(),
+            );
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
                 state.fanout.start_recording().unwrap();
-                state.recording = Some(Arc::new(test_recording(py, &root)));
+                let mut target = test_recording(py, &root);
+                target.audio = Some(Arc::clone(&audio));
+                state.recording = Some(Arc::new(target));
             }
+            assert!(!audio.stop_requested());
             let (inflight, imu) = runtime.begin_recording_stop().unwrap();
+            assert!(audio.stop_requested());
             assert_eq!(inflight, 0);
             assert!(imu.is_none());
             {
@@ -1428,6 +1461,50 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root);
         });
+    }
+
+    #[test]
+    fn recording_failure_terminal_error_and_close_signal_audio_stop() {
+        pyo3::prepare_freethreaded_python();
+        for cause in ["recording", "terminal", "close"] {
+            Python::with_gil(|py| {
+                let root = temp_root("audio-stop-failure");
+                let runtime = Runtime::new(
+                    Arc::new(Stream::test_idle(1)),
+                    Arc::new(LatestBuffer::new(30).unwrap()),
+                    1,
+                    Duration::from_millis(10),
+                    None,
+                )
+                .unwrap();
+                let audio = Arc::new(
+                    crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0)
+                        .unwrap(),
+                );
+                let mut target = test_recording(py, &root);
+                target.audio = Some(Arc::clone(&audio));
+                {
+                    let mut state = runtime.shared.state.lock().unwrap();
+                    state.running = true;
+                    state.fanout.start_recording().unwrap();
+                    state.recording = Some(Arc::new(target));
+                }
+                assert!(!audio.stop_requested());
+                let error = super::RuntimeError::new("audio_failed", "test failure");
+                match cause {
+                    "recording" => super::report_recording_failure(&runtime.shared, error, None),
+                    "terminal" => super::set_terminal_error(&runtime.shared, error),
+                    "close" => {
+                        runtime.close(Duration::from_secs(1)).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(audio.stop_requested());
+                assert!(!runtime.snapshot().unwrap().recording_present);
+                drop(runtime);
+                let _ = fs::remove_dir_all(root);
+            });
+        }
     }
 
     #[test]

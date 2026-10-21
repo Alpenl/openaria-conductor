@@ -439,6 +439,17 @@ impl Recorder {
         }
     }
 
+    /// Signal capture only. The worker still drains accepted PCM and commits it;
+    /// stop() retains ownership of waiting, joining, and reporting its result.
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     pub(crate) fn stop(&self, timeout: Duration) -> Result<AudioRecordingResult, AudioError> {
         let (done, worker) = {
             let mut lifecycle = self
@@ -1813,6 +1824,62 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use std::path::PathBuf;
+
+    #[test]
+    fn stop_signal_never_waits_for_lifecycle_lock_or_durable_commit() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let root = tempfile_dir();
+        let recorder =
+            Arc::new(super::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap());
+        let flag = Arc::clone(&recorder.stop);
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !flag.load(super::Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            observed_tx.send(()).unwrap();
+            // Model accepted PCM still awaiting its required durable commit.
+            commit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            done_tx
+                .send(Err(super::AudioError::new("audio_failed", "commit failed")))
+                .unwrap();
+        });
+        {
+            let mut lifecycle = recorder.lifecycle.lock().unwrap();
+            lifecycle.state = super::State::Running;
+            lifecycle.done = Some(done_rx);
+            lifecycle.worker = Some(worker);
+            // The capture signal cannot acquire this lock or join any worker.
+            recorder.request_stop();
+            recorder.request_stop();
+            observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(lifecycle.worker.is_some());
+            assert_eq!(lifecycle.state, super::State::Running);
+        }
+        let pending = Arc::clone(&recorder);
+        let (result_tx, result_rx) = mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            result_tx
+                .send(pending.stop(Duration::from_secs(5)))
+                .unwrap();
+        });
+        assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        commit_tx.send(()).unwrap();
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "audio_failed");
+        assert_eq!(error.message, "commit failed");
+        stopper.join().unwrap();
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn slow_io_samples_keep_startup_and_failure_tail_with_bounded_space() {

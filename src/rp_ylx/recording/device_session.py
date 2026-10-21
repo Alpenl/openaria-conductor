@@ -2195,10 +2195,12 @@ class DeviceSessionRecorder:
 
         try:
             capture_ended_at = self._now()
+            transaction = self._native_transaction
+            if transaction is not None:
+                transaction.request_audio_stop()
             self._persist_state("finalizing")
             finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None
-            transaction = self._native_transaction
             if transaction is None:
                 self._stop_writer()
                 if self._writer_error is not None:
@@ -2255,10 +2257,30 @@ class DeviceSessionRecorder:
                 # Audio can finish after the video gate closes. Preserve its
                 # actual last sample, excluding durable writes and sealing work.
                 audio_end = float(audio["sync"]["end_time_seconds"])
+                assert self._audio_result is not None
+                thread_end = (
+                    _strict_int(
+                        self._audio_result.get("stopped_monotonic_ns"), "audio.stopped_monotonic_ns"
+                    )
+                    - self._started_monotonic_ns
+                ) / 1e9
+                clock = audio.get("capture_clock")
+                if isinstance(clock, Mapping):
+                    thread_end = max(
+                        thread_end,
+                        (
+                            _strict_int(
+                                clock.get("thread_stopped_monotonic_ns"),
+                                "audio.thread_stopped_monotonic_ns",
+                            )
+                            - self._started_monotonic_ns
+                        )
+                        / 1e9,
+                    )
                 observed_end = (time.monotonic_ns() - self._started_monotonic_ns) / 1e9
-                if not math.isfinite(audio_end) or audio_end > observed_end:
+                if not math.isfinite(audio_end) or max(audio_end, thread_end) > observed_end:
                     raise DeviceRecordingError("audio_invalid", "音频结束时间超出已观测采集窗口")
-                duration = max(duration, audio_end)
+                duration = max(duration, audio_end, thread_end)
                 ended_at += timedelta(seconds=duration - self._stopped_elapsed)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")

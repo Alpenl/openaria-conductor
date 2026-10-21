@@ -344,6 +344,12 @@ impl SessionTransaction {
         }
     }
 
+    pub(crate) fn request_audio_stop(&self) {
+        if let Some(audio) = &self.audio {
+            audio.request_stop();
+        }
+    }
+
     pub(crate) fn finish(
         &self,
         duration: Duration,
@@ -376,6 +382,7 @@ impl SessionTransaction {
             }
         }
 
+        self.request_audio_stop();
         let result = self.finish_inner(duration, timeout);
         match result {
             Ok(outcome) => {
@@ -761,6 +768,10 @@ printf '{"event":"done","frames":0}\n'
         fs::create_dir_all(root.join("video")).unwrap();
         let helper = encoder_helper(&root);
         let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        assert_eq!(transaction.open_handle_count(), 1);
+        transaction.request_audio_stop();
+        transaction.request_audio_stop();
+        transaction.ensure_recording().unwrap();
         assert_eq!(transaction.open_handle_count(), 1);
         let first = transaction
             .finish(Duration::from_millis(1), Duration::from_secs(2))

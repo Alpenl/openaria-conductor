@@ -235,7 +235,11 @@ class FakeAudioRecorder:
 
 
 class FakeSessionTransaction:
+    def request_audio_stop(self) -> None:
+        self.audio_stop_requested = True
+
     def __init__(self, plan: NativeRecordingPlan, *, fail_finish: bool = False) -> None:
+        self.audio_stop_requested = False
         self.plan = plan
         self.root = Path(plan.session_root)
         self.session_id = plan.session_id

@@ -1,7 +1,7 @@
 mod active_take;
 mod audio;
-mod audio_clock;
 mod audio_checkpoint;
+mod audio_clock;
 mod bounded;
 mod capture_runtime;
 mod frame_stream;
@@ -128,6 +128,10 @@ impl NativeSessionTransaction {
             .allow_threads(move || transaction.segments_since(offset))
             .map_err(session_store_error)?;
         stereo_encoder_segment_list(py, &segments)
+    }
+
+    fn request_audio_stop(&self) {
+        self.transaction.request_audio_stop();
     }
 
     #[pyo3(signature = (duration_seconds, timeout_seconds=30.0))]

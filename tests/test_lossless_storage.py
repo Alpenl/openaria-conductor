@@ -100,6 +100,17 @@ class LosslessStorageTests(unittest.TestCase):
 
                 report = audio_clock_report(manifest["audio"], manifest["time"]["duration_seconds"])
                 self.assertEqual(report["mapping"], "piecewise-linear")
+                clock = manifest["audio"]["capture_clock"]
+                capture_end = max(
+                    clock["thread_stopped_monotonic_ns"], clock["sample_end_monotonic_ns"]
+                )
+                self.assertEqual(
+                    manifest["time"]["duration_seconds"],
+                    max(
+                        recorder._stopped_elapsed,
+                        (capture_end - recorder._started_monotonic_ns) / 1e9,
+                    ),
+                )
             from rp_ylx.api.downloads import iter_device_session_v1_artifacts
 
             self.assertEqual(
