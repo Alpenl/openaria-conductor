@@ -34,6 +34,33 @@ def _anchor(value):
     return value
 
 
+def _reobserved_point(first, last):
+    """One ALSA sample/time pair can be queried with a fresh host bracket.
+
+    Keep the original observation already in the journal. A second bracket
+    must still be valid, later and consistent with the existing clock bridge;
+    this exception must not hide a real sample/time regression or clock jump.
+    """
+    for point in (first, last):
+        position, raw, mono, before, after = point
+        if (
+            min(point) <= 0
+            or not raw <= before <= after
+            or after - before > 1_000_000
+            or after - raw > 20_000_000
+            or raw + mono - (before + after) // 2 <= 0
+        ):
+            raise ValueError("invalid repeated audio clock bridge")
+    if last[2] <= first[2] or last[3] <= first[4]:
+        raise ValueError("repeated audio clock bridge regressed")
+    raw_span_twice = (last[3] + last[4]) - (first[3] + first[4])
+    uncertainty_twice = (last[4] - last[3]) + (first[4] - first[3])
+    if abs(2 * (last[2] - first[2]) - raw_span_twice) * 100 > (
+        raw_span_twice + uncertainty_twice * 100
+    ):
+        raise ValueError("repeated audio clock bridge rate outside supported range")
+
+
 class AudioJournalReader:
     def __init__(self, root: Path):
         self.root = root
@@ -143,13 +170,11 @@ class AudioJournalReader:
         last = head.get("last_anchor")
         if last is not None:
             last = _anchor(last)
-            if (
-                previous is not None
-                and last != previous
-                and (last[0] <= previous[0] or last[1] <= previous[1])
-            ):
-                raise ValueError("audio journal final anchor regressed")
-            if last != previous:
+            if previous is not None and last != previous and last[:2] == previous[:2]:
+                _reobserved_point(previous, last)
+            elif last != previous:
+                if previous is not None and (last[0] <= previous[0] or last[1] <= previous[1]):
+                    raise ValueError("audio journal final anchor regressed")
                 anchors.append(last)
         # Commit reader state only after the complete published prefix verifies.
         self.offset, self.digest, self.sequence = end, digest, sequence

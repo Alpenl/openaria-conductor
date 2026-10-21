@@ -5,6 +5,16 @@
 
 pub(crate) type Anchor = [u64; 5];
 
+/// Retain one host observation for each ALSA sample/time pair. USB reads can
+/// observe the same hardware point again with a later, individually validated
+/// host bracket; it is not a new point and must not duplicate a final anchor.
+pub(crate) fn retain_same_point(previous: Option<Anchor>, next: Anchor) -> Anchor {
+    match previous {
+        Some(first) if first[..2] == next[..2] => first,
+        _ => next,
+    }
+}
+
 pub(crate) struct Model {
     pub(crate) start_ns: f64,
     pub(crate) end_ns: f64,
@@ -272,5 +282,52 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, failure);
         assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod repeated_point_tests {
+    use super::retain_same_point;
+
+    #[test]
+    fn refreshed_bridge_retains_original_hardware_point() {
+        let first = [
+            4800,
+            1_000_000_000,
+            2_000_000_100,
+            1_000_000_050,
+            1_000_000_150,
+        ];
+        let later = [
+            4800,
+            1_000_000_000,
+            2_000_100_100,
+            1_000_100_050,
+            1_000_100_150,
+        ];
+        assert!(super::mapped_ns(&first).is_ok());
+        assert!(super::mapped_ns(&later).is_ok());
+        assert_eq!(retain_same_point(Some(first), later), first);
+        assert_eq!(retain_same_point(None, later), later);
+    }
+
+    #[test]
+    fn distinct_and_regressed_hardware_points_remain_for_validation() {
+        let first = [
+            4800,
+            1_000_000_000,
+            2_000_000_100,
+            1_000_000_050,
+            1_000_000_150,
+        ];
+        for (sample, raw) in [
+            (4801, 1_000_001_000),
+            (4799, 999_999_000),
+            (4800, 1_000_001_000),
+            (4801, 1_000_000_000),
+        ] {
+            let next = [sample, raw, 2_000_100_100, 1_000_100_050, 1_000_100_150];
+            assert_eq!(retain_same_point(Some(first), next), next);
+        }
     }
 }

@@ -91,6 +91,94 @@ class AudioJournalTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regressed"):
             reader.read(self.head)
 
+    def repeated_point(self):
+        first = [4800, 1000000000, 2000000100, 1000000050, 1000000150]
+        later = [4800, 1000000000, 2000100100, 1000100050, 1000100150]
+        self.path.unlink()
+        value = row(0)
+        value["anchors"] = [first]
+        head = publish(self.root, [value], last=later)
+        return value, head
+
+    def test_reobserved_same_sample_and_raw_time_is_one_point(self):
+        value, head = self.repeated_point()
+        reader = AudioJournalReader(self.root)
+        decoded = reader.read(head)
+        self.assertEqual(decoded["anchors"], value["anchors"])
+        self.assertEqual(reader.read(head)["anchors"], [])
+        self.assertEqual(reader.anchor_count, 1)
+
+    def test_reobserved_header_after_incremental_read_keeps_original_point(self):
+        value, head = self.repeated_point()
+        first_head = {**head, "last_anchor": value["anchors"][0]}
+        reader = AudioJournalReader(self.root)
+        reader.read(first_head)
+        decoded = reader.read(head)
+        self.assertEqual(decoded["anchors"], [])
+        self.assertEqual(reader.last_anchor, value["anchors"][0])
+        second = row(1)
+        second["anchors"] = [[9600, 1100000000, 2100000100, 1100000050, 1100000150]]
+        end = publish(self.root, [value, second], last=second["anchors"][0])
+        self.assertEqual(reader.read(end)["anchors"], second["anchors"])
+        self.assertEqual(
+            AudioJournalReader(self.root).read(end)["anchors"], value["anchors"] + second["anchors"]
+        )
+
+    def test_reobserved_point_requires_valid_and_forward_host_bridge(self):
+        value, head = self.repeated_point()
+        invalid = [
+            [4800, 1000000000, 2000100100, 999999999, 1000100150],
+            [4800, 1000000000, 2000100100, 1000100151, 1000100150],
+            [4800, 1000000000, 2000100100, 1000100050, 1002100051],
+            [4800, 1000000000, 2030100100, 1030100050, 1030100150],
+            [4800, 1000000000, 0, 1000100050, 1000100150],
+            [4800, 1000000000, 2000000000, 1000000000, 1000000001],
+            [4800, 1000000000, 3000100100, 1000100050, 1000100150],
+        ]
+        for last in invalid:
+            with self.subTest(last=last):
+                reader = AudioJournalReader(self.root)
+                with self.assertRaises(ValueError):
+                    reader.read({**head, "last_anchor": last})
+                self.assertEqual(reader.offset, 0)
+                self.assertEqual(
+                    reader.read({**head, "last_anchor": value["anchors"][0]})["anchors"],
+                    value["anchors"],
+                )
+
+    def test_live_sealing_accepts_reobserved_point_and_final_reverification(self):
+        value, head = self.repeated_point()
+        fixture = live_fixtures.LiveSealingTests()
+        sealing = fixture.audio_sealing(self.root)
+        (self.root / "audio/audio_00000.wav").write_bytes(b"fixture")
+        with patch(
+            "rp_ylx.recording.live_seal.compact_audio", side_effect=fixture.compact_audio
+        ) as compact:
+            sealing._audio()
+            sealing._audio(force=True)
+        self.assertEqual(compact.call_count, 1)
+        self.assertEqual(set(sealing.prepared), {"audio/audio_00000.wav"})
+        self.assertEqual(sealing._audio_journal.last_anchor, value["anchors"][0])
+
+    def test_same_sample_or_raw_time_alone_still_rejects(self):
+        value, head = self.repeated_point()
+        for sample, raw in [
+            (4799, 1000000000),
+            (4800, 999999999),
+            (4800, 1000000001),
+            (4801, 1000000000),
+        ]:
+            with self.subTest(sample=sample, raw=raw):
+                last = [sample, raw, *head["last_anchor"][2:]]
+                with self.assertRaisesRegex(ValueError, "regressed"):
+                    AudioJournalReader(self.root).read({**head, "last_anchor": last})
+
+    def test_distinct_forward_final_point_is_retained(self):
+        value, head = self.repeated_point()
+        last = [4801, 1000001000, 2000100100, 1000100050, 1000100150]
+        result = AudioJournalReader(self.root).read({**head, "last_anchor": last})
+        self.assertEqual(result["anchors"], value["anchors"] + [last])
+
     def test_replaced_inode_is_rejected_even_with_identical_prefix(self):
         reader = AudioJournalReader(self.root)
         reader.read(self.head)

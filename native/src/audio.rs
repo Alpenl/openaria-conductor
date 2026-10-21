@@ -1557,7 +1557,7 @@ fn start_and_capture(
                 ReadOutcome::Frames(frames) => {
                     sample_count += frames;
                     buffered_frames += frames;
-                    let (anchor, mapped_mono) = crate::audio_clock::observe_anchor(
+                    let (observed_anchor, _) = crate::audio_clock::observe_anchor(
                         || {
                             let (position, timestamp) = pcm.clock_anchor(sample_count)?;
                             let before_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
@@ -1572,6 +1572,10 @@ fn start_and_capture(
                             }
                         },
                     )?;
+                    let anchor =
+                        crate::audio_clock::retain_same_point(last_anchor, observed_anchor);
+                    let mapped_mono = crate::audio_clock::mapped_ns(&anchor)
+                        .map_err(|message| AudioError::new("audio_failed", message))?;
                     let [position, timestamp, observed_mono, before_raw, after_raw] = anchor;
                     if let Some(clock) = progress.clock_checkpoint.lock().unwrap().as_mut() {
                         clock.last_anchor = Some(anchor);
