@@ -56,15 +56,33 @@ def atomic_json(path: Path, value: dict) -> None:
 
 def installed_release(name: str, root: Path = INSTALL) -> dict | None:
     link = root / name
-    if not link.is_symlink():
-        return None
-    target = link.resolve()
-    if target.parent != (root / "releases").resolve() or not COMMIT.fullmatch(target.name):
-        raise FirmwareError("installed_release_invalid", "设备版本目录身份无效", 503)
-    metadata = json.loads((target / "release.json").read_bytes())
-    if metadata.get("commit") != target.name or not isinstance(metadata.get("version"), str):
-        raise FirmwareError("installed_release_invalid", "设备版本元数据无效", 503)
-    return {"version": metadata["version"], "commit": target.name}
+    try:
+        try:
+            info = link.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISLNK(info.st_mode):
+            return None
+        target = link.resolve(strict=True)
+        if target.parent != (root / "releases").resolve() or not COMMIT.fullmatch(target.name):
+            raise ValueError("invalid installed release directory")
+        raw = _read_control_file(target / "release.json")
+        metadata = _decode_control_json(raw)
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("commit") != target.name
+            or not isinstance(metadata.get("version"), str)
+            or len(metadata["version"]) > 64
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", metadata["version"])
+        ):
+            raise ValueError("invalid installed release identity")
+        return {"version": metadata["version"], "commit": target.name}
+    except (OSError, ValueError, TypeError, RuntimeError) as error:
+        # Invalid metadata must fail closed without blocking a control worker or
+        # leaking raw file content. A later request can retry after file repair.
+        raise FirmwareError(
+            "installed_release_invalid", "设备版本元数据无法读取或校验", 503
+        ) from error
 
 
 def newer(available: str, current: str) -> bool:
@@ -105,7 +123,7 @@ def _validate_task_record(value, expected_key=None):
     return value
 
 
-def _read_task_record(path, *, expected_key=None, missing_ok=False):
+def _read_control_file(path, *, missing_ok=False):
     try:
         before = path.lstat()
     except FileNotFoundError:
@@ -115,7 +133,7 @@ def _read_task_record(path, *, expected_key=None, missing_ok=False):
 
     def identity(info):
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > LIMIT:
-            raise ValueError("unsafe firmware task file")
+            raise ValueError("unsafe firmware state file")
         return (
             info.st_dev,
             info.st_ino,
@@ -130,7 +148,7 @@ def _read_task_record(path, *, expected_key=None, missing_ok=False):
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
         if identity(os.fstat(fd)) != expected:
-            raise ValueError("firmware task changed before read")
+            raise ValueError("firmware state changed before read")
         raw = bytearray()
         while len(raw) <= LIMIT:
             chunk = os.read(fd, min(8192, LIMIT + 1 - len(raw)))
@@ -138,18 +156,29 @@ def _read_task_record(path, *, expected_key=None, missing_ok=False):
                 break
             raw.extend(chunk)
         if len(raw) > LIMIT or identity(os.fstat(fd)) != expected:
-            raise ValueError("firmware task changed during read")
+            raise ValueError("firmware state changed during read")
         if identity(path.lstat()) != expected:
-            raise ValueError("firmware task replaced during read")
+            raise ValueError("firmware state replaced during read")
     finally:
         os.close(fd)
+    return bytes(raw)
+
+
+def _decode_control_json(raw):
     value = json.loads(
         raw.decode("utf-8"),
         object_pairs_hook=_unique_control_object,
         parse_constant=_reject_control_constant,
     )
     _validate_control_json(value)
-    return _validate_task_record(value, expected_key)
+    return value
+
+
+def _read_task_record(path, *, expected_key=None, missing_ok=False):
+    raw = _read_control_file(path, missing_ok=missing_ok)
+    if raw is None:
+        return None
+    return _validate_task_record(_decode_control_json(raw), expected_key)
 
 
 @contextmanager
