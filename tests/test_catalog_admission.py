@@ -12,6 +12,9 @@ from rp_ylx.recording.catalog import SessionCatalog
 
 class CatalogAdmissionTest(unittest.TestCase):
     def setUp(self):
+        backend = patch("rp_ylx.recording.catalog.native_session_store_or_none", return_value=None)
+        backend.start()
+        self.addCleanup(backend.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

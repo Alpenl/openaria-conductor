@@ -4,6 +4,7 @@ mod audio_checkpoint;
 mod audio_clock;
 mod bounded;
 mod capture_runtime;
+mod catalog_admission;
 mod catalog_signature;
 mod frame_stream;
 mod imu;
@@ -421,6 +422,23 @@ impl NativeSessionStore {
         use std::os::unix::ffi::OsStrExt;
         let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
         py.allow_threads(move || catalog_signature::signature(&path, maximum_bytes))
+            .map_err(|error| {
+                pyo3::exceptions::PyOSError::new_err((
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    error.to_string(),
+                ))
+            })
+    }
+
+    fn catalog_artifacts_match(
+        &self,
+        py: Python<'_>,
+        path: &[u8],
+        artifacts: Vec<(Vec<u8>, i64)>,
+    ) -> PyResult<bool> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        py.allow_threads(move || catalog_admission::matches(&path, &artifacts))
             .map_err(|error| {
                 pyo3::exceptions::PyOSError::new_err((
                     error.raw_os_error().unwrap_or(libc::EIO),

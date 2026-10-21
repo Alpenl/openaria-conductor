@@ -316,6 +316,26 @@ class SessionCatalog(StateDatabase):
 
     @staticmethod
     def _artifacts_match(directory: Path, artifacts: list[tuple[str, int]]) -> bool:
+        native = native_session_store_or_none()
+        check = getattr(native, "catalog_artifacts_match", None)
+        if check is None:
+            return SessionCatalog._artifacts_match_python(directory, artifacts)
+        # SQLite paths are text; preserve POSIX surrogate-escaped filenames.
+        # Invalid input remains rejected before the native typed boundary.
+        encoded = []
+        for relative, expected in artifacts:
+            if not isinstance(relative, str):
+                raise OSError("invalid indexed artifact path")
+            if type(expected) is not int or not 0 <= expected <= 2**63 - 1:
+                return False
+            encoded.append((os.fsencode(relative), expected))
+        result = check(os.fsencode(directory), encoded)
+        if type(result) is not bool:
+            raise OSError("invalid native catalog admission result")
+        return result
+
+    @staticmethod
+    def _artifacts_match_python(directory: Path, artifacts: list[tuple[str, int]]) -> bool:
         def paths():
             for relative, expected_bytes in artifacts:
                 if not isinstance(relative, str) or "\x00" in relative or relative.startswith("/"):
