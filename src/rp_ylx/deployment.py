@@ -46,6 +46,7 @@ MAX_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_FILES = 100_000
 MAX_RELEASE_METADATA_BYTES = 64 * 1024
+MAX_INSTALL_TRANSACTION_BYTES = 64 * 1024
 ACTIVATION_HEALTH_TIMEOUT_SECONDS = 300.0
 NETWORK_CONTROL_PROTOCOL = "persistent-listener-notify-v1"
 NETWORK_CONTROL_MAX_REQUEST_BYTES = 64 * 1024
@@ -798,106 +799,100 @@ def _notify_systemd_ready(status: str) -> None:
         ) from error
 
 
-def _read_release_metadata(release: Path) -> Mapping[str, object]:
-    """Read a stable bounded file without following release or metadata links.
-
-    Keep this helper self-contained: deployment.py is also installed as a
-    standalone bootstrap, without the rest of the application import tree.
-    """
+def _read_deployment_json(path: Path, *, maximum: int) -> object:
+    """Read bounded, stable JSON using only standard-library bootstrap code."""
     directory = descriptor = None
     try:
-        try:
-            directory = os.open(
-                release, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            )
-            parent = os.fstat(directory)
-
-            def identity(info):
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_nlink != 1
-                    or info.st_size > MAX_RELEASE_METADATA_BYTES
-                ):
-                    raise ValueError("unsafe release metadata file")
-                return (
-                    info.st_dev,
-                    info.st_ino,
-                    info.st_mode,
-                    info.st_nlink,
-                    info.st_size,
-                    info.st_mtime_ns,
-                    info.st_ctime_ns,
-                )
-
-            expected = identity(os.stat("release.json", dir_fd=directory, follow_symlinks=False))
-            descriptor = os.open(
-                "release.json",
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                dir_fd=directory,
-            )
-            if identity(os.fstat(descriptor)) != expected:
-                raise ValueError("release metadata changed before read")
-            raw = bytearray()
-            while len(raw) <= MAX_RELEASE_METADATA_BYTES:
-                block = os.read(descriptor, min(8192, MAX_RELEASE_METADATA_BYTES + 1 - len(raw)))
-                if not block:
-                    break
-                raw.extend(block)
-            if len(raw) > MAX_RELEASE_METADATA_BYTES or identity(os.fstat(descriptor)) != expected:
-                raise ValueError("release metadata changed during read")
-            if (
-                identity(os.stat("release.json", dir_fd=directory, follow_symlinks=False))
-                != expected
-            ):
-                raise ValueError("release metadata replaced during read")
-            after = release.lstat()
-            if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != (
-                parent.st_dev,
-                parent.st_ino,
-            ):
-                raise ValueError("release directory replaced during read")
-        finally:
-            primary = sys.exc_info()[1]
-            cleanup_error = None
-            for owned in (descriptor, directory):
-                if owned is not None:
-                    try:
-                        os.close(owned)
-                    except BaseException as error:
-                        if cleanup_error is None:
-                            cleanup_error = error
-            if primary is None and cleanup_error is not None:
-                raise cleanup_error
-
-        def unique(pairs):
-            value = {}
-            for key, item in pairs:
-                if key in value:
-                    raise ValueError("duplicate release metadata key")
-                value[key] = item
-            return value
-
-        def reject_constant(value):
-            raise ValueError("nonfinite release metadata number")
-
-        value = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject_constant
+        directory = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         )
-        pending = [(value, 0)]
-        while pending:
-            item, depth = pending.pop()
-            if depth > 64:
-                raise ValueError("release metadata nesting too deep")
-            if isinstance(item, dict):
-                for key, child in item.items():
-                    key.encode("utf-8")
-                    pending.append((child, depth + 1))
-            elif isinstance(item, list):
-                pending.extend((child, depth + 1) for child in item)
-            elif isinstance(item, str):
-                item.encode("utf-8")
-            elif isinstance(item, float) and not math.isfinite(item):
-                raise ValueError("nonfinite release metadata number")
+        parent = os.fstat(directory)
+
+        def identity(info):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
+                raise ValueError("unsafe deployment JSON file")
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        expected = identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        if identity(os.fstat(descriptor)) != expected:
+            raise ValueError("deployment JSON changed before read")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            block = os.read(descriptor, min(8192, maximum + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        if len(raw) > maximum or identity(os.fstat(descriptor)) != expected:
+            raise ValueError("deployment JSON changed during read")
+        if identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) != expected:
+            raise ValueError("deployment JSON replaced during read")
+        after = path.parent.lstat()
+        if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != (
+            parent.st_dev,
+            parent.st_ino,
+        ):
+            raise ValueError("deployment JSON directory replaced during read")
+    finally:
+        primary = sys.exc_info()[1]
+        cleanup_error = None
+        for owned in (descriptor, directory):
+            if owned is not None:
+                try:
+                    os.close(owned)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        if primary is None and cleanup_error is not None:
+            raise cleanup_error
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate deployment JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("nonfinite deployment JSON number")
+
+    value = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject_constant
+    )
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > 64:
+            raise ValueError("deployment JSON nesting too deep")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                key.encode("utf-8")
+                pending.append((child, depth + 1))
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            item.encode("utf-8")
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("nonfinite deployment JSON number")
+    return value
+
+
+def _read_release_metadata(release: Path) -> Mapping[str, object]:
+    try:
+        value = _read_deployment_json(release / "release.json", maximum=MAX_RELEASE_METADATA_BYTES)
         if (
             not re.fullmatch(r"[0-9a-f]{40}", release.name)
             or not isinstance(value, dict)
@@ -1374,32 +1369,41 @@ class ReleaseManager:
         }
 
     def _read_transaction(self) -> Mapping[str, object] | None:
-        if not self.transaction.exists():
-            return None
         try:
-            value = json.loads(self.transaction.read_bytes())
-        except (OSError, json.JSONDecodeError) as error:
-            raise DeploymentError("install_state_invalid", "安装事务不可读") from error
-        required = {"schema", "transaction_id", "action", "old_current", "new_current", "state"}
-        fields = frozenset(value) if isinstance(value, dict) else frozenset()
-        allowed_fields = {
-            frozenset(required),
-            frozenset(required | {"config_snapshot_required"}),
-        }
-        if (
-            not isinstance(value, dict)
-            or fields not in allowed_fields
-            or value["schema"] != TRANSACTION_SCHEMA
-            or value["action"] not in {"install", "rollback"}
-            or value["state"] not in {"prepared", "switched"}
-            or "config_snapshot_required" in value
-            and value["config_snapshot_required"] is not True
-        ):
-            raise DeploymentError("install_state_invalid", "安装事务字段无效")
-        _canonical_commit(value["new_current"])
-        if value["old_current"] is not None:
-            _canonical_commit(value["old_current"])
-        return value
+            # Only genuine absence means no pending transaction. A dangling
+            # link or an entry disappearing after admission must fail closed.
+            try:
+                self.transaction.lstat()
+            except FileNotFoundError:
+                return None
+            value = _read_deployment_json(self.transaction, maximum=MAX_INSTALL_TRANSACTION_BYTES)
+            required = {"schema", "transaction_id", "action", "old_current", "new_current", "state"}
+            fields = frozenset(value) if isinstance(value, dict) else frozenset()
+            allowed_fields = {
+                frozenset(required),
+                frozenset(required | {"config_snapshot_required"}),
+            }
+            if (
+                not isinstance(value, dict)
+                or fields not in allowed_fields
+                or value["schema"] != TRANSACTION_SCHEMA
+                or value["action"] not in ("install", "rollback")
+                or value["state"] not in ("prepared", "switched")
+                or not isinstance(value["transaction_id"], str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                    value["transaction_id"],
+                )
+                or "config_snapshot_required" in value
+                and value["config_snapshot_required"] is not True
+            ):
+                raise ValueError("invalid install transaction fields")
+            _canonical_commit(value["new_current"])
+            if value["old_current"] is not None:
+                _canonical_commit(value["old_current"])
+            return value
+        except (OSError, ValueError, TypeError, RecursionError, DeploymentError) as error:
+            raise DeploymentError("install_state_invalid", "安装事务不可读或无效") from error
 
     def _settle(self, transaction: Mapping[str, object]) -> None:
         old = transaction["old_current"]
@@ -2572,7 +2576,7 @@ class ReleaseManager:
             "installed": self._link_target("current") is not None,
             "current": self._link_target("current"),
             "previous": self._link_target("previous"),
-            "transaction_pending": self.transaction.exists(),
+            "transaction_pending": os.path.lexists(self.transaction),
             "activation_failure": activation_failure,
         }
 
