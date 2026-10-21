@@ -47,7 +47,86 @@ class CatalogAdmissionTest(unittest.TestCase):
         except OSError:
             result = None
         self.assertIsNone(result)
-        self.assertEqual(self.store._admitted, set())
+        self.assertEqual(self.store._admitted, {})
+
+    def test_lexical_posix_spellings_keep_fresh_file_checks(self):
+        path = self.parent / "0000.fixture"
+        baseline = len(os.listdir("/proc/self/fd"))
+        for relative in (
+            "video/left/0000.fixture",
+            "./video/left/0000.fixture",
+            "video//left/./0000.fixture",
+            "video/left/0000.fixture/",
+        ):
+            with self.subTest(relative=relative):
+                self.assertTrue(SessionCatalog._artifacts_match(self.directory, [(relative, 1)]))
+                path.write_bytes(b"xx")
+                self.assertFalse(SessionCatalog._artifacts_match(self.directory, [(relative, 1)]))
+                path.write_bytes(b"x")
+                self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_invalid_indexed_paths_fail_before_following_outside_files(self):
+        baseline = len(os.listdir("/proc/self/fd"))
+        for relative in (
+            "",
+            ".",
+            "./",
+            "/video/left/0000.fixture",
+            "//video/left/0000.fixture",
+            "../outside",
+            "video/../left/0000.fixture",
+            "video/left/..",
+            "video/left/\x00",
+            None,
+            12,
+        ):
+            with self.subTest(relative=relative), self.assertRaises(OSError):
+                SessionCatalog._artifacts_match(self.directory, [(relative, 1)])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), baseline)
+
+    def test_backslash_is_a_posix_filename_character(self):
+        name = "back\\slash.fixture"
+        (self.directory / name).write_bytes(b"x")
+        self.assertTrue(SessionCatalog._artifacts_match(self.directory, [(name, 1)]))
+
+    def test_changed_manifests_retain_only_latest_admission(self):
+        with self.store.scan():
+            for revision in range(30):
+                self.manifest["revision"] = revision
+                (self.directory / "manifest.json").write_text(json.dumps(self.manifest))
+                self.store.remember("volume", self.directory, "commit", self.summary, self.manifest)
+                self.signature = self.store.signature(self.directory)
+                self.assertEqual(self.cached(), self.summary)
+                self.assertEqual(self.store._admitted, {("volume", "session"): self.signature})
+
+    def test_changed_manifest_still_checks_files_before_replacing_admission(self):
+        self.assertEqual(self.cached(), self.summary)
+        previous = self.signature
+        self.manifest["revision"] = 1
+        (self.directory / "manifest.json").write_text(json.dumps(self.manifest))
+        self.store.remember("volume", self.directory, "commit", self.summary, self.manifest)
+        self.signature = self.store.signature(self.directory)
+        path = self.parent / "0000.fixture"
+        path.write_bytes(b"xx")
+        self.assertIsNone(self.cached())
+        self.assertNotEqual(self.store._admitted.get(("volume", "session")), self.signature)
+        path.write_bytes(b"x")
+        self.assertEqual(self.cached(), self.summary)
+        self.assertEqual(self.store._admitted, {("volume", "session"): self.signature})
+        self.assertNotEqual(previous, self.signature)
+
+    def test_admissions_are_scoped_by_volume_and_pruned_per_volume(self):
+        self.assertEqual(self.cached(), self.summary)
+        self.store.remember("other", self.directory, "commit", self.summary, self.manifest)
+        self.assertEqual(
+            self.store.cached(
+                "other", "session", self.signature, "commit", directory=self.directory
+            ),
+            self.summary,
+        )
+        self.assertEqual(len(self.store._admitted), 2)
+        self.store.discard_missing("volume", set())
+        self.assertEqual(self.store._admitted, {("other", "session"): self.signature})
 
     def test_admission_checks_all_files_without_repeating_parent_stats(self):
         original = os.stat

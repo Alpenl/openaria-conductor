@@ -358,7 +358,7 @@ class PersistenceTest(unittest.TestCase):
             )
             raise RuntimeError("scan failed")
         self.assertEqual(store.summaries("volume"), [])
-        self.assertEqual(store._admitted, set())
+        self.assertEqual(store._admitted, {})
         store.remember("volume", directory, "commit", summary, {})
         self.assertEqual(len(store.summaries("volume")), 1)
 

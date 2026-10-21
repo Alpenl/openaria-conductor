@@ -33,7 +33,9 @@ class SessionCatalog(StateDatabase):
         ] = OrderedDict()
         self._validated_summary_bytes = 0
         super().__init__(path)
-        self._admitted: set[tuple[str, str, str]] = set()
+        # One current identity per session; replaced manifests must not retain
+        # every historical signature for the lifetime of the process.
+        self._admitted: dict[tuple[str, str], str] = {}
         with self.connection() as db, db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS verifications ("
@@ -272,7 +274,7 @@ class SessionCatalog(StateDatabase):
             row = db.execute(query, parameters).fetchone()
         if row is None:
             return None
-        key = (volume, session, signature)
+        key = (volume, session)
         try:
             value = json.loads(row[0])
             if not isinstance(value, dict) or value.get("session_id") != session:
@@ -293,11 +295,11 @@ class SessionCatalog(StateDatabase):
         except (TypeError, ValueError, RecursionError):
             # Only this rebuildable row is invalid. Leave database I/O/schema
             # failures visible; never replace or reinitialize state authority.
-            self._admitted.discard(key)
+            self._admitted.pop(key, None)
             with self._validation_lock:
                 self._forget_summary_validation((volume, session))
             return None
-        if directory is not None and key not in self._admitted:
+        if directory is not None and self._admitted.get(key) != signature:
             with self.connection() as db:
                 artifacts = db.execute(
                     "SELECT path,bytes FROM artifacts WHERE volume=? AND session=? ORDER BY path",
@@ -309,19 +311,22 @@ class SessionCatalog(StateDatabase):
             # including replacement of the session root during that scan.
             if self.signature(directory) != signature:
                 return None
-            self._admitted.add(key)
+            self._admitted[key] = signature
         return value
 
     @staticmethod
     def _artifacts_match(directory: Path, artifacts: list[tuple[str, int]]) -> bool:
         def paths():
             for relative, expected_bytes in artifacts:
-                if not isinstance(relative, str) or "\x00" in relative:
+                if not isinstance(relative, str) or "\x00" in relative or relative.startswith("/"):
                     raise OSError("invalid indexed artifact path")
-                path = Path(relative)
-                if path.is_absolute() or ".." in path.parts or not path.parts:
+                # This descriptor-relative traversal uses POSIX paths. Match
+                # Path's lexical dot/empty normalization without constructing a
+                # Path and repeatedly materializing its parts for every file.
+                parts = tuple(part for part in relative.split("/") if part not in {"", "."})
+                if not parts or ".." in parts:
                     raise OSError("invalid indexed artifact path")
-                yield path.parts, expected_bytes
+                yield parts, expected_bytes
 
         def identity(metadata):
             return (
@@ -428,7 +433,11 @@ class SessionCatalog(StateDatabase):
                 )
 
     def discard_missing(self, volume: str, discovered: set[str]) -> None:
-        self._admitted = {key for key in self._admitted if key[0] != volume or key[1] in discovered}
+        self._admitted = {
+            key: signature
+            for key, signature in self._admitted.items()
+            if key[0] != volume or key[1] in discovered
+        }
         with self._validation_lock:
             for key in list(self._validated_summaries):
                 if key[0] == volume and key[1] not in discovered:
