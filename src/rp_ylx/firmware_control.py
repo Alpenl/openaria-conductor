@@ -21,7 +21,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 SOCKET = "/run/rp-ylx/firmware-control.sock"
@@ -150,6 +150,64 @@ def _read_task_record(path, *, expected_key=None, missing_ok=False):
     )
     _validate_control_json(value)
     return _validate_task_record(value, expected_key)
+
+
+@contextmanager
+def _open_update_log(path):
+    # Keep the directory and file descriptors owned here. Popen accepts an fd
+    # directly, avoiding a second file-object owner during setup failures.
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = None
+    try:
+        parent = os.fstat(directory)
+
+        def identity(info):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("update log must be a single-link regular file")
+            return info.st_dev, info.st_ino
+
+        try:
+            before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            before = None
+        expected = identity(before) if before is not None else None
+        flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+        if before is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory)
+        opened = identity(os.fstat(fd))
+        if expected is not None and opened != expected:
+            raise ValueError("update log replaced before open")
+
+        def validate_target():
+            if identity(os.fstat(fd)) != opened:
+                raise ValueError("update log identity changed")
+            if identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) != opened:
+                raise ValueError("update log replaced after open")
+            current_parent = path.parent.lstat()
+            if not stat.S_ISDIR(current_parent.st_mode) or (
+                current_parent.st_dev,
+                current_parent.st_ino,
+            ) != (parent.st_dev, parent.st_ino):
+                raise ValueError("update log directory replaced")
+
+        validate_target()
+        os.fchmod(fd, 0o600)
+        validate_target()
+        os.ftruncate(fd, 0)
+        yield fd
+    finally:
+        primary = sys.exc_info()[1]
+        cleanup_error = None
+        for owned in (fd, directory):
+            if owned is not None:
+                try:
+                    os.close(owned)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        if primary is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 class FirmwareSupervisor:
@@ -495,7 +553,7 @@ class FirmwareSupervisor:
             command += ["--expected-commit", task["target_commit"]]
         # Logs are root-only; arbitrary command output is never returned by API.
         with (
-            (self.state / "last-update.log").open("wb") as log,
+            _open_update_log(self.state / "last-update.log") as log,
             subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True) as process,
         ):
             try:
