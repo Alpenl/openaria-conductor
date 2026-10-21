@@ -531,11 +531,14 @@ def dispatch(supervisor, request):
 
 class ControlHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        self.connection.settimeout(10)
         try:
-            raw = self.rfile.readline(LIMIT + 1)
+            raw = self.server.read_control_request(self.connection)
+            if not raw:
+                return
             request = _decode_control_frame(raw)
-            result = {"ok": True, "body": dispatch(self.server.supervisor, request)}
+            result = {"ok": True, "body": self.server.dispatch_control(request)}
+        except (ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            return
         except FirmwareError as error:
             result = {
                 "ok": False,
@@ -547,11 +550,159 @@ class ControlHandler(socketserver.StreamRequestHandler):
             raw = _encode_control_response(result)
         except (ValueError, TypeError, RecursionError):
             raw = _encode_control_response(_control_failure_response())
-        self.wfile.write(raw)
+        self.connection.settimeout(self.server.request_timeout_seconds)
+        with suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            self.wfile.write(raw)
 
 
 class ControlServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
+
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        bind_and_activate=True,
+        *,
+        max_connections=16,
+        request_timeout_seconds=10.0,
+        close_timeout_seconds=2.0,
+    ):
+        if type(max_connections) is not int or max_connections < 1:
+            raise ValueError("max_connections must be a positive integer")
+        for value in (request_timeout_seconds, close_timeout_seconds):
+            if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+                raise ValueError("control timeouts must be finite positive numbers")
+        self.max_connections = max_connections
+        self.request_timeout_seconds = request_timeout_seconds
+        self.close_timeout_seconds = close_timeout_seconds
+        self._control_condition = threading.Condition()
+        self._control_connections = {}
+        self._control_workers = {}
+        self._control_closing = False
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
+    def _release_control_request(self, request):
+        with self._control_condition:
+            self._control_connections.pop(request, None)
+            self._control_workers.pop(request, None)
+            self._control_condition.notify_all()
+
+    def _reject_control_request(self, request):
+        try:
+            # A rejected peer must not allocate a worker or block the acceptor.
+            with suppress(OSError):
+                request.settimeout(0.1)
+                request.sendall(
+                    _encode_control_response(
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "update_service_busy",
+                                "message": "更新服务连接繁忙，请稍后重试",
+                                "status": 503,
+                            },
+                        }
+                    )
+                )
+        finally:
+            self.shutdown_request(request)
+
+    def process_request(self, request, client_address):
+        worker = None
+        admitted = False
+        gate = None
+        try:
+            with self._control_condition:
+                if self._control_closing or len(self._control_connections) >= self.max_connections:
+                    rejected = True
+                else:
+                    rejected = False
+                    self._control_connections[request] = (
+                        time.monotonic() + self.request_timeout_seconds
+                    )
+                    try:
+                        gate = threading.Event()
+
+                        def serve_admitted():
+                            try:
+                                gate.wait()
+                                if admitted:
+                                    self.process_request_thread(request, client_address)
+                            finally:
+                                self._release_control_request(request)
+
+                        worker = threading.Thread(target=serve_admitted, daemon=True)
+                        self._control_workers[request] = worker
+                        worker.start()
+                        admitted = True
+                    finally:
+                        if gate is not None:
+                            gate.set()
+        except BaseException as error:
+            self._release_control_request(request)
+            try:
+                if (
+                    worker is not None
+                    and worker is not threading.current_thread()
+                    and worker.ident is not None
+                ):
+                    with suppress(Exception):
+                        worker.join(self.close_timeout_seconds)
+            finally:
+                if isinstance(error, Exception):
+                    self._reject_control_request(request)
+                else:
+                    with suppress(OSError):
+                        self.shutdown_request(request)
+            if isinstance(error, Exception):
+                return
+            raise
+        if rejected:
+            self._reject_control_request(request)
+
+    def read_control_request(self, connection):
+        with self._control_condition:
+            deadline = self._control_connections[connection]
+        raw = bytearray()
+        while len(raw) <= LIMIT:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("control request deadline expired")
+            connection.settimeout(remaining)
+            chunk = connection.recv(min(8192, LIMIT + 1 - len(raw)))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            if newline >= 0:
+                raw.extend(chunk[: newline + 1])
+                break
+            raw.extend(chunk)
+        return bytes(raw)
+
+    def dispatch_control(self, request):
+        with self._control_condition:
+            if self._control_closing:
+                raise FirmwareError("update_service_unavailable", "更新服务正在关闭", 503)
+        # Once admitted here, application work may finish even if the caller
+        # disconnects. Do not hold the connection registry lock during updates.
+        return dispatch(self.supervisor, request)
+
+    def server_close(self):
+        deadline = time.monotonic() + self.close_timeout_seconds
+        with self._control_condition:
+            self._control_closing = True
+            connections = list(self._control_connections)
+            workers = list(self._control_workers.values())
+        super().server_close()
+        for connection in connections:
+            with suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+        for worker in workers:
+            if worker is not threading.current_thread() and worker.ident is not None:
+                worker.join(max(0.0, deadline - time.monotonic()))
+        # Slow application calls cannot be killed safely. Their ownership stays
+        # registered until they exit; later close calls may finish draining them.
 
 
 def main():
