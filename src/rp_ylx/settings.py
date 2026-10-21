@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
+import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 
@@ -151,10 +154,82 @@ def manage(
     if action == "export":
         if destination is None:
             raise ValueError("--output is required")
-        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            json.dump(current, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
+        _export_json(destination, current)
         return {"export": str(destination)}
     return {"settings": current}
+
+
+def _export_json(destination: Path, value: object) -> None:
+    """Publish a complete UTF-8 export without replacing an existing name."""
+    parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd = None
+    temporary = None
+    identity = None
+
+    def same_file() -> bool:
+        if temporary is None or identity is None:
+            return False
+        try:
+            current = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return (current.st_dev, current.st_ino) == identity
+
+    def cleanup() -> None:
+        if same_file():
+            os.unlink(temporary, dir_fd=parent_fd)
+
+    def check_parent() -> None:
+        parent = os.fstat(parent_fd)
+        current = destination.parent.stat()
+        if (parent.st_dev, parent.st_ino) != (current.st_dev, current.st_ino):
+            raise PersistenceError("export parent directory changed during write")
+
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(errno.EEXIST, "export destination already exists", destination)
+        temporary = ".openaria-settings-" + uuid.uuid4().hex + ".tmp"
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=parent_fd,
+        )
+        info = os.fstat(fd)
+        identity = (info.st_dev, info.st_ino)
+        # Keep fd ownership even if stream construction, entry, flush or close
+        # raises. The final hard link refers to this exact open file on Linux.
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(fd)
+        check_parent()
+        if not same_file():
+            raise PersistenceError("export staging file changed during write")
+        # linkat follows our own fd, not a replaceable staging pathname, and
+        # fails atomically if another exporter creates the destination first.
+        os.link(
+            f"/proc/self/fd/{fd}", destination.name,
+            dst_dir_fd=parent_fd, follow_symlinks=True,
+        )
+        cleanup()
+        temporary = None
+        # After publication, a failed durability barrier must not delete the
+        # complete final file or allow a retry to overwrite it.
+        os.fsync(parent_fd)
+        check_parent()
+        published = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (published.st_dev, published.st_ino) != identity:
+            raise PersistenceError("export destination changed during publication")
+    except BaseException:
+        with suppress(OSError):
+            cleanup()
+        raise
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            os.close(parent_fd)
