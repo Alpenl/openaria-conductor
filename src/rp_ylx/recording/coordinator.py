@@ -780,6 +780,8 @@ class CaptureCoordinator:
         self._safe_swap_to_persist: dict[str, object] | None = None
         self._stop_inflight: tuple[str, str, str] | None = None
         self._pending_stop_state_commit: tuple[str, str, str] | None = None
+        self._stop_acceptance_inflight: tuple[str, str, str] | None = None
+        self._safe_swap_failure_clear_pending = False
         self._async_stop_worker: threading.Thread | None = None
         self._async_stop_reason: str | None = None
         self._failure_inflight: DeviceSessionRecorder | None = None
@@ -1217,6 +1219,8 @@ class CaptureCoordinator:
             "pending_safe_swap_failure": self._pending_safe_swap_failure,
             "safe_swap_resource": self._safe_swap_resource,
         }
+        if self._safe_swap_failure_clear_pending:
+            value["pending_safe_swap_failure"] = None
         if self._safe_swap_to_persist is not None:
             # The handoff owner stages a durable snapshot without exposing an
             # uncommitted success through status or the safe-swap endpoint.
@@ -2994,7 +2998,9 @@ class CaptureCoordinator:
         self._require_valid_command_receipt(scope)
         previous = self._commands.get(scope)
         if (
-            self._stop_inflight is not None or self._pending_stop_state_commit is not None
+            self._stop_inflight is not None
+            or self._pending_stop_state_commit is not None
+            or self._stop_acceptance_inflight is not None
         ) and (previous is None or self._persisted_commands.get(scope) is not previous):
             raise ProviderError(
                 "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
@@ -3348,184 +3354,293 @@ class CaptureCoordinator:
         replay = self._retry_completed_stop_receipt(command)
         if replay is not None:
             return replay
+        with self._stop_condition:
+            prepared = self._prepare_stop_request(command)
+        return prepared() if callable(prepared) else prepared
+
+    def _prepare_stop_request(
+        self, command: CaptureCommand,
+    ) -> CaptureCommandResult | Callable[[], CaptureCommandResult]:
         scope = (command.principal_id, "stop", command.idempotency_key)
         reason = command.body.get("reason")
         retry_receipt: CaptureCommandResult | None = None
-        with self._stop_condition:
-            if self._closing:
-                raise ProviderError(
-                    "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
+        if self._closing:
+            raise ProviderError(
+                "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
+            )
+        self._require_valid_command_receipt(scope)
+        previous = self._commands.get(scope)
+        if self._stop_acceptance_inflight is not None:
+            if previous is not None and previous[0] != command.canonical_body:
+                raise ProviderError("idempotency_conflict", "幂等键已经用于不同请求", status=409)
+            if previous is not None and self._persisted_commands.get(scope) is previous:
+                result = previous[1]
+                return CaptureCommandResult(
+                    result.status, copy.deepcopy(result.body), replayed=True,
                 )
-            self._require_valid_command_receipt(scope)
-            previous = self._commands.get(scope)
-            if previous is not None:
-                previous_body, result = previous
-                if previous_body != command.canonical_body:
-                    raise ProviderError(
-                        "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
-                    )
-                if self._persisted_commands.get(scope) is not previous:
-                    if self._stop_inflight is not None or (
-                        self._active is None
-                        and (reason != "safe_swap" or self._pending_safe_swap is None)
-                    ):
-                        raise ProviderError(
-                            "capture_busy", "停止回执正在提交，请重试",
-                            status=HTTPStatus.CONFLICT, retryable=True,
-                        )
-                    self._persist_local_state()
-                if (
-                    reason == "safe_swap"
-                    and self._async_stop_worker is None
-                    and self._pending_safe_swap is not None
-                    and isinstance(result.body, Mapping)
-                    and isinstance(
-                        accepted_active := result.body.get("snapshot", {}).get("active_recording"),
-                        Mapping,
-                    )
-                    and accepted_active.get("recording_state", {}).get("session_id")
-                    == self._pending_safe_swap["session_id"]
+            raise ProviderError(
+                "capture_busy", "停止请求正在持久接收，请重试", status=409, retryable=True,
+            )
+        if previous is not None:
+            previous_body, result = previous
+            if previous_body != command.canonical_body:
+                raise ProviderError(
+                    "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
+                )
+            if self._persisted_commands.get(scope) is not previous:
+                if self._stop_inflight is not None or (
+                    self._active is None
+                    and (reason != "safe_swap" or self._pending_safe_swap is None)
                 ):
-                    return self._request_pending_safe_swap(command, scope, replay=result)
-                if (
-                    self._failure_pending_commit is self._active
-                    and self._active_plan is not None
-                    and self._async_stop_worker is None
-                    and self._stop_inflight is None
-                    and self._failure_inflight is None
-                    and result.status == HTTPStatus.ACCEPTED
-                    and isinstance(result.body, Mapping)
-                    and isinstance(
-                        retry_active := result.body.get("snapshot", {}).get("active_recording"),
-                        Mapping,
-                    )
-                    and retry_active.get("recording_state", {}).get("session_id")
-                    == self._active_plan.session_id
-                ):
-                    # The receipt accepted this exact take's stop, but its
-                    # background commit failed. Re-arm only that unfinished work.
-                    retry_receipt = result
-                else:
-                    return CaptureCommandResult(
-                        result.status, copy.deepcopy(result.body), replayed=True
-                    )
-            if self._stop_inflight is not None and self._active is None:
-                raise ProviderError(
-                    "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
-                )
-            if self._async_stop_worker is not None:
-                if reason != self._async_stop_reason:
                     raise ProviderError(
-                        "stop_intent_conflict",
-                        "已有不同目的的停止请求正在收尾",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
+                        "capture_busy", "停止回执正在提交，请重试",
+                        status=HTTPStatus.CONFLICT, retryable=True,
                     )
-                result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
-                self._remember_command(scope, command, result)
-                return result
-            if self._stop_inflight is not None or self._failure_inflight is not None:
-                raise ProviderError(
-                    "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                return self._prepare_stop_receipt_commit(command, scope, result, retry=True)
+            if (
+                reason == "safe_swap"
+                and self._async_stop_worker is None
+                and self._pending_safe_swap is not None
+                and isinstance(result.body, Mapping)
+                and isinstance(
+                    accepted_active := result.body.get("snapshot", {}).get("active_recording"),
+                    Mapping,
                 )
-            if self._active is None:
-                if reason == "safe_swap" and self._pending_safe_swap is not None:
-                    return self._request_pending_safe_swap(command, scope)
-                return self.stop_capture(command)
-            if reason == "safe_swap" and self._open_representations:
+                and accepted_active.get("recording_state", {}).get("session_id")
+                == self._pending_safe_swap["session_id"]
+            ):
+                return self._request_pending_safe_swap(command, scope, replay=result)
+            if (
+                self._failure_pending_commit is self._active
+                and self._active_plan is not None
+                and self._async_stop_worker is None
+                and self._stop_inflight is None
+                and self._failure_inflight is None
+                and result.status == HTTPStatus.ACCEPTED
+                and isinstance(result.body, Mapping)
+                and isinstance(
+                    retry_active := result.body.get("snapshot", {}).get("active_recording"),
+                    Mapping,
+                )
+                and retry_active.get("recording_state", {}).get("session_id")
+                == self._active_plan.session_id
+            ):
+                # The receipt accepted this exact take's stop, but its
+                # background commit failed. Re-arm only that unfinished work.
+                retry_receipt = result
+            else:
+                return CaptureCommandResult(
+                    result.status, copy.deepcopy(result.body), replayed=True
+                )
+        if self._stop_inflight is not None and self._active is None:
+            raise ProviderError(
+                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+            )
+        if self._async_stop_worker is not None:
+            if reason != self._async_stop_reason:
                 raise ProviderError(
-                    "safe_swap_blocked",
-                    "仍有读取句柄未释放",
+                    "stop_intent_conflict",
+                    "已有不同目的的停止请求正在收尾",
                     status=HTTPStatus.CONFLICT,
                     retryable=True,
-                    details={"open_handle_count": self._open_representations},
                 )
-            recorder, plan = self._active, self._active_plan
-            assert plan is not None
-            result = (
-                CaptureCommandResult(
-                    retry_receipt.status, copy.deepcopy(retry_receipt.body), replayed=True
-                )
-                if retry_receipt is not None
-                else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+            result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+            return self._prepare_stop_receipt_commit(command, scope, result)
+        if self._stop_inflight is not None or self._failure_inflight is not None:
+            raise ProviderError(
+                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
             )
-            old_commands = dict(self._commands)
-
-            def finish() -> None:
-                # start() occurs while the requester holds this condition.
-                # Nothing touches capture sources before durable acceptance.
-                with self._stop_condition:
-                    if self._async_stop_worker is not threading.current_thread():
-                        return
+        if self._active is None:
+            if reason == "safe_swap" and self._pending_safe_swap is not None:
+                return self._request_pending_safe_swap(command, scope)
+            if self._admission is None:
                 try:
-                    self._finish_stop_capture(command, scope, recorder, plan, remember_result=False)
-                except BaseException as error:
-                    operational_logger("recording").event(
-                        "stop_finalization_failed",
-                        level="error",
-                        transaction_id=plan.session_id,
-                        exception_type=type(error).__name__,
-                        code=getattr(error, "code", "stop_finalization_failed"),
-                    )
-                    # Expected recording failures already retained their precise
-                    # diagnostics. Unexpected IO/worker errors must also become
-                    # visible through capture status, not disappear in a thread.
-                    with self._stop_condition:
-                        still_owned = self._active is recorder and self._active_plan is plan
-                        pending = self._pending_safe_swap
-                    if still_owned:
-                        self._retain_active_failure(
-                            DeviceRecordingError("stop_finalization_failed", str(error)),
-                            plan,
-                            from_stop=True,
-                        )
-                    elif (
-                        reason == "safe_swap"
-                        and pending is not None
-                        and pending["session_id"] == plan.session_id
-                    ):
-                        self._record_safe_swap_failure(pending, error)
-                finally:
-                    with self._stop_condition:
-                        if self._async_stop_worker is threading.current_thread():
-                            self._async_stop_worker = None
-                            self._async_stop_reason = None
-                        self._stop_condition.notify_all()
+                    self._require_admission()
+                except DeviceRecordingError as error:
+                    raise ProviderError(
+                        error.code, error.message, status=HTTPStatus.CONFLICT, retryable=True,
+                    ) from error
+            return self._prepare_stop_receipt_commit(
+                command, scope, CaptureCommandResult(HTTPStatus.NO_CONTENT, None),
+            )
+        if reason == "safe_swap" and self._open_representations:
+            raise ProviderError(
+                "safe_swap_blocked",
+                "仍有读取句柄未释放",
+                status=HTTPStatus.CONFLICT,
+                retryable=True,
+                details={"open_handle_count": self._open_representations},
+            )
+        recorder, plan = self._active, self._active_plan
+        assert plan is not None
+        result = (
+            CaptureCommandResult(
+                retry_receipt.status, copy.deepcopy(retry_receipt.body), replayed=True
+            )
+            if retry_receipt is not None
+            else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
+        )
+        old_commands = dict(self._commands)
+        ready = threading.Event()
 
+        def finish() -> None:
+            # The database commit occurs without the status lock. The event
+            # prevents the worker from touching sources before acceptance.
+            ready.wait()
+            with self._stop_condition:
+                if self._async_stop_worker is not threading.current_thread():
+                    return
             try:
-                worker = threading.Thread(
-                    target=finish, name="rp-ylx-stop-finalization", daemon=False
-                )
-                self._stop_inflight = scope
-                self._async_stop_worker = worker
-                self._async_stop_reason = str(reason)
-                worker.start()
+                self._finish_stop_capture(command, scope, recorder, plan, remember_result=False)
             except BaseException as error:
-                self._stop_inflight = None
-                self._async_stop_worker = None
-                self._async_stop_reason = None
-                self._stop_condition.notify_all()
-                if not isinstance(error, (RuntimeError, MemoryError)):
-                    raise
-                raise ProviderError(
-                    "stop_worker_unavailable",
-                    "无法启动录制收尾任务",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    retryable=True,
-                ) from error
-            try:
-                if retry_receipt is None:
-                    self._remember_command(scope, command, result)
-            except BaseException:
-                # The gated worker observes cancellation when this lock exits.
-                # Keep the active recorder and its leases available for retry.
-                self._commands = old_commands
-                self._stop_inflight = None
-                self._async_stop_worker = None
-                self._async_stop_reason = None
-                self._stop_condition.notify_all()
+                operational_logger("recording").event(
+                    "stop_finalization_failed",
+                    level="error",
+                    transaction_id=plan.session_id,
+                    exception_type=type(error).__name__,
+                    code=getattr(error, "code", "stop_finalization_failed"),
+                )
+                # Expected recording failures already retained their precise
+                # diagnostics. Unexpected IO/worker errors must also become
+                # visible through capture status, not disappear in a thread.
+                with self._stop_condition:
+                    still_owned = self._active is recorder and self._active_plan is plan
+                    pending = self._pending_safe_swap
+                if still_owned:
+                    self._retain_active_failure(
+                        DeviceRecordingError("stop_finalization_failed", str(error)),
+                        plan,
+                        from_stop=True,
+                    )
+                elif (
+                    reason == "safe_swap"
+                    and pending is not None
+                    and pending["session_id"] == plan.session_id
+                ):
+                    self._record_safe_swap_failure(pending, error)
+            finally:
+                with self._stop_condition:
+                    if self._async_stop_worker is threading.current_thread():
+                        self._async_stop_worker = None
+                        self._async_stop_reason = None
+                    self._stop_condition.notify_all()
+
+        try:
+            worker = threading.Thread(
+                target=finish, name="rp-ylx-stop-finalization", daemon=False
+            )
+            self._stop_inflight = scope
+            self._async_stop_worker = worker
+            self._async_stop_reason = str(reason)
+            worker.start()
+        except BaseException as error:
+            self._stop_inflight = None
+            self._async_stop_worker = None
+            self._async_stop_reason = None
+            self._stop_condition.notify_all()
+            ready.set()
+            if not isinstance(error, (RuntimeError, MemoryError)):
                 raise
-            return result
+            raise ProviderError(
+                "stop_worker_unavailable",
+                "无法启动录制收尾任务",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                retryable=True,
+            ) from error
+        def rollback() -> None:
+            self._commands = old_commands
+            self._stop_inflight = None
+            self._async_stop_worker = None
+            self._async_stop_reason = None
+
+        try:
+            if retry_receipt is None:
+                self._cache_command(scope, command, result)
+            self._stop_acceptance_inflight = scope
+        except BaseException:
+            ready.set()
+            rollback()
+            self._stop_condition.notify_all()
+            raise
+        return lambda: self._finish_stop_acceptance(
+            scope, result, rollback, persist=retry_receipt is None, ready=ready, worker=worker,
+        )
+
+    def _prepare_stop_receipt_commit(
+        self, command: CaptureCommand, scope: tuple[str, str, str],
+        result: CaptureCommandResult, *, retry: bool = False,
+    ) -> Callable[[], CaptureCommandResult]:
+        old_commands = dict(self._commands)
+
+        def rollback() -> None:
+            self._commands = old_commands
+
+        try:
+            if not retry:
+                self._cache_command(scope, command, result)
+            self._stop_acceptance_inflight = scope
+        except BaseException:
+            rollback()
+            raise
+
+        def commit() -> CaptureCommandResult:
+            committed = self._finish_stop_acceptance(scope, result, rollback)
+            # A nondurable earlier receipt may belong to a retryable handoff or
+            # failed recorder. Re-enter routing only after that receipt commits.
+            return self.request_stop_capture(command) if retry else committed
+
+        return commit
+
+    def _finish_stop_acceptance(
+        self, scope: tuple[str, str, str], result: CaptureCommandResult,
+        rollback: Callable[[], None], *, persist: bool = True,
+        ready: threading.Event | None = None, worker: threading.Thread | None = None,
+        accepted: Callable[[], None] | None = None,
+    ) -> CaptureCommandResult:
+        try:
+            if persist:
+                self._persist_local_state()
+            with self._stop_condition:
+                if accepted is not None:
+                    accepted()
+                self._stop_acceptance_inflight = None
+                self._stop_condition.notify_all()
+        except BaseException as error:
+            try:
+                with self._stop_condition:
+                    try:
+                        rollback()
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "Stop acceptance cleanup failed: " + type(cleanup_error).__name__,
+                        )
+                    source_failure = self._pending_source_failure
+                    failed_plan = self._active_plan
+                # A callback may have deferred its failure to the gated owner.
+                # Keep acceptance ownership until recovery claims that failure,
+                # so close/new mutations cannot cross an unowned transition.
+                if source_failure is not None and failed_plan is not None:
+                    try:
+                        self._retain_active_failure(
+                            source_failure, failed_plan, defer_recovery=True,
+                        )
+                    except BaseException as recovery_error:
+                        error.add_note(
+                            "Deferred source recovery failed: " + type(recovery_error).__name__,
+                        )
+            finally:
+                with self._stop_condition:
+                    self._stop_acceptance_inflight = None
+                    self._stop_condition.notify_all()
+                if ready is not None:
+                    ready.set()
+            if worker is not None:
+                worker.join()
+            raise
+        finally:
+            if ready is not None:
+                ready.set()
+        return result
 
     def _request_pending_safe_swap(
         self,
@@ -3533,8 +3648,8 @@ class CaptureCoordinator:
         scope: tuple[str, str, str],
         *,
         replay: CaptureCommandResult | None = None,
-    ) -> CaptureCommandResult:
-        """Resume a durable handoff intent without hashing under the HTTP lock."""
+    ) -> Callable[[], CaptureCommandResult]:
+        """Prepare a gated handoff worker; commit its acceptance outside the lock."""
         pending = self._pending_safe_swap
         assert pending is not None and self._async_stop_worker is None
         result = (
@@ -3544,9 +3659,11 @@ class CaptureCoordinator:
         )
         old_commands = dict(self._commands)
         previous_failure = self._pending_safe_swap_failure
+        ready = threading.Event()
         self._acquire_network_operation_lease()
 
         def finish() -> None:
+            ready.wait()
             with self._stop_condition:
                 if self._async_stop_worker is not threading.current_thread():
                     return
@@ -3577,6 +3694,7 @@ class CaptureCoordinator:
             self._stop_inflight = scope
             worker.start()
         except BaseException as error:
+            ready.set()
             self._async_stop_worker = None
             self._async_stop_reason = None
             self._stop_inflight = None
@@ -3590,22 +3708,32 @@ class CaptureCoordinator:
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
                 retryable=True,
             ) from error
-        self._pending_safe_swap_failure = None
-        try:
-            if replay is None:
-                self._remember_command(scope, command, result)
-            elif previous_failure is not None:
-                self._persist_local_state()
-        except BaseException:
+        def rollback() -> None:
             self._commands = old_commands
-            self._pending_safe_swap_failure = previous_failure
+            self._safe_swap_failure_clear_pending = False
             self._async_stop_worker = None
             self._async_stop_reason = None
             self._stop_inflight = None
             self._release_network_operation_lease()
+
+        def accepted() -> None:
+            self._pending_safe_swap_failure = None
+            self._safe_swap_failure_clear_pending = False
+
+        try:
+            if replay is None:
+                self._cache_command(scope, command, result)
+            self._safe_swap_failure_clear_pending = previous_failure is not None
+            self._stop_acceptance_inflight = scope
+        except BaseException:
+            ready.set()
+            rollback()
             self._stop_condition.notify_all()
             raise
-        return result
+        return lambda: self._finish_stop_acceptance(
+            scope, result, rollback, persist=replay is None or previous_failure is not None,
+            ready=ready, worker=worker, accepted=accepted,
+        )
 
     def _record_safe_swap_failure(
         self, pending: Mapping[str, object], error: BaseException
@@ -3667,6 +3795,7 @@ class CaptureCoordinator:
                             self._stop_inflight is not None
                             or self._failure_inflight is not None
                             or self._async_stop_worker is not None
+                            or self._stop_acceptance_inflight is not None
                         ):
                             self._stop_condition.wait()
                             continue
@@ -3695,6 +3824,7 @@ class CaptureCoordinator:
                     self._stop_inflight is None
                     and self._failure_inflight is None
                     and self._async_stop_worker is None
+                    and self._stop_acceptance_inflight is None
                 ):
                     break
                 self._stop_condition.wait()
@@ -3802,6 +3932,7 @@ class CaptureCoordinator:
                     self._stop_inflight is not None
                     or self._failure_inflight is not None
                     or self._async_stop_worker is not None
+                    or self._stop_acceptance_inflight is not None
                 ):
                     if wait:
                         self._stop_condition.wait()
@@ -4815,6 +4946,7 @@ class CaptureCoordinator:
                 self._failure_inflight is not None
                 or self._stop_inflight is not None
                 or self._async_stop_worker is not None
+                or self._stop_acceptance_inflight is not None
             ):
                 self._stop_condition.wait()
             active = self._active
