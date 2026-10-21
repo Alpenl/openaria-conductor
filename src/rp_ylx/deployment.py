@@ -2554,7 +2554,18 @@ class ReleaseManager:
                 # Reacquiring the write guard failed: do not mutate state while
                 # a service recovery reader may still be active.
                 raise
-            self._record_activation_failure(error, new_current)
+            diagnostic_error: BaseException | None = None
+            try:
+                self._record_activation_failure(error, new_current)
+            except BaseException as failure:
+                # Recording why activation failed must not prevent the required
+                # stop/rollback, even when the diagnostic write is cancelled.
+                diagnostic_error = failure
+            diagnostic_note = (
+                ""
+                if diagnostic_error is None
+                else f"；激活失败诊断未能保存（{type(diagnostic_error).__name__}）"
+            )
             try:
                 if old_current is None:
                     self._deactivate_systemd_units()
@@ -2566,10 +2577,22 @@ class ReleaseManager:
                     self._deactivate_systemd_units()
             except BaseException as cleanup_error:
                 detail = getattr(cleanup_error, "message", str(cleanup_error))
-                raise DeploymentError(
+                failure = DeploymentError(
                     "activation_cleanup_failed",
-                    f"release {new_current} 激活失败，且无法安全停止或恢复服务：{detail}",
-                ) from cleanup_error
+                    f"release {new_current} 激活失败，且无法安全停止或恢复服务：{detail}"
+                    f"{diagnostic_note}",
+                )
+                if not isinstance(cleanup_error, Exception):
+                    cleanup_error.add_note(str(failure))
+                    raise cleanup_error from error
+                if diagnostic_error is not None and not isinstance(diagnostic_error, Exception):
+                    diagnostic_error.add_note(str(failure))
+                    raise diagnostic_error from cleanup_error
+                raise failure from cleanup_error
+            if diagnostic_error is not None:
+                if not isinstance(diagnostic_error, Exception):
+                    raise diagnostic_error from error
+                raise DeploymentError(error.code, f"{error.message}{diagnostic_note}") from error
             raise
 
     def install(self, bundle_path: str | Path, *, activate: bool = True) -> Mapping[str, object]:
