@@ -42,6 +42,16 @@ class InstallTransactionTest(unittest.TestCase):
         self.assertIsNone(self.manager._read_transaction())
         self.assertFalse(self.manager.status()["transaction_pending"])
 
+    def test_offline_bundle_rejects_numeric_commit_without_coercion(self):
+        bundle = self.fixture.bundle("1")
+        path = bundle / "bundle.json"
+        value = json.loads(path.read_bytes())
+        value["commit"] = int("1" * 40)
+        path.write_text(json.dumps(value))
+        with self.assertRaises(deploy.DeploymentError) as error:
+            deploy.load_bundle(bundle)
+        self.assertEqual(error.exception.code, "bundle_invalid")
+
     def test_current_and_legacy_writer_formats_remain_accepted(self):
         for action in ("install", "rollback"):
             for state in ("prepared", "switched"):
@@ -154,6 +164,8 @@ else:raise AssertionError('FIFO accepted')
             {"config_snapshot_required": 1},
             {"config_snapshot_required": False},
             {"new_current": []},
+            {"new_current": 10**39},
+            {"old_current": 10**39},
             {"new_current": "A" * 40},
             {"old_current": False},
             {"old_current": "../bad"},

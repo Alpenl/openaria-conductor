@@ -347,8 +347,12 @@ def _sha256(path: Path) -> str:
 
 
 def _canonical_commit(value: object) -> str:
-    commit = str(value)
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+    commit = value
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
         raise DeploymentError("bundle_invalid", "bundle commit 不是完整 Git SHA")
     return commit
 
