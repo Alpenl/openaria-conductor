@@ -2986,6 +2986,8 @@ class NetworkControlTest(unittest.TestCase):
     def test_capture_start_is_rejected_while_network_transaction_is_current(self) -> None:
         provider = object.__new__(CaptureCoordinator)
         provider._active = None
+        provider._catalog_verification_epoch = 0
+        provider._catalog_verification_cancel = threading.Event()
         provider._network_operation_lease = None
         provider._pending_focus = None
         response = {

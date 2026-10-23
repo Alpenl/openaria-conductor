@@ -757,6 +757,10 @@ class CaptureCoordinator:
         self._state_persisted_sequence = 0
         self._storage_lock = threading.Lock()
         self._catalog_lock = threading.RLock()
+        self._catalog_verification_lock = threading.Lock()
+        self._catalog_verification_cancel = threading.Event()
+        self._catalog_verification_epoch = 0
+        self._catalog_verification_session: str | None = None
         self._closing = False
         self._storage_checked_at = 0.0
         self._storage_cache: StorageStatus | None = None
@@ -852,7 +856,12 @@ class CaptureCoordinator:
                 return 1 + self._open_representations
             recorder_handles = 0 if self._active is None else self._active.open_handle_count
             source_handles = 0 if self._sources is None else self._sources.open_handle_count
-            return recorder_handles + source_handles + self._open_representations
+            return (
+                recorder_handles
+                + source_handles
+                + self._open_representations
+                + int(self._catalog_verification_session is not None)
+            )
 
     def _sources_keep_preview(self) -> bool:
         return bool(getattr(self._sources, "keeps_preview_after_stop", False))
@@ -1750,8 +1759,145 @@ class CaptureCoordinator:
             store.close()
 
     def _check_catalog_verification_idle(self) -> None:
-        if self._active is not None or self._closing:
+        if self._active is not None or self._closing or self._catalog_verification_cancel.is_set():
             raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
+
+    def _verify_catalog_session(
+        self,
+        session_id: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        allow_pending_safe_swap: bool = False,
+    ) -> None:
+        # Serialize expensive reads independently of both catalog and control.
+        # Existing export clients may wait for another recording's scan. Keep that
+        # wait cancellable without consuming a control lock or duplicating I/O.
+        registered = False
+        with self._lock:
+            epoch = self._catalog_verification_epoch
+
+        def check() -> None:
+            self._check_catalog_verification_idle()
+            if epoch != self._catalog_verification_epoch:
+                raise DeviceRecordingError("verification_changed", "排队的录像校验已取消")
+            if cancelled is not None and cancelled():
+                raise DeviceRecordingError("verification_changed", "下载请求已取消")
+
+        while not self._catalog_verification_lock.acquire(timeout=0.05):
+            try:
+                check()
+            except DeviceRecordingError as error:
+                raise ProviderError(
+                    "verification_cancelled",
+                    "录像校验已中止，请稍后重试",
+                    status=503,
+                    retryable=True,
+                ) from error
+        try:
+            with self._lock:
+                if epoch != self._catalog_verification_epoch:
+                    raise DeviceRecordingError("verification_changed", "排队的录像校验已取消")
+                if self._active is not None or self._closing:
+                    raise ProviderError(
+                        "verification_busy", "采集资源繁忙，请稍后重试", status=503, retryable=True
+                    )
+                if self._released or (
+                    not allow_pending_safe_swap
+                    and (
+                        self._pending_safe_swap is not None
+                        or self._async_stop_reason == "safe_swap"
+                    )
+                ):
+                    raise ProviderError(
+                        "volume_releasing", "录制卷正在安全释放", status=423, retryable=True
+                    )
+                self._catalog_verification_cancel.clear()
+                self._catalog_verification_session = session_id
+                registered = True
+            check()
+            with self._catalog_lock:
+                snapshot = self._session_snapshots.get(session_id)
+            if snapshot is not None and self._session_payload_is_current(session_id, snapshot):
+                check()
+                return
+            with self._catalog_lock:
+                self._invalidate_session_verification(session_id)
+            admission = self._require_admission()
+            for root in admission.catalog_roots:
+                directory = root / session_id
+                if not directory.is_dir():
+                    continue
+                try:
+                    signature = self._catalog_db.signature(directory)
+                    manifest, payload = inspect_device_session_directory(directory)
+                    recovered = any(log.get("role") == RECOVERY_ROLE for log in manifest["logs"])
+                    if session_id in self._retained and not recovered:
+                        raise DeviceRecordingError(
+                            "manifest_invalid", "会话发布失败，未进入可下载 catalog"
+                        )
+                    check()
+                    snapshot, error = self._verify_exact_session_payload(
+                        directory,
+                        session_id,
+                        manifest,
+                        payload,
+                        interrupt_check=check,
+                    )
+                    check()
+                    # Publish only the exact identity verified above. File changes
+                    # during the unlocked scan must never create a usable receipt.
+                    with self._catalog_lock:
+                        check()
+                        if not self._session_payload_is_current(session_id, snapshot):
+                            raise DeviceRecordingError(
+                                "verification_changed", "会话在校验结果发布前发生变化"
+                            )
+                        summary = self._session_summary(
+                            session_id,
+                            manifest,
+                            payload,
+                            verification_error=error,
+                            verification_current=True,
+                        )
+                        self._catalog_db.remember(
+                            admission.volume_id,
+                            directory,
+                            self._config.session.commit,
+                            summary,
+                            manifest,
+                            expected_signature=signature,
+                        )
+                        self._session_summaries[session_id] = summary
+                        self._session_diagnostics.pop(session_id, None)
+                        self._session_snapshots[session_id] = snapshot
+                        if error is None:
+                            self._verified[session_id] = snapshot.manifest_sha256
+                    return
+                except (OSError, DeviceRecordingError, KeyError, TypeError, ValueError) as error:
+                    if (
+                        isinstance(error, DeviceRecordingError)
+                        and error.code == "verification_changed"
+                    ):
+                        raise
+                    with self._catalog_lock:
+                        self._invalidate_session_verification(session_id)
+                        self._session_summaries.pop(session_id, None)
+                        self._session_diagnostics[session_id] = self._session_diagnostic(
+                            session_id, error
+                        )
+                    return
+        except DeviceRecordingError as error:
+            if error.code != "verification_changed":
+                raise
+            raise ProviderError(
+                "verification_cancelled", "录像校验已中止，请稍后重试", status=503, retryable=True
+            ) from error
+        finally:
+            if registered:
+                with self._stop_condition:
+                    self._catalog_verification_session = None
+                    self._stop_condition.notify_all()
+            self._catalog_verification_lock.release()
 
     def _session_payload_is_current(
         self, session_id: str, snapshot: _VerifiedSessionSnapshot
@@ -1779,6 +1925,7 @@ class CaptureCoordinator:
         self,
         *,
         verify_session: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         admission = self._require_admission()
         # Check exact manifest identities to invalidate replaced catalog entries;
@@ -1789,19 +1936,15 @@ class CaptureCoordinator:
             or Path(verify_session).name != verify_session
         ):
             return
-        with (
-            self._catalog_lock,
-            self._catalog_db.scan() if verify_session is None else nullcontext(),
-        ):
+        if verify_session is not None:
+            self._verify_catalog_session(verify_session, cancelled=cancelled)
+            return
+        with self._catalog_lock, self._catalog_db.scan():
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
                 # Directory entries avoid a separate type stat for every child.
                 # Verified sessions still require fresh secure manifest opens.
-                with (
-                    os.scandir(sessions_root)
-                    if verify_session is None
-                    else nullcontext((sessions_root / verify_session,))
-                ) as candidates:
+                with os.scandir(sessions_root) as candidates:
                     for candidate in candidates:
                         # Preserve Path.is_dir's handling of link loops.
                         if candidate.is_symlink():
@@ -1845,38 +1988,37 @@ class CaptureCoordinator:
                                 )
                             continue
 
-                        if verify_session is None:
-                            try:
-                                signature = self._catalog_db.signature(sessions_root / session_id)
-                                cached = self._catalog_db.cached(
-                                    admission.volume_id,
-                                    session_id,
-                                    signature,
-                                    self._config.session.commit,
-                                    directory=sessions_root / session_id,
-                                    validate_summary=validate_session_summary,
-                                    cache_validation=True,
-                                    required_artifact_role=(
-                                        RECOVERY_ROLE
-                                        if session_id in self._retained
-                                        and session_id not in self._verified
-                                        else None
-                                    ),
-                                )
-                            except OSError:
-                                cached = None
-                            if cached is not None:
-                                if summary is None or snapshot is None:
-                                    self._session_summaries[session_id] = cached
-                                self._session_diagnostics.pop(session_id, None)
-                                continue
-                            # A changed manifest must not keep a stale metadata-only summary.
-                            self._session_summaries.pop(session_id, None)
-                            summary = None
+                        try:
+                            signature = self._catalog_db.signature(sessions_root / session_id)
+                            cached = self._catalog_db.cached(
+                                admission.volume_id,
+                                session_id,
+                                signature,
+                                self._config.session.commit,
+                                directory=sessions_root / session_id,
+                                validate_summary=validate_session_summary,
+                                cache_validation=True,
+                                required_artifact_role=(
+                                    RECOVERY_ROLE
+                                    if session_id in self._retained
+                                    and session_id not in self._verified
+                                    else None
+                                ),
+                            )
+                        except OSError:
+                            cached = None
+                        if cached is not None:
+                            if summary is None or snapshot is None:
+                                self._session_summaries[session_id] = cached
+                            self._session_diagnostics.pop(session_id, None)
+                            continue
+                        # A changed manifest must not keep a stale metadata-only summary.
+                        self._session_summaries.pop(session_id, None)
+                        summary = None
 
                         # A summary without a snapshot is already metadata-only.
                         # Only an explicit artifact request can promote it to verified.
-                        if summary is not None and verify_session is None:
+                        if summary is not None:
                             continue
                         try:
                             inspected_signature = self._catalog_db.signature(
@@ -1897,32 +2039,11 @@ class CaptureCoordinator:
                                     session_id, "会话发布失败，未进入可下载 catalog"
                                 )
                                 continue
-                            verified_snapshot = None
-                            verification_error = None
-                            if (
-                                verify_session is not None
-                                and self._active is None
-                                and not self._closing
-                            ):
-                                try:
-                                    verified_snapshot, verification_error = (
-                                        self._verify_exact_session_payload(
-                                            sessions_root / session_id,
-                                            session_id,
-                                            manifest,
-                                            payload,
-                                            interrupt_check=self._check_catalog_verification_idle,
-                                        )
-                                    )
-                                except DeviceRecordingError as error:
-                                    if error.code != "verification_changed":
-                                        raise
                             self._session_summaries[session_id] = self._session_summary(
                                 session_id,
                                 manifest,
                                 payload,
-                                verification_error=verification_error,
-                                verification_current=verified_snapshot is not None,
+                                verification_current=False,
                             )
                             self._catalog_db.remember(
                                 admission.volume_id,
@@ -1933,14 +2054,7 @@ class CaptureCoordinator:
                                 expected_signature=inspected_signature,
                             )
                             self._session_diagnostics.pop(session_id, None)
-                            if verified_snapshot is None:
-                                self._invalidate_session_verification(session_id)
-                                continue
-                            self._session_snapshots[session_id] = verified_snapshot
-                            if verification_error is None:
-                                self._verified[session_id] = verified_snapshot.manifest_sha256
-                            else:
-                                self._verified.pop(session_id, None)
+                            self._invalidate_session_verification(session_id)
                         except (
                             OSError,
                             DeviceRecordingError,
@@ -1960,16 +2074,13 @@ class CaptureCoordinator:
                                 diagnostic = current_diagnostic
                             self._session_diagnostics[session_id] = diagnostic
 
-            # A targeted catalog refresh must not evict summaries for unrelated
-            # sessions. Full discovery performs the stale-entry cleanup.
-            if verify_session is None:
-                self._catalog_db.discard_missing(admission.volume_id, discovered)
-                for session_id in set(self._session_summaries) - discovered:
-                    self._session_summaries.pop(session_id, None)
-                    self._verified.pop(session_id, None)
-                    self._session_snapshots.pop(session_id, None)
-                for session_id in set(self._session_diagnostics) - discovered:
-                    self._session_diagnostics.pop(session_id, None)
+            self._catalog_db.discard_missing(admission.volume_id, discovered)
+            for session_id in set(self._session_summaries) - discovered:
+                self._session_summaries.pop(session_id, None)
+                self._verified.pop(session_id, None)
+                self._session_snapshots.pop(session_id, None)
+            for session_id in set(self._session_diagnostics) - discovered:
+                self._session_diagnostics.pop(session_id, None)
 
     @staticmethod
     def _session_diagnostic(candidate_identity: str, error: object) -> dict[str, object]:
@@ -3040,6 +3151,8 @@ class CaptureCoordinator:
         if body.get("mode") == "calibration" and not self._calibration_source_supported():
             raise self._calibration_unavailable("capture_source_unsupported")
         self._require_camera_connected()
+        self._catalog_verification_epoch += 1
+        self._catalog_verification_cancel.set()
         self._acquire_network_operation_lease()
         try:
             return self._start_capture_with_network_lease(body)
@@ -4522,14 +4635,13 @@ class CaptureCoordinator:
         expected_digest = pending["manifest_sha256"]
         with self._catalog_lock:
             snapshot = self._session_snapshots.get(session_id)
-            if (
-                snapshot is None
-                or self._verified.get(session_id) != snapshot.manifest_sha256
-                or not self._session_payload_is_current(session_id, snapshot)
-            ):
+            if snapshot is not None and self._verified.get(session_id) != snapshot.manifest_sha256:
+                # A previous failed verdict must be retryable after repair (or
+                # after a transient validator failure), even with unchanged stat data.
                 self._invalidate_session_verification(session_id)
-                self._catalog_sessions(verify_session=session_id)
-                snapshot = self._session_snapshots.get(session_id)
+        self._verify_catalog_session(session_id, allow_pending_safe_swap=True)
+        with self._catalog_lock:
+            snapshot = self._session_snapshots.get(session_id)
             if (
                 snapshot is None
                 or snapshot.manifest_sha256 != expected_digest
@@ -4623,15 +4735,20 @@ class CaptureCoordinator:
             return tracked
 
     def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
-        # Verify only the requested session, including direct access without listing first.
+        return self.open_cancellable_artifact(session_id, artifact_id, api_version)
+
+    def open_cancellable_artifact(
+        self,
+        session_id: str,
+        artifact_id: str,
+        api_version: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> object:
+        # The complete payload scan holds no catalog/control lock. Preserve the
+        # existing whole-session integrity contract for both GET and HEAD.
+        self._catalog_sessions(verify_session=session_id, cancelled=cancelled)
         with self._catalog_lock:
-            # Reuse full payload verification only while EVERY securely opened
-            # file identity (including ctime) is unchanged. Same-size edits,
-            # restored mtimes, replacements and link changes invalidate it.
-            snapshot = self._session_snapshots.get(session_id)
-            if snapshot is None or not self._session_payload_is_current(session_id, snapshot):
-                self._invalidate_session_verification(session_id)
-                self._catalog_sessions(verify_session=session_id)
             snapshot = self._session_snapshots.get(session_id)
             if snapshot is None or self._verified.get(session_id) != snapshot.manifest_sha256:
                 raise ArtifactAccessError(
@@ -4642,6 +4759,10 @@ class CaptureCoordinator:
             expected_identities = dict(snapshot.artifact_identities)
 
         with ExitStack() as cleanup:
+            if cancelled is not None and cancelled():
+                raise ProviderError(
+                    "download_cancelled", "下载请求已取消", status=503, retryable=True
+                )
             release = self._acquire_representation()
             cleanup.callback(release)
             try:
@@ -4718,6 +4839,15 @@ class CaptureCoordinator:
                 raise ProviderError(
                     "download_busy", "下载进行中，不能删除", status=HTTPStatus.CONFLICT
                 )
+            if self._catalog_verification_session is not None:
+                self._catalog_verification_epoch += 1
+                self._catalog_verification_cancel.set()
+                raise ProviderError(
+                    "verification_cancelling",
+                    "正在停止录像校验，请稍后重试删除",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                )
             try:
                 self._check_generation(force=True)
             except DeviceRecordingError as error:
@@ -4728,7 +4858,15 @@ class CaptureCoordinator:
             expected = {
                 item["session_id"]: item["manifest_sha256"] for item in command.body["sessions"]
             }
-            with self._catalog_lock:
+            # Never wait for catalog work while owning the capture/clock lock.
+            if not self._catalog_lock.acquire(blocking=False):
+                raise ProviderError(
+                    "catalog_busy",
+                    "录像目录正在更新，请稍后重试删除",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    retryable=True,
+                )
+            try:
                 try:
                     result = delete_recordings(admission.catalog_roots, expected)
                 finally:
@@ -4738,6 +4876,8 @@ class CaptureCoordinator:
                         self._verified.pop(session_id, None)
                         self._session_diagnostics.pop(session_id, None)
                     self._storage_checked_at = 0.0
+            finally:
+                self._catalog_lock.release()
             self._forget_deleted_outcomes(result["deleted_session_ids"])
             return CaptureCommandResult(HTTPStatus.OK, result)
 
@@ -4932,6 +5072,8 @@ class CaptureCoordinator:
     def _close_capture(self) -> None:
         with self._stop_condition:
             self._closing = True
+            self._catalog_verification_epoch += 1
+            self._catalog_verification_cancel.set()
         if self._sources is not None:
             close_sources = getattr(self._sources, "close", None)
             if callable(close_sources):
@@ -4947,6 +5089,7 @@ class CaptureCoordinator:
                 or self._stop_inflight is not None
                 or self._async_stop_worker is not None
                 or self._stop_acceptance_inflight is not None
+                or self._catalog_verification_session is not None
             ):
                 self._stop_condition.wait()
             active = self._active
