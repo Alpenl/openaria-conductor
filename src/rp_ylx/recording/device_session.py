@@ -2301,21 +2301,11 @@ class DeviceSessionRecorder:
                 duration = max(duration, audio_end, thread_end)
                 ended_at += timedelta(seconds=duration - self._stopped_elapsed)
             self._enforce_quality_policy(duration)
-            self._persist_state("verifying")
-            finished_stage("verifying_checkpoint")
+            # Remain finalizing while finishing metadata and durable publication.
             verified_at = self._now()
             sealed_at = self._now()
             manifest = self._manifest(ended_at, verified_at, sealed_at, duration, audio=audio)
             compacted_originals: list[str] = []
-            artifact_count = len(_manifest_artifacts(manifest))
-
-            def compaction_progress(completed: int, total: int) -> None:
-                self._verification_compaction_total = total
-                # Compaction replaces descriptors one-for-one. Count the full
-                # independent content readback too; reserve only publication
-                # and the final identity recheck as the last unit.
-                self._verification_progress(completed, total + artifact_count + 1)
-
             if self._config.lossless_storage:
                 from rp_ylx.recording.audit import capture_audit
                 from rp_ylx.recording.storage import compact_manifest
@@ -2350,7 +2340,6 @@ class DeviceSessionRecorder:
                         manifest,
                         finalize_compacted,
                         prepared=prepared,
-                        progress=compaction_progress,
                     )
                     manifest["capture_audit"] = live_audit if audited is None else audited.result()
                 for relative in compacted_originals:
@@ -2393,10 +2382,8 @@ class DeviceSessionRecorder:
                     (self._final / relative).unlink()
             with self._lock:
                 self._state = "sealed"
-                # The coordinator still admits the sealed manifest against
-                # independent read proofs and current file identities.
-                # Keep the verifying snapshot until it releases this recorder;
-                # clearing it here incorrectly exposes device_state="blocked".
+                # Keep the finalizing snapshot until the coordinator publishes
+                # the saved recording and releases its recording resources.
                 self._native_transaction = None
             if native_manifest_sha256 is None:
                 fsync_directory(self._root)

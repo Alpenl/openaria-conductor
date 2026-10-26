@@ -720,6 +720,34 @@ class DirectorySessionStore:
             _close_all(owned)
             raise
 
+    def open_artifact(self, session_id: str, artifact_id: str, api_version: str) -> LockedArtifact:
+        """Open one saved file without reading media or requiring a verification receipt."""
+        if not _SHA256.fullmatch(artifact_id):
+            raise ArtifactAccessError("not_found", "artifact 不存在")
+        owned, _, _, manifest_bytes = self._open_manifest_bytes(session_id)
+        try:
+            manifest = _validated_manifest(manifest_bytes, session_id, api_version)
+            selected = _artifact_descriptors(manifest).get(artifact_id)
+            if selected is None:
+                raise ArtifactAccessError("not_found", "artifact 不存在")
+            descriptor = _open_relative_regular(selected.path, owned[1])
+            owned.append(descriptor)
+            metadata = _exclusive_regular_identity(descriptor)
+            if metadata[4] != selected.bytes:
+                raise ArtifactAccessError("not_verified", "录像文件大小异常，无法读取")
+            representation = LockedArtifact(
+                descriptor,
+                owned,
+                identity=_FileIdentity.read(descriptor),
+                artifact_descriptor=selected,
+            )
+            owned = []
+            return representation
+        except OSError as error:
+            raise ArtifactAccessError("not_verified", "录像文件无法读取") from error
+        finally:
+            _close_all(owned)
+
     def open_verified_artifact(
         self, session_id: str, artifact_id: str, api_version: str
     ) -> LockedArtifact:

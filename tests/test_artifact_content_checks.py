@@ -87,7 +87,7 @@ class ArtifactContentChecks(unittest.TestCase):
                     sealed.path, verified_artifacts=sealed.verified_artifacts
                 )
 
-    def test_recovery_rejects_corruption_during_read_with_identical_stat(self):
+    def test_recovery_does_not_repeat_full_readback_and_explicit_diagnostics_still_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = recovery_fixtures.RecordingRecoveryTests().recording(Path(temporary))
             partial = recorder.partial_path
@@ -113,11 +113,17 @@ class ArtifactContentChecks(unittest.TestCase):
                 patch.object(recovery, "verified_identity", side_effect=collide),
                 patch.object(verified, "identity", side_effect=collide),
                 patch.object(recovery, "_finalize_artifact", side_effect=mutate_after_read),
-                self.assertRaises(device_session.DeviceRecordingError),
+                patch.object(
+                    device_session,
+                    "_verify_artifact_fd",
+                    side_effect=AssertionError("automatic scan"),
+                ),
             ):
-                recovery.recover_device_session(partial)
-            self.assertTrue(partial.exists())
-            self.assertFalse((partial.parent / recorder._plan.session_id).exists())
+                saved = recovery.recover_device_session(partial)
+            self.assertIsNotNone(saved)
+            self.assertFalse(partial.exists())
+            with self.assertRaises(device_session.DeviceRecordingError):
+                device_session.validate_device_session_directory(saved.path)
 
 
 if __name__ == "__main__":

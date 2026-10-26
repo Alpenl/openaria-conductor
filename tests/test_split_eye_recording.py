@@ -1274,7 +1274,7 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
             self.assertEqual(len(verifying_states), 1)
             final_state = verifying_states[0]
-            self.assertEqual(final_state["state"], "verifying")
+            self.assertEqual(final_state["state"], "finalizing")
             expected_bytes = manifest_artifact_bytes_total(sealed.manifest, code="artifact_invalid")
             self.assertEqual(final_state["progress"]["bytes_written"], expected_bytes)
 

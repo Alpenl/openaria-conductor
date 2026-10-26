@@ -43,6 +43,12 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             },
         )
 
+    def diagnostic_artifact(self, session, artifact, version, *, cancelled=None):
+        self.coordinator._verify_catalog_session(session, cancelled=cancelled)
+        return self.coordinator.open_cancellable_artifact(
+            session, artifact, version, cancelled=cancelled
+        )
+
     @contextmanager
     def scanning(self, *, cancelled=None):
         entered, release = threading.Event(), threading.Event()
@@ -61,7 +67,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             ThreadPoolExecutor(max_workers=3) as pool,
         ):
             future = pool.submit(
-                self.coordinator.open_cancellable_artifact,
+                self.diagnostic_artifact,
                 self.session,
                 self.artifact,
                 "v4",
@@ -133,9 +139,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
 
     def test_second_download_waits_without_duplicate_scan_or_control_lock(self):
         with self.scanning() as (pool, _, release):
-            second = pool.submit(
-                self.coordinator.open_verified_artifact, self.session, self.artifact, "v4"
-            )
+            second = pool.submit(self.diagnostic_artifact, self.session, self.artifact, "v4")
             with patch.object(self.coordinator, "_clock_control", return_value={}):
                 pool.submit(self.coordinator.sync_clock, "operator", {}).result(timeout=1)
             self.assertFalse(second.done())
@@ -154,7 +158,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
         cancelled = threading.Event()
         with self.scanning() as (pool, first, release):
             second = pool.submit(
-                self.coordinator.open_cancellable_artifact,
+                self.diagnostic_artifact,
                 self.session,
                 self.artifact,
                 "v4",
@@ -184,9 +188,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             self.scanning() as (pool, first, _),
             patch.object(self.coordinator, "_catalog_verification_lock", ObservedLock()),
         ):
-            second = pool.submit(
-                self.coordinator.open_verified_artifact, self.session, self.artifact, "v4"
-            )
+            second = pool.submit(self.diagnostic_artifact, self.session, self.artifact, "v4")
             self.assertTrue(queued.wait(1))
             with self.assertRaises(ProviderError):
                 self.coordinator.delete_sessions(self.deletion)
@@ -213,7 +215,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             ),
             self.assertRaises(ProviderError) as changed,
         ):
-            self.coordinator.open_verified_artifact(self.session, self.artifact, "v4")
+            self.diagnostic_artifact(self.session, self.artifact, "v4")
         self.assertEqual(changed.exception.code, "verification_cancelled")
         self.assertNotIn(self.session, self.coordinator._verified)
         self.assertIsNone(self.coordinator._catalog_verification_session)

@@ -1687,12 +1687,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def deletion_command(self, coordinator, session_ids, key="delete-one"):
         items = coordinator.list_sessions(cursor=None, limit=200, take_id=None)["items"]
+
+        def manifest_digest(session_id):
+            with coordinator.open_manifest(session_id, "v4") as opened:
+                return hashlib.sha256(opened.read()).hexdigest()
+
         body = {
             "schema": "ylx.session-delete-request.v1",
             "sessions": [
                 {
                     "session_id": item["session_id"],
-                    "manifest_sha256": item["verification"]["manifest_sha256"],
+                    "manifest_sha256": manifest_digest(item["session_id"]),
                 }
                 for item in items
                 if item["session_id"] in session_ids
@@ -1875,6 +1880,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             source_session_id = self.seal_one(coordinator, prefix="catalog-v3-source")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             source = deepcopy(coordinator._session_summaries[source_session_id])
             take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
             summaries: dict[str, dict[str, object]] = {}
@@ -1976,6 +1984,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-copy-isolation")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             summary = coordinator._session_summaries[session_id]
             summary["verification"]["verdict"] = "unusable"
             summary["verification"]["diagnostics"] = [
@@ -2200,7 +2211,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_restart_defers_catalog_content_verification_until_artifact_access(self) -> None:
+    def test_restart_never_requires_catalog_content_verification(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="deferred-catalog")
@@ -2224,7 +2235,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
                 restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
                 first_access_verifications = verify.call_count
-                self.assertGreater(first_access_verifications, 0)
+                self.assertEqual(first_access_verifications, 0)
                 self.assertEqual(
                     [item["session_id"] for item in listed["items"]],
                     [session_id],
@@ -2307,7 +2318,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_artifact_access_rejects_corruption_in_another_artifact(self) -> None:
+    def test_artifact_access_is_independent_of_another_artifact(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="other-eye-corrupt")
@@ -2319,16 +2330,16 @@ class CaptureCoordinatorTest(unittest.TestCase):
             payload = bytearray(right.read_bytes())
             payload[0] ^= 1
             right.write_bytes(payload)
-            # ctime must catch same-size tampering even when mtime is restored.
+            # Another file must not delay or prevent reading this video.
             os.utime(right, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-            with self.assertRaises(ArtifactAccessError):
-                coordinator.open_verified_artifact(
-                    session_id, artifacts["left"]["artifact_id"], "v4"
-                )
+            with coordinator.open_verified_artifact(
+                session_id, artifacts["left"]["artifact_id"], "v4"
+            ) as opened:
+                self.assertEqual(opened.read(), (root / artifacts["left"]["path"]).read_bytes())
         finally:
             coordinator.close()
 
-    def test_cold_download_hashes_session_once_then_reuses_unchanged_identities(self) -> None:
+    def test_cold_download_reads_each_artifact_without_full_session_scan(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="reuse-download-validation")
@@ -2349,11 +2360,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
                         session_id, artifact["artifact_id"], "v4"
                     ) as opened:
                         self.assertEqual(opened.read(), (root / artifact["path"]).read_bytes())
-                self.assertEqual(validate.call_count, 1)
+                self.assertEqual(validate.call_count, 0)
         finally:
             restarted.close()
 
-    def test_recording_defers_cold_catalog_hashing_until_idle_without_trusting_bytes(self) -> None:
+    def test_recording_and_idle_do_not_require_historical_content_checks(self) -> None:
         for corrupt in (False, True):
             with self.subTest(corrupt=corrupt):
                 first = self.coordinator()
@@ -2398,21 +2409,14 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"][
                         "artifact_id"
                     ]
-                    if corrupt:
-                        with self.assertRaises(ArtifactAccessError):
-                            restarted.open_verified_artifact(session_id, artifact_id, "v4")
-                    else:
-                        restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
+                    restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
                     refreshed = restarted.list_sessions(
                         cursor=None, limit=50, take_id=None, api_version="v4"
                     )
                     refreshed_selected = next(
                         item for item in refreshed["items"] if item["session_id"] == session_id
                     )
-                    self.assertEqual(
-                        refreshed_selected["verification"]["verdict"],
-                        "unusable" if corrupt else "usable",
-                    )
+                    self.assertIsNone(refreshed_selected["verification"])
                 finally:
                     restarted.close()
 
@@ -2450,6 +2454,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             manifest = json.loads(
                 (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
             )
@@ -2613,7 +2620,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
 
             self.assertEqual([item["session_id"] for item in page["items"]], [session_id])
-            self.assertIsNotNone(page["items"][0]["verification"])
+            self.assertIsNone(page["items"][0]["verification"])
             self.assertEqual(page["diagnostics"], [])
         finally:
             coordinator.close()
@@ -2622,6 +2629,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             self.seal_one(coordinator, prefix="catalog-scan-close")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             descriptors_before = len(os.listdir("/proc/self/fd"))
             with (
                 patch.object(
@@ -2640,7 +2650,13 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             first = self.seal_one(coordinator, prefix="catalog-root-first")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             second = self.seal_one(coordinator, prefix="catalog-root-second")
+            coordinator._catalog_sessions()
+            for saved_id in list(coordinator._session_summaries):
+                coordinator._verify_catalog_session(saved_id)
             root = self.mountpoint / "recordings"
             check_identity = coordinator._session_manifest_is_current
             checked: list[str] = []
@@ -3034,12 +3050,12 @@ class CaptureCoordinatorTest(unittest.TestCase):
             release.set()
             coordinator.close()
 
-    def test_capture_status_clears_live_imu_while_sealed_session_is_verified(self) -> None:
+    def test_capture_status_clears_live_imu_while_saved_session_is_published(self) -> None:
         sources = FakeSourcesWithLatestImu(imu_observation(40))
         coordinator = self.coordinator(sources=sources)
         blocked = threading.Event()
         release = threading.Event()
-        original = coordinator._verify_exact_session_payload
+        original = coordinator._catalog_db.remember
 
         def verify(*args: object, **kwargs: object) -> object:
             blocked.set()
@@ -3051,7 +3067,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             coordinator.start_capture(start_command("verify-live-imu-start"))
             self.assertTrue(coordinator.submit_frame(frame()))
             with (
-                patch.object(coordinator, "_verify_exact_session_payload", side_effect=verify),
+                patch.object(coordinator._catalog_db, "remember", side_effect=verify),
                 ThreadPoolExecutor(max_workers=1) as executor,
             ):
                 stopping = executor.submit(
@@ -3061,7 +3077,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     self.assertTrue(blocked.wait(timeout=1))
                     status = coordinator.capture_status()
                     validate_capture_status(status)
-                    self.assertEqual(status["snapshot"]["device_state"], "verifying")
+                    self.assertEqual(status["snapshot"]["device_state"], "finalizing")
                     self.assertIsNotNone(status["snapshot"]["active_recording"])
                     self.assertIsNone(status["snapshot"]["runtime"]["live_imu"])
                 finally:
@@ -3631,7 +3647,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_seal_independently_verifies_artifact_bytes_before_usable_verdict(self) -> None:
+    def test_save_finishes_without_content_readback_or_verification_receipt(self) -> None:
         coordinator = self.coordinator()
         try:
             coordinator.start_capture(start_command("incremental-digest-start"))
@@ -3642,31 +3658,19 @@ class CaptureCoordinatorTest(unittest.TestCase):
             ) as verify:
                 result = coordinator.stop_capture(stop_command("incremental-digest-stop"))
             self.assertEqual(result.status, 202)
-            self.assertEqual(verify.call_count, 1)
+            self.assertEqual(verify.call_count, 0)
             listed = coordinator.list_sessions(
                 cursor=None,
                 limit=50,
                 take_id=None,
                 api_version="v4",
             )
-            self.assertEqual(listed["items"][0]["verification"]["verdict"], "usable")
-            session_id = listed["items"][0]["session_id"]
-            manifest = json.loads(
-                (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
-            )
-            verification = listed["items"][0]["verification"]
-            self.assertEqual(
-                verification["validator"]["name"],
-                "openaria-conductor-device-session-v2-integrity",
-            )
-            self.assertNotEqual(
-                verification["verified_at"],
-                manifest["integrity"]["verified_at"],
-            )
+            self.assertIsNone(listed["items"][0]["verification"])
+            self.assertEqual(listed["items"][0]["producer_outcome"], "sealed")
         finally:
             coordinator.close()
 
-    def test_catalog_verifies_artifact_contents_on_first_artifact_access(self) -> None:
+    def test_first_artifact_access_does_not_verify_contents(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="lightweight-catalog")
@@ -3689,7 +3693,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
                 restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
                 first_access_verifications = verify.call_count
-                self.assertGreater(first_access_verifications, 0)
+                self.assertEqual(first_access_verifications, 0)
                 restarted.list_sessions(cursor=None, limit=50, take_id=None)
                 self.assertEqual(verify.call_count, first_access_verifications)
             finally:
@@ -3703,7 +3707,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(listed["items"][0]["total_bytes"], expected_bytes)
 
-    def test_catalog_marks_content_digest_mismatch_unusable_before_download(self) -> None:
+    def test_explicit_diagnostic_scan_reports_digest_mismatch(self) -> None:
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="gateway-integrity")
@@ -3727,13 +3731,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 api_version="v4",
             )
             self.assertIsNone(listed["items"][0]["verification"])
-            with self.assertRaises(ArtifactAccessError) as blocked:
-                restarted.open_verified_artifact(
-                    session_id,
-                    video["artifact_id"],
-                    "v4",
-                )
-            self.assertEqual(blocked.exception.code, "not_verified")
+            restarted._verify_catalog_session(session_id)
             refreshed = restarted.list_sessions(
                 cursor=None,
                 limit=50,
@@ -3754,10 +3752,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_cached_usable_same_size_tamper_is_rejected_before_direct_download(self) -> None:
+    def test_explicit_diagnostic_rescan_detects_same_size_changes(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="cached-direct-download")
+            coordinator._verify_catalog_session(session_id)
             before = coordinator.list_sessions(
                 cursor=None,
                 limit=50,
@@ -3774,11 +3773,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             payload[0] ^= 0x01
             artifact_path.write_bytes(payload)
 
-            # No intervening list call: the download entry point itself must
-            # invalidate the old usable snapshot before it opens the bytes.
-            with self.assertRaises(ArtifactAccessError) as blocked:
-                coordinator.open_verified_artifact(session_id, video["artifact_id"], "v4")
-            self.assertEqual(blocked.exception.code, "not_verified")
+            coordinator._verify_catalog_session(session_id)
 
             after = coordinator.list_sessions(
                 cursor=None,

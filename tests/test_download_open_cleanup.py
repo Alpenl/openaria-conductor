@@ -51,7 +51,7 @@ class DownloadOpenCleanupTests(unittest.TestCase):
             for failure in (OSError(errno.EIO, "read failed"), Cancelled()):
                 with self.subTest(kind=kind, error=type(failure).__name__):
                     store = self.coordinator._open_store()
-                    name = "open_manifest" if kind == "manifest" else "open_verified_artifact"
+                    name = "open_manifest" if kind == "manifest" else "open_artifact"
                     with (
                         patch.object(self.coordinator, "_open_store", return_value=store),
                         patch.object(store, name, side_effect=failure),
@@ -66,7 +66,7 @@ class DownloadOpenCleanupTests(unittest.TestCase):
         for failure in (sqlite3.OperationalError("database is full"), Cancelled()):
             with self.subTest(error=type(failure).__name__):
                 held = []
-                original = module._MultiRootSessionStore.open_verified_artifact
+                original = module._MultiRootSessionStore.open_artifact
 
                 def opened(store, *args, original=original, held=held):
                     representation = original(store, *args)
@@ -74,7 +74,7 @@ class DownloadOpenCleanupTests(unittest.TestCase):
                     return representation
 
                 with (
-                    patch.object(module._MultiRootSessionStore, "open_verified_artifact", opened),
+                    patch.object(module._MultiRootSessionStore, "open_artifact", opened),
                     patch.object(self.coordinator._state_db, "begin_transfer", side_effect=failure),
                     self.assertRaises(type(failure)),
                 ):
@@ -109,7 +109,7 @@ class DownloadOpenCleanupTests(unittest.TestCase):
                 store = self.coordinator._open_store()
                 original_close = store.close
                 held = []
-                name = "open_manifest" if kind == "manifest" else "open_verified_artifact"
+                name = "open_manifest" if kind == "manifest" else "open_artifact"
                 original_open = getattr(store, name)
 
                 def opened(*args, original_open=original_open, held=held):

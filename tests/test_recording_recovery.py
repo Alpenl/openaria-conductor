@@ -65,7 +65,7 @@ class RecordingRecoveryTests(unittest.TestCase):
                 )
             self.assertEqual(verified, {})
 
-    def test_recovery_and_later_validation_both_read_current_content(self):
+    def test_recovery_avoids_rereads_and_explicit_validation_reads_current_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary))
             with (
@@ -81,7 +81,7 @@ class RecordingRecoveryTests(unittest.TestCase):
             paths = [call.args[0] for call in reads.call_args_list]
             self.assertIn(recorder.partial_path / "video/left_00000.mp4", paths)
             self.assertIn(recorder.partial_path / "recovery/imu.ndjson", paths)
-            self.assertGreater(rereads.call_count, 0)
+            self.assertEqual(rereads.call_count, 0)
             # A later standalone validation also checks current bytes.
             with patch.object(
                 session_module, "_verify_artifact_fd", wraps=session_module._verify_artifact_fd
@@ -97,7 +97,7 @@ class RecordingRecoveryTests(unittest.TestCase):
                 target = partial / "video/left_00000.mp4"
                 original = target.read_bytes()
                 metadata = target.stat()
-                validate = recovery_module.validate_device_session_directory
+                validate = recovery_module.inspect_device_session_directory
 
                 def mutate_then_validate(
                     *args,
@@ -125,7 +125,7 @@ class RecordingRecoveryTests(unittest.TestCase):
                 with (
                     patch.object(
                         recovery_module,
-                        "validate_device_session_directory",
+                        "inspect_device_session_directory",
                         side_effect=mutate_then_validate,
                     ),
                     self.assertRaises((session_module.DeviceRecordingError, ValueError)),

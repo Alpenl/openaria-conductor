@@ -56,8 +56,8 @@ class AsyncStopCrashTest(unittest.TestCase):
                 self.assertTrue(coordinator.submit_frame(fixtures.frame()))
                 if stage == "before_seal":
                     coordinator._active.stop = boundary
-                elif stage == "before_verification":
-                    coordinator._verify_exact_session_payload = boundary
+                elif stage == "before_catalog_publication":
+                    coordinator._catalog_db.remember = boundary
                 elif stage == "before_release":
                     coordinator._publish_safe_swap = boundary
                 elif stage == "after_release":
@@ -115,7 +115,7 @@ class AsyncStopCrashTest(unittest.TestCase):
             self.assertIsNone(coordinator._async_stop_worker)
             self.assertIsNone(coordinator.current_safe_swap_receipt())
             final = self.fixture.mountpoint / "recordings" / accepted["session_id"]
-            if stage == "before_verification":
+            if stage == "before_catalog_publication":
                 validate_device_session_directory(final)
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
                 self.assertEqual(len(listed["items"]), 1)
@@ -134,8 +134,8 @@ class AsyncStopCrashTest(unittest.TestCase):
     def test_kill_after_acceptance_before_seal_preserves_receipt_and_recovers(self):
         self.replay_and_continue("before_seal")
 
-    def test_kill_after_seal_before_verification_recovers_complete_content(self):
-        self.replay_and_continue("before_verification")
+    def test_kill_after_seal_before_catalog_publication_recovers_complete_content(self):
+        self.replay_and_continue("before_catalog_publication")
 
     def test_kill_before_safe_release_replays_only_after_zero_handles(self):
         command, accepted = self.kill_at("before_release", "safe_swap")
@@ -168,13 +168,14 @@ class AsyncStopCrashTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_pending_release_rechecks_content_changed_while_process_was_dead(self):
+    def test_pending_release_rejects_manifest_changed_while_process_was_dead(self):
         command, accepted = self.kill_at("before_release", "safe_swap")
         final = self.fixture.mountpoint / "recordings" / accepted["session_id"]
         manifest = json.loads((final / "manifest.json").read_bytes())
-        artifact = final / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
+        artifact = final / "manifest.json"
         payload = artifact.read_bytes()
-        artifact.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+        manifest["display_name"] += " changed"
+        artifact.write_text(json.dumps(manifest))
         coordinator = self.fixture.coordinator()
         try:
             self.assertIsNone(coordinator.current_safe_swap_receipt())
@@ -221,11 +222,11 @@ class AsyncStopCrashTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def test_pending_release_reverification_does_not_block_http_acceptance_or_status(self):
+    def test_pending_release_manifest_check_does_not_block_http_acceptance_or_status(self):
         command, accepted = self.kill_at("before_release", "safe_swap")
         coordinator = self.fixture.coordinator()
         entered, release, returned, status_returned = (threading.Event() for _ in range(4))
-        original = coordinator._verify_exact_session_payload
+        original = coordinator._check_pending_safe_swap
         results, errors = [], []
 
         def verify(*args, **kwargs):
@@ -249,7 +250,7 @@ class AsyncStopCrashTest(unittest.TestCase):
         caller = threading.Thread(target=request)
         reader = threading.Thread(target=status)
         try:
-            with patch.object(coordinator, "_verify_exact_session_payload", verify):
+            with patch.object(coordinator, "_check_pending_safe_swap", verify):
                 caller.start()
                 self.assertTrue(entered.wait(2))
                 reader.start()
@@ -366,7 +367,7 @@ class AsyncStopCrashTest(unittest.TestCase):
         try:
             with (
                 patch.object(coordinator, "_persist_local_state", side_effect=OSError("disk full")),
-                patch.object(coordinator, "_verify_pending_safe_swap") as verify,
+                patch.object(coordinator, "_check_pending_safe_swap") as verify,
             ):
                 with self.assertRaisesRegex(OSError, "disk full"):
                     coordinator.request_stop_capture(command)
