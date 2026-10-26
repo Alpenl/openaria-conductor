@@ -184,7 +184,7 @@ class RecoveryIndexCompressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             recorder = self.recording(Path(temporary))
             root = recorder.partial_path
-            validate = recovery.validate_device_session_directory
+            validate = recovery.inspect_device_session_directory
 
             def damage_then_validate(*args, **kwargs):
                 path = root / "recovery/frames.ndjson.zst"
@@ -195,7 +195,7 @@ class RecoveryIndexCompressionTests(unittest.TestCase):
                 return validate(*args, **kwargs)
 
             with (
-                patch.object(recovery, "validate_device_session_directory", damage_then_validate),
+                patch.object(recovery, "inspect_device_session_directory", damage_then_validate),
                 self.assertRaises((ValueError, recovery.DeviceRecordingError)),
             ):
                 recovery.recover_device_session(root)

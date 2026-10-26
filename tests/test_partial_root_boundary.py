@@ -63,18 +63,21 @@ class PartialRootBoundaryTest(unittest.TestCase):
         sid, partial, external = self.make_interrupted_partial()
         (partial / "manifest.json").write_text("{}")
         before = {path.name: path.read_bytes() for path in external.iterdir()}
+        inspect = module.inspect_device_session_directory
 
         def replace_directory(*args, **kwargs):
+            if args[0] != partial:
+                return inspect(*args, **kwargs)
             self.replace_with_link(partial, external)
             if rejected:
                 raise module.DeviceRecordingError("manifest_invalid", "injected validation error")
 
         with patch.object(
-            module, "validate_device_session_directory", side_effect=replace_directory
+            module, "inspect_device_session_directory", side_effect=replace_directory
         ) as validate:
             restarted = self.fixture.coordinator()
         try:
-            validate.assert_called_once()
+            self.assertEqual(sum(call.args[0] == partial for call in validate.call_args_list), 1)
             self.assertEqual(before, {path.name: path.read_bytes() for path in external.iterdir()})
             self.assertTrue(partial.is_symlink())
             self.assertFalse((partial.parent / sid).exists())

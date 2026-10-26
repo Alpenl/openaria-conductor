@@ -6,7 +6,6 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from rp_ylx.recording.device_session import DeviceRecordingError
 from tests import test_async_stop_crash as crash_fixtures
 from tests import test_capture_coordinator as fixtures
 from tests import test_gateway as gateway_fixtures
@@ -18,17 +17,18 @@ class SafeSwapFailureTest(unittest.TestCase):
         self.crash.setUp()
         self.addCleanup(self.crash.doCleanups)
 
-    def pending_with_changed_content(self):
+    def pending_with_changed_manifest(self):
         command, accepted = self.crash.kill_at("before_release", "safe_swap")
         final = self.crash.fixture.mountpoint / "recordings" / accepted["session_id"]
         manifest = json.loads((final / "manifest.json").read_bytes())
-        artifact = final / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
+        artifact = final / "manifest.json"
         original = artifact.read_bytes()
-        artifact.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        manifest["display_name"] += " changed"
+        artifact.write_text(json.dumps(manifest))
         return command, accepted, artifact, original
 
     def failed_pending(self):
-        command, accepted, artifact, original = self.pending_with_changed_content()
+        command, accepted, artifact, original = self.pending_with_changed_manifest()
         coordinator = self.crash.fixture.coordinator()
         self.addCleanup(coordinator.close)
         coordinator.request_stop_capture(command)
@@ -44,7 +44,7 @@ class SafeSwapFailureTest(unittest.TestCase):
         return raised.exception
 
     def test_failed_resume_has_typed_http_error_instead_of_missing_receipt(self):
-        command, accepted, _, _ = self.pending_with_changed_content()
+        command, accepted, _, _ = self.pending_with_changed_manifest()
         coordinator = self.crash.fixture.coordinator()
         gateway = gateway_fixtures.GatewayHttpTest()
         gateway.setUp()
@@ -94,7 +94,7 @@ class SafeSwapFailureTest(unittest.TestCase):
         self.assertEqual(failure.details["session_id"], accepted["session_id"])
         artifact.write_bytes(original)
         entered, release = threading.Event(), threading.Event()
-        verify = restarted._verify_pending_safe_swap
+        verify = restarted._check_pending_safe_swap
 
         def blocked(pending):
             entered.set()
@@ -102,7 +102,7 @@ class SafeSwapFailureTest(unittest.TestCase):
                 raise TimeoutError("test did not release verification")
             return verify(pending)
 
-        with patch.object(restarted, "_verify_pending_safe_swap", blocked):
+        with patch.object(restarted, "_check_pending_safe_swap", blocked):
             try:
                 replay = restarted.request_stop_capture(command)
                 self.assertEqual(replay.body, accepted["accepted"])
@@ -148,7 +148,7 @@ class SafeSwapFailureTest(unittest.TestCase):
             patch.object(
                 coordinator, "_persist_local_state", side_effect=OSError("SQLite unavailable")
             ),
-            patch.object(coordinator, "_verify_pending_safe_swap") as verify,
+            patch.object(coordinator, "_check_pending_safe_swap") as verify,
         ):
             with self.assertRaises(OSError):
                 coordinator.request_stop_capture(command)
@@ -169,13 +169,13 @@ class SafeSwapFailureTest(unittest.TestCase):
         self.assertIsNone(coordinator._network_operation_lease)
 
     def test_unknown_worker_error_is_visible_even_when_failure_cannot_be_persisted(self):
-        command, _, _, _ = self.pending_with_changed_content()
+        command, _, _, _ = self.pending_with_changed_manifest()
         coordinator = self.crash.fixture.coordinator()
         self.addCleanup(coordinator.close)
         with (
             patch.object(
                 coordinator,
-                "_verify_pending_safe_swap",
+                "_check_pending_safe_swap",
                 side_effect=OSError("private filesystem path"),
             ),
             patch.object(coordinator, "_persist_local_state", side_effect=OSError("disk failed")),
@@ -207,19 +207,17 @@ class SafeSwapFailureTest(unittest.TestCase):
         self.crash.wait_finished(coordinator)
         self.assertIsNotNone(coordinator.current_safe_swap_receipt())
 
-    def test_fresh_failed_integrity_keeps_retryable_handoff_intent(self):
+    def test_fresh_changed_manifest_keeps_retryable_handoff_intent(self):
         coordinator = self.crash.fixture.coordinator()
         self.addCleanup(coordinator.close)
         coordinator.start_capture(fixtures.start_command("fresh-integrity"))
         coordinator.submit_frame(fixtures.frame())
         command = fixtures.stop_command("fresh-integrity-stop", reason="safe_swap")
-        original = coordinator._verify_exact_session_payload
-
-        def invalid(*args, **kwargs):
-            snapshot, _ = original(*args, **kwargs)
-            return snapshot, DeviceRecordingError("digest_mismatch", "injected digest error")
-
-        with patch.object(coordinator, "_verify_exact_session_payload", invalid):
+        with patch.object(
+            coordinator,
+            "_check_pending_safe_swap",
+            side_effect=ProviderError("safe_swap_unverified", "manifest changed", status=409),
+        ):
             coordinator.request_stop_capture(command)
             self.crash.wait_finished(coordinator)
         self.assert_failure(coordinator)

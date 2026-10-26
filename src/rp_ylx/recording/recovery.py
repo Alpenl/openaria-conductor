@@ -34,8 +34,8 @@ from rp_ylx.recording.device_session import (
     StorageStatus,
     _finalize_artifact,
     fsync_directory,
+    inspect_device_session_directory,
     json_bytes,
-    validate_device_session_directory,
     write_json_atomic,
 )
 from rp_ylx.recording.encoding import RecordingEncoding
@@ -649,10 +649,13 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         )
     ]
     write_json_atomic(partial / "manifest.json", manifest, pretty=False)
-    validate_device_session_directory(
-        partial, expected_session_id=plan.session_id, verified_artifacts=verified
-    )
-    # Archive controls only after the independent validator accepts every byte.
+    inspect_device_session_directory(partial, expected_session_id=plan.session_id)
+    # Recovery owns these files until publication. Detect concurrent replacement
+    # or writes from metadata without rereading the recovered media.
+    for relative, artifact in verified.items():
+        if verified_identity((partial / relative).stat(follow_symlinks=False)) != artifact.identity:
+            raise DeviceRecordingError("artifact_invalid", "恢复文件在保存前发生变化")
+    # Archive controls after the recovered recording has been published durably.
     # If power fails here, startup can finish the ordinary publish transaction.
     for name in ("capture.json", "recording.json"):
         path = partial / name

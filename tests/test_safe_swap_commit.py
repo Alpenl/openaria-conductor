@@ -185,7 +185,7 @@ class SafeSwapCommitTest(unittest.TestCase):
         ):
             c.stop_capture(self.command)
         entered = threading.Event()
-        original = c._verify_pending_safe_swap
+        original = c._check_pending_safe_swap
 
         def verify(pending):
             entered.set()
@@ -193,7 +193,7 @@ class SafeSwapCommitTest(unittest.TestCase):
                 raise TimeoutError("safe-swap verification test")
             return original(pending)
 
-        with patch.object(c, "_verify_pending_safe_swap", side_effect=verify):
+        with patch.object(c, "_check_pending_safe_swap", side_effect=verify):
             method = c.request_stop_capture if asynchronous else c.stop_capture
             stopped = self.launch("stop", lambda: method(self.command))
             try:

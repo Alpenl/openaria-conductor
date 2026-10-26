@@ -115,7 +115,7 @@ class StopCatalogIsolationTest(unittest.TestCase):
                 self.assertTrue(status_done.wait(0.25), "catalog wait held the state lock")
                 self.assertNotIn("status", errors)
                 fixtures.validate_capture_status(outcomes["status"])
-                self.assertEqual(outcomes["status"]["snapshot"]["device_state"], "verifying")
+                self.assertEqual(outcomes["status"]["snapshot"]["device_state"], "finalizing")
                 self.assertIs(coordinator._active, recorder)
                 self.assertFalse(stop_done.is_set())
                 self.assertIsNone(coordinator.current_safe_swap_receipt())

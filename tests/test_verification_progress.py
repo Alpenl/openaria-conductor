@@ -12,7 +12,7 @@ from tests import test_split_eye_recording as recorder_fixtures
 
 
 class VerificationProgressTests(unittest.TestCase):
-    def test_stop_progress_covers_independent_reads_without_regression(self):
+    def test_stop_has_no_verification_progress_for_raw_or_lossless_recordings(self):
         for lossless in (False, True):
             with self.subTest(lossless=lossless):
                 fixture = coordinator_fixtures.CaptureCoordinatorTest()
@@ -48,11 +48,7 @@ class VerificationProgressTests(unittest.TestCase):
                             coordinator_fixtures.stop_command("progress-stop")
                         )
                     self.assertEqual(stopped.body["snapshot"]["device_state"], "idle")
-                    self.assertGreater(len(observed), 3)
-                    self.assertEqual(len({total for _, total in observed}), 1)
-                    self.assertEqual(observed[-1][0], observed[-1][1] - 1)
-                    self.assertEqual(observed, sorted(observed))
-                    self.assertTrue(all(0 <= done < total for done, total in observed))
+                    self.assertEqual(observed, [])
                 finally:
                     coordinator.close()
                     fixture.tearDown()

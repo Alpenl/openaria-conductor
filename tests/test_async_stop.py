@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from rp_ylx.recording.device_session import DeviceRecordingError
 from tests import test_capture_coordinator as fixtures
 from tests import test_gateway as gateway_fixtures
 
@@ -77,7 +76,7 @@ def check_started_worker_cancellation(case, coordinator, command, *, recording):
     started = []
     injected = KeyboardInterrupt("cancelled after OS thread start")
     original_start = threading.Thread.start
-    operation = "_finish_stop_capture" if recording else "_verify_pending_safe_swap"
+    operation = "_finish_stop_capture" if recording else "_check_pending_safe_swap"
 
     def start(worker):
         original_start(worker)
@@ -130,16 +129,16 @@ class AsyncStopTest(unittest.TestCase):
         self.coordinator.start_capture(fixtures.start_command("async-start"))
         self.assertTrue(self.coordinator.submit_frame(fixtures.frame()))
 
-    def block_verification(self):
-        original = self.coordinator._verify_exact_session_payload
+    def block_finalization(self):
+        original = self.coordinator._active.stop
 
         def verify(*args, **kwargs):
             self.entered.set()
             if not self.release.wait(5):
-                raise TimeoutError("test did not release independent verification")
+                raise TimeoutError("test did not release finalization")
             return original(*args, **kwargs)
 
-        context = patch.object(self.coordinator, "_verify_exact_session_payload", verify)
+        context = patch.object(self.coordinator._active, "stop", verify)
         context.start()
         self.addCleanup(context.stop)
 
@@ -151,8 +150,8 @@ class AsyncStopTest(unittest.TestCase):
                 )
             )
 
-    def test_request_returns_before_full_verification_and_replays_same_receipt(self):
-        self.block_verification()
+    def test_request_returns_before_finalization_and_replays_same_receipt(self):
+        self.block_finalization()
         done = threading.Event()
         results, errors = [], []
         command = fixtures.stop_command("async-stop")
@@ -172,7 +171,7 @@ class AsyncStopTest(unittest.TestCase):
         caller.start()
         try:
             self.assertTrue(self.entered.wait(2))
-            self.assertTrue(done.wait(0.5), "HTTP stop still waits for full verification")
+            self.assertTrue(done.wait(0.5), "HTTP stop still waits for finalization")
             self.assertEqual(errors, [])
             self.assertEqual(results[0].status, 202)
             self.assertIsNotNone(self.coordinator._network_operation_lease)
@@ -194,7 +193,7 @@ class AsyncStopTest(unittest.TestCase):
             self.assertFalse(caller.is_alive())
 
     def test_multiple_keys_share_one_worker_and_conflicting_intent_is_rejected(self):
-        self.block_verification()
+        self.block_finalization()
         first = self.coordinator.request_stop_capture(fixtures.stop_command("owner"))
         self.assertEqual(first.status, 202)
         self.assertTrue(self.entered.wait(2))
@@ -211,8 +210,8 @@ class AsyncStopTest(unittest.TestCase):
         self.release.set()
         self.wait_finished()
 
-    def test_safe_swap_receipt_waits_for_full_verification(self):
-        self.block_verification()
+    def test_safe_swap_receipt_waits_for_finalization(self):
+        self.block_finalization()
         result = self.coordinator.request_stop_capture(
             fixtures.stop_command("safe-async", reason="safe_swap")
         )
@@ -269,8 +268,8 @@ class AsyncStopTest(unittest.TestCase):
         self.assertEqual(self.coordinator.request_stop_capture(command).status, 202)
         self.wait_finished()
 
-    def test_close_waits_for_background_integrity_check(self):
-        self.block_verification()
+    def test_close_waits_for_background_finalization(self):
+        self.block_finalization()
         self.coordinator.request_stop_capture(fixtures.stop_command("close-wait"))
         self.assertTrue(self.entered.wait(2))
         closed = threading.Event()
@@ -304,8 +303,8 @@ class AsyncStopTest(unittest.TestCase):
         self.assertFalse(result.replayed)
         self.wait_finished()
 
-    def test_accepted_receipt_is_durable_before_verification_finishes(self):
-        self.block_verification()
+    def test_accepted_receipt_is_durable_before_finalization_finishes(self):
+        self.block_finalization()
         command = fixtures.stop_command("durable-accepted")
         accepted = self.coordinator.request_stop_capture(command)
         self.assertTrue(self.entered.wait(2))
@@ -337,10 +336,8 @@ class AsyncStopTest(unittest.TestCase):
         self.assertEqual(self.fixture.active_session_id(self.coordinator), session)
         self.assertIsNone(self.coordinator._async_stop_worker)
 
-    def test_unexpected_verification_error_is_visible_in_retained_diagnostics(self):
-        with patch.object(
-            self.coordinator, "_verify_exact_session_payload", side_effect=OSError("injected read")
-        ):
+    def test_unexpected_save_error_is_visible_in_retained_diagnostics(self):
+        with patch.object(self.coordinator._active, "stop", side_effect=OSError("injected write")):
             self.coordinator.request_stop_capture(fixtures.stop_command("async-io-failure"))
             self.wait_finished()
         status = self.coordinator.capture_status()["snapshot"]
@@ -351,14 +348,12 @@ class AsyncStopTest(unittest.TestCase):
         )
         self.assertIsNone(self.coordinator.current_safe_swap_receipt())
 
-    def test_failed_content_verification_never_publishes_safe_swap(self):
-        original = self.coordinator._verify_exact_session_payload
-
-        def invalid(*args, **kwargs):
-            verified, _ = original(*args, **kwargs)
-            return verified, DeviceRecordingError("artifact_corrupt", "injected content mismatch")
-
-        with patch.object(self.coordinator, "_verify_exact_session_payload", invalid):
+    def test_changed_handoff_manifest_never_publishes_safe_swap(self):
+        with patch.object(
+            self.coordinator,
+            "_check_pending_safe_swap",
+            side_effect=ProviderError("safe_swap_unverified", "manifest changed", status=409),
+        ):
             self.coordinator.request_stop_capture(
                 fixtures.stop_command("bad-safe-swap", reason="safe_swap")
             )
@@ -386,8 +381,8 @@ class AsyncStopTest(unittest.TestCase):
         self.wait_finished()
         self.assertIsNotNone(self.coordinator.current_safe_swap_receipt())
 
-    def test_real_http_returns_accepted_while_integrity_is_blocked(self):
-        self.block_verification()
+    def test_real_http_returns_accepted_while_finalization_is_blocked(self):
+        self.block_finalization()
         gateway = gateway_fixtures.GatewayHttpTest()
         gateway.setUp()
         gateway.server.provider = self.coordinator
@@ -442,9 +437,9 @@ class AsyncStopTest(unittest.TestCase):
         with (
             patch.object(self.coordinator, "_retain_active_failure", recovery),
             patch.object(
-                self.coordinator,
-                "_verify_exact_session_payload",
-                side_effect=OSError("read failure"),
+                self.coordinator._active,
+                "stop",
+                side_effect=OSError("write failure"),
             ),
         ):
 

@@ -200,7 +200,7 @@ LIVE_IMU_STALE_SECONDS = 2.0
 SAFE_SWAP_FAILURES = {
     "safe_swap_unverified": (
         HTTPStatus.INTERNAL_SERVER_ERROR,
-        "待交接录制内容未通过完整校验，请检查后重试",
+        "待交接录像的信息已变化或无法读取，请重试",
     ),
     "safe_swap_publish_failed": (
         HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -697,6 +697,15 @@ class _MultiRootSessionStore:
                     raise
         raise ArtifactAccessError("not_found", "会话不存在")
 
+    def open_artifact(self, session_id: str, artifact_id: str, api_version: str) -> LockedArtifact:
+        for store in self._stores:
+            try:
+                return store.open_artifact(session_id, artifact_id, api_version)
+            except ArtifactAccessError as error:
+                if error.code != "not_found":
+                    raise
+        raise ArtifactAccessError("not_found", "录像文件不存在")
+
     def open_verified_artifact(
         self, session_id: str, artifact_id: str, api_version: str
     ) -> LockedArtifact:
@@ -847,8 +856,8 @@ class CaptureCoordinator:
         self._restore_local_state(persisted)
         if self._admission is not None:
             self._recover_sessions()
-            # Full payload verification is data-size dependent; defer it until
-            # the catalog is requested so service startup stays bounded.
+            # Saved recordings are discovered from metadata; startup and reads
+            # never require a full-media integrity scan.
         self._persist_local_state()
         if self._sources is not None:
             with suppress(CameraError, ProviderError):
@@ -1050,7 +1059,7 @@ class CaptureCoordinator:
                 }:
                     raise ValueError("invalid persisted safe-swap intent")
                 # Reuse the frozen receipt field rules for the six intent fields.
-                # This validates metadata only; publication still verifies media.
+                # Publication rechecks the saved manifest and released handles.
                 validate_safe_swap_v3_receipt(
                     {
                         **pending,
@@ -1429,7 +1438,7 @@ class CaptureCoordinator:
             final = partial.parent / session_id
             published = False
             try:
-                validate_device_session_directory(partial, expected_session_id=session_id)
+                inspect_device_session_directory(partial, expected_session_id=session_id)
                 if not self._partial_directory_current(partial, descriptor):
                     return
                 if final.exists():
@@ -4211,28 +4220,6 @@ class CaptureCoordinator:
                     error.code, error.message, status=HTTPStatus.CONFLICT
                 ) from error
 
-            verified_snapshot: _VerifiedSessionSnapshot | None = None
-            verification_error: DeviceRecordingError | None = None
-            verification_current = True
-            verify_started = time.monotonic()
-            try:
-                verified_snapshot, verification_error = self._verify_exact_session_payload(
-                    self._require_admission().sessions_root / plan.session_id,
-                    plan.session_id,
-                    sealed.manifest,
-                    sealed.manifest_bytes,
-                    verified_artifacts=sealed.verified_artifacts,
-                    progress=recorder.independent_verification_progress,
-                )
-            except DeviceRecordingError:
-                verification_current = False
-            operational_logger("recording").event(
-                "stop_stage",
-                stage="independent_admission",
-                transaction_id=plan.session_id,
-                duration_ms=(time.monotonic() - verify_started) * 1000,
-            )
-
             with self._lock:
                 if self._pending_source_failure is not None:
                     raise self._pending_source_failure
@@ -4251,8 +4238,7 @@ class CaptureCoordinator:
                     plan.session_id,
                     sealed.manifest,
                     sealed.manifest_bytes,
-                    verification_error=verification_error,
-                    verification_current=verification_current,
+                    verification_current=False,
                 )
                 try:
                     self._catalog_db.remember(
@@ -4269,14 +4255,7 @@ class CaptureCoordinator:
                         level="warning",
                         transaction_id=plan.session_id,
                     )
-                if verified_snapshot is not None:
-                    self._session_snapshots[plan.session_id] = verified_snapshot
-                else:
-                    self._session_snapshots.pop(plan.session_id, None)
-                if verified_snapshot is not None and verification_error is None:
-                    self._verified[plan.session_id] = verified_snapshot.manifest_sha256
-                else:
-                    self._verified.pop(plan.session_id, None)
+                self._invalidate_session_verification(plan.session_id)
                 self._session_diagnostics.pop(plan.session_id, None)
 
             with self._lock:
@@ -4308,19 +4287,9 @@ class CaptureCoordinator:
                         self._cache_command(scope, command, result)
                     self._pending_stop_state_commit = scope
             if reason == "safe_swap":
-                # Retain the owner and leases while the intent, verification,
-                # release proof and command receipt commit outside the status lock.
+                # Retain the owner and leases while the handoff intent, release
+                # proof and command receipt commit outside the status lock.
                 self._persist_local_state()
-                if (
-                    not verification_current
-                    or verified_snapshot is None
-                    or verification_error is not None
-                ):
-                    raise ProviderError(
-                        "safe_swap_unverified",
-                        "录制内容尚未通过完整校验，不能发布安全移除回执",
-                        status=HTTPStatus.CONFLICT,
-                    )
                 result = self._publish_safe_swap_command()
                 if remember_result:
                     with self._lock:
@@ -4673,7 +4642,7 @@ class CaptureCoordinator:
                 )
         # All callers retain the stop owner, which fences new recordings and
         # mutation. Pending handoff intent also fences new representation handles.
-        self._verify_pending_safe_swap(pending)
+        self._check_pending_safe_swap(pending)
         with self._lock:
             if self._pending_safe_swap is not pending:
                 raise ProviderError("capture_state_changed", "待交接录制已变化", status=409)
@@ -4709,37 +4678,22 @@ class CaptureCoordinator:
             self._safe_swap_to_persist = None
             self._next_revision()
 
-    def _verify_pending_safe_swap(self, pending: Mapping[str, object]) -> None:
-        # A durable pending intent is not durable proof of the current files.
-        # In particular, a process restart discards verified file identities.
-        # Require the original manifest AND every payload to be verified before
-        # turning that intent into a durable device-released receipt.
+    def _check_pending_safe_swap(self, pending: Mapping[str, object]) -> None:
+        # Safe removal means writes are durable and handles released. It does
+        # not require rereading the recording. Bind the handoff to its manifest.
         session_id = str(pending["session_id"])
-        expected_digest = pending["manifest_sha256"]
-        with self._catalog_lock:
-            snapshot = self._session_snapshots.get(session_id)
-            if snapshot is not None and self._verified.get(session_id) != snapshot.manifest_sha256:
-                # A previous failed verdict must be retryable after repair (or
-                # after a transient validator failure), even with unchanged stat data.
-                self._invalidate_session_verification(session_id)
-        self._verify_catalog_session(session_id, allow_pending_safe_swap=True)
-        with self._catalog_lock:
-            snapshot = self._session_snapshots.get(session_id)
-            if (
-                snapshot is None
-                or snapshot.manifest_sha256 != expected_digest
-                or snapshot.manifest_id != pending["manifest_id"]
-                or snapshot.volume_id != pending["volume_id"]
-                or snapshot.sealed_at != pending["sealed_at"]
-                or self._verified.get(session_id) != expected_digest
-                or not self._session_payload_is_current(session_id, snapshot)
-            ):
-                raise ProviderError(
-                    "safe_swap_unverified",
-                    "待交接录制内容尚未通过当前完整校验，不能发布安全移除回执",
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                )
+        with (
+            closing(self._open_store()) as store,
+            store.open_manifest(session_id, "v4") as representation,
+        ):
+            payload = representation.read()
+        manifest = json.loads(payload)
+        if hashlib.sha256(payload).hexdigest() != pending["manifest_sha256"] or any(
+            manifest[key] != pending[key] for key in ("manifest_id", "volume_id", "sealed_at")
+        ):
+            raise ProviderError(
+                "safe_swap_unverified", "待交接录像已变化，请重试", status=409, retryable=True
+            )
 
     def current_safe_swap_receipt(self) -> object | None:
         with self._lock:
@@ -4828,19 +4782,8 @@ class CaptureCoordinator:
         *,
         cancelled: Callable[[], bool] | None = None,
     ) -> object:
-        # The complete payload scan holds no catalog/control lock. Preserve the
-        # existing whole-session integrity contract for both GET and HEAD.
-        self._catalog_sessions(verify_session=session_id, cancelled=cancelled)
-        with self._catalog_lock:
-            snapshot = self._session_snapshots.get(session_id)
-            if snapshot is None or self._verified.get(session_id) != snapshot.manifest_sha256:
-                raise ArtifactAccessError(
-                    "not_verified",
-                    "会话验证快照不存在或已失效",
-                    reason="absent",
-                )
-            expected_identities = dict(snapshot.artifact_identities)
-
+        # Playback and download read only the requested file/range. A saved
+        # recording needs no full-content scan, including the first read after boot.
         with ExitStack() as cleanup:
             if cancelled is not None and cancelled():
                 raise ProviderError(
@@ -4848,49 +4791,23 @@ class CaptureCoordinator:
                 )
             release = self._acquire_representation()
             cleanup.callback(release)
-            try:
-                with closing(self._open_store()) as store:
-                    representation = store.open_verified_artifact(
-                        session_id, artifact_id, api_version
-                    )
-                    cleanup.callback(representation.close)
-                    expected_identity = expected_identities.get(artifact_id)
-                    if (
-                        expected_identity is None
-                        or _locked_file_identity(representation) != expected_identity
-                    ):
-                        raise ArtifactAccessError(
-                            "not_verified",
-                            "artifact 与独立验证快照不匹配",
-                            reason="stale",
+            with closing(self._open_store()) as store:
+                representation = store.open_artifact(session_id, artifact_id, api_version)
+                cleanup.callback(representation.close)
+                transfer = self._state_db.begin_transfer(self.volume_id, session_id, artifact_id)
+
+                def record_transfer(status: str, bytes_read: int) -> None:
+                    try:
+                        self._state_db.finish_transfer(transfer, status, bytes_read)
+                    except (OSError, sqlite3.Error, PersistenceError):
+                        operational_logger("recording").event(
+                            "transfer_receipt_failed", level="error", transaction_id=session_id
                         )
-                    transfer = self._state_db.begin_transfer(
-                        self.volume_id, session_id, artifact_id
-                    )
 
-                    def record_transfer(status: str, bytes_read: int) -> None:
-                        try:
-                            self._state_db.finish_transfer(transfer, status, bytes_read)
-                        except (OSError, sqlite3.Error, PersistenceError):
-                            operational_logger("recording").event(
-                                "transfer_receipt_failed", level="error", transaction_id=session_id
-                            )
-
-                    # An admitted receipt whose response cannot be handed off
-                    # must not remain open just because later setup failed.
-                    cleanup.callback(record_transfer, "failed", 0)
-
-                tracked = _TrackedRepresentation(representation, release, record_transfer)
-                # Only the returned representation now owns the file, receipt
-                # and reservation. Every earlier failure/cancellation unwinds.
-                cleanup.pop_all()
-                return tracked
-            except ArtifactAccessError as error:
-                if error.code == "not_verified":
-                    with self._catalog_lock:
-                        if self._session_snapshots.get(session_id) == snapshot:
-                            self._invalidate_session_verification(session_id)
-                raise
+                cleanup.callback(record_transfer, "failed", 0)
+            tracked = _TrackedRepresentation(representation, release, record_transfer)
+            cleanup.pop_all()
+            return tracked
 
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
         admission = self._require_admission()
