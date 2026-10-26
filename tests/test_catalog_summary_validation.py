@@ -78,8 +78,12 @@ class CatalogSummaryValidationTest(unittest.TestCase):
             db.execute("UPDATE sessions SET validator='new-commit'")
         self.assertIsNone(self.cached())
         self.store.cached(
-            "volume", "session", self.signature, "new-commit",
-            validate_summary=second, cache_validation=True,
+            "volume",
+            "session",
+            self.signature,
+            "new-commit",
+            validate_summary=second,
+            cache_validation=True,
         )
         self.assertEqual(second.call_count, 2)
 
@@ -105,14 +109,22 @@ class CatalogSummaryValidationTest(unittest.TestCase):
                         (sid, json.dumps({**self.summary, "session_id": sid})),
                     )
                 self.store.cached(
-                    "volume", sid, self.signature, "commit",
-                    validate_summary=self.validate, cache_validation=True,
+                    "volume",
+                    sid,
+                    self.signature,
+                    "commit",
+                    validate_summary=self.validate,
+                    cache_validation=True,
                 )
             self.assertEqual(len(self.store._validated_summaries), 3)
             self.assertNotIn(("volume", "session-0"), self.store._validated_summaries)
             self.store.cached(
-                "volume", "session-0", self.signature, "commit",
-                validate_summary=self.validate, cache_validation=True,
+                "volume",
+                "session-0",
+                self.signature,
+                "commit",
+                validate_summary=self.validate,
+                cache_validation=True,
             )
             self.assertEqual(self.validate.call_count, 5)
             self.assertNotIn(("volume", "session-1"), self.store._validated_summaries)
@@ -145,8 +157,12 @@ class CatalogSummaryValidationTest(unittest.TestCase):
 
             def read(volume):
                 return self.store.cached(
-                    volume, "session", self.signature, "commit",
-                    validate_summary=self.validate, cache_validation=True,
+                    volume,
+                    "session",
+                    self.signature,
+                    "commit",
+                    validate_summary=self.validate,
+                    cache_validation=True,
                 )
 
             read("one")
@@ -154,9 +170,13 @@ class CatalogSummaryValidationTest(unittest.TestCase):
             read("one")
             read("three")
             self.assertEqual(self.validate.call_count, 3)
-            self.assertEqual(set(self.store._validated_summaries), {
-                ("one", "session"), ("three", "session"),
-            })
+            self.assertEqual(
+                set(self.store._validated_summaries),
+                {
+                    ("one", "session"),
+                    ("three", "session"),
+                },
+            )
             self.assertEqual(self.store._validated_summary_bytes, 2 * size)
 
     def test_unexpected_validator_failure_is_not_cached_or_suppressed(self):
@@ -181,10 +201,16 @@ class CatalogSummaryValidationTest(unittest.TestCase):
 
     def read_rows(self, volume, keys):
         for key in keys:
-            self.assertIsNotNone(self.store.cached(
-                volume, key, self.signature, "commit",
-                validate_summary=self.validate, cache_validation=True,
-            ))
+            self.assertIsNotNone(
+                self.store.cached(
+                    volume,
+                    key,
+                    self.signature,
+                    "commit",
+                    validate_summary=self.validate,
+                    cache_validation=True,
+                )
+            )
 
     def test_full_scan_larger_than_entry_capacity_keeps_a_reusable_subset(self):
         keys = [f"row-{i}" for i in range(20)]
@@ -292,11 +318,14 @@ class CatalogSummaryValidationTest(unittest.TestCase):
         self.addCleanup(reopened.close)
         with (
             patch.object(
-                coordinator_module, "validate_session_summary",
+                coordinator_module,
+                "validate_session_summary",
                 wraps=coordinator_module.validate_session_summary,
             ) as validate,
             patch.object(
-                reopened._catalog_db, "signature", wraps=reopened._catalog_db.signature,
+                reopened._catalog_db,
+                "signature",
+                wraps=reopened._catalog_db.signature,
             ) as signature,
         ):
             first = reopened.list_sessions(cursor=None, limit=50, take_id=None, api_version="v4")

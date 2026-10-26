@@ -2544,9 +2544,7 @@ class ReleaseManager:
         self.transaction.unlink(missing_ok=True)
         _fsync_directory(self.state_root)
 
-    def _activate(
-        self, old_current: str | None, new_current: str
-    ) -> Mapping[str, str] | None:
+    def _activate(self, old_current: str | None, new_current: str) -> Mapping[str, str] | None:
         release_changed = old_current != new_current
         try:
             self._start_release_services(check_health=True)

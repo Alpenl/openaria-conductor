@@ -50,9 +50,7 @@ class ActivationSuccessCleanupTest(unittest.TestCase):
         self.assertEqual(warning["code"], "activation_diagnostic_cleanup_failed")
         self.assertIn("固件已激活", warning["message"])
         self.assertNotIn("private failure detail", warning["message"])
-        self.assertNotIn(
-            ("systemctl", "disable", "--now", "rp-ylx.service"), self.fixture.commands
-        )
+        self.assertNotIn(("systemctl", "disable", "--now", "rp-ylx.service"), self.fixture.commands)
 
     def test_first_install_with_real_diagnostic_directory_succeeds(self):
         self.path.mkdir()
@@ -160,9 +158,7 @@ class ActivationSuccessCleanupTest(unittest.TestCase):
         self.assertIs(caught.exception, cancelled)
         self.assertEqual(self.manager.status()["current"], "a" * 40)
         self.assertIsNone(self.manager._recovery_descriptor)
-        self.assertNotIn(
-            ("systemctl", "disable", "--now", "rp-ylx.service"), self.fixture.commands
-        )
+        self.assertNotIn(("systemctl", "disable", "--now", "rp-ylx.service"), self.fixture.commands)
 
     def test_cleanup_still_holds_deployment_write_lock(self):
         self.old_diagnostic()

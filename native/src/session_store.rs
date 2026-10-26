@@ -681,7 +681,10 @@ printf '{"event":"done","frames":0}\n'
         transaction
             .capture_stopped_monotonic_ns
             .store(10, std::sync::atomic::Ordering::Release);
-        assert_eq!(transaction.ensure_recording().unwrap_err().code, "invalid_state");
+        assert_eq!(
+            transaction.ensure_recording().unwrap_err().code,
+            "invalid_state"
+        );
         assert_eq!(transaction.snapshot().unwrap().state, "recording");
         transaction.abort();
         assert_eq!(transaction.open_handle_count(), 0);

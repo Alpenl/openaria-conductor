@@ -405,9 +405,7 @@ def manifest_display_metadata(value: object) -> dict:
     if not isinstance(notes, str) or len(notes) > 16000:
         raise ValueError("发布说明无效")
     if published is not None and (
-        not isinstance(published, str)
-        or not published
-        or len(published.encode("utf-8")) > 128
+        not isinstance(published, str) or not published or len(published.encode("utf-8")) > 128
     ):
         raise ValueError("发布时间无效")
     metadata = {

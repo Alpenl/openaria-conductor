@@ -87,26 +87,31 @@ class SettingsExportTest(unittest.TestCase):
 
     def test_stream_allocation_failure_closes_fd_and_allows_retry(self):
         self.fails_cleanly(
-            patch.object(settings.os, "fdopen", side_effect=MemoryError()), MemoryError,
+            patch.object(settings.os, "fdopen", side_effect=MemoryError()),
+            MemoryError,
         )
 
     def test_partial_json_write_failure_leaves_no_final_file(self):
         def partial(value, stream, **kwargs):
             stream.write('{"camera":')
             raise OSError("partial JSON write")
+
         self.fails_cleanly(patch.object(settings.json, "dump", side_effect=partial), OSError)
 
     def test_cancelled_json_write_cleans_staging_and_allows_retry(self):
         def cancelled(value, stream, **kwargs):
             stream.write('{"camera":')
             raise KeyboardInterrupt()
+
         self.fails_cleanly(
-            patch.object(settings.json, "dump", side_effect=cancelled), KeyboardInterrupt,
+            patch.object(settings.json, "dump", side_effect=cancelled),
+            KeyboardInterrupt,
         )
 
     def test_file_sync_failure_closes_fds_and_allows_retry(self):
-        self.fails_cleanly(patch.object(settings.os, "fsync", side_effect=OSError("file sync")),
-                           OSError)
+        self.fails_cleanly(
+            patch.object(settings.os, "fsync", side_effect=OSError("file sync")), OSError
+        )
 
     def test_stream_entry_failure_does_not_leak_fd(self):
         class FailedEntry:
@@ -115,8 +120,10 @@ class SettingsExportTest(unittest.TestCase):
 
             def __exit__(self, *args):
                 return False
-        self.fails_cleanly(patch.object(settings.os, "fdopen", return_value=FailedEntry()),
-                           MemoryError)
+
+        self.fails_cleanly(
+            patch.object(settings.os, "fdopen", return_value=FailedEntry()), MemoryError
+        )
 
     def test_stream_close_failure_does_not_publish_or_leak_fd(self):
         original = os.fdopen
@@ -131,11 +138,13 @@ class SettingsExportTest(unittest.TestCase):
             def __exit__(self, *args):
                 self.stream.close()
                 raise OSError("stream close")
+
         self.fails_cleanly(patch.object(settings.os, "fdopen", side_effect=FailedClose), OSError)
 
     def test_link_failure_cleans_staging_and_allows_retry(self):
-        self.fails_cleanly(patch.object(settings.os, "link", side_effect=OSError("link failed")),
-                           OSError)
+        self.fails_cleanly(
+            patch.object(settings.os, "link", side_effect=OSError("link failed")), OSError
+        )
 
     def test_non_ascii_values_are_utf8_and_resolved(self):
         self.fixture.set_patch({"audio": {"device": "测试声卡"}})
@@ -155,7 +164,7 @@ class SettingsExportTest(unittest.TestCase):
                     self.destination.write_bytes(b"existing")
                 elif kind in ("symlink", "dangling"):
                     self.destination.symlink_to(
-                        original if kind == "symlink" else self.root/"absent",
+                        original if kind == "symlink" else self.root / "absent",
                     )
                 elif kind == "fifo":
                     os.mkfifo(self.destination)
@@ -288,7 +297,7 @@ class SettingsExportTest(unittest.TestCase):
 
         def replace_then_link(*args, **kwargs):
             staging = self.staging()[0]
-            staging.rename(self.root/"moved-original")
+            staging.rename(self.root / "moved-original")
             staging.write_bytes(b"foreign staging")
             return original(*args, **kwargs)
 
@@ -298,14 +307,14 @@ class SettingsExportTest(unittest.TestCase):
         self.assertEqual(self.staging()[0].read_bytes(), b"foreign staging")
 
     def test_parent_replacement_before_publication_is_rejected(self):
-        parent = self.root/"out"
+        parent = self.root / "out"
         parent.mkdir()
-        self.destination = parent/"export.json"
+        self.destination = parent / "export.json"
         original = json.dump
 
         def replace(*args, **kwargs):
             original(*args, **kwargs)
-            parent.rename(self.root/"moved")
+            parent.rename(self.root / "moved")
             parent.mkdir()
 
         with (
@@ -314,7 +323,7 @@ class SettingsExportTest(unittest.TestCase):
         ):
             self.export()
         self.assertEqual(list(parent.iterdir()), [])
-        self.assertEqual(list((self.root/"moved").iterdir()), [])
+        self.assertEqual(list((self.root / "moved").iterdir()), [])
 
     def test_target_replacement_after_link_is_not_removed_or_reported_success(self):
         original = os.link
@@ -333,14 +342,14 @@ class SettingsExportTest(unittest.TestCase):
         self.assertEqual(self.staging(), [])
 
     def test_parent_replacement_after_publication_preserves_completed_copy(self):
-        parent = self.root/"out"
+        parent = self.root / "out"
         parent.mkdir()
-        self.destination = parent/"export.json"
+        self.destination = parent / "export.json"
         original = os.link
 
         def replaced(*args, **kwargs):
             original(*args, **kwargs)
-            parent.rename(self.root/"moved")
+            parent.rename(self.root / "moved")
             parent.mkdir()
 
         with (
@@ -349,12 +358,13 @@ class SettingsExportTest(unittest.TestCase):
         ):
             self.export()
         self.assertEqual(list(parent.iterdir()), [])
-        self.assertEqual(json.loads((self.root/"moved/export.json").read_bytes()),
-                         self.fixture.initial)
-        self.assertEqual(list((self.root/"moved").glob(".openaria-settings-*.tmp")), [])
+        self.assertEqual(
+            json.loads((self.root / "moved/export.json").read_bytes()), self.fixture.initial
+        )
+        self.assertEqual(list((self.root / "moved").glob(".openaria-settings-*.tmp")), [])
 
     def test_staging_name_collision_preserves_other_file(self):
-        staging = self.root/".openaria-settings-collision.tmp"
+        staging = self.root / ".openaria-settings-collision.tmp"
         staging.write_bytes(b"not ours")
         with (
             patch.object(settings.uuid, "uuid4", return_value=SimpleNamespace(hex="collision")),
@@ -386,7 +396,7 @@ class SettingsExportCrashTest(unittest.TestCase):
         fixture = fixtures.SettingsPresetTests()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        destination = fixture.root/"export.json"
+        destination = fixture.root / "export.json"
         context = multiprocessing.get_context("fork")
         receive, send = context.Pipe(duplex=False)
         self.addCleanup(receive.close)

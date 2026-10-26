@@ -24,8 +24,11 @@ class StopAcceptanceTest(unittest.TestCase):
 
     def wait_finished(self):
         with self.coordinator._stop_condition:
-            self.assertTrue(self.coordinator._stop_condition.wait_for(
-                lambda: self.coordinator._async_stop_worker is None, timeout=5))
+            self.assertTrue(
+                self.coordinator._stop_condition.wait_for(
+                    lambda: self.coordinator._async_stop_worker is None, timeout=5
+                )
+            )
 
     def slow_accept(self, failure=None):
         c = self.coordinator
@@ -55,8 +58,9 @@ class StopAcceptanceTest(unittest.TestCase):
                 self.assert_busy_start()
                 self.assert_lease_held()
                 finish.assert_not_called()
-                self.assertFalse(any(x["operation"] == "stop"
-                                     for x in c._state_db.capture_state()["commands"]))
+                self.assertFalse(
+                    any(x["operation"] == "stop" for x in c._state_db.capture_state()["commands"])
+                )
                 for command in (self.command, fixtures.stop_command("other")):
                     with self.assertRaises(ProviderError) as raised:
                         c.request_stop_capture(command)
@@ -108,27 +112,36 @@ class StopAcceptanceTest(unittest.TestCase):
             self.launch("request", lambda: c.request_stop_capture(self.command))
             try:
                 self.assertTrue(entered.wait(3))
-                reported = self.launch("source-failure", lambda: c._retain_active_failure(
-                    DeviceRecordingError("camera_read_failed", "source failed during acceptance"),
-                    plan, defer_recovery=True,
-                ))
-                self.assertTrue(reported.wait(.25))
+                reported = self.launch(
+                    "source-failure",
+                    lambda: c._retain_active_failure(
+                        DeviceRecordingError(
+                            "camera_read_failed", "source failed during acceptance"
+                        ),
+                        plan,
+                        defer_recovery=True,
+                    ),
+                )
+                self.assertTrue(reported.wait(0.25))
                 self.assert_responsive()
             finally:
                 self.cleanup_workers()
             with c._stop_condition:
-                self.assertTrue(c._stop_condition.wait_for(
-                    lambda: c._async_stop_worker is None and c._failure_inflight is None,
-                    timeout=5,
-                ))
+                self.assertTrue(
+                    c._stop_condition.wait_for(
+                        lambda: c._async_stop_worker is None and c._failure_inflight is None,
+                        timeout=5,
+                    )
+                )
         if commit_fails:
             self.assertIsInstance(self.errors.pop("request"), OSError)
         self.assertFalse(self.errors, self.errors)
         self.assertIsNone(c._active, "deferred source failure was stranded by acceptance rollback")
         retained = c.capture_status()["snapshot"]["retained_unsuccessful"]
         self.assertIsNotNone(retained)
-        self.assertIn("camera_read_failed", [x["code"] for x in
-                                            retained["recording_state"]["diagnostics"]])
+        self.assertIn(
+            "camera_read_failed", [x["code"] for x in retained["recording_state"]["diagnostics"]]
+        )
 
     def test_source_failure_during_successful_acceptance_is_retained(self):
         self.source_failure_during_acceptance(False)
@@ -176,7 +189,8 @@ class StopAcceptanceTest(unittest.TestCase):
                 if failure:
                     self.assertIsInstance(self.errors.pop("duplicate"), OSError)
                     self.assertNotIn(
-                        (other.principal_id, "stop", other.idempotency_key), c._commands,
+                        (other.principal_id, "stop", other.idempotency_key),
+                        c._commands,
                     )
                     self.assertEqual(c.request_stop_capture(other).status, 202)
                 else:
@@ -270,7 +284,7 @@ class StopAcceptanceTest(unittest.TestCase):
                 self.assert_responsive()
                 self.assert_busy_start()
                 closed = self.launch("close", c.close)
-                self.assertFalse(closed.wait(.05))
+                self.assertFalse(closed.wait(0.05))
                 self.assert_responsive()
             finally:
                 self.cleanup_workers()
@@ -300,8 +314,13 @@ class StopAcceptanceCrashTest(unittest.TestCase):
                     if any(x["operation"] == "stop" for x in commands):
                         if after:
                             original(value, commands, *args, **kwargs)
-                        send.send({"accepted": next(x["body"] for x in commands
-                                                   if x["operation"] == "stop")})
+                        send.send(
+                            {
+                                "accepted": next(
+                                    x["body"] for x in commands if x["operation"] == "stop"
+                                )
+                            }
+                        )
                         threading.Event().wait()
                     return original(value, commands, *args, **kwargs)
 

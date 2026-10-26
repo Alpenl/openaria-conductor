@@ -80,17 +80,31 @@ class StopCatalogIsolationTest(unittest.TestCase):
             try:
                 if stage == "list":
                     coordinator._catalog_lock = ObservedLock()
-                    cleanup.enter_context(patch.object(
-                        coordinator._catalog_db, "signature", side_effect=delayed_signature,
-                    ))
-                    launch("list", lambda: coordinator.list_sessions(
-                        cursor=None, limit=50, take_id=None, api_version="v4",
-                    ))
+                    cleanup.enter_context(
+                        patch.object(
+                            coordinator._catalog_db,
+                            "signature",
+                            side_effect=delayed_signature,
+                        )
+                    )
+                    launch(
+                        "list",
+                        lambda: coordinator.list_sessions(
+                            cursor=None,
+                            limit=50,
+                            take_id=None,
+                            api_version="v4",
+                        ),
+                    )
                     self.assertTrue(entered.wait(3))
                 else:
-                    cleanup.enter_context(patch.object(
-                        coordinator._catalog_db, "remember", side_effect=observed_remember,
-                    ))
+                    cleanup.enter_context(
+                        patch.object(
+                            coordinator._catalog_db,
+                            "remember",
+                            side_effect=observed_remember,
+                        )
+                    )
                     if stage == "sqlite":
                         database = sqlite3.connect(fixture.state_root / "catalog.sqlite3")
                         database.execute("BEGIN IMMEDIATE")
@@ -98,7 +112,7 @@ class StopCatalogIsolationTest(unittest.TestCase):
                 stop_done = launch("stop", lambda: coordinator.stop_capture(command))
                 self.assertTrue((waiting if stage == "list" else entered).wait(3))
                 status_done = launch("status", coordinator.capture_status)
-                self.assertTrue(status_done.wait(.25), "catalog wait held the state lock")
+                self.assertTrue(status_done.wait(0.25), "catalog wait held the state lock")
                 self.assertNotIn("status", errors)
                 fixtures.validate_capture_status(outcomes["status"])
                 self.assertEqual(outcomes["status"]["snapshot"]["device_state"], "verifying")
@@ -111,20 +125,29 @@ class StopCatalogIsolationTest(unittest.TestCase):
                         fcntl.flock(peer, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 finally:
                     os.close(peer)
-                start_done = launch("start", lambda: coordinator.start_capture(
-                    fixtures.start_command("forbidden-new-take"),
-                ))
-                self.assertTrue(start_done.wait(.25))
+                start_done = launch(
+                    "start",
+                    lambda: coordinator.start_capture(
+                        fixtures.start_command("forbidden-new-take"),
+                    ),
+                )
+                self.assertTrue(start_done.wait(0.25))
                 self.assertIsInstance(errors.get("start"), ProviderError)
                 self.assertEqual(errors.pop("start").code, "capture_busy")
                 if late_failure:
-                    failed = launch("source-failure", lambda: coordinator._source_failure(
-                        plan.generation_id, "source_late_error", "late failure", expected_plan=plan,
-                    ))
-                    self.assertTrue(failed.wait(.25))
+                    failed = launch(
+                        "source-failure",
+                        lambda: coordinator._source_failure(
+                            plan.generation_id,
+                            "source_late_error",
+                            "late failure",
+                            expected_plan=plan,
+                        ),
+                    )
+                    self.assertTrue(failed.wait(0.25))
                 else:
                     duplicate = launch("duplicate", lambda: coordinator.stop_capture(command))
-                    self.assertFalse(duplicate.wait(.05))
+                    self.assertFalse(duplicate.wait(0.05))
             finally:
                 release.set()
                 if database is not None:
@@ -147,7 +170,10 @@ class StopCatalogIsolationTest(unittest.TestCase):
                 self.assertIsNotNone(coordinator.current_safe_swap_receipt())
             else:
                 page = coordinator.list_sessions(
-                    cursor=None, limit=50, take_id=None, api_version="v4",
+                    cursor=None,
+                    limit=50,
+                    take_id=None,
+                    api_version="v4",
                 )
                 self.assertIn(plan.session_id, [item["session_id"] for item in page["items"]])
         self.assertFalse(errors, errors)

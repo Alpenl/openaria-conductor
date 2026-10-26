@@ -194,8 +194,10 @@ def _export_json(destination: Path, value: object) -> None:
             raise FileExistsError(errno.EEXIST, "export destination already exists", destination)
         temporary = ".openaria-settings-" + uuid.uuid4().hex + ".tmp"
         fd = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600, dir_fd=parent_fd,
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_fd,
         )
         info = os.fstat(fd)
         identity = (info.st_dev, info.st_ino)
@@ -217,8 +219,10 @@ def _export_json(destination: Path, value: object) -> None:
         # linkat follows our own fd, not a replaceable staging pathname, and
         # fails atomically if another exporter creates the destination first.
         os.link(
-            f"/proc/self/fd/{fd}", destination.name,
-            dst_dir_fd=parent_fd, follow_symlinks=True,
+            f"/proc/self/fd/{fd}",
+            destination.name,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=True,
         )
         cleanup()
         temporary = None

@@ -69,7 +69,9 @@ sys.exit(1)
 """
         child = subprocess.run(
             [sys.executable, "-c", code, str(self.path), "race" if race else "static"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         self.assertEqual(child.returncode, 0, child.stderr)
 
@@ -163,10 +165,12 @@ sys.exit(1)
             return original(descriptor, payload[:7])
 
         with patch("os.write", short), ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(
-                lambda i: self.sink(AuditEvent(str(i), None, "getDevice", None, "allowed")),
-                range(64),
-            ))
+            list(
+                pool.map(
+                    lambda i: self.sink(AuditEvent(str(i), None, "getDevice", None, "allowed")),
+                    range(64),
+                )
+            )
         rows = [json.loads(line) for line in self.path.read_text().splitlines()]
         self.assertEqual({row["request_id"] for row in rows}, {str(i) for i in range(64)})
         self.assertEqual(len(rows), 64)
@@ -183,9 +187,12 @@ sys.exit(1)
         os.mkfifo(self.path)
         provider = DeviceProvider()
         server = create_gateway_server(
-            "127.0.0.1", 0, provider,
+            "127.0.0.1",
+            0,
+            provider,
             security=SecurityPolicy.lab(allowed_operations={"getDevice"}),
-            audit_sink=self.sink, max_http_connections=2,
+            audit_sink=self.sink,
+            max_http_connections=2,
         )
         errors = []
         server.handle_error = lambda *_: errors.append(type(sys.exception()).__name__)
@@ -207,9 +214,12 @@ sys.exit(1)
                     finally:
                         client.close()
                     with server._http_condition:
-                        self.assertTrue(server._http_condition.wait_for(
-                            lambda: not server._http_connections, timeout=1,
-                        ))
+                        self.assertTrue(
+                            server._http_condition.wait_for(
+                                lambda: not server._http_connections,
+                                timeout=1,
+                            )
+                        )
                 get.assert_not_called()
                 self.path.unlink()
                 client = http.client.HTTPConnection(*server.server_address, timeout=2)

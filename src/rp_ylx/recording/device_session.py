@@ -2178,9 +2178,7 @@ class DeviceSessionRecorder:
             self._state = "finalizing"
             assert self._started_monotonic_ns is not None
             stop_observed_ns = time.monotonic_ns()
-            self._stopped_elapsed = max(
-                0.0, (stop_observed_ns - self._started_monotonic_ns) / 1e9
-            )
+            self._stopped_elapsed = max(0.0, (stop_observed_ns - self._started_monotonic_ns) / 1e9)
         published = False
         prepared = None
         live_audit = None

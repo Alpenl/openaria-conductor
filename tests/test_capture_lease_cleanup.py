@@ -53,7 +53,9 @@ class CaptureLeaseCleanupTest(unittest.TestCase):
 
     def test_maintenance_exit_errors_release_network_and_allow_reacquisition(self):
         for error in (
-            OSError(errno.EIO, "close report"), RuntimeError("cleanup"), KeyboardInterrupt()
+            OSError(errno.EIO, "close report"),
+            RuntimeError("cleanup"),
+            KeyboardInterrupt(),
         ):
             with self.subTest(error=type(error).__name__):
                 self.coordinator._acquire_network_operation_lease()

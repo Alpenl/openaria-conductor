@@ -15,10 +15,16 @@ class GatewayJsonUnicodeTest(unittest.TestCase):
     def setUp(self):
         self.provider = DeviceProvider()
         self.server = create_gateway_server(
-            "127.0.0.1", 0, self.provider,
-            security=SecurityPolicy.lab(allowed_operations={
-                "getDevice", "startCapture", "createNetworkCredentialReference",
-            }),
+            "127.0.0.1",
+            0,
+            self.provider,
+            security=SecurityPolicy.lab(
+                allowed_operations={
+                    "getDevice",
+                    "startCapture",
+                    "createNetworkCredentialReference",
+                }
+            ),
         )
         self.errors = []
         self.server.handle_error = lambda *_: self.errors.append(type(sys.exc_info()[1]).__name__)
@@ -34,15 +40,25 @@ class GatewayJsonUnicodeTest(unittest.TestCase):
         self.assertFalse(self.thread.is_alive())
 
     def post(self, path, payload, key="unicode-test"):
-        self.client.request("POST", path, body=payload, headers={
-            "Content-Type": "application/json", "Idempotency-Key": key,
-        })
+        self.client.request(
+            "POST",
+            path,
+            body=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": key,
+            },
+        )
         response = self.client.getresponse()
         return response.status, json.loads(response.read())
 
     def start_body(self, name):
-        return {"schema": "ylx.capture-start.v2", "mode": "production",
-                "take": {"kind": "new"}, "display_name": name}
+        return {
+            "schema": "ylx.capture-start.v2",
+            "mode": "production",
+            "take": {"kind": "new"},
+            "display_name": name,
+        }
 
     def healthy(self):
         self.client.request("GET", "/api/v4/device")
@@ -67,9 +83,13 @@ class GatewayJsonUnicodeTest(unittest.TestCase):
     def test_unpaired_surrogates_in_credentials_return_400(self):
         for passphrase in ("password\ud800", "password\udfff"):
             with self.subTest(passphrase=ascii(passphrase)):
-                self.assert_rejected("/api/v4/network/credentials", {
-                    "schema": "ylx.network-credential-request.v1", "passphrase": passphrase,
-                })
+                self.assert_rejected(
+                    "/api/v4/network/credentials",
+                    {
+                        "schema": "ylx.network-credential-request.v1",
+                        "passphrase": passphrase,
+                    },
+                )
 
     def test_surrogates_in_nested_values_and_keys_rejected(self):
         for value in ({"\ud800": "value"}, [{"name": "\udfff"}]):
@@ -89,9 +109,15 @@ class GatewayJsonUnicodeTest(unittest.TestCase):
 
     def test_valid_unicode_credentials_preserved(self):
         phrase = "测试密码🎥"
-        status, _ = self.post("/api/v4/network/credentials", json.dumps({
-            "schema": "ylx.network-credential-request.v1", "passphrase": phrase,
-        }).encode())
+        status, _ = self.post(
+            "/api/v4/network/credentials",
+            json.dumps(
+                {
+                    "schema": "ylx.network-credential-request.v1",
+                    "passphrase": phrase,
+                }
+            ).encode(),
+        )
         self.assertEqual(status, 201)
         self.assertEqual(self.provider.network_credentials[0].passphrase, phrase)
         self.assertEqual(self.errors, [])

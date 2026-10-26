@@ -52,15 +52,18 @@ class StopStateCommitTest(unittest.TestCase):
         return done
 
     def assert_responsive(self):
-        self.assertTrue(self.launch("status", self.coordinator.capture_status).wait(.25))
+        self.assertTrue(self.launch("status", self.coordinator.capture_status).wait(0.25))
         self.assertNotIn("status", self.errors)
         fixtures.validate_capture_status(self.results["status"])
 
     def assert_busy_start(self):
-        done = self.launch("new-start", lambda: self.coordinator.start_capture(
-            fixtures.start_command("new-start"),
-        ))
-        self.assertTrue(done.wait(.25))
+        done = self.launch(
+            "new-start",
+            lambda: self.coordinator.start_capture(
+                fixtures.start_command("new-start"),
+            ),
+        )
+        self.assertTrue(done.wait(0.25))
         error = self.errors.pop("new-start")
         self.assertIsInstance(error, ProviderError)
         self.assertEqual(error.code, "capture_busy")
@@ -76,8 +79,11 @@ class StopStateCommitTest(unittest.TestCase):
     def assert_committed(self):
         state = self.coordinator._state_db.capture_state()
         self.assertIsNone(state["active_session"])
-        receipts = [c for c in state["commands"] if c["operation"] == "stop"
-                    and c["idempotency_key"] == self.command.idempotency_key]
+        receipts = [
+            c
+            for c in state["commands"]
+            if c["operation"] == "stop" and c["idempotency_key"] == self.command.idempotency_key
+        ]
         self.assertEqual(len(receipts), 1)
         self.assertEqual(receipts[0]["status"], 202)
         self.assertIsNone(self.coordinator._stop_inflight)
@@ -107,12 +113,15 @@ class StopStateCommitTest(unittest.TestCase):
                 self.assert_busy_start()
                 self.assert_lease_held()
                 duplicate = self.launch("duplicate", lambda: coordinator.stop_capture(self.command))
-                self.assertFalse(duplicate.wait(.05))
-                for name, command in (("same-api", self.command),
-                                      ("other-api", fixtures.stop_command("other-stop"))):
-                    done = self.launch(name, lambda command=command:
-                                       coordinator.request_stop_capture(command))
-                    self.assertTrue(done.wait(.25))
+                self.assertFalse(duplicate.wait(0.05))
+                for name, command in (
+                    ("same-api", self.command),
+                    ("other-api", fixtures.stop_command("other-stop")),
+                ):
+                    done = self.launch(
+                        name, lambda command=command: coordinator.request_stop_capture(command)
+                    )
+                    self.assertTrue(done.wait(0.25))
                     error = self.errors.pop(name)
                     self.assertIsInstance(error, ProviderError)
                     self.assertEqual(error.code, "capture_busy")
@@ -176,17 +185,22 @@ class StopStateCommitTest(unittest.TestCase):
         original = coordinator._state_db.put_capture_state
 
         def failed(value, *args, **kwargs):
-            if (threading.current_thread().name == "rp-ylx-stop-finalization"
-                    and coordinator._active is None):
+            if (
+                threading.current_thread().name == "rp-ylx-stop-finalization"
+                and coordinator._active is None
+            ):
                 raise OSError(errno.ENOSPC, "final state unavailable")
             return original(value, *args, **kwargs)
 
         with patch.object(coordinator._state_db, "put_capture_state", side_effect=failed):
             accepted = coordinator.request_stop_capture(self.command)
             with coordinator._stop_condition:
-                self.assertTrue(coordinator._stop_condition.wait_for(
-                    lambda: coordinator._async_stop_worker is None, timeout=5,
-                ))
+                self.assertTrue(
+                    coordinator._stop_condition.wait_for(
+                        lambda: coordinator._async_stop_worker is None,
+                        timeout=5,
+                    )
+                )
         self.assertIsNotNone(coordinator._state_db.capture_state()["active_session"])
         self.assert_busy_start()
         replay = coordinator.request_stop_capture(
@@ -198,9 +212,12 @@ class StopStateCommitTest(unittest.TestCase):
             self.assertTrue(replay.replayed)
             self.assertEqual(replay.body, accepted.body)
         with coordinator._stop_condition:
-            self.assertTrue(coordinator._stop_condition.wait_for(
-                lambda: coordinator._async_stop_worker is None, timeout=5,
-            ))
+            self.assertTrue(
+                coordinator._stop_condition.wait_for(
+                    lambda: coordinator._async_stop_worker is None,
+                    timeout=5,
+                )
+            )
         self.assert_committed()
 
     def test_background_final_commit_failure_can_be_retried(self):
@@ -226,14 +243,13 @@ class StopStateCommitTest(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(3))
                 closed = self.launch("close", coordinator.close)
-                self.assertFalse(closed.wait(.05))
+                self.assertFalse(closed.wait(0.05))
                 self.assert_responsive()
                 self.assert_lease_held()
             finally:
                 self.cleanup_workers()
         self.assertFalse(self.errors, self.errors)
         self.assert_committed()
-
 
     def test_other_completed_state_commit_clears_pending_marker(self):
         coordinator = self.coordinator
@@ -308,6 +324,7 @@ class StopStateCommitCrashTest(unittest.TestCase):
                 worker.kill()
                 worker.join(5)
         from rp_ylx.persistence import StateDatabase
+
         database = StateDatabase(fixture.state_root / "state.sqlite3")
         state = database.capture_state()
         receipts = [x for x in state["commands"] if x["operation"] == "stop"]

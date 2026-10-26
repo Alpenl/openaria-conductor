@@ -28,9 +28,13 @@ class SafeSwapCommitTest(unittest.TestCase):
 
         def write(value, commands, *args, **kwargs):
             if threading.current_thread().name == "stop":
-                phase = ("intent" if value["pending_safe_swap"] is not None else
-                         "receipt" if any(x["operation"] == "stop" for x in commands) else
-                         "publication")
+                phase = (
+                    "intent"
+                    if value["pending_safe_swap"] is not None
+                    else "receipt"
+                    if any(x["operation"] == "stop" for x in commands)
+                    else "publication"
+                )
                 if c._active is None and phase == stage:
                     entered.set()
                     if not self.release.wait(10):
@@ -45,7 +49,7 @@ class SafeSwapCommitTest(unittest.TestCase):
                 self.assert_busy_start()
                 self.assert_lease_held()
                 got = self.launch("receipt", c.current_safe_swap_receipt)
-                self.assertTrue(got.wait(.25))
+                self.assertTrue(got.wait(0.25))
                 if stage != "receipt":
                     self.assertIsNone(self.results["receipt"])
                     self.assertFalse(c._released)
@@ -53,14 +57,14 @@ class SafeSwapCommitTest(unittest.TestCase):
                 else:
                     self.assertEqual(self.results["receipt"]["receipt"]["session_id"], self.sid)
                 duplicate = self.launch("duplicate", lambda: c.stop_capture(self.command))
-                self.assertFalse(duplicate.wait(.05))
+                self.assertFalse(duplicate.wait(0.05))
                 self.assertFalse(stopped.is_set())
                 with self.assertRaises(ProviderError):
                     c._acquire_representation()
                 self.assert_lease_held()
                 if stage == "publication":
                     closed = self.launch("close", c.close)
-                    self.assertFalse(closed.wait(.05))
+                    self.assertFalse(closed.wait(0.05))
                     self.assert_responsive()
                     self.assert_lease_held()
             finally:
@@ -72,7 +76,8 @@ class SafeSwapCommitTest(unittest.TestCase):
         self.assertIsNone(c._network_operation_lease)
         self.assertTrue(c._released)
         self.assertEqual(
-            c.current_safe_swap_receipt(), c._state_db.capture_state()["safe_swap_resource"],
+            c.current_safe_swap_receipt(),
+            c._state_db.capture_state()["safe_swap_resource"],
         )
 
     def test_slow_intent_commit_keeps_status_responsive(self):
@@ -136,8 +141,9 @@ class SafeSwapCommitTest(unittest.TestCase):
         ):
             c.stop_capture(self.command)
         self.assertIsNotNone(c.current_safe_swap_receipt())
-        self.assertFalse(any(x["operation"] == "stop"
-                             for x in c._state_db.capture_state()["commands"]))
+        self.assertFalse(
+            any(x["operation"] == "stop" for x in c._state_db.capture_state()["commands"])
+        )
         entered = threading.Event()
 
         def slow(*args, **kwargs):
@@ -161,8 +167,9 @@ class SafeSwapCommitTest(unittest.TestCase):
         self.assertFalse(self.errors, self.errors)
         self.assertTrue(self.results["retry"].replayed)
         self.assertEqual(self.results["retry"].status, 204)
-        self.assertTrue(any(x["operation"] == "stop"
-                            for x in c._state_db.capture_state()["commands"]))
+        self.assertTrue(
+            any(x["operation"] == "stop" for x in c._state_db.capture_state()["commands"])
+        )
 
     def test_sync_completion_receipt_retry_does_not_block_status(self):
         self.retry_completion(False)
@@ -196,15 +203,16 @@ class SafeSwapCommitTest(unittest.TestCase):
                 self.assert_lease_held()
                 self.assertIsNone(c.current_safe_swap_receipt())
                 if asynchronous:
-                    self.assertTrue(stopped.wait(.25))
+                    self.assertTrue(stopped.wait(0.25))
                     self.assertEqual(self.results["stop"].status, 202)
                 else:
                     self.assertFalse(stopped.is_set())
             finally:
                 self.cleanup_workers()
                 with c._stop_condition:
-                    self.assertTrue(c._stop_condition.wait_for(
-                        lambda: c._async_stop_worker is None, timeout=5))
+                    self.assertTrue(
+                        c._stop_condition.wait_for(lambda: c._async_stop_worker is None, timeout=5)
+                    )
         self.assertFalse(self.errors, self.errors)
         self.assertIsNotNone(c.current_safe_swap_receipt())
 
@@ -273,8 +281,10 @@ class SafeSwapCommitCrashTest(unittest.TestCase):
                 self.assertIsNotNone(restarted._pending_safe_swap)
                 self.assertFalse(restarted._released)
                 self.assertEqual(restarted.stop_capture(command).status, 204)
-                self.assertEqual(restarted.current_safe_swap_receipt()["receipt"]["session_id"],
-                                 event["session_id"])
+                self.assertEqual(
+                    restarted.current_safe_swap_receipt()["receipt"]["session_id"],
+                    event["session_id"],
+                )
         finally:
             restarted.close()
 

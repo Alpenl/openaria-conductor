@@ -2470,9 +2470,7 @@ class GatewayHttpTest(unittest.TestCase):
         representation = OversizedManifest(MANIFEST_BYTES)
         representation.size = MAX_MANIFEST_BYTES + 1
         self.server.provider.manifest_representation = representation
-        status, body, headers = self.request(
-            f"/api/v4/sessions/{SESSION_ID}", token="reader-token"
-        )
+        status, body, headers = self.request(f"/api/v4/sessions/{SESSION_ID}", token="reader-token")
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(body)["error"]["code"], "invalid_source_state")
         self.assertEqual(reads, [])
