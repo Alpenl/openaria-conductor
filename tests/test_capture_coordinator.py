@@ -740,6 +740,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         self,
         coordinator: CaptureCoordinator,
         expected_code: str,
+        expected_storage: dict[str, object] | None = None,
     ) -> None:
         try:
             validate_capture_status(coordinator.capture_status())
@@ -752,7 +753,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertFalse(descriptor["capabilities"]["capture"])
             self.assertEqual(
                 descriptor["storage"],
-                {
+                expected_storage
+                or {
                     "volume_id": None,
                     "total_bytes": 0,
                     "available_bytes": 0,
@@ -1046,6 +1048,12 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assert_storage_admission_failure(
                 self.coordinator(minimum_available_bytes=10),
                 "insufficient_space",
+                {
+                    "volume_id": self.volume_id,
+                    "total_bytes": 10_000,
+                    "available_bytes": 9,
+                    "writable": True,
+                },
             )
 
         with patch(
@@ -1055,6 +1063,12 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assert_storage_admission_failure(
                 self.coordinator(minimum_available_inodes=10),
                 "insufficient_inodes",
+                {
+                    "volume_id": self.volume_id,
+                    "total_bytes": 10_000,
+                    "available_bytes": 100,
+                    "writable": True,
+                },
             )
 
         with patch("rp_ylx.recording.coordinator.os.access", return_value=False):
@@ -1456,6 +1470,109 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertIsNotNone(coordinator._active)
         finally:
             coordinator.close()
+
+    def test_cold_low_capacity_keeps_existing_sessions_readable_and_deletable(self):
+        cases = (
+            ((10_000, 9, 100), None, "insufficient_space"),
+            ((10_000, 0, 100), None, "insufficient_space"),
+            ((10_000, 100, 0), None, "insufficient_inodes"),
+            ((10_000, 100, 100), (0, 100), "insufficient_space"),
+        )
+        for capacity, backing, expected_code in cases:
+            with self.subTest(capacity=capacity, backing=backing):
+                first = self.coordinator()
+                try:
+                    session_id = self.seal_one(first, prefix=f"low-{capacity}-{backing}")
+                    deletion = self.deletion_command(first, {session_id}, key=session_id)
+                    session = self.mountpoint / "recordings" / session_id
+                    manifest_bytes = (session / "manifest.json").read_bytes()
+                    video = json.loads(manifest_bytes)["video"]["segments"][0]["artifacts"]["left"]
+                    video_bytes = (session / video["path"]).read_bytes()
+                finally:
+                    first.close()
+                with (
+                    patch("rp_ylx.recording.coordinator._stat_capacity", return_value=capacity),
+                    patch(
+                        "rp_ylx.recording.backing_storage.backing_capacity", return_value=backing
+                    ),
+                ):
+                    cold = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
+                    try:
+                        # The first request after startup is the catalog, with no device preflight.
+                        listed = cold.list_sessions(
+                            cursor=None, limit=50, take_id=None, api_version="v4"
+                        )
+                        self.assertEqual(
+                            [item["session_id"] for item in listed["items"]], [session_id]
+                        )
+                        descriptor = cold.device_descriptor("v4", "lab")
+                        self.assertEqual(
+                            descriptor["storage"],
+                            {
+                                "volume_id": self.volume_id,
+                                "total_bytes": capacity[0],
+                                "available_bytes": capacity[1],
+                                "writable": True,
+                            },
+                        )
+                        self.assertFalse(descriptor["capabilities"]["capture"])
+                        with self.assertRaises(ProviderError) as rejected:
+                            cold.start_capture(start_command("low-" + session_id))
+                        self.assertEqual(rejected.exception.code, expected_code)
+                        self.assertEqual(rejected.exception.status, 409)
+                        with cold.open_manifest(session_id, "v4") as handle:
+                            self.assertEqual(handle.read(), manifest_bytes)
+                        with cold.open_verified_artifact(
+                            session_id, video["artifact_id"], "v4"
+                        ) as handle:
+                            self.assertEqual(handle.read(), video_bytes)
+                        result = cold.delete_sessions(deletion)
+                        self.assertEqual(result.body["deleted_session_ids"], [session_id])
+                        self.assertEqual(
+                            cold.list_sessions(cursor=None, limit=50, take_id=None)["items"], []
+                        )
+                    finally:
+                        cold.close()
+
+    def test_low_capacity_defers_partial_recovery_until_space_is_available(self):
+        first = self.coordinator()
+        try:
+            session_id = self.seal_one(first)
+        finally:
+            first.close()
+        session = self.mountpoint / "recordings" / session_id
+        partial = session.with_name(session_id + ".partial")
+        session.rename(partial)
+        original_files = {
+            str(p.relative_to(partial)): p.read_bytes() for p in partial.rglob("*") if p.is_file()
+        }
+        with patch("rp_ylx.recording.coordinator._stat_capacity", return_value=(10_000, 0, 100)):
+            cold = self.coordinator(minimum_available_bytes=10)
+            try:
+                self.assertEqual(
+                    cold.list_sessions(cursor=None, limit=50, take_id=None)["items"], []
+                )
+                self.assertTrue(partial.is_dir())
+                self.assertEqual(
+                    {
+                        str(p.relative_to(partial)): p.read_bytes()
+                        for p in partial.rglob("*")
+                        if p.is_file()
+                    },
+                    original_files,
+                )
+            except BaseException:
+                cold.close()
+                raise
+        try:
+            self.seal_one(cold, prefix="space-restored")
+            self.assertFalse(partial.exists())
+            self.assertTrue(session.is_dir())
+            self.assertEqual(
+                (session / "manifest.json").read_bytes(), original_files["manifest.json"]
+            )
+        finally:
+            cold.close()
 
     def test_loop_host_reserve_stops_normally_without_exhausting_logical_volume(self):
         for budget in [(9, 100), (100, 9)]:
