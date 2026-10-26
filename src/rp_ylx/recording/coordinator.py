@@ -839,6 +839,7 @@ class CaptureCoordinator:
         binding = persisted.get("volume_binding")
         self._last_volume_binding = copy.deepcopy(binding) if isinstance(binding, Mapping) else None
         self._admission: VolumeAdmission | None = None
+        self._recovery_deferred = False
         try:
             self._admission = self._admit(persisted)
         except DeviceRecordingError:
@@ -911,20 +912,8 @@ class CaptureCoordinator:
         volume_id = _read_volume_id(mountpoint)
         mount_identity = self._mount_identity(mountpoint)
         total_bytes, available_bytes, available_inodes = _stat_capacity(mountpoint)
-        require_backing_reserve(
-            mountpoint, self._config.minimum_available_bytes, self._config.minimum_available_inodes
-        )
-        if available_bytes < self._config.minimum_available_bytes:
-            raise DeviceRecordingError(
-                "insufficient_space",
-                f"录制卷可用空间不足：{available_bytes}/{self._config.minimum_available_bytes}",
-            )
-        if available_inodes < self._config.minimum_available_inodes:
-            raise DeviceRecordingError(
-                "insufficient_inodes",
-                "录制卷可用 inode 不足："
-                f"{available_inodes}/{self._config.minimum_available_inodes}",
-            )
+        # Admission proves volume identity and topology. Recording reserves must
+        # not prevent reading or deleting existing sessions after a full-disk boot.
         if not _mount_writable(mountpoint):
             raise DeviceRecordingError("volume_read_only", "录制卷不可写")
         previous_binding = persisted.get("volume_binding")
@@ -943,7 +932,10 @@ class CaptureCoordinator:
                         generation_id = previous_generation
         sessions_root = mountpoint / SESSIONS_DIRECTORY
         sessions_root_existed = sessions_root.exists()
-        sessions_root.mkdir(mode=0o750, exist_ok=True)
+        try:
+            sessions_root.mkdir(mode=0o750, exist_ok=True)
+        except OSError as error:
+            raise DeviceRecordingError("storage_unavailable", "无法访问会话目录") from error
         if sessions_root.is_symlink():
             raise DeviceRecordingError("unsafe_sessions_root", "会话目录不能是符号链接")
         if sessions_root.stat().st_dev != mount_stat.st_dev:
@@ -1343,8 +1335,42 @@ class CaptureCoordinator:
         except OSError as error:
             raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
 
+    def _require_capture_reserve(
+        self,
+        admission: VolumeAdmission,
+        capacity: tuple[int, int, int] | None = None,
+    ) -> None:
+        _, available_bytes, available_inodes = (
+            _stat_capacity(admission.mountpoint) if capacity is None else capacity
+        )
+        require_backing_reserve(
+            admission.mountpoint,
+            self._config.minimum_available_bytes,
+            self._config.minimum_available_inodes,
+        )
+        if available_bytes < self._config.minimum_available_bytes:
+            raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
+        if available_inodes < self._config.minimum_available_inodes:
+            raise DeviceRecordingError("insufficient_inodes", "录制卷可用 inode 不足")
+
+    def _can_recover_sessions(self, admission: VolumeAdmission) -> bool:
+        try:
+            self._require_capture_reserve(admission)
+        except DeviceRecordingError as error:
+            self._recovery_deferred = True
+            operational_logger("recording").event(
+                "session_recovery_deferred", level="warning", reason=error.code
+            )
+            return False
+        return True
+
     def _recover_sessions(self) -> None:
         admission = self._require_admission()
+        # Recovery writes manifests and checkpoints. Preserve unfinished data
+        # under pressure; retry under the capture lock before the next recording.
+        if not self._can_recover_sessions(admission):
+            return
+        self._recovery_deferred = False
         for sessions_root in admission.catalog_roots:
             for partial in sorted(sessions_root.glob("*.partial")):
                 session_id = partial.name.removesuffix(".partial")
@@ -1364,6 +1390,8 @@ class CaptureCoordinator:
                     cleanup.callback(os.close, descriptor)
                     if os.fstat(descriptor).st_dev != admission.device:
                         continue
+                    if not self._can_recover_sessions(admission):
+                        return
                     self._recover_partial_directory(partial, session_id, descriptor)
         # Publication may have finished just before a crash, before the local
         # retained state was saved. Reconcile here without taking the catalog
@@ -2589,23 +2617,25 @@ class CaptureCoordinator:
 
     def device_descriptor(self, api_version: str, security_profile: str) -> Mapping[str, object]:
         admission = self._admission
+        capture_ready = False
         try:
             admission = self._require_admission()
             status = self._check_generation(force=True)
-            total_bytes, available_bytes, _ = _stat_capacity(admission.mountpoint)
-            require_backing_reserve(
-                admission.mountpoint,
-                self._config.minimum_available_bytes,
-                self._config.minimum_available_inodes,
-            )
+            capacity = _stat_capacity(admission.mountpoint)
+            total_bytes, available_bytes, _ = capacity
             writable = status.writable
+            # Report actual storage capacity even when it cannot admit a new
+            # capture. A low reserve does not mean that the volume disappeared.
+            with suppress(DeviceRecordingError):
+                self._require_capture_reserve(admission, capacity)
+                capture_ready = writable and not self._released
         except DeviceRecordingError:
             total_bytes = 0 if admission is None else admission.total_bytes
             available_bytes = 0
             writable = False
         commit = self._config.session.commit
         capabilities: dict[str, object] = {
-            "capture": admission is not None and writable and not self._released,
+            "capture": capture_ready,
             "preview": True,
             "range_download": True,
             "network_mutation": (api_version == "v4" and self._network_controller_available()),
@@ -2622,7 +2652,7 @@ class CaptureCoordinator:
             )
             capabilities["calibration_capture"] = self._calibration_capture_capability(
                 admission=admission,
-                writable=writable,
+                writable=capture_ready,
             )
         descriptor = {
             "schema": f"ylx.device.{api_version}",
@@ -3225,16 +3255,12 @@ class CaptureCoordinator:
             raise ProviderError("volume_mismatch", "请求的录制卷未准入", status=HTTPStatus.CONFLICT)
         try:
             self._check_generation(force=True)
-            _, available_bytes, available_inodes = _stat_capacity(admission.mountpoint)
-            require_backing_reserve(
-                admission.mountpoint,
-                self._config.minimum_available_bytes,
-                self._config.minimum_available_inodes,
-            )
-            if available_bytes < self._config.minimum_available_bytes:
-                raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
-            if available_inodes < self._config.minimum_available_inodes:
-                raise DeviceRecordingError("insufficient_inodes", "录制卷可用 inode 不足")
+            self._require_capture_reserve(admission)
+            if self._recovery_deferred:
+                self._recover_sessions()
+                self._require_capture_reserve(admission)
+                if self._recovery_deferred:
+                    raise DeviceRecordingError("storage_unavailable", "录制恢复正在等待可用空间")
         except DeviceRecordingError as error:
             raise ProviderError(error.code, error.message, status=HTTPStatus.CONFLICT) from error
         take = body.get("take")
