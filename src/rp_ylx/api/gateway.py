@@ -957,6 +957,19 @@ class GatewayServer(ThreadingHTTPServer):
         with self._http_condition:
             self._session_downloads.discard(connection)
 
+    def session_download_cancelled(self, connection: socket.socket) -> bool:
+        with self._http_condition:
+            if self._http_closing or connection in self._http_cancelled:
+                return True
+        mask = select.POLLERR | select.POLLHUP | select.POLLNVAL
+        mask |= getattr(select, "POLLRDHUP", 0)
+        try:
+            poller = select.poll()
+            poller.register(connection.fileno(), mask)
+            return any(events & mask for _, events in poller.poll(0))
+        except (OSError, ValueError):
+            return True
+
     def begin_request_input(self, connection: socket.socket) -> None:
         with self._http_condition:
             if self._http_closing or connection in self._http_cancelled:
@@ -2994,9 +3007,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self, api_version: str, session_id: str, artifact_id: str, *, head: bool
     ) -> None:
         try:
-            locked = self.server.provider.open_verified_artifact(
-                session_id, artifact_id, api_version
-            )
+            cancellable = getattr(self.server.provider, "open_cancellable_artifact", None)
+            if callable(cancellable):
+                locked = cancellable(
+                    session_id,
+                    artifact_id,
+                    api_version,
+                    cancelled=lambda: self.server.session_download_cancelled(self.connection),
+                )
+            else:
+                locked = self.server.provider.open_verified_artifact(
+                    session_id, artifact_id, api_version
+                )
             with locked as representation:
                 selected_range = None
                 if not head:
@@ -3057,6 +3079,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers = (
                 {"YLX-Error-Code": error.code} if error.code == "session_not_verified" else None
             )
+            if error.retryable and error.status == HTTPStatus.SERVICE_UNAVAILABLE:
+                headers = {"YLX-Error-Code": error.code, "Retry-After": "1"}
             if head:
                 self._send_empty(error.status, headers=headers)
             else:
