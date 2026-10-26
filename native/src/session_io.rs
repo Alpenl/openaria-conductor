@@ -261,9 +261,20 @@ pub fn sendfile_all(
         if error.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        return Err(SessionIoError::os("send_failed", "sendfile 失败", error));
+        return Err(sendfile_error(error));
     }
     Ok(length)
+}
+
+fn sendfile_error(error: std::io::Error) -> SessionIoError {
+    // Preserve the OS category before formatting its platform-dependent text.
+    // Only peer disconnects are expected connection errors at the Python boundary.
+    let code = match error.raw_os_error() {
+        Some(libc::EPIPE) => "send_broken_pipe",
+        Some(libc::ECONNRESET) => "send_connection_reset",
+        _ => "send_failed",
+    };
+    SessionIoError::os(code, "sendfile 失败", error)
 }
 
 pub fn write_encoder_frame(fd: libc::c_int, jpeg: &[u8]) -> Result<u64, SessionIoError> {
@@ -1234,6 +1245,40 @@ mod tests {
         right.read_to_end(&mut received).unwrap();
         assert_eq!(received, b"bcd");
         assert_eq!(file.stream_position().unwrap(), 5);
+    }
+
+    #[test]
+    fn sendfile_closed_peer_keeps_errno_category_and_owned_descriptors() {
+        let root = tempfile_dir();
+        let path = root.join("artifact.bin");
+        fs::write(&path, b"abcdef").unwrap();
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(5)).unwrap();
+        let (left, right) = UnixStream::pair().unwrap();
+        drop(right);
+        let error = sendfile_all(left.as_raw_fd(), file.as_raw_fd(), 1, 3).unwrap_err();
+        assert_eq!(error.code, "send_broken_pipe");
+        assert_eq!(file.stream_position().unwrap(), 5);
+        assert!(file.metadata().is_ok());
+        assert!(left.local_addr().is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sendfile_classifies_only_broken_pipe_and_connection_reset_as_disconnects() {
+        for (number, expected) in [
+            (libc::EPIPE, "send_broken_pipe"),
+            (libc::ECONNRESET, "send_connection_reset"),
+            (libc::EIO, "send_failed"),
+            (libc::EBADF, "send_failed"),
+            (libc::EINVAL, "send_failed"),
+            (libc::ETIMEDOUT, "send_failed"),
+        ] {
+            let error = super::sendfile_error(std::io::Error::from_raw_os_error(number));
+            assert_eq!(error.code, expected);
+        }
+        let error = super::sendfile_error(std::io::Error::other("unclassified failure"));
+        assert_eq!(error.code, "send_failed");
     }
 
     #[test]

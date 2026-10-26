@@ -211,6 +211,14 @@ def load_production_config(path: str | Path) -> ProductionConfig:
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ProductionConfigError(f"无法读取生产配置：{error}") from error
+    from rp_ylx.settings import effective
+
+    if not isinstance(value, dict):
+        raise ProductionConfigError("生产配置顶层字段无效")
+    return production_config_from_value(effective(value))
+
+
+def production_config_from_value(value: object) -> ProductionConfig:
     required = {
         "schema",
         "listen",
@@ -427,12 +435,22 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NONBLOCK
         with lock:
+            # Reject special files before open can block or affect a device.
+            # The descriptor check below also covers replacement after lstat.
+            try:
+                existing = path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                    raise OSError("API audit target must be an exclusively linked regular file")
             descriptor = os.open(path, flags, 0o600)
             try:
                 metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise OSError("API audit target is not a regular file")
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise OSError("API audit target must be an exclusively linked regular file")
                 if metadata.st_mode & 0o777 != 0o600:
                     os.fchmod(descriptor, 0o600)
                 remaining = memoryview(payload)
@@ -453,12 +471,135 @@ class ProductionService:
     server: Any
     event_pump: CaptureEventPump
     mdns_publisher: MdnsPublisher
+    storage_monitor: StorageReserveMonitor | None = None
 
     def close(self) -> None:
-        self.server.server_close()
-        self.mdns_publisher.close()
-        self.event_pump.close()
-        self.coordinator.close()
+        error = _close_service_components(
+            (
+                ("storage_monitor", self.storage_monitor, "close"),
+                ("server", self.server, "server_close"),
+                ("mdns_publisher", self.mdns_publisher, "close"),
+                ("event_pump", self.event_pump, "close"),
+                ("coordinator", self.coordinator, "close"),
+            )
+        )
+        if error is not None:
+            raise error
+
+
+def _close_service_components(
+    components: tuple[tuple[str, Any, str], ...],
+) -> BaseException | None:
+    """Attempt every owned cleanup, preserving the first failure for the caller."""
+    first_error: BaseException | None = None
+    for stage, component, method in components:
+        if component is None:
+            continue
+        try:
+            getattr(component, method)()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+            with suppress(BaseException):
+                _OPERATIONAL_LOG.event(
+                    "production_service_component_close_failed",
+                    level="error",
+                    stage=stage,
+                    exception_type=type(error).__name__,
+                )
+    return first_error
+
+
+def _report_worker_failure(
+    component: str, event: str, error: Exception, next_report_at: float | None
+) -> float:
+    now = time.monotonic()
+    if next_report_at is not None and now < next_report_at:
+        return next_report_at
+    # Advance before logging, so a failing sink also has a bounded retry rate.
+    next_report_at = now + 30.0
+    with suppress(Exception):
+        operational_logger(component).event(
+            event,
+            level="error",
+            exception_type=type(error).__name__,
+            retryable=True,
+        )
+    return next_report_at
+
+
+def _start_background_worker(
+    target: Callable[[], None], stop: threading.Event, *, name: str, daemon: bool
+) -> threading.Thread:
+    admitted = threading.Event()
+    thread: threading.Thread | None = None
+
+    def run_admitted() -> None:
+        admitted.wait()
+        if not stop.is_set():
+            target()
+
+    try:
+        thread = threading.Thread(target=run_admitted, name=name, daemon=daemon)
+        thread.start()
+        admitted.set()
+        return thread
+    except BaseException as error:
+        # The constructor has not returned an owner to its caller. Stop even a
+        # target that is scheduled only after this failed admission unwinds.
+        with suppress(BaseException):
+            stop.set()
+        with suppress(BaseException):
+            admitted.set()
+        outcome = "start_not_confirmed"
+        try:
+            if thread is not None and thread.ident is not None:
+                outcome = "stop_requested"
+                thread.join(timeout=2.0)
+                if not thread.is_alive():
+                    outcome = "stopped"
+        except BaseException as cleanup_error:
+            with suppress(BaseException):
+                _OPERATIONAL_LOG.event(
+                    "background_worker_cleanup_failed",
+                    level="error",
+                    stage=name,
+                    exception_type=type(cleanup_error).__name__,
+                )
+        with suppress(BaseException):
+            _OPERATIONAL_LOG.event(
+                "background_worker_start_failed",
+                level="error",
+                stage=name,
+                exception_type=type(error).__name__,
+                outcome=outcome,
+            )
+        raise
+
+
+class StorageReserveMonitor:
+    """A separate thread keeps a slow finalization off the SSE/status event pump."""
+
+    def __init__(self, coordinator: CaptureCoordinator) -> None:
+        self.coordinator = coordinator
+        self.stop = threading.Event()
+        self.thread = _start_background_worker(
+            self._run, self.stop, name="storage-reserve", daemon=True
+        )
+
+    def _run(self) -> None:
+        next_report_at: float | None = None
+        while not self.stop.wait(1.0):
+            try:
+                self.coordinator.enforce_storage_reserve()
+            except Exception as error:
+                next_report_at = _report_worker_failure(
+                    "recording", "storage_reserve_monitor_failed", error, next_report_at
+                )
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join()
 
 
 class CaptureEventPump:
@@ -483,44 +624,50 @@ class CaptureEventPump:
         self._last_source = (epoch, revision)
         self._last_progress_key = self._progress_key(self._last_source, state)
         self._last_progress_at = 0.0
-        self._thread = threading.Thread(
-            target=self._run,
-            name="rp-ylx-capture-events",
-            daemon=False,
+        self._thread = _start_background_worker(
+            self._run, self._stop, name="rp-ylx-capture-events", daemon=False
         )
-        self._thread.start()
 
     def _run(self) -> None:
+        next_report_at: float | None = None
         while not self._stop.wait(
             self._progress_interval if self._last_progress_key is not None else self._interval
         ):
-            now = time.monotonic()
-            epoch, revision, state = self._coordinator.capture_recording_progress()
-            source = (epoch, revision)
-            # Idle sampling also retries preview startup when a camera reconnects.
-            if source != self._last_source or state is None:
-                event = self._coordinator.capture_snapshot_event()
-                source = (event["authority_epoch"], event["source_revision"])
-                state = self._recording_state(event)
-                if source != self._last_source:
-                    self._event_buffer.publish(event)
-                    self._last_source = source
-                    self._last_progress_key = self._progress_key(source, state)
-                    self._last_progress_at = now
-                    continue
-            progress_event = self._progress_event(source, state)
-            progress_key = self._progress_key(source, state)
-            if (
-                progress_event is not None
-                and progress_key != self._last_progress_key
-                and (
-                    self._last_progress_at == 0.0
-                    or now - self._last_progress_at >= self._progress_interval
+            try:
+                self._poll()
+            except Exception as error:
+                next_report_at = _report_worker_failure(
+                    "recording", "capture_event_pump_failed", error, next_report_at
                 )
-            ):
-                self._event_buffer.publish(progress_event)
-                self._last_progress_key = progress_key
+
+    def _poll(self) -> None:
+        now = time.monotonic()
+        epoch, revision, state = self._coordinator.capture_recording_progress()
+        source = (epoch, revision)
+        # Idle sampling also retries preview startup when a camera reconnects.
+        if source != self._last_source or state is None:
+            event = self._coordinator.capture_snapshot_event()
+            source = (event["authority_epoch"], event["source_revision"])
+            state = self._recording_state(event)
+            if source != self._last_source:
+                self._event_buffer.publish(event)
+                self._last_source = source
+                self._last_progress_key = self._progress_key(source, state)
                 self._last_progress_at = now
+                return
+        progress_event = self._progress_event(source, state)
+        progress_key = self._progress_key(source, state)
+        if (
+            progress_event is not None
+            and progress_key != self._last_progress_key
+            and (
+                self._last_progress_at == 0.0
+                or now - self._last_progress_at >= self._progress_interval
+            )
+        ):
+            self._event_buffer.publish(progress_event)
+            self._last_progress_key = progress_key
+            self._last_progress_at = now
 
     @staticmethod
     def _recording_state(event: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -688,6 +835,7 @@ def build_production_service(
     server = None
     event_pump = None
     mdns_publisher = None
+    storage_monitor = None
     try:
         try:
             sources.start_preview()
@@ -758,51 +906,45 @@ def build_production_service(
             scheme="https" if config.security_profile == "customer" else "http",
         )
         mdns_publisher.start()
+        storage_monitor = StorageReserveMonitor(coordinator)
+        return ProductionService(coordinator, server, event_pump, mdns_publisher, storage_monitor)
     except BaseException:
-        if mdns_publisher is not None:
-            with suppress(BaseException):
-                mdns_publisher.close()
-        if event_pump is not None:
-            with suppress(BaseException):
-                event_pump.close()
-        if server is not None:
-            with suppress(BaseException):
-                server.server_close()
-        if coordinator is not None:
-            with suppress(BaseException):
-                coordinator.close()
-        else:
-            with suppress(BaseException):
-                sources.close()
+        _close_service_components(
+            (
+                ("storage_monitor", storage_monitor, "close"),
+                ("mdns_publisher", mdns_publisher, "close"),
+                ("event_pump", event_pump, "close"),
+                ("server", server, "server_close"),
+                ("coordinator", coordinator, "close"),
+                ("sources", sources if coordinator is None else None, "close"),
+            )
+        )
         raise
-    return ProductionService(coordinator, server, event_pump, mdns_publisher)
 
 
 def run_production_service(config_path: str | Path) -> None:
     started_ns = time.monotonic_ns()
     _OPERATIONAL_LOG.event("production_service_starting")
     try:
+        from rp_ylx.settings import initialize
+
+        initialize(Path(config_path))
         config = load_production_config(config_path)
         service = build_production_service(config)
     except BaseException as error:
-        code = getattr(error, "code", "service_start_failed")
-        _OPERATIONAL_LOG.event(
-            "production_service_start_failed",
-            level="error",
-            error_code=code if isinstance(code, str) else "service_start_failed",
-            exception_type=type(error).__name__,
-            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-        )
+        with suppress(BaseException):
+            code = getattr(error, "code", "service_start_failed")
+            _OPERATIONAL_LOG.event(
+                "production_service_start_failed",
+                level="error",
+                error_code=code if isinstance(code, str) else "service_start_failed",
+                exception_type=type(error).__name__,
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            )
         raise
-    _OPERATIONAL_LOG.event(
-        "production_service_ready",
-        security_profile=config.security_profile,
-        data_plane=config.data_plane,
-        port=config.port,
-        duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-    )
     previous: dict[int, Any] = {}
     stop_signal: str | None = None
+    primary_error: BaseException | None = None
 
     def stop(signum: int, frame: object) -> None:
         nonlocal stop_signal
@@ -810,28 +952,52 @@ def run_production_service(config_path: str | Path) -> None:
         stop_signal = signal.Signals(signum).name
         raise KeyboardInterrupt
 
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous[signum] = signal.signal(signum, stop)
-    try:
-        with suppress(KeyboardInterrupt):
-            service.server.serve_forever()
-    finally:
-        context: dict[str, object] = {"outcome": "shutdown_requested"}
-        if stop_signal is not None:
-            context["signal"] = stop_signal
-        _OPERATIONAL_LOG.event("production_service_stopping", **context)
-        try:
-            service.close()
-        except BaseException as error:
+    def cleanup_failed(stage: str, error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        with suppress(BaseException):
             code = getattr(error, "code", "service_shutdown_failed")
             _OPERATIONAL_LOG.event(
                 "production_service_shutdown_failed",
                 level="error",
+                stage=stage,
                 error_code=code if isinstance(code, str) else "service_shutdown_failed",
                 exception_type=type(error).__name__,
             )
-            raise
-        finally:
-            for signum, handler in previous.items():
+
+    try:
+        _OPERATIONAL_LOG.event(
+            "production_service_ready",
+            security_profile=config.security_profile,
+            data_plane=config.data_plane,
+            port=config.port,
+            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+        )
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, stop)
+        with suppress(KeyboardInterrupt):
+            service.server.serve_forever()
+    except BaseException as error:
+        primary_error = error
+    finally:
+        try:
+            context: dict[str, object] = {"outcome": "shutdown_requested"}
+            if stop_signal is not None:
+                context["signal"] = stop_signal
+            _OPERATIONAL_LOG.event("production_service_stopping", **context)
+        except BaseException as error:
+            cleanup_failed("stopping_log", error)
+        try:
+            service.close()
+        except BaseException as error:
+            cleanup_failed("service_close", error)
+        for signum, handler in previous.items():
+            try:
                 signal.signal(signum, handler)
-        _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
+            except BaseException as error:
+                cleanup_failed(f"restore_{signal.Signals(signum).name}", error)
+        if primary_error is None:
+            _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
+    if primary_error is not None:
+        raise primary_error

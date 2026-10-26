@@ -8,7 +8,82 @@ in Conductor and Bridge SDK when changing the clock contract.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections.abc import Mapping
+
+
+def audio_sample_time_ns(points: list[tuple[int, int]], sample: int) -> float:
+    """Map a sample through observed clock points, extrapolating only endpoints."""
+    index = min(max(bisect_right(points, (sample, math.inf)), 1), len(points) - 1)
+    first, last = points[index - 1 : index + 1]
+    return first[1] + (sample - first[0]) * (last[1] - first[1]) / (last[0] - first[0])
+
+
+def raw_audio_clock_model(anchors: list, rate: int, count: int, period: int, buffer: int) -> dict:
+    """Validate v2 ALSA RAW anchors and their bracketed host-clock observations.
+
+    Rows contain sample position, ALSA RAW timestamp, MONOTONIC observation,
+    RAW immediately before that observation, RAW immediately after it.
+    The raw clock proves sample continuity; the observed MONOTONIC mapping
+    preserves NTP slewing when placing samples on the video/IMU timeline.
+    Neither clock is a physical ADC timestamp.
+    """
+    if (
+        any(type(v) is not int or v <= 0 for v in (rate, count, period, buffer))
+        or period > buffer
+        or not isinstance(anchors, list)
+        or len(anchors) < 2
+    ):
+        raise ValueError("invalid raw audio clock domain")
+    points: list[tuple[int, int]] = []
+    for row in anchors:
+        if (
+            not isinstance(row, list)
+            or len(row) != 5
+            or any(type(v) is not int or not 0 < v < 2**64 for v in row)
+        ):
+            raise ValueError("invalid raw audio clock anchor")
+        position, raw, mono, before, after = row
+        if not raw <= before <= after or after - before > 1_000_000 or after - raw > 20_000_000:
+            raise ValueError("audio clock bridge is stale or uncertain")
+        midpoint = before + (after - before) // 2
+        mapped = raw + mono - midpoint
+        if mapped <= 0:
+            raise ValueError("invalid mapped audio clock")
+        points.append((position, mapped))
+    for first, last, mapped_first, mapped_last in zip(
+        anchors, anchors[1:], points, points[1:], strict=False
+    ):
+        if (
+            last[0] <= first[0]
+            or last[1] <= first[1]
+            or mapped_last[1] <= mapped_first[1]
+            or last[3] <= first[4]
+            or last[2] <= first[2]
+        ):
+            raise ValueError("nonmonotonic raw audio clock or bridge")
+        if last[0] - first[0] > rate + buffer:
+            raise ValueError("raw audio clock evidence has missing intervals")
+        raw_span = (last[3] - first[3]) + ((last[4] - last[3]) - (first[4] - first[3])) / 2
+        # Permit measured bracket uncertainty, not arbitrary host-clock jumps.
+        uncertainty = (last[4] - last[3] + first[4] - first[3]) / 2
+        if abs((last[2] - first[2]) - raw_span) > raw_span * 0.01 + uncertainty:
+            raise ValueError("audio clock bridge rate outside supported range")
+    first, last = anchors[0], anchors[-1]
+    if first[0] > buffer + period or not count <= last[0] <= count + buffer:
+        raise ValueError("raw audio anchors do not cover captured samples")
+    slope = (last[1] - first[1]) / (last[0] - first[0])
+    actual_rate = 1e9 / slope
+    residual = max(abs((row[1] - first[1]) - (row[0] - first[0]) * slope) for row in anchors)
+    if abs(actual_rate / rate - 1) > 0.01 or residual > 20_000_000:
+        raise ValueError("raw audio capture continuity failed")
+    return {
+        "points": points,
+        "actual_rate": actual_rate,
+        "max_residual_ns": residual,
+        "start_ns": audio_sample_time_ns(points, 0),
+        "end_ns": audio_sample_time_ns(points, count),
+    }
 
 
 def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
@@ -112,9 +187,14 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
     if set(clock) != expected:
         raise ValueError("audio capture_clock fields mismatch")
     if (
-        clock["schema"] != "openaria.audio-clock.v1"
+        clock["schema"] not in {"openaria.audio-clock.v1", "openaria.audio-clock.v2"}
         or clock["clock"] != "host_monotonic"
-        or clock["timestamp_source"] != "alsa_htimestamp_dma"
+        or clock["timestamp_source"]
+        != (
+            "alsa_htimestamp_dma_raw"
+            if clock["schema"] == "openaria.audio-clock.v2"
+            else "alsa_htimestamp_dma"
+        )
         or clock["continuity"] != "verified"
         or not isinstance(clock["device"], str)
         or not clock["device"]
@@ -132,6 +212,12 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
     ):
         raise ValueError("audio capture continuity failed")
     anchors = clock["anchors"]
+    raw_model = None
+    if clock["schema"] == "openaria.audio-clock.v2":
+        raw_model = raw_audio_clock_model(
+            anchors, rate, count, clock["period_frames"], clock["buffer_frames"]
+        )
+        anchors = [list(point) for point in raw_model["points"]]
     if not isinstance(anchors, list) or len(anchors) < 2:
         raise ValueError("audio clock requires multiple anchors")
     for anchor in anchors:
@@ -149,6 +235,11 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
     residual = max(abs((t - first[1]) - (n - first[0]) * ns_per_sample) for n, t in anchors)
     predicted_start = first[1] - first[0] * ns_per_sample
     predicted_end = predicted_start + count * ns_per_sample
+    if raw_model is not None:
+        actual_rate = raw_model["actual_rate"]
+        residual = raw_model["max_residual_ns"]
+        predicted_start = raw_model["start_ns"]
+        predicted_end = raw_model["end_ns"]
     origin = clock["session_start_monotonic_ns"]
     if (
         abs(actual_rate / rate - 1) > 0.01
@@ -185,4 +276,12 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
         thread_span_seconds=(thread_stop - thread_start) / 1e9,
         timestamp_source=clock["timestamp_source"],
     )
+    if raw_model is not None:
+        # Exporters must consume this mapping, not apply one average tempo to
+        # the whole recording. Keep the legacy v1 report unchanged.
+        report["mapping"] = "piecewise-linear"
+        points = [(0, clock["sample_start_monotonic_ns"])]
+        points.extend((n, t) for n, t in raw_model["points"] if 0 < n < count)
+        points.append((count, clock["sample_end_monotonic_ns"]))
+        report["sample_timeline"] = [[n, (t - origin) / 1e9] for n, t in points]
     return report

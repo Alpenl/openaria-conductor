@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+# Use the same inode as capture and firmware updates. Never create or unlink it.
+LOCK=${OPENARIA_MAINTENANCE_LOCK:-/run/rp-ylx/maintenance.lock}
+DATA=${OPENARIA_DATA_MOUNT:-/data}
+if [ ! -f "$LOCK" ] || [ -L "$LOCK" ]; then
+    echo 'OpenAria maintenance lock is missing or invalid; refusing TRIM' >&2
+    exit 1
+fi
+exec 8<"$LOCK"
+if flock --exclusive --nonblock --conflict-exit-code 75 8; then
+    :
+else
+    result=$?
+    if [ "$result" -eq 75 ]; then
+        echo 'Capture or firmware maintenance is active; deferring TRIM'
+        exit 75
+    fi
+    echo 'Cannot acquire OpenAria maintenance lock; refusing TRIM' >&2
+    exit 1
+fi
+
+# Descriptor 8 is inherited by fstrim: even if this shell dies, the active
+# discard keeps the lease until the child exits. Do not use flock --close.
+# Reclaim holes in a loop-backed recording volume before trimming its backing
+# filesystem. The normal system mount enumeration still handles other volumes.
+if mountpoint --quiet "$DATA"; then
+    fstrim --verbose --quiet-unsupported "$DATA" || exit 1
+fi
+fstrim --listed-in /etc/fstab:/proc/self/mountinfo --verbose --quiet-unsupported || exit 1

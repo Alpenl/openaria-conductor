@@ -72,7 +72,12 @@ class MdnsPublisherTest(unittest.TestCase):
         )
         publisher.start()
         try:
-            self._wait_for(lambda: len(responders) == 1)
+            self._wait_for(
+                lambda: (
+                    len(responders) == 1
+                    and len(responders[0].registered) == len(MDNS_SERVICE_TYPES)
+                )
+            )
             first = responders[0]
             self.assertEqual(first.addresses, ("198.51.100.36",))
             self.assertEqual(
@@ -87,7 +92,12 @@ class MdnsPublisherTest(unittest.TestCase):
                 self.assertEqual(options, {"allow_name_change": True})
 
             current[0] = ("198.51.100.37",)
-            self._wait_for(lambda: len(responders) == 2)
+            self._wait_for(
+                lambda: (
+                    len(responders) == 2
+                    and len(responders[1].registered) == len(MDNS_SERVICE_TYPES)
+                )
+            )
             self.assertTrue(first.closed)
             self.assertEqual(len(first.unregistered), 2)
             self.assertEqual(responders[1].addresses, ("198.51.100.37",))
@@ -115,7 +125,12 @@ class MdnsPublisherTest(unittest.TestCase):
         )
         publisher.start()
         try:
-            self._wait_for(lambda: len(responders) == 1)
+            self._wait_for(
+                lambda: (
+                    len(responders) == 1
+                    and len(responders[0].registered) == len(CUSTOMER_MDNS_SERVICE_TYPES)
+                )
+            )
             services = [service for service, _ in responders[0].registered]
             self.assertEqual(
                 {service.type for service in services}, set(CUSTOMER_MDNS_SERVICE_TYPES)

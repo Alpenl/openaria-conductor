@@ -7,19 +7,21 @@ from collections import deque
 from pathlib import Path
 from threading import Event
 
+from .cadence import FrameCadence
+
 
 def _journal_lines(stream, finished: Event | None):
     """Tail complete records; a producer may be halfway through one write."""
-    pending = b""
+    pending = bytearray()
     while True:
-        line = stream.readline()
+        line = stream.readline(1_048_577 - len(pending))
         if line:
-            pending += line
+            pending.extend(line)
             if len(pending) > 1_048_576:
                 raise ValueError("capture audit record exceeds limit")
             if pending.endswith(b"\n"):
-                yield pending
-                pending = b""
+                yield bytes(pending)
+                pending.clear()
             continue
         if finished is None or finished.is_set():
             if pending:
@@ -31,6 +33,7 @@ def _journal_lines(stream, finished: Event | None):
 def capture_audit(
     root: Path, nominal_fps: float, frame_decimation: int = 1, *, finished: Event | None = None
 ) -> dict:
+    cadence = FrameCadence(nominal_fps)
     first = previous = last = None
     frames = matched = 0
     maximum_interval = 0
@@ -74,6 +77,7 @@ def capture_audit(
         for line in _journal_lines(camera, finished):
             frame = json.loads(line)
             host = frame["host_monotonic_ns"]
+            cadence.observe(host)
             if first is None:
                 first = host
             if previous is not None:
@@ -102,7 +106,12 @@ def capture_audit(
             counter = audit.get("camera_counter_raw")
             if counter is not None:
                 counter_available += 1
-                matched += int(any(c == counter and abs(t - host) < 100_000_000 for c, t in recent))
+                # Matching packets normally sit near the newly consumed tail.
+                # Scan newest first but retain the full window for repeats,
+                # wraps and regressing IMU timestamps.
+                matched += int(
+                    any(c == counter and abs(t - host) < 100_000_000 for c, t in reversed(recent))
+                )
                 if previous_counter is not None and counter < previous_counter:
                     if previous_counter - counter > 2**23:
                         counter_wraps += 1
@@ -148,6 +157,7 @@ def capture_audit(
             "last_monotonic_ns": last,
             "actual_fps": (frames - 1) / frame_span if frame_span else None,
             "nominal_fps": nominal_fps,
+            "cadence": cadence.summary(),
             "max_interval_ns": maximum_interval,
             "max_dequeue_delay_ns": maximum_dequeue_delay,
             "clock_sources": sorted(clocks),

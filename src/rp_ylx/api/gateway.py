@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import select
 import socket
@@ -14,14 +15,14 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import RLock
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 from rp_ylx.api.downloads import (
@@ -49,6 +50,7 @@ from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
 from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.clock_sync import valid_clock_request, valid_clock_response
 from rp_ylx.firmware_control import FirmwareError, request_firmware
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network_validation import (
     NETWORK_CREDENTIAL_REF,
     NETWORK_MODES,
@@ -56,6 +58,7 @@ from rp_ylx.network_validation import (
     valid_network_ethernet,
     valid_network_request,
 )
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.web import (
     WEB_ASSETS,
     EchoWebArtifactError,
@@ -65,7 +68,6 @@ from rp_ylx.web import (
 )
 
 MAX_BODY_BYTES = 64 * 1024
-MAX_MANIFEST_RESPONSE_BYTES = 8 * 1024 * 1024
 UUID_V4 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 UUID_V7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 QUOTED_SHA256 = re.compile(r'^"([0-9a-f]{64})"$')
@@ -628,14 +630,24 @@ class _StreamRegistry:
         with self._condition:
             session_id = self._next_id
             self._next_id += 1
-            session = _StreamSession(
-                self,
-                session_id,
-                kind,
-                connection,
-                slot,
-                wake_waiters,
-            )
+            try:
+                session = _StreamSession(
+                    self,
+                    session_id,
+                    kind,
+                    connection,
+                    slot,
+                    wake_waiters,
+                )
+            except RuntimeError:
+                # Thread creation can fail transiently. No session owns the
+                # admission slot yet, so return it and use the existing 503.
+                slot.release()
+                self._rejected[kind] += 1
+                return None
+            except BaseException:
+                slot.release()
+                raise
             self._active[session_id] = session
             return session
 
@@ -682,6 +694,32 @@ class _StreamRegistry:
             self._condition.notify_all()
 
 
+_RESPONSE_WRITE_CHUNK = 16 * 1024
+
+
+@dataclass
+class _IODeadline:
+    expires_at: float
+    expired: bool = False
+
+
+class _BoundedResponseWriter:
+    def __init__(self, writer: object, connection: socket.socket, server: GatewayServer) -> None:
+        self._writer = writer
+        self._connection = connection
+        self._server = server
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._writer, name)
+
+    def write(self, payload: bytes) -> int:
+        view = memoryview(payload).cast("B")
+        for offset in range(0, len(view), _RESPONSE_WRITE_CHUNK):
+            with self._server.response_write(self._connection):
+                self._writer.write(view[offset : offset + _RESPONSE_WRITE_CHUNK])
+        return len(view)
+
+
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -697,6 +735,10 @@ class GatewayServer(ThreadingHTTPServer):
         max_sse_connections: int = 4,
         max_preview_streams: int = 2,
         external_scheme: str = "http",
+        request_timeout_seconds: float = 30.0,
+        max_http_connections: int = 32,
+        write_timeout_seconds: float = 30.0,
+        max_session_downloads: int = 8,
     ) -> None:
         if sse_heartbeat_seconds <= 0 or network_sse_poll_seconds <= 0:
             raise ValueError("SSE 心跳和轮询间隔必须大于零")
@@ -704,6 +746,37 @@ class GatewayServer(ThreadingHTTPServer):
             raise ValueError("长连接并发上限必须大于零")
         if external_scheme not in {"http", "https"}:
             raise ValueError("external_scheme 必须是 http 或 https")
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("HTTP 连接超时必须是有限正数")
+        if (
+            not isinstance(max_http_connections, int)
+            or isinstance(max_http_connections, bool)
+            or max_http_connections < 1
+        ):
+            raise ValueError("HTTP 连接总上限必须是正整数")
+        if not math.isfinite(write_timeout_seconds) or not 0 < write_timeout_seconds <= 3600:
+            raise ValueError("HTTP 发送等待上限必须在 (0, 3600] 秒内")
+        if (
+            not isinstance(max_session_downloads, int)
+            or isinstance(max_session_downloads, bool)
+            or max_session_downloads < 1
+        ):
+            raise ValueError("HTTP 录制下载并发上限必须是正整数")
+        self.max_session_downloads = max_session_downloads
+        self._session_downloads: set[socket.socket] = set()
+        self.write_timeout_seconds = write_timeout_seconds
+        self.max_http_connections = max_http_connections
+        self._http_condition = threading.Condition()
+        self._audit_next_report_at: float | None = None
+        self._audit_suppressed = 0
+        self._http_connections: set[socket.socket] = set()
+        self._http_reclaimable: dict[socket.socket, float] = {}
+        self._http_cancelled: set[socket.socket] = set()
+        self._http_closing = False
+        self._io_deadlines: dict[tuple[socket.socket, str], _IODeadline] = {}
+        self._deadline_watcher: threading.Thread | None = None
+        self._deadline_next_check: float | None = None
+        self.request_timeout_seconds = request_timeout_seconds
         self.provider = provider
         self.security = security
         self.audit_sink = audit_sink or (lambda event: None)
@@ -717,6 +790,205 @@ class GatewayServer(ThreadingHTTPServer):
         )
         self.external_scheme = external_scheme
         super().__init__(address, GatewayHandler)
+        self._deadline_watcher = threading.Thread(
+            target=self._watch_io_deadlines, name="gateway-io-deadlines", daemon=True
+        )
+        try:
+            self._deadline_watcher.start()
+        except BaseException:
+            self.server_close()
+            raise
+
+    def report_audit_failure(self, operation: str, outcome: str, error: Exception) -> None:
+        now = time.monotonic()
+        with self._http_condition:
+            if self._audit_next_report_at is not None and now < self._audit_next_report_at:
+                self._audit_suppressed += 1
+                return
+            suppressed = self._audit_suppressed
+            self._audit_suppressed = 0
+            self._audit_next_report_at = now + 30.0
+        # A broken diagnostic destination must not replace the operation result.
+        # Advance the deadline before logging to bound repeated logger failures too.
+        with suppress(Exception):
+            operational_logger("gateway").event(
+                "api_audit_failed",
+                level="error",
+                operation=operation,
+                outcome=outcome,
+                exception_type=type(error).__name__,
+                suppressed_count=suppressed,
+            )
+
+    def response_write(self, connection: socket.socket) -> AbstractContextManager[None]:
+        return self._io_deadline(connection, "write", time.monotonic() + self.write_timeout_seconds)
+
+    def request_read(
+        self, connection: socket.socket, expires_at: float
+    ) -> AbstractContextManager[None]:
+        return self._io_deadline(connection, "read", expires_at)
+
+    @contextmanager
+    def _io_deadline(
+        self, connection: socket.socket, kind: Literal["read", "write"], expires_at: float
+    ) -> Iterator[None]:
+        deadline = _IODeadline(expires_at)
+        key = (connection, kind)
+        with self._http_condition:
+            if self._http_closing or connection in self._http_cancelled:
+                raise ConnectionResetError("gateway connection is closing")
+            if expires_at <= time.monotonic():
+                raise TimeoutError(f"HTTP {kind} exceeded its deadline")
+            self._io_deadlines[key] = deadline
+            if kind == "read":
+                self._http_reclaimable[connection] = expires_at - self.request_timeout_seconds
+            if self._deadline_next_check is None or expires_at < self._deadline_next_check:
+                self._http_condition.notify_all()
+        try:
+            yield
+        finally:
+            with self._http_condition:
+                if not deadline.expired and time.monotonic() >= expires_at:
+                    deadline.expired = True
+                    with suppress(OSError):
+                        connection.shutdown(socket.SHUT_RDWR)
+                if self._io_deadlines.get(key) is deadline:
+                    self._io_deadlines.pop(key)
+                if kind == "read":
+                    self._http_reclaimable.pop(connection, None)
+                cancelled = connection in self._http_cancelled
+            if deadline.expired:
+                raise TimeoutError(f"HTTP {kind} exceeded its deadline")
+            if cancelled:
+                raise ConnectionResetError("incomplete request yielded connection capacity")
+
+    def _watch_io_deadlines(self) -> None:
+        with self._http_condition:
+            while not self._http_closing:
+                if not self._io_deadlines:
+                    self._deadline_next_check = None
+                    self._http_condition.wait()
+                    continue
+                now = time.monotonic()
+                for key, deadline in tuple(self._io_deadlines.items()):
+                    connection, _kind = key
+                    if deadline.expires_at <= now:
+                        deadline.expired = True
+                        self._io_deadlines.pop(key)
+                        # Cancel under the same lock as completion/new writes so a late
+                        # deadline cannot shut down a subsequent keepalive response.
+                        with suppress(OSError):
+                            connection.shutdown(socket.SHUT_RDWR)
+                if self._io_deadlines:
+                    self._deadline_next_check = min(
+                        d.expires_at for d in self._io_deadlines.values()
+                    )
+                    self._http_condition.wait(max(0, self._deadline_next_check - time.monotonic()))
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        with self._http_condition:
+            if not self._http_closing and len(self._http_connections) >= self.max_http_connections:
+                # Reclaim only idle or incomplete-input clients, never a command or
+                # response already in progress. Keep the old handler counted until
+                # it actually exits; no replacement thread may exceed the hard cap.
+                candidates = {
+                    connection: started
+                    for connection, started in self._http_reclaimable.items()
+                    if connection not in self._http_cancelled
+                }
+                if candidates:
+                    oldest = min(candidates, key=candidates.__getitem__)
+                    self._http_cancelled.add(oldest)
+                    with suppress(OSError):
+                        oldest.shutdown(socket.SHUT_RDWR)
+                    self._http_condition.wait_for(
+                        lambda: (
+                            self._http_closing
+                            or len(self._http_connections) < self.max_http_connections
+                        ),
+                        timeout=0.1,
+                    )
+            admitted = (
+                not self._http_closing and len(self._http_connections) < self.max_http_connections
+            )
+            if admitted:
+                self._http_connections.add(request)
+                self._http_reclaimable[request] = time.monotonic()
+        if not admitted:
+            # Never read or write client data on the accept thread.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._http_finished(request)
+            raise
+
+    def process_request_thread(
+        self, request: socket.socket, client_address: tuple[str, int]
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._http_finished(request)
+
+    def _http_finished(self, request: socket.socket) -> None:
+        with self._http_condition:
+            self._http_connections.discard(request)
+            self._http_reclaimable.pop(request, None)
+            self._http_cancelled.discard(request)
+            self._session_downloads.discard(request)
+            self._http_condition.notify_all()
+
+    def begin_session_download(self, connection: socket.socket) -> bool:
+        with self._http_condition:
+            # Leave an HTTP slot for control whenever the configured total allows.
+            limit = min(self.max_session_downloads, max(1, self.max_http_connections - 1))
+            if (
+                self._http_closing
+                or connection in self._http_cancelled
+                or len(self._session_downloads) >= limit
+            ):
+                return False
+            self._session_downloads.add(connection)
+            return True
+
+    def end_session_download(self, connection: socket.socket) -> None:
+        with self._http_condition:
+            self._session_downloads.discard(connection)
+
+    def session_download_cancelled(self, connection: socket.socket) -> bool:
+        with self._http_condition:
+            if self._http_closing or connection in self._http_cancelled:
+                return True
+        mask = select.POLLERR | select.POLLHUP | select.POLLNVAL
+        mask |= getattr(select, "POLLRDHUP", 0)
+        try:
+            poller = select.poll()
+            poller.register(connection.fileno(), mask)
+            return any(events & mask for _, events in poller.poll(0))
+        except (OSError, ValueError):
+            return True
+
+    def begin_request_input(self, connection: socket.socket) -> None:
+        with self._http_condition:
+            if self._http_closing or connection in self._http_cancelled:
+                raise ConnectionResetError("gateway connection is closing")
+            self._http_reclaimable[connection] = time.monotonic()
+
+    def _cancel_http_connections(self) -> None:
+        with self._http_condition:
+            self._http_closing = True
+            self._http_condition.notify_all()
+            connections = tuple(self._http_connections)
+        for connection in connections:
+            # The handler owns close(); shutdown wakes both reads and raw-fd writes.
+            with suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+
+    def _wait_http_connections(self) -> None:
+        with self._http_condition:
+            self._http_condition.wait_for(lambda: not self._http_connections, timeout=2.0)
 
     def handle_error(self, request: object, client_address: object) -> None:
         if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
@@ -736,18 +1008,67 @@ class GatewayServer(ThreadingHTTPServer):
 
     def shutdown(self) -> None:
         self._streams.cancel_all("server_shutdown")
+        self._cancel_http_connections()
         super().shutdown()
+        self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
 
     def server_close(self) -> None:
         self._streams.cancel_all("server_shutdown")
+        self._cancel_http_connections()
         super().server_close()
+        self._wait_http_connections()
         self._streams.wait_empty(timeout=2.0)
+        if self._deadline_watcher is not None and self._deadline_watcher.is_alive():
+            self._deadline_watcher.join(timeout=2.0)
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
     server: GatewayServer
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.wfile = _BoundedResponseWriter(self.wfile, self.connection, self.server)
+
+    def handle_one_request(self) -> None:
+        self._header_read_context: AbstractContextManager[None] | None = None
+        self.connection.settimeout(self.server.request_timeout_seconds)
+        try:
+            try:
+                # Waiting for the first byte is an idle timeout, separate from the
+                # total request-input budget. peek keeps pipelined bytes intact.
+                self.server.begin_request_input(self.connection)
+                if not self.rfile.peek(1):
+                    self.close_connection = True
+                    return
+                self._request_read_expires_at = (
+                    time.monotonic() + self.server.request_timeout_seconds
+                )
+                context = self.server.request_read(self.connection, self._request_read_expires_at)
+                context.__enter__()
+                self._header_read_context = context
+                super().handle_one_request()
+            finally:
+                self._finish_header_read()
+        except TimeoutError:
+            self.close_connection = True
+        finally:
+            self.connection.settimeout(None)
+
+    def _finish_header_read(self) -> None:
+        context = self._header_read_context
+        self._header_read_context = None
+        if context is not None:
+            context.__exit__(None, None, None)
+
+    def parse_request(self) -> bool:
+        try:
+            return super().parse_request()
+        finally:
+            # Native sendfile and raw-fd writers require blocking response sockets.
+            self.connection.settimeout(None)
+            self._finish_header_read()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -772,7 +1093,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         host, host_is_single = self._single_header("Host")
         if not host_is_single or host is None:
             return False
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False
         return (
             parsed.scheme == self.server.external_scheme
             and parsed.netloc.casefold() == host.casefold()
@@ -789,7 +1113,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "Access-Control-Expose-Headers",
                 (
                     "Accept-Ranges, Content-Range, ETag, Idempotency-Replayed, Retry-After, "
-                    "YLX-Error-Code, YLX-Manifest-SHA256, YLX-Wait-State"
+                    "YLX-Audit-Status, YLX-Error-Code, YLX-Manifest-SHA256, YLX-Wait-State"
                 ),
             )
             self.send_header("Vary", "Origin")
@@ -807,6 +1131,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_audit_failed", False):
+            self.send_header("YLX-Audit-Status", "unavailable")
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -826,6 +1152,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_audit_failed", False):
+            self.send_header("YLX-Audit-Status", "unavailable")
         if headers:
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -883,7 +1211,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             send_to = getattr(representation, "send_to", None)
             if callable(send_to):
                 self.wfile.flush()
-                send_to(self.connection.fileno(), offset, selected_length)
+                for position in range(0, selected_length, _RESPONSE_WRITE_CHUNK):
+                    count = min(_RESPONSE_WRITE_CHUNK, selected_length - position)
+                    with self.server.response_write(self.connection):
+                        sent = send_to(self.connection.fileno(), offset + position, count)
+                    if sent != count:
+                        raise OSError("representation sender returned a short write")
             else:
                 for chunk in representation.iter_chunks(offset, selected_length):
                     self.wfile.write(chunk)
@@ -922,16 +1255,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
         resource_id: str | None,
         outcome: str,
         principal: Principal | None = None,
-    ) -> None:
-        self.server.audit_sink(
-            AuditEvent(
-                request_id=self.request_id,
-                principal_id=None if principal is None else principal.principal_id,
-                operation_id=operation_id,
-                resource_id=resource_id,
-                outcome=outcome,
+    ) -> bool:
+        try:
+            self.server.audit_sink(
+                AuditEvent(
+                    request_id=self.request_id,
+                    principal_id=None if principal is None else principal.principal_id,
+                    operation_id=operation_id,
+                    resource_id=resource_id,
+                    outcome=outcome,
+                )
             )
-        )
+        except Exception as error:
+            self._audit_failed = True
+            self.server.report_audit_failure(operation_id, outcome, error)
+            return False
+        return True
 
     def _close_if_request_body_is_unread(self) -> None:
         content_length = getattr(self, "_request_content_length", None)
@@ -978,12 +1317,33 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 self._problem(HTTPStatus.FORBIDDEN, "forbidden", "调用方无权访问此资源")
             return None
-        self._audit(operation_id, resource_id, "allowed", principal)
+        if not self._audit(operation_id, resource_id, "allowed", principal):
+            self._close_if_request_body_is_unread()
+            headers = {"Retry-After": "1", "YLX-Error-Code": "audit_unavailable"}
+            if self.command == "HEAD":
+                self._send_empty(HTTPStatus.SERVICE_UNAVAILABLE, headers=headers)
+            else:
+                self._problem(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    "审计记录暂不可用，请稍后重试",
+                    retryable=True,
+                    headers=headers,
+                )
+            return None
         return principal
 
     def _begin_request(self, *, body_allowed: bool) -> bool:
         self._request_id = str(uuid.uuid4())
+        self._audit_failed = False
         self._request_content_length: int | None = None
+        try:
+            urlsplit(self.path)
+        except ValueError:
+            # Reject before dispatch; any declared body remains unread.
+            self.close_connection = True
+            self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求目标 URL 无效")
+            return False
         transfer_encodings = self.headers.get_all("Transfer-Encoding", failobj=[])
         content_lengths = self.headers.get_all("Content-Length", failobj=[])
         if transfer_encodings:
@@ -2349,9 +2709,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, result)
 
+    def _admit_session_download(self, *, head: bool = False) -> bool:
+        if self.server.begin_session_download(self.connection):
+            return True
+        self.close_connection = True
+        headers = {"Retry-After": "1", "YLX-Error-Code": "download_capacity_exhausted"}
+        if head:
+            self._send_empty(HTTPStatus.SERVICE_UNAVAILABLE, headers=headers)
+        else:
+            self._problem(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "download_capacity_exhausted",
+                "录制下载并发已达上限，请稍后重试",
+                retryable=True,
+                headers=headers,
+            )
+        return False
+
     def _get_manifest(self, api_version: str, session_id: str) -> None:
         if self._principal("getSession", session_id) is None:
             return
+        if not self._admit_session_download():
+            return
+        try:
+            self._send_manifest(api_version, session_id)
+        finally:
+            self.server.end_session_download(self.connection)
+
+    def _send_manifest(self, api_version: str, session_id: str) -> None:
         try:
             locked = self.server.provider.open_manifest(session_id, api_version)
             with locked as manifest:
@@ -2364,7 +2749,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     etag_match is None
                     or content_type != "application/json"
                     or type(size) is not int
-                    or not 0 < size <= MAX_MANIFEST_RESPONSE_BYTES
+                    or not 0 < size <= MAX_MANIFEST_BYTES
                     or not callable(iter_chunks)
                 ):
                     self._invalid_source_state("daemon manifest representation 元数据无效")
@@ -2378,7 +2763,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             return
                         payload_chunk = bytes(chunk)
                         received += len(payload_chunk)
-                        if received > size or received > MAX_MANIFEST_RESPONSE_BYTES:
+                        if received > size or received > MAX_MANIFEST_BYTES:
                             self._invalid_source_state("daemon manifest representation 长度无效")
                             return
                         chunks.append(payload_chunk)
@@ -2423,7 +2808,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _get_safe_swap(self, api_version: str) -> None:
         if self._principal("getCurrentSafeSwapReceipt") is None:
             return
-        resource = self.server.provider.current_safe_swap_receipt()
+        try:
+            resource = self.server.provider.current_safe_swap_receipt()
+        except ProviderError as error:
+            self._problem(
+                error.status,
+                error.code,
+                error.message,
+                retryable=error.retryable,
+                details=error.details,
+            )
+            return
+        except Exception:
+            self._provider_failure()
+            return
         if not isinstance(resource, Mapping) or set(resource) != {"schema", "receipt"}:
             self._problem(HTTPStatus.NOT_FOUND, "not_found", "当前没有可读取的安全换盘回执")
             return
@@ -2598,10 +2996,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        if not self._admit_session_download(head=head):
+            return
         try:
-            locked = self.server.provider.open_verified_artifact(
-                session_id, artifact_id, api_version
-            )
+            self._send_session_artifact(api_version, session_id, artifact_id, head=head)
+        finally:
+            self.server.end_session_download(self.connection)
+
+    def _send_session_artifact(
+        self, api_version: str, session_id: str, artifact_id: str, *, head: bool
+    ) -> None:
+        try:
+            cancellable = getattr(self.server.provider, "open_cancellable_artifact", None)
+            if callable(cancellable):
+                locked = cancellable(
+                    session_id,
+                    artifact_id,
+                    api_version,
+                    cancelled=lambda: self.server.session_download_cancelled(self.connection),
+                )
+            else:
+                locked = self.server.provider.open_verified_artifact(
+                    session_id, artifact_id, api_version
+                )
             with locked as representation:
                 selected_range = None
                 if not head:
@@ -2662,6 +3079,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers = (
                 {"YLX-Error-Code": error.code} if error.code == "session_not_verified" else None
             )
+            if error.retryable and error.status == HTTPStatus.SERVICE_UNAVAILABLE:
+                headers = {"YLX-Error-Code": error.code, "Retry-After": "1"}
             if head:
                 self._send_empty(error.status, headers=headers)
             else:
@@ -2697,7 +3116,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体大小无效")
             return None
         try:
-            payload = self.rfile.read(length)
+            with self.server.request_read(self.connection, self._request_read_expires_at):
+                self.connection.settimeout(self.server.request_timeout_seconds)
+                try:
+                    payload = self.rfile.read(length)
+                finally:
+                    self.connection.settimeout(None)
         except OSError:
             self.close_connection = True
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体读取失败")
@@ -2708,7 +3132,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return None
         try:
             body = json.loads(payload)
-        except (UnicodeError, json.JSONDecodeError):
+            # JSON escapes can represent lone surrogates that UTF-8 storage and
+            # command canonicalization cannot encode. Reject before dispatch.
+            pending = [body]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, str):
+                    value.encode("utf-8")
+                elif isinstance(value, dict):
+                    pending.extend(value)
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+        except (ValueError, RecursionError):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "请求体不是有效 JSON")
             return None
         if not isinstance(body, dict):
@@ -2721,7 +3157,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             allowed = {"schema", "mode", "volume_id", "display_name", "take"}
             if set(body) - allowed or body.get("schema") != "ylx.capture-start.v2":
                 return False
-            if body.get("mode") not in {"production", "calibration"}:
+            mode = body.get("mode")
+            if not isinstance(mode, str) or mode not in {"production", "calibration"}:
                 return False
             volume_id = body.get("volume_id")
             if volume_id is not None and (
@@ -2748,6 +3185,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return (
             set(body) == {"schema", "reason"}
             and body.get("schema") == "ylx.capture-stop.v2"
+            and isinstance(body.get("reason"), str)
             and body.get("reason") in {"user", "safe_swap"}
         )
 
@@ -2892,11 +3330,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         ).encode()
         command = CaptureCommand(principal.principal_id, key, body, canonical)
         try:
-            result = (
-                self.server.provider.start_capture(command)
-                if operation == "start"
-                else self.server.provider.stop_capture(command)
-            )
+            if operation == "start":
+                result = self.server.provider.start_capture(command)
+            else:
+                request_stop = getattr(self.server.provider, "request_stop_capture", None)
+                result = (
+                    request_stop(command)
+                    if callable(request_stop)
+                    else self.server.provider.stop_capture(command)
+                )
         except ProviderError as error:
             self._send_camera_provider_error(error)
             return
@@ -3002,6 +3444,10 @@ def create_gateway_server(
     max_sse_connections: int = 4,
     max_preview_streams: int = 2,
     external_scheme: str = "http",
+    request_timeout_seconds: float = 30.0,
+    max_http_connections: int = 32,
+    write_timeout_seconds: float = 30.0,
+    max_session_downloads: int = 8,
 ) -> GatewayServer:
     return GatewayServer(
         (host, port),
@@ -3014,4 +3460,8 @@ def create_gateway_server(
         max_sse_connections,
         max_preview_streams,
         external_scheme,
+        request_timeout_seconds,
+        max_http_connections,
+        write_timeout_seconds,
+        max_session_downloads,
     )

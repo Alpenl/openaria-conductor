@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3
 import threading
 import uuid
 from collections.abc import Mapping
@@ -15,9 +16,8 @@ from rp_ylx.network import (
     _desired_state_from_disk,
     _network_lock,
     _prepare_state_dir,
-    _read_json,
-    _write_json,
 )
+from rp_ylx.persistence import StateDatabase
 
 CONTROLLER_STATE_SCHEMA = "ylx.network-controller-state.v1"
 TRANSACTION_SCHEMA = "ylx.network-transaction.v1"
@@ -340,41 +340,52 @@ class NetworkStateStore:
         self._path = self._state_dir / "controller-state.json"
         self._thread_lock = threading.RLock()
         _prepare_state_dir(self._state_dir)
+        self._database = StateDatabase(self._state_dir / "controller.sqlite3")
+
+        def validate_import(value):
+            migrated = deepcopy(value)
+            current = migrated.get("transaction", {}).get("current")
+            migrated.setdefault(
+                "execution_release",
+                ({str(current["transaction_id"]): True} if isinstance(current, Mapping) else {}),
+            )
+            migrated.setdefault("rescue_boot_id", None)
+            self._validate(migrated)
+
+        def initial_state():
+            desired = _desired_state_from_disk(self._state_dir)
+            saved = desired.get("mode") == "wifi-client"
+            return {
+                "schema": CONTROLLER_STATE_SCHEMA,
+                "authority_epoch": str(uuid.uuid4()),
+                "source_revision": 0,
+                "saved": saved,
+                "verified": saved,
+                "desired": desired,
+                "transaction": {"current": None, "latest": None},
+                "receipts": {},
+                "work": {},
+                "execution_release": {},
+                "rescue_boot_id": None,
+            }
+
         with self._thread_lock, _network_lock(self._state_dir):
-            state = _read_json(self._path)
-            if state is None:
-                desired = _desired_state_from_disk(self._state_dir)
-                saved = desired.get("mode") == "wifi-client"
-                state = {
-                    "schema": CONTROLLER_STATE_SCHEMA,
-                    "authority_epoch": str(uuid.uuid4()),
-                    "source_revision": 0,
-                    "saved": saved,
-                    "verified": saved,
-                    "desired": desired,
-                    "transaction": {"current": None, "latest": None},
-                    "receipts": {},
-                    "work": {},
-                    "execution_release": {},
-                    "rescue_boot_id": None,
-                }
+            state = self._database.import_json(
+                "controller", self._path, validate=validate_import, default_factory=initial_state
+            )
+            migrated = False
+            if "execution_release" not in state:
+                current = state.get("transaction", {}).get("current")
+                state["execution_release"] = (
+                    {str(current["transaction_id"]): True} if isinstance(current, Mapping) else {}
+                )
+                migrated = True
+            if "rescue_boot_id" not in state:
+                state["rescue_boot_id"] = None
+                migrated = True
+            if migrated:
+                self._validate(state)
                 self._write_locked(state)
-            else:
-                migrated = False
-                if "execution_release" not in state:
-                    current = state.get("transaction", {}).get("current")
-                    state["execution_release"] = (
-                        {str(current["transaction_id"]): True}
-                        if isinstance(current, Mapping)
-                        else {}
-                    )
-                    migrated = True
-                if "rescue_boot_id" not in state:
-                    state["rescue_boot_id"] = None
-                    migrated = True
-                if migrated:
-                    self._validate(state)
-                    self._write_locked(state)
             self._validate(state)
 
     @staticmethod
@@ -383,20 +394,18 @@ class NetworkStateStore:
             raise NetworkStateError("state_invalid", "network controller state is invalid")
 
     def _load_locked(self) -> dict[str, Any]:
-        state = _read_json(self._path)
+        state = self._database.get("controller")
         if state is None:
             raise NetworkStateError("state_invalid", "network controller state is missing")
         self._validate(state)
         return state
 
     def _write_locked(self, state: Mapping[str, Any]) -> None:
-        """Treat a post-replace error as published only when read-back is exact."""
-
+        """Resolve an ambiguous commit only against the committed database value."""
         try:
-            _write_json(self._path, state)
-        except OSError:
-            published = _read_json(self._path)
-            if published != state:
+            self._database.put("controller", state)
+        except (OSError, sqlite3.Error):
+            if self._database.get("controller") != state:
                 raise
 
     def snapshot(self) -> dict[str, Any]:

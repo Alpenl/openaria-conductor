@@ -25,6 +25,7 @@ from rp_ylx.api.downloads import (
 from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.native import NativeRecordingPlan
+from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import (
     DeviceSessionConfig,
     DeviceSessionRecorder,
@@ -234,7 +235,12 @@ class FakeAudioRecorder:
 
 
 class FakeSessionTransaction:
+    def request_audio_stop(self) -> None:
+        self.audio_stop_requested = True
+
     def __init__(self, plan: NativeRecordingPlan, *, fail_finish: bool = False) -> None:
+        self.audio_stop_requested = False
+        self.capture_stopped_monotonic_ns: int | None = None
         self.plan = plan
         self.root = Path(plan.session_root)
         self.session_id = plan.session_id
@@ -317,6 +323,8 @@ class FakeSessionTransaction:
         return {
             "frames_written": self.frames_written,
             "imu_samples_written": self.imu_samples_written,
+            "frames_indexed": self.frames_written,
+            "imu_samples_indexed": self.imu_samples_written,
             "bytes_written": sum(
                 int(item["bytes"]) for item in selected.values() if isinstance(item, dict)
             ),
@@ -602,6 +610,123 @@ class SplitEyeRecordingTest(unittest.TestCase):
                 )
             )
 
+    def test_native_checkpoint_waits_for_indexed_frames_and_coalesces_ready_pairs(self) -> None:
+        from types import SimpleNamespace
+
+        for indexed, expected in [(0, 0), (3, 1), (6, 2)]:
+            with self.subTest(indexed=indexed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                recorder, _, _ = self.build(root)
+                recorder._partial = root / "partial"
+                recorder._partial.mkdir()
+                for name in ("frames.ndjson", "imu.ndjson"):
+                    (recorder._partial / name).write_bytes(b"")
+                segments = [
+                    {
+                        "index": i,
+                        "start_frame": i * 3,
+                        "end_frame": (i + 1) * 3,
+                        "left_path": f"video/left_{i:05d}.mp4",
+                        "left_bytes": 1,
+                        "right_path": f"video/right_{i:05d}.mp4",
+                        "right_bytes": 1,
+                    }
+                    for i in range(2)
+                ]
+                recorder._native_transaction = SimpleNamespace(
+                    segments=lambda segments=segments: segments,
+                    snapshot=lambda indexed=indexed: {
+                        "sink": {"frames_written": 6, "frames_indexed": indexed}
+                    },
+                )
+                with (
+                    patch.object(
+                        recorder, "_segment_record", side_effect=lambda item: {"index": item.index}
+                    ),
+                    patch.object(recorder, "_capture_diagnostics", return_value={}),
+                    patch("rp_ylx.recording.device_session.write_json_atomic") as checkpoint,
+                    patch("rp_ylx.recording.device_session.os.fsync") as sync,
+                ):
+                    recorder._harvest_segments()
+                self.assertEqual(recorder._harvested_segments, expected)
+                self.assertEqual(checkpoint.call_count, int(expected > 0))
+                self.assertEqual(sync.call_count, 2 if expected else 0)
+                if expected:
+                    self.assertEqual(len(checkpoint.call_args.args[1]["segments"]), expected)
+
+    def test_capture_diagnostics_identify_shared_metrics_lifetime(self) -> None:
+        metrics = PerformanceMetrics()
+        metrics.record_loss("source_gap", 2)
+        with tempfile.TemporaryDirectory() as directory:
+            first, _, _ = self.build(Path(directory))
+            second, _, _ = self.build(Path(directory))
+            first._metrics = second._metrics = metrics
+            for recorder in (first, second):
+                result = recorder._capture_diagnostics()
+                self.assertEqual(result["capture_scope"], "metrics_lifetime")
+                self.assertEqual(result["capture"]["loss"]["source_gap"], 2)
+            self.assertEqual(metrics.snapshot().loss["source_gap"], 2)
+
+    def test_metrics_snapshot_failure_preserves_failure_file_and_encoder_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            recorder.start()
+            recorder._metrics = Mock(snapshot=Mock(side_effect=RuntimeError("metrics unavailable")))
+            recorder._encoder.stats = {"frames_submitted": 7}
+            recorder.fail("source_sequence_gap", "source sequence 10 -> 13", media_lost=True)
+            diagnostic = json.loads(
+                (recorder.partial_path / "failure-diagnostics.json").read_text()
+            )
+            self.assertEqual(diagnostic["code"], "source_sequence_gap")
+            self.assertEqual(diagnostic["message"], "source sequence 10 -> 13")
+            self.assertEqual(diagnostic["capture_snapshot_error"], "metrics unavailable")
+            self.assertEqual(diagnostic["encoder"], {"frames_submitted": 7})
+            self.assertNotIn("capture", diagnostic)
+
+    def test_audio_failure_does_not_hide_encoder_and_index_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            error = {"code": "audio_failed", "message": "audio durable commit backlog exhausted"}
+            encoder_error = {"code": "encoder_failed", "message": "dequeue input failed: -16"}
+            transaction = SimpleNamespace(
+                snapshot=Mock(side_effect=RuntimeError(error["message"])),
+                abort=Mock(),
+                diagnostic_snapshot=Mock(
+                    return_value={
+                        "audio_failure": error,
+                        "encoder_failure": encoder_error,
+                        "encoder_stats": {"frames_submitted": 90},
+                        "sink": {
+                            "frames_written": 90,
+                            "frames_indexed": 83,
+                            "index_pending_bytes": 4096,
+                            "bytes_written": 12345,
+                        },
+                    }
+                ),
+            )
+            recorder._native_transaction = transaction
+            result = recorder._capture_diagnostics()
+            self.assertEqual(result["audio_failure"], error)
+            self.assertEqual(result["encoder_failure"], encoder_error)
+            self.assertEqual(result["encoder"]["frames_submitted"], 90)
+            self.assertEqual(result["index_writer"]["frames_indexed"], 83)
+            self.assertEqual(result["index_writer"]["index_pending_bytes"], 4096)
+            self.assertNotIn("snapshot_error", result)
+            transaction.snapshot.assert_not_called()
+            transaction.diagnostic_snapshot.assert_called_once_with()
+            recorder._native_direct_recording = True
+            live = recorder._live_recording_state_locked({"progress": {"captured_frames": 0}})
+            self.assertEqual(live["progress"]["captured_frames"], 90)
+            self.assertEqual(live["progress"]["bytes_written"], 12345)
+            transaction.snapshot.assert_not_called()
+            recorder._abandon_encoder()
+            self.assertIsNone(recorder._native_transaction)
+            transaction.abort.assert_called_once_with("recording abandoned")
+            final_state = recorder._state_document("failed", diagnostics=[])
+            self.assertEqual(final_state["progress"]["captured_frames"], 90)
+            self.assertEqual(final_state["progress"]["bytes_written"], 12345)
+
     def test_sealed_session_declares_contiguous_split_eye_segments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -723,7 +848,11 @@ class SplitEyeRecordingTest(unittest.TestCase):
 
                 with patch.object(store.transaction, "finish", side_effect=delayed_finish):
                     sealed = recorder.stop()
-                self.assertGreaterEqual(
+                self.assertEqual(
+                    sealed.manifest["time"]["duration_seconds"],
+                    recorder._stopped_elapsed,
+                )
+                self.assertLess(
                     sealed.manifest["time"]["duration_seconds"],
                     (finished_at_ns[0] - recorder._started_monotonic_ns) / 1e9,
                 )

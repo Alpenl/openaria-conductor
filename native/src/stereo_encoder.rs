@@ -239,7 +239,14 @@ impl EncoderProcess {
             .stdin
             .as_mut()
             .ok_or_else(|| EncoderProcessError::new("invalid_state", "助手进程未启动"))?;
-        let written = session_io::write_encoder_frame(stdin.as_raw_fd(), jpeg)?;
+        let written = match session_io::write_encoder_frame(stdin.as_raw_fd(), jpeg) {
+            Ok(written) => written,
+            Err(error) => {
+                // Prefer the helper's causal error over the subsequent EPIPE.
+                self.raise_if_failed()?;
+                return Err(error.into());
+            }
+        };
         self.submitted = self.submitted.checked_add(1).ok_or_else(|| {
             EncoderProcessError::new(
                 "counter_overflow",
@@ -307,11 +314,28 @@ impl EncoderProcess {
         }
     }
 
+    pub(crate) fn segments_since(
+        &self,
+        offset: usize,
+    ) -> Result<Vec<SegmentEvent>, EncoderProcessError> {
+        let state = self.shared.state.lock().map_err(|_| {
+            EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        let tail = state.segments.get(offset..).ok_or_else(|| {
+            EncoderProcessError::new("segment_invalid", "encoder segment list regressed")
+        })?;
+        Ok(tail.to_vec())
+    }
+
     pub(crate) fn stats(&self) -> BTreeMap<String, i64> {
         match self.shared.state.lock() {
             Ok(state) => state.stats.clone(),
             Err(_) => BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn failure(&self) -> Option<EncoderProcessError> {
+        self.shared.state.lock().ok()?.failure.clone()
     }
 
     pub(crate) fn submitted_frames(&self) -> u64 {
@@ -434,7 +458,9 @@ fn handle_event(shared: &SharedProcess, line: &[u8]) -> Result<(), EncoderProces
             state.stats = stats;
         }
         EncoderEvent::Error { code, message } => {
-            state.failure = Some(EncoderProcessError::new(code, message));
+            if state.failure.is_none() {
+                state.failure = Some(EncoderProcessError::new(code, message));
+            }
         }
     }
     shared.changed.notify_all();
@@ -570,6 +596,38 @@ fn required_artifact_bytes(
 mod tests {
     use super::{EncoderEvent, SegmentEvent, parse_event};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn preserves_first_codec_failure_after_later_errors_and_stats() {
+        let encoder = super::EncoderProcess::new(
+            std::path::Path::new("/unused"),
+            std::path::Path::new("/unused/helper"),
+            3840,
+            1080,
+            30,
+            12000,
+            150,
+            "video/",
+        )
+        .unwrap();
+        super::handle_event(&encoder.shared,
+            br#"{"event":"error","code":"frame_rejected","message":"decoder_input_dequeue_failed: ret=-42"}"#).unwrap();
+        super::handle_event(
+            &encoder.shared,
+            br#"{"event":"error","code":"pipeline_failed","message":"drain failed"}"#,
+        )
+        .unwrap();
+        super::handle_event(
+            &encoder.shared,
+            br#"{"event":"done","submitted":8,"decoded":7}"#,
+        )
+        .unwrap();
+        let failure = encoder.failure().unwrap();
+        assert_eq!(failure.code, "frame_rejected");
+        assert_eq!(failure.message, "decoder_input_dequeue_failed: ret=-42");
+        assert_eq!(encoder.stats()["decoded"], 7);
+        assert_eq!(encoder.raise_if_failed(), Err(failure));
+    }
 
     #[test]
     fn parses_ready_segment_done_and_error_events() {

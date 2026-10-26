@@ -1,0 +1,36 @@
+{
+  "baseline_commit": "e7da4babf1d1f48ebc262b5714497cfabac98801",
+  "comparison": [
+    {
+      "segments": 0,
+      "before_median_microseconds": 0.76342,
+      "after_median_microseconds": 0.737962,
+      "before_peak_python_bytes": 2174,
+      "after_peak_python_bytes": 2069
+    },
+    {
+      "segments": 120,
+      "before_median_microseconds": 42.590157,
+      "after_median_microseconds": 0.7397859999999999,
+      "before_peak_python_bytes": 106314,
+      "after_peak_python_bytes": 2069
+    },
+    {
+      "segments": 720,
+      "before_median_microseconds": 260.170239,
+      "after_median_microseconds": 0.739645,
+      "before_peak_python_bytes": 639734,
+      "after_peak_python_bytes": 2069
+    },
+    {
+      "segments": 2880,
+      "before_median_microseconds": 1065.7595660000002,
+      "after_median_microseconds": 0.7534120000000001,
+      "before_peak_python_bytes": 2572692,
+      "after_peak_python_bytes": 2069
+    }
+  ],
+  "behavior_parity": true,
+  "identity_comparison": "Per-fixture device/inode/mtime_ns identities normalized to integer type; sizes and SHA256 preserved; fields other than removed snapshot inventory equal.",
+  "method": "Seven 1,000-call repeats per case, actual release-built NativeSessionTransaction PyO3. Peak traced Python allocation measured separately over100 snapshots. Synthetic encoder helper events; no hardware capture or full-recording speed claim."
+}

@@ -440,6 +440,48 @@ class SessionDownloadHttpTest(unittest.TestCase):
                 self.assertEqual(headers["Content-Length"], "0")
 
 
+class DirectorySessionIdentityTest(unittest.TestCase):
+    def test_identity_checks_do_not_read_payload_or_leak_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = root / SESSION_ID
+            session.mkdir()
+            manifest = session / "manifest.json"
+            manifest.write_bytes(b"known immutable payload")
+            with DirectorySessionStore(root) as store:
+                expected = store.manifest_identity(SESSION_ID)
+                with patch.object(
+                    downloads,
+                    "_read_exact_file",
+                    side_effect=AssertionError("identity lookup must not read payloads"),
+                ):
+                    before = len(list(Path("/proc/self/fd").iterdir()))
+                    for _ in range(100):
+                        self.assertEqual(store.manifest_identity(SESSION_ID), expected)
+                    self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+
+    def test_identity_lookup_rejects_links_at_manifest_and_session_components(self) -> None:
+        for change in ("manifest_symlink", "session_symlink", "manifest_hardlink"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                session = root / SESSION_ID
+                session.mkdir()
+                manifest = session / "manifest.json"
+                manifest.write_bytes(b"immutable payload")
+                if change == "manifest_symlink":
+                    target = root / "original.json"
+                    manifest.rename(target)
+                    manifest.symlink_to(target)
+                elif change == "session_symlink":
+                    target = root / "original-session"
+                    session.rename(target)
+                    session.symlink_to(target, target_is_directory=True)
+                else:
+                    os.link(manifest, root / "linked.json")
+                with DirectorySessionStore(root) as store, self.assertRaises(ArtifactAccessError):
+                    store.manifest_identity(SESSION_ID)
+
+
 class DirectorySessionDownloadHttpTest(unittest.TestCase):
     def setUp(self) -> None:
         downloads._clear_validated_manifest_cache_for_tests()

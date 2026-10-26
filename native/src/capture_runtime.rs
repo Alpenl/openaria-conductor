@@ -7,7 +7,7 @@ use crate::recording::{self, CaptureFanoutState, RecordingError};
 use crate::stereo_encoder;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -76,13 +76,77 @@ struct SplitSinkRecording {
     encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
     segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
     recording_start_monotonic_ns: u64,
+    capture_stopped_monotonic_ns: Arc<AtomicU64>,
     on_failure: Arc<Py<PyAny>>,
     imu: Option<Arc<Collector>>,
+    audio: Option<Arc<crate::audio::Recorder>>,
+}
+
+impl SplitSinkRecording {
+    fn request_capture_stop(&self) {
+        if let Some(audio) = &self.audio {
+            audio.request_stop();
+        }
+        // Preserve the first gate closure across repeated calls, without
+        // waiting for encoder or sink locks held by an in-flight frame.
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: timestamp points to writable storage. A clock failure marks
+        // the boundary invalid but must not prevent resource drain/cleanup.
+        let stopped = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0
+        {
+            (timestamp.tv_sec as u64)
+                .checked_mul(1_000_000_000)
+                .and_then(|seconds| seconds.checked_add(timestamp.tv_nsec as u64))
+                .filter(|value| *value > 0)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        let _ = self.capture_stopped_monotonic_ns.compare_exchange(
+            0,
+            stopped,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+// Keep scalar evidence only: no extra frame payload ownership or per-frame JSON.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct SourceFrameEvidence {
+    source_sequence: u64,
+    host_monotonic_ns: u64,
+    dequeue_monotonic_ns: u64,
+    buffer_flags: u32,
+    payload_bytes: u64,
+    camera_counter_raw: Option<u32>,
+}
+
+impl SourceFrameEvidence {
+    fn from_frame(frame: &Frame) -> Self {
+        let raw = &frame.raw_side_by_side;
+        let counter = raw
+            .windows(2)
+            .position(|window| window == b"\xff\xd8")
+            .and_then(|start| recording::avi1_counter(&raw[start..]));
+        Self {
+            source_sequence: frame.source_sequence,
+            host_monotonic_ns: frame.host_monotonic_ns,
+            dequeue_monotonic_ns: frame.dequeue_monotonic_ns,
+            buffer_flags: frame.buffer_flags,
+            payload_bytes: usize_to_u64(raw.len()),
+            camera_counter_raw: counter,
+        }
+    }
 }
 
 struct State {
     fanout: CaptureFanoutState,
     validator: FrameValidator,
+    previous_source_frame: Option<SourceFrameEvidence>,
     recording: Option<Arc<SplitSinkRecording>>,
     running: bool,
     terminal_error: Option<RuntimeError>,
@@ -133,6 +197,7 @@ impl Runtime {
                 state: Mutex::new(State {
                     fanout: CaptureFanoutState::new(frame_decimation)?,
                     validator: FrameValidator::new(),
+                    previous_source_frame: None,
                     recording: None,
                     running: false,
                     terminal_error: None,
@@ -170,6 +235,7 @@ impl Runtime {
                 )
             })?;
             state.validator.reset();
+            state.previous_source_frame = None;
             state.running = true;
             state.terminal_error = None;
             state.last_preview_error = None;
@@ -198,11 +264,18 @@ impl Runtime {
         imu: Option<Arc<Collector>>,
         imu_timeout: Duration,
         audio: Option<Arc<crate::audio::Recorder>>,
+        capture_stopped_monotonic_ns: Arc<AtomicU64>,
     ) -> Result<RuntimeSnapshot, RuntimeError> {
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
                 "invalid_argument",
                 "recording start monotonic timestamp must be positive",
+            ));
+        }
+        if capture_stopped_monotonic_ns.load(Ordering::Acquire) != 0 {
+            return Err(RuntimeError::new(
+                "invalid_state",
+                "session transaction capture gate has already closed",
             ));
         }
         if imu.is_some() && imu_timeout.is_zero() {
@@ -253,8 +326,10 @@ impl Runtime {
             encoder,
             segment_planner,
             recording_start_monotonic_ns,
+            capture_stopped_monotonic_ns,
             on_failure: Arc::clone(&on_failure),
             imu,
+            audio: audio.clone(),
         }));
         self.shared.changed.notify_all();
         let snapshot = snapshot_locked(&state);
@@ -366,12 +441,19 @@ impl Runtime {
             .as_ref()
             .and_then(|recording| recording.imu.clone());
         let inflight = state.fanout.start_stopping();
+        self.imu_stop.store(true, Ordering::Release);
+        if let Some(recording) = &state.recording {
+            recording.request_capture_stop();
+        }
         self.shared.changed.notify_all();
         Ok((inflight, imu))
     }
 
     pub(crate) fn close(&self, timeout: Duration) -> Result<RuntimeSnapshot, RuntimeError> {
         self.stop.store(true, Ordering::Release);
+        // A poisoned state must not bypass the remaining resource cleanup.
+        // The final state read below still returns the original state error.
+        let _ = self.begin_recording_stop();
         self.request_imu_stop()?;
         self.stop_imu_worker(timeout)?;
         let _ = self.stream.close();
@@ -507,6 +589,9 @@ fn run_loop(
     }
     if let Ok(mut state) = shared.state.lock() {
         state.running = false;
+        if let Some(recording) = &state.recording {
+            recording.request_capture_stop();
+        }
         state.recording = None;
         state.fanout.start_stopping();
         shared.changed.notify_all();
@@ -545,13 +630,6 @@ fn process_frame(
             raw_size,
             u64::from(has_raw),
         );
-        let preview_jpeg = if has_left {
-            Some(frame.left.as_slice())
-        } else if has_raw {
-            Some(frame.raw_side_by_side.as_slice())
-        } else {
-            None
-        };
         let source_sequence = i64::try_from(frame.source_sequence).map_err(|_| {
             RuntimeError::new("bad_frame", "camera source sequence is out of range")
         })?;
@@ -564,7 +642,8 @@ fn process_frame(
                     "application dropped frame count is out of range",
                 )
             })?;
-        let (dropped_before, validation, dispatch) = {
+        let current_source_frame = SourceFrameEvidence::from_frame(&frame);
+        let (dropped_before, validation, previous_source_frame, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
                     "capture_runtime_poisoned",
@@ -581,27 +660,36 @@ fn process_frame(
                     application_dropped_before,
                 )
                 .map_err(RuntimeError::from)?;
+            let previous_source_frame = state.previous_source_frame.replace(current_source_frame);
             record_loss(metrics, "queue_rejected", validation.queue_rejected);
             record_loss(metrics, "source_gap", validation.source_gap);
             let decision = state
                 .fanout
-                .begin_frame(validation.dropped_before, preview_jpeg.is_some())
+                .begin_frame(validation.dropped_before, has_left || has_raw)
                 .map_err(RuntimeError::from)?;
             if decision.publish_preview {
-                if let Some(jpeg) = preview_jpeg {
-                    let publish_started = start_stage(metrics);
-                    if let Err(error) = preview.publish(jpeg) {
-                        state.last_preview_error = Some(RuntimeError::from(error));
-                    }
-                    finish_stage(metrics, "native_preview_publish", publish_started);
+                let publish_started = start_stage(metrics);
+                let published = if has_left {
+                    preview.publish(&frame.left)
+                } else {
+                    preview.publish_shared(Arc::clone(&frame.raw_side_by_side))
+                };
+                if let Err(error) = published {
+                    state.last_preview_error = Some(RuntimeError::from(error));
                 }
+                finish_stage(metrics, "native_preview_publish", publish_started);
             }
             let dispatch = if decision.record {
                 state.recording.clone()
             } else {
                 None
             };
-            (decision.dropped_before, validation, dispatch)
+            (
+                decision.dropped_before,
+                validation,
+                previous_source_frame,
+                dispatch,
+            )
         };
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
@@ -611,11 +699,11 @@ fn process_frame(
             if let Err(mut error) = write_result {
                 if error.code == "source_sequence_gap" {
                     error.message = format!(
-                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={}, consumer_max_frame_ns={})",
+                        "{} (previous_sequence={}, current_sequence={}, source_gap={}, queue_rejected={}, producer_max_interval_ns={}, producer_max_control_ns={}, producer_max_read_ns={}, consumer_max_frame_ns={}); source_frame_evidence={}",
                         error.message,
-                        frame
-                            .source_sequence
-                            .saturating_sub(validation.dropped_before + 1),
+                        previous_source_frame
+                            .map(|previous| previous.source_sequence)
+                            .unwrap_or(frame.source_sequence),
                         frame.source_sequence,
                         validation.source_gap,
                         validation.queue_rejected,
@@ -627,6 +715,11 @@ fn process_frame(
                             .lock()
                             .map(|state| state.max_consumer_frame_ns)
                             .unwrap_or(0),
+                        serde_json::json!({
+                            "schema": "openaria.source-frame-evidence.v1",
+                            "previous": previous_source_frame,
+                            "current": current_source_frame,
+                        }),
                     );
                 }
                 report_recording_failure(shared, error, Some(Arc::clone(&dispatch.on_failure)));
@@ -880,6 +973,9 @@ fn report_recording_failure(
             Err(_) => return,
         };
         let (should_report, _inflight) = state.fanout.mark_failure();
+        if let Some(recording) = &state.recording {
+            recording.request_capture_stop();
+        }
         let callback = if should_report {
             preferred_callback.or_else(|| {
                 state
@@ -912,6 +1008,9 @@ fn set_terminal_error(shared: &Shared, error: RuntimeError) {
         state.terminal_error = Some(error.clone());
         state.running = false;
         let (should_report, _inflight) = state.fanout.mark_failure();
+        if let Some(recording) = &state.recording {
+            recording.request_capture_stop();
+        }
         let callback = if should_report {
             state
                 .recording
@@ -962,6 +1061,42 @@ mod tests {
         std::env::temp_dir().join(format!("rp-ylx-{name}-{}-{unique}", std::process::id()))
     }
 
+    #[test]
+    fn capture_preview_shares_the_owned_raw_frame_without_copying() {
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(25).unwrap()),
+            2,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        let raw: Arc<[u8]> = Arc::from(&b"\xff\xd8payload\xff\xd9"[..]);
+        process_frame(
+            &runtime.preview,
+            &runtime.shared,
+            Frame {
+                buffer_flags: 0,
+                dequeue_monotonic_ns: 0,
+                source_sequence: 1,
+                host_monotonic_ns: 1_000_000,
+                application_dropped_before: 0,
+                producer_max_interval_ns: 0,
+                producer_max_control_ns: 0,
+                producer_max_read_ns: 0,
+                left: Vec::new(),
+                right: Vec::new(),
+                raw_side_by_side: Arc::clone(&raw),
+            },
+            None,
+        )
+        .unwrap();
+        let snapshot = runtime.preview.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&raw, &snapshot.jpeg));
+        assert_eq!(snapshot.sequence, 1);
+        assert!(!runtime.snapshot().unwrap().recording_present);
+    }
+
     fn test_recording(py: Python<'_>, root: &std::path::Path) -> SplitSinkRecording {
         fs::create_dir_all(root.join("video")).unwrap();
         SplitSinkRecording {
@@ -988,9 +1123,150 @@ mod tests {
                 recording::RecordingSegmentPlanner::new(3).unwrap(),
             )),
             recording_start_monotonic_ns: 1,
+            capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
             on_failure: Arc::new(PyBytes::new(py, b"on-failure").into_any().unbind()),
             imu: None,
+            audio: None,
         }
+    }
+
+    fn evidence_frame(sequence: u64, counter: Option<u32>) -> Frame {
+        let mut raw = b"prefix\xff\xd8".to_vec();
+        if let Some(counter) = counter {
+            raw.extend_from_slice(b"\xff\xe0\x00\x21");
+            let mut app0 = [0; 31];
+            app0[..8].copy_from_slice(b"AVI1\0\x01\x01\x01");
+            app0[10..13].copy_from_slice(&counter.to_be_bytes()[1..]);
+            raw.extend_from_slice(&app0);
+        }
+        raw.extend_from_slice(b"\xff\xd9");
+        Frame {
+            buffer_flags: 0x2000,
+            dequeue_monotonic_ns: sequence * 20_000_000 + 100_000,
+            source_sequence: sequence,
+            host_monotonic_ns: sequence * 20_000_000,
+            application_dropped_before: 0,
+            producer_max_interval_ns: 0,
+            producer_max_control_ns: 0,
+            producer_max_read_ns: 0,
+            left: Vec::new(),
+            right: Vec::new(),
+            raw_side_by_side: raw.into(),
+        }
+    }
+
+    #[test]
+    fn source_gap_callback_keeps_real_adjacent_frames_and_rejects_gap_before_reservation() {
+        pyo3::prepare_freethreaded_python();
+        // A gap on a normally decimated frame must still fail immediately.
+        for decimation in [1, 2, 3] {
+            let root = temp_root("source-gap-evidence");
+            let mut target = Python::with_gil(|py| test_recording(py, &root));
+            let helper = root.join("encoder-helper.sh");
+            fs::write(
+                &helper,
+                "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\n",
+            )
+            .unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut encoder = stereo_encoder::EncoderProcess::new(
+                &root.join("video"),
+                &helper,
+                3840,
+                1080,
+                60,
+                8192,
+                3,
+                "video/",
+            )
+            .unwrap();
+            encoder.start().unwrap();
+            target.encoder = Arc::new(Mutex::new(encoder));
+            let callbacks = Python::with_gil(|py| {
+                let module = pyo3::types::PyModule::from_code(
+                    py,
+                    c"calls = []\ndef on_failure(code, message):\n    calls.append((code, message))\n",
+                    c"source_gap_test.py",
+                    c"source_gap_test",
+                ).unwrap();
+                target.on_failure = Arc::new(module.getattr("on_failure").unwrap().unbind());
+                module.getattr("calls").unwrap().unbind()
+            });
+            let active_take = Arc::clone(&target.active_take);
+            let encoder = Arc::clone(&target.encoder);
+            let runtime = Runtime::new(
+                Arc::new(Stream::test_idle(1)),
+                Arc::new(LatestBuffer::new(25).unwrap()),
+                decimation,
+                Duration::from_millis(10),
+                None,
+            )
+            .unwrap();
+            // Preview-only gap at the recording boundary belongs to preview.
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(1, Some(101)),
+                None,
+            )
+            .unwrap();
+            {
+                let mut state = runtime.shared.state.lock().unwrap();
+                state.running = true;
+                state.fanout.start_recording().unwrap();
+                state.recording = Some(Arc::new(target));
+            }
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(10, Some(110)),
+                None,
+            )
+            .unwrap();
+            assert!(!runtime.snapshot().unwrap().failure_reported);
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(13, Some(113)),
+                None,
+            )
+            .unwrap();
+            assert!(!runtime.snapshot().unwrap().recording_present);
+            assert_eq!(encoder.lock().unwrap().submitted_frames(), 1);
+            let summary = active_take.lock().unwrap().finish().unwrap();
+            assert_eq!(summary.frames_written, 1);
+            assert_eq!(summary.frame_domain, 1);
+            assert_eq!(summary.pending_frames, 0);
+            Python::with_gil(|py| {
+                let calls: Vec<(String, String)> = callbacks.bind(py).extract().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, "source_sequence_gap");
+                assert!(calls[0].1.contains(
+                    "previous_sequence=10, current_sequence=13, source_gap=2, queue_rejected=0"
+                ));
+                let (_, evidence) = calls[0].1.split_once("; source_frame_evidence=").unwrap();
+                let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
+                assert_eq!(evidence["previous"]["source_sequence"], 10);
+                assert_eq!(evidence["previous"]["camera_counter_raw"], 110);
+                assert_eq!(evidence["current"]["camera_counter_raw"], 113);
+                assert_eq!(evidence["previous"]["host_monotonic_ns"], 200_000_000);
+                assert_eq!(evidence["current"]["host_monotonic_ns"], 260_000_000);
+                assert_eq!(evidence["current"]["dequeue_monotonic_ns"], 260_100_000);
+                assert_eq!(evidence["current"]["buffer_flags"], 0x2000);
+            });
+            drop(runtime);
+            drop(encoder);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn source_frame_evidence_does_not_invent_a_missing_camera_counter() {
+        let frame = evidence_frame(7, None);
+        let evidence = SourceFrameEvidence::from_frame(&frame);
+        assert_eq!(evidence.source_sequence, 7);
+        assert_eq!(evidence.camera_counter_raw, None);
+        assert_eq!(evidence.payload_bytes, frame.raw_side_by_side.len() as u64);
     }
 
     #[test]
@@ -1038,7 +1314,7 @@ mod tests {
                     producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
-                    raw_side_by_side: b"prefix\xff\xd8payload\xff\xd9suffix".to_vec(),
+                    raw_side_by_side: Arc::from(&b"prefix\xff\xd8payload\xff\xd9suffix"[..]),
                 },
                 0,
             )
@@ -1129,6 +1405,7 @@ mod tests {
                     None,
                     Duration::from_millis(10),
                     None,
+                    Arc::clone(&next.capture_stopped_monotonic_ns),
                 )
                 .unwrap();
             assert!(snapshot.recording_active);
@@ -1138,6 +1415,7 @@ mod tests {
             assert_eq!(error.code, "invalid_state");
             assert!(runtime.snapshot().unwrap().recording_active);
             runtime.stop_recording(Duration::from_secs(1)).unwrap();
+            assert!(next.capture_stopped_monotonic_ns.load(Ordering::Acquire) > 0);
             let _ = fs::remove_dir_all(root);
         });
     }
@@ -1194,13 +1472,20 @@ mod tests {
                 None,
             )
             .unwrap();
+            let audio = Arc::new(
+                crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap(),
+            );
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
                 state.fanout.start_recording().unwrap();
-                state.recording = Some(Arc::new(test_recording(py, &root)));
+                let mut target = test_recording(py, &root);
+                target.audio = Some(Arc::clone(&audio));
+                state.recording = Some(Arc::new(target));
             }
+            assert!(!audio.stop_requested());
             let (inflight, imu) = runtime.begin_recording_stop().unwrap();
+            assert!(audio.stop_requested());
             assert_eq!(inflight, 0);
             assert!(imu.is_none());
             {
@@ -1213,6 +1498,50 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root);
         });
+    }
+
+    #[test]
+    fn recording_failure_terminal_error_and_close_signal_audio_stop() {
+        pyo3::prepare_freethreaded_python();
+        for cause in ["recording", "terminal", "close"] {
+            Python::with_gil(|py| {
+                let root = temp_root("audio-stop-failure");
+                let runtime = Runtime::new(
+                    Arc::new(Stream::test_idle(1)),
+                    Arc::new(LatestBuffer::new(30).unwrap()),
+                    1,
+                    Duration::from_millis(10),
+                    None,
+                )
+                .unwrap();
+                let audio = Arc::new(
+                    crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0)
+                        .unwrap(),
+                );
+                let mut target = test_recording(py, &root);
+                target.audio = Some(Arc::clone(&audio));
+                {
+                    let mut state = runtime.shared.state.lock().unwrap();
+                    state.running = true;
+                    state.fanout.start_recording().unwrap();
+                    state.recording = Some(Arc::new(target));
+                }
+                assert!(!audio.stop_requested());
+                let error = super::RuntimeError::new("audio_failed", "test failure");
+                match cause {
+                    "recording" => super::report_recording_failure(&runtime.shared, error, None),
+                    "terminal" => super::set_terminal_error(&runtime.shared, error),
+                    "close" => {
+                        runtime.close(Duration::from_secs(1)).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(audio.stop_requested());
+                assert!(!runtime.snapshot().unwrap().recording_present);
+                drop(runtime);
+                let _ = fs::remove_dir_all(root);
+            });
+        }
     }
 
     #[test]
@@ -1248,6 +1577,7 @@ mod tests {
             None,
         )
         .unwrap();
+        let stopped = Arc::clone(&target.capture_stopped_monotonic_ns);
         let active_take = Arc::clone(&target.active_take);
         let sink = Arc::clone(&target.sink);
         let blocked_writer = active_take.lock().unwrap();
@@ -1274,7 +1604,7 @@ mod tests {
                     producer_max_read_ns: 0,
                     left: Vec::new(),
                     right: Vec::new(),
-                    raw_side_by_side: b"\xff\xd8payload\xff\xd9".to_vec(),
+                    raw_side_by_side: Arc::from(&b"\xff\xd8payload\xff\xd9"[..]),
                 },
                 None,
             )
@@ -1287,9 +1617,18 @@ mod tests {
         let (inflight, _) = runtime.begin_recording_stop().unwrap();
         assert_eq!(inflight, 1);
         assert!(!runtime.snapshot().unwrap().recording_active);
+        assert!(runtime.imu_stop.load(Ordering::Acquire));
+        let gate_closed = stopped.load(Ordering::Acquire);
+        assert!(gate_closed > 0 && gate_closed < u64::MAX);
+        thread::sleep(Duration::from_millis(20));
+        // Repeating a stop while a real frame still owns the writer must not
+        // move the boundary to the later drain/retry time.
+        runtime.begin_recording_stop().unwrap();
+        assert_eq!(stopped.load(Ordering::Acquire), gate_closed);
         // Stopping closes admission while the blocked frame still owns its resources.
         drop(blocked_writer);
         worker.join().unwrap().unwrap();
+        assert_eq!(stopped.load(Ordering::Acquire), gate_closed);
         let snapshot = runtime.snapshot().unwrap();
         assert_eq!(snapshot.inflight_frames, 0);
         assert!(!snapshot.recording_present);

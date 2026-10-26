@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -29,6 +30,7 @@ from rp_ylx.api.downloads import (
 )
 from rp_ylx.camera import FrameObservation
 from rp_ylx.imu import ImuObservation
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.native import (
     NativeModuleError,
     NativeRecordingPlan,
@@ -72,9 +74,6 @@ class _AudioRecorderAdapter(Protocol):
     def abort(self) -> None: ...
 
     def close(self) -> None: ...
-
-
-MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +221,7 @@ class SealedDeviceSession:
 class _FrameEvent:
     observation: FrameObservation
     record_sequence: int
+    accepted_elapsed: float
     payload_lease: PayloadLease | None = None
 
 
@@ -284,11 +284,11 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def write_json_atomic(path: Path, value: object) -> None:
+def write_json_atomic(path: Path, value: object, *, pretty: bool = True) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("xb") as stream:
-            payload = json_bytes(value, pretty=True)
+            payload = json_bytes(value, pretty=pretty)
             if stream.write(payload) != len(payload):
                 raise OSError(f"{path.name} 发生短写")
             stream.flush()
@@ -372,6 +372,19 @@ def _finalize_artifact(
     if not stat.S_ISREG(metadata.st_mode) or after != before:
         raise DeviceRecordingError(code, "artifact 在封存校验期间发生变化")
     return _FinalizedArtifact(sha256=digest, bytes=metadata.st_size, identity=after)
+
+
+def _verified_finalization(
+    path: Path, expected_bytes: int | None, *, code: str
+) -> tuple[_FinalizedArtifact, VerifiedArtifact]:
+    """Read fresh bytes and return a proof without mutating recorder state."""
+    before = verified_identity(path.stat(follow_symlinks=False))
+    # Same inode/size/mtime/ctime does not imply identical bytes on the
+    # camera's coarse-timestamp filesystem. Always read before admission.
+    result = _finalize_artifact(path, expected_bytes, code=code)
+    if verified_identity(path.stat(follow_symlinks=False)) != before:
+        raise DeviceRecordingError(code, "artifact changed during independent verification")
+    return result, VerifiedArtifact(before, result.sha256)
 
 
 def _jpeg_payload(payload: bytes) -> bytes:
@@ -675,6 +688,11 @@ class DeviceSessionRecorder:
         self._enqueue_timeout = enqueue_timeout
         self._checkpoint_interval = checkpoint_interval
         self._lock = threading.RLock()
+        # Serialize durable state and its callback without holding the status
+        # lock during filesystem I/O. A late checkpoint must not replace a
+        # newer finalizing state, either on disk or in the coordinator cache.
+        self._state_write_lock = threading.RLock()
+        self._writer_stopping = threading.Event()
         self._counter_lock = threading.Lock()
         self._state = "new"
         self._partial = self._root / f"{plan.session_id}.partial"
@@ -709,6 +727,7 @@ class DeviceSessionRecorder:
         self._verified_artifacts: dict[str, VerifiedArtifact] = {}
         self._live_sealing: LiveSealing | None = None
         self._stopped_elapsed: float | None = None
+        self._verification_compaction_total = 0
         self._writer: threading.Thread | None = None
         self._writer_error: BaseException | None = None
         self._started_at: datetime | None = None
@@ -722,6 +741,7 @@ class DeviceSessionRecorder:
         self._current_state: Mapping[str, object] | None = None
         self._last_checkpoint = 0.0
         self.recovered_session: SealedDeviceSession | None = None
+        self.recovery_attempted = False
 
     @property
     def state(self) -> str:
@@ -824,16 +844,17 @@ class DeviceSessionRecorder:
         diagnostics: list[Mapping[str, object]] | None = None,
         storage: StorageStatus | None = None,
     ) -> Mapping[str, object]:
-        document = self._state_document(
-            state,
-            diagnostics=[] if diagnostics is None else diagnostics,
-            storage=storage,
-        )
-        write_json_atomic(self._partial / "recording.json", document)
-        with self._lock:
-            self._current_state = document
-        self._state_sink(document)
-        return document
+        with self._state_write_lock:
+            document = self._state_document(
+                state,
+                diagnostics=[] if diagnostics is None else diagnostics,
+                storage=storage,
+            )
+            write_json_atomic(self._partial / "recording.json", document)
+            with self._lock:
+                self._current_state = document
+            self._state_sink(document)
+            return document
 
     def _verification_progress(self, completed: int, total: int) -> None:
         # This is live progress, not a recovery checkpoint. Avoid fsync for each
@@ -854,6 +875,11 @@ class DeviceSessionRecorder:
         # sink fsyncs coordinator recovery data; doing that per artifact adds
         # a disk barrier for every five-second audio segment. State transitions
         # and the final command result remain durable through _persist_state.
+
+    def independent_verification_progress(self, completed: int, total: int) -> None:
+        """Include full-content admission in live progress, retaining one final unit."""
+        offset = self._verification_compaction_total
+        self._verification_progress(offset + completed, offset + total + 1)
 
     def _live_audio_bytes(self) -> int:
         recorder = self._audio_recorder
@@ -899,7 +925,8 @@ class DeviceSessionRecorder:
             transaction = self._native_transaction
             if transaction is not None:
                 try:
-                    transaction_snapshot = transaction.snapshot()
+                    snapshot = getattr(transaction, "diagnostic_snapshot", transaction.snapshot)
+                    transaction_snapshot = snapshot()
                 except BaseException:
                     transaction_snapshot = None
                 sink_snapshot = (
@@ -967,8 +994,8 @@ class DeviceSessionRecorder:
                     }
                 if self._native_transaction is None:
                     encoder = self._encoder_factory(self._partial)
-                    encoder.start()
                     self._encoder = encoder
+                    encoder.start()
                     if self._config.audio_enabled:
                         if self._audio_recorder_factory is None:
                             raise DeviceRecordingError(
@@ -976,8 +1003,8 @@ class DeviceSessionRecorder:
                                 "源码测试音频路径必须显式注入 audio_recorder_factory",
                             )
                         audio = self._audio_recorder_factory(self._partial)
-                        audio.start()
                         self._audio_recorder = audio
+                        audio.start()
                 fsync_directory(self._partial)
                 fsync_directory(self._root)
                 if self._native_transaction is not None and self._config.lossless_storage:
@@ -986,7 +1013,30 @@ class DeviceSessionRecorder:
                         self._config.sensor_fps / self._config.frame_decimation,
                         self._config.frame_decimation,
                     )
+                # start() still owns the admission lock, so callbacks cannot
+                # enqueue work before both workers have started. Only retain
+                # threads after start succeeds: an unstarted thread cannot join.
+                self._state = "recording"
+                if self._native_transaction is None:
+                    writer = threading.Thread(
+                        target=self._writer_loop,
+                        name=f"rp-ylx-session-writer-{self._plan.session_id[:8]}",
+                        daemon=True,
+                    )
+                    writer.start()
+                    self._writer = writer
+                if self._encoder is not None or self._native_transaction is not None:
+                    # Segment hashes accumulate while recording so that stop() only
+                    # has to seal the trailing segment.
+                    harvester = threading.Thread(
+                        target=self._harvest_loop,
+                        name=f"rp-ylx-v1-segments-{self._plan.session_id[:8]}",
+                        daemon=True,
+                    )
+                    harvester.start()
+                    self._harvester = harvester
             except Exception as error:
+                self._stop_writer()
                 self._abandon_audio()
                 self._abandon_encoder()
                 self._close_files(ignore_errors=True)
@@ -995,23 +1045,6 @@ class DeviceSessionRecorder:
                 raise DeviceRecordingError(
                     "start_failed", f"创建 device-session 会话失败：{error}"
                 ) from error
-            self._state = "recording"
-            if self._native_transaction is None:
-                self._writer = threading.Thread(
-                    target=self._writer_loop,
-                    name=f"rp-ylx-session-writer-{self._plan.session_id[:8]}",
-                    daemon=True,
-                )
-                self._writer.start()
-            if self._encoder is not None or self._native_transaction is not None:
-                # Segment hashes accumulate while recording so that stop() only
-                # has to seal the trailing segment.
-                self._harvester = threading.Thread(
-                    target=self._harvest_loop,
-                    name=f"rp-ylx-v1-segments-{self._plan.session_id[:8]}",
-                    daemon=True,
-                )
-                self._harvester.start()
             return self._partial
 
     def _write(self, role: str, payload: bytes) -> None:
@@ -1072,7 +1105,7 @@ class DeviceSessionRecorder:
         payload = _jpeg_payload(frame.raw_side_by_side)
         ordinal = self._frames_written
         if ordinal % self._segment_frames == 0:
-            self._mark_segment_boundary(ordinal, event.record_sequence)
+            self._mark_segment_boundary(ordinal, event.record_sequence, event.accepted_elapsed)
         segment_index = ordinal // self._segment_frames
         segment_frame = ordinal % self._segment_frames
         try:
@@ -1095,11 +1128,9 @@ class DeviceSessionRecorder:
         if self._metrics is not None:
             self._metrics.finish("recording_frame", started)
 
-    def _mark_segment_boundary(self, ordinal: int, record_sequence: int) -> None:
+    def _mark_segment_boundary(self, ordinal: int, record_sequence: int, elapsed: float) -> None:
         """记录编码序号到帧域序号与经过时长的对应关系，用于封存分段边界。"""
 
-        assert self._started_monotonic_ns is not None
-        elapsed = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
         with self._segment_lock:
             self._boundary_record_sequence.setdefault(ordinal, record_sequence)
             self._boundary_elapsed.setdefault(ordinal, elapsed)
@@ -1152,7 +1183,22 @@ class DeviceSessionRecorder:
         """对助手已封好的分段计算 SHA-256 并登记封存身份。"""
 
         transaction = self._native_transaction
+        closed_offset = 0
         if transaction is not None:
+            closed_offset = self._harvested_segments
+            incremental = getattr(transaction, "segments_since", None)
+            if incremental is not None:
+                raw_segments = incremental(closed_offset)
+            else:
+                # Older native builds expose only the complete inventory.
+                raw_segments = transaction.segments()
+                if len(raw_segments) < closed_offset:
+                    raise DeviceRecordingError("segment_invalid", "encoder segment list regressed")
+                raw_segments = raw_segments[closed_offset:]
+            # Native closed segments are append-only and previously harvested
+            # records already have sealed identities. Revalidating their fields
+            # every 200 ms made Python work grow with the recording's duration.
+            # Validate every unharvested entry, including an unindexed tail.
             closed = tuple(
                 ClosedSegment(
                     index=_native_segment_uint(item.get("index"), "segment.index"),
@@ -1167,48 +1213,52 @@ class DeviceSessionRecorder:
                         item.get("right_bytes"), "segment.right_bytes"
                     ),
                 )
-                for item in transaction.segments()
+                for item in raw_segments
             )
         else:
             encoder = self._encoder
             if encoder is None:
                 return
             closed = encoder.segments
-        while self._harvested_segments < len(closed):
-            segment = closed[self._harvested_segments]
+        harvested_before = self._harvested_segments
+        while self._harvested_segments < closed_offset + len(closed):
+            segment = closed[self._harvested_segments - closed_offset]
             if transaction is not None:
-                available = transaction.snapshot()["sink"]["frames_written"]
+                available = transaction.snapshot()["sink"]["frames_indexed"]
             else:
                 available = self._frames_written
             if available < segment.end_frame:
                 # The helper can announce completion before the last index
                 # write returns. Commit only after that frame has an index.
-                return
+                break
             self._segment_records.append(self._segment_record(segment))
             self._harvested_segments += 1
-            # Commit each pair independently. Index files are append-only; sync
-            # them through separate descriptors so a slow flush never holds the
-            # capture sink mutex. Recovery still verifies the indexed prefix.
-            for relative in ("frames.ndjson", "imu.ndjson"):
-                stream = self._files.get(
-                    "frames.index" if relative == "frames.ndjson" else "imu.samples"
-                )
-                if stream is not None and not stream.closed:
-                    stream.flush()
-                descriptor = os.open(self._partial / relative, os.O_RDONLY | os.O_NOFOLLOW)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            write_json_atomic(
-                self._partial / "segments.json",
-                {
-                    "schema": "openaria.segment-checkpoint.v1",
-                    "session_id": self._plan.session_id,
-                    "segments": self._segment_records,
-                    "diagnostics": self._capture_diagnostics(),
-                },
+        # Publish the eligible contiguous batch in one durable checkpoint.
+        # Replaying several fsync barriers per already-closed pair magnifies
+        # IO stalls while catching up. Never include an frame still queued for indexing.
+        if self._harvested_segments == harvested_before:
+            return
+        for relative in ("frames.ndjson", "imu.ndjson"):
+            stream = self._files.get(
+                "frames.index" if relative == "frames.ndjson" else "imu.samples"
             )
+            if stream is not None and not stream.closed:
+                stream.flush()
+            descriptor = os.open(self._partial / relative, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        write_json_atomic(
+            self._partial / "segments.json",
+            {
+                "schema": "openaria.segment-checkpoint.v1",
+                "session_id": self._plan.session_id,
+                "segments": self._segment_records,
+                "diagnostics": self._capture_diagnostics(),
+            },
+            pretty=False,
+        )
 
     def _segment_record(self, segment: ClosedSegment) -> dict[str, object]:
         artifacts: dict[str, object] = {}
@@ -1335,7 +1385,8 @@ class DeviceSessionRecorder:
                 else None
             )
             if self._queue_put(
-                _FrameEvent(observation, record_sequence, lease), self._enqueue_timeout
+                _FrameEvent(observation, record_sequence, self._elapsed(), lease),
+                self._enqueue_timeout,
             ):
                 if self._metrics is not None:
                     self._metrics.observe_queue(
@@ -1372,29 +1423,42 @@ class DeviceSessionRecorder:
             raise failure
 
     def _checkpoint_if_due(self) -> None:
-        now = time.monotonic()
-        if (
-            self._checkpoint_interval > 0
-            and now - self._last_checkpoint < self._checkpoint_interval
-        ):
-            return
-        try:
-            self._persist_state("recording")
-        except BaseException as error:
-            code, _, _ = _failure_details(error)
-            raise DeviceRecordingError(code, f"录制状态 checkpoint 失败：{error}") from error
-        self._last_checkpoint = now
+        with self._state_write_lock:
+            if self._writer_stopping.is_set() or self._state != "recording":
+                return
+            now = time.monotonic()
+            if (
+                self._checkpoint_interval > 0
+                and now - self._last_checkpoint < self._checkpoint_interval
+            ):
+                return
+            try:
+                self._persist_state("recording")
+            except BaseException as error:
+                code, _, _ = _failure_details(error)
+                raise DeviceRecordingError(code, f"录制状态 checkpoint 失败：{error}") from error
+            # Slow storage must not cause an immediate catch-up checkpoint.
+            self._last_checkpoint = time.monotonic()
 
     def _stop_writer(self) -> None:
         writer = self._writer
         if writer is None:
             return
+        # Drain accepted media; lifecycle transitions and segment checkpoints
+        # retain durability without writing recording progress for every item.
+        self._writer_stopping.set()
         while writer.is_alive():
             if self._queue_put(_STOP, 0.1):
                 break
         writer.join(timeout=10)
-        if writer.is_alive() and self._writer_error is None:
-            self._writer_error = TimeoutError("v1 writer 未在期限内停止")
+        if writer.is_alive():
+            if self._writer_error is None:
+                self._writer_error = TimeoutError("v1 writer 未在期限内停止")
+            # A join timeout cannot cancel filesystem I/O. Keep ownership until
+            # the writer exits: callers close its streams and may recover the
+            # same files immediately after this method returns. The error also
+            # makes the writer discard queued work after its current write.
+            writer.join()
         self._writer = None
 
     _ROLE_PATHS = {
@@ -1579,10 +1643,39 @@ class DeviceSessionRecorder:
     def _capture_diagnostics(self) -> dict[str, object]:
         result: dict[str, object] = {"observed_monotonic_ns": time.monotonic_ns()}
         if self._metrics is not None:
-            result["capture"] = asdict(self._metrics.snapshot())
+            # The daemon shares these counters with preview and every recorder;
+            # they are not losses or histogram percentiles for this session.
+            result["capture_scope"] = "metrics_lifetime"
+            try:
+                result["capture"] = asdict(self._metrics.snapshot())
+            except Exception as error:
+                # Keep the original failure and independent encoder/index
+                # evidence even when the optional metrics snapshot fails.
+                result["capture_snapshot_error"] = str(error)
         if self._native_transaction is not None:
             try:
-                result["encoder"] = self._native_transaction.snapshot().get("encoder_stats", {})
+                diagnostic_snapshot = getattr(
+                    self._native_transaction,
+                    "diagnostic_snapshot",
+                    self._native_transaction.snapshot,
+                )
+                snapshot = diagnostic_snapshot()
+                result["encoder"] = snapshot.get("encoder_stats", {})
+                result["encoder_failure"] = snapshot.get("encoder_failure")
+                result["audio_failure"] = snapshot.get("audio_failure")
+                sink = snapshot.get("sink", {})
+                result["index_writer"] = {
+                    name: sink.get(name)
+                    for name in (
+                        "frames_written",
+                        "frames_indexed",
+                        "imu_samples_written",
+                        "imu_samples_indexed",
+                        "index_pending_bytes",
+                        "index_peak_bytes",
+                        "index_max_write_ns",
+                    )
+                }
             except Exception as error:
                 result["snapshot_error"] = str(error)
         elif self._encoder is not None:
@@ -1592,6 +1685,9 @@ class DeviceSessionRecorder:
     def recover_completed_segments(self) -> SealedDeviceSession | None:
         from rp_ylx.recording.recovery import recover_device_session
 
+        # A failed attempt may have scanned a multi-hour take. The coordinator
+        # must not repeat it immediately; a later explicit retry or boot may.
+        self.recovery_attempted = True
         try:
             self.recovered_session = recover_device_session(self._partial)
             return self.recovered_session
@@ -1687,9 +1783,8 @@ class DeviceSessionRecorder:
         if sample_format != "S16_LE":
             raise DeviceRecordingError("audio_invalid", "audio.sample_format 必须是 S16_LE")
         bytes_per_sample_frame = channels * 2
-        self._audio_result = dict(result)
-        self._audio_segment_records = []
-        self._audio_bytes = 0
+        # Validate the entire producer inventory before submitting any reads.
+        inventory = []
         expected_sample = 0
         for expected_index, raw_segment in enumerate(segments):
             if not isinstance(raw_segment, Mapping):
@@ -1699,46 +1794,89 @@ class DeviceSessionRecorder:
                 raw_segment.get("start_sample"), "audio.segments[].start_sample"
             )
             end_sample = _strict_int(raw_segment.get("end_sample"), "audio.segments[].end_sample")
-            relative = str(raw_segment.get("path"))
+            relative = raw_segment.get("path")
             if (
                 index != expected_index
                 or start_sample != expected_sample
                 or end_sample <= start_sample
             ):
                 raise DeviceRecordingError("audio_invalid", "音频分段序号或采样域不连续")
-            if not relative.startswith("audio/") or not relative.endswith(".wav"):
+            # Match the native producer's assigned path before any file I/O.
+            # Prefix/suffix checks also admit traversal and another segment.
+            if not isinstance(relative, str) or relative != f"audio/audio_{index:05d}.wav":
                 raise DeviceRecordingError("audio_invalid", "音频 artifact 路径无效")
-            path = self._partial / relative
-            finalized = self._finalize_for_seal(path, None, code="audio_invalid")
-            pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
-            wav_header_bytes = finalized.bytes - pcm_payload_bytes
-            if wav_header_bytes < 44 or wav_header_bytes > 65_536:
-                raise DeviceRecordingError("audio_invalid", "音频 WAV header 与采样字节数不一致")
-            self._artifact_identities[relative] = finalized.identity
-            self._audio_bytes += finalized.bytes
-            self._audio_segment_records.append(
-                {
-                    "index": index,
-                    "start_sample": start_sample,
-                    "end_sample": end_sample,
-                    "start_time_seconds": float(raw_segment["start_time_seconds"]),
-                    "end_time_seconds": float(raw_segment["end_time_seconds"]),
-                    "pcm_payload_bytes": pcm_payload_bytes,
-                    "wav_header_bytes": wav_header_bytes,
-                    "artifact": {
-                        "artifact_id": finalized.sha256,
-                        "role": "audio.wav",
-                        "path": relative,
-                        "media_type": "audio/wav",
-                        "bytes": finalized.bytes,
-                        "sha256": finalized.sha256,
-                    },
-                }
-            )
+            inventory.append((index, start_sample, end_sample, relative, raw_segment))
             expected_sample = end_sample
         sample_count = _strict_int(result.get("sample_count"), "audio.sample_count")
         if sample_count != expected_sample:
             raise DeviceRecordingError("audio_invalid", "音频总采样数与分段不一致")
+
+        records = []
+        proofs = {}
+        identities = {}
+        audio_bytes = 0
+        # Keep at most two unconsumed reads, replenishing after ordered assembly.
+        # A stalled read must not impose a separate two-file batch barrier.
+        # Workers only return data;
+        # ordered assembly and recorder mutation remain on the calling thread.
+        # The context joins both workers even if a read or assembly fails.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-inventory") as pool:
+            pending = deque(
+                pool.submit(
+                    _verified_finalization,
+                    self._partial / segment[3],
+                    None,
+                    code="audio_invalid",
+                )
+                for segment in inventory[:2]
+            )
+            for offset, segment in enumerate(inventory):
+                future = pending.popleft()
+                index, start_sample, end_sample, relative, raw_segment = segment
+                finalized, proof = future.result()
+                pcm_payload_bytes = (end_sample - start_sample) * bytes_per_sample_frame
+                wav_header_bytes = finalized.bytes - pcm_payload_bytes
+                if wav_header_bytes < 44 or wav_header_bytes > 65_536:
+                    raise DeviceRecordingError(
+                        "audio_invalid", "音频 WAV header 与采样字节数不一致"
+                    )
+                identities[relative] = finalized.identity
+                proofs[relative] = proof
+                audio_bytes += finalized.bytes
+                records.append(
+                    {
+                        "index": index,
+                        "start_sample": start_sample,
+                        "end_sample": end_sample,
+                        "start_time_seconds": float(raw_segment["start_time_seconds"]),
+                        "end_time_seconds": float(raw_segment["end_time_seconds"]),
+                        "pcm_payload_bytes": pcm_payload_bytes,
+                        "wav_header_bytes": wav_header_bytes,
+                        "artifact": {
+                            "artifact_id": finalized.sha256,
+                            "role": "audio.wav",
+                            "path": relative,
+                            "media_type": "audio/wav",
+                            "bytes": finalized.bytes,
+                            "sha256": finalized.sha256,
+                        },
+                    }
+                )
+                if offset + 2 < len(inventory):
+                    pending.append(
+                        pool.submit(
+                            _verified_finalization,
+                            self._partial / inventory[offset + 2][3],
+                            None,
+                            code="audio_invalid",
+                        )
+                    )
+        # Publish only a complete inventory; failures leave existing state intact.
+        self._audio_result = dict(result)
+        self._audio_segment_records = records
+        self._audio_bytes = audio_bytes
+        self._artifact_identities.update(identities)
+        self._verified_artifacts.update(proofs)
 
     def _audio_block(self) -> dict[str, object]:
         if self._audio_result is None or not self._audio_segment_records:
@@ -1843,6 +1981,8 @@ class DeviceSessionRecorder:
         verified_at: datetime,
         sealed_at: datetime,
         duration: float,
+        *,
+        audio: dict[str, object] | None = None,
     ) -> dict[str, object]:
         video = self._video_block(duration)
         imu = self._artifact("imu.samples", "imu.ndjson", "application/x-ndjson")
@@ -1932,7 +2072,7 @@ class DeviceSessionRecorder:
             },
         }
         manifest["audio"] = (
-            self._audio_block()
+            (audio if audio is not None else self._audio_block())
             if self._config.audio_enabled
             else {
                 "state": "not_recorded",
@@ -2019,18 +2159,8 @@ class DeviceSessionRecorder:
         self, path: Path, expected_bytes: int | None, *, code: str
     ) -> _FinalizedArtifact:
         relative = path.relative_to(self._partial).as_posix()
-        before = verified_identity(path.stat(follow_symlinks=False))
-        proof = self._verified_artifacts.get(relative)
-        if proof is not None and proof.identity == before:
-            if expected_bytes is not None and expected_bytes != before[4]:
-                raise DeviceRecordingError(code, "closed artifact size changed")
-            return _FinalizedArtifact(
-                proof.sha256, before[4], (before[0], before[1], before[4], before[5])
-            )
-        result = _finalize_artifact(path, expected_bytes, code=code)
-        if verified_identity(path.stat(follow_symlinks=False)) != before:
-            raise DeviceRecordingError(code, "artifact changed during independent verification")
-        self._verified_artifacts[relative] = VerifiedArtifact(before, result.sha256)
+        result, proof = _verified_finalization(path, expected_bytes, code=code)
+        self._verified_artifacts[relative] = proof
         return result
 
     def stop(self, *, before_publish: Callable[[], None] | None = None) -> SealedDeviceSession:
@@ -2046,7 +2176,9 @@ class DeviceSessionRecorder:
             if self._state != "recording":
                 raise DeviceRecordingError("invalid_state", "只有 recording 会话可以停止")
             self._state = "finalizing"
-            self._stopped_elapsed = self._elapsed()
+            assert self._started_monotonic_ns is not None
+            stop_observed_ns = time.monotonic_ns()
+            self._stopped_elapsed = max(0.0, (stop_observed_ns - self._started_monotonic_ns) / 1e9)
         published = False
         prepared = None
         live_audit = None
@@ -2064,10 +2196,29 @@ class DeviceSessionRecorder:
             stage_started = now
 
         try:
+            capture_ended_at = self._now()
+            transaction = self._native_transaction
+            if transaction is not None:
+                transaction.request_audio_stop()
+                boundary = transaction.capture_stopped_monotonic_ns
+                if boundary is not None:
+                    if (
+                        isinstance(boundary, bool)
+                        or not isinstance(boundary, int)
+                        or not self._started_monotonic_ns <= boundary <= stop_observed_ns
+                    ):
+                        raise DeviceRecordingError(
+                            "native_session_store_failed", "原生采集停止边界超出已观测采集窗口"
+                        )
+                    # The native frame/IMU gate closes before source draining.
+                    # Retain accepted frames and real audio tail, but exclude
+                    # time spent joining workers or waiting on their disk I/O.
+                    with self._lock:
+                        self._stopped_elapsed = (boundary - self._started_monotonic_ns) / 1e9
+                    capture_ended_at -= timedelta(seconds=(stop_observed_ns - boundary) / 1e9)
             self._persist_state("finalizing")
             finished_stage("finalizing_checkpoint")
             assert self._started_monotonic_ns is not None
-            transaction = self._native_transaction
             if transaction is None:
                 self._stop_writer()
                 if self._writer_error is not None:
@@ -2076,8 +2227,8 @@ class DeviceSessionRecorder:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
                 self._finish_audio()
                 self._sync_and_close_files()
-            ended_at = self._now()
-            duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
+            ended_at = capture_ended_at
+            duration = self._stopped_elapsed
             if transaction is None:
                 self._finish_encoder(duration)
             else:
@@ -2119,17 +2270,52 @@ class DeviceSessionRecorder:
                 finished_stage("video_tail")
                 if self._frames_written == 0:
                     raise DeviceRecordingError("no_frames", "没有可封存的相机帧")
-                # Native finish joins audio capture; its final samples can arrive
-                # after the stop request timestamp passed to the video planner.
-                ended_at = self._now()
-                duration = max(0.0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
+            audio = self._audio_block() if self._config.audio_enabled else None
+            if audio is not None:
+                # Audio can finish after the video gate closes. Preserve its
+                # actual last sample, excluding durable writes and sealing work.
+                audio_end = float(audio["sync"]["end_time_seconds"])
+                assert self._audio_result is not None
+                thread_end = (
+                    _strict_int(
+                        self._audio_result.get("stopped_monotonic_ns"), "audio.stopped_monotonic_ns"
+                    )
+                    - self._started_monotonic_ns
+                ) / 1e9
+                clock = audio.get("capture_clock")
+                if isinstance(clock, Mapping):
+                    thread_end = max(
+                        thread_end,
+                        (
+                            _strict_int(
+                                clock.get("thread_stopped_monotonic_ns"),
+                                "audio.thread_stopped_monotonic_ns",
+                            )
+                            - self._started_monotonic_ns
+                        )
+                        / 1e9,
+                    )
+                observed_end = (time.monotonic_ns() - self._started_monotonic_ns) / 1e9
+                if not math.isfinite(audio_end) or max(audio_end, thread_end) > observed_end:
+                    raise DeviceRecordingError("audio_invalid", "音频结束时间超出已观测采集窗口")
+                duration = max(duration, audio_end, thread_end)
+                ended_at += timedelta(seconds=duration - self._stopped_elapsed)
             self._enforce_quality_policy(duration)
             self._persist_state("verifying")
             finished_stage("verifying_checkpoint")
             verified_at = self._now()
             sealed_at = self._now()
-            manifest = self._manifest(ended_at, verified_at, sealed_at, duration)
+            manifest = self._manifest(ended_at, verified_at, sealed_at, duration, audio=audio)
             compacted_originals: list[str] = []
+            artifact_count = len(_manifest_artifacts(manifest))
+
+            def compaction_progress(completed: int, total: int) -> None:
+                self._verification_compaction_total = total
+                # Compaction replaces descriptors one-for-one. Count the full
+                # independent content readback too; reserve only publication
+                # and the final identity recheck as the last unit.
+                self._verification_progress(completed, total + artifact_count + 1)
+
             if self._config.lossless_storage:
                 from rp_ylx.recording.audit import capture_audit
                 from rp_ylx.recording.storage import compact_manifest
@@ -2164,11 +2350,7 @@ class DeviceSessionRecorder:
                         manifest,
                         finalize_compacted,
                         prepared=prepared,
-                        # Reserve the last unit for audit, publication and the
-                        # coordinator's independent verification admission.
-                        progress=lambda completed, total: self._verification_progress(
-                            completed, total + 1
-                        ),
+                        progress=compaction_progress,
                     )
                     manifest["capture_audit"] = live_audit if audited is None else audited.result()
                 for relative in compacted_originals:
@@ -2221,6 +2403,10 @@ class DeviceSessionRecorder:
                 self._validate_artifact_bytes(manifest, root=self._final)
             finished_stage("publication")
         except BaseException as error:
+            # The finalizing checkpoint can fail before the normal writer join.
+            # Its accepted writes still own the encoder and journal streams;
+            # drain them before any failure cleanup closes those resources.
+            self._stop_writer()
             if self._native_transaction is not None:
                 with suppress(BaseException):
                     self._native_transaction.abort(str(error))
@@ -2306,7 +2492,12 @@ class DeviceSessionRecorder:
             # Preserve native progress before abort releases the transaction.
             # Failed recordings must not report zero frames after writing media.
             with suppress(BaseException):
-                sink = self._native_transaction.snapshot().get("sink")
+                snapshot = getattr(
+                    self._native_transaction,
+                    "diagnostic_snapshot",
+                    self._native_transaction.snapshot,
+                )
+                sink = snapshot().get("sink")
                 if isinstance(sink, Mapping):
                     self._frames_written = max(
                         self._frames_written,
@@ -2365,9 +2556,12 @@ def _open_regular_at(root_fd: int, relative: str, *, code: str) -> int:
     directory_flags = (
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
-    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
     current_fd = root_fd
     owned_directory_fd: int | None = None
+    descriptor: int | None = None
     try:
         for component in path.parts[:-1]:
             next_fd = os.open(component, directory_flags, dir_fd=current_fd)
@@ -2378,14 +2572,17 @@ def _open_regular_at(root_fd: int, relative: str, *, code: str) -> int:
         descriptor = os.open(path.parts[-1], file_flags, dir_fd=current_fd)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            os.close(descriptor)
             raise DeviceRecordingError(code, f"不是独占普通文件：{relative}")
-        return descriptor
+        result = descriptor
+        descriptor = None  # Ownership transfers to the caller only after validation.
+        return result
     except DeviceRecordingError:
         raise
     except OSError as error:
         raise DeviceRecordingError(code, f"无法安全打开 {relative}：{error}") from error
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if owned_directory_fd is not None:
             os.close(owned_directory_fd)
 
@@ -2516,10 +2713,12 @@ def validate_device_session_directory(
     expected_session_id: str | None = None,
     interrupt_check: Callable[[], None] | None = None,
     verified_artifacts: Mapping[str, VerifiedArtifact] | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> Mapping[str, object]:
-    """校验 manifest 和所有 artifact；仅本次录制的独立读回证明可复用。
+    """校验 manifest 和所有 artifact 的当前内容。
 
-    CLI、恢复和历史会话均不提供缓存，仍逐字节读取。缓存从不从磁盘加载。
+    保留 verified_artifacts 参数以兼容调用方，但文件属性相同不能证明
+    内容不变：包括本次封存/恢复在内，每次发布校验都完整读回。
     """
 
     root = Path(path)
@@ -2545,6 +2744,8 @@ def validate_device_session_directory(
             selected_session_id = root.name if expected_session_id is None else expected_session_id
             manifest = validated_device_session_payload(payload, selected_session_id)
             descriptors = _manifest_artifacts(manifest)
+            if progress is not None:
+                progress(0, len(descriptors))
 
             def verify_artifact(artifact_descriptor):
                 if interrupt_check is not None:
@@ -2562,11 +2763,6 @@ def validate_device_session_directory(
                     code="artifact_invalid",
                 )
                 try:
-                    proof = None if verified_artifacts is None else verified_artifacts.get(relative)
-                    if proof is not None and proof.matches(
-                        os.fstat(artifact_fd), expected_bytes, expected_sha256
-                    ):
-                        return
                     _verify_artifact_fd(
                         artifact_fd,
                         expected_bytes,
@@ -2579,8 +2775,10 @@ def validate_device_session_directory(
             if interrupt_check is not None:
                 # Catalog verification must yield promptly to a new recording;
                 # keep its existing sequential interruption semantics.
-                for descriptor in descriptors:
+                for completed, descriptor in enumerate(descriptors, 1):
                     verify_artifact(descriptor)
+                    if progress is not None:
+                        progress(completed, len(descriptors))
             else:
                 # Each worker owns its artifact fd; the pinned root stays open
                 # until both have joined. Uncached or changed files are fully
@@ -2588,8 +2786,20 @@ def validate_device_session_directory(
                 with ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="session-verify"
                 ) as executor:
-                    for _ in executor.map(verify_artifact, descriptors):
-                        pass
+                    # Keep queued reads bounded too. A bad digest or failed
+                    # progress callback must not enqueue the entire recording.
+                    pending = deque(
+                        executor.submit(verify_artifact, descriptor)
+                        for descriptor in descriptors[:2]
+                    )
+                    for completed in range(1, len(descriptors) + 1):
+                        pending.popleft().result()
+                        if progress is not None:
+                            progress(completed, len(descriptors))
+                        if completed + 1 < len(descriptors):
+                            pending.append(
+                                executor.submit(verify_artifact, descriptors[completed + 1])
+                            )
             return manifest
         finally:
             os.close(root_fd)

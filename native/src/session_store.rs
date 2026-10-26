@@ -7,6 +7,7 @@ use crate::recording::{
 use crate::stereo_encoder::{self, EncoderProcess, SegmentEvent};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -83,9 +84,10 @@ pub(crate) struct TransactionSnapshot {
     pub(crate) active_take: ActiveTakeSnapshot,
     pub(crate) sink: RecordingSinkSnapshot,
     pub(crate) audio: Option<AudioRecordingSnapshot>,
-    pub(crate) segments: Vec<SegmentEvent>,
+    pub(crate) audio_failure: Option<audio::AudioError>,
     pub(crate) submitted_frames: u64,
     pub(crate) encoder_stats: BTreeMap<String, i64>,
+    pub(crate) encoder_failure: Option<crate::stereo_encoder::EncoderProcessError>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,8 +120,10 @@ pub(crate) struct SessionTransaction {
     pub(crate) encoder: Arc<Mutex<EncoderProcess>>,
     pub(crate) segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     pub(crate) recording_start_monotonic_ns: u64,
+    pub(crate) capture_stopped_monotonic_ns: Arc<AtomicU64>,
     pub(crate) audio: Option<Arc<Recorder>>,
     state: Mutex<State>,
+    segment_inventory: Mutex<()>,
 }
 
 impl SessionTransaction {
@@ -184,16 +188,24 @@ impl SessionTransaction {
             encoder,
             segment_planner,
             recording_start_monotonic_ns: plan.recording_start_monotonic_ns,
+            capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
             audio,
             state: Mutex::new(State {
                 lifecycle: Lifecycle::Recording,
                 registered_segments: 0,
                 outcome: None,
             }),
+            segment_inventory: Mutex::new(()),
         })
     }
 
     pub(crate) fn ensure_recording(&self) -> Result<(), StoreError> {
+        if self.capture_stopped_monotonic_ns.load(Ordering::Acquire) != 0 {
+            return Err(StoreError::new(
+                "invalid_state",
+                "session transaction capture gate has already closed",
+            ));
+        }
         if let Some(audio) = &self.audio {
             audio.check_health()?;
         }
@@ -228,6 +240,16 @@ impl SessionTransaction {
         if let Some(audio) = &self.audio {
             audio.check_health()?;
         }
+        self.diagnostic_snapshot()
+    }
+
+    pub(crate) fn diagnostic_snapshot(&self) -> Result<TransactionSnapshot, StoreError> {
+        // Health failures must stop capture, but must not hide other components'
+        // progress and first errors when collecting a failure checkpoint.
+        let audio_failure = self
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.check_health().err());
         let lifecycle = self
             .state
             .lock()
@@ -243,15 +265,15 @@ impl SessionTransaction {
             .lock()
             .map_err(|_| StoreError::poisoned("sink"))?
             .snapshot();
-        let (segments, submitted_frames, encoder_stats) = {
+        let (submitted_frames, encoder_stats, encoder_failure) = {
             let encoder = self
                 .encoder
                 .lock()
                 .map_err(|_| StoreError::poisoned("encoder"))?;
             (
-                encoder.segments(),
                 encoder.submitted_frames(),
                 encoder.stats(),
+                encoder.failure(),
             )
         };
         Ok(TransactionSnapshot {
@@ -264,20 +286,77 @@ impl SessionTransaction {
             active_take,
             sink,
             audio: self.audio.as_ref().map(|audio| audio.snapshot()),
-            segments,
+            audio_failure,
             submitted_frames,
             encoder_stats,
+            encoder_failure,
         })
     }
 
     pub(crate) fn segments(&self) -> Result<Vec<SegmentEvent>, StoreError> {
-        let segments = self
+        self.segments_since(0)
+    }
+
+    pub(crate) fn segments_since(&self, offset: usize) -> Result<Vec<SegmentEvent>, StoreError> {
+        // Serialize the inventory snapshot with planner registration. Capturing
+        // them separately lets a concurrent reader register a newer inventory
+        // before an older snapshot, falsely reporting a regression.
+        let _inventory = self
+            .segment_inventory
+            .lock()
+            .map_err(|_| StoreError::poisoned("segment inventory"))?;
+        let registered = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::poisoned("state"))?
+            .registered_segments;
+        let start = offset.min(registered);
+        let mut segments = self
             .encoder
             .lock()
             .map_err(|_| StoreError::poisoned("encoder"))?
-            .segments();
-        self.register_segments(&segments)?;
-        Ok(segments)
+            .segments_since(start)?;
+        // The encoder lock is released before the planner is acquired. Capture
+        // submission also releases the planner before acquiring the encoder.
+        // Do not hold the lifecycle state while waiting on encoder submission.
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StoreError::poisoned("state"))?;
+        let total = start + segments.len();
+        if total < state.registered_segments {
+            return Err(StoreError::new(
+                "segment_invalid",
+                "encoder segment list regressed",
+            ));
+        }
+        if offset > total {
+            return Err(StoreError::new(
+                "invalid_argument",
+                "segment offset exceeds inventory",
+            ));
+        }
+        let mut planner = self
+            .segment_planner
+            .lock()
+            .map_err(|_| StoreError::poisoned("segment planner"))?;
+        for segment in &segments[state.registered_segments - start..] {
+            planner.register_segment(segment.index, segment.start_frame, segment.end_frame)?;
+            state.registered_segments += 1;
+        }
+        if offset == start {
+            Ok(segments)
+        } else {
+            // A first caller may ask beyond the registered prefix. Register
+            // that prefix as well, but expose only the requested window.
+            Ok(segments.split_off(offset - start))
+        }
+    }
+
+    pub(crate) fn request_audio_stop(&self) {
+        if let Some(audio) = &self.audio {
+            audio.request_stop();
+        }
     }
 
     pub(crate) fn finish(
@@ -312,6 +391,7 @@ impl SessionTransaction {
             }
         }
 
+        self.request_audio_stop();
         let result = self.finish_inner(duration, timeout);
         match result {
             Ok(outcome) => {
@@ -438,6 +518,10 @@ impl SessionTransaction {
     }
 
     fn register_segments(&self, segments: &[SegmentEvent]) -> Result<(), StoreError> {
+        let _inventory = self
+            .segment_inventory
+            .lock()
+            .map_err(|_| StoreError::poisoned("segment inventory"))?;
         let mut state = self
             .state
             .lock()
@@ -532,6 +616,167 @@ mod tests {
         }
     }
 
+    fn segmented_helper(root: &Path, count: usize) -> PathBuf {
+        let helper = encoder_helper(root);
+        let mut events = String::new();
+        for index in 0..count {
+            let event = serde_json::json!({
+                "event": "segment", "index": index,
+                "start_frame": index * 3, "end_frame": (index + 1) * 3,
+                "left": {"path": format!("video/left_{index:05}.mp4"), "bytes": 1},
+                "right": {"path": format!("video/right_{index:05}.mp4"), "bytes": 1}
+            });
+            events.push_str(&event.to_string());
+            events.push('\n');
+        }
+        fs::write(root.join("events.ndjson"), events).unwrap();
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+cat "$(dirname "$0")/events.ndjson"
+printf '{"event":"ready"}\n'
+cat >/dev/null
+printf '{"event":"done","frames":0}\n'
+"#,
+        )
+        .unwrap();
+        helper
+    }
+
+    #[test]
+    fn segment_window_registers_skipped_prefix_and_rejects_bad_offset_without_mutation() {
+        let root = temp_root("segment-window");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 3);
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        assert_eq!(
+            transaction.segments_since(4).unwrap_err().code,
+            "invalid_argument"
+        );
+        assert_eq!(transaction.state.lock().unwrap().registered_segments, 0);
+        assert_eq!(transaction.segments_since(2).unwrap()[0].index, 2);
+        assert_eq!(transaction.state.lock().unwrap().registered_segments, 3);
+        assert_eq!(
+            transaction
+                .segment_planner
+                .lock()
+                .unwrap()
+                .snapshot()
+                .segment_count,
+            3
+        );
+        assert!(transaction.segments_since(3).unwrap().is_empty());
+        assert_eq!(transaction.segments().unwrap().len(), 3);
+        transaction.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_capture_gate_rejects_reattachment_but_retains_cleanup_ownership() {
+        let root = temp_root("closed-capture-gate");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 0);
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        transaction.ensure_recording().unwrap();
+        transaction
+            .capture_stopped_monotonic_ns
+            .store(10, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            transaction.ensure_recording().unwrap_err().code,
+            "invalid_state"
+        );
+        assert_eq!(transaction.snapshot().unwrap().state, "recording");
+        transaction.abort();
+        assert_eq!(transaction.open_handle_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn segment_window_still_rejects_inventory_regression() {
+        let root = temp_root("segment-regression");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 3);
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        transaction.state.lock().unwrap().registered_segments = 4;
+        for offset in [0, 2, 4] {
+            assert_eq!(
+                transaction.segments_since(offset).unwrap_err().code,
+                "segment_invalid"
+            );
+        }
+        transaction.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_segment_windows_register_each_segment_once() {
+        let root = temp_root("segment-concurrency");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 120);
+        let transaction = std::sync::Arc::new(
+            SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap(),
+        );
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let transaction = std::sync::Arc::clone(&transaction);
+                scope.spawn(move || {
+                    for index in 0..100 {
+                        let offset = (index + worker) % 121;
+                        let tail = transaction.segments_since(offset).unwrap();
+                        assert_eq!(tail.len(), 120 - offset);
+                        assert!(
+                            tail.iter()
+                                .enumerate()
+                                .all(|(i, segment)| segment.index == (i + offset) as u64)
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(transaction.state.lock().unwrap().registered_segments, 120);
+        assert_eq!(
+            transaction
+                .segment_planner
+                .lock()
+                .unwrap()
+                .snapshot()
+                .segment_count,
+            120
+        );
+        transaction.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_segment_inventory_does_not_hold_lifecycle_state() {
+        let root = temp_root("segment-state-lock");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 3);
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        let encoder = transaction.encoder.lock().unwrap();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| transaction.segments_since(0));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let entered = loop {
+                if transaction.segment_inventory.try_lock().is_err() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            // The inventory reader now waits for the encoder held above.
+            std::thread::sleep(Duration::from_millis(10));
+            let state_available = transaction.state.try_lock().is_ok();
+            drop(encoder);
+            assert_eq!(reader.join().unwrap().unwrap().len(), 3);
+            assert!(entered && state_available);
+        });
+        transaction.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejects_invalid_start_before_acquiring_resources() {
         let root = temp_root("invalid-start");
@@ -553,6 +798,10 @@ mod tests {
         let helper = encoder_helper(&root);
         let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
         assert_eq!(transaction.open_handle_count(), 1);
+        transaction.request_audio_stop();
+        transaction.request_audio_stop();
+        transaction.ensure_recording().unwrap();
+        assert_eq!(transaction.open_handle_count(), 1);
         let first = transaction
             .finish(Duration::from_millis(1), Duration::from_secs(2))
             .unwrap();
@@ -562,6 +811,44 @@ mod tests {
         assert_eq!(first.active_take.frames_written, 0);
         assert_eq!(second.encoder_stats, first.encoder_stats);
         assert_eq!(transaction.open_handle_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_failure_remains_fatal_but_does_not_hide_diagnostics() {
+        let root = temp_root("failed-audio-diagnostics");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = encoder_helper(&root);
+        let mut transaction =
+            SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        let audio =
+            crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap();
+        audio.inject_failure(crate::audio::AudioError::new(
+            "audio_failed",
+            "audio durable commit backlog exhausted",
+        ));
+        transaction.audio = Some(std::sync::Arc::new(audio));
+        let first = transaction.snapshot().unwrap_err();
+        assert_eq!(first.code, "audio_failed");
+        let diagnostics = transaction.diagnostic_snapshot().unwrap();
+        assert_eq!(diagnostics.state, "recording");
+        assert_eq!(diagnostics.sink.frames_indexed, 0);
+        assert_eq!(diagnostics.submitted_frames, 0);
+        assert!(diagnostics.audio.is_some());
+        let failure = diagnostics.audio_failure.unwrap();
+        assert_eq!(failure.code, first.code);
+        assert_eq!(failure.message, first.message);
+        // Diagnostic observation must neither clear the fault nor authorize writes.
+        assert_eq!(transaction.ensure_recording().unwrap_err(), first);
+        assert_eq!(transaction.snapshot().unwrap_err(), first);
+        transaction.abort();
+        assert!(
+            transaction
+                .diagnostic_snapshot()
+                .unwrap()
+                .audio_failure
+                .is_some()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

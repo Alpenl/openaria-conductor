@@ -21,6 +21,7 @@
 
 #define DECODER_INPUT_TIMEOUT_MS 200
 #define DECODER_OUTPUT_TIMEOUT_MS 200
+#define DECODER_DRAIN_POLLS 25 /* 5s without output after input stops */
 #define ENCODER_INPUT_TIMEOUT_MS 1000
 #define ENCODER_OUTPUT_TIMEOUT_MS 200
 #define ENCODER_DRAIN_POLLS 25 /* 5s ceiling on a stuck VPU drain */
@@ -28,6 +29,11 @@
 #define PATH_LEN 512
 #define MUX_QUEUE_BYTES (32u * 1024u * 1024u) /* per eye, compressed packets */
 #define MUX_QUEUE_SECONDS 16u
+/* Include both writable eyes, queued segments and the in-flight disk sealer.
+ * Otherwise a stalled fsync can retain muxers indefinitely while writers keep
+ * opening files. At five seconds per segment this permits over a minute of
+ * backlog before reporting an explicit storage failure. */
+#define MAX_PENDING_SEGMENTS 32u
 
 typedef struct segment {
     struct segment *next;
@@ -47,6 +53,7 @@ typedef struct {
     pthread_t thread;
     pthread_t writer_thread;
     ylx_packet_queue_t packets;
+    int codec_started, output_started, writer_started, packets_initialized;
     atomic_ullong max_write_ns;
     segment_t *current;
     unsigned long long ordinal; /* encoded frames emitted so far */
@@ -67,6 +74,9 @@ struct ylx_pipeline {
     media_codec_context_t decoder;
     eye_t eyes[YLX_EYES];
     pthread_t split_thread;
+    int decoder_started, split_started, closer_started;
+    int ledger_initialized, error_initialized;
+    int closer_lock_initialized, closer_signal_initialized;
 
     ylx_segment_closed_fn on_segment;
     void *user;
@@ -80,6 +90,7 @@ struct ylx_pipeline {
     segment_t *closer_head;
     segment_t *closer_tail;
     int closer_stop;
+    atomic_uint pending_segments;
 
     pthread_mutex_t ledger_lock;
     /* Eyes can seal at different speeds. Keep all pending pairs until the
@@ -483,8 +494,18 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
 static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
                         unsigned long long start_frame)
 {
+    unsigned pending = atomic_load(&pipeline->pending_segments);
+    do {
+        if (pending >= MAX_PENDING_SEGMENTS) {
+            fail(pipeline, "segment_queue_exhausted: pending=%u limit=%u",
+                 pending, MAX_PENDING_SEGMENTS);
+            return -1;
+        }
+    } while (!atomic_compare_exchange_weak(&pipeline->pending_segments, &pending,
+                                           pending + 1));
     segment_t *segment = calloc(1, sizeof(*segment));
     if (segment == NULL) {
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         fail(pipeline, "out_of_memory: segment %d", index);
         return -1;
     }
@@ -499,6 +520,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     if (hb_mm_mx_get_default_context(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: default context for %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
     segment->muxer.output_file_name = segment->absolute;
@@ -506,6 +528,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     if (hb_mm_mx_initialize(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: initialize %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
 
@@ -523,6 +546,7 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
         hb_mm_mx_start(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: start %s", segment->relative);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
     }
     eye->current = segment;
@@ -664,6 +688,7 @@ static void *closer_thread_main(void *argument)
         segment_seal(pipeline, segment);
         observe_max(&pipeline->max_seal_ns, monotonic_time_ns() - started);
         free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
     }
 }
 
@@ -725,6 +750,7 @@ static void *mux_writer_thread(void *argument)
     else if (eye->current) {
         hb_mm_mx_stop(&eye->current->muxer);
         free(eye->current);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
         eye->current = NULL;
     }
     return NULL;
@@ -748,6 +774,11 @@ static void *encoder_output_thread(void *argument)
             if (atomic_load(&pipeline->split_done) != 0 &&
                 (atomic_load(&pipeline->encoded[eye->eye]) >= atomic_load(&pipeline->fed[eye->eye]) ||
                  ++idle_polls >= ENCODER_DRAIN_POLLS)) {
+                if (atomic_load(&pipeline->encoded[eye->eye]) < atomic_load(&pipeline->fed[eye->eye])) {
+                    fail(pipeline, "encoder_drain_timeout: eye=%s ret=%d fed=%llu encoded=%llu",
+                         EYE_NAMES[eye->eye], ret, atomic_load(&pipeline->fed[eye->eye]),
+                         atomic_load(&pipeline->encoded[eye->eye]));
+                }
                 break;
             }
             continue;
@@ -802,6 +833,7 @@ static void *split_thread_main(void *argument)
     ylx_pipeline_t *pipeline = (ylx_pipeline_t *)argument;
     const int eye_width = pipeline->eye_width;
     const int height = pipeline->config.height;
+    int idle_polls = 0;
 
     for (;;) {
         media_codec_buffer_t frame;
@@ -811,17 +843,24 @@ static void *split_thread_main(void *argument)
         int ret = hb_mm_mc_dequeue_output_buffer(&pipeline->decoder, &frame, &info,
                                                  DECODER_OUTPUT_TIMEOUT_MS);
         if (ret != 0) {
-            if (atomic_load(&pipeline->stopping) != 0 &&
-                atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) {
-                break;
+            if (atomic_load(&pipeline->stopping) != 0) {
+                if (atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) break;
+                if (++idle_polls >= DECODER_DRAIN_POLLS) {
+                    fail(pipeline, "decoder_drain_timeout: ret=%d submitted=%llu decoded=%llu",
+                         ret, atomic_load(&pipeline->submitted), atomic_load(&pipeline->decoded));
+                    break;
+                }
             }
             continue;
         }
+        idle_polls = 0;
         if (frame.type != MC_VIDEO_FRAME_BUFFER || frame.vframe_buf.size == 0 ||
             info.video_frame_info.decode_result == 0) {
             atomic_fetch_add(&pipeline->drop_decoder_output, 1ULL);
+            fail(pipeline, "decoder_output_invalid: type=%d bytes=%u result=%d",
+                 frame.type, frame.vframe_buf.size, info.video_frame_info.decode_result);
             hb_mm_mc_queue_output_buffer(&pipeline->decoder, &frame, 0);
-            continue;
+            break;
         }
         if (frame.vframe_buf.width != pipeline->config.sbs_width ||
             frame.vframe_buf.height != height) {
@@ -837,10 +876,13 @@ static void *split_thread_main(void *argument)
             media_codec_buffer_t input;
             memset(&input, 0, sizeof(input));
             input.type = MC_VIDEO_FRAME_BUFFER;
-            if (hb_mm_mc_dequeue_input_buffer(&pipeline->eyes[eye].codec, &input,
-                                              ENCODER_INPUT_TIMEOUT_MS) != 0) {
+            ret = hb_mm_mc_dequeue_input_buffer(&pipeline->eyes[eye].codec, &input,
+                                                ENCODER_INPUT_TIMEOUT_MS);
+            if (ret != 0) {
                 atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
-                continue;
+                fail(pipeline, "encoder_input_dequeue_failed: eye=%s ret=%d timeout_ms=%d",
+                     EYE_NAMES[eye], ret, ENCODER_INPUT_TIMEOUT_MS);
+                break;
             }
             input.type = MC_VIDEO_FRAME_BUFFER;
             input.vframe_buf.width = eye_width;
@@ -848,14 +890,19 @@ static void *split_thread_main(void *argument)
             input.vframe_buf.pix_fmt = MC_PIXEL_FORMAT_NV12;
             input.vframe_buf.size = (uint32_t)(eye_width * height * 3 / 2);
             split_eye(&frame, &input, eye_width, height, eye * eye_width);
-            if (hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
-                                            ENCODER_INPUT_TIMEOUT_MS) != 0) {
+            ret = hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
+                                              ENCODER_INPUT_TIMEOUT_MS);
+            if (ret != 0) {
                 atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
+                fail(pipeline, "encoder_input_queue_failed: eye=%s ret=%d",
+                     EYE_NAMES[eye], ret);
+                break;
             } else {
                 atomic_fetch_add(&pipeline->fed[eye], 1ULL);
             }
         }
         hb_mm_mc_queue_output_buffer(&pipeline->decoder, &frame, 0);
+        if (atomic_load(&pipeline->failed)) break;
     }
     atomic_store(&pipeline->split_done, 1);
     return NULL;
@@ -867,6 +914,7 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
                       ylx_segment_closed_fn on_segment, void *user,
                       ylx_pipeline_t **out, char *error, size_t error_len)
 {
+    if (out != NULL) *out = NULL;
     if (config == NULL || out == NULL || config->out_dir == NULL ||
         config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->height <= 0 ||
         config->fps <= 0 || config->fps > 60 || config->segment_frames < 0 || config->intra_period < 0 ||
@@ -896,50 +944,87 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     pipeline->segment_frames = config->segment_frames;
     pipeline->on_segment = on_segment;
     pipeline->user = user;
-    pthread_mutex_init(&pipeline->ledger_lock, NULL);
-    pthread_mutex_init(&pipeline->error_lock, NULL);
-    pthread_mutex_init(&pipeline->closer_lock, NULL);
-    pthread_cond_init(&pipeline->closer_signal, NULL);
+    const char *resource = "ledger lock";
+    int ret = pthread_mutex_init(&pipeline->ledger_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->ledger_initialized = 1;
+    resource = "error lock";
+    ret = pthread_mutex_init(&pipeline->error_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->error_initialized = 1;
+    resource = "closer lock";
+    ret = pthread_mutex_init(&pipeline->closer_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->closer_lock_initialized = 1;
+    resource = "closer condition";
+    ret = pthread_cond_init(&pipeline->closer_signal, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->closer_signal_initialized = 1;
 
-    configure_decoder(&pipeline->decoder, &pipeline->config);
-    int ret = codec_start(&pipeline->decoder);
-    if (ret != 0) {
-        snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
-        free(pipeline);
-        return -1;
-    }
-
+    /* Complete shared queue setup before any worker can observe an eye. */
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
         pipeline->eyes[eye].pipeline = pipeline;
         pipeline->eyes[eye].eye = eye;
+        resource = eye == 0 ? "left queue" : "right queue";
+        ret = ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
+                                    config->fps * MUX_QUEUE_SECONDS);
+        if (ret != 0) goto sync_failed;
+        pipeline->eyes[eye].packets_initialized = 1;
+    }
+
+    configure_decoder(&pipeline->decoder, &pipeline->config);
+    ret = codec_start(&pipeline->decoder);
+    if (ret != 0) {
+        snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
+        goto open_failed;
+    }
+    pipeline->decoder_started = 1;
+
+    for (int eye = 0; eye < YLX_EYES; eye += 1) {
         ret = configure_encoder(&pipeline->eyes[eye].codec, &pipeline->config,
                           pipeline->eye_width);
         if (ret == 0) ret = codec_start(&pipeline->eyes[eye].codec);
         if (ret != 0) {
             snprintf(error, error_len, "vpu_unavailable: %s video encoder start failed (%d)",
                      EYE_NAMES[eye], ret);
-            for (int done = 0; done < eye; done += 1) {
-                codec_stop(&pipeline->eyes[done].codec);
-            }
-            codec_stop(&pipeline->decoder);
-            free(pipeline);
-            return -1;
+            goto open_failed;
         }
+        pipeline->eyes[eye].codec_started = 1;
     }
 
-    pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
-    pthread_create(&pipeline->split_thread, NULL, split_thread_main, pipeline);
+    const char *worker = "closer";
+    ret = pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
+    if (ret != 0) goto thread_failed;
+    pipeline->closer_started = 1;
+    worker = "splitter";
+    ret = pthread_create(&pipeline->split_thread, NULL, split_thread_main, pipeline);
+    if (ret != 0) goto thread_failed;
+    pipeline->split_started = 1;
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        ylx_packet_queue_init(&pipeline->eyes[eye].packets, MUX_QUEUE_BYTES,
-                             config->fps * MUX_QUEUE_SECONDS);
-        pthread_create(&pipeline->eyes[eye].writer_thread, NULL, mux_writer_thread,
-                       &pipeline->eyes[eye]);
-        pthread_create(&pipeline->eyes[eye].thread, NULL, encoder_output_thread,
-                       &pipeline->eyes[eye]);
+        worker = eye == 0 ? "left writer" : "right writer";
+        ret = pthread_create(&pipeline->eyes[eye].writer_thread, NULL, mux_writer_thread,
+                             &pipeline->eyes[eye]);
+        if (ret != 0) goto thread_failed;
+        pipeline->eyes[eye].writer_started = 1;
+        worker = eye == 0 ? "left output" : "right output";
+        ret = pthread_create(&pipeline->eyes[eye].thread, NULL, encoder_output_thread,
+                             &pipeline->eyes[eye]);
+        if (ret != 0) goto thread_failed;
+        pipeline->eyes[eye].output_started = 1;
     }
 
     *out = pipeline;
     return 0;
+
+thread_failed:
+    snprintf(error, error_len, "thread_start_failed: %s (%d)", worker, ret);
+    goto open_failed;
+sync_failed:
+    snprintf(error, error_len, "sync_init_failed: %s (%d)", resource, ret);
+open_failed:
+    atomic_store(&pipeline->failed, 1);
+    ylx_pipeline_close(pipeline);
+    return -1;
 }
 
 int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
@@ -951,19 +1036,24 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
     }
     if (jpeg == NULL || length == 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_invalid: bytes=%zu", length);
         return -1;
     }
 
     media_codec_buffer_t input;
     memset(&input, 0, sizeof(input));
     input.type = MC_VIDEO_STREAM_BUFFER;
-    if (hb_mm_mc_dequeue_input_buffer(&pipeline->decoder, &input,
-                                      timeout_ms > 0 ? timeout_ms
-                                                     : DECODER_INPUT_TIMEOUT_MS) != 0) {
+    const int timeout = timeout_ms > 0 ? timeout_ms : DECODER_INPUT_TIMEOUT_MS;
+    int ret = hb_mm_mc_dequeue_input_buffer(&pipeline->decoder, &input, timeout);
+    if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_dequeue_failed: ret=%d timeout_ms=%d bytes=%zu",
+             ret, timeout, length);
         return -1;
     }
     if ((size_t)input.vstream_buf.size < length) {
+        fail(pipeline, "decoder_input_capacity: bytes=%zu capacity=%u",
+             length, input.vstream_buf.size);
         hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         return -1;
@@ -972,9 +1062,10 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
     input.vstream_buf.size = (uint32_t)length;
     input.vstream_buf.stream_end = 0;
     memcpy(input.vstream_buf.vir_ptr, jpeg, length);
-    if (hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input,
-                                    DECODER_INPUT_TIMEOUT_MS) != 0) {
+    ret = hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
+    if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "decoder_input_queue_failed: ret=%d bytes=%zu", ret, length);
         return -1;
     }
     atomic_fetch_add(&pipeline->submitted, 1ULL);
@@ -986,17 +1077,22 @@ int ylx_pipeline_finish(ylx_pipeline_t *pipeline)
     if (atomic_exchange(&pipeline->stopping, 1) != 0) {
         return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
     }
-    pthread_join(pipeline->split_thread, NULL);
+    if (pipeline->split_started) pthread_join(pipeline->split_thread, NULL);
+    else atomic_store(&pipeline->split_done, 1);
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        pthread_join(pipeline->eyes[eye].thread, NULL);
-        pthread_join(pipeline->eyes[eye].writer_thread, NULL);
+        if (pipeline->eyes[eye].output_started) pthread_join(pipeline->eyes[eye].thread, NULL);
+        /* Startup can fail after a writer starts but before its producer does. */
+        if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_close(&pipeline->eyes[eye].packets);
+        if (pipeline->eyes[eye].writer_started) pthread_join(pipeline->eyes[eye].writer_thread, NULL);
     }
     /* Only once both eyes stopped queueing can the closer drain to empty. */
-    pthread_mutex_lock(&pipeline->closer_lock);
-    pipeline->closer_stop = 1;
-    pthread_cond_signal(&pipeline->closer_signal);
-    pthread_mutex_unlock(&pipeline->closer_lock);
-    pthread_join(pipeline->closer_thread, NULL);
+    if (pipeline->closer_started) {
+        pthread_mutex_lock(&pipeline->closer_lock);
+        pipeline->closer_stop = 1;
+        pthread_cond_signal(&pipeline->closer_signal);
+        pthread_mutex_unlock(&pipeline->closer_lock);
+        pthread_join(pipeline->closer_thread, NULL);
+    }
     return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
 }
 
@@ -1007,19 +1103,19 @@ void ylx_pipeline_close(ylx_pipeline_t *pipeline)
     }
     ylx_pipeline_finish(pipeline);
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        codec_stop(&pipeline->eyes[eye].codec);
-        ylx_packet_queue_destroy(&pipeline->eyes[eye].packets);
+        if (pipeline->eyes[eye].codec_started) codec_stop(&pipeline->eyes[eye].codec);
+        if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_destroy(&pipeline->eyes[eye].packets);
     }
     while (pipeline->closed_pairs) {
         closed_pair_t *pair = pipeline->closed_pairs;
         pipeline->closed_pairs = pair->next;
         free(pair);
     }
-    codec_stop(&pipeline->decoder);
-    pthread_mutex_destroy(&pipeline->ledger_lock);
-    pthread_mutex_destroy(&pipeline->error_lock);
-    pthread_mutex_destroy(&pipeline->closer_lock);
-    pthread_cond_destroy(&pipeline->closer_signal);
+    if (pipeline->decoder_started) codec_stop(&pipeline->decoder);
+    if (pipeline->ledger_initialized) pthread_mutex_destroy(&pipeline->ledger_lock);
+    if (pipeline->error_initialized) pthread_mutex_destroy(&pipeline->error_lock);
+    if (pipeline->closer_lock_initialized) pthread_mutex_destroy(&pipeline->closer_lock);
+    if (pipeline->closer_signal_initialized) pthread_cond_destroy(&pipeline->closer_signal);
     free(pipeline);
 }
 
@@ -1049,5 +1145,12 @@ void ylx_pipeline_stats(const ylx_pipeline_t *pipeline, ylx_pipeline_stats_t *ou
 
 const char *ylx_pipeline_error(const ylx_pipeline_t *pipeline)
 {
-    return pipeline->error;
+    /* An input error is reported before worker drain completes. Copy under the
+     * lock so the caller never races the first error from another thread. */
+    static _Thread_local char error[ERROR_LEN];
+    ylx_pipeline_t *mutable_pipeline = (ylx_pipeline_t *)pipeline;
+    pthread_mutex_lock(&mutable_pipeline->error_lock);
+    memcpy(error, pipeline->error, sizeof(error));
+    pthread_mutex_unlock(&mutable_pipeline->error_lock);
+    return error;
 }

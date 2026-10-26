@@ -14,7 +14,6 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import rp_ylx.network as network_module
-import rp_ylx.network_state as network_state_module
 from rp_ylx.api.gateway import NetworkCommand, NetworkCredentialCommand, ProviderError
 from rp_ylx.cli import main
 from rp_ylx.network_control import (
@@ -30,6 +29,7 @@ from rp_ylx.network_control import (
 from rp_ylx.network_credentials import NetworkCredentialError, NetworkCredentialStore
 from rp_ylx.network_state import NetworkStateError, NetworkStateStore
 from rp_ylx.operational_logging import reset_operational_logging
+from rp_ylx.persistence import StateDatabase
 from rp_ylx.recording.coordinator import CaptureCoordinator
 
 
@@ -184,9 +184,9 @@ class NetworkStateStoreTest(unittest.TestCase):
 
             reopened = NetworkStateStore(root).snapshot()
             self.assertEqual(reopened, accepted)
-            state_path = root / "controller-state.json"
+            state_path = root / "controller.sqlite3"
             self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
-            rendered = state_path.read_text(encoding="utf-8")
+            rendered = json.dumps(StateDatabase(state_path).get("controller"))
             self.assertNotIn("credential_ref", rendered)
             self.assertNotIn("client-secret", rendered)
 
@@ -217,7 +217,7 @@ class NetworkStateStoreTest(unittest.TestCase):
                 )
             self.assertEqual(conflict.exception.code, "idempotency_conflict")
 
-    def test_post_replace_write_error_is_confirmed_from_published_state(self) -> None:
+    def test_post_commit_error_is_confirmed_from_committed_state(self) -> None:
         desired = {"mode": "hotspot", "wifi_client": None, "ethernet": None}
         transaction_id = "0198d2a0-41a0-7b7a-a751-0e86a39d4db4"
 
@@ -233,13 +233,13 @@ class NetworkStateStoreTest(unittest.TestCase):
                 accepted_at="2026-08-23T15:03:00+08:00",
                 work={"kind": "rescue", "desired": desired},
             )
-            real_write_json = network_state_module._write_json
+            real_write = store._database.put
 
-            def publish_then_fail(path: Path, value: object) -> None:
-                real_write_json(path, value)
-                raise OSError("directory fsync failed after replace")
+            def publish_then_fail(name, value):
+                real_write(name, value)
+                raise OSError("connection failed after commit")
 
-            with patch.object(network_state_module, "_write_json", side_effect=publish_then_fail):
+            with patch.object(store._database, "put", side_effect=publish_then_fail):
                 terminal = store.transition(
                     transaction_id,
                     status="committed",
@@ -262,8 +262,10 @@ class NetworkStateStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             NetworkStateStore(root)
+            legacy = StateDatabase(root / "controller.sqlite3").get("controller")
+            for candidate in root.glob("controller.sqlite3*"):
+                candidate.unlink()
             state_path = root / "controller-state.json"
-            legacy = json.loads(state_path.read_text(encoding="utf-8"))
             legacy.pop("execution_release")
             legacy.pop("rescue_boot_id")
             legacy["work"] = {"legacy": {"secret": "must-not-migrate"}}
@@ -308,11 +310,11 @@ class NetworkStateStoreTest(unittest.TestCase):
                 retain_work=False,
             )
 
-            state_path = root / "controller-state.json"
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state_path = root / "controller.sqlite3"
+            state = json.loads(json.dumps(StateDatabase(state_path).get("controller")))
             oldest = state["receipts"]["0" * 64]
             state["receipts"] = {f"{index:064x}": oldest for index in range(1024)}
-            state_path.write_text(json.dumps(state), encoding="utf-8")
+            StateDatabase(state_path).put("controller", state)
 
             with patch.object(NetworkStateStore, "_scope", return_value="f" * 64):
                 store.accept_transaction(
@@ -651,8 +653,8 @@ class NetworkControllerCoreTest(unittest.TestCase):
                         status_before["body"]["transaction"]["current"]["status"],
                         "accepted",
                     )
-                    state_path = root / "state" / "controller-state.json"
-                    state_before = state_path.read_text(encoding="utf-8")
+                    state_path = root / "state" / "controller.sqlite3"
+                    state_before = json.dumps(StateDatabase(state_path).get("controller"))
                     self.assertNotIn("client-secret-123", state_before)
                     self.assertNotIn(credential_ref, state_before)
 
@@ -785,7 +787,9 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 finally:
                     restarted.close()
 
-            persisted = (root / "state" / "controller-state.json").read_text(encoding="utf-8")
+            persisted = json.dumps(
+                StateDatabase(root / "state/controller.sqlite3").get("controller")
+            )
 
         self.assertTrue(accepted["ok"])
         self.assertIsNone(status["transaction"]["current"])
@@ -949,8 +953,8 @@ class NetworkControllerCoreTest(unittest.TestCase):
                             "operation": "status",
                         }
                     )["body"]
-                    persisted_state = (root / "state" / "controller-state.json").read_text(
-                        encoding="utf-8"
+                    persisted_state = json.dumps(
+                        StateDatabase(root / "state/controller.sqlite3").get("controller")
                     )
                 finally:
                     controller.close()
@@ -1606,7 +1610,9 @@ class NetworkControllerCoreTest(unittest.TestCase):
                     ):
                         pass
                     persisted = json.loads(
-                        (root / "state" / "controller-state.json").read_text(encoding="utf-8")
+                        json.dumps(
+                            StateDatabase(root / "state/controller.sqlite3").get("controller")
+                        )
                     )
                 finally:
                     controller.close()
@@ -2099,7 +2105,9 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 finally:
                     rebooted.close()
 
-            persisted = (root / "state/controller-state.json").read_text(encoding="utf-8")
+            persisted = json.dumps(
+                StateDatabase(root / "state/controller.sqlite3").get("controller")
+            )
 
         self.assertEqual(reboot_activations, [candidate_profile])
         self.assertEqual(after_reboot["transaction"]["latest"]["status"], "committed")
@@ -2197,7 +2205,9 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 finally:
                     rebooted.close()
 
-            persisted = (root / "state/controller-state.json").read_text(encoding="utf-8")
+            persisted = json.dumps(
+                StateDatabase(root / "state/controller.sqlite3").get("controller")
+            )
 
         security_query = next(command for command in nmcli.commands if "--get-values" in command)
         activation = next(
@@ -2934,6 +2944,7 @@ class NetworkControlTest(unittest.TestCase):
         provider._lock = threading.RLock()
         provider._active = None
         provider._network_operation_lease = None
+        provider._pending_focus = None
         command = NetworkCommand(
             "customer",
             "retry-missing",
@@ -2975,7 +2986,10 @@ class NetworkControlTest(unittest.TestCase):
     def test_capture_start_is_rejected_while_network_transaction_is_current(self) -> None:
         provider = object.__new__(CaptureCoordinator)
         provider._active = None
+        provider._catalog_verification_epoch = 0
+        provider._catalog_verification_cancel = threading.Event()
         provider._network_operation_lease = None
+        provider._pending_focus = None
         response = {
             "schema": CONTROL_RESPONSE_SCHEMA,
             "ok": True,

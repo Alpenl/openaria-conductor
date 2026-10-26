@@ -9,14 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from zstandard import ZstdError
+
 from rp_ylx.frame_index import valid_frame_record
+from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
     validate_device_session_directory,
 )
 from rp_ylx.recording.storage import open_metadata
+from rp_ylx.recording.verified import open_regular
 
-MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_NDJSON_LINE_BYTES = 1024 * 1024
 
 
@@ -168,8 +171,12 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise CaptureValidationError(f"{label} exceeds the bounded size")
     try:
-        value = _loads_json(path.read_text(encoding="utf-8"), label)
-    except OSError as error:
+        with open_regular(path) as stream:
+            payload = stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise CaptureValidationError(f"{label} grew beyond the bounded size")
+        value = _loads_json(payload.decode("utf-8"), label)
+    except (OSError, ValueError) as error:
         raise CaptureValidationError(f"cannot read {label}: {error}") from error
     return _mapping(value, label)
 
@@ -190,7 +197,7 @@ def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
                     )
                 value = _loads_json(line, f"{label}:{line_number}")
                 records.append(_mapping(value, f"{label}:{line_number}"))
-    except OSError as error:
+    except (OSError, ZstdError) as error:
         raise CaptureValidationError(f"cannot read {label}: {error}") from error
     if not records:
         raise CaptureValidationError(f"{label} is empty")

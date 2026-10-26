@@ -22,13 +22,20 @@ typedef struct {
     int closed;
 } ylx_packet_queue_t;
 
-static void ylx_packet_queue_init(ylx_packet_queue_t *queue, size_t bytes, size_t frames)
+/* A failed initializer owns no resources; callers must not use/destroy it. */
+static int ylx_packet_queue_init(ylx_packet_queue_t *queue, size_t bytes, size_t frames)
 {
     memset(queue, 0, sizeof(*queue));
-    pthread_mutex_init(&queue->lock, NULL);
-    pthread_cond_init(&queue->ready, NULL);
+    int ret = pthread_mutex_init(&queue->lock, NULL);
+    if (ret != 0) return ret;
+    ret = pthread_cond_init(&queue->ready, NULL);
+    if (ret != 0) {
+        pthread_mutex_destroy(&queue->lock);
+        return ret;
+    }
     queue->max_bytes = bytes;
     queue->max_frames = frames;
+    return 0;
 }
 
 static int ylx_packet_queue_push(ylx_packet_queue_t *queue, const void *data,

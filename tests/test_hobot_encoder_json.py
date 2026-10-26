@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import select
 import shutil
+import struct
 import subprocess
 import tempfile
 import textwrap
@@ -10,6 +12,74 @@ from pathlib import Path
 
 
 class HobotEncoderJsonTest(unittest.TestCase):
+    def test_submit_error_is_emitted_before_blocked_drain(self) -> None:
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("C compiler unavailable")
+        source = Path(__file__).resolve().parents[1] / "src/rp_ylx/hobot/ylx_stereo_encoder.c"
+        stubs = r"""
+struct ylx_pipeline { int unused; };
+int ylx_pipeline_open(const ylx_pipeline_config_t *config,
+                      ylx_segment_closed_fn callback, void *user,
+                      ylx_pipeline_t **out, char *error, size_t size) {
+    (void)config; (void)callback; (void)user; (void)error; (void)size;
+    static ylx_pipeline_t p; *out = &p; return 0;
+}
+int ylx_pipeline_submit(ylx_pipeline_t *p, const unsigned char *data, size_t size, int timeout) {
+    (void)p; (void)data; (void)size; (void)timeout; return -1;
+}
+int ylx_pipeline_finish(ylx_pipeline_t *p) {
+    (void)p; char gate;
+    return read(STDIN_FILENO, &gate, 1) == 1 ? -1 : -2;
+}
+void ylx_pipeline_close(ylx_pipeline_t *p) { (void)p; }
+void ylx_pipeline_stats(const ylx_pipeline_t *p, ylx_pipeline_stats_t *stats) {
+    (void)p; memset(stats, 0, sizeof(*stats)); stats->drop_decoder_input = 1;
+}
+const char *ylx_pipeline_error(const ylx_pipeline_t *p) {
+    (void)p; return "decoder_input_dequeue_failed: ret=-42";
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness, binary = root / "main.c", root / "main"
+            harness.write_text(f'#include "{source}"\n' + stubs)
+            subprocess.run(
+                [compiler, "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)],
+                check=True,
+            )
+            process = subprocess.Popen(
+                [str(binary), "--out-dir", str(root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            try:
+
+                def event():
+                    self.assertTrue(
+                        select.select([process.stdout], [], [], 2)[0], "event blocked by drain"
+                    )
+                    return json.loads(process.stdout.readline())
+
+                self.assertEqual(event()["event"], "ready")
+                process.stdin.write(struct.pack("<4sI", b"YLXF", 4) + b"jpeg")
+                failure = event()
+                self.assertEqual(failure["event"], "error")
+                self.assertEqual(failure["message"], "decoder_input_dequeue_failed: ret=-42")
+                self.assertIsNone(process.poll())
+                process.stdin.write(b"x")
+                self.assertEqual(event()["event"], "done")
+                self.assertEqual(process.wait(timeout=2), 1)
+                self.assertEqual(process.stdout.read(), b"")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=2)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    stream.close()
+
     def run_harness(self, body: str) -> subprocess.CompletedProcess[str]:
         compiler = shutil.which("cc") or shutil.which("gcc")
         if compiler is None:

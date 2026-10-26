@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -22,7 +23,8 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from contextlib import contextmanager
+import zipfile
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 DEFAULT_MANIFEST = "https://openaria-firmware-cn.oss-cn-beijing.aliyuncs.com/rdk-x5/latest.json"
@@ -37,6 +39,53 @@ NETWORK_STATE = Path("/var/lib/rp-ylx-network")
 NETWORK_PROFILES = Path("/etc/NetworkManager/system-connections")
 UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
+
+
+class MaintenanceBusyError(ValueError):
+    """A cooperating capture or maintenance process currently holds the lease."""
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    """Publish a durable JSON file, cleaning only our unpublished temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        # Cleanup covers serialization and file fsync too, not just replace.
+        # A failed cleanup must not hide the original I/O or cancellation error.
+        # Once replace succeeds, never remove or roll back the published path.
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
+
+
+def sqlite_state_required() -> bool:
+    root = Path("/var/lib/rp-ylx")
+    if CONFIG.exists():
+        value = json.loads(CONFIG.read_bytes())
+        root = Path(value.get("state_root", str(root)))
+    return any((root / (name + ".sqlite3.initialized")).exists() for name in ("state", "settings"))
+
+
+def require_sqlite_wheel(path: Path) -> None:
+    if sqlite_state_required():
+        with zipfile.ZipFile(path) as wheel:
+            if "rp_ylx/persistence.py" not in wheel.namelist():
+                raise ValueError("设备已迁移 SQLite，目标固件不支持当前状态；禁止直接降级")
 
 
 @contextmanager
@@ -67,7 +116,7 @@ def maintenance_lock(*, shared: bool = False):
         try:
             fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ValueError("设备正在录制或更新，请等待当前任务完成") from error
+            raise MaintenanceBusyError("设备正在录制或更新，请等待当前任务完成") from error
         yield
     finally:
         os.close(fd)
@@ -87,7 +136,24 @@ def prepare_first_install_network(
     if any((state_dir / name).exists() for name in ("lkg-wlan0.json", "lkg-eth0.json")):
         return
     controller_path = state_dir / "controller-state.json"
-    controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
+    database = state_dir / "controller.sqlite3"
+    if database.exists() or database.with_suffix(".sqlite3.initialized").exists():
+        # This updater also runs standalone, before the application is importable.
+        db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+        try:
+            if (
+                db.execute("PRAGMA application_id").fetchone()[0] != 0x594C5801
+                or db.execute("PRAGMA user_version").fetchone()[0] != 1
+            ):
+                raise ValueError("网络数据库版本无效")
+            row = db.execute("SELECT body FROM documents WHERE name='controller'").fetchone()
+            if row is None:
+                raise ValueError("网络控制器状态缺失")
+            controller = json.loads(row[0])
+        finally:
+            db.close()
+    else:
+        controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
     if controller is not None and not isinstance(controller, dict):
         raise ValueError("网络控制器状态无效，停止继承 Wi-Fi")
     if controller is not None and not (
@@ -215,18 +281,7 @@ def prepare_first_install_network(
             "config": {"mode": "wifi-client", "ssid": ssid, "security": security},
         }
 
-        def save_state(path: Path, value: dict) -> None:
-            with tempfile.NamedTemporaryFile(mode="w", dir=state_dir, delete=False) as stream:
-                temporary = Path(stream.name)
-                json.dump(value, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
-
-        save_state(state_dir / "lkg-wlan0.json", record)
+        atomic_json(state_dir / "lkg-wlan0.json", record)
         if controller is not None:
             # Migrate only untouched first-boot hotspot defaults. An explicit
             # user transaction or previously saved network always takes priority.
@@ -244,7 +299,21 @@ def prepare_first_install_network(
                 verified=True,
                 source_revision=controller["source_revision"] + 1,
             )
-            save_state(controller_path, controller)
+            if database.exists():
+                db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+                try:
+                    db.execute("PRAGMA synchronous=FULL")
+                    with db:
+                        db.execute(
+                            "UPDATE documents SET body=?,revision=revision+1,"
+                            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                            "WHERE name='controller'",
+                            (json.dumps(controller),),
+                        )
+                finally:
+                    db.close()
+            else:
+                atomic_json(controller_path, controller)
     except BaseException:
         (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
         nmcli("connection", "delete", "id", profile)
@@ -318,17 +387,47 @@ def validate_descriptor(value: dict, maximum: int) -> None:
         raise ValueError("文件大小或 SHA-256 无效")
 
 
+# Reserve half of the 64 KiB control frame for installed releases, task state
+# (including escaped diagnostic text), warnings and the response envelope.
+MAX_DISPLAY_METADATA = 32 * 1024
+
+
+def manifest_display_metadata(value: object) -> dict:
+    """Validate detached display fields before publishing or caching a release."""
+    if not isinstance(value, dict):
+        raise ValueError("发布清单必须是对象")
+    version, commit = value.get("version"), value.get("commit")
+    if not isinstance(version, str) or not re.fullmatch(r"[!-~]{1,64}", version):
+        raise ValueError("发布清单 version 无效")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("发布清单 commit 无效")
+    notes, published = value.get("release_notes", ""), value.get("published_at")
+    if not isinstance(notes, str) or len(notes) > 16000:
+        raise ValueError("发布说明无效")
+    if published is not None and (
+        not isinstance(published, str) or not published or len(published.encode("utf-8")) > 128
+    ):
+        raise ValueError("发布时间无效")
+    metadata = {
+        "version": version,
+        "commit": commit,
+        "release_notes": notes,
+        "published_at": published,
+    }
+    # Encoding also rejects lone surrogates. Count JSON escaping, not just
+    # characters: control characters can expand to six bytes each on the wire.
+    encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if len(encoded) > MAX_DISPLAY_METADATA:
+        raise ValueError("发布元数据超过控制响应容量")
+    return metadata
+
+
 def validate_manifest(value: object) -> dict:
     if not isinstance(value, dict) or value.get("schema") != RELEASE_SCHEMA:
         raise ValueError("发布清单 schema 无效")
     if value.get("platform") != PLATFORM:
         raise ValueError("发布清单不支持 RDK X5")
-    if not isinstance(value.get("commit"), str) or not re.fullmatch(
-        "[0-9a-f]{40}", value["commit"]
-    ):
-        raise ValueError("发布清单 commit 无效")
-    if not isinstance(value.get("version"), str) or not value["version"]:
-        raise ValueError("发布清单 version 无效")
+    manifest_display_metadata(value)
     if not isinstance(value.get("bundle"), dict):
         raise ValueError("发布清单 bundle 无效")
     validate_descriptor(value["bundle"], MAX_ARCHIVE)
@@ -432,6 +531,7 @@ def verify_bundle(root: Path, manifest: dict) -> None:
         raise ValueError("bundle 应包含唯一应用 wheel")
     if {path.name for path in root.iterdir()} - names:
         raise ValueError("bundle 包含未声明文件")
+    require_sqlite_wheel(root / bundle["application_wheel"])
 
 
 def current_commit() -> str | None:

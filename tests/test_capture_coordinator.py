@@ -5,6 +5,8 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -12,11 +14,12 @@ import unittest
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import rp_ylx.api.downloads as downloads_module
 import rp_ylx.recording.coordinator as coordinator_module
@@ -445,6 +448,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
     def test_tracked_representation_forwards_send_to_fast_path(self) -> None:
         calls: list[tuple[int, int, int | None]] = []
         releases: list[bool] = []
+        receipts: list[tuple[str, int]] = []
 
         class _Representation:
             etag = '"etag"'
@@ -477,12 +481,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 calls.append((output_descriptor, offset, length))
                 return 2
 
-        tracked = _TrackedRepresentation(_Representation(), lambda: releases.append(True))
+        tracked = _TrackedRepresentation(
+            _Representation(),
+            lambda: releases.append(True),
+            lambda status, size: receipts.append((status, size)),
+        )
 
         self.assertEqual(tracked.send_to(7, 1, 2), 2)
         self.assertEqual(calls, [(7, 1, 2)])
         tracked.close()
         self.assertEqual(releases, [True])
+        self.assertEqual(receipts, [("partial", 2)])
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -596,6 +605,50 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator.latest_preview(fps=None, accept="image/jpeg")
             self.assertEqual(preview.exception.code, "camera_not_connected")
             self.assertEqual(preview.exception.status, 503)
+        finally:
+            coordinator.close()
+
+    def test_network_status_does_not_query_capture_hardware(self) -> None:
+        sources = FakeSourcesWithLatestImu(imu_observation(40))
+        coordinator = self.coordinator(sources=sources)
+        runtime = deepcopy(coordinator._runtime())
+        legacy = {
+            "capabilities": {"second_wifi": False},
+            "mdns": {
+                "hostname": "rp-ylx.local",
+                "service": "_ylx-capture._tcp",
+                "aliases": ["_http._tcp"],
+                "port": 8080,
+            },
+            "devices": [],
+        }
+        try:
+            with (
+                patch.object(coordinator, "_runtime", return_value=runtime),
+                patch("rp_ylx.recording.coordinator.collect_network_status", return_value=legacy),
+                patch("rp_ylx.network._controller_status_projection", return_value=None),
+                patch("rp_ylx.network._state_dir", return_value=self.root / "network-state"),
+                patch.object(sources, "camera_connection_status") as camera,
+                patch.object(sources, "camera_focus_status") as focus,
+                patch.object(sources, "latest_imu_observation") as imu,
+            ):
+                first = coordinator.network_status()
+                self.assertEqual(first["schema"], "ylx.network-status.v1")
+                self.assertEqual(first["observed_at"], runtime["observed_at"])
+                self.assertEqual(first["observed"]["mdns"], legacy["mdns"])
+                self.assertEqual(first["observed"]["devices"], legacy["devices"])
+                for key, value in runtime["network"].items():
+                    self.assertEqual(first["observed"][key], value)
+
+                runtime["observed_at"] = "2026-10-03T00:00:01Z"
+                runtime["network"]["wired"]["addresses"] = ["192.0.2.42/24"]
+                second = coordinator.network_status()
+                self.assertEqual(second["observed_at"], runtime["observed_at"])
+                self.assertEqual(second["observed"]["wired"]["addresses"], ["192.0.2.42/24"])
+                self.assertNotEqual(first["observed_at"], second["observed_at"])
+                camera.assert_not_called()
+                focus.assert_not_called()
+                imu.assert_not_called()
         finally:
             coordinator.close()
 
@@ -1062,6 +1115,390 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_live_storage_uses_latest_monitor_sample_without_query_io(self):
+        coordinator = self.coordinator()
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity", return_value=(1000, 800, 1000)
+            ):
+                coordinator.start_capture(start_command("live-storage"))
+            before = coordinator.capture_status()["snapshot"]["active_recording"]["recording_state"]
+            self.assertEqual(before["storage"]["remaining_bytes"], 800)
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity", return_value=(1000, 500, 1000)
+            ):
+                coordinator.enforce_storage_reserve()
+            with patch(
+                "rp_ylx.recording.coordinator._stat_capacity",
+                side_effect=AssertionError("status queries must not probe the filesystem"),
+            ):
+                status = coordinator.capture_status()
+                validate_capture_status(status)
+                after = status["snapshot"]["active_recording"]["recording_state"]
+                self.assertEqual(after["storage"]["remaining_bytes"], 500)
+                self.assertEqual(after["storage"]["volume_id"], self.volume_id)
+                # A subsequent projection must not mutate a previously returned response.
+                self.assertEqual(before["storage"]["remaining_bytes"], 800)
+                _, _, progress = coordinator.capture_recording_progress()
+                self.assertEqual(progress["storage"]["remaining_bytes"], 500)
+        finally:
+            coordinator.close()
+
+    def test_reserve_probe_io_does_not_block_status(self):
+        for target in ("_stat_capacity", "backing_capacity"):
+            with self.subTest(target=target):
+                self._check_reserve_probe_io(target)
+
+    def _check_reserve_probe_io(self, target):
+        coordinator = self.coordinator()
+        entered, release, observed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        errors, responses, threads = [], [], []
+        try:
+            coordinator.start_capture(start_command("probe-io-" + target))
+            original = getattr(coordinator_module, target)
+
+            def probe(*args):
+                if threading.current_thread().name == "reserve-probe-test":
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("reserve probe was not released")
+                return original(*args)
+
+            def enforce():
+                try:
+                    coordinator.enforce_storage_reserve()
+                except BaseException as error:
+                    errors.append(error)
+
+            def observe():
+                try:
+                    responses.append(coordinator.capture_status())
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    observed.set()
+
+            with patch("rp_ylx.recording.coordinator." + target, side_effect=probe):
+                monitor = threading.Thread(target=enforce, name="reserve-probe-test")
+                threads.append(monitor)
+                monitor.start()
+                self.assertTrue(entered.wait(1))
+                reader = threading.Thread(target=observe)
+                threads.append(reader)
+                reader.start()
+                self.assertTrue(observed.wait(1), "slow capacity IO held the control lock")
+                self.assertEqual(responses[0]["snapshot"]["device_state"], "recording")
+                self.assertFalse(errors)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+            coordinator.close()
+        self.assertFalse(errors)
+
+    def test_delayed_reserve_result_cannot_stop_or_poison_next_recording(self):
+        for target in ("_stat_capacity", "backing_capacity"):
+            for failed in (False, True):
+                with self.subTest(target=target, failed=failed):
+                    self._check_delayed_reserve_result(target, failed)
+
+    def _check_delayed_reserve_result(self, target, failed):
+        coordinator = self.coordinator(minimum_available_bytes=10)
+        entered, release, replaced = threading.Event(), threading.Event(), threading.Event()
+        errors, next_ids, threads = [], [], []
+        original = getattr(coordinator_module, target)
+        prefix = f"reserve-{target}-{failed}"
+
+        def probe(*args):
+            if threading.current_thread().name != "old-reserve-probe":
+                return original(*args)
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("old reserve probe was not released")
+            if failed:
+                if target == "_stat_capacity":
+                    raise OSError("old volume failed")
+                raise DeviceRecordingError("storage_unavailable", "old backing failed")
+            return (100, 0, 100) if target == "_stat_capacity" else (0, 100)
+
+        def enforce():
+            try:
+                coordinator.enforce_storage_reserve()
+            except BaseException as error:
+                errors.append(error)
+
+        def replace_recording():
+            try:
+                coordinator.stop_capture(stop_command(prefix + "-stop"))
+                coordinator.start_capture(start_command(prefix + "-next"))
+                next_ids.append(self.active_session_id(coordinator))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                replaced.set()
+
+        try:
+            coordinator.start_capture(start_command(prefix + "-start"))
+            old_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch("rp_ylx.recording.coordinator." + target, side_effect=probe):
+                monitor = threading.Thread(target=enforce, name="old-reserve-probe")
+                threads.append(monitor)
+                monitor.start()
+                self.assertTrue(entered.wait(1))
+                replacement = threading.Thread(target=replace_recording)
+                threads.append(replacement)
+                replacement.start()
+                self.assertTrue(replaced.wait(2), "slow probe blocked stopping or starting")
+                self.assertFalse(errors)
+                self.assertNotEqual(next_ids[0], old_id)
+                before = coordinator.capture_status()["snapshot"]["active_recording"][
+                    "recording_state"
+                ]["storage"]
+                release.set()
+                monitor.join(2)
+                self.assertFalse(monitor.is_alive())
+                self.assertFalse(errors)
+                self.assertFalse(coordinator._media_lost)
+                self.assertEqual(self.active_session_id(coordinator), next_ids[0])
+                after = coordinator.capture_status()["snapshot"]["active_recording"][
+                    "recording_state"
+                ]["storage"]
+                self.assertEqual(after, before)
+                self.assertTrue(coordinator.submit_frame(frame(0)))
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+            coordinator.close()
+
+    def test_storage_reserve_stops_and_seals_active_recording(self):
+        coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
+        try:
+            coordinator.start_capture(start_command("reserve-start"))
+            session_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch("rp_ylx.recording.coordinator._stat_capacity", return_value=(100, 9, 100)):
+                coordinator.enforce_storage_reserve()
+            self.assertIsNone(coordinator._active)
+            manifest = validate_device_session_directory(
+                self.mountpoint / "recordings" / session_id
+            )
+            self.assertTrue(manifest["sealed"])
+        finally:
+            coordinator.close()
+
+    def _retained_catalog_entry(self, *, recovered: bool, prefix: str = "retained-catalog"):
+        coordinator = self.coordinator()
+        coordinator.start_capture(start_command(prefix + "-start"))
+        retained = deepcopy(coordinator.capture_status()["snapshot"]["active_recording"])
+        session_id = retained["recording_state"]["session_id"]
+        coordinator.submit_frame(frame())
+        coordinator.stop_capture(stop_command(prefix + "-stop"))
+        directory = self.mountpoint / "recordings" / session_id
+        if recovered:
+            # A valid published prefix still has a failed retained outcome.
+            payload = b'{"outcome":"interrupted"}\n'
+            log = directory / "recovery" / "interruption.json"
+            log.parent.mkdir()
+            log.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            manifest_path = directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["logs"].append(
+                {
+                    "artifact_id": digest,
+                    "path": "recovery/interruption.json",
+                    "sha256": digest,
+                    "bytes": len(payload),
+                    "role": coordinator_module.RECOVERY_ROLE,
+                    "media_type": "application/json",
+                }
+            )
+            manifest_path.write_text(json.dumps(manifest))
+            validate_device_session_directory(directory)
+        retained["recording_state"]["state"] = "failed"
+        retained["recording_state"]["diagnostics"] = [
+            {
+                "code": "process_interrupted",
+                "severity": "error",
+                "message": "test interrupted recording",
+                "at": retained["recording_state"]["updated_at"],
+                "recoverable": False,
+            }
+        ]
+        coordinator._retained[session_id] = retained
+        coordinator._invalidate_session_verification(session_id)
+        coordinator._persist_local_state()
+        coordinator.list_sessions(cursor=None, limit=50, take_id=None, api_version="v4")
+        return coordinator, session_id
+
+    def test_recovered_retained_catalog_reuses_metadata_cache_after_restart(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=True)
+        try:
+            for restart in (False, True):
+                with self.subTest(restart=restart):
+                    if restart:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    with (
+                        patch(
+                            "rp_ylx.recording.coordinator.inspect_device_session_directory",
+                            side_effect=AssertionError("recovered manifest was revalidated"),
+                        ),
+                        patch.object(
+                            coordinator._catalog_db,
+                            "remember",
+                            side_effect=AssertionError("unchanged recovered catalog was rewritten"),
+                        ),
+                    ):
+                        for _ in range(2):
+                            listed = coordinator.list_sessions(
+                                cursor=None, limit=50, take_id=None, api_version="v4"
+                            )
+                            validate_session_list(listed, limit=50, take_id=None, api_version="v4")
+                            self.assertEqual(
+                                [x["session_id"] for x in listed["items"]], [session_id]
+                            )
+                            self.assertIsNone(listed["items"][0]["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                    retained = coordinator.retained_unsuccessful_outcome(session_id)
+                    self.assertEqual(retained["outcome"]["recording_state"]["state"], "failed")
+        finally:
+            coordinator.close()
+
+    def test_retained_unrecovered_manifest_cannot_reuse_success_catalog(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=False)
+        try:
+            for restart in (False, True):
+                with self.subTest(restart=restart):
+                    if restart:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    listed = coordinator.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    self.assertEqual(listed["items"], [])
+                    self.assertTrue(listed["diagnostics"])
+                    self.assertNotIn(session_id, coordinator._verified)
+        finally:
+            coordinator.close()
+
+    def test_recovered_catalog_marker_is_bound_to_unchanged_manifest(self):
+        coordinator, session_id = self._retained_catalog_entry(recovered=True)
+        try:
+            path = self.mountpoint / "recordings" / session_id / "manifest.json"
+            before = path.stat()
+            payload = path.read_bytes()
+            marker = coordinator_module.RECOVERY_ROLE.encode()
+            replacement = b"log." + b"x" * (len(marker) - 4)
+            self.assertIn(marker, payload)
+            path.write_bytes(payload.replace(marker, replacement))
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertEqual(path.stat().st_size, before.st_size)
+            listed = coordinator.list_sessions(
+                cursor=None, limit=50, take_id=None, api_version="v4"
+            )
+            self.assertEqual(listed["items"], [])
+            self.assertTrue(listed["diagnostics"])
+        finally:
+            coordinator.close()
+
+    def test_recovered_catalog_marker_does_not_admit_other_failed_session(self):
+        first, recovered_id = self._retained_catalog_entry(recovered=True, prefix="recovered")
+        first.close()
+        coordinator, failed_id = self._retained_catalog_entry(recovered=False, prefix="unrecovered")
+        try:
+            self.assertNotEqual(recovered_id, failed_id)
+            listed = coordinator.list_sessions(
+                cursor=None, limit=50, take_id=None, api_version="v4"
+            )
+            self.assertEqual([x["session_id"] for x in listed["items"]], [recovered_id])
+            self.assertTrue(listed["diagnostics"])
+        finally:
+            coordinator.close()
+
+    def test_persisted_catalog_avoids_reinspection_after_restart(self):
+        first = self.coordinator()
+        session_id = self.seal_one(first, prefix="sqlite-restart")
+        first.close()
+        reopened = self.coordinator()
+        try:
+            with patch(
+                "rp_ylx.recording.coordinator.inspect_device_session_directory",
+                side_effect=AssertionError("unchanged manifest was revalidated"),
+            ):
+                listed = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
+            self.assertIsNone(listed["items"][0]["verification"])
+        finally:
+            reopened.close()
+
+    def test_loop_host_reserve_rejects_start_even_after_volume_admission(self):
+        coordinator = self.coordinator(minimum_available_bytes=10)
+        try:
+            coordinator.device_descriptor("v3", "customer")
+            with patch("rp_ylx.recording.backing_storage.backing_capacity", return_value=(9, 100)):
+                with self.assertRaises(ProviderError) as error:
+                    coordinator.start_capture(start_command("host-reserve-start"))
+                self.assertEqual(error.exception.code, "insufficient_space")
+                self.assertIsNone(coordinator._active)
+                self.assertFalse(
+                    coordinator.device_descriptor("v3", "customer")["capabilities"]["capture"]
+                )
+            coordinator.start_capture(start_command("host-reserve-recovered"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            coordinator.close()
+
+    def test_loop_host_reserve_stops_normally_without_exhausting_logical_volume(self):
+        for budget in [(9, 100), (100, 9)]:
+            with self.subTest(budget=budget):
+                coordinator = self.coordinator(
+                    minimum_available_bytes=10, minimum_available_inodes=10
+                )
+                try:
+                    coordinator.start_capture(start_command("host-low-" + str(budget)))
+                    session_id = self.active_session_id(coordinator)
+                    coordinator.submit_frame(frame(0))
+                    with patch(
+                        "rp_ylx.recording.coordinator.backing_capacity", return_value=budget
+                    ):
+                        coordinator.enforce_storage_reserve()
+                    self.assertIsNone(coordinator._active)
+                    manifest = validate_device_session_directory(
+                        self.mountpoint / "recordings" / session_id
+                    )
+                    self.assertTrue(manifest["sealed"])
+                finally:
+                    coordinator.close()
+
+    def test_unreadable_loop_host_budget_stops_instead_of_only_retrying_monitor(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("host-unreadable"))
+            session_id = self.active_session_id(coordinator)
+            coordinator.submit_frame(frame(0))
+            with patch(
+                "rp_ylx.recording.coordinator.backing_capacity",
+                side_effect=DeviceRecordingError("storage_unavailable", "host unavailable"),
+            ):
+                coordinator.enforce_storage_reserve()
+            self.assertIsNone(coordinator._active)
+            self.assertTrue(
+                validate_device_session_directory(self.mountpoint / "recordings" / session_id)[
+                    "sealed"
+                ]
+            )
+        finally:
+            coordinator.close()
+
     def test_start_rechecks_thresholds_and_rejects_wrong_volume(self) -> None:
         coordinator = self.coordinator(minimum_available_bytes=10, minimum_available_inodes=10)
         try:
@@ -1418,6 +1855,52 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_catalog_pages_isolate_nested_responses_and_legacy_projection(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-copy-isolation")
+            summary = coordinator._session_summaries[session_id]
+            summary["verification"]["verdict"] = "unusable"
+            summary["verification"]["diagnostics"] = [
+                {"code": "artifact_digest_mismatch", "summary": "artifact 摘要不匹配"}
+            ]
+            older = deepcopy(summary)
+            older["session_id"] = "01989f69-f000-7c3d-ae4f-5061728394a5"
+            older["started_at"] = older["ended_at"] = "2020-01-01T00:00:00Z"
+            coordinator._session_summaries[older["session_id"]] = older
+            coordinator._session_diagnostics["quarantined"] = coordinator._session_diagnostic(
+                "quarantined", OSError("unreadable")
+            )
+            original_summaries = deepcopy(coordinator._session_summaries)
+            original_diagnostics = deepcopy(coordinator._session_diagnostics)
+            with patch.object(coordinator, "_catalog_sessions", return_value=None):
+                for api_version in ("v2", "v3", "v4"):
+                    with self.subTest(api_version=api_version):
+                        first = coordinator.list_sessions(
+                            cursor=None, limit=1, take_id=None, api_version=api_version
+                        )
+                        continuation = first["next_cursor"]
+                        self.assertIsNotNone(continuation)
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        if api_version != "v4":
+                            self.assertEqual(
+                                first["items"][0]["verification"]["diagnostics"],
+                                ["artifact 摘要不匹配"],
+                            )
+                        first["items"][0]["device"]["device_label"] = "response-only"
+                        first["items"][0]["verification"]["diagnostics"].clear()
+                        last = coordinator.list_sessions(
+                            cursor=continuation, limit=3, take_id=None, api_version=api_version
+                        )
+                        self.assertEqual(last["items"][0]["session_id"], older["session_id"])
+                        self.assertEqual(len(last["diagnostics"]), 1)
+                        last["items"][0]["verification"]["validator"]["name"] = "modified"
+                        last["diagnostics"][0]["message"] = "response-only"
+                        self.assertEqual(coordinator._session_summaries, original_summaries)
+                        self.assertEqual(coordinator._session_diagnostics, original_diagnostics)
+        finally:
+            coordinator.close()
+
     def test_v4_quarantine_only_catalog_is_fully_pageable(self) -> None:
         coordinator = self.coordinator()
         try:
@@ -1571,7 +2054,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
                 listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
                 first_list_inspections = inspect_session.call_count
-                self.assertGreater(first_list_inspections, 0)
+                self.assertEqual(first_list_inspections, 0)  # SQLite survived the service restart.
                 self.assertEqual(
                     [item["session_id"] for item in listed["items"]],
                     [session_id],
@@ -1651,11 +2134,17 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertEqual(len(listed["items"]), 2)
             roots = set(restarted._require_admission().catalog_roots)
             iterdir = Path.iterdir
+            scandir = os.scandir
 
             def without_catalog_scan(path: Path):
                 if path in roots:
                     raise AssertionError("artifact access must not enumerate other sessions")
                 return iterdir(path)
+
+            def without_catalog_scandir(path):
+                if Path(path) in roots:
+                    raise AssertionError("artifact access must not enumerate other sessions")
+                return scandir(path)
 
             for session_id, root in (
                 (current, self.mountpoint / "recordings"),
@@ -1665,6 +2154,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
                 with (
                     patch.object(Path, "iterdir", without_catalog_scan),
+                    patch.object(os, "scandir", without_catalog_scandir),
                     restarted.open_verified_artifact(
                         session_id, artifact["artifact_id"], "v4"
                     ) as opened,
@@ -1839,7 +2329,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             restarted.close()
 
-    def test_cached_catalog_reads_each_manifest_once_for_all_artifact_identities(self) -> None:
+    def test_cached_catalog_rehashes_manifest_without_revalidating_json(self) -> None:
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-identity-cache")
@@ -1848,14 +2338,233 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertGreater(len(list(iter_device_session_v1_artifacts(manifest))), 1)
 
-            with patch(
-                "rp_ylx.api.downloads._read_exact_file",
-                wraps=downloads_module._read_exact_file,
-            ) as read_manifest:
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            with (
+                patch(
+                    "rp_ylx.api.downloads._read_exact_file",
+                    wraps=downloads_module._read_exact_file,
+                ) as read_manifest,
+                patch(
+                    "rp_ylx.api.downloads._decode_and_validate_manifest",
+                    side_effect=AssertionError("unchanged manifest must not be revalidated"),
+                ),
+            ):
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
 
             self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
             self.assertEqual(read_manifest.call_count, 1)
+        finally:
+            coordinator.close()
+
+    def test_cached_catalog_invalidates_manifest_replacement_and_restored_mtime(self) -> None:
+        for change in ("replace", "same_size_edit"):
+            with self.subTest(change=change):
+                coordinator = self.coordinator()
+                try:
+                    session_id = self.seal_one(coordinator, prefix=f"identity-{change}")
+                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    original = manifest_path.read_bytes()
+                    metadata = manifest_path.stat()
+                    if change == "replace":
+                        replacement = manifest_path.with_suffix(".replacement")
+                        replacement.write_bytes(original)
+                        os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                        replacement.replace(manifest_path)
+                    else:
+                        changed = original.replace(b"YLX-12AB34CD", b"YLX-56EF78AB")
+                        self.assertNotEqual(changed, original)
+                        self.assertEqual(len(changed), len(original))
+                        manifest_path.write_bytes(changed)
+                        os.utime(manifest_path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    self.assertEqual(manifest_path.stat().st_mtime_ns, metadata.st_mtime_ns)
+
+                    listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+                    selected = next(
+                        item for item in listed["items"] if item["session_id"] == session_id
+                    )
+                    self.assertIsNone(selected["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                    self.assertNotIn(session_id, coordinator._session_snapshots)
+                    if change == "same_size_edit":
+                        self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                finally:
+                    coordinator.close()
+
+    def test_catalog_manifest_content_changes_with_identical_filesystem_metadata(self):
+        for restarted in (False, True):
+            with self.subTest(restarted=restarted):
+                coordinator = self.coordinator()
+                try:
+                    session_id = self.seal_one(coordinator, prefix=f"coarse-manifest-{restarted}")
+                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    original = manifest_path.read_bytes()
+                    metadata = manifest_path.stat()
+                    if restarted:
+                        coordinator.close()
+                        coordinator = self.coordinator()
+                    coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+                    changed = original.replace(b"YLX-12AB34CD", b"YLX-56EF78AB")
+                    self.assertNotEqual(changed, original)
+                    self.assertEqual(len(changed), len(original))
+                    manifest_path.write_bytes(changed)
+                    real_fstat, real_stat, real_os_stat = os.fstat, Path.stat, os.stat
+
+                    def collide(current, metadata=metadata):
+                        return (
+                            metadata
+                            if (current.st_dev, current.st_ino)
+                            == (metadata.st_dev, metadata.st_ino)
+                            else current
+                        )
+
+                    def stat_path(path, *args, read=real_stat, **kwargs):
+                        return collide(read(path, *args, **kwargs))
+
+                    with (
+                        patch.object(
+                            os, "fstat", side_effect=lambda fd, read=real_fstat: collide(read(fd))
+                        ),
+                        patch.object(Path, "stat", stat_path),
+                        patch.object(
+                            os,
+                            "stat",
+                            side_effect=lambda *a, read=real_os_stat, **kw: collide(read(*a, **kw)),
+                        ),
+                    ):
+                        listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+                    selected = next(x for x in listed["items"] if x["session_id"] == session_id)
+                    self.assertEqual(selected["device"]["device_label"], "YLX-56EF78AB")
+                    self.assertIsNone(selected["verification"])
+                    self.assertNotIn(session_id, coordinator._verified)
+                finally:
+                    coordinator.close()
+
+    def test_twenty_mib_manifest_is_readable_without_revalidating_unchanged_json(self):
+        from rp_ylx.recording.catalog import SessionCatalog
+        from rp_ylx.spectacular.adapter import _read_json_object
+        from rp_ylx.validation import _read_discriminator
+
+        coordinator = self.coordinator()
+        try:
+            sid = self.seal_one(coordinator, prefix="large-recovery-manifest")
+            directory = self.mountpoint / "recordings" / sid
+            path = directory / "manifest.json"
+            original = path.read_bytes()
+            payload = original + b" " * (20 * 1024 * 1024 - len(original))
+            path.write_bytes(payload)
+            manifest = json.loads(original)
+            for label, read in (
+                ("public validation", lambda: _read_discriminator(directory)),
+                ("recording inspection", lambda: inspect_device_session_directory(directory)[0]),
+                ("calibration adapter", lambda: _read_json_object(path, "manifest")),
+            ):
+                with self.subTest(reader=label):
+                    self.assertEqual(read(), manifest)
+            with self.subTest(reader="sqlite fingerprint"):
+                self.assertEqual(
+                    json.loads(SessionCatalog.signature(directory))[-1],
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            with (
+                DirectorySessionStore(directory.parent) as store,
+                patch.object(
+                    downloads_module,
+                    "_decode_and_validate_manifest",
+                    wraps=downloads_module._decode_and_validate_manifest,
+                ) as decode,
+            ):
+                for _ in range(2):
+                    with store.open_manifest(sid, "v4") as opened:
+                        self.assertEqual(opened.read(), payload)
+                self.assertEqual(decode.call_count, 1)
+        finally:
+            downloads_module._clear_validated_manifest_cache_for_tests()
+            coordinator.close()
+
+    def test_catalog_scan_ignores_link_loops_and_non_directories(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-loop-filter")
+            root = self.mountpoint / "recordings"
+            (root / "loop").symlink_to("loop", target_is_directory=True)
+            (root / "dangling").symlink_to("absent", target_is_directory=True)
+            (root / "ordinary-file").write_text("not a session")
+            (root / "unfinished.partial").mkdir()
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual([item["session_id"] for item in page["items"]], [session_id])
+            self.assertIsNotNone(page["items"][0]["verification"])
+            self.assertEqual(page["diagnostics"], [])
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_closes_on_manifest_identity_error(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            self.seal_one(coordinator, prefix="catalog-scan-close")
+            descriptors_before = len(os.listdir("/proc/self/fd"))
+            with (
+                patch.object(
+                    coordinator,
+                    "_session_manifest_is_current",
+                    side_effect=RuntimeError("injected identity error"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected identity error"),
+            ):
+                coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors_before)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_checks_fresh_root_after_directory_replacement(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            first = self.seal_one(coordinator, prefix="catalog-root-first")
+            second = self.seal_one(coordinator, prefix="catalog-root-second")
+            root = self.mountpoint / "recordings"
+            check_identity = coordinator._session_manifest_is_current
+            checked: list[str] = []
+
+            def replace_after_first_check(session_id, snapshot):
+                current = check_identity(session_id, snapshot)
+                checked.append(session_id)
+                if len(checked) == 1:
+                    retired = self.mountpoint / "retired-recordings"
+                    root.rename(retired)
+                    shutil.copytree(retired, root)
+                return current
+
+            with patch.object(
+                coordinator, "_session_manifest_is_current", replace_after_first_check
+            ):
+                page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(set(checked), {first, second})
+            summaries = {item["session_id"]: item for item in page["items"]}
+            self.assertIsNotNone(summaries[checked[0]]["verification"])
+            self.assertIsNone(summaries[checked[1]]["verification"])
+            self.assertNotIn(checked[1], coordinator._session_snapshots)
+            self.assertNotIn(checked[1], coordinator._verified)
+        finally:
+            coordinator.close()
+
+    def test_catalog_scan_rejects_session_replaced_with_symlink(self) -> None:
+        coordinator = self.coordinator()
+        try:
+            session_id = self.seal_one(coordinator, prefix="catalog-session-link")
+            original = self.mountpoint / "recordings" / session_id
+            retired = self.mountpoint / "outside-recordings"
+            original.rename(retired)
+            original.symlink_to(retired, target_is_directory=True)
+
+            page = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
+
+            self.assertEqual(page["items"], [])
+            self.assertEqual(len(page["diagnostics"]), 1)
+            self.assertNotIn(session_id, coordinator._session_snapshots)
+            self.assertNotIn(session_id, coordinator._verified)
         finally:
             coordinator.close()
 
@@ -3105,6 +3814,831 @@ class CaptureCoordinatorTest(unittest.TestCase):
             release_checkpoint.set()
             coordinator.close()
 
+    def test_failure_recovery_and_durable_state_do_not_block_status_or_release_lease(self) -> None:
+        for stage in ("fail", "recovery", "state"):
+            for cached in (True, False):
+                with self.subTest(stage=stage, cached=cached):
+                    self._check_failure_io_stage(stage, cached=cached)
+
+    def test_failure_io_probe_waits_for_slow_recovery_entry(self):
+        original = coordinator_module.DeviceSessionRecorder.fail
+
+        def slow_fail(recorder, code, *args, **kwargs):
+            if code == "encoder_failed":
+                time.sleep(1.2)
+            return original(recorder, code, *args, **kwargs)
+
+        with patch.object(coordinator_module.DeviceSessionRecorder, "fail", slow_fail):
+            self._check_failure_io_stage("recovery", cached=False)
+
+    def test_media_lost_diagnostic_visible_during_recovery_with_or_without_cache(self):
+        for cached in (True, False):
+            with self.subTest(cached=cached):
+                self._check_failure_io_stage("fail", cached=cached, error_code="media_lost")
+
+    def test_native_failure_callback_returns_while_recovery_keeps_volume_reserved(self):
+        class CallbackSources(FakeSources):
+            keeps_preview_after_stop = True
+
+            def start(self, **kwargs):
+                self.failure_callback = kwargs["on_failure"]
+                super().start(**kwargs)
+
+        sources = CallbackSources()
+        coordinator = self.coordinator(sources=sources)
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        callback = None
+        try:
+            coordinator.start_capture(start_command("native-failure-dispatch"))
+            recorder = coordinator._active
+            original = recorder.fail
+
+            def fail(*args, **kwargs):
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("recovery not released")
+                return original(*args, **kwargs)
+
+            def report():
+                sources.failure_callback("source_sequence_gap", "test source gap")
+                # This is where the same native consumer resumes preview delivery.
+                returned.set()
+
+            with patch.object(recorder, "fail", side_effect=fail) as failed:
+                callback = threading.Thread(target=report)
+                callback.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(returned.wait(0.25), "source callback blocked on recovery")
+                status = coordinator.capture_status()
+                validate_capture_status(status)
+                diagnostic = status["snapshot"]["active_recording"]["recording_state"][
+                    "diagnostics"
+                ][-1]
+                self.assertEqual(diagnostic["code"], "source_sequence_gap")
+                self.assertEqual(diagnostic["message"], "test source gap")
+                self.assertEqual(diagnostic["severity"], "error")
+                self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                self.assert_network_operation_lock_held()
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("during-native-failure"))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                sources.failure_callback("duplicate", "ignored")
+                self.assertEqual(failed.call_count, 1)
+                release.set()
+                coordinator.stop_capture(stop_command("wait-native-failure"))
+                self.assertIsNone(coordinator._active)
+                self.assertIsNone(coordinator._failure_inflight)
+                self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            if callback is not None:
+                callback.join(4)
+            coordinator.close()
+
+    def test_failure_worker_start_error_still_preserves_failed_recording(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("failure-worker-unavailable"))
+            recorder = coordinator._active
+            with (
+                patch.object(threading.Thread, "start", side_effect=RuntimeError("no threads")),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+            ):
+                coordinator._source_failure(
+                    coordinator.generation_id,
+                    "source_sequence_gap",
+                    "test gap",
+                    defer_recovery=True,
+                )
+            self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._failure_inflight)
+            self.assertIsNone(coordinator._active)
+            status = coordinator.capture_status()["snapshot"]
+            self.assertEqual(status["device_state"], "idle")
+            retained = status["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["code"], "source_sequence_gap")
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def test_failure_worker_constructor_runtime_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("construct", RuntimeError("no locks"))
+
+    def test_failure_worker_constructor_memory_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("construct", MemoryError("no memory"))
+
+    def test_failure_worker_start_memory_error_releases_recording(self):
+        self._check_failure_worker_initialization_error("start", MemoryError("no memory"))
+
+    def _check_failure_worker_initialization_error(self, stage, injected):
+        coordinator = self.coordinator()
+        recorder = None
+        try:
+            coordinator.start_capture(start_command("worker-init-" + stage))
+            recorder = coordinator._active
+            sid = self.active_session_id(coordinator)
+            target = (
+                patch.object(threading, "Thread", side_effect=injected)
+                if stage == "construct"
+                else patch.object(threading.Thread, "start", side_effect=injected)
+            )
+            escaped = []
+            with target, patch.object(recorder, "fail", wraps=recorder.fail) as fail:
+                try:
+                    coordinator._source_failure(
+                        coordinator.generation_id,
+                        "source_sequence_gap",
+                        "original source fault",
+                        defer_recovery=True,
+                    )
+                except Exception as error:
+                    escaped.append(error)
+            self.assertIsNone(coordinator._failure_inflight, "recovery ownership stranded")
+            self.assertEqual(escaped, [])
+            self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._failure_projection)
+            self.assertIsNone(coordinator._active)
+            self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "idle")
+            self.assertIsNotNone(coordinator.retained_unsuccessful_outcome(sid))
+            retained = coordinator.capture_status()["snapshot"]["retained_unsuccessful"][
+                "recording_state"
+            ]
+            self.assertEqual(retained["diagnostics"][0]["code"], "source_sequence_gap")
+            self.assertEqual(retained["diagnostics"][0]["message"], "original source fault")
+            self.assert_network_operation_lock_available()
+            self.assertEqual(coordinator.stop_capture(stop_command("worker-init-stop")).status, 204)
+            coordinator.start_capture(start_command("worker-init-next"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            # All injected failures occur before a worker exists. Release only
+            # a stranded test latch so the pre-fix regression can fail, not hang.
+            with coordinator._stop_condition:
+                if coordinator._failure_inflight is recorder:
+                    coordinator._failure_inflight = None
+                    coordinator._failure_projection = None
+                    coordinator._stop_condition.notify_all()
+            coordinator.close()
+
+    def test_failed_recovery_sqlite_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(sqlite3.OperationalError("database full"))
+
+    def test_failed_recovery_io_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(OSError("state storage unavailable"))
+
+    def test_failed_recovery_persistence_commit_can_retry_without_recovering_again(self):
+        self._check_failed_recovery_commit_retry(coordinator_module.PersistenceError("state write"))
+
+    def test_failed_recovery_commit_retry_keeps_status_responsive_and_waiters_ordered(self):
+        coordinator = self.coordinator()
+        entered, release, waiter_blocked = threading.Event(), threading.Event(), threading.Event()
+        threads, errors, results = [], [], []
+        try:
+            coordinator.start_capture(start_command("slow-failure-commit"))
+            sid = self.active_session_id(coordinator)
+            recorder = coordinator._active
+            original = coordinator._state_db.put_capture_state
+            original_wait = coordinator._stop_condition.wait
+            first = True
+
+            def write(value, *args):
+                nonlocal first
+                if sid in value["retained"]:
+                    if first:
+                        first = False
+                        raise sqlite3.OperationalError("injected failure")
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("commit retry was not released")
+                return original(value, *args)
+
+            def wait(timeout=None):
+                waiter_blocked.set()
+                return original_wait(timeout)
+
+            def stop(key):
+                try:
+                    results.append(coordinator.stop_capture(stop_command(key)))
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.object(coordinator._state_db, "put_capture_state", side_effect=write),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "slow commit fault"
+                    )
+                owner = threading.Thread(target=stop, args=("commit-owner",))
+                threads.append(owner)
+                owner.start()
+                self.assertTrue(entered.wait(1))
+                with patch.object(coordinator._stop_condition, "wait", side_effect=wait):
+                    waiter = threading.Thread(target=stop, args=("commit-waiter",))
+                    threads.append(waiter)
+                    waiter.start()
+                    self.assertTrue(waiter_blocked.wait(1))
+                    before = time.monotonic()
+                    status = coordinator.capture_status()
+                    self.assertLess(time.monotonic() - before, 0.25)
+                    validate_capture_status(status)
+                    self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                    self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                    self.assert_network_operation_lock_held()
+                    with self.assertRaises(ProviderError) as busy:
+                        coordinator.start_capture(start_command("during-commit-retry"))
+                    self.assertEqual(busy.exception.code, "capture_busy")
+                    self.assertTrue(owner.is_alive())
+                    self.assertTrue(waiter.is_alive())
+                    release.set()
+                    for thread in threads:
+                        thread.join(3)
+                        self.assertFalse(thread.is_alive())
+                self.assertEqual(fail.call_count, 1)
+            self.assertEqual(errors, [])
+            self.assertEqual([result.status for result in results], [204, 204])
+            validate_capture_status(coordinator.capture_status())
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(4)
+            coordinator.close()
+
+    def test_failure_commit_does_not_admit_new_capture_before_owner_exits(self):
+        coordinator = self.coordinator()
+        committed, release = threading.Event(), threading.Event()
+        errors, worker = [], None
+        try:
+            coordinator.start_capture(start_command("failure-owner-handoff"))
+            original = coordinator._commit_active_failure
+
+            def commit(recorder):
+                original(recorder)
+                committed.set()
+                if not release.wait(5):
+                    raise TimeoutError("failure owner not released")
+
+            def fail():
+                try:
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "fault"
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch.object(coordinator, "_commit_active_failure", side_effect=commit):
+                worker = threading.Thread(target=fail)
+                worker.start()
+                self.assertTrue(committed.wait(1))
+                self.assertIsNone(coordinator._active)
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("before-failure-owner-exits"))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                release.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            coordinator.start_capture(start_command("after-failure-owner-exits"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            release.set()
+            if worker is not None:
+                worker.join(4)
+            coordinator.close()
+
+    def test_async_stop_replay_retries_uncommitted_failure_without_changing_receipt(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("async-failure-commit"))
+            recorder = coordinator._active
+            original = coordinator._state_db.put_capture_state
+            command = stop_command("async-failure-commit-stop")
+            worker_failures = 0
+
+            def write(value, *args):
+                nonlocal worker_failures
+                if threading.current_thread().name == "rp-ylx-stop-finalization":
+                    worker_failures += 1
+                    if worker_failures == 1:
+                        raise sqlite3.OperationalError("first background commit failed")
+                return original(value, *args)
+
+            def wait_worker():
+                deadline = time.monotonic() + 5
+                with coordinator._stop_condition:
+                    while coordinator._async_stop_worker is not None:
+                        remaining = deadline - time.monotonic()
+                        self.assertGreater(remaining, 0, "stop worker did not finish")
+                        coordinator._stop_condition.wait(remaining)
+
+            with patch.object(recorder, "fail", wraps=recorder.fail) as failed:
+                with (
+                    patch.object(
+                        coordinator._state_db,
+                        "put_capture_state",
+                        side_effect=sqlite3.OperationalError("initial failure commit"),
+                    ),
+                    self.assertRaises(sqlite3.OperationalError),
+                ):
+                    coordinator._source_failure(
+                        coordinator.generation_id, "encoder_failed", "original async fault"
+                    )
+                with patch.object(coordinator._state_db, "put_capture_state", side_effect=write):
+                    accepted = coordinator.request_stop_capture(command)
+                    self.assertEqual(accepted.status, 202)
+                    wait_worker()
+                    self.assertIs(coordinator._active, recorder)
+                    validate_capture_status(coordinator.capture_status())
+                    replay = coordinator.request_stop_capture(command)
+                    self.assertTrue(replay.replayed)
+                    self.assertEqual(replay.body, accepted.body)
+                    wait_worker()
+                    self.assertIsNone(coordinator._active)
+                self.assertEqual(failed.call_count, 1)
+            self.assertEqual(worker_failures, 2)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["message"], "original async fault")
+            self.assert_network_operation_lock_available()
+            coordinator.start_capture(start_command("new-take-after-async-retry"))
+            next_recorder = coordinator._active
+            with (
+                patch.object(
+                    coordinator._state_db,
+                    "put_capture_state",
+                    side_effect=sqlite3.OperationalError("next take commit"),
+                ),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                coordinator._source_failure(
+                    coordinator.generation_id, "audio_failed", "next take fault"
+                )
+            stale = coordinator.request_stop_capture(command)
+            self.assertTrue(stale.replayed)
+            self.assertEqual(stale.body, accepted.body)
+            self.assertIs(coordinator._active, next_recorder)
+            self.assertIsNone(coordinator._async_stop_worker)
+            self.assert_network_operation_lock_held()
+            self.assertEqual(
+                coordinator.stop_capture(stop_command("next-take-failure-commit")).status, 204
+            )
+        finally:
+            coordinator.close()
+
+    def test_failure_checkpoint_revision_is_durable_before_recovery(self):
+        coordinator = self.coordinator()
+        observed = []
+        try:
+            coordinator.start_capture(start_command("failure-checkpoint-order"))
+            recorder = coordinator._active
+            original = recorder.recover_completed_segments
+
+            def recover():
+                state = recorder.current_recording_state
+                durable = coordinator._state_db.capture_state()
+                observed.append((durable["source_revision"], state["state_revision"]))
+                return original()
+
+            with patch.object(recorder, "recover_completed_segments", side_effect=recover):
+                coordinator._source_failure(coordinator.generation_id, "encoder_failed", "fault")
+            self.assertEqual(len(observed), 1)
+            self.assertGreaterEqual(observed[0][0], observed[0][1])
+        finally:
+            coordinator.close()
+
+    def _check_failed_recovery_commit_retry(self, injected):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("failure-state-commit"))
+            recorder = coordinator._active
+            sid = self.active_session_id(coordinator)
+            original = coordinator._state_db.put_capture_state
+            command = stop_command("retry-failure-state")
+
+            def fail_retained(value, *args):
+                if sid in value["retained"]:
+                    raise injected
+                return original(value, *args)
+
+            with patch.object(recorder, "fail", wraps=recorder.fail) as fail:
+                with patch.object(
+                    coordinator._state_db, "put_capture_state", side_effect=fail_retained
+                ):
+                    with self.assertRaises(type(injected)):
+                        coordinator._source_failure(
+                            coordinator.generation_id, "encoder_failed", "original encoder fault"
+                        )
+                    status = coordinator.capture_status()
+                    validate_capture_status(status)
+                    self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                    self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                    self.assertIsNone(coordinator._failure_inflight)
+                    self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                    self.assert_network_operation_lock_held()
+                    with self.assertRaises(ProviderError) as busy:
+                        coordinator.start_capture(start_command("must-wait-for-failure-commit"))
+                    self.assertEqual(busy.exception.code, "capture_busy")
+                    # Duplicate source callbacks must not repeat recovery or replace its cause.
+                    coordinator._source_failure(coordinator.generation_id, "duplicate", "ignored")
+                    for _ in range(2):
+                        with self.assertRaises(type(injected)):
+                            coordinator.stop_capture(command)
+                        validate_capture_status(coordinator.capture_status())
+                        self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                        self.assert_network_operation_lock_held()
+                        self.assertIsNone(coordinator._stop_inflight)
+                    self.assertEqual(fail.call_count, 1)
+                self.assertEqual(coordinator.stop_capture(command).status, 204)
+                self.assertTrue(coordinator.stop_capture(command).replayed)
+                self.assertEqual(fail.call_count, 1)
+            self.assertIsNone(coordinator._active)
+            self.assertIsNone(coordinator._failure_projection)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]["recording_state"]
+            self.assertEqual(retained["diagnostics"][0]["code"], "encoder_failed")
+            self.assertEqual(retained["diagnostics"][0]["message"], "original encoder fault")
+            self.assert_network_operation_lock_available()
+            coordinator.close()
+            coordinator = self.coordinator()
+            self.assertTrue(coordinator.stop_capture(command).replayed)
+            persisted = coordinator.retained_unsuccessful_outcome(sid)["outcome"]["recording_state"]
+            self.assertEqual(persisted["diagnostics"][0]["message"], "original encoder fault")
+            coordinator.start_capture(start_command("after-failure-state-commit"))
+            self.assertIsNotNone(coordinator._active)
+        finally:
+            coordinator.close()
+
+    def test_failed_recovery_is_not_scanned_twice_before_returning_idle(self):
+        for outcome in (None, OSError("no space")):
+            with self.subTest(outcome=outcome):
+                coordinator = self.coordinator()
+                try:
+                    coordinator.start_capture(start_command("one-recovery-" + str(outcome)))
+                    recorder = coordinator._active
+                    partial = recorder.partial_path
+                    options = (
+                        {"side_effect": outcome}
+                        if isinstance(outcome, Exception)
+                        else {"return_value": None}
+                    )
+                    with (
+                        patch(
+                            "rp_ylx.recording.recovery.recover_device_session", **options
+                        ) as first,
+                        patch.object(
+                            coordinator_module, "recover_device_session", **options
+                        ) as fallback,
+                    ):
+                        coordinator._source_failure(
+                            coordinator.generation_id, "encoder_failed", "test fault"
+                        )
+                    self.assertEqual(first.call_count + fallback.call_count, 1)
+                    self.assertTrue(partial.is_dir())
+                    self.assertIsNone(coordinator._active)
+                    self.assertIsNone(coordinator._failure_inflight)
+                    self.assert_network_operation_lock_available()
+                    coordinator.close()
+                    with patch.object(
+                        coordinator_module, "recover_device_session", return_value=None
+                    ) as restarted:
+                        coordinator = self.coordinator()
+                    self.assertIn(partial, [call.args[0] for call in restarted.call_args_list])
+                finally:
+                    coordinator.close()
+
+    def test_already_failed_writer_still_gets_its_first_recovery_attempt(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("already-failed-before-recovery"))
+            recorder = coordinator._active
+            recorder._stop_writer()
+            recorder._abandon_encoder()
+            recorder._close_files(ignore_errors=False)
+            recorder._mark_failed("encoder_failed", "test failure", recoverable=False)
+            self.assertFalse(recorder.recovery_attempted)
+            with patch(
+                "rp_ylx.recording.recovery.recover_device_session", return_value=None
+            ) as recovery:
+                coordinator._source_failure(
+                    coordinator.generation_id, "encoder_failed", "test failure"
+                )
+            recovery.assert_called_once_with(recorder.partial_path)
+            self.assertTrue(recorder.recovery_attempted)
+            self.assertTrue(recorder.partial_path.is_dir())
+            self.assertIsNone(coordinator._active)
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def _check_failure_io_stage(self, stage, *, cached=True, error_code="encoder_failed"):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        errors, stopped = [], []
+        threads = []
+        try:
+            coordinator.start_capture(start_command(f"fault-io-{stage}-{cached}-{error_code}"))
+            sid = self.active_session_id(coordinator)
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+
+            def gate():
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("blocked failure IO was not released")
+
+            original_fail = recorder.fail
+            original_write = coordinator._state_db.put_capture_state
+
+            def fail(*args, **kwargs):
+                # Model storage IO holding the recorder's own lock too.
+                with recorder._lock:
+                    gate()
+                return original_fail(*args, **kwargs)
+
+            def recover(*args, **kwargs):
+                gate()
+                return None
+
+            def write(value, *args):
+                if sid in value["retained"]:
+                    gate()
+                return original_write(value, *args)
+
+            def report():
+                try:
+                    coordinator._source_failure(generation, error_code, "test fault")
+                except BaseException as error:
+                    errors.append(error)
+
+            def stop():
+                try:
+                    stopped.append(
+                        coordinator.stop_capture(
+                            stop_command(f"fault-stop-{stage}-{cached}-{error_code}")
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with ExitStack() as patches:
+                live = deepcopy(recorder.current_recording_state)
+                live["progress"].update(
+                    captured_frames=123, elapsed_seconds=4.1, bytes_written=45678
+                )
+                with patch.object(
+                    type(recorder),
+                    "current_recording_state",
+                    new_callable=PropertyMock,
+                    return_value=live,
+                ):
+                    observed = coordinator.capture_status()["snapshot"]["active_recording"][
+                        "recording_state"
+                    ]
+                warning = {
+                    "code": "test_warning",
+                    "severity": "warning",
+                    "message": "earlier warning",
+                    "at": live["updated_at"],
+                    "recoverable": True,
+                }
+                if cached:
+                    coordinator._cached_active_state["diagnostics"].append(warning)
+                else:
+                    coordinator._cached_active_state = None
+                original_cache = coordinator._cached_active_state
+                cached_before = deepcopy(original_cache)
+                if stage == "fail":
+                    patches.enter_context(patch.object(recorder, "fail", side_effect=fail))
+                elif stage == "recovery":
+                    patches.enter_context(
+                        patch(
+                            "rp_ylx.recording.recovery.recover_device_session",
+                            side_effect=recover,
+                        )
+                    )
+                else:
+                    patches.enter_context(
+                        patch.object(coordinator._state_db, "put_capture_state", side_effect=write)
+                    )
+                fault = threading.Thread(target=report)
+                threads.append(fault)
+                fault.start()
+                # This gate marks setup completion, not a recovery latency SLA.
+                # Storage before the injected pause can legitimately take >1s.
+                deadline = time.monotonic() + 30
+                while not entered.wait(0.05):
+                    self.assertTrue(
+                        fault.is_alive(), f"failure worker exited before gate: {errors}"
+                    )
+                    self.assertLess(time.monotonic(), deadline, "failure IO gate was not reached")
+                before = time.monotonic()
+                status = coordinator.capture_status()
+                self.assertLess(time.monotonic() - before, 0.25)
+                validate_capture_status(status)
+                self.assertEqual(status["snapshot"]["device_state"], "finalizing")
+                projected = status["snapshot"]["active_recording"]["recording_state"]
+                if cached:
+                    self.assertEqual(projected["progress"], observed["progress"])
+                    self.assertEqual(projected["diagnostics"][0], warning)
+                errors_visible = [d for d in projected["diagnostics"] if d["severity"] == "error"]
+                self.assertEqual(len(errors_visible), 1)
+                self.assertEqual(errors_visible[0]["code"], error_code)
+                self.assertEqual(errors_visible[0]["message"], "test fault")
+                self.assertEqual(errors_visible[0]["recoverable"], error_code == "media_lost")
+                self.assertEqual(original_cache, cached_before)
+                projected["diagnostics"].clear()
+                self.assertTrue(
+                    coordinator.capture_status()["snapshot"]["active_recording"]["recording_state"][
+                        "diagnostics"
+                    ]
+                )
+                self.assertEqual(coordinator.artifact_io_state(), "finalizing")
+                self.assertGreater(coordinator.open_handle_count, 0)
+                self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
+                self.assert_network_operation_lock_held()
+                with self.assertRaises(ProviderError) as busy:
+                    coordinator.start_capture(start_command("fault-new-" + stage))
+                self.assertEqual(busy.exception.code, "capture_busy")
+                # Duplicates and stale callbacks must not recover a second time.
+                coordinator._source_failure(generation, "duplicate", "ignored")
+                coordinator._source_failure(str(uuid.uuid4()), "stale", "ignored")
+                stopper = threading.Thread(target=stop)
+                threads.append(stopper)
+                stopper.start()
+                time.sleep(0.02)
+                self.assertTrue(stopper.is_alive())
+                release.set()
+                for thread in threads:
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(stopped[0].status, 204)
+            replay = coordinator.stop_capture(
+                stop_command(f"fault-stop-{stage}-{cached}-{error_code}")
+            )
+            self.assertTrue(replay.replayed)
+            status = coordinator.capture_status()
+            validate_capture_status(status)
+            self.assertEqual(status["snapshot"]["device_state"], "idle")
+            retained = status["snapshot"]["retained_unsuccessful"]
+            self.assertEqual(retained["recording_state"]["diagnostics"][0]["code"], error_code)
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(4)
+            coordinator.close()
+
+    def test_source_failure_during_source_stop_is_owned_by_stop_without_callback_deadlock(self):
+        sources = FakeSources()
+        coordinator = self.coordinator(sources=sources)
+        try:
+            coordinator.start_capture(start_command("fault-from-stop"))
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+
+            def stop_with_callback():
+                callback = threading.Thread(
+                    target=lambda: coordinator._source_failure(
+                        generation, "encoder_failed", "source stopped after codec fault"
+                    )
+                )
+                callback.start()
+                callback.join(1)
+                self.assertFalse(callback.is_alive())
+                sources.open_handle_count = 0
+
+            with (
+                patch.object(sources, "stop", side_effect=stop_with_callback),
+                patch.object(recorder, "fail", wraps=recorder.fail) as fail,
+                patch.object(recorder, "stop", wraps=recorder.stop) as stop,
+            ):
+                with self.assertRaises(ProviderError) as failure:
+                    coordinator.stop_capture(stop_command("fault-from-stop-end"))
+                self.assertEqual(failure.exception.code, "encoder_failed")
+                self.assertEqual(fail.call_count, 1)
+                stop.assert_not_called()
+            self.assertIsNone(coordinator._active)
+            self.assertIsNone(coordinator._stop_inflight)
+            self.assertIsNone(coordinator._failure_inflight)
+            self.assert_network_operation_lock_available()
+        finally:
+            coordinator.close()
+
+    def test_close_waits_for_failure_owner_without_aborting_the_same_recorder(self):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        fault = closer = None
+        errors = []
+        try:
+            coordinator.start_capture(start_command("close-during-failure"))
+            recorder = coordinator._active
+            generation = coordinator.generation_id
+            original = recorder.fail
+
+            def fail(*args, **kwargs):
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError("failure not released")
+                return original(*args, **kwargs)
+
+            def report():
+                try:
+                    coordinator._source_failure(generation, "encoder_failed", "test")
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.object(recorder, "fail", side_effect=fail),
+                patch.object(recorder, "abort", wraps=recorder.abort) as abort,
+            ):
+                fault = threading.Thread(target=report)
+                fault.start()
+                self.assertTrue(entered.wait(1))
+                closer = threading.Thread(target=coordinator.close)
+                closer.start()
+                time.sleep(0.02)
+                self.assertTrue(closer.is_alive())
+                self.assert_network_operation_lock_held()
+                validate_capture_status(coordinator.capture_status())
+                release.set()
+                fault.join(3)
+                closer.join(3)
+                self.assertFalse(fault.is_alive())
+                self.assertFalse(closer.is_alive())
+                abort.assert_not_called()
+            self.assertEqual(errors, [])
+            self.assert_network_operation_lock_available()
+        finally:
+            release.set()
+            for thread in (fault, closer):
+                if thread is not None:
+                    thread.join(4)
+            coordinator.close()
+
+    def test_old_source_callback_cannot_fail_new_take_on_same_mount_generation(self):
+        callbacks = []
+
+        class Sources(FakeSources):
+            def start(self, **kwargs):
+                callbacks.append(kwargs["on_failure"])
+                super().start(**kwargs)
+
+        coordinator = self.coordinator(sources=Sources())
+        try:
+            self.seal_one(coordinator, prefix="old-callback")
+            generation = coordinator.generation_id
+            coordinator.start_capture(start_command("new-callback-start"))
+            sid = self.active_session_id(coordinator)
+            self.assertEqual(coordinator.generation_id, generation)
+            callbacks[0]("encoder_failed", "late fault from previous take")
+            self.assertEqual(self.active_session_id(coordinator), sid)
+            self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "recording")
+        finally:
+            coordinator.close()
+
+    def test_delayed_state_snapshot_cannot_overwrite_newer_durable_revision(self):
+        coordinator = self.coordinator()
+        entered, release = threading.Event(), threading.Event()
+        real_lock = threading.Lock()
+
+        class DelayedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "delayed-state-writer":
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("state write was not released")
+                real_lock.acquire()
+
+            def __exit__(self, *args):
+                real_lock.release()
+
+        thread = None
+        try:
+            with patch.object(coordinator, "_state_persist_lock", DelayedLock()):
+                coordinator._revision = 10
+                thread = threading.Thread(
+                    target=coordinator._persist_local_state, name="delayed-state-writer"
+                )
+                thread.start()
+                self.assertTrue(entered.wait(1))
+                coordinator._revision = 11
+                coordinator._persist_local_state()
+                release.set()
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(coordinator._read_local_state()["source_revision"], 11)
+        finally:
+            release.set()
+            if thread is not None:
+                thread.join(4)
+            coordinator.close()
+
     def test_concurrent_same_stop_replays_after_inflight_stop_finishes(self) -> None:
         manifest_blocked = threading.Event()
         release_manifest = threading.Event()
@@ -3148,6 +4682,169 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             release_manifest.set()
             coordinator.close()
+
+    def _queued_stop_after_new_take(self, *, same_key=False, reason="user"):
+        manifest_blocked = threading.Event()
+        release_manifest = threading.Event()
+        waiter_entered = threading.Event()
+        waiter_awake = threading.Event()
+        release_waiter = threading.Event()
+
+        def before_write(role, payload):
+            del payload
+            if role == "manifest":
+                manifest_blocked.set()
+                if not release_manifest.wait(4):
+                    raise TimeoutError("first take did not finish")
+
+        coordinator = self.coordinator(before_write=before_write)
+        results, errors, threads = {}, {}, []
+        condition = coordinator._stop_condition
+        original_wait = condition.wait
+
+        def delayed_wait(timeout=None):
+            late = threading.current_thread().name == "queued-old-stop"
+            if late:
+                waiter_entered.set()
+            result = original_wait(timeout)
+            if late:
+                # Force the valid scheduling order: the first stop completes,
+                # another client starts a new take, then this waiter resumes.
+                condition.release()
+                try:
+                    waiter_awake.set()
+                    # This gate selects a schedule, not a product timeout.
+                    # The owner releases it after new-take admission or in
+                    # finally; slow storage must not cancel the old request.
+                    release_waiter.wait()
+                finally:
+                    condition.acquire()
+            return result
+
+        def stop(name, command):
+            try:
+                results[name] = coordinator.stop_capture(command)
+            except BaseException as error:
+                errors[name] = error
+
+        try:
+            coordinator.start_capture(start_command("queued-old-start"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            first_command = stop_command("queued-first")
+            late_command = first_command if same_key else stop_command("queued-late", reason=reason)
+            with patch.object(condition, "wait", side_effect=delayed_wait):
+                first = threading.Thread(target=stop, args=("first", first_command))
+                late = threading.Thread(
+                    target=stop, args=("late", late_command), name="queued-old-stop"
+                )
+                threads = [first, late]
+                first.start()
+                # This selects a concurrency schedule, not a stop latency SLA.
+                # Real finalization includes durable I/O before the manifest
+                # barrier. Fail promptly if the worker exits without reaching
+                # it, and retain a bounded test setup budget for deadlocks.
+                manifest_deadline = time.monotonic() + 30
+                while not manifest_blocked.wait(0.05):
+                    self.assertTrue(
+                        first.is_alive(), f"first stop missed manifest barrier: {errors!r}"
+                    )
+                    self.assertLess(
+                        time.monotonic(), manifest_deadline, "manifest test barrier timed out"
+                    )
+                late.start()
+                self.assertTrue(waiter_entered.wait(2))
+                release_manifest.set()
+                first.join(4)
+                self.assertFalse(first.is_alive())
+                self.assertNotIn("first", errors)
+                self.assertTrue(waiter_awake.wait(2))
+                coordinator.start_capture(start_command("queued-new-start"))
+                new_session = self.active_session_id(coordinator)
+                self.assertTrue(coordinator.submit_frame(frame()))
+                release_waiter.set()
+                late.join(4)
+                self.assertFalse(late.is_alive())
+                if reason != "safe_swap":
+                    self.assertNotIn("late", errors)
+                self.assertIsNotNone(coordinator._active_plan, "queued stop affected the new take")
+                self.assertEqual(self.active_session_id(coordinator), new_session)
+                self.assertEqual(
+                    coordinator.capture_status()["snapshot"]["device_state"], "recording"
+                )
+                self.assert_network_operation_lock_held()
+                if not same_key and reason == "user":
+                    results["repeated_late"] = coordinator.stop_capture(late_command)
+                    self.assertEqual(self.active_session_id(coordinator), new_session)
+            return results, errors
+        finally:
+            release_manifest.set()
+            release_waiter.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(5)
+            coordinator.close()
+
+    def test_queued_old_stop_does_not_stop_a_new_take(self):
+        results, errors = self._queued_stop_after_new_take()
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 204)
+        self.assertEqual(results["repeated_late"].status, 204)
+        self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_stop_survives_slow_new_take_start(self):
+        original = CaptureCoordinator.start_capture
+
+        def slow_new_start(coordinator, command):
+            if command.idempotency_key == "queued-new-start":
+                # The test controls when the queued request resumes. Storage
+                # latency while admitting the next take must not expire it.
+                time.sleep(4.2)
+            return original(coordinator, command)
+
+        with patch.object(CaptureCoordinator, "start_capture", slow_new_start):
+            results, errors = self._queued_stop_after_new_take()
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 204)
+        self.assertEqual(results["repeated_late"].status, 204)
+        self.assertTrue(results["repeated_late"].replayed)
+
+    def test_queued_same_stop_survives_slow_old_take_finalization(self):
+        original = coordinator_module.DeviceSessionRecorder.stop
+
+        def slow_stop(recorder, **kwargs):
+            # Delay normal storage finalization, not the public request receipt.
+            # The scheduling fixture must await its manifest barrier rather
+            # than impose a two-second total finalization requirement.
+            time.sleep(2.2)
+            return original(recorder, **kwargs)
+
+        with patch.object(coordinator_module.DeviceSessionRecorder, "stop", slow_stop):
+            results, errors = self._queued_stop_after_new_take(same_key=True)
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 202)
+        self.assertTrue(results["late"].replayed)
+        self.assertEqual(results["late"].body, results["first"].body)
+
+    def test_queued_stop_cleanup_preserves_early_failure(self):
+        with (
+            patch.object(CaptureCoordinator, "stop_capture", side_effect=OSError("early stop")),
+            self.assertRaises(AssertionError),
+        ):
+            self._queued_stop_after_new_take()
+
+    def test_queued_safe_swap_cannot_release_a_new_take(self):
+        results, errors = self._queued_stop_after_new_take(reason="safe_swap")
+        self.assertNotIn("late", results)
+        self.assertIsInstance(errors.get("late"), ProviderError)
+        self.assertEqual(errors["late"].code, "capture_state_changed")
+        self.assertFalse(errors["late"].retryable)
+
+    def test_queued_same_stop_replays_original_receipt_after_new_take(self):
+        results, errors = self._queued_stop_after_new_take(same_key=True)
+        self.assertEqual(errors, {})
+        self.assertEqual(results["late"].status, 202)
+        self.assertTrue(results["late"].replayed)
+        self.assertEqual(results["late"].body, results["first"].body)
 
     def test_remount_at_same_path_rotates_generation_and_rejects_stale_submitter(self) -> None:
         mount_identity = "mount-a"
@@ -3400,6 +5097,24 @@ class CaptureCoordinatorTest(unittest.TestCase):
             validate_device_session_directory(final)
         finally:
             restarted.close()
+
+    def test_sqlite_catalog_clears_diagnostic_after_artifact_repair(self):
+        first = self.coordinator()
+        session_id = self.seal_one(first, prefix="catalog-repair")
+        first.close()
+        video = next((self.mountpoint / "recordings" / session_id / "video").glob("left_*.mp4"))
+        original = video.read_bytes()
+        video.write_bytes(b"bad")
+        reopened = self.coordinator()
+        try:
+            invalid = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertTrue(invalid["diagnostics"])
+            video.write_bytes(original)
+            repaired = reopened.list_sessions(cursor=None, limit=50, take_id=None)
+            self.assertEqual(repaired["diagnostics"], [])
+            self.assertEqual(repaired["items"][0]["session_id"], session_id)
+        finally:
+            reopened.close()
 
     def test_digest_error_is_not_listed_as_a_success(self) -> None:
         first = self.coordinator()

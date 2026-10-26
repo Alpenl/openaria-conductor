@@ -5,14 +5,14 @@ backend-path = ["."]
 
 [project]
 name = "rp-ylx"
-version = "0.2.7"
+version = "0.2.8"
 description = "RDK X5 + YLX 2UQ2 双目视频与 IMU 录制服务"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
   "jsonschema>=4.23,<5",
-  "pillow>=10,<13",
+  "pillow>=13,<14",
   "typing-extensions>=4.4,<5",
   "zeroconf>=0.150,<1",
   "zstandard>=0.23,<1",

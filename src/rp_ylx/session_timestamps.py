@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
-from bisect import bisect_left
+import os
+import tempfile
+from collections import Counter
 from collections.abc import Iterator
+from contextlib import ExitStack, closing
 from pathlib import Path, PurePosixPath
-from statistics import fmean, median, pstdev
-from typing import Any
+from statistics import fmean, pstdev
+from typing import Any, BinaryIO, TextIO
 
+from zstandard import ZstdError
+
+from rp_ylx.api.downloads import iter_device_session_v1_artifacts
 from rp_ylx.frame_index import valid_frame_record
 from rp_ylx.recording.storage import open_metadata
 from rp_ylx.validation import PublicValidationError, validate_public_session
@@ -89,123 +96,151 @@ def _artifact_path(root: Path, descriptor: object, *, role: str, label: str) -> 
     return path
 
 
-def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with open_metadata(path) as stream:
-        line_number = 0
-        while True:
-            line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
-            if not line:
-                break
-            line_number += 1
-            if len(line) > MAX_NDJSON_LINE_BYTES or not line.endswith(b"\n"):
-                raise SessionTimestampError(
-                    "session_timestamps_invalid",
-                    f"{label}:{line_number} 行过长或缺少换行",
-                )
-            try:
-                value = json.loads(line)
-            except (UnicodeError, json.JSONDecodeError) as error:
-                raise SessionTimestampError(
-                    "session_timestamps_invalid",
-                    f"{label}:{line_number} JSON 无效：{error}",
-                ) from error
-            rows.append(_mapping(value, f"{label}:{line_number}"))
-    if not rows:
+def _iter_jsonl(
+    path: Path,
+    label: str,
+    descriptor: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    digest = hashlib.sha256()
+    size = 0
+    line_number = 0
+    try:
+        with open_metadata(path) as stream:
+            line_number = 0
+            while True:
+                line = stream.readline(MAX_NDJSON_LINE_BYTES + 1)
+                if not line:
+                    break
+                line_number += 1
+                if len(line) > MAX_NDJSON_LINE_BYTES or not line.endswith(b"\n"):
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid",
+                        f"{label}:{line_number} 行过长或缺少换行",
+                    )
+                try:
+                    value = json.loads(line)
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid",
+                        f"{label}:{line_number} JSON 无效：{error}",
+                    ) from error
+                digest.update(line)
+                size += len(line)
+                yield _mapping(value, f"{label}:{line_number}")
+    except (OSError, ZstdError) as error:
+        raise SessionTimestampError(
+            "session_timestamps_invalid", f"{label} 无法完整读取：{error}"
+        ) from error
+    if not line_number:
         raise SessionTimestampError("session_timestamps_empty", f"{label} 为空")
-    return rows
+    if descriptor is not None:
+        encoding = descriptor.get("storage_encoding")
+        expected = (
+            (encoding["uncompressed_bytes"], encoding["uncompressed_sha256"])
+            if encoding
+            else (descriptor["bytes"], descriptor["sha256"])
+        )
+        if (size, digest.hexdigest()) != expected:
+            raise SessionTimestampError("session_timestamps_invalid", f"{label} 读取校验不一致")
+
+
+def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
+    # Compatibility helper; export itself never materializes the IMU journal.
+    return list(_iter_jsonl(path, label))
 
 
 def _load_frames(root: Path, manifest: dict[str, Any]) -> list[dict[str, int]]:
     frames = _mapping(manifest.get("frames"), "frames")
     path = _artifact_path(root, frames.get("artifact"), role="frames.index", label="frames")
-    records = _read_jsonl(path, "frames")
+    records = _iter_jsonl(path, "frames", frames["artifact"])
     expected_count = _integer(frames.get("count"), "frames.count")
-    if len(records) != expected_count:
-        raise SessionTimestampError("session_timestamps_invalid", "frames.count 与文件行数不一致")
     normalized: list[dict[str, int]] = []
     previous_host = -1
-    for index, record in enumerate(records):
-        if not valid_frame_record(record):
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                f"frames:{index + 1} 不是闭合帧索引记录",
+    with closing(records):
+        for index, record in enumerate(records):
+            if not valid_frame_record(record) or record["session_id"] != manifest["session_id"]:
+                raise SessionTimestampError(
+                    "session_timestamps_invalid",
+                    f"frames:{index + 1} 不是闭合帧索引记录",
+                )
+            frame = _integer(record["frame"], f"frames[{index}].frame")
+            source_sequence = _integer(
+                record["source_sequence"], f"frames[{index}].source_sequence"
             )
-        frame = _integer(record["frame"], f"frames[{index}].frame")
-        source_sequence = _integer(record["source_sequence"], f"frames[{index}].source_sequence")
-        host = _integer(record["host_monotonic_ns"], f"frames[{index}].host_monotonic_ns")
-        if frame != index or host <= previous_host:
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                f"frames:{index + 1} 帧号或主机时间不递增",
+            host = _integer(record["host_monotonic_ns"], f"frames[{index}].host_monotonic_ns")
+            if frame != index or host <= previous_host:
+                raise SessionTimestampError(
+                    "session_timestamps_invalid",
+                    f"frames:{index + 1} 帧号或主机时间不递增",
+                )
+            normalized.append(
+                {
+                    "frame_index": frame,
+                    "source_sequence": source_sequence,
+                    "host_monotonic_ns": host,
+                }
             )
-        normalized.append(
-            {
-                "frame_index": frame,
-                "source_sequence": source_sequence,
-                "host_monotonic_ns": host,
-            }
-        )
-        previous_host = host
+            previous_host = host
+    if len(normalized) != expected_count:
+        raise SessionTimestampError("session_timestamps_invalid", "frames.count 与文件行数不一致")
     return normalized
 
 
-def _load_imu(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _iter_imu(root: Path, manifest: dict[str, Any]) -> Iterator[dict[str, Any]]:
     imu = _mapping(manifest.get("imu"), "imu")
     path = _artifact_path(root, imu.get("artifact"), role="imu.samples", label="imu")
-    records = _read_jsonl(path, "imu")
+    records = _iter_jsonl(path, "imu", imu["artifact"])
     expected_count = _integer(imu.get("sample_count"), "imu.sample_count")
-    if len(records) != expected_count:
-        raise SessionTimestampError(
-            "session_timestamps_invalid",
-            "imu.sample_count 与文件行数不一致",
-        )
-    normalized: list[dict[str, Any]] = []
+    count = 0
     previous_sequence = -1
-    for index, record in enumerate(records):
-        expected_keys = {
-            "format",
-            "session_id",
-            "sequence",
-            "packet_sequence",
-            "sample_index",
-            "device_timestamp_raw",
-            "device_ticks",
-            "host_read_start_ns",
-            "host_read_end_ns",
-            "host_monotonic_ns",
-            "raw",
-            "sync",
-        }
-        if set(record) != expected_keys or record.get("format") != "ylx.imu.v0":
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                f"imu:{index + 1} 不是闭合 IMU 记录",
+    with closing(records):
+        for index, record in enumerate(records):
+            expected_keys = {
+                "format",
+                "session_id",
+                "sequence",
+                "packet_sequence",
+                "sample_index",
+                "device_timestamp_raw",
+                "device_ticks",
+                "host_read_start_ns",
+                "host_read_end_ns",
+                "host_monotonic_ns",
+                "raw",
+                "sync",
+            }
+            if (
+                set(record) != expected_keys
+                or record.get("format") != "ylx.imu.v0"
+                or record["session_id"] != manifest["session_id"]
+            ):
+                raise SessionTimestampError(
+                    "session_timestamps_invalid",
+                    f"imu:{index + 1} 不是闭合 IMU 记录",
+                )
+            sequence = _integer(record["sequence"], f"imu[{index}].sequence")
+            packet_sequence = _integer(record["packet_sequence"], f"imu[{index}].packet_sequence")
+            sample_index = _integer(record["sample_index"], f"imu[{index}].sample_index")
+            device_timestamp_raw = _integer(
+                record["device_timestamp_raw"], f"imu[{index}].device_timestamp_raw"
             )
-        sequence = _integer(record["sequence"], f"imu[{index}].sequence")
-        packet_sequence = _integer(record["packet_sequence"], f"imu[{index}].packet_sequence")
-        sample_index = _integer(record["sample_index"], f"imu[{index}].sample_index")
-        device_timestamp_raw = _integer(
-            record["device_timestamp_raw"], f"imu[{index}].device_timestamp_raw"
-        )
-        device_ticks = _integer(record["device_ticks"], f"imu[{index}].device_ticks")
-        host_start = _integer(record["host_read_start_ns"], f"imu[{index}].host_read_start_ns")
-        host_end = _integer(record["host_read_end_ns"], f"imu[{index}].host_read_end_ns")
-        host = _integer(record["host_monotonic_ns"], f"imu[{index}].host_monotonic_ns")
-        if sequence != previous_sequence + 1 or host_start > host or host > host_end:
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                f"imu:{index + 1} 序号或主机读取区间无效",
-            )
-        sync = _mapping(record["sync"], f"imu[{index}].sync")
-        quality = sync.get("quality")
-        if quality not in {"insufficient", "degraded", "good"}:
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                f"imu:{index + 1} sync quality 无效",
-            )
-        normalized.append(
-            {
+            device_ticks = _integer(record["device_ticks"], f"imu[{index}].device_ticks")
+            host_start = _integer(record["host_read_start_ns"], f"imu[{index}].host_read_start_ns")
+            host_end = _integer(record["host_read_end_ns"], f"imu[{index}].host_read_end_ns")
+            host = _integer(record["host_monotonic_ns"], f"imu[{index}].host_monotonic_ns")
+            if sequence != previous_sequence + 1 or host_start > host or host > host_end:
+                raise SessionTimestampError(
+                    "session_timestamps_invalid",
+                    f"imu:{index + 1} 序号或主机读取区间无效",
+                )
+            sync = _mapping(record["sync"], f"imu[{index}].sync")
+            quality = sync.get("quality")
+            if quality not in {"insufficient", "degraded", "good"}:
+                raise SessionTimestampError(
+                    "session_timestamps_invalid",
+                    f"imu:{index + 1} sync quality 无效",
+                )
+            yield {
                 "sample_number": index,
                 "sequence": sequence,
                 "packet_sequence": packet_sequence,
@@ -215,41 +250,123 @@ def _load_imu(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
                 "host_monotonic_ns": host,
                 "sync_quality": quality,
             }
+            previous_sequence = sequence
+            count += 1
+    if count != expected_count:
+        raise SessionTimestampError(
+            "session_timestamps_invalid", "imu.sample_count 与文件行数不一致"
         )
-        previous_sequence = sequence
-    return normalized
 
 
-def _packets(samples: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    packets: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_packet: int | None = None
-    for sample in samples:
-        packet = int(sample["packet_sequence"])
-        if current_packet is None or packet != current_packet:
-            if current:
-                packets.append(current)
-            current = []
-            current_packet = packet
-        current.append(sample)
-    if current:
-        packets.append(current)
-    previous_packet = -1
-    for packet in packets:
-        packet_sequence = int(packet[0]["packet_sequence"])
-        if packet_sequence != previous_packet + 1:
-            raise SessionTimestampError("session_timestamps_invalid", "IMU packet_sequence 不连续")
-        indices = [int(sample["sample_index"]) for sample in packet]
-        if indices != list(range(len(packet))):
-            raise SessionTimestampError(
-                "session_timestamps_invalid",
-                "IMU packet 内 sample_index 不连续",
-            )
-        host = int(packet[0]["host_monotonic_ns"])
-        if any(int(sample["host_monotonic_ns"]) != host for sample in packet):
-            raise SessionTimestampError("session_timestamps_invalid", "IMU packet 内主机时间不一致")
-        previous_packet = packet_sequence
-    return packets
+def _packet_summary(root: Path, manifest: dict[str, Any], spool: BinaryIO) -> dict[str, Any]:
+    """Store only [host, count] per packet on disk, never whole sample dictionaries."""
+    sizes: Counter[int] = Counter()
+    packet = -1
+    host = first_host = count = total = 0
+
+    def finish_packet() -> None:
+        data = (json.dumps([host, count]) + "\n").encode("ascii")
+        if spool.write(data) != len(data):
+            raise OSError("short timestamp packet spool write")
+        sizes[count] += 1
+
+    with closing(_iter_imu(root, manifest)) as samples:
+        for sample in samples:
+            sequence = sample["packet_sequence"]
+            if sequence != packet:
+                if sequence != packet + 1:
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid", "IMU packet_sequence 不连续"
+                    )
+                if packet >= 0:
+                    finish_packet()
+                    if sample["host_monotonic_ns"] < host:
+                        raise SessionTimestampError(
+                            "session_timestamps_invalid", "IMU packet 主机时间倒退"
+                        )
+                else:
+                    first_host = sample["host_monotonic_ns"]
+                host, count, packet = sample["host_monotonic_ns"], 0, sequence
+            if sample["sample_index"] != count or sample["host_monotonic_ns"] != host:
+                raise SessionTimestampError(
+                    "session_timestamps_invalid", "IMU packet 内索引或主机时间无效"
+                )
+            count += 1
+            total += 1
+    finish_packet()
+    packets = packet + 1
+    # The counter has at most O(sqrt(samples)) distinct positive packet sizes.
+    low, high = (packets - 1) // 2, packets // 2
+    cumulative = 0
+    middle = []
+    for size, frequency in sorted(sizes.items()):
+        for position in (low, high):
+            if cumulative <= position < cumulative + frequency:
+                middle.append(size)
+        cumulative += frequency
+    per_packet = middle[0] if packets % 2 else sum(middle) / 2
+    rate = None if packets < 2 or host <= first_host else (packets - 1) * 1e9 / (host - first_host)
+    return {
+        "samples": total,
+        "packets": packets,
+        "median_samples_per_packet": per_packet,
+        "packet_rate_hz": rate,
+        "record_rate_hz": None if rate is None else rate * float(per_packet),
+    }
+
+
+class _UseHostTimes(Exception):
+    """A late non-increasing estimate requires restarting the entire alignment."""
+
+
+def _timed_samples(
+    root: Path,
+    manifest: dict[str, Any],
+    spool: BinaryIO,
+    rate: float | None,
+    *,
+    raw: bool = False,
+) -> Iterator[tuple[dict[str, Any], float]]:
+    spool.seek(0)
+    packet = -1
+    host = count = seen = 0
+    previous_host = None
+    previous_time = None
+    period = 0.0
+    with closing(_iter_imu(root, manifest)) as samples:
+        for sample in samples:
+            if sample["packet_sequence"] != packet:
+                if seen != count or sample["packet_sequence"] != packet + 1:
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid", "IMU packet 在读取间改变"
+                    )
+                descriptor = spool.readline()
+                if not descriptor:
+                    raise SessionTimestampError(
+                        "session_timestamps_invalid", "IMU packet 在读取间增加"
+                    )
+                host, count = json.loads(descriptor)
+                packet += 1
+                seen = 0
+                if rate is not None and not raw:
+                    period = 1e9 / rate
+                    if previous_host is not None:
+                        period = min(period, (host - previous_host) / count)
+                previous_host = host
+            if (
+                sample["sample_index"] != seen
+                or sample["host_monotonic_ns"] != host
+                or seen >= count
+            ):
+                raise SessionTimestampError("session_timestamps_invalid", "IMU packet 在读取间改变")
+            when = float(host) if raw or rate is None else host - (count - 1 - seen) * period
+            if not raw and rate is not None and previous_time is not None and when <= previous_time:
+                raise _UseHostTimes
+            yield sample, when
+            seen += 1
+            previous_time = when
+    if seen != count or spool.read(1):
+        raise SessionTimestampError("session_timestamps_invalid", "IMU packet 在读取间减少")
 
 
 def _rate_from_times(times_ns: list[int], events_per_tick: float = 1.0) -> float | None:
@@ -259,40 +376,6 @@ def _rate_from_times(times_ns: list[int], events_per_tick: float = 1.0) -> float
     if span <= 0:
         return None
     return (len(times_ns) - 1) * events_per_tick * 1_000_000_000.0 / span
-
-
-def _estimated_imu_times(
-    packets: list[list[dict[str, Any]]],
-    record_rate_hz: float | None,
-) -> list[float]:
-    if record_rate_hz is None:
-        return [float(sample["host_monotonic_ns"]) for packet in packets for sample in packet]
-    global_period_ns = 1_000_000_000.0 / record_rate_hz
-    estimated: list[float] = []
-    previous_packet_host: int | None = None
-    for packet in packets:
-        host = int(packet[0]["host_monotonic_ns"])
-        period_ns = global_period_ns
-        if previous_packet_host is not None:
-            period_ns = min(period_ns, (host - previous_packet_host) / len(packet))
-        for sample in packet:
-            offset = len(packet) - 1 - int(sample["sample_index"])
-            estimated.append(host - offset * period_ns)
-        previous_packet_host = host
-    if any(later <= earlier for earlier, later in zip(estimated, estimated[1:], strict=False)):
-        return [float(sample["host_monotonic_ns"]) for packet in packets for sample in packet]
-    return estimated
-
-
-def _nearest_index(values: list[float], target: int) -> int:
-    lo = bisect_left(values, target)
-    if lo <= 0:
-        return 0
-    if lo >= len(values):
-        return len(values) - 1
-    before = lo - 1
-    after = lo
-    return before if abs(values[before] - target) <= abs(values[after] - target) else after
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -342,14 +425,24 @@ def _frame_interval_summary(
 
 def _alignment_rows(
     frames: list[dict[str, int]],
-    samples: list[dict[str, Any]],
-    imu_times: list[float],
+    samples: Iterator[tuple[dict[str, Any], float]],
 ) -> Iterator[dict[str, Any]]:
+    before = None
+    after = next(samples, None)
+    if after is None:
+        raise SessionTimestampError("session_timestamps_empty", "会话没有可对齐的 IMU 样本")
     for frame in frames:
         frame_time = frame["host_monotonic_ns"]
-        imu_index = _nearest_index(imu_times, frame_time)
-        imu = samples[imu_index]
-        imu_time = imu_times[imu_index]
+        while after is not None and after[1] < frame_time:
+            before, after = after, next(samples, None)
+        if before is None:
+            chosen = after
+        elif after is None or abs(before[1] - frame_time) <= abs(after[1] - frame_time):
+            chosen = before
+        else:
+            chosen = after
+        assert chosen is not None
+        imu, imu_time = chosen
         yield {
             "frame_index": frame["frame_index"],
             "source_sequence": frame["source_sequence"],
@@ -365,46 +458,41 @@ def _alignment_rows(
             "imu_sample_index": imu["sample_index"],
             "imu_sync_quality": imu["sync_quality"],
         }
+    # EOF checks and late fallback apply even beyond the final camera frame.
+    for _ in samples:
+        pass
 
 
-def _alignment_summary(frames: list[dict[str, int]], imu_times: list[float]) -> dict[str, Any]:
-    deltas = [
-        abs(
-            (
-                imu_times[_nearest_index(imu_times, frame["host_monotonic_ns"])]
-                - frame["host_monotonic_ns"]
-            )
-            / 1_000_000.0
-        )
-        for frame in frames
-    ]
+def _alignment_summary(deltas: list[float]) -> dict[str, Any]:
     return {
         "camera_timestamp_source": "shared_sbs_frame",
         "camera_time_base": "host_monotonic",
         "left_right_delta_ms": 0.0,
         "imu_matching": "nearest_estimated_sample",
-        "rows": len(frames),
+        "rows": len(deltas),
         "nearest_imu_delta_p50_ms": _percentile(deltas, 0.50),
         "nearest_imu_delta_p95_ms": _percentile(deltas, 0.95),
         "nearest_imu_delta_max_ms": max(deltas, default=None),
     }
 
 
-def _imu_summary(
-    samples: list[dict[str, Any]],
-    packets: list[list[dict[str, Any]]],
-) -> dict[str, float | int | None]:
-    packet_hosts = [int(packet[0]["host_monotonic_ns"]) for packet in packets]
-    samples_per_packet = median([len(packet) for packet in packets]) if packets else 0
-    packet_rate_hz = _rate_from_times(packet_hosts)
-    record_rate_hz = None if packet_rate_hz is None else packet_rate_hz * float(samples_per_packet)
-    return {
-        "samples": len(samples),
-        "packets": len(packets),
-        "median_samples_per_packet": samples_per_packet,
-        "packet_rate_hz": packet_rate_hz,
-        "record_rate_hz": record_rate_hz,
-    }
+class _CheckedCsvOutput:
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+
+    def write(self, text: str) -> int:
+        written = self.stream.write(text)
+        if written != len(text):
+            raise OSError("short timestamp CSV write")
+        return written
+
+
+def _check_output(path: Path, root: Path, manifest: dict[str, Any]) -> None:
+    protected = [root / "manifest.json"]
+    protected.extend(root / item["path"] for item in iter_device_session_v1_artifacts(manifest))
+    resolved = path.resolve()
+    if any(resolved == item.resolve() for item in protected):
+        raise SessionTimestampError("session_timestamps_invalid", "CSV 输出不能覆盖会话原始文件")
 
 
 def build_session_timestamp_report(
@@ -423,36 +511,73 @@ def build_session_timestamp_report(
         "ylx.device-session.v3",
         "ylx.device-session.v4",
     }:
-        raise SessionTimestampError("unsupported_session", "只支持 Device Session v1/v2/v3")
+        raise SessionTimestampError("unsupported_session", "只支持 Device Session v1/v2/v3/v4")
+    path = Path(output) if output is not None else None
+    if path is not None:
+        _check_output(path, root, manifest)
     frames = _load_frames(root, manifest)
-    samples = _load_imu(root, manifest)
-    packets = _packets(samples)
-    if not samples or not packets:
-        raise SessionTimestampError("session_timestamps_empty", "会话没有可对齐的 IMU 样本")
-    imu = _imu_summary(samples, packets)
-    imu_times = _estimated_imu_times(packets, imu["record_rate_hz"])
-    report: dict[str, Any] = {
-        "ok": True,
-        "schema": "openaria.session-timestamps.v1",
-        "source_schema": manifest["schema"],
-        "session_id": manifest["session_id"],
-        "capture_mode": manifest.get("capture_mode"),
-        "frames": len(frames),
-        "imu_samples": len(samples),
-        "frame_interval": _frame_interval_summary(frames, manifest),
-        "imu": imu,
-        "timestamp_alignment": _alignment_summary(frames, imu_times),
-    }
-    if output is not None:
-        path = Path(output)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=TIMESTAMP_CSV_FIELDS)
-            writer.writeheader()
-            writer.writerows(_alignment_rows(frames, samples, imu_times))
-        report["csv"] = {
-            "path": str(path),
-            "rows": len(frames),
-            "columns": list(TIMESTAMP_CSV_FIELDS),
+    frame_interval = _frame_interval_summary(frames, manifest)
+    with ExitStack() as stack:
+        spool = stack.enter_context(tempfile.TemporaryFile(mode="w+b"))
+        imu = _packet_summary(root, manifest, spool)
+        stream = None
+        temporary = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stream = tempfile.NamedTemporaryFile(  # noqa: SIM115 - owned by ExitStack below
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            )
+            temporary = Path(stream.name)
+            stack.callback(temporary.unlink, missing_ok=True)
+            stack.enter_context(stream)
+        for raw in (False, True):
+            deltas: list[float] = []
+            writer = None
+            if stream is not None:
+                stream.seek(0)
+                stream.truncate()
+                writer = csv.DictWriter(_CheckedCsvOutput(stream), fieldnames=TIMESTAMP_CSV_FIELDS)
+                writer.writeheader()
+            try:
+                with closing(
+                    _timed_samples(root, manifest, spool, imu["record_rate_hz"], raw=raw)
+                ) as samples:
+                    for row in _alignment_rows(frames, samples):
+                        deltas.append(abs(row["nearest_imu_delta_ms"]))
+                        if writer is not None:
+                            writer.writerow(row)
+            except _UseHostTimes:
+                continue
+            break
+        report: dict[str, Any] = {
+            "ok": True,
+            "schema": "openaria.session-timestamps.v1",
+            "source_schema": manifest["schema"],
+            "session_id": manifest["session_id"],
+            "capture_mode": manifest.get("capture_mode"),
+            "frames": len(frames),
+            "imu_samples": imu["samples"],
+            "frame_interval": frame_interval,
+            "imu": imu,
+            "timestamp_alignment": _alignment_summary(deltas),
         }
+        if stream is not None:
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            # Recheck aliases after the potentially long input passes.
+            assert path is not None and temporary is not None
+            _check_output(path, root, manifest)
+            os.replace(temporary, path)
+            report["csv"] = {
+                "path": str(path),
+                "rows": len(frames),
+                "columns": list(TIMESTAMP_CSV_FIELDS),
+            }
     return report

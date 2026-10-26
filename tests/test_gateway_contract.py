@@ -50,7 +50,7 @@ CONTRACT_GOLDENS = {
 
 SCHEMA_GOLDENS = {
     "ylx-device-session-v4.schema.json": (
-        "617270d8a6c5534bd97e30a993f55ebea68fda6066013fcd8d1a69fa5fea4cfd"
+        "a7ac6367f44f9d34216323301c935ad8a4af6846916db35a827fbe52b6b40cb6"
     ),
     "ylx-device-session-v1.schema.json": (
         "38a4ca96bbaa171d809f72134537c65d1a5de36db66cb96be3006c20215c0bad"
@@ -59,7 +59,7 @@ SCHEMA_GOLDENS = {
         "2d9aaad4523029fb593198e0e4911fd88c5f29c3d7a3b93018847a238eb2e13f"
     ),
     "ylx-device-session-v3.schema.json": (
-        "a342b904daa39f397a6629f74d8c9f81b490a2387668b4934035a88ce44a61a3"
+        "c90ba08f2418bfbd2a743b21024f219adb7be99eae1bb48cbe73ae2ea2e1fd26"
     ),
     "ylx-recording-state-v1.schema.json": (
         "1bdedf7025380e712906bdde9bd980d1f2aa8e5e70ce23a1939948cbc76150f7"

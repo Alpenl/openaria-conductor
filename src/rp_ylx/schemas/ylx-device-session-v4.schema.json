@@ -1071,7 +1071,7 @@
           ],
           "properties": {
             "schema": {
-              "const": "openaria.audio-clock.v1"
+              "enum": ["openaria.audio-clock.v1", "openaria.audio-clock.v2"]
             }
           }
         }

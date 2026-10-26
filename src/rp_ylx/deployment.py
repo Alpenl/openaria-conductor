@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes.util
+import fcntl
 import grp
 import hashlib
 import json
+import math
 import os
 import platform
 import posixpath
@@ -19,13 +21,14 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from email.parser import BytesParser
 from importlib.resources import files
@@ -43,6 +46,9 @@ MAX_BUNDLE_WHEELS = 128
 MAX_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RUNTIME_FILES = 100_000
+MAX_RELEASE_METADATA_BYTES = 64 * 1024
+MAX_INSTALL_TRANSACTION_BYTES = 64 * 1024
+MAX_ACTIVATION_DIAGNOSTIC_BYTES = 64 * 1024
 ACTIVATION_HEALTH_TIMEOUT_SECONDS = 300.0
 NETWORK_CONTROL_PROTOCOL = "persistent-listener-notify-v1"
 NETWORK_CONTROL_MAX_REQUEST_BYTES = 64 * 1024
@@ -64,6 +70,11 @@ CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
 CUSTOMER_TLS_PRIVATE_KEY_RELATIVE = Path("tls/device.key")
 DEVICE_CONFIG_SNAPSHOT_DIRECTORY = ".release-configs"
 DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "rp-ylx-idle-fstrim": ("usr/local/sbin/rp-ylx-idle-fstrim", 0o755),
+    "openaria-idle-fstrim.conf": (
+        "etc/systemd/system/fstrim.service.d/50-openaria-idle.conf",
+        0o644,
+    ),
     "openaria-update.service": ("usr/lib/systemd/system/openaria-update.service", 0o644),
     "rp-ylx-recover.service": (
         "usr/lib/systemd/system/rp-ylx-recover.service",
@@ -338,8 +349,12 @@ def _sha256(path: Path) -> str:
 
 
 def _canonical_commit(value: object) -> str:
-    commit = str(value)
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+    commit = value
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
         raise DeploymentError("bundle_invalid", "bundle commit 不是完整 Git SHA")
     return commit
 
@@ -790,6 +805,112 @@ def _notify_systemd_ready(status: str) -> None:
         ) from error
 
 
+def _read_deployment_json(path: Path, *, maximum: int) -> object:
+    """Read bounded, stable JSON using only standard-library bootstrap code."""
+    directory = descriptor = None
+    try:
+        directory = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        parent = os.fstat(directory)
+
+        def identity(info):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
+                raise ValueError("unsafe deployment JSON file")
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        expected = identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        if identity(os.fstat(descriptor)) != expected:
+            raise ValueError("deployment JSON changed before read")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            block = os.read(descriptor, min(8192, maximum + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        if len(raw) > maximum or identity(os.fstat(descriptor)) != expected:
+            raise ValueError("deployment JSON changed during read")
+        if identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) != expected:
+            raise ValueError("deployment JSON replaced during read")
+        after = path.parent.lstat()
+        if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != (
+            parent.st_dev,
+            parent.st_ino,
+        ):
+            raise ValueError("deployment JSON directory replaced during read")
+    finally:
+        primary = sys.exc_info()[1]
+        cleanup_error = None
+        for owned in (descriptor, directory):
+            if owned is not None:
+                try:
+                    os.close(owned)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        if primary is None and cleanup_error is not None:
+            raise cleanup_error
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate deployment JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("nonfinite deployment JSON number")
+
+    value = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=reject_constant
+    )
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > 64:
+            raise ValueError("deployment JSON nesting too deep")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                key.encode("utf-8")
+                pending.append((child, depth + 1))
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            item.encode("utf-8")
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("nonfinite deployment JSON number")
+    return value
+
+
+def _read_release_metadata(release: Path) -> Mapping[str, object]:
+    try:
+        value = _read_deployment_json(release / "release.json", maximum=MAX_RELEASE_METADATA_BYTES)
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", release.name)
+            or not isinstance(value, dict)
+            or value.get("schema") != RELEASE_SCHEMA
+            or value.get("commit") != release.name
+        ):
+            raise ValueError("invalid release metadata identity")
+        return value
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        raise DeploymentError("release_incomplete", "release metadata 不可读或无效") from error
+
+
 def _current_release_metadata(install_root: Path) -> tuple[Path, Mapping[str, object]]:
     current = install_root / "current"
     if not current.is_symlink():
@@ -799,17 +920,7 @@ def _current_release_metadata(install_root: Path) -> tuple[Path, Mapping[str, ob
         raise DeploymentError("install_state_invalid", "current release 链接越界")
     commit = _canonical_commit(target.parts[1])
     release = install_root / "releases" / commit
-    try:
-        metadata = json.loads((release / "release.json").read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise DeploymentError("release_incomplete", "current release metadata 不可读") from error
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("schema") != RELEASE_SCHEMA
-        or metadata.get("commit") != commit
-    ):
-        raise DeploymentError("release_incomplete", "current release metadata 无效")
-    return release, metadata
+    return release, _read_release_metadata(release)
 
 
 def _control_compatibility_error(payload: bytes) -> bytes:
@@ -1180,6 +1291,111 @@ class ReleaseManager:
         self.tls_material_generator = tls_material_generator
         self.group_resolver = group_resolver
         self.unit_load_state_reader = unit_load_state_reader
+        self._recovery_descriptor: int | None = None
+        self._recovery_exclusive = False
+
+    @contextmanager
+    def _deployment_lock(self, name: str, *, shared: bool = False) -> Iterator[int]:
+        # This root-owned directory is shared by every install/state root on the
+        # same system. Never unlink lock files: waiters must use the same inode.
+        root = self.system_root / "var/lib/openaria-update"
+        directory = descriptor = None
+        try:
+            try:
+                root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                directory = os.open(
+                    root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                )
+                owner = self._deployment_owner()[0]
+                parent = os.fstat(directory)
+                if parent.st_uid != owner or parent.st_mode & 0o022:
+                    raise ValueError("untrusted deployment lock directory")
+                filename = f"deployment-{name}.lock"
+                descriptor = os.open(
+                    filename,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=directory,
+                )
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != owner
+                    or metadata.st_mode & 0o077
+                ):
+                    raise ValueError("untrusted deployment lock file")
+                try:
+                    fcntl.flock(
+                        descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+                    )
+                except BlockingIOError as error:
+                    raise DeploymentError(
+                        "deployment_busy", "其他维护操作正在执行，请稍后重试"
+                    ) from error
+                named = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+                current_parent = root.lstat()
+                if (named.st_dev, named.st_ino, named.st_mode, named.st_nlink, named.st_uid) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    1,
+                    owner,
+                ) or (current_parent.st_dev, current_parent.st_ino) != (
+                    parent.st_dev,
+                    parent.st_ino,
+                ):
+                    raise ValueError("deployment lock identity changed")
+            except (OSError, ValueError) as error:
+                raise DeploymentError("deployment_lock_invalid", "无法安全取得维护锁") from error
+            yield descriptor
+        finally:
+            primary = sys.exc_info()[1]
+            cleanup_error = None
+            for fd in (descriptor, directory):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+            if primary is None and cleanup_error is not None:
+                raise cleanup_error
+
+    @contextmanager
+    def _maintenance_operation(self) -> Iterator[None]:
+        with self._deployment_lock("operation"), self._deployment_lock("recovery") as descriptor:
+            self._recovery_descriptor = descriptor
+            self._recovery_exclusive = True
+            try:
+                yield
+            finally:
+                self._recovery_descriptor = None
+                self._recovery_exclusive = False
+
+    @contextmanager
+    def _service_recovery_readers(self) -> Iterator[None]:
+        descriptor = self._recovery_descriptor
+        if descriptor is None:
+            yield
+            return
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        self._recovery_exclusive = False
+        try:
+            yield
+        finally:
+            primary = sys.exc_info()[1]
+            try:
+                # Only read-only service checks can coexist here. Other writers
+                # remain excluded by the operation lock throughout activation.
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                self._recovery_exclusive = True
+            except BaseException as error:
+                if primary is not None:
+                    raise primary from error
+                if isinstance(error, OSError):
+                    raise DeploymentError("deployment_lock_invalid", "无法恢复维护写锁") from error
+                raise
 
     def _require_target(self) -> None:
         self._require_platform()
@@ -1232,12 +1448,21 @@ class ReleaseManager:
 
     def _link_target(self, name: str) -> str | None:
         link = self.install_root / name
-        if not link.is_symlink():
+        try:
+            # Read the link itself once. A separate is_symlink check can race
+            # with uninstall; other I/O errors must not masquerade as absence.
+            raw = os.readlink(link)
+        except FileNotFoundError:
             return None
-        target = PurePosixPath(os.readlink(link))
+        except OSError as error:
+            raise DeploymentError("install_state_invalid", f"无法读取 {name} 链接") from error
+        target = PurePosixPath(raw)
         if len(target.parts) != 2 or target.parts[0] != "releases":
             raise DeploymentError("install_state_invalid", f"{name} 链接越界")
-        return _canonical_commit(target.parts[1])
+        try:
+            return _canonical_commit(target.parts[1])
+        except DeploymentError as error:
+            raise DeploymentError("install_state_invalid", f"{name} 链接版本无效") from error
 
     def _switch(self, name: str, release: str | None) -> None:
         link = self.install_root / name
@@ -1264,38 +1489,46 @@ class ReleaseManager:
         }
 
     def _read_transaction(self) -> Mapping[str, object] | None:
-        if not self.transaction.exists():
-            return None
         try:
-            value = json.loads(self.transaction.read_bytes())
-        except (OSError, json.JSONDecodeError) as error:
-            raise DeploymentError("install_state_invalid", "安装事务不可读") from error
-        required = {"schema", "transaction_id", "action", "old_current", "new_current", "state"}
-        fields = frozenset(value) if isinstance(value, dict) else frozenset()
-        allowed_fields = {
-            frozenset(required),
-            frozenset(required | {"config_snapshot_required"}),
-        }
-        if (
-            not isinstance(value, dict)
-            or fields not in allowed_fields
-            or value["schema"] != TRANSACTION_SCHEMA
-            or value["action"] not in {"install", "rollback"}
-            or value["state"] not in {"prepared", "switched"}
-            or "config_snapshot_required" in value
-            and value["config_snapshot_required"] is not True
-        ):
-            raise DeploymentError("install_state_invalid", "安装事务字段无效")
-        _canonical_commit(value["new_current"])
-        if value["old_current"] is not None:
-            _canonical_commit(value["old_current"])
-        return value
+            # Only genuine absence means no pending transaction. A dangling
+            # link or an entry disappearing after admission must fail closed.
+            try:
+                self.transaction.lstat()
+            except FileNotFoundError:
+                return None
+            value = _read_deployment_json(self.transaction, maximum=MAX_INSTALL_TRANSACTION_BYTES)
+            required = {"schema", "transaction_id", "action", "old_current", "new_current", "state"}
+            fields = frozenset(value) if isinstance(value, dict) else frozenset()
+            allowed_fields = {
+                frozenset(required),
+                frozenset(required | {"config_snapshot_required"}),
+            }
+            if (
+                not isinstance(value, dict)
+                or fields not in allowed_fields
+                or value["schema"] != TRANSACTION_SCHEMA
+                or value["action"] not in ("install", "rollback")
+                or value["state"] not in ("prepared", "switched")
+                or not isinstance(value["transaction_id"], str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                    value["transaction_id"],
+                )
+                or "config_snapshot_required" in value
+                and value["config_snapshot_required"] is not True
+            ):
+                raise ValueError("invalid install transaction fields")
+            _canonical_commit(value["new_current"])
+            if value["old_current"] is not None:
+                _canonical_commit(value["old_current"])
+            return value
+        except (OSError, ValueError, TypeError, RecursionError, DeploymentError) as error:
+            raise DeploymentError("install_state_invalid", "安装事务不可读或无效") from error
 
     def _settle(self, transaction: Mapping[str, object]) -> None:
         old = transaction["old_current"]
         new = str(transaction["new_current"])
-        if not (self.releases / new / "release.json").is_file():
-            raise DeploymentError("release_incomplete", "事务目标 release 不完整")
+        self._release_metadata(self.releases / new)
         if transaction["state"] == "prepared":
             self._switch("current", new)
             switched = dict(transaction)
@@ -1309,8 +1542,26 @@ class ReleaseManager:
         self.transaction.unlink(missing_ok=True)
         _fsync_directory(self.state_root)
 
-    def recover(self) -> Mapping[str, object]:
+    def recover(self, *, service_start: bool = False) -> Mapping[str, object]:
         self._require_platform()
+        try:
+            with self._maintenance_operation():
+                return self._recover_locked()
+        except DeploymentError as error:
+            if not service_start or error.code != "deployment_busy":
+                raise
+        # systemd starts recovery as a dependency of capture/network services.
+        # During activation only, the installer permits this non-mutating check.
+        with self._deployment_lock("recovery", shared=True):
+            if self._read_transaction() is not None:
+                raise DeploymentError("deployment_busy", "版本事务尚未提交，不能启动服务")
+            current = self._link_target("current")
+            if current is None:
+                raise DeploymentError("deployment_busy", "没有可启动的已提交版本")
+            self._release_metadata(self.releases / current)
+            return {**self.status(), "recovery_delegated": True}
+
+    def _recover_locked(self) -> Mapping[str, object]:
         self._ensure_layout()
         transaction = self._read_transaction()
         if transaction is not None:
@@ -1346,17 +1597,7 @@ class ReleaseManager:
         _fsync_directory(self.releases)
 
     def _release_metadata(self, release: Path) -> Mapping[str, object]:
-        try:
-            value = json.loads((release / "release.json").read_bytes())
-        except (OSError, json.JSONDecodeError) as error:
-            raise DeploymentError("release_incomplete", "release metadata 不可读") from error
-        if (
-            not isinstance(value, dict)
-            or value.get("schema") != RELEASE_SCHEMA
-            or value.get("commit") != release.name
-        ):
-            raise DeploymentError("release_incomplete", "release metadata 无效")
-        return value
+        return _read_release_metadata(release)
 
     def _prepare_release(self, bundle: Bundle) -> Path:
         final = self.releases / bundle.commit
@@ -1461,7 +1702,7 @@ class ReleaseManager:
             "lkg-eth0.json",
             "controller-state.json",
         }
-        transient_files = {".lock", "operation.lock"}
+        transient_files = {".lock", "operation.lock", "controller.sqlite3.init.lock"}
         payloads: dict[str, bytes] = {}
         try:
             entries = sorted(root.iterdir(), key=lambda path: path.name)
@@ -1471,6 +1712,26 @@ class ReleaseManager:
                 "无法枚举网络状态目录",
             ) from error
         for entry in entries:
+            if entry.name in {"controller.sqlite3-wal", "controller.sqlite3-shm"}:
+                _require_regular_file(entry, code="network_state_migration_unsafe")
+                continue  # Included by the SQLite backup API, never copied separately.
+            if entry.name == "controller.sqlite3":
+                from rp_ylx.persistence import StateDatabase
+
+                _require_regular_file(entry, code="network_state_migration_unsafe")
+                with tempfile.TemporaryDirectory(prefix="ylx-network-backup-") as directory:
+                    backup = Path(directory) / entry.name
+                    StateDatabase(entry).backup(backup)
+                    payloads[entry.name] = backup.read_bytes()
+                continue
+            if entry.name in {"controller.sqlite3.initialized", "controller-state.json.pre-sqlite"}:
+                metadata = _require_regular_file(entry, code="network_state_migration_unsafe")
+                if metadata.st_mode & 0o077 or metadata.st_size > MAX_NETWORK_STATE_MIGRATION_BYTES:
+                    raise DeploymentError(
+                        "network_state_migration_unsafe", "数据库迁移证据权限或大小无效"
+                    )
+                payloads[entry.name] = entry.read_bytes()
+                continue
             if entry.name == NETWORK_STATE_MIGRATION_MARKER and migration_target:
                 continue
             if entry.name in transient_files:
@@ -1575,6 +1836,9 @@ class ReleaseManager:
                         "lkg-wlan0.json",
                         "lkg-eth0.json",
                         "controller-state.json",
+                        "controller.sqlite3",
+                        "controller.sqlite3.initialized",
+                        "controller-state.json.pre-sqlite",
                     }
                     or re.fullmatch(r"requests/[0-9a-f]{64}\.json", relative) is not None
                 )
@@ -2215,17 +2479,18 @@ class ReleaseManager:
         )
 
     def _start_release_services(self, *, check_health: bool) -> None:
-        # Independent of capture/network units: never stop this supervisor while
-        # it is executing the transaction that restarts those services.
-        self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
-        for unit in CORE_SYSTEMD_UNITS:
-            self.runner(["systemctl", "enable", "--now", unit])
-        if check_health:
-            self.health_checker()
-        button_config = json.loads((self.config_root / "recording-button.json").read_bytes())
-        button_action = "enable" if button_config.get("enabled", True) is True else "disable"
-        self.runner(["systemctl", button_action, "--now", "rp-ylx-recording-button.service"])
-        self.runner(["systemctl", "enable", "--now", WATCHDOG_TIMER])
+        with self._service_recovery_readers():
+            # Independent of capture/network units: never stop this supervisor while
+            # it is executing the transaction that restarts those services.
+            self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
+            for unit in CORE_SYSTEMD_UNITS:
+                self.runner(["systemctl", "enable", "--now", unit])
+            if check_health:
+                self.health_checker()
+            button_config = json.loads((self.config_root / "recording-button.json").read_bytes())
+            button_action = "enable" if button_config.get("enabled", True) is True else "disable"
+            self.runner(["systemctl", button_action, "--now", "rp-ylx-recording-button.service"])
+            self.runner(["systemctl", "enable", "--now", WATCHDOG_TIMER])
 
     def _deactivate_systemd_units(self) -> None:
         self._run_unit_commands(
@@ -2279,13 +2544,27 @@ class ReleaseManager:
         self.transaction.unlink(missing_ok=True)
         _fsync_directory(self.state_root)
 
-    def _activate(self, old_current: str | None, new_current: str) -> None:
+    def _activate(self, old_current: str | None, new_current: str) -> Mapping[str, str] | None:
         release_changed = old_current != new_current
         try:
             self._start_release_services(check_health=True)
-            (self.state_root / "activation-failure.json").unlink(missing_ok=True)
         except DeploymentError as error:
-            self._record_activation_failure(error, new_current)
+            if self._recovery_descriptor is not None and not self._recovery_exclusive:
+                # Reacquiring the write guard failed: do not mutate state while
+                # a service recovery reader may still be active.
+                raise
+            diagnostic_error: BaseException | None = None
+            try:
+                self._record_activation_failure(error, new_current)
+            except BaseException as failure:
+                # Recording why activation failed must not prevent the required
+                # stop/rollback, even when the diagnostic write is cancelled.
+                diagnostic_error = failure
+            diagnostic_note = (
+                ""
+                if diagnostic_error is None
+                else f"；激活失败诊断未能保存（{type(diagnostic_error).__name__}）"
+            )
             try:
                 if old_current is None:
                     self._deactivate_systemd_units()
@@ -2297,18 +2576,48 @@ class ReleaseManager:
                     self._deactivate_systemd_units()
             except BaseException as cleanup_error:
                 detail = getattr(cleanup_error, "message", str(cleanup_error))
-                raise DeploymentError(
+                failure = DeploymentError(
                     "activation_cleanup_failed",
-                    f"release {new_current} 激活失败，且无法安全停止或恢复服务：{detail}",
-                ) from cleanup_error
+                    f"release {new_current} 激活失败，且无法安全停止或恢复服务：{detail}"
+                    f"{diagnostic_note}",
+                )
+                if not isinstance(cleanup_error, Exception):
+                    cleanup_error.add_note(str(failure))
+                    raise cleanup_error from error
+                if diagnostic_error is not None and not isinstance(diagnostic_error, Exception):
+                    diagnostic_error.add_note(str(failure))
+                    raise diagnostic_error from cleanup_error
+                raise failure from cleanup_error
+            if diagnostic_error is not None:
+                if not isinstance(diagnostic_error, Exception):
+                    raise diagnostic_error from error
+                raise DeploymentError(error.code, f"{error.message}{diagnostic_note}") from error
             raise
+        # Health and release activation have succeeded. Optional diagnostic
+        # cleanup must not send that success through the rollback/error path.
+        try:
+            (self.state_root / "activation-failure.json").unlink(missing_ok=True)
+        except OSError as error:
+            return {
+                "code": "activation_diagnostic_cleanup_failed",
+                "message": "固件已激活，但旧激活失败诊断未能清理"
+                f"（{type(error).__name__}）；保留文件供检查",
+            }
+        return None
 
     def install(self, bundle_path: str | Path, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
+        with self._maintenance_operation():
+            return self._install_locked(bundle_path, activate=activate)
+
+    def _install_locked(
+        self, bundle_path: str | Path, *, activate: bool = True
+    ) -> Mapping[str, object]:
         self._ensure_layout()
-        self.recover()
+        self._recover_locked()
         bundle = load_bundle(bundle_path)
         self._prepare_release(bundle)
+        self._require_state_compatible_release(bundle.commit)
         current = self._link_target("current")
         old_current = current
         quiesced = old_current is not None and (activate or old_current != bundle.commit)
@@ -2354,18 +2663,38 @@ class ReleaseManager:
                     f"升级失败，且无法恢复原 release 服务或配置：{detail}",
                 ) from recovery_error
             raise
-        if activate:
-            self._activate(old_current, bundle.commit)
-        return self.status()
+        warning = self._activate(old_current, bundle.commit) if activate else None
+        result = dict(self.status())
+        if warning is not None:
+            result["warnings"] = [warning]
+        return result
+
+    def _require_state_compatible_release(self, commit: str) -> None:
+        if any(
+            (self.state_root / (name + ".sqlite3.initialized")).exists()
+            for name in ("state", "settings")
+        ):
+            module = self.install_root / "releases" / commit / "site-packages/rp_ylx/persistence.py"
+            if not module.is_file():
+                raise DeploymentError(
+                    "state_schema_incompatible",
+                    "设备已迁移 SQLite，不能直接运行只支持旧 JSON 的固件",
+                )
 
     def rollback(self, *, activate: bool = True) -> Mapping[str, object]:
         self._require_target()
+        with self._maintenance_operation():
+            return self._rollback_locked(activate=activate)
+
+    def _rollback_locked(self, *, activate: bool = True) -> Mapping[str, object]:
         self._ensure_layout()
-        self.recover()
+        self._recover_locked()
         current = self._link_target("current")
         previous = self._link_target("previous")
         if current is None or previous is None:
             raise DeploymentError("rollback_unavailable", "没有可回滚的上一版本")
+        self._release_metadata(self.releases / previous)
+        self._require_state_compatible_release(previous)
         self._quiesce_release_services()
         transaction_started = False
         current_snapshot_written = False
@@ -2392,12 +2721,18 @@ class ReleaseManager:
                     f"回滚切换失败，且无法恢复原 release 服务或配置：{detail}",
                 ) from recovery_error
             raise
-        if activate:
-            self._activate(current, previous)
-        return self.status()
+        warning = self._activate(current, previous) if activate else None
+        result = dict(self.status())
+        if warning is not None:
+            result["warnings"] = [warning]
+        return result
 
     def uninstall(self) -> Mapping[str, object]:
         self._require_platform()
+        with self._maintenance_operation():
+            return self._uninstall_locked()
+
+    def _uninstall_locked(self) -> Mapping[str, object]:
         self.runner(["systemctl", "disable", "--now", "openaria-update.service"])
         self._deactivate_systemd_units()
         if self.install_root.exists() and not self.install_root.is_symlink():
@@ -2420,22 +2755,39 @@ class ReleaseManager:
     def status(self) -> Mapping[str, object]:
         activation_failure: Mapping[str, object] | None = None
         diagnostic_path = self.state_root / "activation-failure.json"
-        if diagnostic_path.exists():
+        try:
             try:
-                diagnostic = json.loads(diagnostic_path.read_bytes())
-                if isinstance(diagnostic, dict):
-                    activation_failure = diagnostic
-            except (OSError, json.JSONDecodeError):
-                activation_failure = {
-                    "schema": "ylx.activation-failure.v1",
-                    "code": "diagnostic_unreadable",
-                    "message": "activation failure diagnostic is unreadable",
-                }
+                diagnostic_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                diagnostic = _read_deployment_json(
+                    diagnostic_path, maximum=MAX_ACTIVATION_DIAGNOSTIC_BYTES
+                )
+                if (
+                    not isinstance(diagnostic, dict)
+                    or diagnostic.get("schema") != "ylx.activation-failure.v1"
+                    or not isinstance(diagnostic.get("code"), str)
+                    or not isinstance(diagnostic.get("message"), str)
+                ):
+                    raise ValueError("invalid activation diagnostic")
+                if "release_commit" in diagnostic:
+                    _canonical_commit(diagnostic["release_commit"])
+                activation_failure = diagnostic
+        except (OSError, ValueError, TypeError, RecursionError, DeploymentError):
+            # Diagnostics are optional: preserve the basic status and the original
+            # file, while making the read failure visible. Retry on every query.
+            activation_failure = {
+                "schema": "ylx.activation-failure.v1",
+                "code": "diagnostic_unreadable",
+                "message": "activation failure diagnostic is unreadable",
+            }
+        current = self._link_target("current")
         return {
-            "installed": self._link_target("current") is not None,
-            "current": self._link_target("current"),
+            "installed": current is not None,
+            "current": current,
             "previous": self._link_target("previous"),
-            "transaction_pending": self.transaction.exists(),
+            "transaction_pending": os.path.lexists(self.transaction),
             "activation_failure": activation_failure,
         }
 
@@ -2453,7 +2805,8 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--no-activate", action="store_true")
     rollback = subcommands.add_parser("rollback")
     rollback.add_argument("--no-activate", action="store_true")
-    subcommands.add_parser("recover")
+    recover = subcommands.add_parser("recover")
+    recover.add_argument("--service-start", action="store_true")
     subcommands.add_parser("status")
     subcommands.add_parser("uninstall")
     subcommands.add_parser("network-control-launch", help=argparse.SUPPRESS)
@@ -2475,7 +2828,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rollback":
             result = manager.rollback(activate=not args.no_activate)
         elif args.command == "recover":
-            result = manager.recover()
+            result = manager.recover(service_start=args.service_start)
         elif args.command == "uninstall":
             result = manager.uninstall()
         else:

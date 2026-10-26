@@ -1,0 +1,85 @@
+{
+  "baseline_revision": "e7da4babf1d1f48ebc262b5714497cfabac98801",
+  "source_sha256": "1b484b0958b888409b4859c62f24cf5459d989186bd3e19e602342c2d6db0473",
+  "candidate_sha256": "e6a09549a9347dd2472dbedfe63755addd7d7b37454227331d56964013dbda59",
+  "scope": "actual scheduler; synthetic 60 Hz source, identity codec with controlled delay; not device FPS",
+  "can_start_second_frame_while_first_blocked": {
+    "two_codecs": true,
+    "one_codec": false
+  },
+  "measurements": {
+    "0": {
+      "two_codecs": {
+        "trials": [
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          }
+        ],
+        "median_fps": 25.0
+      },
+      "one_codec": {
+        "trials": [
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          }
+        ],
+        "median_fps": 25.0
+      }
+    },
+    "0.075": {
+      "two_codecs": {
+        "trials": [
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          },
+          {
+            "published_in_1_2_seconds": 30,
+            "fps": 25.0
+          }
+        ],
+        "median_fps": 25.0
+      },
+      "one_codec": {
+        "trials": [
+          {
+            "published_in_1_2_seconds": 15,
+            "fps": 12.5
+          },
+          {
+            "published_in_1_2_seconds": 15,
+            "fps": 12.5
+          },
+          {
+            "published_in_1_2_seconds": 15,
+            "fps": 12.5
+          }
+        ],
+        "median_fps": 12.5
+      }
+    }
+  },
+  "decision": "reject one-codec ablation: blocks supported overlapping slow resize"
+}

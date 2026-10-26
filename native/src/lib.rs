@@ -1,7 +1,11 @@
 mod active_take;
 mod audio;
+mod audio_checkpoint;
+mod audio_clock;
 mod bounded;
 mod capture_runtime;
+mod catalog_admission;
+mod catalog_signature;
 mod frame_stream;
 mod imu;
 mod imu_preview;
@@ -10,6 +14,7 @@ mod metrics;
 mod native_camera;
 mod preview;
 mod recording;
+mod schema_validation;
 mod session_io;
 mod session_store;
 mod stereo_encoder;
@@ -31,6 +36,7 @@ const V4L2_FOCUS_CONTROL: &str = "v4l2_focus_control";
 const CAPTURE_ENGINE: &str = "capture_engine";
 const NATIVE_AUDIO: &str = "native_audio";
 const SESSION_STORE: &str = "session_store";
+const SCHEMA_VALIDATION: &str = "schema_validation";
 const PREVIEW_BUFFER: &str = "preview_buffer";
 const PERFORMANCE_METRICS: &str = "performance_metrics";
 
@@ -51,7 +57,14 @@ fn imu_error(error: imu::ImuError) -> PyErr {
 }
 
 fn session_io_error(error: session_io::SessionIoError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", error.code, error.message))
+    let message = format!("{}: {}", error.code, error.message);
+    match error.code {
+        "send_broken_pipe" => pyo3::exceptions::PyBrokenPipeError::new_err((libc::EPIPE, message)),
+        "send_connection_reset" => {
+            pyo3::exceptions::PyConnectionResetError::new_err((libc::ECONNRESET, message))
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(message),
+    }
 }
 
 fn session_store_error(error: session_store::StoreError) -> PyErr {
@@ -87,10 +100,27 @@ impl NativeSessionTransaction {
         self.transaction.recording_start_monotonic_ns
     }
 
+    #[getter]
+    fn capture_stopped_monotonic_ns(&self) -> Option<u64> {
+        let value = self
+            .transaction
+            .capture_stopped_monotonic_ns
+            .load(std::sync::atomic::Ordering::Acquire);
+        (value != 0).then_some(value)
+    }
+
     fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let transaction = Arc::clone(&self.transaction);
         let snapshot = py
             .allow_threads(move || transaction.snapshot())
+            .map_err(session_store_error)?;
+        session_transaction_snapshot_dict(py, &snapshot)
+    }
+
+    fn diagnostic_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let transaction = Arc::clone(&self.transaction);
+        let snapshot = py
+            .allow_threads(move || transaction.diagnostic_snapshot())
             .map_err(session_store_error)?;
         session_transaction_snapshot_dict(py, &snapshot)
     }
@@ -101,6 +131,18 @@ impl NativeSessionTransaction {
             .allow_threads(move || transaction.segments())
             .map_err(session_store_error)?;
         stereo_encoder_segment_list(py, &segments)
+    }
+
+    fn segments_since(&self, py: Python<'_>, offset: usize) -> PyResult<Py<PyList>> {
+        let transaction = Arc::clone(&self.transaction);
+        let segments = py
+            .allow_threads(move || transaction.segments_since(offset))
+            .map_err(session_store_error)?;
+        stereo_encoder_segment_list(py, &segments)
+    }
+
+    fn request_audio_stop(&self) {
+        self.transaction.request_audio_stop();
     }
 
     #[pyo3(signature = (duration_seconds, timeout_seconds=30.0))]
@@ -371,6 +413,40 @@ impl NativeSessionStore {
         Ok(result.unbind())
     }
 
+    fn catalog_manifest_signature(
+        &self,
+        py: Python<'_>,
+        path: &[u8],
+        maximum_bytes: usize,
+    ) -> PyResult<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        py.allow_threads(move || catalog_signature::signature(&path, maximum_bytes))
+            .map_err(|error| {
+                pyo3::exceptions::PyOSError::new_err((
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    error.to_string(),
+                ))
+            })
+    }
+
+    fn catalog_artifacts_match(
+        &self,
+        py: Python<'_>,
+        path: &[u8],
+        artifacts: Vec<(Vec<u8>, i64)>,
+    ) -> PyResult<bool> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        py.allow_threads(move || catalog_admission::matches(&path, &artifacts))
+            .map_err(|error| {
+                pyo3::exceptions::PyOSError::new_err((
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    error.to_string(),
+                ))
+            })
+    }
+
     fn read_bounded_fd<'py>(
         &self,
         py: Python<'py>,
@@ -532,6 +608,8 @@ impl NativeCaptureEngine {
         let encoder = Arc::clone(&transaction.transaction.encoder);
         let segment_planner = Arc::clone(&transaction.transaction.segment_planner);
         let recording_start_monotonic_ns = transaction.transaction.recording_start_monotonic_ns;
+        let capture_stopped_monotonic_ns =
+            Arc::clone(&transaction.transaction.capture_stopped_monotonic_ns);
         let worker_collector = Arc::clone(&collector);
         let audio = transaction.transaction.audio.clone();
         let imu_timeout = self.imu_config.timeout;
@@ -547,6 +625,7 @@ impl NativeCaptureEngine {
                     Some(worker_collector),
                     imu_timeout,
                     audio,
+                    capture_stopped_monotonic_ns,
                 )
             })
             .map_err(capture_runtime_error);
@@ -936,6 +1015,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
         JPEG_CONTRACT,
         FRAME_STREAM,
         SESSION_STORE,
+        SCHEMA_VALIDATION,
         PREVIEW_BUFFER,
         PERFORMANCE_METRICS,
         V4L2_FOCUS_CONTROL,
@@ -1074,6 +1154,11 @@ fn recording_sink_snapshot_dict(
     value.set_item("bytes_written", snapshot.bytes_written)?;
     value.set_item("frames_written", snapshot.frames_written)?;
     value.set_item("imu_samples_written", snapshot.imu_samples_written)?;
+    value.set_item("frames_indexed", snapshot.frames_indexed)?;
+    value.set_item("imu_samples_indexed", snapshot.imu_samples_indexed)?;
+    value.set_item("index_pending_bytes", snapshot.index_pending_bytes)?;
+    value.set_item("index_peak_bytes", snapshot.index_peak_bytes)?;
+    value.set_item("index_max_write_ns", snapshot.index_max_write_ns)?;
     let artifacts = PyDict::new(py);
     for artifact in &snapshot.artifacts {
         let item = PyDict::new(py);
@@ -1118,16 +1203,30 @@ fn session_transaction_snapshot_dict(
         Some(audio) => value.set_item("audio", audio_snapshot_dict(py, audio)?)?,
         None => value.set_item("audio", py.None())?,
     }
-    value.set_item(
-        "segments",
-        stereo_encoder_segment_list(py, &snapshot.segments)?,
-    )?;
     value.set_item("submitted_frames", snapshot.submitted_frames)?;
+    match &snapshot.audio_failure {
+        Some(error) => {
+            let failure = PyDict::new(py);
+            failure.set_item("code", error.code)?;
+            failure.set_item("message", &error.message)?;
+            value.set_item("audio_failure", failure)?;
+        }
+        None => value.set_item("audio_failure", py.None())?,
+    }
     let encoder_stats = PyDict::new(py);
     for (name, count) in &snapshot.encoder_stats {
         encoder_stats.set_item(name, count)?;
     }
     value.set_item("encoder_stats", encoder_stats)?;
+    match &snapshot.encoder_failure {
+        Some(error) => {
+            let failure = PyDict::new(py);
+            failure.set_item("code", &error.code)?;
+            failure.set_item("message", &error.message)?;
+            value.set_item("encoder_failure", failure)?;
+        }
+        None => value.set_item("encoder_failure", py.None())?,
+    }
     Ok(value.unbind())
 }
 
@@ -1311,6 +1410,22 @@ fn device_session_seal_result_dict(
     Ok(value.unbind())
 }
 
+#[pyfunction]
+fn audio_checkpoint_segments(py: Python<'_>, payload: &[u8]) -> PyResult<Py<PyList>> {
+    // bytes is immutable and borrowed for this call; parsing need not hold GIL.
+    let segments = py
+        .allow_threads(|| audio_checkpoint::segments(payload))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let result = PyList::empty(py);
+    for segment in segments {
+        let record = PyDict::new(py);
+        record.set_item("index", segment.index)?;
+        record.set_item("path", segment.path)?;
+        result.append(record)?;
+    }
+    Ok(result.unbind())
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("NATIVE_ABI", NATIVE_ABI)?;
@@ -1320,6 +1435,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(module.py(), frame_stream::MAGIC),
     )?;
     module.add_function(wrap_pyfunction!(capabilities, module)?)?;
+    module.add_function(wrap_pyfunction!(audio_checkpoint_segments, module)?)?;
     module.add_function(wrap_pyfunction!(jpeg_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(encode_frame, module)?)?;
     module.add_function(wrap_pyfunction!(v4l2_focus_status, module)?)?;
@@ -1327,6 +1443,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSplitter>()?;
     module.add_class::<NativeCaptureEngine>()?;
     module.add_class::<NativeSessionStore>()?;
+    module.add_class::<schema_validation::NativeSchemaValidator>()?;
     module.add_class::<NativeSessionTransaction>()?;
     module.add_class::<NativePreviewBuffer>()?;
     module.add_class::<NativeMultipartPreview>()?;

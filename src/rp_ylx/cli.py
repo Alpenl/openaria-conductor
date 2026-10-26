@@ -44,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="输出版本和提交标识")
     subcommands = parser.add_subparsers(dest="command")
     subcommands.add_parser("status", help="输出本机可用能力")
+    settings = subcommands.add_parser("settings", help="管理SQLite动态配置，重启空闲服务后生效")
+    settings.add_argument("action", choices=["show", "set", "export", "backup"])
+    settings.add_argument("--config", type=Path, default=Path("/etc/rp-ylx/device.json"))
+    settings.add_argument("--input", type=Path)
+    settings.add_argument("--output", type=Path)
+
     validate = subcommands.add_parser("validate", help="验证一个已封存的录制会话目录")
     validate.add_argument("directory")
     timestamps = subcommands.add_parser(
@@ -145,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--trace", help="仅 fixed_trace 使用的显式 MJPEG 输入")
     benchmark.add_argument("--recording-root", help="recording/concurrent 的空闲输出根")
     benchmark.add_argument("--output", required=True, help="新建或覆盖的严格 JSON 报告")
+    database = subcommands.add_parser("database", help="检查、备份或离线恢复 SQLite 数据库")
+    database.add_argument("action", choices=["check", "backup", "restore", "rebuild-catalog"])
+    database.add_argument("--database", required=True, type=Path)
+    database.add_argument("--input", type=Path)
+    database.add_argument("--output", type=Path)
     return parser
 
 
@@ -211,6 +222,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
+    if args.command == "database":
+        import sqlite3
+
+        from rp_ylx.database_admin import manage
+
+        try:
+            value = manage(args.database, args.action, source=args.input, destination=args.output)
+            print(json.dumps(value, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+    if args.command == "settings":
+        from rp_ylx.settings import manage
+
+        try:
+            value = manage(args.config, args.action, source=args.input, destination=args.output)
+            print(json.dumps(value, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError, RuntimeError) as error:
+            print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
+            return 1
     if args.command == "benchmark":
         from rp_ylx.performance.benchmark import BenchmarkConfig, BenchmarkError, run_benchmark
 

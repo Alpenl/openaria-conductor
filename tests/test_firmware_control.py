@@ -15,6 +15,17 @@ from rp_ylx.firmware_control import FirmwareError, FirmwareSupervisor, dispatch
 
 
 class FirmwareControlTest(unittest.TestCase):
+    def test_sqlite_migration_blocks_same_version_legacy_update_and_rollback(self):
+        self.manifest["version"] = "0.2.1"
+        with patch("rp_ylx.update.sqlite_state_required", return_value=True):
+            status = self.supervisor.check(force=True)
+            self.assertFalse(status["has_update"])
+            self.assertIn("SQLite", status["warning"])
+            with self.assertRaises(FirmwareError) as error:
+                self.supervisor.start("rollback", str(uuid.uuid4()), "b" * 40)
+            self.assertEqual(error.exception.code, "state_schema_incompatible")
+            self.idle.assert_not_called()
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -22,6 +33,11 @@ class FirmwareControlTest(unittest.TestCase):
         self.install = self.root / "install"
         self.install.mkdir()
         self.state = self.root / "state"
+        config = self.root / "device.json"
+        config.write_text(json.dumps({"state_root": str(self.state)}))
+        p = patch.object(update, "CONFIG", config)
+        p.start()
+        self.addCleanup(p.stop)
         self.make_release("a", "0.2.1", "current")
         self.make_release("b", "0.1.0", "previous")
         self.supervisor = FirmwareSupervisor(self.state, self.install)
@@ -37,6 +53,27 @@ class FirmwareControlTest(unittest.TestCase):
         p = patch("rp_ylx.update.require_idle")
         self.idle = p.start()
         self.addCleanup(p.stop)
+
+    def test_sqlite_migration_uses_fixture_state_and_preserves_guard(self):
+        self.assertFalse(update.sqlite_state_required())
+        self.fetch.return_value = {**self.manifest, "version": "0.2.1"}
+        self.assertTrue(self.supervisor.check(force=True)["has_update"])
+        self.state.mkdir(exist_ok=True)
+        for name in ("state", "settings"):
+            with self.subTest(database=name):
+                marker = self.state / (name + ".sqlite3.initialized")
+                marker.write_text("initialized")
+                try:
+                    self.assertTrue(update.sqlite_state_required())
+                    self.assertFalse(self.supervisor.check(force=True)["has_update"])
+                    with self.assertRaises(FirmwareError) as error:
+                        self.supervisor.start("rollback", str(uuid.uuid4()), "b" * 40)
+                    self.assertEqual(error.exception.code, "state_schema_incompatible")
+                    self.idle.assert_not_called()
+                finally:
+                    marker.unlink()
+                self.assertFalse(update.sqlite_state_required())
+                self.assertTrue(self.supervisor.check(force=True)["has_update"])
 
     def make_release(self, char, version, link):
         target = self.install / "releases" / (char * 40)
@@ -153,7 +190,17 @@ class FirmwareControlTest(unittest.TestCase):
     def test_restart_marks_unfinished_task_failed_not_successful(self):
         self.state.mkdir()
         (self.state / "task.json").write_text(
-            json.dumps({"id": str(uuid.uuid4()), "status": "running"})
+            json.dumps(
+                {
+                    "id": str(uuid.uuid4()),
+                    "action": "update",
+                    "target_commit": "c" * 40,
+                    "status": "running",
+                    "message": "running",
+                    "started_at": 1,
+                    "finished_at": None,
+                }
+            )
         )
         result = FirmwareSupervisor(self.state, self.install).status()
         self.assertEqual(result["task"]["status"], "failed")
@@ -215,6 +262,8 @@ class FirmwareControlTest(unittest.TestCase):
             with update.maintenance_lock(), self.assertRaises(ProviderError) as raised:
                 coordinator._acquire_network_operation_lease()
             self.assertEqual(raised.exception.code, "maintenance_active")
+            self.assertTrue(raised.exception.retryable)
+            self.assertIsInstance(raised.exception.__cause__, update.MaintenanceBusyError)
             coordinator._acquire_network_operation_lease()
             try:
                 with self.assertRaises(ValueError), update.maintenance_lock():

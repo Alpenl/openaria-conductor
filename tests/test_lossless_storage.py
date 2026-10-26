@@ -1,4 +1,5 @@
 import hashlib
+import json
 import shutil
 import tempfile
 import unittest
@@ -42,6 +43,13 @@ class LosslessStorageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FLAC integration requires ffmpeg")
     def test_sealed_v4_downloads_compressed_bytes_and_preserves_pcm_clock(self):
+        self._check_sealed_v4_audio_clock(raw_clock=False)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FLAC integration requires ffmpeg")
+    def test_sealed_v4_accepts_raw_clock_and_preserves_evidence(self):
+        self._check_sealed_v4_audio_clock(raw_clock=True)
+
+    def _check_sealed_v4_audio_clock(self, *, raw_clock):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture = fixtures.SplitEyeRecordingTest()
@@ -53,8 +61,56 @@ class LosslessStorageTests(unittest.TestCase):
             recorder._config = replace(recorder._config, lossless_storage=True)
             recorder.start()
             fixture.feed(recorder, 3)
-            sealed = recorder.stop()
+            original_stop = fixtures.FakeAudioRecorder.stop
+
+            def stop_with_clock(audio, *args, **kwargs):
+                result = original_stop(audio, *args, **kwargs)
+                if raw_clock:
+                    from tests.test_audio_clock import audio_fixture
+
+                    clock = audio_fixture()["capture_clock"]
+                    start = result["started_monotonic_ns"]
+                    clock.update(
+                        schema="openaria.audio-clock.v2",
+                        timestamp_source="alsa_htimestamp_dma_raw",
+                        thread_started_monotonic_ns=start,
+                        thread_stopped_monotonic_ns=result["stopped_monotonic_ns"],
+                        sample_start_monotonic_ns=start,
+                        sample_end_monotonic_ns=start + 100_000_000,
+                        anchors=[
+                            [
+                                n,
+                                start + n * 1_000_000_000 // 48000 + 1_000_000_000,
+                                start + n * 1_000_000_000 // 48000,
+                                start + n * 1_000_000_000 // 48000 + 1_000_000_000,
+                                start + n * 1_000_000_000 // 48000 + 1_000_000_000,
+                            ]
+                            for n in (48, 4800)
+                        ],
+                    )
+                    del clock["session_start_monotonic_ns"]
+                    result["capture_clock_json"] = json.dumps(clock)
+                return result
+
+            with patch.object(fixtures.FakeAudioRecorder, "stop", stop_with_clock):
+                sealed = recorder.stop()
             manifest = validate_device_session_directory(sealed.path)
+            if raw_clock:
+                from rp_ylx.audio_clock import audio_clock_report
+
+                report = audio_clock_report(manifest["audio"], manifest["time"]["duration_seconds"])
+                self.assertEqual(report["mapping"], "piecewise-linear")
+                clock = manifest["audio"]["capture_clock"]
+                capture_end = max(
+                    clock["thread_stopped_monotonic_ns"], clock["sample_end_monotonic_ns"]
+                )
+                self.assertEqual(
+                    manifest["time"]["duration_seconds"],
+                    max(
+                        recorder._stopped_elapsed,
+                        (capture_end - recorder._started_monotonic_ns) / 1e9,
+                    ),
+                )
             from rp_ylx.api.downloads import iter_device_session_v1_artifacts
 
             self.assertEqual(

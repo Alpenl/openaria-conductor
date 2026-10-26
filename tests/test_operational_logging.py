@@ -262,6 +262,7 @@ class OperationalLoggingTest(unittest.TestCase):
         service.server.serve_forever.return_value = None
 
         with (
+            patch("rp_ylx.settings.initialize"),
             patch("rp_ylx.daemon.load_production_config", return_value=config),
             patch("rp_ylx.daemon.build_production_service", return_value=service),
         ):

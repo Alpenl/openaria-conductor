@@ -34,6 +34,26 @@ PCM 流，实际存储格式由 `media_type=audio/flac` 和 `.flac` 路径声明
 匹配和回绕/重置、IMU 实际交付槽位频率、读取时间窗、boot_id 与时钟能力。
 百分位使用有界的 100 µs 桶，超过 1 秒的溢出桶保守报告最大值。
 
+`capture_audit.camera.cadence` 进一步区分平均速率偏差和相邻帧抖动：
+保存平均/最小/最大间隔、标准差、相对目标周期的最大绝对误差、超过
+0.5/1 ms 的间隔数量，以及连续 `ceil(nominal_fps)` 个间隔的滚动帧率范围。
+所有计算使用原始整数时间戳之差，内存使用不随录制时长增长，不改写索引。
+默认工程验收线为平均速率误差 ≤1000 ppm（30 fps 时 ±0.03 fps）、至少
+99% 的间隔误差 ≤0.5 ms、全部间隔误差 ≤1 ms、滚动速率误差 ≤5000 ppm。
+至少观察 10 秒才能返回 `within_tolerance`；已观测违规返回
+`outside_tolerance`，短且未见违规返回 `insufficient_duration`。
+具体阈值随审计结果保存。该状态描述已记录的主机时钟，不证明曝光时刻
+准确，也不因未达帧率预算就销毁或阻止导出完整素材。
+
+旧录制可只读复查（退出码 0=符合上述观察预算、2=超差、3=样本过短）：
+
+```bash
+PYTHONPATH=src uv run python scripts/check_frame_cadence.py /path/to/frames.ndjson.zst --fps 30
+```
+
+平均值接近 30 或驱动协商返回 60，均不代表已达到恒定 30 fps；源传感器
+速率不足时调整编码器 FPS、补帧或重写时间戳不能补足真实曝光事件。
+
 MP4 分段仍采用编码器的标称帧率时基。**定量分析和完整视频导出必须使用
 `frames.host_monotonic_ns`**。配套 Bridge SDK 支持压缩索引，导出逐帧 VFR
 时间戳，并沿用 ALSA 捕获时钟校正音频速率；不可用 `frame/30` 替代真实时间。
@@ -53,3 +73,35 @@ IMU 的两个六轴槽位共享一次 USB 读取的中点时间。现有协议�
 固件公开版本限定在 0.2.x，首次公开交付为 0.2.1。网页检查同时比较版本与
 提交身份，以便本地同版本候选升级到公共正式构建；旧版本渠道不提供降级。
 OSS 发布仍拒绝覆盖已公开版本的不同产物，后续变更必须递增补丁号。
+
+
+### Observed frame cadence diagnostics
+
+The capture audit now includes `camera.cadence`: measured rate, interval extrema,
+standard deviation, rolling rate, and explicit tolerances. `status` describes the
+engineering profile printed in `acceptance_limits`. The separate
+`quantized_interval_status` requires every observed interval to lie within 1 us
+of the target period (V4L2 timestamp quantization), with at least 10 seconds of
+observations to pass. Neither result verifies physical exposure timing.
+
+`PYTHONPATH=src python scripts/check_frame_cadence.py frames.ndjson.zst --fps 30
+--strict-intervals` checks an existing journal without modifying it. Exit codes
+are 0 within tolerance, 2 outside tolerance, and 3 insufficient duration.
+Nominal MP4 FPS and gap-free frame sequences do not imply constant exposure cadence.
+
+Native audio diagnostics retain separate file sync and checkpoint timings, plus
+queue peak and maximum whole writer operation duration, including failed captures.
+
+
+Audio segment durability runs on a separate commit worker. The PCM writer queues
+completed file handles, returning its capture buffer before segment `fsync` and
+checkpoint serialization/sync. Pending commits, including an in-flight batch,
+are capped at eight segments (40 s at the default 5 s segment length); capacity
+exhaustion or any I/O error fails explicitly. Accumulated commits may share one
+checkpoint only after all included segment files have synced. The checkpoint is
+still atomically replaced and its directory synced. Stop joins the worker before
+returning the final audio result; compression/recovery must not race that worker.
+An abrupt power loss can lose the uncommitted tail. `durable_sample_count` and
+`durable_commit_peak_segments` in `audio/capture-clock.json` distinguish durable
+progress from successful buffered PCM writes. This does not fix storage media
+that cannot sustain the bitrate, nor does it guarantee unlimited stall tolerance.

@@ -6,6 +6,7 @@ import importlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from types import ModuleType
 from typing import Protocol, cast
 
@@ -149,7 +150,16 @@ class NativeSessionTransaction(Protocol):
 
     def snapshot(self) -> dict[str, object]: ...
 
+    def diagnostic_snapshot(self) -> dict[str, object]: ...
+
     def segments(self) -> list[dict[str, object]]: ...
+
+    def segments_since(self, offset: int) -> list[dict[str, object]]: ...
+
+    @property
+    def capture_stopped_monotonic_ns(self) -> int | None: ...
+
+    def request_audio_stop(self) -> None: ...
 
     def finish(
         self,
@@ -244,6 +254,8 @@ class NativeSessionStore(Protocol):
 
     def read_bounded_fd(self, descriptor: int, maximum_bytes: int) -> bytes: ...
 
+    def catalog_manifest_signature(self, path: bytes, maximum_bytes: int) -> str: ...
+
 
 class NativeMultipartPreview(Protocol):
     def __iter__(self) -> NativeMultipartPreview: ...
@@ -303,6 +315,41 @@ def _require_native_feature(
     if feature not in _validate_capabilities(module).features:
         raise NativeModuleError(unavailable_code, missing_message)
     return module
+
+
+class NativeSchemaValidator(Protocol):
+    def is_valid(self, payload: str) -> bool: ...
+
+
+def audio_checkpoint_segments(payload: bytes) -> list[dict[str, object]]:
+    """Read live compaction inputs without allocating historical clock arrays.
+
+    Older/source-only builds keep their full JSON reader. Native parse errors
+    propagate: a malformed checkpoint must not silently take another path.
+    """
+    try:
+        module = importlib.import_module(NATIVE_MODULE)
+    except ImportError:
+        module = None
+    parser = getattr(module, "audio_checkpoint_segments", None)
+    if parser is not None:
+        _validate_capabilities(module)
+        return parser(payload)
+    import json
+
+    return json.loads(payload)["segments"]
+
+
+@lru_cache(maxsize=4)
+def native_schema_validator_or_none(schema_json: str) -> NativeSchemaValidator | None:
+    """Compile only trusted bundled schemas; missing/older modules use Python."""
+    try:
+        module = _require_native_feature(
+            "schema_validation", "native_schema_unavailable", "清单校验模块", "缺少清单校验能力"
+        )
+        return module.NativeSchemaValidator(schema_json)
+    except Exception:
+        return None
 
 
 def _parse_native_error(exc: Exception, fallback_code: str) -> NativeModuleError:
