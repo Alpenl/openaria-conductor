@@ -120,3 +120,5 @@ RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援
 Rewrite MVP 已建立最小可运行基线。后续差量功能按 GitHub Issue 逐项实现与验收。
 
 公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。
+
+定时结束采集的使用方式、接口和计时边界见[定时录制说明](docs/timed-capture.md)。
