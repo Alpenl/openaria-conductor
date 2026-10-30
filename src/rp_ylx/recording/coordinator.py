@@ -53,6 +53,7 @@ from rp_ylx.api.gateway import (
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.camera_focus import valid_camera_focus_status
+from rp_ylx.capture_timer import DEFAULT_TIMER, valid_timer_settings
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network import NetworkError, network_operation_lock_path
@@ -789,6 +790,7 @@ class CaptureCoordinator:
         self._storage_cache: StorageStatus | None = None
         self._active: DeviceSessionRecorder | None = None
         self._active_plan: SessionPlan | None = None
+        self._capture_timer: tuple[SessionPlan, float, int] | None = None
         self._network_operation_lease: int | None = None
         self._retained: dict[str, dict[str, object]] = {}
         self._recovery_session: dict[str, str] | None = None
@@ -826,6 +828,9 @@ class CaptureCoordinator:
         self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
         self._state_db.import_json("capture", self._state_path)
         self._state_db.interrupt_transfers()
+        self._timer_settings = self._state_db.get("capture_timer")
+        if self._timer_settings is None:
+            self._timer_settings = dict(DEFAULT_TIMER)
         self._focus_restore_invalid = False
         self._focus_to_persist: dict[str, object] | None = None
         self._persisted_focus: dict[str, object] | None = None
@@ -3198,11 +3203,77 @@ class CaptureCoordinator:
         self._persist_local_state()
         return result
 
+    def capture_timer_status(self) -> dict[str, object]:
+        with self._lock:
+            self._require_timer_settings()
+            active = None
+            timer = self._capture_timer
+            if timer is not None and self._active_plan is timer[0]:
+                plan, deadline, duration = timer
+                active = {
+                    "session_id": plan.session_id,
+                    "duration_seconds": duration,
+                    "remaining_seconds": max(0.0, min(duration, deadline - time.monotonic())),
+                }
+            return {
+                "schema": "ylx.capture-timer.v1",
+                "settings": dict(self._timer_settings),
+                "active": active,
+            }
+
+    def _require_timer_settings(self) -> None:
+        if not valid_timer_settings(self._timer_settings):
+            raise ProviderError(
+                "invalid_timer_settings",
+                "定时设置损坏，请在待机时重新保存",
+                status=HTTPStatus.CONFLICT,
+            )
+
+    def set_capture_timer(self, settings: Mapping[str, object]) -> dict[str, object]:
+        if not valid_timer_settings(settings):
+            raise ProviderError("invalid_request", "时长须为1至86400秒的整数", status=400)
+        with self._lock:
+            if (
+                self._active is not None
+                or self._closing
+                or self._stop_inflight is not None
+                or self._async_stop_worker is not None
+                or self._failure_inflight is not None
+            ):
+                raise ProviderError("capture_busy", "请在录制结束后设置定时", status=409)
+            # Publish only after the SQLite transaction succeeds. No timer setting
+            # is copied into legacy capture state or the immutable media manifest.
+            value = dict(settings)
+            self._state_db.put("capture_timer", value, history=True)
+            self._timer_settings = value
+            return self.capture_timer_status()
+
+    def enforce_capture_timer(self) -> None:
+        with self._lock:
+            timer = self._capture_timer
+            if (
+                timer is None
+                or self._active_plan is not timer[0]
+                or self._closing
+                or self._failure_projection is not None
+                or time.monotonic() < timer[1]
+            ):
+                return
+            session_id = timer[0].session_id
+        body = {"reason": "timer"}
+        # The stop path rechecks session identity under its own lock, including
+        # after waiting for a concurrent manual stop. Never stop a newer take.
+        self.stop_capture(
+            CaptureCommand("capture-timer", session_id, body, _canonical_json_bytes(body)),
+            expected_session_id=session_id,
+        )
+
     def start_capture(self, command: CaptureCommand) -> CaptureCommandResult:
         with self._lock:
             return self._idempotent("start", command, lambda: self._start_capture(command.body))
 
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
+        self._require_timer_settings()
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
         if body.get("mode") == "calibration" and not self._calibration_source_supported():
@@ -3389,12 +3460,18 @@ class CaptureCoordinator:
                 }
             self._active = None
             self._active_plan = None
+            self._capture_timer = None
             self._latest_imu = None
             self._preview.clear()
             self._persist_local_state()
             code = getattr(error, "code", "source_start_failed")
             message = getattr(error, "message", str(error))
             raise ProviderError(str(code), str(message), status=HTTPStatus.CONFLICT) from error
+        if self._timer_settings["enabled"]:
+            duration = self._timer_settings["duration_seconds"]
+            self._capture_timer = (plan, time.monotonic() + duration, duration)
+        else:
+            self._capture_timer = None
         # _idempotent persists this state together with the accepted start receipt.
         # Writing here can fail after sources have started but before that receipt
         # is remembered, so a same-key retry would incorrectly report capture_busy.
@@ -4270,6 +4347,7 @@ class CaptureCoordinator:
                     )
                 self._active = None
                 self._active_plan = None
+                self._capture_timer = None
                 self._latest_imu = None
                 self._next_revision()
                 if reason == "safe_swap":
@@ -4468,6 +4546,7 @@ class CaptureCoordinator:
                 self._failure_projection = None
             self._active = None
             self._active_plan = None
+            self._capture_timer = None
             self._cached_active_state = None
             self._latest_imu = None
             if self._stop_inflight is None:
@@ -5108,6 +5187,7 @@ class CaptureCoordinator:
                         }
                     self._active = None
                     self._active_plan = None
+                    self._capture_timer = None
                     self._latest_imu = None
                     self._failure_pending_commit = None
                     self._failure_projection = None

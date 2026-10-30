@@ -561,6 +561,125 @@ class CaptureCoordinatorTest(unittest.TestCase):
             before_write=before_write,  # type: ignore[arg-type]
         )
 
+    def test_capture_timer_background_monitor_saves_without_browser(self):
+        from rp_ylx.daemon import CaptureTimerMonitor
+
+        with self.coordinator() as c:
+            c.set_capture_timer({"enabled": True, "duration_seconds": 1})
+            c.start_capture(start_command("background-timer"))
+            sid = c._active_plan.session_id
+            c.submit_frame(frame())
+            monitor = CaptureTimerMonitor(c)
+            try:
+                deadline = time.monotonic() + 5
+                while c._active is not None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertIsNone(c._active)
+                self.assertTrue((self.mountpoint / "recordings" / sid / "manifest.json").exists())
+            finally:
+                monitor.close()
+            self.assertFalse(monitor.thread.is_alive())
+
+    def test_capture_timer_defaults_and_persistence(self):
+        with self.coordinator() as c:
+            self.assertEqual(
+                c.capture_timer_status()["settings"], {"enabled": False, "duration_seconds": 600}
+            )
+            c.set_capture_timer({"enabled": True, "duration_seconds": 600})
+        with self.coordinator() as c:
+            self.assertTrue(c.capture_timer_status()["settings"]["enabled"])
+            self.assertIsNone(c.capture_timer_status()["active"])
+
+    def test_capture_timer_stops_and_saves_without_http_client(self):
+        with self.coordinator() as c:
+            c.set_capture_timer({"enabled": True, "duration_seconds": 600})
+            c.start_capture(start_command("timer"))
+            c.submit_frame(frame())
+            timer = c._capture_timer
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=timer[1] - 0.01):
+                c.enforce_capture_timer()
+                self.assertIsNotNone(c._active)
+            with patch("rp_ylx.recording.coordinator.time.monotonic", return_value=timer[1]):
+                c.enforce_capture_timer()
+            self.assertIsNone(c._active)
+            self.assertIsNone(c.capture_timer_status()["active"])
+            self.assertTrue(
+                (self.mountpoint / "recordings" / timer[0].session_id / "manifest.json").is_file()
+            )
+            self.assertEqual(c.capture_status()["snapshot"]["device_state"], "idle")
+
+    def test_capture_timer_manual_stop_cancels_and_disabled_start_is_unlimited(self):
+        with self.coordinator() as c:
+            c.set_capture_timer({"enabled": True, "duration_seconds": 10})
+            c.start_capture(start_command("timer-first"))
+            c.submit_frame(frame())
+            c.stop_capture(stop_command("manual"))
+            self.assertIsNone(c._capture_timer)
+            c.set_capture_timer({"enabled": False, "duration_seconds": 10})
+            c.start_capture(start_command("unlimited"))
+            c.enforce_capture_timer()
+            self.assertIsNotNone(c._active)
+            self.assertIsNone(c._capture_timer)
+
+    def test_capture_timer_replay_does_not_restart_deadline_and_busy_edit_rejected(self):
+        with self.coordinator() as c:
+            c.set_capture_timer({"enabled": True, "duration_seconds": 10})
+            start = start_command("timer-repeat")
+            c.start_capture(start)
+            timer = c._capture_timer
+            self.assertTrue(c.start_capture(start).replayed)
+            self.assertEqual(c._capture_timer, timer)
+            with self.assertRaises(ProviderError) as error:
+                c.set_capture_timer({"enabled": False, "duration_seconds": 60})
+            self.assertEqual(error.exception.code, "capture_busy")
+            self.assertEqual(c._capture_timer, timer)
+
+    def test_capture_timer_late_callback_never_stops_new_take(self):
+        with self.coordinator() as c:
+            c.set_capture_timer({"enabled": True, "duration_seconds": 1})
+            c.start_capture(start_command("old-timer"))
+            c.submit_frame(frame())
+            timer = c._capture_timer
+            original = c.stop_capture
+
+            def delayed(command, **kwargs):
+                original(stop_command("manual-race"))
+                c.start_capture(start_command("new-timer"))
+                return original(command, **kwargs)
+
+            with (
+                patch.object(c, "stop_capture", side_effect=delayed),
+                patch("rp_ylx.recording.coordinator.time.monotonic", return_value=timer[1]),
+            ):
+                c.enforce_capture_timer()
+            self.assertIsNotNone(c._active)
+            self.assertNotEqual(c._active_plan.session_id, timer[0].session_id)
+
+    def test_capture_timer_invalid_settings_and_failed_persistence_keep_previous(self):
+        with self.coordinator() as c:
+            for duration in [0, -1, True, 1.5, "600", 86401, None]:
+                with self.subTest(duration=duration), self.assertRaises(ProviderError):
+                    c.set_capture_timer({"enabled": True, "duration_seconds": duration})
+            with (
+                patch.object(c._state_db, "put", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                c.set_capture_timer({"enabled": True, "duration_seconds": 10})
+            self.assertFalse(c.capture_timer_status()["settings"]["enabled"])
+
+    def test_capture_timer_failed_start_and_shutdown_clear_deadline(self):
+        sources = FakeSources()
+        c = self.coordinator(sources=sources)
+        c.set_capture_timer({"enabled": True, "duration_seconds": 10})
+        with (
+            patch.object(sources, "start", side_effect=RuntimeError("camera failed")),
+            self.assertRaises(ProviderError),
+        ):
+            c.start_capture(start_command("failed-timer"))
+        self.assertIsNone(c._capture_timer)
+        c.close()
+        self.assertIsNone(c._capture_timer)
+
     def test_disconnected_camera_is_reported_and_rejected_before_capture_side_effects(
         self,
     ) -> None:

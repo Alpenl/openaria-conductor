@@ -51,6 +51,8 @@ x-ylx-security-profiles:
       - getDeviceClock
       - syncDeviceClock
       - getCaptureStatus
+      - getCaptureTimer
+      - setCaptureTimer
       - startCapture
       - stopCapture
       - streamCaptureEvents
@@ -80,6 +82,70 @@ x-ylx-security-profiles:
       capture_status: true
       session_deletion: true
 paths:
+  /capture/timer:
+    get:
+      tags: [Capture]
+      operationId: getCaptureTimer
+      summary: Read persistent timer settings and the current take countdown
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Device-authoritative timer state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureTimerStatus"
+        "409":
+          description: Invalid stored timer settings; replace them while idle
+    post:
+      tags: [Capture]
+      operationId: setCaptureTimer
+      summary: Replace the capture timer settings while idle
+      description: |
+        Persistent device-wide settings apply to subsequent starts, including the
+        physical button and calibration. Defaults are disabled and 600 seconds.
+        Uses normal bearer, Origin and CSRF checks. No Idempotency-Key is required;
+        repeating the same replacement is safe. Active recording/finalization
+        rejects changes. Timing starts after successful source startup using a
+        monotonic device clock, checked every 100 ms. Expiry uses normal stop and
+        sealing; it does not guarantee frame-exact duration or instant sealing.
+        Closing the browser does not cancel the timer. A device restart cancels
+        the active take timer but preserves settings; normal crash recovery applies.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema, enabled, duration_seconds]
+              properties:
+                schema:
+                  const: ylx.capture-timer-set.v1
+                enabled:
+                  type: boolean
+                duration_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 86400
+      responses:
+        "200":
+          description: Settings durably saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureTimerStatus"
+        "400":
+          description: Invalid closed request schema, boolean or integer duration
+        "409":
+          description: Recording, finalization or shutdown is active
+        "500":
+          description: Persistence failed; previous settings remain effective
   /clock:
     get:
       tags: [Device]
@@ -1563,6 +1629,42 @@ components:
     InternalErrorHead:
       description: Unexpected device error; HEAD sends no response body
   schemas:
+    CaptureTimerStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, settings, active]
+      properties:
+        schema:
+          const: ylx.capture-timer.v1
+        settings:
+          type: object
+          additionalProperties: false
+          required: [enabled, duration_seconds]
+          properties:
+            enabled:
+              type: boolean
+            duration_seconds:
+              type: integer
+              minimum: 1
+              maximum: 86400
+        active:
+          oneOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required: [session_id, duration_seconds, remaining_seconds]
+              properties:
+                session_id:
+                  type: string
+                  format: uuid
+                duration_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 86400
+                remaining_seconds:
+                  type: number
+                  minimum: 0
+                  maximum: 86400
     ClockStatus:
       type: object
       additionalProperties: false

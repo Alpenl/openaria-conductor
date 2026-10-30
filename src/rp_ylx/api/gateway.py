@@ -48,6 +48,7 @@ from rp_ylx.api.events import (
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
 from rp_ylx.camera_focus import valid_camera_focus_status
+from rp_ylx.capture_timer import valid_timer_settings, valid_timer_status
 from rp_ylx.clock_sync import valid_clock_request, valid_clock_response
 from rp_ylx.firmware_control import FirmwareError, request_firmware
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
@@ -1395,6 +1396,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return True
 
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
+        if path == "/api/v4/capture/timer":
+            return ("GET", "POST", "OPTIONS")
         if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
             return ("GET", "OPTIONS")
         if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
@@ -1526,6 +1529,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
             self._firmware_request("check" if path.endswith("/check") else "status")
+            return
+        if path == "/api/v4/capture/timer":
+            self._capture_timer_request(write=False)
             return
         if path == "/api/v4/clock":
             self._clock_request(sync=False)
@@ -1662,6 +1668,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
             self._firmware_request(path.rsplit("/", 1)[1])
+            return
+        if path == "/api/v4/capture/timer":
+            self._capture_timer_request(write=True)
             return
         if path == "/api/v4/clock/sync":
             self._clock_request(sync=True)
@@ -3246,6 +3255,43 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "Idempotency-Key 无效")
             return None
         return principal, key
+
+    def _capture_timer_request(self, *, write: bool) -> None:
+        principal = (
+            self._write_principal("setCaptureTimer")
+            if write
+            else self._principal("getCaptureTimer")
+        )
+        if principal is None:
+            return
+        body = self._read_json() if write else {}
+        if body is None:
+            return
+        if write and (
+            set(body) != {"schema", "enabled", "duration_seconds"}
+            or body.get("schema") != "ylx.capture-timer-set.v1"
+            or not valid_timer_settings({k: v for k, v in body.items() if k != "schema"})
+        ):
+            self._problem(400, "invalid_request", "定时设置无效")
+            return
+        method = getattr(
+            self.server.provider, "set_capture_timer" if write else "capture_timer_status", None
+        )
+        if not callable(method):
+            self._problem(404, "not_found", "设备不支持定时录制")
+            return
+        try:
+            result = method({k: v for k, v in body.items() if k != "schema"}) if write else method()
+        except ProviderError as error:
+            self._problem(error.status, error.code, error.message, retryable=error.retryable)
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not valid_timer_status(result):
+            self._invalid_source_state("设备定时状态无效")
+            return
+        self._send_json(HTTPStatus.OK, result)
 
     def _clock_request(self, *, sync: bool) -> None:
         principal = (

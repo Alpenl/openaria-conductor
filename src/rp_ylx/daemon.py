@@ -47,6 +47,8 @@ LAB_OPERATIONS = frozenset(
     {
         "getDevice",
         "syncDeviceClock",
+        "getCaptureTimer",
+        "setCaptureTimer",
         "getDeviceClock",
         "firmwareStatus",
         "firmwareUpdate",
@@ -472,10 +474,12 @@ class ProductionService:
     event_pump: CaptureEventPump
     mdns_publisher: MdnsPublisher
     storage_monitor: StorageReserveMonitor | None = None
+    capture_timer_monitor: CaptureTimerMonitor | None = None
 
     def close(self) -> None:
         error = _close_service_components(
             (
+                ("capture_timer_monitor", self.capture_timer_monitor, "close"),
                 ("storage_monitor", self.storage_monitor, "close"),
                 ("server", self.server, "server_close"),
                 ("mdns_publisher", self.mdns_publisher, "close"),
@@ -600,6 +604,27 @@ class StorageReserveMonitor:
     def close(self) -> None:
         self.stop.set()
         self.thread.join()
+
+
+class CaptureTimerMonitor(StorageReserveMonitor):
+    """Independent of storage probes, browsers and SSE; checks at 100 ms intervals."""
+
+    def __init__(self, coordinator: CaptureCoordinator) -> None:
+        self.coordinator = coordinator
+        self.stop = threading.Event()
+        self.thread = _start_background_worker(
+            self._run, self.stop, name="capture-timer", daemon=True
+        )
+
+    def _run(self) -> None:
+        next_report_at: float | None = None
+        while not self.stop.wait(0.1):
+            try:
+                self.coordinator.enforce_capture_timer()
+            except Exception as error:
+                next_report_at = _report_worker_failure(
+                    "recording", "capture_timer_monitor_failed", error, next_report_at
+                )
 
 
 class CaptureEventPump:
@@ -836,6 +861,7 @@ def build_production_service(
     event_pump = None
     mdns_publisher = None
     storage_monitor = None
+    capture_timer_monitor = None
     try:
         try:
             sources.start_preview()
@@ -907,10 +933,14 @@ def build_production_service(
         )
         mdns_publisher.start()
         storage_monitor = StorageReserveMonitor(coordinator)
-        return ProductionService(coordinator, server, event_pump, mdns_publisher, storage_monitor)
+        capture_timer_monitor = CaptureTimerMonitor(coordinator)
+        return ProductionService(
+            coordinator, server, event_pump, mdns_publisher, storage_monitor, capture_timer_monitor
+        )
     except BaseException:
         _close_service_components(
             (
+                ("capture_timer_monitor", capture_timer_monitor, "close"),
                 ("storage_monitor", storage_monitor, "close"),
                 ("mdns_publisher", mdns_publisher, "close"),
                 ("event_pump", event_pump, "close"),
