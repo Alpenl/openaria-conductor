@@ -580,6 +580,31 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 monitor.close()
             self.assertFalse(monitor.thread.is_alive())
 
+    def test_voice_success_and_idempotent_replay(self):
+        with self.coordinator() as c, patch.object(coordinator_module, "notify_voice") as voice:
+            request = start_command("voice")
+            c.start_capture(request)
+            sid = c._active_plan.session_id
+            c.start_capture(request)
+            c.submit_frame(frame())
+            c.stop_capture(stop_command("voice-stop"))
+            c.stop_capture(stop_command("voice-stop"))
+            self.assertEqual(
+                voice.call_args_list,
+                [unittest.mock.call("started", sid), unittest.mock.call("saved", sid)],
+            )
+
+    def test_voice_rejected_start_never_announces_success(self):
+        sources = FakeSources()
+        sources.camera_state = "disconnected"
+        with (
+            self.coordinator(sources=sources) as c,
+            patch.object(coordinator_module, "notify_voice") as voice,
+        ):
+            with self.assertRaises(ProviderError):
+                c.start_capture(start_command("voice-failed"))
+            voice.assert_called_once_with("start_failed")
+
     def test_capture_timer_defaults_and_persistence(self):
         with self.coordinator() as c:
             self.assertEqual(

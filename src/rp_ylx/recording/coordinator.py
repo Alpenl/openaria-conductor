@@ -85,6 +85,7 @@ from rp_ylx.recording.recovery import (
     recover_device_session,
 )
 from rp_ylx.runtime import collect_linux_runtime
+from rp_ylx.voice_feedback import notify as notify_voice
 
 
 def _validated_command_receipt(item: Mapping[str, object]) -> tuple[bytes, CaptureCommandResult]:
@@ -3273,6 +3274,13 @@ class CaptureCoordinator:
             return self._idempotent("start", command, lambda: self._start_capture(command.body))
 
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
+        try:
+            return self._start_capture_checked(body)
+        except Exception:
+            notify_voice("start_failed")
+            raise
+
+    def _start_capture_checked(self, body: Mapping[str, object]) -> CaptureCommandResult:
         self._require_timer_settings()
         if self._active is not None:
             raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
@@ -3472,6 +3480,7 @@ class CaptureCoordinator:
             self._capture_timer = (plan, time.monotonic() + duration, duration)
         else:
             self._capture_timer = None
+        notify_voice("started", plan.session_id)
         # _idempotent persists this state together with the accepted start receipt.
         # Writing here can fail after sources have started but before that receipt
         # is remembered, so a same-key retry would incorrectly report capture_busy.
@@ -4382,6 +4391,7 @@ class CaptureCoordinator:
                 if self._pending_stop_state_commit == scope:
                     self._pending_stop_state_commit = None
                 self._release_network_operation_lease()
+                notify_voice("saved", plan.session_id)
                 return result
         except DeviceRecordingError as error:
             self._retain_active_failure(error, plan, from_stop=True)
@@ -4437,6 +4447,7 @@ class CaptureCoordinator:
                 # handle the failure; never wait for that owner from here.
                 self._pending_source_failure = self._pending_source_failure or error
                 return
+            notify_voice("save_failed" if from_stop else "recording_failed", plan.session_id)
             error = self._pending_source_failure or error
             self._pending_source_failure = None
             projection = copy.deepcopy(self._cached_active_state)
