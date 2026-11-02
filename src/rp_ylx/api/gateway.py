@@ -60,6 +60,7 @@ from rp_ylx.network_validation import (
     valid_network_request,
 )
 from rp_ylx.operational_logging import operational_logger
+from rp_ylx.voice_feedback import valid_volume
 from rp_ylx.web import (
     WEB_ASSETS,
     EchoWebArtifactError,
@@ -1396,7 +1397,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return True
 
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
-        if path == "/api/v4/capture/timer":
+        if path in {"/api/v4/capture/timer", "/api/v4/voice"}:
             return ("GET", "POST", "OPTIONS")
         if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
             return ("GET", "OPTIONS")
@@ -1529,6 +1530,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
             self._firmware_request("check" if path.endswith("/check") else "status")
+            return
+        if path == "/api/v4/voice":
+            self._voice_request(write=False)
             return
         if path == "/api/v4/capture/timer":
             self._capture_timer_request(write=False)
@@ -1668,6 +1672,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
             self._firmware_request(path.rsplit("/", 1)[1])
+            return
+        if path == "/api/v4/voice":
+            self._voice_request(write=True)
             return
         if path == "/api/v4/capture/timer":
             self._capture_timer_request(write=True)
@@ -3255,6 +3262,46 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "Idempotency-Key 无效")
             return None
         return principal, key
+
+    def _voice_request(self, *, write: bool) -> None:
+        principal = (
+            self._write_principal("setVoiceVolume") if write else self._principal("getVoice")
+        )
+        if principal is None:
+            return
+        body = self._read_json() if write else {}
+        if body is None:
+            return
+        if write and (
+            set(body) != {"schema", "volume"}
+            or body.get("schema") != "ylx.voice-set.v1"
+            or not valid_volume(body.get("volume"))
+        ):
+            self._problem(400, "invalid_request", "提示音量须为0至100的整数")
+            return
+        method = getattr(
+            self.server.provider, "set_voice_volume" if write else "voice_status", None
+        )
+        if not callable(method):
+            self._problem(404, "not_found", "设备不支持提示音量设置")
+            return
+        try:
+            result = method(body["volume"]) if write else method()
+        except ProviderError as error:
+            self._problem(error.status, error.code, error.message, retryable=error.retryable)
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if (
+            not isinstance(result, dict)
+            or result.get("schema") != "ylx.voice.v1"
+            or type(result.get("enabled")) is not bool
+            or not valid_volume(result.get("volume"))
+        ):
+            self._invalid_source_state("设备提示音状态无效")
+            return
+        self._send_json(HTTPStatus.OK, result)
 
     def _capture_timer_request(self, *, write: bool) -> None:
         principal = (

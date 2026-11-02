@@ -86,6 +86,7 @@ from rp_ylx.recording.recovery import (
 )
 from rp_ylx.runtime import collect_linux_runtime
 from rp_ylx.voice_feedback import notify as notify_voice
+from rp_ylx.voice_feedback import valid_volume
 
 
 def _validated_command_receipt(item: Mapping[str, object]) -> tuple[bytes, CaptureCommandResult]:
@@ -829,6 +830,9 @@ class CaptureCoordinator:
         self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
         self._state_db.import_json("capture", self._state_path)
         self._state_db.interrupt_transfers()
+        self._voice_settings = self._state_db.get("voice_feedback")
+        if self._voice_settings is None:
+            self._voice_settings = {"volume": 100}
         self._timer_settings = self._state_db.get("capture_timer")
         if self._timer_settings is None:
             self._timer_settings = dict(DEFAULT_TIMER)
@@ -3204,6 +3208,40 @@ class CaptureCoordinator:
         self._persist_local_state()
         return result
 
+    def _notify_voice(self, event: str, identity: str = "") -> None:
+        volume = self._voice_settings.get("volume")
+        notify_voice(event, identity, volume=volume if valid_volume(volume) else 0)
+
+    def voice_status(self) -> dict[str, object]:
+        with self._lock:
+            volume = self._voice_settings.get("volume")
+            if not valid_volume(volume):
+                raise ProviderError(
+                    "invalid_voice_settings", "提示音设置损坏，请重新保存", status=409
+                )
+            return {
+                "schema": "ylx.voice.v1",
+                "enabled": os.environ.get("OPENARIA_VOICE_ENABLED") == "1",
+                "volume": volume,
+            }
+
+    def set_voice_volume(self, volume: int) -> dict[str, object]:
+        if not valid_volume(volume):
+            raise ProviderError("invalid_request", "音量须为0至100的整数", status=400)
+        with self._lock:
+            if (
+                self._active is not None
+                or self._closing
+                or self._stop_inflight is not None
+                or self._async_stop_worker is not None
+                or self._failure_inflight is not None
+            ):
+                raise ProviderError("capture_busy", "请在录制结束后调整提示音量", status=409)
+            value = {"volume": volume}
+            self._state_db.put("voice_feedback", value, history=True)
+            self._voice_settings = value
+            return self.voice_status()
+
     def capture_timer_status(self) -> dict[str, object]:
         with self._lock:
             self._require_timer_settings()
@@ -3277,7 +3315,7 @@ class CaptureCoordinator:
         try:
             return self._start_capture_checked(body)
         except Exception:
-            notify_voice("start_failed")
+            self._notify_voice("start_failed")
             raise
 
     def _start_capture_checked(self, body: Mapping[str, object]) -> CaptureCommandResult:
@@ -3480,7 +3518,7 @@ class CaptureCoordinator:
             self._capture_timer = (plan, time.monotonic() + duration, duration)
         else:
             self._capture_timer = None
-        notify_voice("started", plan.session_id)
+        self._notify_voice("started", plan.session_id)
         # _idempotent persists this state together with the accepted start receipt.
         # Writing here can fail after sources have started but before that receipt
         # is remembered, so a same-key retry would incorrectly report capture_busy.
@@ -4391,7 +4429,7 @@ class CaptureCoordinator:
                 if self._pending_stop_state_commit == scope:
                     self._pending_stop_state_commit = None
                 self._release_network_operation_lease()
-                notify_voice("saved", plan.session_id)
+                self._notify_voice("saved", plan.session_id)
                 return result
         except DeviceRecordingError as error:
             self._retain_active_failure(error, plan, from_stop=True)
@@ -4447,7 +4485,7 @@ class CaptureCoordinator:
                 # handle the failure; never wait for that owner from here.
                 self._pending_source_failure = self._pending_source_failure or error
                 return
-            notify_voice("save_failed" if from_stop else "recording_failed", plan.session_id)
+            self._notify_voice("save_failed" if from_stop else "recording_failed", plan.session_id)
             error = self._pending_source_failure or error
             self._pending_source_failure = None
             projection = copy.deepcopy(self._cached_active_state)

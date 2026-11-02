@@ -591,7 +591,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
             c.stop_capture(stop_command("voice-stop"))
             self.assertEqual(
                 voice.call_args_list,
-                [unittest.mock.call("started", sid), unittest.mock.call("saved", sid)],
+                [
+                    unittest.mock.call("started", sid, volume=100),
+                    unittest.mock.call("saved", sid, volume=100),
+                ],
             )
 
     def test_voice_rejected_start_never_announces_success(self):
@@ -603,7 +606,31 @@ class CaptureCoordinatorTest(unittest.TestCase):
         ):
             with self.assertRaises(ProviderError):
                 c.start_capture(start_command("voice-failed"))
-            voice.assert_called_once_with("start_failed")
+            voice.assert_called_once_with("start_failed", "", volume=100)
+
+    def test_voice_volume_persists_and_failed_write_keeps_previous_value(self):
+        with self.coordinator() as c:
+            self.assertEqual(c.voice_status()["volume"], 100)
+            c.set_voice_volume(35)
+            with (
+                patch.object(c._state_db, "put", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                c.set_voice_volume(0)
+            self.assertEqual(c.voice_status()["volume"], 35)
+        with self.coordinator() as c, patch.object(coordinator_module, "notify_voice") as voice:
+            self.assertEqual(c.voice_status()["volume"], 35)
+            c._notify_voice("saved", "take")
+            voice.assert_called_once_with("saved", "take", volume=35)
+            for value in (-1, 101, True, 1.5):
+                with self.assertRaises(ProviderError):
+                    c.set_voice_volume(value)
+            c.start_capture(start_command("volume-busy"))
+            with self.assertRaises(ProviderError) as error:
+                c.set_voice_volume(0)
+            self.assertEqual(error.exception.code, "capture_busy")
+            c.submit_frame(frame())
+            c.stop_capture(stop_command("volume-busy-stop"))
 
     def test_capture_timer_defaults_and_persistence(self):
         with self.coordinator() as c:

@@ -1,7 +1,11 @@
+import array
+import io
 import os
 import subprocess
 import threading
 import unittest
+import wave
+from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx import voice_feedback as voice
@@ -50,3 +54,28 @@ class VoiceFeedbackTest(unittest.TestCase):
             self.assertTrue(failed.wait(2))
             player.notify("saved", "a")
             self.assertTrue(played.wait(2))
+
+
+class VoiceVolumeTest(unittest.TestCase):
+    def test_gain_scales_pcm_and_preserves_format(self):
+        path = Path(voice.__file__).with_name("voice_assets") / "started.wav"
+
+        def samples(volume):
+            with wave.open(io.BytesIO(voice.scaled_wave(path, volume)), "rb") as f:
+                return f.getparams(), array.array("h", f.readframes(f.getnframes()))
+
+        params, full = samples(100)
+        half_params, half = samples(50)
+        _, silent = samples(0)
+        self.assertEqual(params, half_params)
+        self.assertEqual(list(half), [int(x * 0.5) for x in full])
+        self.assertFalse(any(silent))
+        with self.assertRaises(ValueError):
+            voice.scaled_wave(path, True)
+
+    def test_mute_clears_pending_cue_without_enqueuing_playback(self):
+        with patch.object(threading.Thread, "start"):
+            player = voice.VoiceFeedback("test")
+        player.notify("started", "one", 100)
+        player.notify("saved", "one", 0)
+        self.assertTrue(player.pending.empty())
