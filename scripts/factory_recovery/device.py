@@ -69,8 +69,7 @@ def backup_locked():
     if config.get("security", {}).get("profile") != "lab":
         raise RuntimeError("This recovery version supports HTTP lab profile only")
     capture = document("/var/lib/rp-ylx/state.sqlite3", "capture")
-    if capture.get("active_session") or capture.get("pending_safe_swap") or capture.get("retained"):
-        raise RuntimeError("Device must be idle without retained capture before backup")
+    require_idle(capture)
     current = document("/var/lib/rp-ylx/settings.sqlite3", "device")
     for group, values in current.items():
         if group not in {"camera", "audio", "recording", "storage"} or not isinstance(values, dict):
@@ -99,6 +98,18 @@ def backup_locked():
     result = {"schema": SCHEMA, "board": board, "files": files, "voice": voice}
     validate(result)
     return result
+
+
+def require_idle(capture):
+    # Retained entries are historical failed recordings, not active capture.
+    # The caller holds the exclusive maintenance lease. They remain on the old
+    # card and are never included in this configuration-only backup.
+    if (
+        not isinstance(capture, dict)
+        or capture.get("active_session")
+        or capture.get("pending_safe_swap")
+    ):
+        raise RuntimeError("Device must be idle without a pending safe swap before backup")
 
 
 def validate(profile):

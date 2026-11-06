@@ -32,6 +32,19 @@ def make_bundle(path):
 
 
 class AutoinstallTests(unittest.TestCase):
+    def test_configuration_backup_allows_failed_history_but_not_active_capture(self):
+        historical = {"old-session": {"recording_state": {"state": "failed"}}}
+        device.require_idle(
+            {"active_session": None, "pending_safe_swap": None, "retained": historical}
+        )
+        for value in (
+            {"active_session": {"session_id": "active"}},
+            {"pending_safe_swap": {"state": "pending"}},
+            None,
+        ):
+            with self.assertRaises(RuntimeError):
+                device.require_idle(value)
+
     def test_board_encryption_and_tamper(self):
         from cryptography.exceptions import InvalidTag
 
