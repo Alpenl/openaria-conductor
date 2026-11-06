@@ -32,6 +32,18 @@ def make_bundle(path):
 
 
 class AutoinstallTests(unittest.TestCase):
+    def test_sparse_copy_preserves_leading_and_trailing_zeros_and_exact_size(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base, output = Path(folder) / "base.img", Path(folder) / "output.img"
+            raw = bytes(4 * 1024**2) + b"payload" + bytes(8 * 1024**2)
+            base.write_bytes(raw)
+            with base.open("rb") as src, output.open("wb") as dst:
+                provision.copy_image(src, dst)
+            self.assertEqual(output.read_bytes(), raw)
+            self.assertEqual(output.stat().st_size, len(raw))
+            if os.name == "posix":
+                self.assertLess(provision.copy_budget(base), len(raw))
+
     def test_configuration_backup_allows_failed_history_but_not_active_capture(self):
         historical = {"old-session": {"recording_state": {"state": "failed"}}}
         device.require_idle(

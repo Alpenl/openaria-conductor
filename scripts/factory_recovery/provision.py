@@ -84,6 +84,34 @@ def require_partition_firmware(bundle):
                 raise RuntimeError("Firmware does not support exFAT recording partitions")
 
 
+def copy_budget(base):
+    """On Unix, reserve only nonzero blocks plus room for the FAT payload."""
+    if os.name != "posix":
+        return base.stat().st_size
+    block_size = 4 * 1024**2
+    zeros = bytes(block_size)
+    required = 0
+    with base.open("rb") as src:
+        for block in iter(lambda: src.read(block_size), b""):
+            if block != zeros[: len(block)]:
+                required += block_size
+    return required
+
+
+def copy_image(src, dst):
+    """Preserve exact raw image bytes while avoiding allocated zero-only extents."""
+    if os.name != "posix":
+        shutil.copyfileobj(src, dst, 4 * 1024**2)
+        return
+    zeros = bytes(4 * 1024**2)
+    for block in iter(lambda: src.read(len(zeros)), b""):
+        if block == zeros[: len(block)]:
+            dst.seek(len(block), os.SEEK_CUR)
+        else:
+            dst.write(block)
+    dst.truncate(src.tell())
+
+
 def compose(
     base,
     base_sha,
@@ -117,13 +145,13 @@ def compose(
         if lines != ["exit 0"] or fat.exists("/openaria"):
             raise RuntimeError("Use an unmodified official image with an empty vendor hook")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(output.parent).free < base.stat().st_size + 512 * 1024**2:
+    if shutil.disk_usage(output.parent).free < copy_budget(base) + 512 * 1024**2:
         raise RuntimeError("Not enough space for the composed image")
     # Exclusive creation: never replace a prior image, block device or symlink.
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as dst, base.open("rb") as src:
-            shutil.copyfileobj(src, dst, 4 * 1024**2)
+            copy_image(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
         if layout is not None:
