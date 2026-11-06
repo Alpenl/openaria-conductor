@@ -85,6 +85,10 @@ def prepare(layout, boot, state_root, atomic_json):
         if not identity:
             raise RuntimeError("New exFAT filesystem has no identity")
         atomic_json(journal, {"phase": "ready", "layout": layout, "uuid": identity})
+    # Refresh aliases after mkfs; an old card may still have stale udev UUID
+    # links when the recording service starts immediately after installation.
+    run("udevadm", "trigger", "--action=change", str(data))
+    run("udevadm", "settle", "--timeout=30")
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temporary = CONFIG.with_suffix(".tmp")
     with temporary.open("w") as dst:
