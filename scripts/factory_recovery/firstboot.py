@@ -13,11 +13,12 @@ import tarfile
 from pathlib import Path, PurePosixPath
 
 if __package__:
-    from . import device, disks, provision
+    from . import device, disks, provision, storage_firstboot
 else:
     import device
     import disks
     import provision
+    import storage_firstboot
 
 ROOT = Path("/var/lib/openaria-factory/firstboot")
 BOOT = Path("/boot/config/openaria")
@@ -161,6 +162,8 @@ def execute():
         device.write_files(device.validate(profile))
         advance("configured")
     if state["phase"] == "configured":
+        if "storage" in manifest:
+            storage_firstboot.prepare(manifest["storage"], BOOT, ROOT, atomic_json)
         bundle = ROOT / "bundle"
         if bundle.is_symlink():
             raise RuntimeError("Unsafe staging directory")

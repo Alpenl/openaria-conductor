@@ -282,6 +282,11 @@ def parser():
         c.add_argument("--bundle-sha256", required=True)
         c.add_argument("--profile", required=True, type=Path)
         c.add_argument("--output", required=True, type=Path)
+        c.add_argument("--storage", choices=("exfat", "legacy-loop"), default="exfat")
+        c.add_argument("--system-gib", type=int, default=16)
+        c.add_argument("--tools-directory", type=Path, default=Path(__file__).parent / "tools")
+        if action == "compose":
+            c.add_argument("--card-bytes", type=int, help="actual target size for exFAT layout")
         if action == "auto-flash":
             c.add_argument("--disk", required=True)
             c.add_argument("--full-erase", action="store_true")
@@ -424,6 +429,9 @@ def main():
         restore(args)
     elif args.action in {"compose", "auto-flash"}:
         disk = disks.select(args.disk) if args.action == "auto-flash" else None
+        card_bytes = disk.size if disk else args.card_bytes
+        if args.storage == "exfat" and card_bytes is None:
+            raise RuntimeError("exFAT composition requires --card-bytes from disk discovery")
         profile = json.loads(
             decrypt(args.profile.read_bytes(), getpass.getpass("Backup encryption password: "))
         )
@@ -434,6 +442,9 @@ def main():
             args.bundle_sha256.lower(),
             profile,
             args.output,
+            card_bytes=card_bytes if args.storage == "exfat" else None,
+            system_gib=args.system_gib,
+            tools_directory=args.tools_directory,
         )
         print(json.dumps(receipt))
         if disk is not None:

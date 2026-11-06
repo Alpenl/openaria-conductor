@@ -12,6 +12,7 @@ Group=rp-ylx
 SupplementaryGroups=video vpu jpu vps misc
 Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/default/rp-ylx-data-volume
 ExecStart=/opt/rp-ylx/current/bin/rp-ylx serve --config /etc/rp-ylx/device.json
 StandardOutput=journal
 StandardError=journal

@@ -12,6 +12,7 @@ import hmac
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -531,7 +532,10 @@ def _stat_capacity(mountpoint: Path) -> tuple[int, int, int]:
     return (
         stat.f_frsize * stat.f_blocks,
         stat.f_frsize * stat.f_bavail,
-        stat.f_favail,
+        # exFAT has no fixed inode table and reports f_files=f_favail=0.
+        # Use free allocation units as a conservative creation budget there;
+        # preserve the real exhausted-inode signal on ext4.
+        stat.f_bavail if stat.f_files == 0 else stat.f_favail,
     )
 
 
@@ -928,6 +932,16 @@ class CaptureCoordinator:
             mount_stat = mountpoint.stat()
         except OSError as error:
             raise DeviceRecordingError("storage_unavailable", "录制卷不可读取") from error
+        if os.environ.get("RP_YLX_DATA_VOLUME_MODE") == "exfat":
+            identity = os.environ.get("RP_YLX_DATA_VOLUME_UUID", "")
+            if not re.fullmatch(r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}", identity):
+                raise DeviceRecordingError("volume_not_admitted", "录制卷配置缺少有效身份")
+            try:
+                expected = Path("/dev/disk/by-uuid", identity).stat()
+            except OSError as error:
+                raise DeviceRecordingError("volume_not_mounted", "指定的录制卷不在线") from error
+            if not stat.S_ISBLK(expected.st_mode) or expected.st_rdev != mount_stat.st_dev:
+                raise DeviceRecordingError("volume_not_admitted", "挂载的录制卷与设备配置不匹配")
         volume_id = _read_volume_id(mountpoint)
         mount_identity = self._mount_identity(mountpoint)
         total_bytes, available_bytes, available_inodes = _stat_capacity(mountpoint)

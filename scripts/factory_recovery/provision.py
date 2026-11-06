@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import struct
+import tarfile
+import zipfile
 from pathlib import Path
 
 if __package__:
-    from . import device, disks
+    from . import device, disks, partition_layout
 else:
     import device
     import disks
+    import partition_layout
 
 MAGIC = b"OAB1"
 HOOK = """#!/bin/bash -e
@@ -60,7 +64,38 @@ def boot_offset(image):
     return start * 512
 
 
-def compose(base, base_sha, bundle, bundle_sha, profile, output):
+def require_partition_firmware(bundle):
+    """Never pair a new layout with an old installer that creates an 80 GiB loop."""
+    with tarfile.open(bundle) as archive:
+        wheels = [
+            m
+            for m in archive.getmembers()
+            if Path(m.name).name.startswith("rp_ylx-") and m.name.endswith(".whl")
+        ]
+        if len(wheels) != 1 or not wheels[0].isfile() or wheels[0].size > 256 * 1024**2:
+            raise RuntimeError("Missing partition-capable application wheel")
+        with (
+            archive.extractfile(wheels[0]) as src,
+            zipfile.ZipFile(io.BytesIO(src.read())) as wheel,
+        ):
+            helper = wheel.read("rp_ylx/deploy/rp-ylx-data-volume")
+            unit = wheel.read("rp_ylx/deploy/rp-ylx-data-volume.service")
+            if b"RP_YLX_DATA_VOLUME_PARTUUID" not in helper or b"EnvironmentFile=" not in unit:
+                raise RuntimeError("Firmware does not support exFAT recording partitions")
+
+
+def compose(
+    base,
+    base_sha,
+    bundle,
+    bundle_sha,
+    profile,
+    output,
+    *,
+    card_bytes=None,
+    system_gib=16,
+    tools_directory=None,
+):
     from pyfatfs.PyFatFS import PyFatFS
 
     base, bundle, output = Path(base), Path(bundle), Path(output)
@@ -70,6 +105,12 @@ def compose(base, base_sha, bundle, bundle_sha, profile, output):
     if disks.digest(base) != base_sha or disks.digest(bundle) != bundle_sha:
         raise RuntimeError("Input image or bundle digest mismatch")
     offset = boot_offset(base)
+    layout = None
+    if card_bytes is not None:
+        require_partition_firmware(bundle)
+        with base.open("rb") as src:
+            mbr, layout = partition_layout.plan(src.read(512), card_bytes, system_gib)
+        package = partition_layout.prepare_tools(tools_directory or output.parent / "tools")
     with PyFatFS(str(base), offset=offset, read_only=True) as fat:
         hook = fat.readtext("/hobot_config.sh")
         lines = [s.strip() for s in hook.splitlines() if s.strip() and not s.startswith("#")]
@@ -85,11 +126,23 @@ def compose(base, base_sha, bundle, bundle_sha, profile, output):
             shutil.copyfileobj(src, dst, 4 * 1024**2)
             dst.flush()
             os.fsync(dst.fileno())
+        if layout is not None:
+            with output.open("r+b") as dst:
+                dst.write(mbr)
         source = Path(__file__).parent
         with PyFatFS(str(output), offset=offset) as fat:
             fat.makedir("/openaria")
-            for name in ("firstboot.py", "device.py", "provision.py", "disks.py"):
+            for name in (
+                "firstboot.py",
+                "device.py",
+                "provision.py",
+                "disks.py",
+                "partition_layout.py",
+                "storage_firstboot.py",
+            ):
                 fat.writebytes("/openaria/" + name, (source / name).read_bytes())
+            if layout is not None:
+                fat.writebytes("/openaria/" + package.name, package.read_bytes())
             fat.writebytes("/openaria/profile.bin", sealed)
             with bundle.open("rb") as src, fat.openbin("/openaria/bundle.tar", "w") as dst:
                 shutil.copyfileobj(src, dst, 4 * 1024**2)
@@ -100,6 +153,7 @@ def compose(base, base_sha, bundle, bundle_sha, profile, output):
                         "schema": "openaria.autoinstall.v1",
                         "bundle_sha256": bundle_sha,
                         "profile_sha256": hashlib.sha256(sealed).hexdigest(),
+                        **({"storage": layout} if layout is not None else {}),
                     }
                 ).encode(),
             )
@@ -111,6 +165,7 @@ def compose(base, base_sha, bundle, bundle_sha, profile, output):
             "sha256": disks.digest(output),
             "bytes": output.stat().st_size,
             "mode": "offline-firstboot",
+            **({"storage": layout} if layout is not None else {}),
         }
         with output.with_suffix(".json").open("x") as dst:
             json.dump(result, dst, indent=2)

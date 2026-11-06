@@ -311,6 +311,11 @@ def operate(disk, image=None, expected=None, *, quick=False):
             raise RuntimeError("Image size does not fit card")
         if not expected or digest(image) != expected.lower():
             raise RuntimeError("Image SHA-256 mismatch")
+        if __package__:
+            from .partition_layout import check_fit
+        else:
+            from partition_layout import check_fit
+        check_fit(image, disk.size)
     print(json.dumps(asdict(disk), ensure_ascii=False))
     print(
         "Disk will be overwritten. Quick mode may leave old data outside the image."

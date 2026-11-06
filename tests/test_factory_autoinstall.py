@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.factory_recovery import device, disks, firstboot, provision, recover
+from scripts.factory_recovery import device, disks, firstboot, partition_layout, provision, recover
 from tests.test_factory_recovery import profile
 
 
@@ -205,6 +205,74 @@ class AutoinstallTests(unittest.TestCase):
                     base, original, bundle, disks.digest(bundle), bound_profile(), output
                 )
             self.assertEqual(disks.digest(output), receipt["sha256"])
+
+    def test_exfat_composition_embeds_layout_tools_and_refuses_old_firmware(self):
+        import zipfile
+
+        from pyfatfs.PyFat import PyFat
+        from pyfatfs.PyFatFS import PyFatFS
+
+        from tests.test_exfat_storage import vendor_mbr
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base, partition = root / "vendor.img", root / "fat"
+            partition.touch()
+            fat = PyFat()
+            fat.mkfs(str(partition), PyFat.FAT_TYPE_FAT32, size=256 * 1024**2, label="CONFIG")
+            fat.close()
+            with PyFatFS(str(partition)) as fs:
+                fs.writetext("/hobot_config.sh", "#!/bin/bash -e\nexit 0\n")
+            with base.open("wb") as dst, partition.open("rb") as src:
+                dst.write(vendor_mbr())
+                dst.seek(8192 * 512)
+                shutil.copyfileobj(src, dst)
+            original = disks.digest(base)
+            bundle = root / "bundle.tar"
+            make_bundle(bundle)
+            output = root / "new.img"
+            with self.assertRaises(RuntimeError):
+                provision.compose(
+                    base,
+                    original,
+                    bundle,
+                    disks.digest(bundle),
+                    bound_profile(),
+                    output,
+                    card_bytes=127999672320,
+                )
+            self.assertFalse(output.exists())
+            wheel_bytes = io.BytesIO()
+            with zipfile.ZipFile(wheel_bytes, "w") as wheel:
+                for name in ("rp-ylx-data-volume", "rp-ylx-data-volume.service"):
+                    source = Path(__file__).parents[1] / "src/rp_ylx/deploy" / name
+                    wheel.writestr("rp_ylx/deploy/" + name, source.read_bytes())
+            with tarfile.open(bundle, "w") as tar:
+                member = tarfile.TarInfo("rp_ylx-test.whl")
+                member.size = len(wheel_bytes.getvalue())
+                tar.addfile(member, io.BytesIO(wheel_bytes.getvalue()))
+            package = root / partition_layout.PACKAGE
+            package.write_bytes(b"verified-package-fixture")
+            with patch.object(partition_layout, "prepare_tools", return_value=package):
+                receipt = provision.compose(
+                    base,
+                    original,
+                    bundle,
+                    disks.digest(bundle),
+                    bound_profile(),
+                    output,
+                    card_bytes=127999672320,
+                )
+            self.assertEqual(original, disks.digest(base))
+            self.assertEqual(receipt["sha256"], disks.digest(output))
+            partition_layout.check_fit(output, 127999672320)
+            with PyFatFS(str(output), offset=8192 * 512, read_only=True) as fs:
+                manifest = json.loads(fs.readbytes("/openaria/manifest.json"))
+                self.assertEqual(manifest["storage"], receipt["storage"])
+                self.assertEqual(fs.readbytes("/openaria/" + package.name), package.read_bytes())
+                self.assertTrue(fs.exists("/openaria/storage_firstboot.py"))
+            with output.open("rb") as src:
+                self.assertEqual(partition_layout.partitions(src.read(512))[2][0], 7)
 
 
 if __name__ == "__main__":

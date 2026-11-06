@@ -1300,6 +1300,23 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
+    def test_partition_identity_mismatch_keeps_control_plane_and_refuses_capture(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "RP_YLX_DATA_VOLUME_MODE": "exfat",
+                    "RP_YLX_DATA_VOLUME_UUID": "missing-or-invalid",
+                },
+            ),
+            self.coordinator() as coordinator,
+        ):
+            validate_capture_status(coordinator.capture_status())
+            with self.assertRaises(ProviderError) as unavailable:
+                coordinator.start_capture(start_command("wrong-partition"))
+            self.assertEqual(unavailable.exception.code, "volume_not_admitted")
+            self.assertFalse((self.mountpoint / "recordings").exists())
+
     def test_live_storage_uses_latest_monitor_sample_without_query_io(self):
         coordinator = self.coordinator()
         try:
