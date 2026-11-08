@@ -2986,6 +2986,7 @@ class NetworkControlTest(unittest.TestCase):
     def test_capture_start_is_rejected_while_network_transaction_is_current(self) -> None:
         provider = object.__new__(CaptureCoordinator)
         provider._timer_settings = {"enabled": False, "duration_seconds": 600}
+        provider._voice_settings = {"volume": 100}
         provider._active = None
         provider._catalog_verification_epoch = 0
         provider._catalog_verification_cancel = threading.Event()
@@ -3003,11 +3004,13 @@ class NetworkControlTest(unittest.TestCase):
                 "rp_ylx.recording.coordinator.request_network_control",
                 return_value=response,
             ),
+            patch("rp_ylx.recording.coordinator.notify_voice") as voice,
             self.assertRaises(ProviderError) as raised,
         ):
             provider._start_capture({})
         self.assertEqual(raised.exception.code, "network_mutation_active")
         self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
+        voice.assert_called_once_with("start_failed", "", volume=100)
 
 
 if __name__ == "__main__":
