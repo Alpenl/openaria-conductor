@@ -580,6 +580,58 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 monitor.close()
             self.assertFalse(monitor.thread.is_alive())
 
+    def test_voice_success_and_idempotent_replay(self):
+        with self.coordinator() as c, patch.object(coordinator_module, "notify_voice") as voice:
+            request = start_command("voice")
+            c.start_capture(request)
+            sid = c._active_plan.session_id
+            c.start_capture(request)
+            c.submit_frame(frame())
+            c.stop_capture(stop_command("voice-stop"))
+            c.stop_capture(stop_command("voice-stop"))
+            self.assertEqual(
+                voice.call_args_list,
+                [
+                    unittest.mock.call("started", sid, volume=100),
+                    unittest.mock.call("saved", sid, volume=100),
+                ],
+            )
+
+    def test_voice_rejected_start_never_announces_success(self):
+        sources = FakeSources()
+        sources.camera_state = "disconnected"
+        with (
+            self.coordinator(sources=sources) as c,
+            patch.object(coordinator_module, "notify_voice") as voice,
+        ):
+            with self.assertRaises(ProviderError):
+                c.start_capture(start_command("voice-failed"))
+            voice.assert_called_once_with("start_failed", "", volume=100)
+
+    def test_voice_volume_persists_and_failed_write_keeps_previous_value(self):
+        with self.coordinator() as c:
+            self.assertEqual(c.voice_status()["volume"], 100)
+            c.set_voice_volume(35)
+            with (
+                patch.object(c._state_db, "put", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                c.set_voice_volume(0)
+            self.assertEqual(c.voice_status()["volume"], 35)
+        with self.coordinator() as c, patch.object(coordinator_module, "notify_voice") as voice:
+            self.assertEqual(c.voice_status()["volume"], 35)
+            c._notify_voice("saved", "take")
+            voice.assert_called_once_with("saved", "take", volume=35)
+            for value in (-1, 101, True, 1.5):
+                with self.assertRaises(ProviderError):
+                    c.set_voice_volume(value)
+            c.start_capture(start_command("volume-busy"))
+            with self.assertRaises(ProviderError) as error:
+                c.set_voice_volume(0)
+            self.assertEqual(error.exception.code, "capture_busy")
+            c.submit_frame(frame())
+            c.stop_capture(stop_command("volume-busy-stop"))
+
     def test_capture_timer_defaults_and_persistence(self):
         with self.coordinator() as c:
             self.assertEqual(
@@ -1247,6 +1299,23 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertTrue(restored["storage"]["writable"])
         finally:
             coordinator.close()
+
+    def test_partition_identity_mismatch_keeps_control_plane_and_refuses_capture(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "RP_YLX_DATA_VOLUME_MODE": "exfat",
+                    "RP_YLX_DATA_VOLUME_UUID": "missing-or-invalid",
+                },
+            ),
+            self.coordinator() as coordinator,
+        ):
+            validate_capture_status(coordinator.capture_status())
+            with self.assertRaises(ProviderError) as unavailable:
+                coordinator.start_capture(start_command("wrong-partition"))
+            self.assertEqual(unavailable.exception.code, "volume_not_admitted")
+            self.assertFalse((self.mountpoint / "recordings").exists())
 
     def test_live_storage_uses_latest_monitor_sample_without_query_io(self):
         coordinator = self.coordinator()

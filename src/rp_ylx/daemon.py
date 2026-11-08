@@ -47,6 +47,8 @@ LAB_OPERATIONS = frozenset(
     {
         "getDevice",
         "syncDeviceClock",
+        "getVoice",
+        "setVoiceVolume",
         "getCaptureTimer",
         "setCaptureTimer",
         "getDeviceClock",

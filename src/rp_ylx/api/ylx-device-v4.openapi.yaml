@@ -51,6 +51,8 @@ x-ylx-security-profiles:
       - getDeviceClock
       - syncDeviceClock
       - getCaptureStatus
+      - getVoice
+      - setVoiceVolume
       - getCaptureTimer
       - setCaptureTimer
       - startCapture
@@ -82,6 +84,55 @@ x-ylx-security-profiles:
       capture_status: true
       session_deletion: true
 paths:
+  /voice:
+    get:
+      operationId: getVoice
+      summary: Read persistent voice prompt volume
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Voice prompt settings; does not describe microphone gain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceStatus"
+    post:
+      operationId: setVoiceVolume
+      summary: Save voice prompt volume while idle
+      description: Applies to future prompts. Zero mutes; 100 preserves original prompt amplitude. Does not change ALSA capture gain. Uses Origin and CSRF protection. Repeated replacement is safe.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema, volume]
+              properties:
+                schema:
+                  const: ylx.voice-set.v1
+                volume:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+      responses:
+        "200":
+          description: Settings durably saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceStatus"
+        "400":
+          description: Invalid request
+        "409":
+          description: Device busy
+        "500":
+          description: Persistence failure; previous volume remains effective
   /capture/timer:
     get:
       tags: [Capture]
@@ -1629,6 +1680,19 @@ components:
     InternalErrorHead:
       description: Unexpected device error; HEAD sends no response body
   schemas:
+    VoiceStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, enabled, volume]
+      properties:
+        schema:
+          const: ylx.voice.v1
+        enabled:
+          type: boolean
+        volume:
+          type: integer
+          minimum: 0
+          maximum: 100
     CaptureTimerStatus:
       type: object
       additionalProperties: false

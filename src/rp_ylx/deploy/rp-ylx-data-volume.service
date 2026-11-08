@@ -8,6 +8,8 @@ Before=rp-ylx.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+EnvironmentFile=-/etc/default/rp-ylx-data-volume
+TimeoutStartSec=120s
 ExecStart=/usr/local/sbin/rp-ylx-data-volume ensure
 StandardOutput=journal
 StandardError=journal

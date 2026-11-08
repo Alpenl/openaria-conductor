@@ -807,8 +807,15 @@ impl Pcm {
                 )
             },
         )?;
-        let mut buffer = SndPcmUframes::try_from(DEFAULT_PERIOD_FRAMES * 8)
-            .map_err(|_| AudioError::new("invalid_argument", "buffer is too large"))?;
+        // Keep one second of hardware-side PCM available across scheduling and
+        // storage stalls. The old eight-period ring held only 171 ms at 48 kHz;
+        // the downstream writer queue cannot recover samples already lost here.
+        // Reads remain nonblocking and use the same small period, so this does
+        // not wait a second before consuming audio or change its timestamps.
+        let mut buffer = SndPcmUframes::try_from(
+            u64::from(config.sample_rate_hz).max(DEFAULT_PERIOD_FRAMES * 8),
+        )
+        .map_err(|_| AudioError::new("invalid_argument", "buffer is too large"))?;
         self.check(
             "unsupported_audio_mode",
             "snd_pcm_hw_params_set_buffer_size_near",
@@ -1547,13 +1554,30 @@ fn start_and_capture(
             )
         })
     };
+    let mut last_read_started = std::time::Instant::now();
+    let mut max_read_gap_ns = 0_u64;
     let captured = (|| {
         let mut buffer = pool_rx.try_recv().unwrap();
         let mut buffered_frames = 0;
         while !stop.load(Ordering::Acquire) {
             progress.check()?;
             let offset = (buffered_frames * bytes_per_frame) as usize;
-            match pcm.readi(&mut buffer[offset..], period_frames - buffered_frames)? {
+            let now = std::time::Instant::now();
+            let read_gap_ns = now.duration_since(last_read_started).as_nanos() as u64;
+            max_read_gap_ns = max_read_gap_ns.max(read_gap_ns);
+            last_read_started = now;
+            let read = pcm
+                .readi(&mut buffer[offset..], period_frames - buffered_frames)
+                .map_err(|error| {
+                    AudioError::new(
+                        error.code,
+                        format!(
+                            "{}; read_gap_ns={read_gap_ns}; buffer_frames={}",
+                            error.message, pcm.buffer_frames
+                        ),
+                    )
+                })?;
+            match read {
                 ReadOutcome::Frames(frames) => {
                     sample_count += frames;
                     buffered_frames += frames;
@@ -1677,6 +1701,9 @@ fn start_and_capture(
         "durable_commit_peak_segments": progress.peak_pending_commits.load(Ordering::Relaxed),
         "durable_sample_count": progress.durable_samples.load(Ordering::Acquire),
         "max_write_ns": progress.max_write_ns.load(Ordering::Relaxed),
+        "max_read_gap_ns": max_read_gap_ns,
+        "period_frames": pcm.period_frames,
+        "buffer_frames": pcm.buffer_frames,
     });
     let diagnostic_path = config.session_root.join("audio/capture-clock.json");
     if let Ok(payload) = serde_json::to_vec(&diagnostic) {

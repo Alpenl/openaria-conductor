@@ -24,6 +24,48 @@ getent passwd rp-ylx >/dev/null || {
     exit 1
 }
 
+# Existing installations retain their loop volume. Only factory provisioned
+# cards opt into partition mode; a failed partition must never create an image.
+case "${RP_YLX_DATA_VOLUME_MODE:-loop}" in
+    exfat)
+        partuuid="${RP_YLX_DATA_VOLUME_PARTUUID:?missing recording partition identity}"
+        [[ "$partuuid" =~ ^[[:xdigit:]]{8}-03$ ]] || exit 1
+        uuid="${RP_YLX_DATA_VOLUME_UUID:?missing recording filesystem identity}"
+        [[ "$uuid" =~ ^[[:xdigit:]]{4}-[[:xdigit:]]{4}$ ]] || exit 1
+        device="/dev/disk/by-uuid/$uuid"
+        [ -b "$device" ] || { log 'recording partition is absent'; exit 1; }
+        [ "$(blkid -s PARTUUID -o value "$device")" = "$partuuid" ] || exit 1
+        [ "$(blkid -s TYPE -o value "$device")" = exfat ] || exit 1
+        capture_uid="$(id -u rp-ylx)"
+        capture_gid="$(id -g rp-ylx)"
+        if ! mountpoint -q "$MOUNT"; then
+            install -d -o root -g root -m 0755 "$MOUNT"
+            # Safe automatic repairs only; never format a damaged data volume.
+            # A failed/timed-out repair leaves the web service available.
+            rc=0
+            timeout --kill-after=5s 90s fsck.exfat -p "$device" || rc=$?
+            [ "$rc" = 0 ] || [ "$rc" = 1 ] || exit "$rc"
+            mount -t exfat -o "rw,nosuid,nodev,noexec,noatime,uid=$capture_uid,gid=$capture_gid,fmask=0137,dmask=0027,errors=remount-ro" "$device" "$MOUNT"
+        fi
+        [ "$(findmnt -rn --mountpoint "$MOUNT" -o FSTYPE)" = exfat ] || exit 1
+        source="$(findmnt -rn --mountpoint "$MOUNT" -o SOURCE)"
+        [ "$(readlink -f "$source")" = "$(readlink -f "$device")" ] || exit 1
+        if [ ! -f "$MOUNT/.ylx-volume.json" ]; then
+            runuser -u rp-ylx -- /opt/rp-ylx/current/bin/rp-ylx volume init "$MOUNT"
+        fi
+        runuser -u rp-ylx -- mkdir -p "$MOUNT/recordings" "$MOUNT/sessions"
+        log "ready: $device exFAT at $MOUNT"
+        exit 0
+        ;;
+    loop)
+        if [ -e /var/lib/openaria-factory/firstboot/storage.json ]; then
+            log 'factory partition configuration is missing; refusing loop fallback'
+            exit 1
+        fi
+        ;;
+    *) log 'unknown storage mode'; exit 1 ;;
+esac
+
 install -d -o root -g root -m 0755 "$(dirname "$IMAGE")"
 if [ ! -e "$IMAGE" ]; then
     log "creating $SIZE ext4 image at $IMAGE"

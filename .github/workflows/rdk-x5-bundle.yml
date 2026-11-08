@@ -135,7 +135,9 @@ jobs:
       - name: 下载并校验 package-owned runtime
         run: |
           mkdir -p dist-runtime
-          curl -fL "$RDK_RUNTIME_URL" -o "dist-runtime/$RDK_RUNTIME_NAME"
+          curl -fL --retry 4 --retry-delay 2 --retry-max-time 600 \
+            --connect-timeout 30 --max-time 300 \
+            "$RDK_RUNTIME_URL" -o "dist-runtime/$RDK_RUNTIME_NAME"
           printf '%s  %s\n' "$RDK_RUNTIME_SHA256" "dist-runtime/$RDK_RUNTIME_NAME" \
             | sha256sum --check --strict
 

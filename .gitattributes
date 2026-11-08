@@ -1,0 +1,2 @@
+scripts/factory_recovery/start.cmd text eol=crlf
+scripts/card_export/start.cmd text eol=crlf
