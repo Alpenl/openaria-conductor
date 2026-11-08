@@ -86,6 +86,13 @@ def run(*args, **kwargs):
     return subprocess.run(args, check=True, **kwargs)
 
 
+def install_bundle(bundle):
+    # Recovery secrets stay under umask 077. The installer creates public
+    # application directories and modules read by the unprivileged rp-ylx user;
+    # it must not inherit the recovery process's root-only default permissions.
+    run("/usr/bin/python3", str(bundle / "rdk_x5_install.py"), "install", str(bundle), umask=0o022)
+
+
 def complete():
     path = ROOT / "state.json"
     return path.exists() and json.loads(path.read_bytes()).get("phase") == "complete"
@@ -171,7 +178,7 @@ def execute():
             shutil.rmtree(bundle)
         extract_bundle(archive, bundle)
         run("sha256sum", "-c", "SHA256SUMS", cwd=bundle)
-        run("/usr/bin/python3", str(bundle / "rdk_x5_install.py"), "install", str(bundle))
+        install_bundle(bundle)
         run("systemctl", "is-active", "--quiet", "rp-ylx.service")
         advance("installed")
     if state["phase"] == "installed":

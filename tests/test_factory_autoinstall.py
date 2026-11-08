@@ -32,6 +32,27 @@ def make_bundle(path):
 
 
 class AutoinstallTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "factory first boot runs on Linux")
+    def test_installer_permissions_do_not_inherit_private_recovery_umask(self):
+        import stat
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "rdk_x5_install.py").write_text(
+                "from pathlib import Path; import sys\n"
+                "root=Path(sys.argv[-1]); (root/'application').mkdir(); "
+                "(root/'application/module.py').write_text('application')\n"
+            )
+            previous = os.umask(0o077)
+            try:
+                firstboot.install_bundle(root)
+                (root / "private-profile").write_text("secret fixture")
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE((root / "application").stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((root / "application/module.py").stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE((root / "private-profile").stat().st_mode), 0o600)
+
     def test_sparse_copy_preserves_leading_and_trailing_zeros_and_exact_size(self):
         with tempfile.TemporaryDirectory() as folder:
             base, output = Path(folder) / "base.img", Path(folder) / "output.img"
