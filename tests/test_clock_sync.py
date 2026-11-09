@@ -70,6 +70,7 @@ class ClockSyncTest(unittest.TestCase):
     def test_ntp_wins_even_if_it_synchronizes_between_challenge_and_post(self) -> None:
         body = self.request()
         self.ntp.return_value = True
+        self.wall = CLIENT_MS * 1_000_000
         result = self.syncer.sync("phone", body)
         self.assertEqual(result["source"], "ntp")
         self.assertFalse(result["applied"])
@@ -161,6 +162,73 @@ class ClockSyncTest(unittest.TestCase):
         self.assertEqual(raised.exception.status, 409)
         request.assert_not_called()
 
+    def extended_request(self, *, replace=False):
+        status = self.syncer.status("phone", extended=True)
+        self.assertTrue(valid_clock_response(status))
+        return {
+            "schema": "ylx.clock-sync-request.v2",
+            "challenge": status["challenge"],
+            "unix_time_ms": CLIENT_MS,
+            "replace": replace,
+        }
+
+    def test_service_restart_preserves_reference_but_new_boot_never_does(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clock.json"
+            self.syncer = ClockSynchronizer(path, boot_id="boot-one")
+            self.syncer.sync("phone", self.extended_request())
+            self.mono += 60_000000000
+            self.wall += 60_000000000
+            restarted = ClockSynchronizer(path, boot_id="boot-one")
+            status = restarted.status("phone", extended=True)
+            self.assertEqual(status["source"], "client")
+            self.assertEqual(status["age_seconds"], 60)
+            self.assertEqual(status["synchronized_at_ms"], CLIENT_MS)
+            rebooted = ClockSynchronizer(path, boot_id="boot-two")
+            self.assertEqual(rebooted.status("phone")["source"], "unsynchronized")
+            self.wall += 10_000000000
+            self.assertEqual(restarted.status("phone")["source"], "unsynchronized")
+
+    def test_explicit_resync_and_stale_second_phone(self):
+        self.syncer.sync("phone", self.extended_request())
+        a = self.extended_request(replace=True)
+        b = self.extended_request(replace=True)
+        self.syncer.sync("phone", {**a, "unix_time_ms": CLIENT_MS + 120000})
+        with self.assertRaises(ClockSyncError):
+            self.syncer.sync("phone", b)
+        self.assertEqual(self.wall, (CLIENT_MS + 120000) * 1_000_000)
+        auto = self.extended_request()
+        result = self.syncer.sync("phone", auto)
+        self.assertFalse(result["applied"])
+        self.assertEqual(self.wall, (CLIENT_MS + 120000) * 1_000_000)
+
+    def test_silent_clock_set_failure_fails_readback(self):
+        self.clock.clock_settime_ns.side_effect = lambda *_: None
+        with self.assertRaisesRegex(ClockSyncError, "回读"):
+            self.syncer.sync("phone", self.extended_request())
+        self.assertEqual(self.syncer.status("phone")["source"], "unsynchronized")
+
+    def test_persistence_failure_and_corrupt_state_do_not_authorize_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clock.json"
+            path.write_text("not json")
+            self.syncer = ClockSynchronizer(path)
+            body = self.extended_request()
+            with (
+                patch("rp_ylx.clock_sync.os.replace", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(ClockSyncError, "保存失败"),
+            ):
+                self.syncer.sync("phone", body)
+            self.assertEqual(self.syncer.status("phone")["source"], "unsynchronized")
+
+    def test_explicit_resync_cannot_override_active_ntp(self):
+        self.wall = CLIENT_MS * 1_000_000
+        self.ntp.return_value = True
+        body = self.extended_request(replace=True)
+        with self.assertRaisesRegex(ClockSyncError, "网络校时"):
+            self.syncer.sync("phone", body)
+        self.clock.clock_settime_ns.assert_not_called()
+
 
 class ClockGatewayTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -242,6 +310,46 @@ class ClockGatewayTest(unittest.TestCase):
         self.provider.sync_clock.assert_not_called()
         self.assertEqual(self.call("/api/v4/clock/sync", data=data, headers=headers)[0], 200)
         self.provider.sync_clock.assert_called_once_with("phone", data)
+
+    def test_extended_clock_uses_same_permissions_and_explicit_replace(self):
+        self.provider.clock_inspect.return_value = {
+            **self.status,
+            "schema": "ylx.clock-status.v2",
+            "boot_id": "a4578322-241e-4b9c-bb54-a860d5a2aa37",
+            "synchronized_at_ms": None,
+            "age_seconds": None,
+        }
+        self.assertEqual(self.call("/api/v4/clock/check")[0], 401)
+        self.assertEqual(
+            self.call("/api/v4/clock/check", headers={"Authorization": "Bearer viewer"})[0], 403
+        )
+        headers = {
+            "Authorization": "Bearer owner",
+            "Content-Type": "application/json",
+            "Origin": "http://phone.test",
+            "X-CSRF-Token": "csrf",
+        }
+        status, body = self.call("/api/v4/clock/check", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["schema"], "ylx.clock-status.v2")
+        self.provider.clock_inspect.assert_called_once_with("phone")
+        data = {
+            "schema": "ylx.clock-sync-request.v2",
+            "replace": True,
+            "challenge": body["challenge"],
+            "unix_time_ms": CLIENT_MS,
+        }
+        self.provider.sync_clock.return_value = {
+            **body,
+            "source": "client",
+            "unix_time_ms": CLIENT_MS,
+            "synchronized_at_ms": CLIENT_MS,
+            "age_seconds": 0,
+        }
+        self.assertEqual(self.call("/api/v4/clock/sync", data=data, headers=headers)[0], 200)
+        self.provider.sync_clock.assert_called_once_with("phone", data)
+        bad_headers = {key: value for key, value in headers.items() if key != "X-CSRF-Token"}
+        self.assertEqual(self.call("/api/v4/clock/sync", data=data, headers=bad_headers)[0], 403)
 
     def test_clock_errors_propagate_and_legacy_routes_are_not_changed(self) -> None:
         self.provider.clock_status.side_effect = ProviderError(

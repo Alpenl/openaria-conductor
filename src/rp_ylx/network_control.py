@@ -72,7 +72,7 @@ NETWORK_RESCUE_REACHABILITY_SECONDS = 15.0
 NETWORK_MONITOR_ERROR_LOG_INTERVAL_SECONDS = 60.0
 MUTATION_OPERATIONS = frozenset({"apply", "retry", "forget"})
 ROOT_OPERATIONS = frozenset(
-    {"create_credential", "health", "scan", "status", "clock_status", "clock_sync"}
+    {"create_credential", "health", "scan", "status", "clock_status", "clock_inspect", "clock_sync"}
 )
 SUPPORTED_OPERATIONS = MUTATION_OPERATIONS | ROOT_OPERATIONS
 SECRET_FIELD_NAMES = frozenset({"password", "psk", "secret", "token"})
@@ -137,13 +137,13 @@ def _valid_principal_id(value: object) -> bool:
 
 
 def _valid_control_request(operation: str, request: Mapping[str, object]) -> bool:
-    if operation in {"clock_status", "clock_sync"}:
+    if operation in {"clock_status", "clock_inspect", "clock_sync"}:
         return (
             set(request) == {"schema", "operation", "principal_id", "body"}
             and _valid_principal_id(request.get("principal_id"))
             and (
                 request.get("body") == {}
-                if operation == "clock_status"
+                if operation in {"clock_status", "clock_inspect"}
                 else valid_clock_request(request.get("body"))
             )
         )
@@ -314,7 +314,7 @@ def _valid_scan_body(value: object) -> bool:
 
 def _valid_controller_success(response: Mapping[str, Any]) -> bool:
     operation = response.get("operation")
-    if operation in {"clock_status", "clock_sync"}:
+    if operation in {"clock_status", "clock_inspect", "clock_sync"}:
         return (
             set(response) == {"schema", "ok", "operation", "status", "body"}
             and response.get("status") == 200
@@ -485,7 +485,7 @@ class NetworkController:
         if health_poll_seconds <= 0 or health_failure_seconds <= 0:
             raise ValueError("network health intervals must be positive")
         self._credentials = credential_store or NetworkCredentialStore()
-        self._clock = ClockSynchronizer()
+        self._clock = ClockSynchronizer(_state_dir() / "clock.json")
         self._boot_id = _controller_boot_id()
         with _network_operation_lock():
             prepare_first_install_network(state_dir=_state_dir(), profile_dir=_profile_dir())
@@ -1717,12 +1717,12 @@ class NetworkController:
         }
 
     def _handle_validated(self, operation: str, request: Mapping[str, object]) -> dict[str, Any]:
-        if operation in {"clock_status", "clock_sync"}:
+        if operation in {"clock_status", "clock_inspect", "clock_sync"}:
             principal_id = str(request["principal_id"])
             body = request["body"]
             assert isinstance(body, Mapping)
-            if operation == "clock_status":
-                result = self._clock.status(principal_id)
+            if operation in {"clock_status", "clock_inspect"}:
+                result = self._clock.status(principal_id, extended=operation == "clock_inspect")
             else:
                 # Capture holds this same flock for its entire lifetime, including
                 # finalization. It also protects against a queued, timed-out caller.
@@ -2148,7 +2148,7 @@ def request_control(
                 "body": dict(body),
             }
         )
-    elif operation in {"create_credential", "clock_status", "clock_sync"}:
+    elif operation in {"create_credential", "clock_status", "clock_inspect", "clock_sync"}:
         if principal_id is None or body is None:
             raise NetworkControlClientError(
                 "request_invalid",

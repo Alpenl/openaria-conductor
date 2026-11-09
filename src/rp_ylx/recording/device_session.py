@@ -176,6 +176,7 @@ class SessionPlan:
     take_id: str
     take_sequence: int
     continuation_of: str | None
+    clock_provenance: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.capture_mode not in {"production", "calibration"}:
@@ -979,9 +980,24 @@ class DeviceSessionRecorder:
                         "started_at": self._timestamp(self._started_at),
                         "started_monotonic_ns": self._started_monotonic_ns,
                         "config": asdict(self._config),
-                        "plan": asdict(self._plan),
+                        "plan": {
+                            key: value
+                            for key, value in asdict(self._plan).items()
+                            if key != "clock_provenance"
+                        },
                     },
                 )
+                if self._plan.clock_provenance is not None:
+                    write_json_atomic(
+                        self._partial / "clock-calibration.json",
+                        {
+                            "schema": "openaria.recording-clock.v1",
+                            "session_id": self._plan.session_id,
+                            "started_at": self._timestamp(self._started_at),
+                            "utc_offset_seconds": int(self._started_at.utcoffset().total_seconds()),
+                            "calibration": self._plan.clock_provenance,
+                        },
+                    )
                 if self._native_transaction_enabled:
                     try:
                         self._native_transaction = self._begin_native_transaction()
@@ -1723,6 +1739,21 @@ class DeviceSessionRecorder:
             "sha256": digest,
         }
 
+    def _clock_artifact(self) -> dict[str, object]:
+        relative = "clock-calibration.json"
+        result = self._finalize_for_seal(
+            self._partial / relative, None, code="clock_metadata_invalid"
+        )
+        self._artifact_identities[relative] = result.identity
+        return {
+            "artifact_id": result.sha256,
+            "sha256": result.sha256,
+            "role": "log.clock-calibration",
+            "path": relative,
+            "media_type": "application/json",
+            "bytes": result.bytes,
+        }
+
     def _video_block(self, duration: float) -> dict[str, object]:
         if not self._segment_records:
             raise DeviceRecordingError("no_frames", "没有可封存的成片分段")
@@ -1992,7 +2023,9 @@ class DeviceSessionRecorder:
         display_name = self._plan.display_name
         # NTP may correct the RTC during capture. Keep wall-clock metadata
         # consistent with the monotonic duration, using the calibrated end.
-        if ended_at.year >= 2020 and abs((ended_at - started_at).total_seconds() - duration) > 5:
+        if self._plan.clock_provenance is not None:
+            ended_at = started_at + timedelta(seconds=duration)
+        elif ended_at.year >= 2020 and abs((ended_at - started_at).total_seconds() - duration) > 5:
             started_at = ended_at - timedelta(seconds=duration)
             if display_name == self._started_at.strftime("录制 %Y-%m-%d %H:%M:%S"):
                 display_name = started_at.strftime("录制 %Y-%m-%d %H:%M:%S")
@@ -2048,7 +2081,7 @@ class DeviceSessionRecorder:
                 "coordinate_frame": "raw_device_axes",
             },
             "frames": {"artifact": frames, "count": self._frames_written},
-            "logs": [],
+            "logs": ([self._clock_artifact()] if self._plan.clock_provenance is not None else []),
             "integrity": {
                 "verified_at": self._timestamp(verified_at),
                 "dropped_frames": dropped,

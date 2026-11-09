@@ -26,6 +26,7 @@ from rp_ylx.daemon import (
 from rp_ylx.deployment import ReleaseManager
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.recording.encoding import RecordingEncoding
+from tests.test_capture_coordinator import idle_network_control
 
 PRODUCTION_NATIVE_FEATURES = (
     "capability_probe",
@@ -378,12 +379,7 @@ class ProductionDaemonTest(unittest.TestCase):
             )
             controller_patch = patch(
                 "rp_ylx.recording.coordinator.request_network_control",
-                return_value={
-                    "ok": True,
-                    "operation": "status",
-                    "status": 200,
-                    "body": {"transaction": {"current": None}},
-                },
+                side_effect=idle_network_control,
             )
             lock_path_patch.start()
             controller_patch.start()

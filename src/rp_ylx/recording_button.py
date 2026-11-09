@@ -18,8 +18,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from rp_ylx.clock_sync import valid_clock_response
-
 LOG = logging.getLogger("rp-ylx.recording-button")
 GPIO_PINS = frozenset(
     {
@@ -206,9 +204,6 @@ class CaptureClient:
         if state != "idle":
             LOG.info("button ignored while capture state is %s", state)
             return None
-        clock = self.request("/clock")
-        if not valid_clock_response(clock) or clock["source"] not in {"ntp", "client"}:
-            raise ButtonError("设备日期尚未校准：请联网校时或先用手机/电脑打开控制页面")
         # All camera, volume, network-operation and active-recording guards remain in the daemon.
         self.request(
             "/capture/start",

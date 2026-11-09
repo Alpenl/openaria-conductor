@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "6c25cb41f043639d92b78032ae917d758a03d48ec3ef2decc88f5a30be3e6e52",
-        "bytes": 138005,
+        "sha256": "6028b0807e82d77e1eb21f8e31909b44e25c18013203faf95e268b25d1e17ca7",
+        "bytes": 140392,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -104,6 +104,7 @@ ROUTE_GOLDENS = {
         ("/capture/timer", "get", "getCaptureTimer"),
         ("/capture/timer", "post", "setCaptureTimer"),
         ("/clock", "get", "getDeviceClock"),
+        ("/clock/check", "get", "inspectDeviceClock"),
         ("/clock/sync", "post", "syncDeviceClock"),
         ("/network", "get", "getNetworkStatus"),
         ("/network/scan", "get", "scanNetworks"),
