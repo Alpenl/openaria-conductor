@@ -120,7 +120,7 @@ def valid_clock_response(body: object) -> bool:
 def ntp_synchronized() -> bool:
     try:
         result = subprocess.run(
-            ["timedatectl", "show", "--property=NTPSynchronized", "--value"],
+            ["timedatectl", "show", "--property=NTP", "--property=NTPSynchronized"],
             check=True,
             capture_output=True,
             text=True,
@@ -128,10 +128,14 @@ def ntp_synchronized() -> bool:
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ClockSyncError("clock_status_unavailable", "暂时无法读取网络校时状态") from error
-    value = result.stdout.strip()
-    if value not in {"yes", "no"}:
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if set(values) != {"NTP", "NTPSynchronized"} or any(
+        value not in {"yes", "no"} for value in values.values()
+    ):
         raise ClockSyncError("clock_status_unavailable", "网络校时状态无效")
-    return value == "yes"
+    # The kernel can retain a synchronized flag after the NTP service is disabled.
+    # Only an enabled network time service may establish a new NTP reference.
+    return values["NTP"] == "yes" and values["NTPSynchronized"] == "yes"
 
 
 class ClockSynchronizer:

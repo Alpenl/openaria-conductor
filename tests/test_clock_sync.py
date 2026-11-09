@@ -230,6 +230,33 @@ class ClockSyncTest(unittest.TestCase):
         self.clock.clock_settime_ns.assert_not_called()
 
 
+class NtpStatusTest(unittest.TestCase):
+    def test_disabled_ntp_cannot_authorize_from_a_stale_kernel_flag(self):
+        from rp_ylx.clock_sync import ntp_synchronized
+
+        for enabled, synchronized, expected in (
+            ("no", "yes", False),
+            ("yes", "no", False),
+            ("yes", "yes", True),
+        ):
+            with (
+                self.subTest(enabled=enabled, synchronized=synchronized),
+                patch(
+                    "rp_ylx.clock_sync.subprocess.run",
+                    return_value=Mock(stdout=f"NTP={enabled}\nNTPSynchronized={synchronized}\n"),
+                ),
+            ):
+                self.assertEqual(ntp_synchronized(), expected)
+        with (
+            patch(
+                "rp_ylx.clock_sync.subprocess.run",
+                return_value=Mock(stdout="NTPSynchronized=yes\n"),
+            ),
+            self.assertRaises(ClockSyncError),
+        ):
+            ntp_synchronized()
+
+
 class ClockGatewayTest(unittest.TestCase):
     def setUp(self) -> None:
         self.provider = Mock()
