@@ -464,6 +464,17 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         )
     config = DeviceSessionConfig(**config_values)
     plan = SessionPlan(**capture["plan"])
+    clock = None
+    if (partial / "clock-calibration.json").exists():
+        clock = _read_json(partial, "clock-calibration.json")
+        if (
+            clock.get("schema") != "openaria.recording-clock.v1"
+            or clock.get("session_id") != plan.session_id
+            or clock.get("started_at") != capture["started_at"]
+            or not isinstance(clock.get("calibration"), dict)
+        ):
+            raise ValueError("invalid recording clock metadata")
+        plan = replace(plan, clock_provenance=clock["calibration"])
     if (
         partial.name != f"{plan.session_id}.partial"
         or capture["session_id"] != plan.session_id
@@ -648,6 +659,16 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
             verified=verified,
         )
     ]
+    if clock is not None:
+        manifest["logs"].append(
+            _artifact(
+                partial,
+                "clock-calibration.json",
+                "log.clock-calibration",
+                "application/json",
+                verified=verified,
+            )
+        )
     write_json_atomic(partial / "manifest.json", manifest, pretty=False)
     inspect_device_session_directory(partial, expected_session_id=plan.session_id)
     # Recovery owns these files until publication. Detect concurrent replacement

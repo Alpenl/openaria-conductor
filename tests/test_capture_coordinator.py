@@ -340,6 +340,23 @@ def network_command(key: str, body: dict[str, object]) -> NetworkCommand:
 
 def idle_network_control(operation: str, **unused: object) -> dict[str, object]:
     del unused
+    if operation == "clock_inspect":
+        return {
+            "ok": True,
+            "operation": operation,
+            "status": 200,
+            "body": {
+                "schema": "ylx.clock-status.v2",
+                "source": "client",
+                "unix_time_ms": 1794144394000,
+                "challenge": "a" * 32,
+                "expires_in_ms": 5000,
+                "applied": False,
+                "boot_id": "a4578322-241e-4b9c-bb54-a860d5a2aa37",
+                "synchronized_at_ms": 1794144390000,
+                "age_seconds": 4,
+            },
+        }
     if operation == "status":
         return {
             "ok": True,
@@ -533,6 +550,50 @@ class CaptureCoordinatorTest(unittest.TestCase):
         self.encoder_patcher.stop()
         self.environment_patcher.stop()
         self.temporary.cleanup()
+
+    def test_unsynchronized_clock_rejects_start_with_specific_voice(self):
+        coordinator = self.coordinator()
+        try:
+            with (
+                patch.object(
+                    coordinator,
+                    "clock_inspect",
+                    return_value={
+                        **idle_network_control("clock_inspect")["body"],
+                        "source": "unsynchronized",
+                        "synchronized_at_ms": None,
+                        "age_seconds": None,
+                    },
+                ),
+                patch("rp_ylx.recording.coordinator.notify_voice") as voice,
+            ):
+                with self.assertRaises(ProviderError) as raised:
+                    coordinator.start_capture(start_command("unsynchronized"))
+                self.assertEqual(raised.exception.code, "clock_unsynchronized")
+                self.assertIsNone(coordinator._active)
+                voice.assert_called_once_with("clock_required", "", volume=100)
+        finally:
+            coordinator.close()
+
+    def test_clock_provenance_written_before_recording_and_survives_stop(self):
+        coordinator = self.coordinator()
+        try:
+            coordinator.start_capture(start_command("calibrated"))
+            capture = json.loads((coordinator._active.partial_path / "capture.json").read_text())
+            self.assertNotIn("clock_provenance", capture["plan"])
+            clock = json.loads(
+                (coordinator._active.partial_path / "clock-calibration.json").read_text()
+            )
+            self.assertEqual(clock["calibration"]["source"], "client")
+            self.assertEqual(clock["calibration"]["age_seconds"], 4)
+            coordinator.submit_frame(frame())
+            coordinator.stop_capture(stop_command("calibrated-stop"))
+            manifest = coordinator._load_manifest(capture["session_id"])
+            self.assertEqual(manifest["logs"][0]["path"], "clock-calibration.json")
+            self.assertEqual(manifest["time"]["started_at"], capture["started_at"])
+            self.assertIn("utc_offset_seconds", clock)
+        finally:
+            coordinator.close()
 
     def coordinator(
         self,
@@ -979,7 +1040,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         def idle_status_while_locked(operation: str, **unused: object) -> dict[str, object]:
             nonlocal status_checked
             del unused
-            self.assertEqual(operation, "status")
+            self.assertIn(operation, {"status", "clock_inspect"})
             self.assert_network_operation_lock_held()
             status_checked = True
             return idle_network_control(operation)
@@ -4051,6 +4112,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 )
                 + int(manifest["frames"]["artifact"]["bytes"])
                 + int(manifest["imu"]["artifact"]["bytes"])
+                + sum(int(item["bytes"]) for item in manifest["logs"])
             )
             self.assertEqual(listed["items"][0]["total_bytes"], expected_bytes)
             left = manifest["video"]["segments"][0]["artifacts"]["left"]

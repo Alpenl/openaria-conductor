@@ -226,11 +226,21 @@ class ButtonGatewayTest(unittest.TestCase):
                 "reason": "user",
             },
         )
-        self.provider.clock_status.assert_called_once_with("physical-button")
+        self.provider.clock_status.assert_not_called()
 
     def test_uninitialized_clock_blocks_start_but_never_blocks_stop(self) -> None:
         self.clock.update(source="unsynchronized", challenge="a" * 32, expires_in_ms=5000)
-        with self.assertRaisesRegex(ButtonError, "日期尚未校准"):
+        # The shared server admission now owns clock rejection and voice feedback.
+        with (
+            patch.object(
+                self.provider,
+                "start_capture",
+                side_effect=ProviderError(
+                    "clock_unsynchronized", "请打开手机控制页面校准时间", status=409
+                ),
+            ),
+            self.assertRaisesRegex(ButtonError, "409"),
+        ):
             self.client.handle_press()
         self.assertFalse(self.provider.commands)
         self.provider.status = _active_capture_status()

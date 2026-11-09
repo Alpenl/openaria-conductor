@@ -1403,7 +1403,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return ("GET", "OPTIONS")
         if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
             return ("POST", "OPTIONS")
-        if path == "/api/v4/clock":
+        if path in {"/api/v4/clock", "/api/v4/clock/check"}:
             return ("GET", "OPTIONS")
         if path == "/api/v4/clock/sync":
             return ("POST", "OPTIONS")
@@ -1537,8 +1537,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if path == "/api/v4/capture/timer":
             self._capture_timer_request(write=False)
             return
-        if path == "/api/v4/clock":
-            self._clock_request(sync=False)
+        if path in {"/api/v4/clock", "/api/v4/clock/check"}:
+            self._clock_request(sync=False, extended=path.endswith("/check"))
             return
         web_asset = WEB_PATHS.get(path)
         if web_asset is not None:
@@ -3340,7 +3340,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, result)
 
-    def _clock_request(self, *, sync: bool) -> None:
+    def _clock_request(self, *, sync: bool, extended: bool = False) -> None:
         principal = (
             self._write_principal("syncDeviceClock") if sync else self._principal("getDeviceClock")
         )
@@ -3356,6 +3356,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             result = (
                 self.server.provider.sync_clock(principal.principal_id, body)
                 if sync
+                else self.server.provider.clock_inspect(principal.principal_id)
+                if extended
                 else self.server.provider.clock_status(principal.principal_id)
             )
         except ProviderError as error:

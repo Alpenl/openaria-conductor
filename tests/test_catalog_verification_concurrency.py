@@ -140,7 +140,9 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
     def test_second_download_waits_without_duplicate_scan_or_control_lock(self):
         with self.scanning() as (pool, _, release):
             second = pool.submit(self.diagnostic_artifact, self.session, self.artifact, "v4")
-            with patch.object(self.coordinator, "_clock_control", return_value={}):
+            with patch.object(
+                self.coordinator, "_clock_control", return_value={"source": "client"}
+            ):
                 pool.submit(self.coordinator.sync_clock, "operator", {}).result(timeout=1)
             self.assertFalse(second.done())
             release.set()
@@ -226,7 +228,9 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             with self.assertRaises(ProviderError) as busy:
                 pool.submit(self.coordinator.delete_sessions, self.deletion).result(timeout=1)
             self.assertEqual(busy.exception.code, "catalog_busy")
-            with patch.object(self.coordinator, "_clock_control", return_value={}):
+            with patch.object(
+                self.coordinator, "_clock_control", return_value={"source": "client"}
+            ):
                 pool.submit(self.coordinator.sync_clock, "operator", {}).result(timeout=1)
 
     def test_safe_swap_fences_download_scans_before_any_payload_is_opened(self):

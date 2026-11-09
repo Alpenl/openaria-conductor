@@ -55,6 +55,7 @@ from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, Pre
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.camera_focus import valid_camera_focus_status
 from rp_ylx.capture_timer import DEFAULT_TIMER, valid_timer_settings
+from rp_ylx.clock_sync import valid_clock_response
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.network import NetworkError, network_operation_lock_path
@@ -2968,6 +2969,9 @@ class CaptureCoordinator:
     def clock_status(self, principal_id: str) -> Mapping[str, object]:
         return self._clock_control("clock_status", principal_id, {})
 
+    def clock_inspect(self, principal_id: str) -> Mapping[str, object]:
+        return self._clock_control("clock_inspect", principal_id, {})
+
     def sync_clock(self, principal_id: str, body: Mapping[str, object]) -> Mapping[str, object]:
         # Share the start/stop lock: never step wall time halfway through a capture
         # or between allocating its session ID and writing the initial metadata.
@@ -2979,7 +2983,11 @@ class CaptureCoordinator:
                     status=HTTPStatus.CONFLICT,
                     retryable=True,
                 )
-            return self._clock_control("clock_sync", principal_id, body)
+            before = self.clock_status(principal_id)
+            result = self._clock_control("clock_sync", principal_id, body)
+            if before["source"] == "unsynchronized" and result["source"] == "client":
+                self._notify_voice("clock_ready")
+            return result
 
     @staticmethod
     def _clock_control(
@@ -3004,10 +3012,21 @@ class CaptureCoordinator:
             code = str(error.get("code", "clock_sync_unavailable"))
             status = (
                 HTTPStatus.CONFLICT
-                if code in {"clock_challenge_expired", "clock_changed", "capture_active"}
+                if code
+                in {
+                    "clock_challenge_expired",
+                    "clock_changed",
+                    "clock_ntp_active",
+                    "capture_active",
+                }
                 else HTTPStatus.SERVICE_UNAVAILABLE
             )
-            raise ProviderError(code, "设备日期尚未校准，请重试", status=status, retryable=True)
+            raise ProviderError(
+                code,
+                str(error.get("message", "设备日期尚未校准，请重试")),
+                status=status,
+                retryable=True,
+            )
         return response["body"]
 
     def scan_networks(self) -> Mapping[str, object]:
@@ -3328,8 +3347,12 @@ class CaptureCoordinator:
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         try:
             return self._start_capture_checked(body)
-        except Exception:
-            self._notify_voice("start_failed")
+        except Exception as error:
+            self._notify_voice(
+                "clock_required"
+                if getattr(error, "code", "") in {"clock_unsynchronized", "clock_sync_unavailable"}
+                else "start_failed"
+            )
             raise
 
     def _start_capture_checked(self, body: Mapping[str, object]) -> CaptureCommandResult:
@@ -3381,6 +3404,18 @@ class CaptureCoordinator:
                 status=HTTPStatus.CONFLICT,
                 retryable=True,
             )
+        clock = self.clock_inspect("capture-start")
+        if (
+            not valid_clock_response(clock)
+            or clock.get("schema") != "ylx.clock-status.v2"
+            or clock.get("source") == "unsynchronized"
+        ):
+            raise ProviderError(
+                "clock_unsynchronized", "请打开手机控制页面校准时间", status=409, retryable=True
+            )
+        clock_provenance = {
+            key: clock[key] for key in ("source", "boot_id", "synchronized_at_ms", "age_seconds")
+        }
         try:
             admission = self._require_admission()
         except DeviceRecordingError as error:
@@ -3442,6 +3477,7 @@ class CaptureCoordinator:
             take_id=take_id,
             take_sequence=take_sequence,
             continuation_of=None if continuation_of is None else str(continuation_of),
+            clock_provenance=clock_provenance,
         )
         session_config = self._config.session
         if plan.capture_mode == "calibration":

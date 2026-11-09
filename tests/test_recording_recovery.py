@@ -38,6 +38,33 @@ class RecordingRecoveryTests(unittest.TestCase):
             self.assertEqual(raw, json_bytes(json.loads(raw)))
             validate_device_session_directory(recovered.path)
 
+    def test_clock_metadata_survives_interruption_without_changing_legacy_plan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            recorder = self.recording(Path(temporary))
+            capture = json.loads((recorder.partial_path / "capture.json").read_text())
+            self.assertNotIn("clock_provenance", capture["plan"])
+            clock = {
+                "schema": "openaria.recording-clock.v1",
+                "session_id": capture["session_id"],
+                "started_at": capture["started_at"],
+                "utc_offset_seconds": 0,
+                "calibration": {
+                    "source": "client",
+                    "boot_id": "old-boot",
+                    "age_seconds": 4,
+                    "synchronized_at_ms": 1789524000000,
+                },
+            }
+            write_json_atomic(recorder.partial_path / "clock-calibration.json", clock)
+            recovered = recover_device_session(recorder.partial_path)
+            manifest = json.loads((recovered.path / "manifest.json").read_text())
+            self.assertEqual(manifest["time"]["started_at"], capture["started_at"])
+            self.assertIn("log.clock-calibration", [item["role"] for item in manifest["logs"]])
+            self.assertEqual(
+                json.loads((recovered.path / "clock-calibration.json").read_text()), clock
+            )
+            validate_device_session_directory(recovered.path)
+
     def test_recovery_readback_proof_rejects_change_during_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

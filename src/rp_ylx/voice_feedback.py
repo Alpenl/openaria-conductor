@@ -15,7 +15,15 @@ import wave
 from pathlib import Path
 
 LOG = logging.getLogger(__name__)
-EVENTS = {"started", "saved", "start_failed", "recording_failed", "save_failed"}
+EVENTS = {
+    "started",
+    "saved",
+    "start_failed",
+    "recording_failed",
+    "save_failed",
+    "clock_ready",
+    "clock_required",
+}
 
 
 def valid_volume(value: object) -> bool:

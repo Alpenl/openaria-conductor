@@ -32,6 +32,7 @@ from rp_ylx.recording import (
     validate_device_session_directory,
 )
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
+from tests.test_capture_coordinator import idle_network_control
 
 JPEG = b"\xff\xd8threaded-sbs\xff\xd9"
 
@@ -498,12 +499,7 @@ class CaptureSourcesTest(unittest.TestCase):
         self.environment_patcher.start()
         self.network_control_patcher = patch(
             "rp_ylx.recording.coordinator.request_network_control",
-            return_value={
-                "ok": True,
-                "operation": "status",
-                "status": 200,
-                "body": {"transaction": {"current": None}},
-            },
+            side_effect=idle_network_control,
         )
         self.network_control_patcher.start()
         self.encoder_patcher = patch(
