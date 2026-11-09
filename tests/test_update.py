@@ -399,6 +399,97 @@ class OnlineUpdateTest(unittest.TestCase):
                         with self.assertRaises(ValueError):
                             update.require_idle()
 
+    def test_exfat_upgrade_preserves_config_and_never_allocates_loop(self):
+        config = self.root / "volume.conf"
+        config.write_text(
+            "RP_YLX_DATA_VOLUME_MODE=exfat\n"
+            "RP_YLX_DATA_VOLUME_UUID=6FFE-F9A7\n"
+            "RP_YLX_DATA_VOLUME_PARTUUID=db2e7205-03\n"
+        )
+        before = config.read_bytes()
+        device = "/dev/disk/by-uuid/6FFE-F9A7"
+        outputs = [
+            "exfat\n",
+            "6FFE-F9A7\n",
+            "db2e7205-03\n",
+            json.dumps({"filesystems": [{"source": device, "fstype": "exfat"}]}),
+        ]
+        with (
+            patch.object(update, "DATA_VOLUME_CONFIG", config),
+            patch.object(Path, "is_block_device", return_value=True),
+            patch.object(
+                update.subprocess, "run", side_effect=[Mock(stdout=value) for value in outputs]
+            ) as run,
+            patch.object(update.shutil, "disk_usage") as usage,
+        ):
+            update.configure_data_volume()
+        self.assertEqual(config.read_bytes(), before)
+        usage.assert_not_called()
+        self.assertEqual(
+            [c.args[0][0] for c in run.call_args_list], ["blkid", "blkid", "blkid", "findmnt"]
+        )
+
+    def test_exfat_upgrade_rejects_wrong_or_absent_volume_without_loop_fallback(self):
+        config = self.root / "volume.conf"
+        config.write_text(
+            "RP_YLX_DATA_VOLUME_MODE=exfat\n"
+            "RP_YLX_DATA_VOLUME_UUID=6FFE-F9A7\n"
+            "RP_YLX_DATA_VOLUME_PARTUUID=db2e7205-03\n"
+        )
+        cases = [
+            (False, []),
+            (True, ["ext4"]),
+            (True, ["exfat", "BAD0-BAD0"]),
+            (True, ["exfat", "6FFE-F9A7", "deadbeef-03"]),
+            (
+                True,
+                [
+                    "exfat",
+                    "6FFE-F9A7",
+                    "db2e7205-03",
+                    json.dumps({"filesystems": [{"source": "/dev/wrong", "fstype": "exfat"}]}),
+                ],
+            ),
+            (True, ["exfat", "6FFE-F9A7", "db2e7205-03", json.dumps({"filesystems": []})]),
+        ]
+        for block, outputs in cases:
+            with (
+                self.subTest(block=block, outputs=outputs),
+                patch.object(update, "DATA_VOLUME_CONFIG", config),
+                patch.object(Path, "is_block_device", return_value=block),
+                patch.object(
+                    update.subprocess, "run", side_effect=[Mock(stdout=value) for value in outputs]
+                ),
+                patch.object(update.shutil, "disk_usage") as usage,
+                self.assertRaises(ValueError),
+            ):
+                try:
+                    update.configure_data_volume()
+                finally:
+                    usage.assert_not_called()
+
+    def test_missing_factory_config_and_malformed_modes_block_loop_fallback(self):
+        config = self.root / "volume.conf"
+        state = self.root / "storage.json"
+        with (
+            patch.object(update, "DATA_VOLUME_CONFIG", config),
+            patch.object(update, "FACTORY_STORAGE_STATE", state),
+        ):
+            self.assertFalse(update.require_configured_exfat_volume())
+            state.write_text('{"phase":"ready"}')
+            with self.assertRaises(ValueError):
+                update.configure_data_volume()
+            for content in (
+                "RP_YLX_DATA_VOLUME_MODE=loop\n",
+                "RP_YLX_DATA_VOLUME_MODE=unknown\n",
+                "RP_YLX_DATA_VOLUME_MODE=exfat\n",
+                "RP_YLX_DATA_VOLUME_MODE=exfat\nRP_YLX_DATA_VOLUME_MODE=loop\n",
+                "RP_YLX_DATA_VOLUME_MODE=exfat; touch /tmp/unexpected\n",
+            ):
+                config.write_text(content)
+                with self.subTest(content=content), self.assertRaises(ValueError):
+                    update.configure_data_volume()
+
     def test_volume_size_keeps_os_reserve(self):
         for available, expected in ((12, 4), (24, 16), (64, 51), (128, 80)):
             self.assertEqual(update.data_volume_size(available * 1024**3), expected)

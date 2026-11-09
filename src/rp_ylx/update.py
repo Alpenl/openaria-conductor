@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import sqlite3
 import ssl
@@ -39,6 +40,8 @@ NETWORK_STATE = Path("/var/lib/rp-ylx-network")
 NETWORK_PROFILES = Path("/etc/NetworkManager/system-connections")
 UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
+DATA_VOLUME_CONFIG = Path("/etc/default/rp-ylx-data-volume")
+FACTORY_STORAGE_STATE = Path("/var/lib/openaria-factory/firstboot/storage.json")
 
 
 class MaintenanceBusyError(ValueError):
@@ -627,7 +630,63 @@ def data_volume_size(free_bytes: int) -> int:
     return size
 
 
+def require_configured_exfat_volume() -> bool:
+    values = {}
+    if DATA_VOLUME_CONFIG.exists():
+        for line in DATA_VOLUME_CONFIG.read_text().splitlines():
+            fields = shlex.split(line, comments=True)
+            if not fields:
+                continue
+            if len(fields) != 1 or "=" not in fields[0]:
+                raise ValueError("录像分区配置格式无效")
+            key, value = fields[0].split("=", 1)
+            if key in values:
+                raise ValueError("录像分区配置项重复")
+            values[key] = value
+    mode = values.get("RP_YLX_DATA_VOLUME_MODE", "loop")
+    if mode != "exfat":
+        if mode != "loop" or FACTORY_STORAGE_STATE.exists():
+            raise ValueError("独立录像分区配置缺失或无效；禁止回退创建loop卷")
+        return False
+    identity = values.get("RP_YLX_DATA_VOLUME_UUID", "")
+    partuuid = values.get("RP_YLX_DATA_VOLUME_PARTUUID", "")
+    if not re.fullmatch(r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}", identity) or not re.fullmatch(
+        r"[0-9A-Fa-f]{8}-03", partuuid
+    ):
+        raise ValueError("录像分区身份配置无效")
+    device = Path("/dev/disk/by-uuid") / identity
+    if not device.is_block_device():
+        raise ValueError("配置的录像分区不存在")
+    for field, expected in (("TYPE", "exfat"), ("UUID", identity), ("PARTUUID", partuuid)):
+        result = subprocess.run(
+            ["blkid", "-s", field, "-o", "value", str(device)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.stdout.strip() != expected:
+            raise ValueError("录像分区身份与配置不一致")
+    result = subprocess.run(
+        ["findmnt", "--json", "--mountpoint", "/data", "-o", "SOURCE,FSTYPE"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    mounts = json.loads(result.stdout).get("filesystems", [])
+    if (
+        len(mounts) != 1
+        or mounts[0].get("fstype") != "exfat"
+        or Path(mounts[0].get("source", "")).resolve() != device.resolve()
+    ):
+        raise ValueError("/data挂载的不是配置的录像分区")
+    return True
+
+
 def configure_data_volume() -> None:
+    if require_configured_exfat_volume():
+        return
     image = Path("/var/lib/rp-ylx-data-volume/data-volume.img")
     override = Path("/etc/systemd/system/rp-ylx-data-volume.service.d/10-size.conf")
     if image.exists() or override.exists():
