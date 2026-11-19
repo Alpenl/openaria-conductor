@@ -29,11 +29,10 @@
 #define PATH_LEN 512
 #define MUX_QUEUE_BYTES (32u * 1024u * 1024u) /* per eye, compressed packets */
 #define MUX_QUEUE_SECONDS 16u
-/* Include both writable eyes, queued segments and the in-flight disk sealer.
- * Otherwise a stalled fsync can retain muxers indefinitely while writers keep
- * opening files. At five seconds per segment this permits over a minute of
- * backlog before reporting an explicit storage failure. */
+/* Bound active muxers independently of closed files waiting for disk sync.
+ * Both limits include their respective in-flight work. */
 #define MAX_PENDING_SEGMENTS 32u
+#define MAX_PENDING_COMMITS 64u
 
 typedef struct segment {
     struct segment *next;
@@ -44,6 +43,7 @@ typedef struct segment {
     char relative[PATH_LEN];
     unsigned long long start_frame;
     unsigned long long end_frame;
+    unsigned long long finalize_ns;
 } segment_t;
 
 typedef struct {
@@ -74,16 +74,15 @@ struct ylx_pipeline {
     media_codec_context_t decoder;
     eye_t eyes[YLX_EYES];
     pthread_t split_thread;
-    int decoder_started, split_started, closer_started;
+    int decoder_started, split_started, closer_started, committer_started;
     int ledger_initialized, error_initialized;
-    int closer_lock_initialized, closer_signal_initialized;
+    int closer_lock_initialized, closer_signal_initialized, commit_signal_initialized;
 
     ylx_segment_closed_fn on_segment;
     void *user;
 
-    /* Sealing a segment writes the MP4 index and fsyncs several megabytes; on
-     * the encode path that stall backs up into dropped frames, so it runs on a
-     * dedicated thread instead. */
+    /* Release the vendor muxer and finish the MP4 index before queuing file
+     * and directory sync. Slow durability must not occupy active muxer slots. */
     pthread_t closer_thread;
     pthread_mutex_t closer_lock;
     pthread_cond_t closer_signal;
@@ -91,6 +90,12 @@ struct ylx_pipeline {
     segment_t *closer_tail;
     int closer_stop;
     atomic_uint pending_segments;
+    pthread_t committer_thread;
+    pthread_cond_t commit_signal;
+    segment_t *commit_head;
+    segment_t *commit_tail;
+    int commit_stop;
+    unsigned pending_commits;
 
     pthread_mutex_t ledger_lock;
     /* Eyes can seal at different speeds. Keep all pending pairs until the
@@ -598,46 +603,50 @@ static void ledger_record(ylx_pipeline_t *pipeline, int eye_index, int segment_i
     pthread_mutex_unlock(&pipeline->ledger_lock);
 }
 
+static void queue_segment(segment_t **head, segment_t **tail, segment_t *segment)
+{
+    segment->next = NULL;
+    if (*tail != NULL) (*tail)->next = segment;
+    else *head = segment;
+    *tail = segment;
+}
+
 /* Hands the finished segment to the closer thread; never blocks the encoder. */
 static void segment_close(ylx_pipeline_t *pipeline, eye_t *eye)
 {
     segment_t *segment = eye->current;
-    if (segment == NULL) {
-        return;
-    }
+    if (segment == NULL) return;
     eye->current = NULL;
     segment->end_frame = eye->ordinal;
-    segment->next = NULL;
     pthread_mutex_lock(&pipeline->closer_lock);
-    if (pipeline->closer_tail == NULL) {
-        pipeline->closer_head = segment;
-    } else {
-        pipeline->closer_tail->next = segment;
-    }
-    pipeline->closer_tail = segment;
+    queue_segment(&pipeline->closer_head, &pipeline->closer_tail, segment);
     pthread_cond_signal(&pipeline->closer_signal);
     pthread_mutex_unlock(&pipeline->closer_lock);
 }
 
-static void segment_seal(ylx_pipeline_t *pipeline, segment_t *segment)
+static int segment_finalize(ylx_pipeline_t *pipeline, segment_t *segment)
 {
     if (hb_mm_mx_stop(&segment->muxer) != 0) {
         fail(pipeline, "segment_seal_failed: stop %s", segment->relative);
-        return;
+        return 0;
     }
     if (segment->end_frame == segment->start_frame) {
-        /* A take whose frame count lands exactly on a boundary opens a segment
-         * it never fills; it is not part of the recording. */
+        /* A segment opened exactly at the final frame boundary has no media. */
         unlink(segment->absolute);
-        return;
+        return 0;
     }
     char reason[128] = {0};
     if (mp4_extend_durations(segment->absolute, pipeline->config.fps, reason,
                              sizeof(reason)) != 0) {
         fail(pipeline, "segment_seal_failed: %s duration fixup: %s", segment->relative,
              reason);
-        return;
+        return 0;
     }
+    return 1;
+}
+
+static void segment_seal(ylx_pipeline_t *pipeline, segment_t *segment)
+{
     /* A closed segment must survive a power cut on its own. */
     int fd = open(segment->absolute, O_RDONLY);
     if (fd < 0 || fsync(fd) != 0) {
@@ -665,31 +674,69 @@ static void segment_seal(ylx_pipeline_t *pipeline, segment_t *segment)
                   segment->start_frame, segment->end_frame);
 }
 
+static segment_t *wait_segment(ylx_pipeline_t *pipeline, pthread_cond_t *signal,
+                               segment_t **head, segment_t **tail, const int *stopping)
+{
+    pthread_mutex_lock(&pipeline->closer_lock);
+    while (*head == NULL && !*stopping) {
+        pthread_cond_wait(signal, &pipeline->closer_lock);
+    }
+    segment_t *segment = *head;
+    if (segment != NULL) {
+        *head = segment->next;
+        if (*head == NULL) *tail = NULL;
+    }
+    pthread_mutex_unlock(&pipeline->closer_lock);
+    return segment;
+}
+
 static void *closer_thread_main(void *argument)
 {
-    ylx_pipeline_t *pipeline = (ylx_pipeline_t *)argument;
-    for (;;) {
+    ylx_pipeline_t *pipeline = argument;
+    segment_t *segment;
+    while ((segment = wait_segment(pipeline, &pipeline->closer_signal,
+                    &pipeline->closer_head, &pipeline->closer_tail, &pipeline->closer_stop))) {
+        unsigned long long started = monotonic_time_ns();
+        int finalized = segment_finalize(pipeline, segment);
+        segment->finalize_ns = monotonic_time_ns() - started;
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
+        if (!finalized) {
+            observe_max(&pipeline->max_seal_ns, segment->finalize_ns);
+            free(segment);
+            continue;
+        }
         pthread_mutex_lock(&pipeline->closer_lock);
-        while (pipeline->closer_head == NULL && pipeline->closer_stop == 0) {
-            pthread_cond_wait(&pipeline->closer_signal, &pipeline->closer_lock);
-        }
-        segment_t *segment = pipeline->closer_head;
-        if (segment == NULL) {
-            pthread_mutex_unlock(&pipeline->closer_lock);
-            return NULL;
-        }
-        pipeline->closer_head = segment->next;
-        if (pipeline->closer_head == NULL) {
-            pipeline->closer_tail = NULL;
+        unsigned pending = pipeline->pending_commits;
+        if (pending < MAX_PENDING_COMMITS) {
+            pipeline->pending_commits++;
+            queue_segment(&pipeline->commit_head, &pipeline->commit_tail, segment);
+            pthread_cond_signal(&pipeline->commit_signal);
         }
         pthread_mutex_unlock(&pipeline->closer_lock);
+        if (pending >= MAX_PENDING_COMMITS) {
+            fail(pipeline, "segment_commit_queue_exhausted: pending=%u limit=%u",
+                 pending, MAX_PENDING_COMMITS);
+            free(segment);
+        }
+    }
+    return NULL;
+}
 
+static void *committer_thread_main(void *argument)
+{
+    ylx_pipeline_t *pipeline = argument;
+    segment_t *segment;
+    while ((segment = wait_segment(pipeline, &pipeline->commit_signal,
+                    &pipeline->commit_head, &pipeline->commit_tail, &pipeline->commit_stop))) {
         unsigned long long started = monotonic_time_ns();
         segment_seal(pipeline, segment);
-        observe_max(&pipeline->max_seal_ns, monotonic_time_ns() - started);
+        observe_max(&pipeline->max_seal_ns, segment->finalize_ns + monotonic_time_ns() - started);
         free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1);
+        pthread_mutex_lock(&pipeline->closer_lock);
+        pipeline->pending_commits--;
+        pthread_mutex_unlock(&pipeline->closer_lock);
     }
+    return NULL;
 }
 
 /* -------------------------------------------------------------- threads --- */
@@ -960,6 +1007,10 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     ret = pthread_cond_init(&pipeline->closer_signal, NULL);
     if (ret != 0) goto sync_failed;
     pipeline->closer_signal_initialized = 1;
+    resource = "commit condition";
+    ret = pthread_cond_init(&pipeline->commit_signal, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->commit_signal_initialized = 1;
 
     /* Complete shared queue setup before any worker can observe an eye. */
     for (int eye = 0; eye < YLX_EYES; eye += 1) {
@@ -992,7 +1043,11 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
         pipeline->eyes[eye].codec_started = 1;
     }
 
-    const char *worker = "closer";
+    const char *worker = "committer";
+    ret = pthread_create(&pipeline->committer_thread, NULL, committer_thread_main, pipeline);
+    if (ret != 0) goto thread_failed;
+    pipeline->committer_started = 1;
+    worker = "closer";
     ret = pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
     if (ret != 0) goto thread_failed;
     pipeline->closer_started = 1;
@@ -1093,6 +1148,13 @@ int ylx_pipeline_finish(ylx_pipeline_t *pipeline)
         pthread_mutex_unlock(&pipeline->closer_lock);
         pthread_join(pipeline->closer_thread, NULL);
     }
+    if (pipeline->committer_started) {
+        pthread_mutex_lock(&pipeline->closer_lock);
+        pipeline->commit_stop = 1;
+        pthread_cond_signal(&pipeline->commit_signal);
+        pthread_mutex_unlock(&pipeline->closer_lock);
+        pthread_join(pipeline->committer_thread, NULL);
+    }
     return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
 }
 
@@ -1114,6 +1176,7 @@ void ylx_pipeline_close(ylx_pipeline_t *pipeline)
     if (pipeline->decoder_started) codec_stop(&pipeline->decoder);
     if (pipeline->ledger_initialized) pthread_mutex_destroy(&pipeline->ledger_lock);
     if (pipeline->error_initialized) pthread_mutex_destroy(&pipeline->error_lock);
+    if (pipeline->commit_signal_initialized) pthread_cond_destroy(&pipeline->commit_signal);
     if (pipeline->closer_lock_initialized) pthread_mutex_destroy(&pipeline->closer_lock);
     if (pipeline->closer_signal_initialized) pthread_cond_destroy(&pipeline->closer_signal);
     free(pipeline);

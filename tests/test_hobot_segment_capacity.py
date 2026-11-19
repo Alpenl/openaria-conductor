@@ -32,10 +32,12 @@ class HobotSegmentCapacityTests(unittest.TestCase):
             source.index("static int segment_open(") : source.index("static void ledger_record(")
         ]
         closing = source[
-            source.index("static void segment_close(") : source.index("static void segment_seal(")
+            source.index("static void queue_segment(") : source.index(
+                "static int segment_finalize("
+            )
         ]
         closer = source[
-            source.index("static void *closer_thread_main(") : source.index(
+            source.index("static segment_t *wait_segment(") : source.index(
                 "/* -------------------------------------------------------------- threads"
             )
         ]
@@ -45,7 +47,7 @@ class HobotSegmentCapacityTests(unittest.TestCase):
             )
         ]
         constants = "\n".join(
-            line for line in source.splitlines() if line.startswith("#define MAX_PENDING_SEGMENTS")
+            line for line in source.splitlines() if line.startswith("#define MAX_PENDING_")
         )
         prefix = r"""
 #define _GNU_SOURCE
@@ -73,7 +75,8 @@ typedef struct {
     struct {int width,height;uint32_t frame_rate,bit_rate;int pix_fmt;} video_params;
 } mx_stream_params_t;
 typedef struct {void *vir_ptr;uint32_t size;unsigned long long pts;int is_key_frame;} mx_stream_t;
-static atomic_int live_segments,peak_segments,fail_stage,holding,sealing;
+static atomic_int live_segments,peak_segments,fail_stage,holding,finalizing;
+static atomic_int holding_commit,committing,committed;
 static void *checked_calloc(size_t count,size_t bytes) {
     if(atomic_load(&fail_stage)==1)return NULL;
     void *p=calloc(count,bytes);assert(p);
@@ -108,10 +111,17 @@ static unsigned long long monotonic_time_ns(void){return 1;}
 static void observe_max(atomic_ullong *counter,unsigned long long elapsed){
     (void)counter;(void)elapsed;
 }
+static int segment_finalize(ylx_pipeline_t *pipeline,segment_t *segment){
+    (void)pipeline;(void)segment;
+    atomic_store(&finalizing,1);
+    while(atomic_load(&holding))usleep(1000);
+    return 1;
+}
 static void segment_seal(ylx_pipeline_t *pipeline,segment_t *segment){
     (void)pipeline;(void)segment;
-    atomic_store(&sealing,1);
-    while(atomic_load(&holding))usleep(1000);
+    atomic_store(&committing,1);
+    while(atomic_load(&holding_commit))usleep(1000);
+    atomic_fetch_add(&committed,1);
 }
 """
         main = r"""
@@ -129,8 +139,10 @@ static void *produce(void *arg){
 static void drain(ylx_pipeline_t *p){
     pthread_mutex_lock(&p->closer_lock);p->closer_stop=1;
     pthread_cond_broadcast(&p->closer_signal);pthread_mutex_unlock(&p->closer_lock);
-    closer_thread_main(p);assert(!atomic_load(&live_segments));
-    p->closer_stop=0;
+    closer_thread_main(p);
+    p->commit_stop=1;
+    committer_thread_main(p);assert(!atomic_load(&live_segments));
+    p->closer_stop=p->commit_stop=0;
 }
 int main(int argc,char **argv){
     assert(argc==2);int mode=atoi(argv[1]),accepted=0;
@@ -139,7 +151,7 @@ int main(int argc,char **argv){
         .hevc=1,.bitrate_kbps=12288,.out_dir="unused",.path_prefix="video/"};
     p.eye_width=1920;
     pthread_mutex_init(&p.error_lock,NULL);pthread_mutex_init(&p.closer_lock,NULL);
-    pthread_cond_init(&p.closer_signal,NULL);
+    pthread_cond_init(&p.closer_signal,NULL);pthread_cond_init(&p.commit_signal,NULL);
     for(int i=0;i<2;i++){p.eyes[i].eye=i;p.eyes[i].pipeline=&p;}
     if(mode==0){
         producer_t x={.p=&p,.eye=&p.eyes[0]};produce(&x);accepted=x.count;drain(&p);
@@ -147,11 +159,12 @@ int main(int argc,char **argv){
         // A segment being sealed still owns its muxer even after leaving the queue.
         assert(submit_segment(&p,&p.eyes[0],0));accepted=1;atomic_store(&holding,1);
         pthread_t t;assert(!pthread_create(&t,NULL,closer_thread_main,&p));
-        while(!atomic_load(&sealing))usleep(1000);
+        while(!atomic_load(&finalizing))usleep(1000);
         producer_t x={.p=&p,.eye=&p.eyes[1]};produce(&x);accepted+=x.count;
         pthread_mutex_lock(&p.closer_lock);p.closer_stop=1;
         pthread_cond_broadcast(&p.closer_signal);pthread_mutex_unlock(&p.closer_lock);
         atomic_store(&holding,0);pthread_join(t,NULL);
+        drain(&p);
     }else if(mode==2){
         producer_t x[2]={{.p=&p,.eye=&p.eyes[0]},{.p=&p,.eye=&p.eyes[1]}};
         pthread_t t[2];
@@ -187,11 +200,38 @@ int main(int argc,char **argv){
         atomic_store(&fail_stage,0);
         for(int i=0;i<32;i++){assert(submit_segment(&p,&p.eyes[0],i));accepted++;}
         drain(&p);
+    }else if(mode==7){
+        // Block only durable sync. Finalized files must not consume muxer slots.
+        atomic_store(&holding_commit,1);
+        pthread_t closer,committer;
+        assert(!pthread_create(&closer,NULL,closer_thread_main,&p));
+        assert(!pthread_create(&committer,NULL,committer_thread_main,&p));
+        for(unsigned i=0;i<=MAX_PENDING_COMMITS;i++){
+            assert(submit_segment(&p,&p.eyes[i%2],(int)i));accepted++;
+            pthread_mutex_lock(&p.closer_lock);
+            while(p.pending_commits < i+1 && !atomic_load(&p.failed)){
+                pthread_mutex_unlock(&p.closer_lock);
+                usleep(1000);
+                pthread_mutex_lock(&p.closer_lock);
+            }
+            pthread_mutex_unlock(&p.closer_lock);
+            assert(!atomic_load(&p.pending_segments));
+        }
+        assert(p.pending_commits==MAX_PENDING_COMMITS && atomic_load(&committing));
+        assert(!atomic_load(&committed));
+        pthread_mutex_lock(&p.closer_lock);p.closer_stop=1;
+        pthread_cond_signal(&p.closer_signal);pthread_mutex_unlock(&p.closer_lock);
+        pthread_join(closer,NULL);
+        pthread_mutex_lock(&p.closer_lock);p.commit_stop=1;
+        pthread_cond_signal(&p.commit_signal);pthread_mutex_unlock(&p.closer_lock);
+        atomic_store(&holding_commit,0);pthread_join(committer,NULL);
+        assert(atomic_load(&committed)==MAX_PENDING_COMMITS);
     }else abort();
+    assert(!p.pending_commits && !p.commit_head && !p.commit_tail);
     assert(!atomic_load(&live_segments) && !p.closer_head && !p.closer_tail);
     printf("{\"accepted\":%d,\"peak_segments\":%d,\"failed\":%d,\"error\":\"%s\"}\n",
         accepted,atomic_load(&peak_segments),atomic_load(&p.failed),p.error);
-    pthread_cond_destroy(&p.closer_signal);pthread_mutex_destroy(&p.closer_lock);
+    pthread_cond_destroy(&p.commit_signal);pthread_cond_destroy(&p.closer_signal);pthread_mutex_destroy(&p.closer_lock);
     pthread_mutex_destroy(&p.error_lock);return 0;
 }
 """
@@ -252,6 +292,13 @@ int main(int argc,char **argv){
 
     def test_both_eye_producers_share_one_atomic_limit(self):
         self.bounded(2)
+
+    def test_stalled_durable_sync_has_an_independent_bound(self):
+        result = self.run_case(7)
+        self.assertEqual(result["accepted"], 65, result)
+        self.assertEqual(result["peak_segments"], 65, result)
+        self.assertEqual(result["failed"], 1, result)
+        self.assertIn("segment_commit_queue_exhausted", result["error"])
 
     def test_failed_allocations_and_initializers_return_capacity(self):
         result = self.run_case(3)

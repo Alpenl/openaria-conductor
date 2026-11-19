@@ -62,11 +62,15 @@ class CaptureGateBoundaryTest(unittest.TestCase):
     def test_without_native_runtime_gate_direct_transaction_stop_uses_observed_time(self):
         with self.recording() as (recorder, transaction):
             self.assertIsNone(transaction.capture_stopped_monotonic_ns)
-            with patch(
-                "rp_ylx.recording.device_session.time.monotonic_ns",
-                return_value=recorder._started_monotonic_ns + 30_000_000_000,
+            with (
+                patch(
+                    "rp_ylx.recording.device_session.time.monotonic_ns",
+                    return_value=recorder._started_monotonic_ns + 30_000_000_000,
+                ),
+                patch.object(transaction, "finish", wraps=transaction.finish) as finish,
             ):
                 sealed = recorder.stop()
+            finish.assert_called_once_with(30.0, 150.0)
             self.assertEqual(sealed.manifest["time"]["duration_seconds"], 30.0)
             self.assertTrue(transaction.finished)
 

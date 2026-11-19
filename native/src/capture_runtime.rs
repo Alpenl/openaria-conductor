@@ -265,6 +265,7 @@ impl Runtime {
         imu_timeout: Duration,
         audio: Option<Arc<crate::audio::Recorder>>,
         capture_stopped_monotonic_ns: Arc<AtomicU64>,
+        recover_source_gaps: bool,
     ) -> Result<RuntimeSnapshot, RuntimeError> {
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
@@ -318,7 +319,7 @@ impl Runtime {
                 "capture runtime is already recording",
             ));
         }
-        state.fanout.start_recording()?;
+        state.fanout.start_recording(recover_source_gaps)?;
         state.max_consumer_frame_ns = 0;
         state.recording = Some(Arc::new(SplitSinkRecording {
             active_take,
@@ -643,7 +644,7 @@ fn process_frame(
                 )
             })?;
         let current_source_frame = SourceFrameEvidence::from_frame(&frame);
-        let (dropped_before, validation, previous_source_frame, dispatch) = {
+        let (decision, validation, previous_source_frame, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
                     "capture_runtime_poisoned",
@@ -663,9 +664,20 @@ fn process_frame(
             let previous_source_frame = state.previous_source_frame.replace(current_source_frame);
             record_loss(metrics, "queue_rejected", validation.queue_rejected);
             record_loss(metrics, "source_gap", validation.source_gap);
+            let recovery_time_ns = previous_source_frame
+                .filter(|previous| {
+                    validation.source_gap != 0
+                        && validation.queue_rejected == 0
+                        && frame.host_monotonic_ns - previous.host_monotonic_ns <= 150_000_000
+                })
+                .map(|_| frame.host_monotonic_ns);
             let decision = state
                 .fanout
-                .begin_frame(validation.dropped_before, has_left || has_raw)
+                .begin_frame(
+                    validation.dropped_before,
+                    has_left || has_raw,
+                    recovery_time_ns,
+                )
                 .map_err(RuntimeError::from)?;
             if decision.publish_preview {
                 let publish_started = start_stage(metrics);
@@ -684,16 +696,17 @@ fn process_frame(
             } else {
                 None
             };
-            (
-                decision.dropped_before,
-                validation,
-                previous_source_frame,
-                dispatch,
-            )
+            (decision, validation, previous_source_frame, dispatch)
         };
+        if decision.recovered_source_gap > 0 {
+            eprintln!(
+                "recording continued after source gap: missing={}, next_source_sequence={}, host_monotonic_ns={}",
+                decision.recovered_source_gap, frame.source_sequence, frame.host_monotonic_ns,
+            );
+        }
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
-            let write_result = write_split_sink_frame(&dispatch, &frame, dropped_before);
+            let write_result = write_split_sink_frame(&dispatch, &frame, decision.dropped_before);
             finish_stage(metrics, "native_recording_split_sink", write_started);
             finish_recording_frame(shared)?;
             if let Err(mut error) = write_result {
@@ -1213,7 +1226,7 @@ mod tests {
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
-                state.fanout.start_recording().unwrap();
+                state.fanout.start_recording(false).unwrap();
                 state.recording = Some(Arc::new(target));
             }
             process_frame(
@@ -1365,7 +1378,7 @@ mod tests {
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
-                state.fanout.start_recording().unwrap();
+                state.fanout.start_recording(false).unwrap();
                 state.recording = Some(Arc::new(test_recording(py, &root)));
             }
             let stop = Arc::clone(&runtime.imu_stop);
@@ -1406,6 +1419,7 @@ mod tests {
                     Duration::from_millis(10),
                     None,
                     Arc::clone(&next.capture_stopped_monotonic_ns),
+                    false,
                 )
                 .unwrap();
             assert!(snapshot.recording_active);
@@ -1436,7 +1450,7 @@ mod tests {
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
-                state.fanout.start_recording().unwrap();
+                state.fanout.start_recording(false).unwrap();
                 state.recording = Some(Arc::new(test_recording(py, &root)));
             }
             let (done_tx, done_rx) = mpsc::channel();
@@ -1478,7 +1492,7 @@ mod tests {
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
-                state.fanout.start_recording().unwrap();
+                state.fanout.start_recording(false).unwrap();
                 let mut target = test_recording(py, &root);
                 target.audio = Some(Arc::clone(&audio));
                 state.recording = Some(Arc::new(target));
@@ -1523,7 +1537,7 @@ mod tests {
                 {
                     let mut state = runtime.shared.state.lock().unwrap();
                     state.running = true;
-                    state.fanout.start_recording().unwrap();
+                    state.fanout.start_recording(false).unwrap();
                     state.recording = Some(Arc::new(target));
                 }
                 assert!(!audio.stop_requested());
@@ -1584,7 +1598,7 @@ mod tests {
         {
             let mut state = runtime.shared.state.lock().unwrap();
             state.running = true;
-            state.fanout.start_recording().unwrap();
+            state.fanout.start_recording(false).unwrap();
             state.recording = Some(Arc::new(target));
         }
         let shared = Arc::clone(&runtime.shared);

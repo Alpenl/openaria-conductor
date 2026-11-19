@@ -22,6 +22,9 @@ from pathlib import Path
 _FRAME_MAGIC = b"YLXF"
 _HEADER = struct.Struct("<4sI")
 _READY_TIMEOUT_SECONDS = 15.0
+# A stop also waits for the bounded disk commit queue. On SD storage a single
+# real sync took over 95 seconds while capture was otherwise healthy.
+ENCODER_FINISH_TIMEOUT_SECONDS = 150.0
 _DEFAULT_EXECUTABLE = "ylx-stereo-encoder"
 
 
@@ -187,7 +190,7 @@ class StereoEncoderProcess:
             self._raise_if_failed()
             raise StereoEncoderError("encoder_failed", f"助手写入失败：{error}") from error
 
-    def finish(self, *, timeout: float = 30.0) -> Sequence[ClosedSegment]:
+    def finish(self, *, timeout: float = ENCODER_FINISH_TIMEOUT_SECONDS) -> Sequence[ClosedSegment]:
         """关闭输入、等待助手封完最后一段，返回全部已封分段。"""
 
         process = self._process

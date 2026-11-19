@@ -563,11 +563,13 @@ impl NativeCaptureEngine {
         Ok(())
     }
 
+    #[pyo3(signature = (transaction, on_failure, *, recover_source_gaps=false))]
     fn start_recording(
         &self,
         py: Python<'_>,
         transaction: PyRef<'_, NativeSessionTransaction>,
         on_failure: Py<PyAny>,
+        recover_source_gaps: bool,
     ) -> PyResult<Py<PyDict>> {
         transaction
             .transaction
@@ -626,6 +628,7 @@ impl NativeCaptureEngine {
                     imu_timeout,
                     audio,
                     capture_stopped_monotonic_ns,
+                    recover_source_gaps,
                 )
             })
             .map_err(capture_runtime_error);

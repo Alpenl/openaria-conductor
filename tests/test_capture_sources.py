@@ -384,7 +384,10 @@ class FakeNativeCaptureEngine:
     def start_preview(self) -> None:
         self.preview_started = True
 
-    def start_recording(self, transaction: object, on_failure: object) -> dict[str, object]:
+    def start_recording(
+        self, transaction: object, on_failure: object, *, recover_source_gaps: bool = False
+    ) -> dict[str, object]:
+        self.recover_source_gaps = recover_source_gaps
         if self.transaction is not None:
             raise RuntimeError("invalid_state: capture engine is already recording")
         self.transaction = transaction

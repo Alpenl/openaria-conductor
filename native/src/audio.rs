@@ -23,9 +23,11 @@ const DEFAULT_PERIOD_FRAMES: u64 = 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
 const QUEUE_BLOCKS: usize = 768;
-// At most eight completed segments may await durable commit, including the
-// in-flight batch. This bounds the recovery lag without retaining PCM buffers.
-const MAX_PENDING_COMMITS: u64 = 8;
+// Keep a finite backlog of closed WAV segments, including the in-flight batch.
+// At the default five seconds per segment, 24 slots absorb consecutive slow
+// checkpoint transactions on SD storage without retaining extra PCM buffers.
+// No segment is published as durable until the existing syncs have completed.
+const MAX_PENDING_COMMITS: u64 = 24;
 const IO_BUCKET_NS: [u64; 10] = [
     100_000,
     1_000_000,
@@ -2002,13 +2004,16 @@ mod tests {
             progress
                 .pending_commits
                 .load(std::sync::atomic::Ordering::Acquire),
-            8
+            super::MAX_PENDING_COMMITS
         );
         let error = writer.write_frames(&[7; 12], 3, &mut written).unwrap_err();
         assert!(error.message.contains("durable commit backlog exhausted"));
         release_tx.send(()).unwrap();
         drop(writer);
-        assert_eq!(*committed.lock().unwrap(), (0..8).collect::<Vec<_>>());
+        assert_eq!(
+            *committed.lock().unwrap(),
+            (0..super::MAX_PENDING_COMMITS).collect::<Vec<_>>()
+        );
         assert_eq!(
             progress
                 .pending_commits
@@ -2019,7 +2024,7 @@ mod tests {
             progress
                 .peak_pending_commits
                 .load(std::sync::atomic::Ordering::Acquire),
-            8
+            super::MAX_PENDING_COMMITS
         );
         assert!(!root.join("audio/checkpoint.json").exists());
         std::fs::remove_dir_all(root).unwrap();

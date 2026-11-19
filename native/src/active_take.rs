@@ -149,9 +149,8 @@ impl ActiveTakeWriter {
             frame_domain: self.frame_domain,
             frames_written: self.frames_written,
             bytes_written: self.bytes_written,
-            // Preserve the exported snapshot shape. Native recording fails on
-            // source/queue gaps instead of accepting dropped record sequences;
-            // FrameValidator, Metrics and the encoder retain the loss evidence.
+            // The encoded frame index is dense. Source gaps remain visible in
+            // its original source sequences and timestamps, and in the audit.
             dropped_frames: 0,
             pending_frames: u64::from(self.pending_frame.is_some()),
             drop_events: Vec::new(),
