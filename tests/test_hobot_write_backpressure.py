@@ -95,7 +95,7 @@ int main(void) {
             Path(__file__).resolve().parents[1] / "src/rp_ylx/hobot/ylx_stereo_pipeline.c"
         ).read_text()
         ledger = source[
-            source.index("static void ledger_record(") : source.index("static void segment_close(")
+            source.index("static void ledger_record(") : source.index("static void queue_segment(")
         ]
         pair = source[
             source.index("typedef struct closed_pair {") : source.index("struct ylx_pipeline {")

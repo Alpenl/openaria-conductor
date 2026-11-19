@@ -62,6 +62,7 @@ pub(crate) struct CaptureFanoutDecision {
     pub(crate) publish_preview: bool,
     pub(crate) record: bool,
     pub(crate) dropped_before: u64,
+    pub(crate) recovered_source_gap: u64,
     pub(crate) observed_frames: u64,
     pub(crate) inflight_frames: u64,
     pub(crate) recording_active: bool,
@@ -109,6 +110,8 @@ struct RecordingState {
     inflight_frames: u64,
     stopping: bool,
     failure_reported: bool,
+    recover_source_gaps: bool,
+    last_recovered_gap_ns: Option<u64>,
 }
 
 pub(crate) struct CaptureFanoutState {
@@ -130,7 +133,10 @@ impl CaptureFanoutState {
         })
     }
 
-    pub(crate) fn start_recording(&mut self) -> Result<CaptureFanoutSnapshot, RecordingError> {
+    pub(crate) fn start_recording(
+        &mut self,
+        recover_source_gaps: bool,
+    ) -> Result<CaptureFanoutSnapshot, RecordingError> {
         if let Some(existing) = &self.recording {
             if existing.inflight_frames != 0 || !existing.stopping {
                 return Err(RecordingError::new(
@@ -139,7 +145,10 @@ impl CaptureFanoutState {
                 ));
             }
         }
-        self.recording = Some(RecordingState::default());
+        self.recording = Some(RecordingState {
+            recover_source_gaps,
+            ..RecordingState::default()
+        });
         Ok(self.snapshot())
     }
 
@@ -147,18 +156,21 @@ impl CaptureFanoutState {
         &mut self,
         mut dropped_before: u64,
         has_preview: bool,
+        recovery_time_ns: Option<u64>,
     ) -> Result<CaptureFanoutDecision, RecordingError> {
         let Some(recording) = self.recording.as_mut() else {
             return Ok(CaptureFanoutDecision {
                 publish_preview: has_preview,
                 record: false,
                 dropped_before,
+                recovered_source_gap: 0,
                 observed_frames: 0,
                 inflight_frames: 0,
                 recording_active: false,
             });
         };
         let mut record = false;
+        let mut recovered_source_gap = 0;
         if !recording.stopping {
             if recording.observed_frames == 0 {
                 // Gaps before the first frame belong to preview, not this take.
@@ -166,16 +178,32 @@ impl CaptureFanoutState {
                 dropped_before = 0;
                 record = true;
             } else {
-                let observed_index = recording.observed_frames;
-                recording.observed_frames = observed_index
+                let observed_index = recording
+                    .observed_frames
                     .checked_add(dropped_before)
-                    .and_then(|value| value.checked_add(1))
                     .ok_or_else(|| {
                         RecordingError::new(
                             "counter_overflow",
                             "recording frame gate observed overflow",
                         )
                     })?;
+                recording.observed_frames = observed_index.checked_add(1).ok_or_else(|| {
+                    RecordingError::new(
+                        "counter_overflow",
+                        "recording frame gate observed overflow",
+                    )
+                })?;
+                if recording.recover_source_gaps && (1..=4).contains(&dropped_before) {
+                    if let Some(now) = recovery_time_ns.filter(|now| {
+                        recording
+                            .last_recovered_gap_ns
+                            .is_none_or(|last| now.saturating_sub(last) >= 1_000_000_000)
+                    }) {
+                        recovered_source_gap = dropped_before;
+                        dropped_before = 0;
+                        recording.last_recovered_gap_ns = Some(now);
+                    }
+                }
                 record = dropped_before != 0 || observed_index % self.frame_decimation == 0;
             }
             if record {
@@ -192,6 +220,7 @@ impl CaptureFanoutState {
             publish_preview: has_preview,
             record,
             dropped_before,
+            recovered_source_gap,
             observed_frames: recording.observed_frames,
             inflight_frames: recording.inflight_frames,
             recording_active: !recording.stopping,
@@ -1119,33 +1148,72 @@ mod tests {
     }
 
     #[test]
+    fn isolated_source_gap_preserves_decimation_and_rejects_a_second_nearby_gap() {
+        let mut gate = CaptureFanoutState::new(2).unwrap();
+        gate.start_recording(true).unwrap();
+        assert!(gate.begin_frame(0, true, None).unwrap().record);
+        gate.finish_frame().unwrap();
+
+        // The one absent source frame was already outside the recorded phase.
+        let first_gap = gate.begin_frame(1, true, Some(10_000_000_000)).unwrap();
+        assert!(first_gap.record);
+        assert_eq!(first_gap.recovered_source_gap, 1);
+        assert_eq!(first_gap.dropped_before, 0);
+        assert_eq!(first_gap.observed_frames, 3);
+        gate.finish_frame().unwrap();
+
+        let frequent = gate.begin_frame(2, true, Some(10_500_000_000)).unwrap();
+        assert!(frequent.record);
+        assert_eq!(frequent.dropped_before, 2);
+        assert_eq!(frequent.recovered_source_gap, 0);
+    }
+
+    #[test]
+    fn source_gap_recovery_keeps_the_next_recorded_frame_on_its_original_phase() {
+        let mut gate = CaptureFanoutState::new(2).unwrap();
+        gate.start_recording(true).unwrap();
+        assert!(gate.begin_frame(0, true, None).unwrap().record);
+        gate.finish_frame().unwrap();
+
+        let off_phase = gate.begin_frame(4, true, Some(10_000_000_000)).unwrap();
+        assert!(!off_phase.record);
+        assert_eq!(off_phase.recovered_source_gap, 4);
+        assert!(gate.begin_frame(0, true, None).unwrap().record);
+        gate.finish_frame().unwrap();
+
+        let too_large = gate.begin_frame(5, true, Some(12_000_000_000)).unwrap();
+        assert_eq!(too_large.dropped_before, 5);
+        assert_eq!(too_large.recovered_source_gap, 0);
+    }
+
+    #[test]
     fn capture_fanout_matches_continuous_source_decimation() {
         let mut gate = CaptureFanoutState::new(3).unwrap();
-        gate.start_recording().unwrap();
+        gate.start_recording(false).unwrap();
 
-        let first = gate.begin_frame(2, true).unwrap();
+        let first = gate.begin_frame(2, true, None).unwrap();
         assert!(first.record);
         assert_eq!(first.dropped_before, 0);
         assert_eq!(first.observed_frames, 1);
         assert_eq!(first.inflight_frames, 1);
         assert_eq!(gate.finish_frame().unwrap(), 0);
 
-        let skipped = gate.begin_frame(0, true).unwrap();
+        let skipped = gate.begin_frame(0, true, None).unwrap();
         assert!(!skipped.record);
         assert_eq!(skipped.observed_frames, 2);
         assert_eq!(skipped.inflight_frames, 0);
 
-        let skipped_again = gate.begin_frame(0, true).unwrap();
+        let skipped_again = gate.begin_frame(0, true, None).unwrap();
         assert!(!skipped_again.record);
         assert_eq!(skipped_again.observed_frames, 3);
 
-        let recorded = gate.begin_frame(0, true).unwrap();
+        let recorded = gate.begin_frame(0, true, None).unwrap();
         assert!(recorded.record);
         assert_eq!(recorded.observed_frames, 4);
         assert_eq!(recorded.inflight_frames, 1);
         assert_eq!(gate.finish_frame().unwrap(), 0);
 
-        let gap = gate.begin_frame(2, true).unwrap();
+        let gap = gate.begin_frame(2, true, None).unwrap();
         assert!(gap.record);
         assert_eq!(gap.dropped_before, 2);
         assert_eq!(gap.observed_frames, 7);
@@ -1156,14 +1224,14 @@ mod tests {
     #[test]
     fn capture_fanout_stopping_rejects_new_frames_but_tracks_inflight() {
         let mut gate = CaptureFanoutState::new(1).unwrap();
-        gate.start_recording().unwrap();
+        gate.start_recording(false).unwrap();
 
-        let decision = gate.begin_frame(0, true).unwrap();
+        let decision = gate.begin_frame(0, true, None).unwrap();
         assert!(decision.record);
         assert_eq!(decision.inflight_frames, 1);
         assert_eq!(gate.start_stopping(), 1);
 
-        let stopped = gate.begin_frame(0, true).unwrap();
+        let stopped = gate.begin_frame(0, true, None).unwrap();
         assert!(!stopped.record);
         assert_eq!(stopped.inflight_frames, 1);
 
@@ -1177,9 +1245,9 @@ mod tests {
     #[test]
     fn capture_fanout_preserves_failure_until_inflight_frames_drain() {
         let mut tap = CaptureFanoutState::new(2).unwrap();
-        tap.start_recording().unwrap();
+        tap.start_recording(false).unwrap();
 
-        let first = tap.begin_frame(3, true).unwrap();
+        let first = tap.begin_frame(3, true, None).unwrap();
         assert!(first.record);
         assert_eq!(first.dropped_before, 0);
         assert_eq!(first.inflight_frames, 1);
@@ -1191,7 +1259,7 @@ mod tests {
         assert!(!duplicate_report);
         assert_eq!(duplicate_inflight, 1);
 
-        let rejected = tap.begin_frame(0, true).unwrap();
+        let rejected = tap.begin_frame(0, true, None).unwrap();
         assert!(!rejected.record);
         assert_eq!(rejected.inflight_frames, 1);
         let snapshot = tap.snapshot();
@@ -1206,29 +1274,29 @@ mod tests {
     #[test]
     fn capture_fanout_publishes_preview_without_decimating_recording() {
         let mut fanout = CaptureFanoutState::new(2).unwrap();
-        let idle = fanout.begin_frame(0, true).unwrap();
+        let idle = fanout.begin_frame(0, true, None).unwrap();
         assert!(idle.publish_preview);
         assert!(!idle.record);
         assert!(!idle.recording_active);
         assert_eq!(idle.inflight_frames, 0);
 
-        let started = fanout.start_recording().unwrap();
+        let started = fanout.start_recording(false).unwrap();
         assert!(started.recording_present);
         assert!(started.recording_active);
 
-        let first = fanout.begin_frame(3, true).unwrap();
+        let first = fanout.begin_frame(3, true, None).unwrap();
         assert!(first.publish_preview);
         assert!(first.record);
         assert_eq!(first.dropped_before, 0);
         assert_eq!(first.inflight_frames, 1);
         assert_eq!(fanout.finish_frame().unwrap(), 0);
 
-        let skipped = fanout.begin_frame(0, true).unwrap();
+        let skipped = fanout.begin_frame(0, true, None).unwrap();
         assert!(skipped.publish_preview);
         assert!(!skipped.record);
         assert_eq!(skipped.inflight_frames, 0);
 
-        let recorded = fanout.begin_frame(0, true).unwrap();
+        let recorded = fanout.begin_frame(0, true, None).unwrap();
         assert!(recorded.publish_preview);
         assert!(recorded.record);
         assert_eq!(recorded.observed_frames, 3);
@@ -1239,25 +1307,25 @@ mod tests {
     fn capture_fanout_stops_and_clears_after_inflight_finishes() {
         let mut fanout = CaptureFanoutState::new(1).unwrap();
         assert!(CaptureFanoutState::new(0).is_err());
-        fanout.start_recording().unwrap();
-        assert!(fanout.begin_frame(0, false).unwrap().record);
-        assert!(fanout.start_recording().is_err());
+        fanout.start_recording(false).unwrap();
+        assert!(fanout.begin_frame(0, false, None).unwrap().record);
+        assert!(fanout.start_recording(false).is_err());
         assert_eq!(fanout.start_stopping(), 1);
-        let rejected = fanout.begin_frame(0, true).unwrap();
+        let rejected = fanout.begin_frame(0, true, None).unwrap();
         assert!(rejected.publish_preview);
         assert!(!rejected.record);
         assert!(!rejected.recording_active);
         assert_eq!(fanout.finish_frame().unwrap(), 0);
         assert!(!fanout.snapshot().recording_present);
-        fanout.start_recording().unwrap();
+        fanout.start_recording(false).unwrap();
         assert!(fanout.snapshot().recording_active);
     }
 
     #[test]
     fn capture_fanout_reports_failure_once() {
         let mut fanout = CaptureFanoutState::new(1).unwrap();
-        fanout.start_recording().unwrap();
-        assert!(fanout.begin_frame(0, false).unwrap().record);
+        fanout.start_recording(false).unwrap();
+        assert!(fanout.begin_frame(0, false, None).unwrap().record);
         assert_eq!(fanout.mark_failure(), (true, 1));
         assert_eq!(fanout.mark_failure(), (false, 1));
         assert_eq!(fanout.finish_frame().unwrap(), 0);

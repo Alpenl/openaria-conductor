@@ -191,6 +191,8 @@ class NativeCaptureEngine(Protocol):
         self,
         transaction: NativeSessionTransaction,
         on_failure: object,
+        *,
+        recover_source_gaps: bool = False,
     ) -> dict[str, object]: ...
 
     def stop_recording(self, timeout_seconds: float = 3.0) -> dict[str, object]: ...

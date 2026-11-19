@@ -34,6 +34,11 @@ PCM 流，实际存储格式由 `media_type=audio/flac` 和 `.flac` 路径声明
 匹配和回绕/重置、IMU 实际交付槽位频率、读取时间窗、boot_id 与时钟能力。
 百分位使用有界的 100 µs 桶，超过 1 秒的溢出桶保守报告最大值。
 
+普通原生录制可以跨过孤立的相机源序号缺口。单次最多 4 个源序号，相邻
+有效帧间隔须在 150 毫秒以内，两次恢复之间至少间隔 1 秒。录制保持原来的
+抽帧相位、源序号及时间戳，用户可在录制详情查看发生的缺口。应用队列拒收、
+超出保护范围及标定录制的源帧缺口仍会中止并保留可恢复前段。
+
 `capture_audit.camera.cadence` 进一步区分平均速率偏差和相邻帧抖动：
 保存平均/最小/最大间隔、标准差、相对目标周期的最大绝对误差、超过
 0.5/1 ms 的间隔数量，以及连续 `ceil(nominal_fps)` 个间隔的滚动帧率范围。
@@ -96,7 +101,7 @@ queue peak and maximum whole writer operation duration, including failed capture
 Audio segment durability runs on a separate commit worker. The PCM writer queues
 completed file handles, returning its capture buffer before segment `fsync` and
 checkpoint serialization/sync. Pending commits, including an in-flight batch,
-are capped at eight segments (40 s at the default 5 s segment length); capacity
+are capped at twenty-four segments (120 s at the default 5 s segment length); capacity
 exhaustion or any I/O error fails explicitly. Accumulated commits may share one
 checkpoint only after all included segment files have synced. The checkpoint is
 still atomically replaced and its directory synced. Stop joins the worker before
@@ -105,3 +110,11 @@ An abrupt power loss can lose the uncommitted tail. `durable_sample_count` and
 `durable_commit_peak_segments` in `audio/capture-clock.json` distinguish durable
 progress from successful buffered PCM writes. This does not fix storage media
 that cannot sustain the bitrate, nor does it guarantee unlimited stall tolerance.
+
+The stereo helper finishes the MP4 index and releases the vendor muxer before
+queuing file and directory sync. At most 32 active or closing muxers and 64
+completed files can await their respective work, including in-flight entries.
+It publishes only contiguous left/right pairs whose files and directory have
+synced. Stop joins both workers, with a 150-second process budget to allow a
+transient storage stall to clear. A failed sync or capacity overrun still
+terminates the recording and preserves the verified prefix.

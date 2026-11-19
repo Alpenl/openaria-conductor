@@ -28,7 +28,7 @@ class HobotThreadStartTests(unittest.TestCase):
             )
         ]
         closer = source[
-            source.index("static void *closer_thread_main(") : source.index(
+            source.index("static segment_t *wait_segment(") : source.index(
                 "/* -------------------------------------------------------------- threads"
             )
         ]
@@ -46,6 +46,7 @@ class HobotThreadStartTests(unittest.TestCase):
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,7 +59,7 @@ static pthread_mutex_t *mutexes[8];
 static pthread_cond_t *conditions[8];
 static int fail_codec, codec_calls, codecs_started, codecs_stopped, next_encoder;
 static atomic_int live_workers;
-static pthread_t created[6];
+static pthread_t created[7];
 static int checked_create(pthread_t *thread,const pthread_attr_t *attr,
                           void *(*function)(void *),void *argument) {
     int number=++create_calls;
@@ -151,6 +152,16 @@ static unsigned long long monotonic_time_ns(void) {return 1;}
 static void observe_max(atomic_ullong *value,unsigned long long elapsed) {
     (void)value;(void)elapsed;
 }
+static void queue_segment(segment_t **head,segment_t **tail,segment_t *segment) {
+    (void)head;(void)tail;(void)segment;abort();
+}
+static int segment_finalize(ylx_pipeline_t *pipeline,segment_t *segment) {
+    (void)pipeline;(void)segment;abort();
+}
+static void fail(ylx_pipeline_t *pipeline,const char *format,...) {
+    (void)pipeline;(void)format;abort();
+}
+#define MAX_PENDING_COMMITS 64u
 static void segment_seal(ylx_pipeline_t *pipeline,segment_t *segment) {
     (void)pipeline;(void)segment;
 }
@@ -174,9 +185,9 @@ static void *mux_writer_thread(void *argument) {
         main = r"""
 int main(int argc,char **argv) {
     assert(argc==2);int test=atoi(argv[1]);
-    if(test>0 && test<7)fail_thread=test;
+    if(test>0 && test<8)fail_thread=test;
     if(test<0)fail_codec=-test;
-    if(test>=101 && test<=108)fail_init=test-100;
+    if(test>=101 && test<=109)fail_init=test-100;
     ylx_pipeline_config_t config={.sbs_width=3840,.height=1080,.fps=30,.bitrate_kbps=12288,
         .hevc=1,.rate_control=0,.intra_period=30,.min_qp=18,.max_qp=32,.intra_qp=20,
         .initial_qp=22,.vbv_ms=3000,.segment_frames=150,.out_dir="unused"};
@@ -184,10 +195,10 @@ int main(int argc,char **argv) {
     ylx_pipeline_t *pipeline=(void *)(uintptr_t)1;char error[256]={0};
     int result=ylx_pipeline_open(&config,NULL,NULL,&pipeline,error,sizeof(error));
     if(test==0) {
-        assert(result==0 && pipeline && create_calls==6);
+        assert(result==0 && pipeline && create_calls==7);
         assert(ylx_pipeline_finish(pipeline)==0);
         assert(ylx_pipeline_finish(pipeline)==0);
-        ylx_pipeline_close(pipeline);assert(join_calls==6);
+        ylx_pipeline_close(pipeline);assert(join_calls==7);
     } else {
         assert(result==-1 && pipeline==NULL);
         if(fail_thread) {
@@ -237,7 +248,7 @@ int main(int argc,char **argv) {
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_each_thread_creation_failure_reclaims_started_workers_and_resources(self):
-        for number in range(1, 7):
+        for number in range(1, 8):
             with self.subTest(thread=number):
                 self.run_case(number)
 
@@ -253,7 +264,7 @@ int main(int argc,char **argv) {
         self.run_case(99)
 
     def test_each_synchronization_init_failure_avoids_invalid_use_and_leaks(self):
-        for number in range(1, 9):
+        for number in range(1, 10):
             with self.subTest(initializer=number):
                 self.run_case(100 + number)
 

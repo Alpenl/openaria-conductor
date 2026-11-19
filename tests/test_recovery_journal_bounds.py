@@ -67,9 +67,6 @@ class RecoveryJournalBoundsTests(unittest.TestCase):
                 prefix = json_bytes(row)
                 if name == "oversized":
                     tail = prefix[:-1] + b" " * LIMIT + b"\n"
-                if name == "nested":
-                    with self.assertRaises(RecursionError):
-                        json.loads(tail)
                 original = prefix + tail + prefix
                 (root / "imu.ndjson").write_bytes(original)
                 recovered = recover_device_session(root)
@@ -165,7 +162,11 @@ class RecoveryJournalBoundsTests(unittest.TestCase):
                 root = recorder.partial_path
                 damaged = b"[" * 10000 + b"0" + b"]" * 10000 + b"\n"
                 (root / name).write_bytes(damaged)
-                with self.assertRaisesRegex(ValueError, "nesting"):
+                # Decoders with a larger stack can reach the top-level object check.
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"^(recovery metadata nesting exceeds parser limit|invalid recovery metadata)$",
+                ):
                     recover_device_session(root)
                 self.assertEqual((root / name).read_bytes(), damaged)
                 self.assertFalse((root.parent / recorder._plan.session_id).exists())

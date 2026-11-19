@@ -45,6 +45,7 @@ from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
 from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.live_seal import LiveSealing
 from rp_ylx.recording.stereo_encoder import (
+    ENCODER_FINISH_TIMEOUT_SECONDS,
     ClosedSegment,
     StereoEncoderError,
     StereoEncoderProcess,
@@ -2272,7 +2273,7 @@ class DeviceSessionRecorder:
                         raise DeviceRecordingError("segment_invalid", "分段校验线程未在期限内停止")
                     self._harvester = None
                 try:
-                    outcome = transaction.finish(duration, 30.0)
+                    outcome = transaction.finish(duration, ENCODER_FINISH_TIMEOUT_SECONDS)
                 except BaseException as error:
                     raise _recording_error(error, "native_session_store_failed") from error
                 finished_stage("native_finish")

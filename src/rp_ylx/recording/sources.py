@@ -224,6 +224,7 @@ class NativeContinuousCaptureSources:
             engine.start_recording(
                 transaction,
                 lambda code, message: self._runtime_failure(tap, code, message),
+                recover_source_gaps=mode == "production",
             )
         except BaseException:
             with self._lock:
