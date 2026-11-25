@@ -395,6 +395,49 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
+  /capture/readiness:
+    get:
+      tags: [Capture]
+      operationId: getCaptureReadiness
+      summary: Read current storage and recovery admission independently of the last take
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current storage budgets and whether capture is available; start rechecks admission
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema, allowed, code, message, storage]
+                properties:
+                  schema:
+                    const: ylx.capture-readiness.v1
+                  allowed:
+                    type: boolean
+                  code:
+                    type: string
+                  message:
+                    type: string
+                  storage:
+                    type: object
+                    additionalProperties: false
+                    required: [recording, system, backing]
+                    properties:
+                      recording:
+                        $ref: "#/components/schemas/CaptureStorageBudget"
+                      system:
+                        $ref: "#/components/schemas/CaptureStorageBudget"
+                      backing:
+                        $ref: "#/components/schemas/CaptureStorageBudget"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /capture/status:
     get:
       tags: [Capture]
@@ -1698,6 +1741,19 @@ components:
     InternalErrorHead:
       description: Unexpected device error; HEAD sends no response body
   schemas:
+    CaptureStorageBudget:
+      oneOf:
+        - type: "null"
+        - type: object
+          additionalProperties: false
+          required: [available_bytes, required_bytes]
+          properties:
+            available_bytes:
+              type: integer
+              minimum: 0
+            required_bytes:
+              type: integer
+              minimum: 0
     VoiceStatus:
       type: object
       additionalProperties: false

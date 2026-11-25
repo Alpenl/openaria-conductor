@@ -48,6 +48,7 @@ from rp_ylx.api.events import (
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.api.security import AuditEvent, Principal, SecurityPolicy
 from rp_ylx.camera_focus import valid_camera_focus_status
+from rp_ylx.capture_readiness import valid_readiness
 from rp_ylx.capture_timer import valid_timer_settings, valid_timer_status
 from rp_ylx.clock_sync import valid_clock_request, valid_clock_response
 from rp_ylx.firmware_control import FirmwareError, request_firmware
@@ -1399,7 +1400,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _route_methods(self, path: str) -> tuple[str, ...] | None:
         if path in {"/api/v4/capture/timer", "/api/v4/voice"}:
             return ("GET", "POST", "OPTIONS")
-        if path in {"/api/v4/firmware", "/api/v4/firmware/check"}:
+        if path in {"/api/v4/firmware", "/api/v4/firmware/check", "/api/v4/capture/readiness"}:
             return ("GET", "OPTIONS")
         if path in {"/api/v4/firmware/update", "/api/v4/firmware/rollback"}:
             return ("POST", "OPTIONS")
@@ -1533,6 +1534,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v4/voice":
             self._voice_request(write=False)
+            return
+        if path == "/api/v4/capture/readiness":
+            self._capture_readiness_request()
             return
         if path == "/api/v4/capture/timer":
             self._capture_timer_request(write=False)
@@ -3337,6 +3341,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if not valid_timer_status(result):
             self._invalid_source_state("设备定时状态无效")
+            return
+        self._send_json(HTTPStatus.OK, result)
+
+    def _capture_readiness_request(self) -> None:
+        if self._principal("getCaptureReadiness") is None:
+            return
+        method = getattr(self.server.provider, "capture_readiness", None)
+        if not callable(method):
+            self._problem(404, "not_found", "设备不支持录制准入详情")
+            return
+        try:
+            result = method()
+        except ProviderError as error:
+            self._problem(error.status, error.code, error.message, retryable=error.retryable)
+            return
+        except Exception:
+            self._provider_failure()
+            return
+        if not valid_readiness(result):
+            self._invalid_source_state("录制准入详情无效")
             return
         self._send_json(HTTPStatus.OK, result)
 

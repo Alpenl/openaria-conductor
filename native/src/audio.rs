@@ -22,12 +22,13 @@ const WAV_HEADER_BYTES: u64 = 44;
 const DEFAULT_PERIOD_FRAMES: u64 = 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
-const QUEUE_BLOCKS: usize = 768;
+// About 32 seconds of PCM: bounded headroom over the observed 19-second write stall.
+const QUEUE_BLOCKS: usize = 1536;
 // Keep a finite backlog of closed WAV segments, including the in-flight batch.
-// At the default five seconds per segment, 24 slots absorb consecutive slow
-// checkpoint transactions on SD storage without retaining extra PCM buffers.
+// At five seconds per segment, 48 slots cover the observed 142-second
+// checkpoint stall with finite headroom, without retaining extra PCM buffers.
 // No segment is published as durable until the existing syncs have completed.
-const MAX_PENDING_COMMITS: u64 = 24;
+const MAX_PENDING_COMMITS: u64 = 48;
 const IO_BUCKET_NS: [u64; 10] = [
     100_000,
     1_000_000,
@@ -542,6 +543,17 @@ impl Recorder {
     #[cfg(test)]
     pub(crate) fn inject_failure(&self, error: AudioError) {
         self.progress.fail(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_completed_failure(&self, error: AudioError) {
+        self.progress.fail(error.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || sender.send(Err(error)).unwrap());
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.state = State::Running;
+        lifecycle.done = Some(receiver);
+        lifecycle.worker = Some(worker);
     }
 
     pub(crate) fn abort(&self) {
@@ -1997,7 +2009,18 @@ mod tests {
             .unwrap();
         // The commit worker remains blocked until this test explicitly releases
         // it. Further complete PCM segments must still be writable.
-        for _ in 1..super::MAX_PENDING_COMMITS {
+        // 30 default five-second segments cover the observed 142-second
+        // checkpoint stall; the previous 24-segment capacity fails here.
+        for _ in 1..30 {
+            writer.write_frames(&[7; 12], 3, &mut written).unwrap();
+        }
+        assert_eq!(
+            progress
+                .pending_commits
+                .load(std::sync::atomic::Ordering::Acquire),
+            30
+        );
+        for _ in 30..super::MAX_PENDING_COMMITS {
             writer.write_frames(&[7; 12], 3, &mut written).unwrap();
         }
         assert_eq!(

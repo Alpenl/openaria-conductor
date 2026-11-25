@@ -27,8 +27,8 @@
 #define ENCODER_DRAIN_POLLS 25 /* 5s ceiling on a stuck VPU drain */
 #define ERROR_LEN 256
 #define PATH_LEN 512
-#define MUX_QUEUE_BYTES (32u * 1024u * 1024u) /* per eye, compressed packets */
-#define MUX_QUEUE_SECONDS 16u
+#define MUX_QUEUE_BYTES (64u * 1024u * 1024u) /* per eye, compressed packets */
+#define MUX_QUEUE_SECONDS 32u
 /* Bound active muxers independently of closed files waiting for disk sync.
  * Both limits include their respective in-flight work. */
 #define MAX_PENDING_SEGMENTS 32u

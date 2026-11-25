@@ -90,6 +90,41 @@ int main(void) {
 """
         )
 
+    def test_production_budget_retains_twenty_seconds_then_drains_in_order(self):
+        root = Path(__file__).resolve().parents[1] / "src/rp_ylx/hobot"
+        constants = "\n".join(
+            line
+            for line in (root / "ylx_stereo_pipeline.c").read_text().splitlines()
+            if line.startswith(("#define MUX_QUEUE_BYTES", "#define MUX_QUEUE_SECONDS"))
+        )
+        self.compile_and_run(
+            f'#include "{root / "ylx_packet_queue.h"}"\n'
+            + constants
+            + r"""
+#include <assert.h>
+int main(void) {
+    ylx_packet_queue_t queue;
+    assert(!ylx_packet_queue_init(&queue, MUX_QUEUE_BYTES, MUX_QUEUE_SECONDS * 30));
+    // No consumer runs: simulate a 20-second disk stall at 30fps and 8Mbps.
+    unsigned char data[35000];
+    for (unsigned n = 0; n < 600; n++) {
+        memset(data, n % 251, sizeof(data));
+        assert(!ylx_packet_queue_push(&queue, data, sizeof(data), n == 0));
+    }
+    ylx_packet_queue_close(&queue);
+    for (unsigned n = 0; n < 600; n++) {
+        ylx_packet_t *packet = ylx_packet_queue_pop(&queue);
+        assert(packet && packet->size == sizeof(data));
+        for (size_t i = 0; i < packet->size; i++) assert(packet->data[i] == n % 251);
+        ylx_packet_queue_done(&queue, packet);
+    }
+    assert(!ylx_packet_queue_pop(&queue) && queue.bytes == 0 && queue.frames == 0);
+    ylx_packet_queue_destroy(&queue);
+    return 0;
+}
+"""
+        )
+
     def test_one_eye_can_finish_multiple_segments_before_other_eye(self):
         source = (
             Path(__file__).resolve().parents[1] / "src/rp_ylx/hobot/ylx_stereo_pipeline.c"

@@ -54,6 +54,7 @@ from rp_ylx.api.gateway import (
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
 from rp_ylx.camera_focus import valid_camera_focus_status
+from rp_ylx.capture_readiness import SYSTEM_RESERVE_BYTES, SYSTEM_RESERVE_INODES, system_capacity
 from rp_ylx.capture_timer import DEFAULT_TIMER, valid_timer_settings
 from rp_ylx.clock_sync import valid_clock_response
 from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
@@ -867,6 +868,8 @@ class CaptureCoordinator:
                 level="warning",
                 exception_type=type(error).__name__,
             )
+        self._failure_retry = None
+        self._recovery_retry_at = 0.0
         self._recording_paths: dict[Path, dict[str, Path]] = {}
         self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
         persisted = self._read_local_state()
@@ -1386,6 +1389,7 @@ class CaptureCoordinator:
         admission: VolumeAdmission,
         capacity: tuple[int, int, int] | None = None,
     ) -> None:
+        self._require_system_reserve()
         _, available_bytes, available_inodes = (
             _stat_capacity(admission.mountpoint) if capacity is None else capacity
         )
@@ -1398,6 +1402,122 @@ class CaptureCoordinator:
             raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
         if available_inodes < self._config.minimum_available_inodes:
             raise DeviceRecordingError("insufficient_inodes", "录制卷可用 inode 不足")
+
+    def _require_system_reserve(self) -> None:
+        try:
+            available, inodes = system_capacity(self._config.state_root)
+        except OSError as error:
+            raise DeviceRecordingError("storage_unavailable", "无法读取系统状态盘容量") from error
+        if available < SYSTEM_RESERVE_BYTES:
+            raise DeviceRecordingError(
+                "insufficient_space", "系统状态盘可用空间不足，至少需要 256 MiB"
+            )
+        if inodes < SYSTEM_RESERVE_INODES:
+            raise DeviceRecordingError("insufficient_inodes", "系统状态盘可用 inode 不足")
+
+    def capture_readiness(self) -> dict[str, object]:
+        budgets = {"recording": None, "system": None, "backing": None}
+        code, message = "ready", "可以开始新录制"
+        try:
+            available, _ = system_capacity(self._config.state_root)
+            budgets["system"] = {
+                "available_bytes": max(0, available),
+                "required_bytes": SYSTEM_RESERVE_BYTES,
+            }
+            admission = self._require_admission()
+            status = self._check_generation(force=True)
+            budgets["recording"] = {
+                "available_bytes": max(0, status.remaining_bytes or 0),
+                "required_bytes": self._config.minimum_available_bytes,
+            }
+            backing = backing_capacity(admission.mountpoint)
+            if backing is not None:
+                budgets["backing"] = {
+                    "available_bytes": max(0, backing[0]),
+                    "required_bytes": self._config.minimum_available_bytes,
+                }
+            self._require_capture_reserve(admission)
+            if not status.writable:
+                raise DeviceRecordingError("storage_unavailable", "录像盘不可写")
+        except (DeviceRecordingError, OSError) as error:
+            code = getattr(error, "code", "storage_unavailable")
+            message = getattr(error, "message", "无法读取存储状态")
+        with self._lock:
+            if (
+                self._failure_retry is not None
+                or self._failure_inflight is not None
+                or self._failure_pending_commit is not None
+                or self._pending_stop_state_commit is not None
+            ):
+                code, message = (
+                    "recovery_pending",
+                    "正在保存上次录制并释放资源，完成后自动恢复；请勿断电",
+                )
+            elif (
+                self._active is not None
+                or self._stop_inflight is not None
+                or self._stop_acceptance_inflight is not None
+                or self._async_stop_worker is not None
+            ):
+                code, message = "capture_busy", "录制或保存正在进行"
+            elif self._closing:
+                code, message = "capture_busy", "录制服务正在关闭"
+            elif code == "ready" and self._camera_connection_status()["state"] != "connected":
+                code, message = "hardware_unavailable", "相机未连接"
+        return {
+            "schema": "ylx.capture-readiness.v1",
+            "allowed": code == "ready",
+            "code": code,
+            "message": message,
+            "storage": budgets,
+        }
+
+    def reconcile_capture_recovery(self) -> None:
+        """Retry only quiescent owners; never detach a live writer or replay a start."""
+        with self._stop_condition:
+            if (
+                self._closing
+                or self._failure_inflight is not None
+                or self._stop_inflight is not None
+                or self._async_stop_worker is not None
+                or self._stop_acceptance_inflight is not None
+                or time.monotonic() < self._recovery_retry_at
+            ):
+                return
+            self._recovery_retry_at = time.monotonic() + 2.0
+            retry = self._failure_retry
+            pending = self._pending_stop_state_commit
+            if retry is not None:
+                recorder, plan, error = retry
+                if self._active is not recorder or self._active_plan is not plan:
+                    self._failure_retry = None
+                    return
+                self._failure_inflight = recorder
+            elif self._active is None and pending is not None:
+                self._stop_inflight = pending
+            else:
+                return
+        try:
+            if retry is not None:
+                if self._failure_pending_commit is recorder:
+                    self._commit_active_failure(recorder)
+                else:
+                    self._finish_active_failure(recorder, plan, error)
+            else:
+                self._persist_local_state()
+                with self._lock:
+                    if self._pending_stop_state_commit == pending:
+                        self._pending_stop_state_commit = None
+                    self._release_network_operation_lease()
+        finally:
+            with self._stop_condition:
+                if retry is not None and self._failure_inflight is recorder:
+                    self._failure_inflight = None
+                    if self._active is not recorder:
+                        self._failure_projection = None
+                elif retry is None and self._stop_inflight == pending:
+                    self._stop_inflight = None
+                self._stop_condition.notify_all()
 
     def _can_recover_sessions(self, admission: VolumeAdmission) -> bool:
         try:
@@ -3657,6 +3777,11 @@ class CaptureCoordinator:
         observed_at = time.monotonic()
         available = storage.remaining_bytes
         backing_error = None
+        system_error = None
+        try:
+            self._require_system_reserve()
+        except DeviceRecordingError as error:
+            system_error = error.code
         try:
             backing = backing_capacity(admission.mountpoint)
         except DeviceRecordingError as error:
@@ -3679,6 +3804,7 @@ class CaptureCoordinator:
             session_id = plan.session_id
             if (
                 backing_error is None
+                and system_error is None
                 and available >= self._config.minimum_available_bytes
                 and inodes >= self._config.minimum_available_inodes
                 and (
@@ -3690,7 +3816,9 @@ class CaptureCoordinator:
                 )
             ):
                 return
-            if backing_error is not None:
+            if system_error is not None:
+                reserve_reason, error_code = "system_reserve_low", system_error
+            elif backing_error is not None:
                 reserve_reason, error_code = "backing_capacity_unavailable", backing_error
             elif available < self._config.minimum_available_bytes:
                 reserve_reason, error_code = "volume_bytes_low", "insufficient_space"
@@ -4592,6 +4720,7 @@ class CaptureCoordinator:
             projection["updated_at"] = now
             self._failure_projection = projection
             self._failure_inflight = recorder
+            self._failure_retry = (recorder, plan, error)
 
         def finish() -> None:
             try:
@@ -4599,7 +4728,7 @@ class CaptureCoordinator:
             finally:
                 with self._stop_condition:
                     self._failure_inflight = None
-                    if self._failure_pending_commit is not recorder:
+                    if self._active is not recorder:
                         self._failure_projection = None
                     self._stop_condition.notify_all()
 
@@ -4669,12 +4798,13 @@ class CaptureCoordinator:
         self._commit_active_failure(recorder)
 
     def _commit_active_failure(self, recorder: DeviceSessionRecorder) -> None:
-        # A failed write retains the projection and ownership for an explicit
-        # stop retry. No worker is claimed while storage is unavailable.
+        # A failed write retains projection and ownership for the background
+        # retry (or an explicit stop retry), without repeating media recovery.
         self._persist_local_state()
         with self._lock:
             assert self._active is recorder and self._failure_pending_commit is recorder
             self._failure_pending_commit = None
+            self._failure_retry = None
             if self._failure_inflight is None:
                 self._failure_projection = None
             self._active = None

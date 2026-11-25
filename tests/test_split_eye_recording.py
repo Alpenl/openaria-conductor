@@ -683,6 +683,35 @@ class SplitEyeRecordingTest(unittest.TestCase):
             self.assertEqual(diagnostic["encoder"], {"frames_submitted": 7})
             self.assertNotIn("capture", diagnostic)
 
+    def test_failure_file_includes_audio_error_discovered_during_final_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recorder, _, _ = self.build(Path(directory))
+            recorder.start()
+            recorder._stop_writer()
+            drained = False
+
+            def abort(reason):
+                nonlocal drained
+                drained = True
+
+            transaction = Mock()
+            transaction.abort.side_effect = abort
+            transaction.diagnostic_snapshot.side_effect = lambda: {
+                "audio_failure": {"code": "audio_failed", "message": "late commit failure"}
+                if drained
+                else None,
+                "sink": {},
+                "encoder_stats": {},
+            }
+            recorder._native_transaction = transaction
+            with patch.object(recorder, "_harvest_segments"):
+                recorder.fail("encoder_failed", "backpressure", media_lost=True)
+            diagnostic = json.loads(
+                (recorder.partial_path / "failure-diagnostics.json").read_text()
+            )
+            self.assertEqual(diagnostic["audio_failure"]["message"], "late commit failure")
+            self.assertIsNone(recorder._native_transaction)
+
     def test_audio_failure_does_not_hide_encoder_and_index_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             recorder, _, _ = self.build(Path(directory))

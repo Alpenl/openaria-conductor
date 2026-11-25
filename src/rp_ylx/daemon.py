@@ -55,6 +55,7 @@ LAB_OPERATIONS = frozenset(
         "firmwareStatus",
         "firmwareUpdate",
         "getCaptureStatus",
+        "getCaptureReadiness",
         "streamCaptureEvents",
         "listSessions",
         "getSession",
@@ -477,10 +478,12 @@ class ProductionService:
     mdns_publisher: MdnsPublisher
     storage_monitor: StorageReserveMonitor | None = None
     capture_timer_monitor: CaptureTimerMonitor | None = None
+    recovery_monitor: CaptureRecoveryMonitor | None = None
 
     def close(self) -> None:
         error = _close_service_components(
             (
+                ("recovery_monitor", self.recovery_monitor, "close"),
                 ("capture_timer_monitor", self.capture_timer_monitor, "close"),
                 ("storage_monitor", self.storage_monitor, "close"),
                 ("server", self.server, "server_close"),
@@ -606,6 +609,20 @@ class StorageReserveMonitor:
     def close(self) -> None:
         self.stop.set()
         self.thread.join()
+
+
+class CaptureRecoveryMonitor(StorageReserveMonitor):
+    """Failure publication retries must not wait behind the storage monitor."""
+
+    def _run(self) -> None:
+        next_report_at = None
+        while not self.stop.wait(2.0):
+            try:
+                self.coordinator.reconcile_capture_recovery()
+            except Exception as error:
+                next_report_at = _report_worker_failure(
+                    "recording", "capture_recovery_retry_failed", error, next_report_at
+                )
 
 
 class CaptureTimerMonitor(StorageReserveMonitor):
@@ -864,6 +881,7 @@ def build_production_service(
     mdns_publisher = None
     storage_monitor = None
     capture_timer_monitor = None
+    recovery_monitor = None
     try:
         try:
             sources.start_preview()
@@ -936,12 +954,20 @@ def build_production_service(
         mdns_publisher.start()
         storage_monitor = StorageReserveMonitor(coordinator)
         capture_timer_monitor = CaptureTimerMonitor(coordinator)
+        recovery_monitor = CaptureRecoveryMonitor(coordinator)
         return ProductionService(
-            coordinator, server, event_pump, mdns_publisher, storage_monitor, capture_timer_monitor
+            coordinator,
+            server,
+            event_pump,
+            mdns_publisher,
+            storage_monitor,
+            capture_timer_monitor,
+            recovery_monitor,
         )
     except BaseException:
         _close_service_components(
             (
+                ("recovery_monitor", recovery_monitor, "close"),
                 ("capture_timer_monitor", capture_timer_monitor, "close"),
                 ("storage_monitor", storage_monitor, "close"),
                 ("mdns_publisher", mdns_publisher, "close"),
