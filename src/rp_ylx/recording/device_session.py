@@ -1628,11 +1628,6 @@ class DeviceSessionRecorder:
                 return self._partial
             self._state = "stopping"
         self._stop_writer()
-        with suppress(Exception):
-            write_json_atomic(
-                self._partial / "failure-diagnostics.json",
-                {"code": code, "message": message, **self._capture_diagnostics()},
-            )
         if self._native_transaction is not None and not media_lost:
             self._harvest_stop.set()
             if self._harvester is not None:
@@ -1646,6 +1641,14 @@ class DeviceSessionRecorder:
                     duration = max(0, (time.monotonic_ns() - self._started_monotonic_ns) / 1e9)
                     self._native_transaction.finish(duration, 10.0)
         self._abandon_audio()
+        if self._native_transaction is not None:
+            # abort joins native audio before recovery reads its final checkpoint.
+            self._native_transaction.abort(message)
+        with suppress(Exception):
+            write_json_atomic(
+                self._partial / "failure-diagnostics.json",
+                {"code": code, "message": message, **self._capture_diagnostics()},
+            )
         self._abandon_encoder()
         self._close_files(ignore_errors=True)
         self._mark_failed(

@@ -424,32 +424,45 @@ impl SessionTransaction {
                 "transaction finish timeout must be positive",
             ));
         }
+        // One failed stream must not short-circuit draining the others. In
+        // particular, an audio backlog error used to kill the video helper
+        // before it could report already completed pairs.
         let active_take = self
             .active_take
             .lock()
             .map_err(|_| StoreError::poisoned("active take"))?
-            .finish()?;
+            .finish();
         let audio = self
             .audio
             .as_ref()
             .map(|audio| audio.stop(timeout))
-            .transpose()?;
+            .transpose();
         let sink = self
             .sink
             .lock()
             .map_err(|_| StoreError::poisoned("sink"))?
-            .flush_and_close()?;
-        let (segments, submitted_frames, encoder_stats) = {
+            .flush_and_close();
+        let (encoder_result, segments, submitted_frames, encoder_stats) = {
             let mut encoder = self
                 .encoder
                 .lock()
                 .map_err(|_| StoreError::poisoned("encoder"))?;
-            let segments = encoder.finish(timeout)?;
-            let submitted_frames = encoder.submitted_frames();
-            let stats = encoder.stats();
-            (segments, submitted_frames, stats)
+            let result = encoder.finish(timeout);
+            // Only completed, synced segment events enter this inventory, even
+            // if the helper also reported an error in a later segment.
+            (
+                result,
+                encoder.segments(),
+                encoder.submitted_frames(),
+                encoder.stats(),
+            )
         };
-        self.register_segments(&segments)?;
+        let registration = self.register_segments(&segments);
+        let active_take = active_take?;
+        let audio = audio?;
+        let sink = sink?;
+        encoder_result?;
+        registration?;
         let planner = self
             .segment_planner
             .lock()
@@ -812,6 +825,43 @@ printf '{"event":"done","frames":0}\n'
         assert_eq!(second.encoder_stats, first.encoder_stats);
         assert_eq!(transaction.open_handle_count(), 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audio_failure_still_drains_and_registers_video_tail() {
+        let root = temp_root("audio-failure-video-tail");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = segmented_helper(&root, 1);
+        // This pair only becomes visible after stdin closes during finish.
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+printf '{"event":"ready"}\n'
+cat >/dev/null
+cat "$(dirname "$0")/events.ndjson"
+touch "$(dirname "$0")/drained"
+printf '{"event":"done","frames":0}\n'
+"#,
+        )
+        .unwrap();
+        let mut transaction =
+            SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        let audio =
+            crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap();
+        audio.inject_completed_failure(crate::audio::AudioError::new(
+            "audio_failed",
+            "stalled checkpoint",
+        ));
+        transaction.audio = Some(std::sync::Arc::new(audio));
+        let error = transaction
+            .finish(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(error.code, "audio_failed");
+        assert!(root.join("drained").exists());
+        assert_eq!(transaction.state.lock().unwrap().registered_segments, 1);
+        assert_eq!(transaction.segments().unwrap().len(), 1);
+        assert_eq!(transaction.open_handle_count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
