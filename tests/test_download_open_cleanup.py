@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rp_ylx.recording import coordinator as module
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -21,7 +22,10 @@ class DownloadOpenCleanupTests(unittest.TestCase):
         self.addCleanup(self.coordinator.close)
         self.sid = self.fixture.seal_one(self.coordinator)
         manifest = json.loads(
-            (self.fixture.mountpoint / "recordings" / self.sid / "manifest.json").read_text()
+            (
+                resolve_recording(self.fixture.mountpoint / "recordings", self.sid)
+                / "manifest.json"
+            ).read_text()
         )
         self.artifact = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
         self.coordinator.list_sessions(cursor=None, limit=50, take_id=None)

@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 from rp_ylx.api.downloads import ArtifactAccessError
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -33,7 +34,7 @@ class CameraWorkflowTest(unittest.TestCase):
             self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "idle")
         finally:
             coordinator.close()
-        directory = self.fixture.mountpoint / "recordings" / session
+        directory = resolve_recording(self.fixture.mountpoint / "recordings", session)
         manifest = json.loads((directory / "manifest.json").read_bytes())
         artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
         return session, directory, artifact

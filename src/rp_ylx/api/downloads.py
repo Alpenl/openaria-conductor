@@ -29,6 +29,7 @@ from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 from rp_ylx.native import (
     native_session_store_or_none as _session_store_or_none,
 )
+from rp_ylx.recording_layout import open_relative_directory, resolve_recording
 
 
 def _unique_json_key(value: object) -> object:
@@ -609,10 +610,13 @@ class DirectorySessionStore:
         *,
         verified_manifests: Mapping[str, str] | None = None,
         max_manifest_bytes: int = MAX_MANIFEST_BYTES,
+        recording_paths: Mapping[str, Path] | None = None,
     ) -> None:
         if max_manifest_bytes <= 0:
             raise ValueError("max_manifest_bytes 必须大于零")
         self._root_descriptor = _open_absolute_directory(generation_root)
+        self._generation_root = Path(generation_root)
+        self._recording_paths = recording_paths or {}
         self._verified_manifests = {} if verified_manifests is None else verified_manifests
         self._max_manifest_bytes = max_manifest_bytes
         self._lock = threading.Lock()
@@ -648,7 +652,12 @@ class DirectorySessionStore:
             raise ArtifactAccessError("not_found", "会话不存在")
         owned = [self._duplicate_root()]
         try:
-            session_descriptor = _open_directory_component(session_id, owned[-1])
+            relative = self._recording_paths.get(session_id)
+            if relative is None:
+                relative = resolve_recording(
+                    self._generation_root, session_id, root_fd=owned[-1]
+                ).relative_to(self._generation_root)
+            session_descriptor = open_relative_directory(owned[-1], relative)
             owned.append(session_descriptor)
             manifest_descriptor = _open_regular_component("manifest.json", session_descriptor)
             owned.append(manifest_descriptor)

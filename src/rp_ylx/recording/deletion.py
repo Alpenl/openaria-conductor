@@ -12,6 +12,7 @@ from pathlib import Path
 
 from rp_ylx.api.gateway import ProviderError
 from rp_ylx.recording.device_session import DeviceRecordingError, inspect_device_session_directory
+from rp_ylx.recording_layout import iter_recordings, open_relative_directory
 
 SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -48,16 +49,28 @@ def delete_recordings(roots: tuple[Path, ...], expected: dict[str, str]) -> dict
         for root in roots:
             descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, descriptor)
-            for name in os.listdir(descriptor):
-                if SESSION_ID.fullmatch(name) is None:
-                    continue
-                path = root / name
+            parents = {}
+            for path, session_id in iter_recordings(root, root_fd=descriptor):
+                if SESSION_ID.fullmatch(session_id) is None:
+                    raise ProviderError(
+                        "catalog_unavailable", "录制目录身份无效", status=HTTPStatus.CONFLICT
+                    )
+                relative = path.relative_to(root)
+                parent = descriptor
+                if len(relative.parts) > 1:
+                    parent = parents.get(relative.parent)
+                    if parent is None:
+                        parent = open_relative_directory(descriptor, relative.parent)
+                        parents[relative.parent] = parent
+                        stack.callback(os.close, parent)
                 try:
                     if path.is_symlink():
                         raise ValueError("symbolic link")
-                    identity = path.stat()
-                    manifest, payload = inspect_device_session_directory(path)
-                    if manifest["session_id"] != name or name in candidates:
+                    identity = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+                    manifest, payload = inspect_device_session_directory(
+                        path, expected_session_id=session_id
+                    )
+                    if session_id in candidates:
                         raise ValueError("ambiguous recording identity")
                 except (OSError, DeviceRecordingError, ValueError, KeyError) as error:
                     raise ProviderError(
@@ -65,7 +78,7 @@ def delete_recordings(roots: tuple[Path, ...], expected: dict[str, str]) -> dict
                         "录制目录无法安全检查，请先修复或移除异常目录",
                         status=HTTPStatus.CONFLICT,
                     ) from error
-                candidates[name] = (descriptor, identity, manifest, payload)
+                candidates[session_id] = (parent, identity, manifest, payload, relative.name)
         for session_id, digest in expected.items():
             item = candidates.get(session_id)
             if item is None:
@@ -91,16 +104,16 @@ def delete_recordings(roots: tuple[Path, ...], expected: dict[str, str]) -> dict
         )
         deleted, failures = [], []
         for index, name in enumerate(ordered):
-            descriptor, original, _, _ = candidates[name]
+            descriptor, original, _, _, directory_name = candidates[name]
             try:
-                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                current = os.stat(directory_name, dir_fd=descriptor, follow_symlinks=False)
                 if (current.st_dev, current.st_ino, current.st_mode) != (
                     original.st_dev,
                     original.st_ino,
                     original.st_mode,
                 ):
                     raise OSError("录制目录在删除前已变化")
-                shutil.rmtree(name, dir_fd=descriptor)
+                shutil.rmtree(directory_name, dir_fd=descriptor)
                 deleted.append(name)
                 os.fsync(descriptor)
             except OSError:

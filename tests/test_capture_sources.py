@@ -32,6 +32,7 @@ from rp_ylx.recording import (
     validate_device_session_directory,
 )
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
+from rp_ylx.recording_layout import resolve_recording
 from tests.test_capture_coordinator import idle_network_control
 
 JPEG = b"\xff\xd8threaded-sbs\xff\xd9"
@@ -599,7 +600,9 @@ class CaptureSourcesTest(unittest.TestCase):
             self.stop(coordinator, key="continuous-stop")
             retained = coordinator.capture_status()["snapshot"]["retained_unsuccessful"]
             self.assertIsNone(retained)
-            manifest = validate_device_session_directory(self.volume / "recordings" / session_id)
+            manifest = validate_device_session_directory(
+                resolve_recording(self.volume / "recordings", session_id)
+            )
             self.assertGreater(manifest["frames"]["count"], 0)
             self.assertEqual(manifest["integrity"]["dropped_frames"], 0)
             after_stop_preview = coordinator.latest_preview(fps=None, accept="image/jpeg")
@@ -997,7 +1000,7 @@ class CaptureSourcesTest(unittest.TestCase):
             state = retained["outcome"]["recording_state"]
             self.assertEqual(state["state"], "failed")
             self.assertEqual(state["diagnostics"][0]["code"], "source_sequence_gap")
-            self.assertFalse((self.volume / "recordings" / session_id).exists())
+            self.assertFalse((resolve_recording(self.volume / "recordings", session_id)).exists())
         finally:
             coordinator.close()
 
@@ -1031,7 +1034,9 @@ class CaptureSourcesTest(unittest.TestCase):
             self.stop(coordinator, key="continuous-gap-stop")
             retained = coordinator.capture_status()["snapshot"]["retained_unsuccessful"]
             self.assertIsNone(retained)
-            manifest = validate_device_session_directory(self.volume / "recordings" / session_id)
+            manifest = validate_device_session_directory(
+                resolve_recording(self.volume / "recordings", session_id)
+            )
             self.assertEqual(manifest["integrity"]["dropped_frames"], 0)
             self.assertGreaterEqual(manifest["frames"]["count"], 1)
         finally:
@@ -1130,7 +1135,7 @@ class CaptureSourcesTest(unittest.TestCase):
                     )
 
                     partial = self.volume / "recordings" / f"{session_id}.partial"
-                    final = self.volume / "recordings" / session_id
+                    final = resolve_recording(self.volume / "recordings", session_id)
                     self.assertTrue(partial.is_dir())
                     self.assertFalse((partial / "manifest.json").exists())
                     self.assertFalse(final.exists())
@@ -1172,7 +1177,9 @@ class CaptureSourcesTest(unittest.TestCase):
                 )
             )
             self.stop(coordinator, key="after-source-fault-stop")
-            manifest = validate_device_session_directory(self.volume / "recordings" / session_id)
+            manifest = validate_device_session_directory(
+                resolve_recording(self.volume / "recordings", session_id)
+            )
             self.assertEqual(manifest["frames"]["count"], 1)
         finally:
             coordinator.close()

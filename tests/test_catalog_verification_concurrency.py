@@ -12,6 +12,7 @@ import test_capture_coordinator as fixtures
 
 from rp_ylx.api import ProviderError
 from rp_ylx.api.downloads import ArtifactAccessError
+from rp_ylx.recording_layout import resolve_recording
 
 
 class CatalogVerificationConcurrencyTest(unittest.TestCase):
@@ -26,7 +27,7 @@ class CatalogVerificationConcurrencyTest(unittest.TestCase):
             original.close()
         self.coordinator = self.fixture.coordinator()
         self.addCleanup(self.coordinator.close)
-        self.directory = self.fixture.mountpoint / "recordings" / self.session
+        self.directory = resolve_recording(self.fixture.mountpoint / "recordings", self.session)
         payload = (self.directory / "manifest.json").read_bytes()
         self.manifest = json.loads(payload)
         self.artifact = self.manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]

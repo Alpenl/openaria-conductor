@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_async_stop_crash as crash_fixtures
 from tests import test_capture_coordinator as fixtures
 from tests import test_gateway as gateway_fixtures
@@ -19,7 +20,9 @@ class SafeSwapFailureTest(unittest.TestCase):
 
     def pending_with_changed_manifest(self):
         command, accepted = self.crash.kill_at("before_release", "safe_swap")
-        final = self.crash.fixture.mountpoint / "recordings" / accepted["session_id"]
+        final = resolve_recording(
+            self.crash.fixture.mountpoint / "recordings", accepted["session_id"]
+        )
         manifest = json.loads((final / "manifest.json").read_bytes())
         artifact = final / "manifest.json"
         original = artifact.read_bytes()

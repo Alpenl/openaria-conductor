@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.recording import coordinator as module
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -119,15 +120,16 @@ class PartialRootBoundaryTest(unittest.TestCase):
             sid = self.fixture.seal_one(first, prefix="partial-sync")
         finally:
             first.close()
-        final = self.fixture.mountpoint / "recordings" / sid
+        final = resolve_recording(self.fixture.mountpoint / "recordings", sid)
         manifest = (final / "manifest.json").read_bytes()
-        partial = final.with_name(sid + ".partial")
+        partial = self.fixture.mountpoint / "recordings" / (sid + ".partial")
+        legacy_final = partial.parent / sid
         final.rename(partial)
         fsync_directory = module.fsync_directory
         failures = []
 
         def fail_after_rename(path):
-            if path == final.parent and final.exists():
+            if path == legacy_final.parent and legacy_final.exists():
                 failures.append(True)
                 raise OSError("injected parent directory fsync failure")
             return fsync_directory(path)
@@ -137,6 +139,7 @@ class PartialRootBoundaryTest(unittest.TestCase):
         try:
             self.assertEqual(failures, [True])
             self.assertFalse(partial.exists())
+            final = resolve_recording(self.fixture.mountpoint / "recordings", sid)
             self.assertEqual((final / "manifest.json").read_bytes(), manifest)
             self.assertNotIn(sid, restarted._verified)
             fixtures.validate_device_session_directory(final)

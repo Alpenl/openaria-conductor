@@ -13,6 +13,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from rp_ylx.recording import coordinator as module
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -63,7 +64,10 @@ class RecoveryPublishCrashTest(unittest.TestCase):
                     if not normal_stop:
                         self.assertIsNotNone(active.recovered_session)
                     self.assertTrue(
-                        (self.fixture.mountpoint / "recordings" / sid / "manifest.json").is_file()
+                        (
+                            resolve_recording(self.fixture.mountpoint / "recordings", sid)
+                            / "manifest.json"
+                        ).is_file()
                     )
                     if database_failure:
                         self.assertTrue(failed_writes, "database injection was not exercised")
@@ -95,7 +99,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
                     rename = os.rename
 
                     def before_publish(source, destination, *args, **kwargs):
-                        expected = self.fixture.mountpoint / "recordings" / sid
+                        expected = resolve_recording(self.fixture.mountpoint / "recordings", sid)
                         if destination == expected:
                             self.assertTrue((source / "recovery" / "recording.json").is_file())
                             self.assertTrue((source / "manifest.json").is_file())
@@ -219,7 +223,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
     def test_corrupt_metadata_never_creates_outcome_or_blocks_startup(self):
         published = self.kill_after_publication()
         sid = published["session_id"]
-        root = self.fixture.mountpoint / "recordings" / sid
+        root = resolve_recording(self.fixture.mountpoint / "recordings", sid)
         cases = [
             ("manifest.json", lambda x: x.update(session_id=str(uuid.uuid4()))),
             ("manifest.json", lambda x: x.update(volume_id=str(uuid.uuid4()))),
@@ -259,7 +263,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
     def test_unsafe_metadata_files_are_rejected_without_blocking(self):
         published = self.kill_after_publication()
         sid = published["session_id"]
-        root = self.fixture.mountpoint / "recordings" / sid
+        root = resolve_recording(self.fixture.mountpoint / "recordings", sid)
         path = root / "recovery" / "recording.json"
         original = path.read_bytes()
         target = self.fixture.root / "external.json"
@@ -330,7 +334,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
                 outcome["outcome"]["recording_state"]["diagnostics"][0]["code"],
                 "source_sequence_gap",
             )
-            self.assertTrue((root / sid / "manifest.json").is_file())
+            self.assertTrue((resolve_recording(root, sid) / "manifest.json").is_file())
             self.assertFalse((root / (sid + ".partial")).exists())
         finally:
             coordinator.close()
@@ -338,7 +342,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
     def test_symlink_session_and_recovery_directories_are_not_followed(self):
         published = self.kill_after_publication()
         sid = published["session_id"]
-        root = self.fixture.mountpoint / "recordings" / sid
+        root = resolve_recording(self.fixture.mountpoint / "recordings", sid)
         for path in (root, root / "recovery"):
             with self.subTest(path=path.name):
                 moved = self.fixture.root / "moved-directory"

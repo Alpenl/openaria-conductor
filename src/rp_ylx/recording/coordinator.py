@@ -86,6 +86,12 @@ from rp_ylx.recording.recovery import (
     RECOVERY_ROLE,
     recover_device_session,
 )
+from rp_ylx.recording_layout import (
+    iter_recordings,
+    open_relative_directory,
+    publish_readable,
+    resolve_recording,
+)
 from rp_ylx.runtime import collect_linux_runtime
 from rp_ylx.voice_feedback import notify as notify_voice
 from rp_ylx.voice_feedback import valid_volume
@@ -666,11 +672,16 @@ class _MultiRootSessionStore:
         roots: tuple[Path, ...],
         *,
         verified_manifests: Mapping[str, str],
+        recording_paths: Mapping[Path, Mapping[str, Path]] | None = None,
     ) -> None:
         self._stores = []
         with ExitStack() as cleanup:
             for root in roots:
-                store = DirectorySessionStore(root, verified_manifests=verified_manifests)
+                store = DirectorySessionStore(
+                    root,
+                    verified_manifests=verified_manifests,
+                    recording_paths=None if recording_paths is None else recording_paths.get(root),
+                )
                 cleanup.callback(store.close)
                 self._stores.append(store)
             cleanup.pop_all()
@@ -856,6 +867,7 @@ class CaptureCoordinator:
                 level="warning",
                 exception_type=type(error).__name__,
             )
+        self._recording_paths: dict[Path, dict[str, Path]] = {}
         self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
         persisted = self._read_local_state()
         self._authority_epoch = str(persisted.get("authority_epoch") or uuid.uuid4())
@@ -1436,7 +1448,9 @@ class CaptureCoordinator:
                 continue
             for sessions_root in admission.catalog_roots:
                 try:
-                    recovered, _ = inspect_device_session_directory(sessions_root / session_id)
+                    recovered, _ = inspect_device_session_directory(
+                        resolve_recording(sessions_root, session_id)
+                    )
                 except (OSError, DeviceRecordingError):
                     continue
                 if any(log.get("role") == RECOVERY_ROLE for log in recovered["logs"]):
@@ -1497,6 +1511,7 @@ class CaptureCoordinator:
                     descriptor, ("manifest.json",), MAX_MANIFEST_BYTES
                 )
                 self._verified[session_id] = hashlib.sha256(payload).hexdigest()
+                self._publish_recording_directory(final, json.loads(payload))
                 return
             except (OSError, ValueError, RecursionError, DeviceRecordingError):
                 if published or self._partial_directory_current(final, descriptor):
@@ -1524,13 +1539,18 @@ class CaptureCoordinator:
             return None
         retryable_read = False
         for sessions_root in admission.catalog_roots:
+            session_opened = False
             try:
                 with ExitStack() as cleanup:
                     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
                     root_fd = os.open(sessions_root, flags)
                     cleanup.callback(os.close, root_fd)
-                    session_fd = os.open(session_id, flags, dir_fd=root_fd)
+                    relative = resolve_recording(sessions_root, session_id).relative_to(
+                        sessions_root
+                    )
+                    session_fd = open_relative_directory(root_fd, relative)
                     cleanup.callback(os.close, session_fd)
+                    session_opened = True
                     if os.fstat(session_fd).st_dev != admission.device:
                         raise ValueError("recovery session is on a different device")
                     state, _ = _read_recovery_metadata(
@@ -1592,6 +1612,12 @@ class CaptureCoordinator:
                 if expected_log not in manifest["logs"]:
                     raise ValueError("recovery receipt is not bound to the published manifest")
             except FileNotFoundError:
+                # A damaged manifest or temporarily replaced readable directory
+                # can hide the UUID. Keep the pending recovery identity for a
+                # later repaired-volume retry; absence of recovery files inside
+                # an opened normal recording still settles the identity.
+                if not session_opened:
+                    retryable_read = True
                 continue
             except (
                 OSError,
@@ -1615,6 +1641,21 @@ class CaptureCoordinator:
             self._recovery_session = None
         return None
 
+    def _publish_recording_directory(self, path: Path, manifest: Mapping[str, object]) -> Path:
+        try:
+            published = publish_readable(path, manifest)
+            self._recording_paths.setdefault(path.parent, {})[str(manifest["session_id"])] = (
+                published.relative_to(path.parent)
+            )
+            return published
+        except (OSError, ValueError, AttributeError):
+            operational_logger("recording").event(
+                "readable_directory_deferred",
+                level="warning",
+                transaction_id=str(manifest.get("session_id")),
+            )
+            return resolve_recording(path.parent, str(manifest["session_id"]))
+
     def _recover_completed_prefix(self, partial: Path, session_id: str) -> None:
         try:
             recovered = recover_device_session(partial)
@@ -1628,6 +1669,7 @@ class CaptureCoordinator:
         ):
             return
         if recovered is not None:
+            self._publish_recording_directory(recovered.path, recovered.manifest)
             self._verified[session_id] = recovered.manifest_sha256
             self._record_saved_prefix(session_id, recovered.manifest)
 
@@ -1739,6 +1781,7 @@ class CaptureCoordinator:
         store = _MultiRootSessionStore(
             admission.catalog_roots,
             verified_manifests={session_id: manifest_sha256},
+            recording_paths=self._recording_paths,
         )
         try:
             try:
@@ -1825,6 +1868,7 @@ class CaptureCoordinator:
         store = _MultiRootSessionStore(
             admission.catalog_roots,
             verified_manifests={session_id: snapshot.manifest_sha256},
+            recording_paths=self._recording_paths,
         )
         try:
             # Coarse timestamps can collide across same-size writes. Recheck
@@ -1904,7 +1948,7 @@ class CaptureCoordinator:
                 self._invalidate_session_verification(session_id)
             admission = self._require_admission()
             for root in admission.catalog_roots:
-                directory = root / session_id
+                directory = resolve_recording(root, session_id)
                 if not directory.is_dir():
                     continue
                 try:
@@ -1986,6 +2030,7 @@ class CaptureCoordinator:
         store = _MultiRootSessionStore(
             admission.catalog_roots,
             verified_manifests={session_id: snapshot.manifest_sha256},
+            recording_paths=self._recording_paths,
         )
         try:
             payload, manifest_identity, artifact_identities = store.snapshot_verified_identities(
@@ -2022,119 +2067,28 @@ class CaptureCoordinator:
         with self._catalog_lock, self._catalog_db.scan():
             discovered: set[str] = set()
             for sessions_root in admission.catalog_roots:
-                # Directory entries avoid a separate type stat for every child.
-                # Verified sessions still require fresh secure manifest opens.
-                with os.scandir(sessions_root) as candidates:
-                    for candidate in candidates:
-                        # Preserve Path.is_dir's handling of link loops.
-                        if candidate.is_symlink():
-                            candidate = sessions_root / candidate.name
-                        if (
-                            not candidate.is_dir()
-                            or candidate.name.endswith(".partial")
-                            or candidate.name in discovered
-                        ):
+                for directory, session_id in iter_recordings(sessions_root):
+                    self._recording_paths.setdefault(sessions_root, {})[session_id] = (
+                        directory.relative_to(sessions_root)
+                    )
+                    if session_id in discovered:
+                        continue
+                    discovered.add(session_id)
+                    summary = self._session_summaries.get(session_id)
+                    snapshot = self._session_snapshots.get(session_id)
+                    if summary is not None and snapshot is not None:
+                        if self._session_manifest_is_current(session_id, snapshot):
                             continue
-                        discovered.add(candidate.name)
-                        session_id = candidate.name
-                        summary = self._session_summaries.get(session_id)
-                        snapshot = self._session_snapshots.get(session_id)
-                        if summary is not None and snapshot is not None:
-                            if self._session_manifest_is_current(session_id, snapshot):
-                                continue
-                            self._invalidate_session_verification(session_id)
-                            try:
-                                manifest, payload = inspect_device_session_directory(
-                                    sessions_root / session_id
-                                )
-                                self._session_summaries[session_id] = self._session_summary(
-                                    session_id,
-                                    manifest,
-                                    payload,
-                                    verification_current=False,
-                                )
-                                self._session_diagnostics.pop(session_id, None)
-                            except (
-                                OSError,
-                                DeviceRecordingError,
-                                KeyError,
-                                TypeError,
-                                ValueError,
-                            ) as error:
-                                self._session_summaries.pop(session_id, None)
-                                self._session_diagnostics[session_id] = self._session_diagnostic(
-                                    session_id,
-                                    error,
-                                )
-                            continue
-
+                        self._invalidate_session_verification(session_id)
                         try:
-                            signature = self._catalog_db.signature(sessions_root / session_id)
-                            cached = self._catalog_db.cached(
-                                admission.volume_id,
-                                session_id,
-                                signature,
-                                self._config.session.commit,
-                                directory=sessions_root / session_id,
-                                validate_summary=validate_session_summary,
-                                cache_validation=True,
-                                required_artifact_role=(
-                                    RECOVERY_ROLE
-                                    if session_id in self._retained
-                                    and session_id not in self._verified
-                                    else None
-                                ),
-                            )
-                        except OSError:
-                            cached = None
-                        if cached is not None:
-                            if summary is None or snapshot is None:
-                                self._session_summaries[session_id] = cached
-                            self._session_diagnostics.pop(session_id, None)
-                            continue
-                        # A changed manifest must not keep a stale metadata-only summary.
-                        self._session_summaries.pop(session_id, None)
-                        summary = None
-
-                        # A summary without a snapshot is already metadata-only.
-                        # Only an explicit artifact request can promote it to verified.
-                        if summary is not None:
-                            continue
-                        try:
-                            inspected_signature = self._catalog_db.signature(
-                                sessions_root / session_id
-                            )
-                            manifest, payload = inspect_device_session_directory(
-                                sessions_root / session_id
-                            )
-                            recovered = any(
-                                log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
-                            )
-                            if (
-                                session_id in self._retained
-                                and session_id not in self._verified
-                                and not recovered
-                            ):
-                                self._session_diagnostics[session_id] = self._session_diagnostic(
-                                    session_id, "会话发布失败，未进入可下载 catalog"
-                                )
-                                continue
+                            manifest, payload = inspect_device_session_directory(directory)
                             self._session_summaries[session_id] = self._session_summary(
                                 session_id,
                                 manifest,
                                 payload,
                                 verification_current=False,
                             )
-                            self._catalog_db.remember(
-                                admission.volume_id,
-                                sessions_root / session_id,
-                                self._config.session.commit,
-                                self._session_summaries[session_id],
-                                manifest,
-                                expected_signature=inspected_signature,
-                            )
                             self._session_diagnostics.pop(session_id, None)
-                            self._invalidate_session_verification(session_id)
                         except (
                             OSError,
                             DeviceRecordingError,
@@ -2143,16 +2097,92 @@ class CaptureCoordinator:
                             ValueError,
                         ) as error:
                             self._session_summaries.pop(session_id, None)
-                            self._verified.pop(session_id, None)
-                            self._session_snapshots.pop(session_id, None)
-                            diagnostic = self._session_diagnostic(session_id, error)
-                            current_diagnostic = self._session_diagnostics.get(session_id)
-                            if (
-                                current_diagnostic is not None
-                                and current_diagnostic.get("code") == diagnostic["code"]
-                            ):
-                                diagnostic = current_diagnostic
-                            self._session_diagnostics[session_id] = diagnostic
+                            self._session_diagnostics[session_id] = self._session_diagnostic(
+                                session_id,
+                                error,
+                            )
+                        continue
+
+                    try:
+                        signature = self._catalog_db.signature(directory)
+                        cached = self._catalog_db.cached(
+                            admission.volume_id,
+                            session_id,
+                            signature,
+                            self._config.session.commit,
+                            directory=directory,
+                            validate_summary=validate_session_summary,
+                            cache_validation=True,
+                            required_artifact_role=(
+                                RECOVERY_ROLE
+                                if session_id in self._retained and session_id not in self._verified
+                                else None
+                            ),
+                        )
+                    except OSError:
+                        cached = None
+                    if cached is not None:
+                        if summary is None or snapshot is None:
+                            self._session_summaries[session_id] = cached
+                        self._session_diagnostics.pop(session_id, None)
+                        continue
+                    # A changed manifest must not keep a stale metadata-only summary.
+                    self._session_summaries.pop(session_id, None)
+                    summary = None
+
+                    # A summary without a snapshot is already metadata-only.
+                    # Only an explicit artifact request can promote it to verified.
+                    if summary is not None:
+                        continue
+                    try:
+                        inspected_signature = self._catalog_db.signature(directory)
+                        manifest, payload = inspect_device_session_directory(directory)
+                        recovered = any(
+                            log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
+                        )
+                        if (
+                            session_id in self._retained
+                            and session_id not in self._verified
+                            and not recovered
+                        ):
+                            self._session_diagnostics[session_id] = self._session_diagnostic(
+                                session_id, "会话发布失败，未进入可下载 catalog"
+                            )
+                            continue
+                        self._session_summaries[session_id] = self._session_summary(
+                            session_id,
+                            manifest,
+                            payload,
+                            verification_current=False,
+                        )
+                        self._catalog_db.remember(
+                            admission.volume_id,
+                            directory,
+                            self._config.session.commit,
+                            self._session_summaries[session_id],
+                            manifest,
+                            expected_signature=inspected_signature,
+                        )
+                        self._session_diagnostics.pop(session_id, None)
+                        self._invalidate_session_verification(session_id)
+                    except (
+                        OSError,
+                        DeviceRecordingError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        self._session_summaries.pop(session_id, None)
+                        self._verified.pop(session_id, None)
+                        self._session_snapshots.pop(session_id, None)
+                        diagnostic = self._session_diagnostic(session_id, error)
+                        current_diagnostic = self._session_diagnostics.get(session_id)
+                        if (
+                            current_diagnostic is not None
+                            and current_diagnostic.get("code") == diagnostic["code"]
+                        ):
+                            diagnostic = current_diagnostic
+                        self._session_diagnostics[session_id] = diagnostic
 
             self._catalog_db.discard_missing(admission.volume_id, discovered)
             for session_id in set(self._session_summaries) - discovered:
@@ -4404,6 +4434,7 @@ class CaptureCoordinator:
                         status=HTTPStatus.CONFLICT,
                         retryable=True,
                     )
+            published_path = self._publish_recording_directory(sealed.path, sealed.manifest)
             # This rebuildable metadata can wait for an unrelated list scan or
             # SQLite writer. Keep the stop owner and leases, but leave status
             # readers free to observe the sealed recorder while it is pending.
@@ -4417,7 +4448,7 @@ class CaptureCoordinator:
                 try:
                     self._catalog_db.remember(
                         plan.volume_id,
-                        self._require_admission().sessions_root / plan.session_id,
+                        published_path,
                         self._config.session.commit,
                         self._session_summaries[plan.session_id],
                         sealed.manifest,
@@ -4621,6 +4652,9 @@ class CaptureCoordinator:
             # fail() can return early for an already failed writer. Recover it
             # once, but do not rescan an unchanged long take after a failed try.
             recovered = recorder.recover_completed_segments()
+        if not media_lost and recovered is not None:
+            published = self._publish_recording_directory(recovered.path, recovered.manifest)
+            recorder.recovered_session = replace(recovered, path=published)
         with self._lock:
             if state is None or state.get("state") not in {"recoverable", "failed", "abandoned"}:
                 state = self._local_failure_state(plan, error, media_lost=media_lost)
@@ -4936,6 +4970,7 @@ class CaptureCoordinator:
         return _MultiRootSessionStore(
             admission.catalog_roots,
             verified_manifests=self._verified,
+            recording_paths=self._recording_paths,
         )
 
     def open_manifest(self, session_id: str, api_version: str) -> object:
@@ -4990,7 +5025,7 @@ class CaptureCoordinator:
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
         admission = self._require_admission()
         for sessions_root in admission.catalog_roots:
-            path = sessions_root / session_id
+            path = resolve_recording(sessions_root, session_id)
             try:
                 manifest, _ = inspect_device_session_directory(path)
                 return manifest

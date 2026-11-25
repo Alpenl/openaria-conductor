@@ -53,6 +53,7 @@ from rp_ylx.recording.stereo_encoder import (
 )
 from rp_ylx.recording.verified import VerifiedArtifact
 from rp_ylx.recording.verified import identity as verified_identity
+from rp_ylx.recording_layout import manifest_identity
 
 
 class DeviceRecordingError(RuntimeError):
@@ -2698,7 +2699,11 @@ def inspect_device_session_directory(
         finally:
             os.close(manifest_fd)
         manifest = json.loads(payload)
-        selected_session_id = root.name if expected_session_id is None else expected_session_id
+        selected_session_id = (
+            manifest_identity(root, manifest)
+            if expected_session_id is None
+            else expected_session_id
+        )
         if not isinstance(manifest, dict) or manifest.get("session_id") != selected_session_id:
             raise DeviceRecordingError("manifest_invalid", "manifest 会话身份无效")
         validate_device_session_manifest(manifest)
@@ -2762,7 +2767,11 @@ def validate_device_session_directory(
                 payload = _read_bounded_fd(manifest_fd, MAX_MANIFEST_BYTES, code="manifest_invalid")
             finally:
                 os.close(manifest_fd)
-            selected_session_id = root.name if expected_session_id is None else expected_session_id
+            selected_session_id = (
+                manifest_identity(root, json.loads(payload))
+                if expected_session_id is None
+                else expected_session_id
+            )
             manifest = validated_device_session_payload(payload, selected_session_id)
             descriptors = _manifest_artifacts(manifest)
             if progress is not None:

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
 from rp_ylx.recording import validate_device_session_directory
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 from tests.test_async_stop import (
     check_started_worker_cancellation,
@@ -114,7 +115,9 @@ class AsyncStopCrashTest(unittest.TestCase):
             self.assertEqual(replay.body, accepted["accepted"])
             self.assertIsNone(coordinator._async_stop_worker)
             self.assertIsNone(coordinator.current_safe_swap_receipt())
-            final = self.fixture.mountpoint / "recordings" / accepted["session_id"]
+            final = resolve_recording(
+                self.fixture.mountpoint / "recordings", accepted["session_id"]
+            )
             if stage == "before_catalog_publication":
                 validate_device_session_directory(final)
                 listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
@@ -170,7 +173,7 @@ class AsyncStopCrashTest(unittest.TestCase):
 
     def test_pending_release_rejects_manifest_changed_while_process_was_dead(self):
         command, accepted = self.kill_at("before_release", "safe_swap")
-        final = self.fixture.mountpoint / "recordings" / accepted["session_id"]
+        final = resolve_recording(self.fixture.mountpoint / "recordings", accepted["session_id"])
         manifest = json.loads((final / "manifest.json").read_bytes())
         artifact = final / "manifest.json"
         payload = artifact.read_bytes()
@@ -204,7 +207,7 @@ class AsyncStopCrashTest(unittest.TestCase):
 
     def test_pending_release_remains_bound_to_original_manifest_bytes(self):
         command, accepted = self.kill_at("before_release", "safe_swap")
-        final = self.fixture.mountpoint / "recordings" / accepted["session_id"]
+        final = resolve_recording(self.fixture.mountpoint / "recordings", accepted["session_id"])
         path = final / "manifest.json"
         original = path.read_bytes()
         path.write_bytes(original + b"\n")

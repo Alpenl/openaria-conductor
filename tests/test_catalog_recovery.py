@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from rp_ylx.api.events import validate_session_list
 from rp_ylx.recording.device_session import inspect_device_session_directory
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -35,7 +36,7 @@ class CatalogRecoveryTest(unittest.TestCase):
             first.close()
 
     def assert_rebuilt(self, broken, healthy, store, expected):
-        directory = self.fixture.mountpoint / "recordings" / broken
+        directory = resolve_recording(self.fixture.mountpoint / "recordings", broken)
         before = hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest()
         reopened = self.fixture.coordinator()
         try:
@@ -149,7 +150,7 @@ class CatalogRecoveryTest(unittest.TestCase):
                     (broken,),
                 ).fetchone()[0]
                 db.execute("UPDATE sessions SET summary='{' WHERE session=?", (broken,))
-            path = self.fixture.mountpoint / "recordings" / broken / relative
+            path = resolve_recording(self.fixture.mountpoint / "recordings", broken) / relative
             original = path.read_bytes()  # Tiny generated test fixture, never device media.
             path.write_bytes(b"damaged")
             page = reopened.list_sessions(cursor=None, limit=50, take_id=None, api_version="v4")
