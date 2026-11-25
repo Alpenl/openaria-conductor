@@ -9,6 +9,7 @@ from rp_ylx.api import CaptureCommand, ProviderError
 from rp_ylx.api.events import validate_capture_status
 from rp_ylx.persistence import PersistenceError
 from rp_ylx.recording.device_session import uuid7
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -177,7 +178,9 @@ class CommandReceiptAdmissionTest(unittest.TestCase):
             recovered=True, prefix="unrelated-delete"
         )
         manifest = json.loads(
-            (self.fixture.mountpoint / "recordings" / sid / "manifest.json").read_bytes()
+            (
+                resolve_recording(self.fixture.mountpoint / "recordings", sid) / "manifest.json"
+            ).read_bytes()
         )
         coordinator._record_saved_prefix(sid, manifest)
         coordinator._persist_local_state()

@@ -250,7 +250,7 @@ class RecoveryIndexCompressionTests(unittest.TestCase):
                     )
                     getattr(fixture, case)()
                     manifests = list(
-                        (fixture.fixture.mountpoint / "recordings").glob("*/manifest.json")
+                        (fixture.fixture.mountpoint / "recordings").rglob("manifest.json")
                     )
                     self.assertEqual(len(manifests), 1)
                     manifest = json.loads(manifests[0].read_bytes())

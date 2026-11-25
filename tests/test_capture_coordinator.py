@@ -52,6 +52,7 @@ from rp_ylx.recording import (
 from rp_ylx.recording.coordinator import _TrackedRepresentation
 from rp_ylx.recording.device_session import inspect_device_session_directory
 from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
+from rp_ylx.recording_layout import resolve_recording
 
 JPEG = b"\xff\xd8raw-side-by-side\xff\xd9"
 COMMIT = "a" * 40
@@ -636,7 +637,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 while c._active is not None and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertIsNone(c._active)
-                self.assertTrue((self.mountpoint / "recordings" / sid / "manifest.json").exists())
+                self.assertTrue(
+                    (
+                        resolve_recording(self.mountpoint / "recordings", sid) / "manifest.json"
+                    ).exists()
+                )
             finally:
                 monitor.close()
             self.assertFalse(monitor.thread.is_alive())
@@ -717,7 +722,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
             self.assertIsNone(c._active)
             self.assertIsNone(c.capture_timer_status()["active"])
             self.assertTrue(
-                (self.mountpoint / "recordings" / timer[0].session_id / "manifest.json").is_file()
+                (
+                    resolve_recording(self.mountpoint / "recordings", timer[0].session_id)
+                    / "manifest.json"
+                ).is_file()
             )
             self.assertEqual(c.capture_status()["snapshot"]["device_state"], "idle")
 
@@ -1551,7 +1559,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator.enforce_storage_reserve()
             self.assertIsNone(coordinator._active)
             manifest = validate_device_session_directory(
-                self.mountpoint / "recordings" / session_id
+                resolve_recording(self.mountpoint / "recordings", session_id)
             )
             self.assertTrue(manifest["sealed"])
         finally:
@@ -1564,7 +1572,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         session_id = retained["recording_state"]["session_id"]
         coordinator.submit_frame(frame())
         coordinator.stop_capture(stop_command(prefix + "-stop"))
-        directory = self.mountpoint / "recordings" / session_id
+        directory = resolve_recording(self.mountpoint / "recordings", session_id)
         if recovered:
             # A valid published prefix still has a failed retained outcome.
             payload = b'{"outcome":"interrupted"}\n'
@@ -1656,7 +1664,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
     def test_recovered_catalog_marker_is_bound_to_unchanged_manifest(self):
         coordinator, session_id = self._retained_catalog_entry(recovered=True)
         try:
-            path = self.mountpoint / "recordings" / session_id / "manifest.json"
+            path = resolve_recording(self.mountpoint / "recordings", session_id) / "manifest.json"
             before = path.stat()
             payload = path.read_bytes()
             marker = coordinator_module.RECOVERY_ROLE.encode()
@@ -1733,7 +1741,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 try:
                     session_id = self.seal_one(first, prefix=f"low-{capacity}-{backing}")
                     deletion = self.deletion_command(first, {session_id}, key=session_id)
-                    session = self.mountpoint / "recordings" / session_id
+                    session = resolve_recording(self.mountpoint / "recordings", session_id)
                     manifest_bytes = (session / "manifest.json").read_bytes()
                     video = json.loads(manifest_bytes)["video"]["segments"][0]["artifacts"]["left"]
                     video_bytes = (session / video["path"]).read_bytes()
@@ -1789,8 +1797,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session_id = self.seal_one(first)
         finally:
             first.close()
-        session = self.mountpoint / "recordings" / session_id
-        partial = session.with_name(session_id + ".partial")
+        session = resolve_recording(self.mountpoint / "recordings", session_id)
+        partial = self.mountpoint / "recordings" / (session_id + ".partial")
         session.rename(partial)
         original_files = {
             str(p.relative_to(partial)): p.read_bytes() for p in partial.rglob("*") if p.is_file()
@@ -1839,7 +1847,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                         coordinator.enforce_storage_reserve()
                     self.assertIsNone(coordinator._active)
                     manifest = validate_device_session_directory(
-                        self.mountpoint / "recordings" / session_id
+                        resolve_recording(self.mountpoint / "recordings", session_id)
                     )
                     self.assertTrue(manifest["sealed"])
                 finally:
@@ -1858,9 +1866,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator.enforce_storage_reserve()
             self.assertIsNone(coordinator._active)
             self.assertTrue(
-                validate_device_session_directory(self.mountpoint / "recordings" / session_id)[
-                    "sealed"
-                ]
+                validate_device_session_directory(
+                    resolve_recording(self.mountpoint / "recordings", session_id)
+                )["sealed"]
             )
         finally:
             coordinator.close()
@@ -1896,7 +1904,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator)
-            session = self.mountpoint / "recordings" / session_id
+            session = resolve_recording(self.mountpoint / "recordings", session_id)
+            self.assertRegex(session.parent.name, r"^\d{4}-\d{2}-\d{2}$")
+            self.assertRegex(session.name, r"^\d{2}-\d{2}-\d{2}(?:_\d+)?$")
+            self.assertEqual(session.parent.parent, self.mountpoint / "recordings")
+            self.assertFalse((self.mountpoint / "recordings" / session_id).exists())
             manifest = validate_device_session_directory(session)
             self.assertEqual(manifest["schema"], "ylx.device-session.v2")
             self.assertEqual(manifest["imu"]["coordinate_frame"], "raw_device_axes")
@@ -1962,8 +1974,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             command = self.deletion_command(coordinator, {first})
             result = coordinator.delete_sessions(command)
             self.assertEqual(result.body["deleted_session_ids"], [first])
-            self.assertFalse((self.mountpoint / "recordings" / first).exists())
-            self.assertTrue((self.mountpoint / "recordings" / second).exists())
+            self.assertFalse((resolve_recording(self.mountpoint / "recordings", first)).exists())
+            self.assertTrue((resolve_recording(self.mountpoint / "recordings", second)).exists())
             self.assertTrue(coordinator.delete_sessions(command).replayed)
             items = coordinator.list_sessions(cursor=None, limit=50, take_id=None)["items"]
             self.assertEqual([item["session_id"] for item in items], [second])
@@ -1997,7 +2009,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     CaptureCommand("bridge", "changed", body, json.dumps(body).encode())
                 )
             self.assertEqual(rejected.exception.code, "manifest_changed")
-            self.assertTrue((self.mountpoint / "recordings" / session_id).exists())
+            self.assertTrue(
+                (resolve_recording(self.mountpoint / "recordings", session_id)).exists()
+            )
         finally:
             coordinator.close()
 
@@ -2011,9 +2025,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
             inspect = deletion.inspect_device_session_directory
 
-            def linked(path):
-                manifest, payload = inspect(path)
-                if path.name == second:
+            def linked(path, **kwargs):
+                manifest, payload = inspect(path, **kwargs)
+                if manifest["session_id"] == second:
                     manifest = deepcopy(manifest)
                     manifest["take"]["continuation_of"] = first
                 return manifest, payload
@@ -2023,7 +2037,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     coordinator.delete_sessions(command)
                 self.assertEqual(rejected.exception.code, "continuation_required")
             root = self.mountpoint / "recordings"
-            (root / first).rename(self.mountpoint / "outside")
+            resolve_recording(root, first).rename(self.mountpoint / "outside")
             (root / first).symlink_to(self.mountpoint / "outside", target_is_directory=True)
             with self.assertRaises(ProviderError) as rejected:
                 coordinator.delete_sessions(command)
@@ -2056,7 +2070,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             remaining = result.body["failed_sessions"][0]["session_id"]
             legacy = self.mountpoint / "sessions"
             legacy.mkdir()
-            (self.mountpoint / "recordings" / remaining).rename(legacy / remaining)
+            (resolve_recording(self.mountpoint / "recordings", remaining)).rename(
+                legacy / remaining
+            )
         finally:
             coordinator.close()
         restarted = self.coordinator()
@@ -2076,7 +2092,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         first = self.coordinator()
         try:
             session_id = self.seal_one(first, prefix="legacy-sessions")
-            current = self.mountpoint / "recordings" / session_id
+            current = resolve_recording(self.mountpoint / "recordings", session_id)
             legacy_root = self.mountpoint / "sessions"
             legacy_root.mkdir()
             legacy = legacy_root / session_id
@@ -2376,7 +2392,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             first.close()
 
-        manifest_path = self.mountpoint / "recordings" / unsealed_session_id / "manifest.json"
+        manifest_path = (
+            resolve_recording(self.mountpoint / "recordings", unsealed_session_id) / "manifest.json"
+        )
         manifest = json.loads(manifest_path.read_bytes())
         manifest["sealed"] = False
         manifest_path.write_text(
@@ -2384,7 +2402,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             encoding="utf-8",
         )
         unknown_session_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
-        unknown_directory = self.mountpoint / "recordings" / unknown_session_id
+        unknown_directory = resolve_recording(self.mountpoint / "recordings", unknown_session_id)
         unknown_directory.mkdir()
         (unknown_directory / "manifest.json").write_text(
             json.dumps(
@@ -2479,7 +2497,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(verify.call_count, 0)
                 self.assertIsNone(listed["items"][0]["verification"])
                 manifest = json.loads(
-                    (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                    (
+                        resolve_recording(self.mountpoint / "recordings", session_id)
+                        / "manifest.json"
+                    ).read_bytes()
                 )
                 artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
                 restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
@@ -2504,7 +2525,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             first.close()
         legacy_root = self.mountpoint / "sessions"
         legacy_root.mkdir()
-        (self.mountpoint / "recordings" / legacy).rename(legacy_root / legacy)
+        (resolve_recording(self.mountpoint / "recordings", legacy)).rename(legacy_root / legacy)
         restarted = self.coordinator()
         try:
             listed = restarted.list_sessions(cursor=None, limit=50, take_id=None)
@@ -2527,7 +2548,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 (current, self.mountpoint / "recordings"),
                 (legacy, legacy_root),
             ):
-                manifest = json.loads((root / session_id / "manifest.json").read_bytes())
+                manifest = json.loads(
+                    (resolve_recording(root, session_id) / "manifest.json").read_bytes()
+                )
                 artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
                 with (
                     patch.object(Path, "iterdir", without_catalog_scan),
@@ -2537,7 +2560,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     ) as opened,
                 ):
                     self.assertEqual(
-                        opened.read(), (root / session_id / artifact["path"]).read_bytes()
+                        opened.read(),
+                        (resolve_recording(root, session_id) / artifact["path"]).read_bytes(),
                     )
                 self.assertEqual(
                     len(restarted.list_sessions(cursor=None, limit=50, take_id=None)["items"]), 2
@@ -2549,7 +2573,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="target-path")
-            root = self.mountpoint / "recordings" / session_id
+            root = resolve_recording(self.mountpoint / "recordings", session_id)
             manifest = json.loads((root / "manifest.json").read_bytes())
             artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
             for invalid in (
@@ -2571,7 +2595,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="other-eye-corrupt")
-            root = self.mountpoint / "recordings" / session_id
+            root = resolve_recording(self.mountpoint / "recordings", session_id)
             manifest = json.loads((root / "manifest.json").read_bytes())
             artifacts = manifest["video"]["segments"][0]["artifacts"]
             right = root / artifacts["right"]["path"]
@@ -2596,7 +2620,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             first.close()
         restarted = self.coordinator()
         try:
-            root = self.mountpoint / "recordings" / session_id
+            root = resolve_recording(self.mountpoint / "recordings", session_id)
             manifest = json.loads((root / "manifest.json").read_bytes())
             from rp_ylx.recording.coordinator import validate_device_session_directory
 
@@ -2638,7 +2662,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                             )
                             self.assertIsNone(selected["verification"])
                     if corrupt:
-                        root = self.mountpoint / "recordings" / session_id
+                        root = resolve_recording(self.mountpoint / "recordings", session_id)
                         manifest = json.loads((root / "manifest.json").read_bytes())
                         path = root / manifest["video"]["segments"][0]["artifacts"]["left"]["path"]
                         payload = bytearray(path.read_bytes())
@@ -2653,7 +2677,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     )
                     self.assertIsNone(selected["verification"])
                     manifest = json.loads(
-                        (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                        (
+                            resolve_recording(self.mountpoint / "recordings", session_id)
+                            / "manifest.json"
+                        ).read_bytes()
                     )
                     artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"][
                         "artifact_id"
@@ -2675,7 +2702,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session_id = self.seal_one(first, prefix="interrupt-catalog")
         finally:
             first.close()
-        root = self.mountpoint / "recordings" / session_id
+        root = resolve_recording(self.mountpoint / "recordings", session_id)
         manifest = json.loads((root / "manifest.json").read_bytes())
         artifact = manifest["video"]["segments"][0]["artifacts"]["left"]
         path = root / artifact["path"]
@@ -2707,7 +2734,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             for saved_id in list(coordinator._session_summaries):
                 coordinator._verify_catalog_session(saved_id)
             manifest = json.loads(
-                (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                (
+                    resolve_recording(self.mountpoint / "recordings", session_id) / "manifest.json"
+                ).read_bytes()
             )
             self.assertGreater(len(list(iter_device_session_v1_artifacts(manifest))), 1)
 
@@ -2735,7 +2764,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator = self.coordinator()
                 try:
                     session_id = self.seal_one(coordinator, prefix=f"identity-{change}")
-                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    manifest_path = (
+                        resolve_recording(self.mountpoint / "recordings", session_id)
+                        / "manifest.json"
+                    )
                     original = manifest_path.read_bytes()
                     metadata = manifest_path.stat()
                     if change == "replace":
@@ -2770,7 +2802,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 coordinator = self.coordinator()
                 try:
                     session_id = self.seal_one(coordinator, prefix=f"coarse-manifest-{restarted}")
-                    manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+                    manifest_path = (
+                        resolve_recording(self.mountpoint / "recordings", session_id)
+                        / "manifest.json"
+                    )
                     original = manifest_path.read_bytes()
                     metadata = manifest_path.stat()
                     if restarted:
@@ -2821,7 +2856,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             sid = self.seal_one(coordinator, prefix="large-recovery-manifest")
-            directory = self.mountpoint / "recordings" / sid
+            directory = resolve_recording(self.mountpoint / "recordings", sid)
             path = directory / "manifest.json"
             original = path.read_bytes()
             payload = original + b" " * (20 * 1024 * 1024 - len(original))
@@ -2841,7 +2876,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 )
             downloads_module._clear_validated_manifest_cache_for_tests()
             with (
-                DirectorySessionStore(directory.parent) as store,
+                DirectorySessionStore(self.mountpoint / "recordings") as store,
                 patch.object(
                     downloads_module,
                     "_decode_and_validate_manifest",
@@ -2936,7 +2971,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         coordinator = self.coordinator()
         try:
             session_id = self.seal_one(coordinator, prefix="catalog-session-link")
-            original = self.mountpoint / "recordings" / session_id
+            original = resolve_recording(self.mountpoint / "recordings", session_id)
             retired = self.mountpoint / "outside-recordings"
             original.rename(retired)
             original.symlink_to(retired, target_is_directory=True)
@@ -3937,7 +3972,10 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 self.assertEqual(verify.call_count, 0)
                 self.assertIsNone(listed["items"][0]["verification"])
                 manifest = json.loads(
-                    (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+                    (
+                        resolve_recording(self.mountpoint / "recordings", session_id)
+                        / "manifest.json"
+                    ).read_bytes()
                 )
                 artifact_id = manifest["video"]["segments"][0]["artifacts"]["left"]["artifact_id"]
                 restarted.open_verified_artifact(session_id, artifact_id, "v4").close()
@@ -3949,7 +3987,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 restarted.close()
         self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
         manifest = json.loads(
-            (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+            (
+                resolve_recording(self.mountpoint / "recordings", session_id) / "manifest.json"
+            ).read_bytes()
         )
         expected_bytes = sum(
             int(artifact["bytes"]) for artifact in iter_device_session_v1_artifacts(manifest)
@@ -3963,7 +4003,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             first.close()
 
-        session = self.mountpoint / "recordings" / session_id
+        session = resolve_recording(self.mountpoint / "recordings", session_id)
         manifest = json.loads((session / "manifest.json").read_bytes())
         video = manifest["video"]["segments"][0]["artifacts"]["left"]
         artifact_path = session / video["path"]
@@ -4014,7 +4054,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             )
             self.assertEqual(before["items"][0]["verification"]["verdict"], "usable")
 
-            session = self.mountpoint / "recordings" / session_id
+            session = resolve_recording(self.mountpoint / "recordings", session_id)
             manifest = json.loads((session / "manifest.json").read_bytes())
             video = manifest["video"]["segments"][0]["artifacts"]["left"]
             artifact_path = session / video["path"]
@@ -4057,7 +4097,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
         self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
         manifest = json.loads(
-            (self.mountpoint / "recordings" / session_id / "manifest.json").read_bytes()
+            (
+                resolve_recording(self.mountpoint / "recordings", session_id) / "manifest.json"
+            ).read_bytes()
         )
         self.assertEqual(native.verify_calls, [])
         self.assertEqual(
@@ -4101,7 +4143,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             listed = coordinator.list_sessions(cursor=None, limit=50, take_id=None)
             validate_session_list(listed, limit=50, take_id=None)
             self.assertEqual([item["session_id"] for item in listed["items"]], [session_id])
-            manifest_path = self.mountpoint / "recordings" / session_id / "manifest.json"
+            manifest_path = (
+                resolve_recording(self.mountpoint / "recordings", session_id) / "manifest.json"
+            )
             manifest = json.loads(manifest_path.read_bytes())
             self.assertEqual(manifest["video"]["layout"], "split-eyes")
             expected_bytes = (
@@ -4119,7 +4163,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             with coordinator.open_verified_artifact(
                 session_id, left["artifact_id"], "v3"
             ) as artifact:
-                expected = self.mountpoint / "recordings" / session_id / left["path"]
+                expected = (
+                    resolve_recording(self.mountpoint / "recordings", session_id) / left["path"]
+                )
                 self.assertEqual(artifact.read(), expected.read_bytes())
         finally:
             coordinator.close()
@@ -5262,7 +5308,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
         )
         try:
             session_id = self.seal_one(coordinator, prefix="cal", mode="calibration")
-            session = self.mountpoint / "recordings" / session_id
+            session = resolve_recording(self.mountpoint / "recordings", session_id)
             manifest = validate_device_session_directory(session)
             self.assertEqual(manifest["capture_mode"], "calibration")
             self.assertEqual(manifest["video"]["layout"], "split-eyes")
@@ -5330,7 +5376,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             partial = self.mountpoint / "recordings" / f"{session_id}.partial"
             self.assertTrue(partial.is_dir())
             self.assertFalse((partial / "manifest.json").exists())
-            self.assertFalse((self.mountpoint / "recordings" / session_id).exists())
+            self.assertFalse(
+                (resolve_recording(self.mountpoint / "recordings", session_id)).exists()
+            )
             with self.assertRaises(DeviceRecordingError) as invalid:
                 validate_device_session_directory(partial)
             self.assertEqual(invalid.exception.code, "manifest_invalid")
@@ -5372,7 +5420,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
                     self.assertEqual(stopped.exception.code, "write_failed")
                     partial = self.mountpoint / "recordings" / f"{session_id}.partial"
-                    final = self.mountpoint / "recordings" / session_id
+                    final = resolve_recording(self.mountpoint / "recordings", session_id)
                     self.assertTrue(partial.is_dir())
                     self.assertFalse((partial / "manifest.json").exists())
                     self.assertFalse(final.exists())
@@ -5437,7 +5485,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             settled = json.loads((partial / "recording.json").read_bytes())
             self.assertEqual(settled["state"], "recoverable")
             self.assertEqual(settled["diagnostics"][0]["code"], "process_interrupted")
-            self.assertFalse((self.mountpoint / "recordings" / session_id).exists())
+            self.assertFalse(
+                (resolve_recording(self.mountpoint / "recordings", session_id)).exists()
+            )
             validate_capture_status(restarted.capture_status())
         finally:
             restarted.close()
@@ -5448,8 +5498,8 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session_id = self.seal_one(first, prefix="rename")
         finally:
             first.close()
-        final = self.mountpoint / "recordings" / session_id
-        partial = final.with_name(f"{session_id}.partial")
+        final = resolve_recording(self.mountpoint / "recordings", session_id)
+        partial = self.mountpoint / "recordings" / f"{session_id}.partial"
         final.rename(partial)
 
         restarted = self.coordinator()
@@ -5464,7 +5514,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
         first = self.coordinator()
         session_id = self.seal_one(first, prefix="catalog-repair")
         first.close()
-        video = next((self.mountpoint / "recordings" / session_id / "video").glob("left_*.mp4"))
+        video = next(
+            (resolve_recording(self.mountpoint / "recordings", session_id) / "video").glob(
+                "left_*.mp4"
+            )
+        )
         original = video.read_bytes()
         video.write_bytes(b"bad")
         reopened = self.coordinator()
@@ -5484,7 +5538,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
             session_id = self.seal_one(first, prefix="digest")
         finally:
             first.close()
-        video = next((self.mountpoint / "recordings" / session_id / "video").glob("left_*.mp4"))
+        video = next(
+            (resolve_recording(self.mountpoint / "recordings", session_id) / "video").glob(
+                "left_*.mp4"
+            )
+        )
         video.write_bytes(b"tampered")
 
         restarted = self.coordinator()
@@ -5520,7 +5578,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             partial = self.mountpoint / "recordings" / f"{session_id}.partial"
             self.assertTrue(partial.is_dir())
             self.assertFalse((partial / "manifest.json").exists())
-            self.assertFalse((self.mountpoint / "recordings" / session_id).exists())
+            self.assertFalse(
+                (resolve_recording(self.mountpoint / "recordings", session_id)).exists()
+            )
             with self.assertRaises(DeviceRecordingError) as invalid:
                 validate_device_session_directory(partial)
             self.assertEqual(invalid.exception.code, "manifest_invalid")
@@ -5553,7 +5613,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
             ):
                 coordinator.stop_capture(stop_command("post-publish-stop"))
             self.assertEqual(rejected.exception.code, "digest_mismatch")
-            final = self.mountpoint / "recordings" / session_id
+            final = resolve_recording(self.mountpoint / "recordings", session_id)
             self.assertTrue(final.is_dir())
             self.assertTrue((final / "manifest.json").is_file())
             self.assertFalse(final.with_name(f"{session_id}.partial").exists())

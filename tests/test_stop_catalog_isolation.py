@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -59,7 +60,10 @@ class StopCatalogIsolationTest(unittest.TestCase):
         signature = coordinator._catalog_db.signature
 
         def delayed_signature(directory):
-            if directory.name == old_sid and threading.current_thread().name == "list-worker":
+            if (
+                directory == resolve_recording(fixture.mountpoint / "recordings", old_sid)
+                and threading.current_thread().name == "list-worker"
+            ):
                 entered.set()
                 if not release.wait(10):
                     raise TimeoutError("test directory gate")

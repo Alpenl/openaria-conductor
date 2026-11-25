@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from rp_ylx.api import CaptureCommand, ProviderError
 from rp_ylx.recording import deletion
+from rp_ylx.recording_layout import resolve_recording
 from tests import test_capture_coordinator as fixtures
 
 
@@ -20,7 +21,9 @@ class DeletedRecordingOutcomesTest(unittest.TestCase):
     def recovered(self, prefix):
         coordinator, sid = self.fixture._retained_catalog_entry(recovered=True, prefix=prefix)
         manifest = json.loads(
-            (self.fixture.mountpoint / "recordings" / sid / "manifest.json").read_bytes()
+            (
+                resolve_recording(self.fixture.mountpoint / "recordings", sid) / "manifest.json"
+            ).read_bytes()
         )
         coordinator._record_saved_prefix(sid, manifest)
         coordinator._persist_local_state()
@@ -41,7 +44,8 @@ class DeletedRecordingOutcomesTest(unittest.TestCase):
                     "session_id": sid,
                     "manifest_sha256": hashlib.sha256(
                         (
-                            self.fixture.mountpoint / "recordings" / sid / "manifest.json"
+                            resolve_recording(self.fixture.mountpoint / "recordings", sid)
+                            / "manifest.json"
                         ).read_bytes()
                     ).hexdigest(),
                 }
@@ -153,7 +157,7 @@ class DeletedRecordingOutcomesTest(unittest.TestCase):
             self.assertRaises(OSError),
         ):
             coordinator.delete_sessions(command)
-        self.assertFalse((self.fixture.mountpoint / "recordings" / sid).exists())
+        self.assertFalse((resolve_recording(self.fixture.mountpoint / "recordings", sid)).exists())
         self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
         with patch.object(
             deletion, "delete_recordings", side_effect=AssertionError("duplicate delete")
@@ -166,7 +170,7 @@ class DeletedRecordingOutcomesTest(unittest.TestCase):
 
     def test_missing_media_without_delete_receipt_keeps_failure_diagnostics(self):
         coordinator, sid = self.recovered("missing-media")
-        (self.fixture.mountpoint / "recordings" / sid).rename(
+        (resolve_recording(self.fixture.mountpoint / "recordings", sid)).rename(
             self.fixture.root / "disconnected-media"
         )
         coordinator.close()
