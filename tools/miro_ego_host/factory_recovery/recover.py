@@ -332,19 +332,32 @@ def restore(args: argparse.Namespace) -> None:
         else:
             raise RuntimeError("Install still pending; do not reflash or clear logs")
 
-        volume = int(profile.get("voice", {"volume": 100})["volume"])
+        voice_payload = device.voice_settings_payload(profile)
         has_alsa_state = "var/lib/alsa/asound.state" in profile["files"]
-        finalize_script = f"""import json, os, pathlib, subprocess
+        finalize_script = f"""import json, os, pathlib, pwd, subprocess, uuid
 subprocess.run(['systemctl', 'is-active', '--quiet', 'miro-ego.service'], check=True)
 subprocess.run(['systemctl', 'daemon-reload'], check=True)
 subprocess.run(['systemctl', 'stop', 'miro-ego.service'], check=True)
 voice = pathlib.Path('/var/lib/miro-ego/voice.json')
 voice.parent.mkdir(parents=True, exist_ok=True)
-tmp = voice.with_suffix('.json.tmp')
-payload = json.dumps({{'schema': 'miro-ego.voice.v1', 'volume': {volume}}}) + '\\n'
-tmp.write_text(payload, encoding='utf-8')
-tmp.chmod(0o640)
-os.replace(tmp, voice)
+tmp = voice.with_name(f'.{{voice.name}}.{{uuid.uuid4().hex}}.tmp')
+payload = json.dumps({voice_payload!r}, indent=2, sort_keys=True) + '\\n'
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as out:
+        os.fchmod(out.fileno(), 0o640)
+        try:
+            pw = pwd.getpwnam('miro-ego')
+            os.fchown(out.fileno(), pw.pw_uid, pw.pw_gid)
+        except KeyError:
+            pass
+        out.write(payload)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, voice)
+except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
 if {has_alsa_state!r}:
     subprocess.run(['alsactl', 'restore'], check=True)
 subprocess.run(['systemctl', 'start', 'miro-ego.service'], check=True)

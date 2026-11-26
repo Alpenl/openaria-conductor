@@ -5,7 +5,7 @@ Pure-Python, read-only exporter for Miro-Ego `MIRO-EGO` exFAT recording partitio
 ## Capabilities
 
 - **Strictly read-only**: opens raw cards or images in `rb` mode without mounting, repairing, or modifying a single byte on the SD card.
-- **Canonical layout only**: reads `recordings/YYYY-MM-DD/HH-MM-SS/` (including `_02..` same-second suffixes) with `miro-ego.device-session.v1` manifests.
+- **Canonical layout only**: reads `recordings/YYYY-MM-DD/HH-MM-SS/` (including `_02..` same-second suffixes) and unsynced-clock `recordings/unknown-date/recording_NN/` sessions with `miro-ego.device-session.v1` manifests.
 - **Full SHA-256 verification**: verifies every copied file against both source-to-destination readback SHA-256 and the exact `bytes` + `sha256` recorded for every artifact (`video.left`, `video.right`, `imu.samples`, `frames.index`, `audio.wav`, `logs`) in `manifest.json`.
 - **Diagnostic log export**: supports exporting `/logs/` (including `logs/wifi-watchdog/`) alongside recordings (`--include-logs`) or standalone (`--logs-only`).
 - **`sudo` ownership restoration**: restores exported directory and file ownership to `SUDO_UID:SUDO_GID` on Linux/macOS when invoked under `sudo`.

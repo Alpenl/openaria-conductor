@@ -27,9 +27,14 @@ else:
 MAGIC = b"MEB1"
 AUTOINSTALL_SCHEMA = "miro-ego.autoinstall.v1"
 NATIVE_BUNDLE_SCHEMA = "miro-ego.rdk-x5-bundle.v1"
+TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
+REQUIRED_NATIVE_BINARIES = ("bin/miro-ego", "bin/miro-ego-encoder")
+BUNDLE_MANIFEST_KEYS = frozenset({"schema", "platform", "version", "commit", "binaries", "assets"})
+BUNDLE_ENTRY_KEYS = frozenset({"path", "bytes", "sha256", "executable"})
 ELF_MACHINE_AARCH64 = 183
 MAX_PROFILE_BYTES = 16 * 1024**2
 MAX_BINARY_BYTES = 256 * 1024**2
+MAX_BUNDLE_MANIFEST_BYTES = 128 * 1024
 MAX_DEPLOY_ASSET_BYTES = 1024**2
 MAX_BUNDLE_MEMBERS = 10000
 MAX_BUNDLE_TOTAL_BYTES = 4 * 1024**3
@@ -118,9 +123,74 @@ def _normalize_tar_path(name: str) -> PurePosixPath | None:
     return path
 
 
+def _validate_bundle_manifest(
+    metadata: Any,
+    by_path: dict[str, tarfile.TarInfo],
+) -> None:
+    if not isinstance(metadata, dict):
+        raise RuntimeError("bundle.json must be a JSON object")
+    unknown = set(metadata) - BUNDLE_MANIFEST_KEYS
+    if unknown:
+        raise RuntimeError(f"bundle.json contains unknown field(s): {', '.join(sorted(unknown))}")
+    if metadata.get("schema") != NATIVE_BUNDLE_SCHEMA:
+        raise RuntimeError(f"bundle.json schema must be {NATIVE_BUNDLE_SCHEMA}")
+    if metadata.get("platform") != TARGET_PLATFORM:
+        raise RuntimeError(f"bundle.json platform must be {TARGET_PLATFORM}")
+    version = metadata.get("version")
+    if (
+        not isinstance(version, str)
+        or not 1 <= len(version) <= 64
+        or any(ord(c) < 0x20 or ord(c) == 0x7F for c in version)
+    ):
+        raise RuntimeError("bundle.json version is invalid")
+    commit = metadata.get("commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError("bundle.json commit must be a 40-character lowercase hex SHA")
+    binaries = metadata.get("binaries")
+    assets = metadata.get("assets", [])
+    if not isinstance(binaries, list) or not binaries or not isinstance(assets, list):
+        raise RuntimeError("bundle.json must declare non-empty binaries list and valid assets list")
+
+    declared_binaries: set[str] = set()
+    for section_name, entries in (("binaries", binaries), ("assets", assets)):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"bundle.json {section_name} entry must be an object")
+            extra_keys = set(entry) - BUNDLE_ENTRY_KEYS
+            if extra_keys:
+                raise RuntimeError(f"bundle.json entry has unknown key(s): {sorted(extra_keys)}")
+            rel = entry.get("path")
+            size = entry.get("bytes")
+            digest = entry.get("sha256")
+            executable = entry.get("executable", False)
+            if (
+                not isinstance(rel, str)
+                or type(size) is not int
+                or size < 0
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or type(executable) is not bool
+            ):
+                raise RuntimeError(f"Malformed bundle.json entry in {section_name}")
+            member = by_path.get(rel)
+            if member is None or not member.isfile() or member.size != size:
+                raise RuntimeError(f"bundle.json entry {rel!r} missing or size mismatch in tar")
+            if section_name == "binaries":
+                declared_binaries.add(rel)
+            elif not rel.startswith("deploy/miro-ego/"):
+                raise RuntimeError(f"bundle.json asset must live under deploy/miro-ego/: {rel}")
+    for required in REQUIRED_NATIVE_BINARIES:
+        if required not in declared_binaries:
+            raise RuntimeError(f"bundle.json missing required binary declaration: {required}")
+
+
 def require_native_bundle(bundle: str | Path) -> None:
     """Validate a native AArch64 Miro-Ego bundle with exFAT ``miro-ego-data-volume`` support.
 
+    Strictly matches ``crates/miro-ego-deploy/src/bundle.rs``: requires both
+    ``bin/miro-ego`` and ``bin/miro-ego-encoder`` (AArch64 ELF64), ``bundle.json``
+    (``miro-ego.rdk-x5-bundle.v1``, ``platform == "linux_aarch64_rdk_x5_v1"``),
+    ``SHA256SUMS``, and exFAT-only ``deploy/miro-ego/miro-ego-data-volume*`` assets.
     Rejects Python wheel/CPython runtime bundles, non-AArch64 binaries, unsafe tar
     members, and any legacy loop-volume fallback assets.
     """
@@ -144,8 +214,13 @@ def require_native_bundle(bundle: str | Path) -> None:
             if key in by_path:
                 raise RuntimeError(f"Duplicate bundle member: {key!r}")
             filename = rel.name
-            if filename.endswith(".whl") or (
-                filename.startswith("cpython-") and filename.endswith(".tar.gz")
+            lower_key = key.lower()
+            if (
+                filename.endswith(".whl")
+                or (filename.startswith("cpython-") and filename.endswith(".tar.gz"))
+                or lower_key.startswith("runtime/")
+                or "/site-packages/" in lower_key
+                or lower_key.endswith("/python3")
             ):
                 raise RuntimeError(
                     "Legacy Python runtime/wheel bundles are unsupported; "
@@ -153,36 +228,33 @@ def require_native_bundle(bundle: str | Path) -> None:
                 )
             by_path[key] = member
 
-        miro_bin = by_path.get("bin/miro-ego")
-        if miro_bin is None or not miro_bin.isfile() or not 64 <= miro_bin.size <= MAX_BINARY_BYTES:
-            raise RuntimeError("Missing native AArch64 bin/miro-ego executable in bundle")
-        extracted_bin = archive.extractfile(miro_bin)
-        if extracted_bin is None:
-            raise RuntimeError("Unable to read bin/miro-ego from bundle")
-        with extracted_bin as src:
-            validate_aarch64_elf(src.read(64), name="bin/miro-ego")
-
-        encoder_bin = by_path.get("bin/miro-ego-encoder")
-        if encoder_bin is not None:
-            if not encoder_bin.isfile() or not 64 <= encoder_bin.size <= MAX_BINARY_BYTES:
-                raise RuntimeError("Invalid bin/miro-ego-encoder executable in bundle")
-            extracted_enc = archive.extractfile(encoder_bin)
-            if extracted_enc is None:
-                raise RuntimeError("Unable to read bin/miro-ego-encoder from bundle")
-            with extracted_enc as src:
-                validate_aarch64_elf(src.read(64), name="bin/miro-ego-encoder")
+        for binary_rel in REQUIRED_NATIVE_BINARIES:
+            bin_member = by_path.get(binary_rel)
+            if (
+                bin_member is None
+                or not bin_member.isfile()
+                or not 64 <= bin_member.size <= MAX_BINARY_BYTES
+            ):
+                raise RuntimeError(f"Missing native AArch64 {binary_rel} executable in bundle")
+            extracted_bin = archive.extractfile(bin_member)
+            if extracted_bin is None:
+                raise RuntimeError(f"Unable to read {binary_rel} from bundle")
+            with extracted_bin as src:
+                validate_aarch64_elf(src.read(64), name=binary_rel)
 
         bundle_meta = by_path.get("bundle.json")
-        if bundle_meta is not None:
-            if not bundle_meta.isfile() or bundle_meta.size > MAX_DEPLOY_ASSET_BYTES:
-                raise RuntimeError("Invalid bundle.json in native bundle")
-            extracted_meta = archive.extractfile(bundle_meta)
-            if extracted_meta is None:
-                raise RuntimeError("Unable to read bundle.json")
-            with extracted_meta as src:
-                metadata = json.loads(src.read())
-            if not isinstance(metadata, dict) or metadata.get("schema") != NATIVE_BUNDLE_SCHEMA:
-                raise RuntimeError(f"bundle.json schema must be {NATIVE_BUNDLE_SCHEMA}")
+        if (
+            bundle_meta is None
+            or not bundle_meta.isfile()
+            or bundle_meta.size > MAX_BUNDLE_MANIFEST_BYTES
+        ):
+            raise RuntimeError("Missing or invalid bundle.json in native bundle")
+        extracted_meta = archive.extractfile(bundle_meta)
+        if extracted_meta is None:
+            raise RuntimeError("Unable to read bundle.json")
+        with extracted_meta as src:
+            metadata = json.loads(src.read())
+        _validate_bundle_manifest(metadata, by_path)
 
         sums = by_path.get("SHA256SUMS")
         if sums is None or not sums.isfile():

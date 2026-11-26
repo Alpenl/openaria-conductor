@@ -176,6 +176,41 @@ class CardExportExfatTests(unittest.TestCase):
         # Source card image must remain bit-for-bit unmodified.
         self.assertEqual(disks.sha256_file(self.card), before_sha)
 
+    def test_unknown_date_unsynced_clock_recordings_export_and_verify(self) -> None:
+        files_u1, manifest_u1 = _sample_session_files(seed=21)
+        exfat_img = self.root / "unknown-date.exfat"
+        exfat_img.write_bytes(
+            build_exfat_image(
+                {
+                    "recordings": {
+                        "unknown-date": {
+                            "recording_01": _session_tree(files_u1, manifest_u1),
+                            # Non-canonical child under unknown-date must be ignored.
+                            "not_a_recording": {"manifest.json": b"{}"},
+                        },
+                        # Legacy UUID folder still ignored.
+                        "0198c9a8-7a3c-7000-8000-000000000088": {"manifest.json": b"{}"},
+                    },
+                    "sessions": {"unknown-date": {"recording_01": {"manifest.json": b"{}"}}},
+                }
+            )
+        )
+        dest = self.root / "unknown-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            self.assertEqual(
+                [r["id"] for r in records], ["exfat/recordings/unknown-date/recording_01"]
+            )
+            self.assertTrue(records[0]["sealed"])
+            output = tool.export_selected(records, dest)
+
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["verified_artifacts"], 6)
+        exported_left = output / "exfat/recordings/unknown-date/recording_01/video/left_00000.mp4"
+        self.assertEqual(exported_left.read_bytes(), files_u1["video/left_00000.mp4"])
+
     def test_logs_only_cli_export(self) -> None:
         dest = self.root / "logs-out"
         dest.mkdir()

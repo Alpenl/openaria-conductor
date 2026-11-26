@@ -45,7 +45,9 @@ SESSION_MANIFEST_SCHEMA = "miro-ego.device-session.v1"
 EXPORT_REPORT_SCHEMA = "miro-ego.card-export-report.v1"
 
 DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-TIME_DIR_RE = re.compile(r"^\d{2}-\d{2}-\d{2}(?:_\d{2,})?$")
+TIME_DIR_RE = re.compile(r"^\d{2}-\d{2}-\d{2}(?:_\d{1,5})?$")
+UNKNOWN_DATE_DIR = "unknown-date"
+UNKNOWN_TIME_DIR_RE = re.compile(r"^recording_\d{1,5}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _RESERVED_WINDOWS_NAMES = frozenset(
@@ -692,7 +694,7 @@ def manifest_artifacts(manifest: Any) -> dict[str, tuple[int, str]]:
 
 
 def recordings(found: list[tuple[str, Any, bool, str]]) -> list[dict[str, Any]]:
-    """Discover ``recordings/YYYY-MM-DD/HH-MM-SS[_NN]/`` sessions on ``MIRO-EGO`` exFAT volumes."""
+    """Discover ``YYYY-MM-DD/HH-MM-SS[_NN]`` and ``unknown-date/recording_NN`` sessions."""
     result: list[dict[str, Any]] = []
     for label, fs, unclean, volume_label in found:
         rec_root = get_optional(fs, "/recordings")
@@ -701,14 +703,18 @@ def recordings(found: list[tuple[str, Any, bool, str]]) -> list[dict[str, Any]]:
         for day_node in sorted(rec_root.iterdir(), key=lambda n: n.filename):
             if day_node.filetype != stat.S_IFDIR:
                 continue
-            if DAY_DIR_RE.fullmatch(day_node.filename) is None:
+            if DAY_DIR_RE.fullmatch(day_node.filename) is not None:
+                child_re = TIME_DIR_RE
+            elif day_node.filename == UNKNOWN_DATE_DIR:
+                child_re = UNKNOWN_TIME_DIR_RE
+            else:
                 # Ignore non-canonical or legacy top-level folders (e.g. UUID directories).
                 continue
             day_name = safe_name(day_node.filename)
             for session_node in sorted(day_node.iterdir(), key=lambda n: n.filename):
                 if session_node.filetype != stat.S_IFDIR:
                     continue
-                if TIME_DIR_RE.fullmatch(session_node.filename) is None:
+                if child_re.fullmatch(session_node.filename) is None:
                     continue
                 time_name = safe_name(session_node.filename)
                 manifest_node = get_optional(

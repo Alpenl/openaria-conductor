@@ -61,6 +61,7 @@ def factory_profile(
     *,
     board: str = "a" * 64,
     voice_volume: int = 42,
+    voice_enabled: bool | None = True,
     extra_files: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Build a valid ``miro-ego.factory-profile.v1`` profile dictionary."""
@@ -81,11 +82,14 @@ def factory_profile(
             "data": base64.b64encode(raw).decode("ascii"),
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
+    voice: dict[str, Any] = {"volume": voice_volume}
+    if voice_enabled is not None:
+        voice["enabled"] = voice_enabled
     return {
         "schema": "miro-ego.factory-profile.v1",
         "board": board,
         "files": encoded,
-        "voice": {"volume": voice_volume},
+        "voice": voice,
     }
 
 
@@ -98,10 +102,12 @@ def make_native_bundle(
     helper_bytes: bytes | None = DATA_VOLUME_SCRIPT,
     unit_bytes: bytes | None = DATA_VOLUME_UNIT,
     bundle_schema: str | None = "miro-ego.rdk-x5-bundle.v1",
+    bundle_platform: str = "linux_aarch64_rdk_x5_v1",
+    bundle_extra_fields: dict[str, Any] | None = None,
     include_sums: bool = True,
     extra_files: dict[str, bytes] | None = None,
 ) -> Path:
-    """Create a synthetic native Miro-Ego ``bundle.tar`` archive on disk."""
+    """Create a synthetic native Miro-Ego ``bundle.tar`` archive matching ``BundleManifest``."""
     files: dict[str, tuple[bytes, int]] = {}
     if miro_ego_bytes is None:
         miro_ego_bytes = aarch64_elf_stub(payload=b"miro-ego-bin")
@@ -115,15 +121,37 @@ def make_native_bundle(
     if unit_bytes is not None:
         files["deploy/miro-ego/miro-ego-data-volume.service"] = (unit_bytes, 0o644)
     if bundle_schema is not None:
-        meta = json.dumps(
+        binaries = [
             {
-                "schema": bundle_schema,
-                "version": "0.3.0",
-                "commit": "1" * 40,
-                "arch": "aarch64",
+                "path": rel,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "executable": True,
             }
-        ).encode("utf-8")
-        files["bundle.json"] = (meta, 0o644)
+            for rel, (data, _mode) in sorted(files.items())
+            if rel.startswith("bin/")
+        ]
+        assets = [
+            {
+                "path": rel,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "executable": bool(mode & 0o111),
+            }
+            for rel, (data, mode) in sorted(files.items())
+            if rel.startswith("deploy/miro-ego/")
+        ]
+        manifest_obj: dict[str, Any] = {
+            "schema": bundle_schema,
+            "platform": bundle_platform,
+            "version": "0.3.0",
+            "commit": "1" * 40,
+            "binaries": binaries,
+            "assets": assets,
+        }
+        if bundle_extra_fields:
+            manifest_obj.update(bundle_extra_fields)
+        files["bundle.json"] = (json.dumps(manifest_obj).encode("utf-8"), 0o644)
     if extra_files:
         for name, data in extra_files.items():
             files[name] = (data, 0o644)

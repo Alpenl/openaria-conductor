@@ -34,6 +34,7 @@ BOOT = Path("/boot/config/miro-ego")
 HOBOT_HOOK = Path("/boot/config/hobot_config.sh")
 FIRSTBOOT_UNIT = Path("/etc/systemd/system/miro-ego-firstboot.service")
 VOICE_STATE = Path("/var/lib/miro-ego/voice.json")
+SERVICE_USER = "miro-ego"
 
 STATUS_SCHEMA = "miro-ego.autoinstall-status.v1"
 KEEP_BOOT_FILES = frozenset({"status.json", "DO_NOT_DELETE.txt"})
@@ -69,6 +70,7 @@ def _atomic_write_text(
     *,
     mode: int,
     strict_mode: bool = True,
+    owner: tuple[int, int] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -87,6 +89,8 @@ def _atomic_write_text(
             except OSError as exc:
                 if strict_mode or exc.errno not in (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP):
                     raise
+            if owner is not None:
+                os.fchown(stream.fileno(), owner[0], owner[1])
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
@@ -105,7 +109,12 @@ def _atomic_write_text(
 
 
 def atomic_json(
-    path: str | Path, value: Any, *, mode: int = 0o600, strict_mode: bool = True
+    path: str | Path,
+    value: Any,
+    *,
+    mode: int = 0o600,
+    strict_mode: bool = True,
+    owner: tuple[int, int] | None = None,
 ) -> None:
     """Atomically write JSON to *path* with fsync and parent-dir sync."""
     _atomic_write_text(
@@ -113,6 +122,7 @@ def atomic_json(
         json.dumps(value, indent=2, sort_keys=True) + "\n",
         mode=mode,
         strict_mode=strict_mode,
+        owner=owner,
     )
 
 
@@ -186,11 +196,24 @@ def register() -> None:
     run("systemctl", "start", "--no-block", FIRSTBOOT_UNIT.name)
 
 
+def _resolve_service_owner(user: str = SERVICE_USER) -> tuple[int, int] | None:
+    if os.name != "posix":
+        return None
+    import pwd
+
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    return (entry.pw_uid, entry.pw_gid)
+
+
 def restore_voice(profile: dict[str, Any]) -> None:
-    """Persist voice volume setting and restore ALSA mixer state if backed up."""
-    volume = int(profile.get("voice", {"volume": 100})["volume"])
+    """Persist ``miro-ego.voice-settings.v1`` owned by ``miro-ego`` and restore ALSA state."""
+    payload = device.voice_settings_payload(profile)
+    owner = _resolve_service_owner(SERVICE_USER)
     run("systemctl", "stop", "miro-ego.service")
-    atomic_json(VOICE_STATE, {"schema": "miro-ego.voice.v1", "volume": volume}, mode=0o640)
+    atomic_json(VOICE_STATE, payload, mode=0o640, owner=owner)
     if "var/lib/alsa/asound.state" in profile.get("files", {}):
         run("alsactl", "restore")
     run("systemctl", "start", "miro-ego.service")

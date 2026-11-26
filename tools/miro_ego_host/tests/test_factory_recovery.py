@@ -112,12 +112,33 @@ class FactoryRecoveryTests(unittest.TestCase):
         ):
             self.assertTrue(device.allowed(ok_path))
 
-        # Voice bounds check.
+        # Voice bounds and enabled preservation checks.
+        legacy_vol_only = factory_profile(voice_volume=50, voice_enabled=None)
+        device.validate(legacy_vol_only)
+        self.assertEqual(
+            device.voice_settings_payload(legacy_vol_only),
+            {"schema": "miro-ego.voice-settings.v1", "enabled": False, "volume": 50},
+        )
+        enabled_voice = factory_profile(voice_volume=75, voice_enabled=True)
+        device.validate(enabled_voice)
+        self.assertEqual(
+            device.voice_settings_payload(enabled_voice),
+            {"schema": "miro-ego.voice-settings.v1", "enabled": True, "volume": 75},
+        )
         for bad_vol in (-1, 101, True, "50"):
             value = factory_profile()
             value["voice"]["volume"] = bad_vol
             with self.assertRaises(RuntimeError):
                 device.validate(value)
+        for bad_enabled in (1, "true", None):
+            value = factory_profile()
+            value["voice"]["enabled"] = bad_enabled
+            with self.assertRaises(RuntimeError):
+                device.validate(value)
+        extra_key_voice = factory_profile()
+        extra_key_voice["voice"]["unexpected"] = 1
+        with self.assertRaises(RuntimeError):
+            device.validate(extra_key_voice)
 
         # Idle checks.
         device.require_idle(None)
@@ -205,6 +226,11 @@ class FactoryRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ELF"):
                 provision.require_native_bundle(script_bundle)
 
+            # Reject missing bin/miro-ego-encoder.
+            no_enc = make_native_bundle(root / "no-enc.tar", include_encoder=False)
+            with self.assertRaisesRegex(RuntimeError, "miro-ego-encoder"):
+                provision.require_native_bundle(no_enc)
+
             # Reject bad encoder architecture.
             bad_enc = make_native_bundle(
                 root / "bad-enc.tar",
@@ -212,6 +238,32 @@ class FactoryRecoveryTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "AArch64"):
                 provision.require_native_bundle(bad_enc)
+
+            # Reject missing bundle.json, wrong platform, wrong schema, or unknown fields.
+            no_meta = make_native_bundle(root / "no-meta.tar", bundle_schema=None)
+            with self.assertRaisesRegex(RuntimeError, "bundle.json"):
+                provision.require_native_bundle(no_meta)
+
+            wrong_platform = make_native_bundle(
+                root / "wrong-platform.tar",
+                bundle_platform="linux_x86_64",
+            )
+            with self.assertRaisesRegex(RuntimeError, "platform"):
+                provision.require_native_bundle(wrong_platform)
+
+            wrong_schema = make_native_bundle(
+                root / "wrong-schema.tar",
+                bundle_schema="miro-ego.rdk-x5-bundle.v0",
+            )
+            with self.assertRaisesRegex(RuntimeError, "schema"):
+                provision.require_native_bundle(wrong_schema)
+
+            unknown_field = make_native_bundle(
+                root / "unknown-field.tar",
+                bundle_extra_fields={"arch": "aarch64"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "unknown field"):
+                provision.require_native_bundle(unknown_field)
 
             # Reject legacy Python wheel in bundle.
             wheel_bundle = make_native_bundle(

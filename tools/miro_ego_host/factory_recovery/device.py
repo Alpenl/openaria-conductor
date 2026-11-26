@@ -18,6 +18,9 @@ from typing import Any
 
 SCHEMA = "miro-ego.factory-profile.v1"
 DEVICE_CONFIG_SCHEMA = "miro-ego.device-config.v1"
+VOICE_SETTINGS_SCHEMA = "miro-ego.voice-settings.v1"
+DEFAULT_VOICE_VOLUME = 80
+DEFAULT_VOICE_ENABLED = False
 
 FILES = frozenset(
     {
@@ -149,9 +152,12 @@ def backup_locked() -> dict[str, Any]:
 
     voice_raw = _read_optional_json(Path("/var/lib/miro-ego/voice.json"))
     if isinstance(voice_raw, dict) and "volume" in voice_raw:
-        voice = {"volume": voice_raw["volume"]}
+        enabled = voice_raw.get("enabled", DEFAULT_VOICE_ENABLED)
+        if type(enabled) is not bool:
+            raise RuntimeError("Invalid voice enabled preference")
+        voice: dict[str, Any] = {"enabled": enabled, "volume": voice_raw["volume"]}
     else:
-        voice = {"volume": 100}
+        voice = {"enabled": DEFAULT_VOICE_ENABLED, "volume": DEFAULT_VOICE_VOLUME}
 
     result: dict[str, Any] = {
         "schema": SCHEMA,
@@ -163,6 +169,28 @@ def backup_locked() -> dict[str, Any]:
     return result
 
 
+def voice_settings_payload(profile: dict[str, Any]) -> dict[str, Any]:
+    """Build a ``miro-ego.voice-settings.v1`` file payload matching ``miro-ego-hw``."""
+    voice = profile.get("voice")
+    if voice is None:
+        return {
+            "schema": VOICE_SETTINGS_SCHEMA,
+            "enabled": DEFAULT_VOICE_ENABLED,
+            "volume": DEFAULT_VOICE_VOLUME,
+        }
+    enabled = voice.get("enabled", DEFAULT_VOICE_ENABLED)
+    if type(enabled) is not bool:
+        raise RuntimeError("Invalid voice preference")
+    volume = voice.get("volume")
+    if type(volume) is not int or not 0 <= volume <= 100:
+        raise RuntimeError("Invalid voice preference")
+    return {
+        "schema": VOICE_SETTINGS_SCHEMA,
+        "enabled": enabled,
+        "volume": volume,
+    }
+
+
 def validate(profile: Any) -> dict[str, bytes]:
     """Validate a Miro-Ego factory profile and return decoded ``{relpath: bytes}``."""
     if not isinstance(profile, dict):
@@ -172,12 +200,14 @@ def validate(profile: Any) -> dict[str, bytes]:
     if len(profile["files"]) > MAX_FILES:
         raise RuntimeError("Too many configuration files")
 
-    voice = profile.get("voice", {"volume": 100})
+    voice = profile.get("voice", {"enabled": DEFAULT_VOICE_ENABLED, "volume": DEFAULT_VOICE_VOLUME})
     if (
         not isinstance(voice, dict)
-        or set(voice) != {"volume"}
+        or "volume" not in voice
+        or not set(voice).issubset({"volume", "enabled"})
         or type(voice["volume"]) is not int
         or not 0 <= voice["volume"] <= 100
+        or ("enabled" in voice and type(voice["enabled"]) is not bool)
     ):
         raise RuntimeError("Invalid voice preference")
 

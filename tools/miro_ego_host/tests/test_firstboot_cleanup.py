@@ -192,7 +192,7 @@ class FirstbootAndCleanupTests(unittest.TestCase):
             layout["exfatprogs_sha256"] = exfat_sha
             layout["logrotate_sha256"] = logrotate_sha
 
-            profile = factory_profile(board="a" * 64, voice_volume=63)
+            profile = factory_profile(board="a" * 64, voice_volume=63, voice_enabled=True)
             sealed = provision.seal_profile(profile)
             (boot / "profile.bin").write_bytes(sealed)
 
@@ -206,6 +206,7 @@ class FirstbootAndCleanupTests(unittest.TestCase):
             (boot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
             calls: list[tuple[str, ...]] = []
+            chowned_voice: list[tuple[int, int]] = []
             fail_install_once = [True]
 
             def fake_run(*args: str, **_kwargs: object) -> None:
@@ -218,12 +219,17 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 ):
                     raise RuntimeError("simulated deploy install failure")
 
+            def fake_fchown(_fd: int, uid: int, gid: int) -> None:
+                chowned_voice.append((uid, gid))
+
             with (
                 patch.object(firstboot, "ROOT", state_root),
                 patch.object(firstboot, "BOOT", boot),
                 patch.object(firstboot, "HOBOT_HOOK", hook_path),
                 patch.object(firstboot, "FIRSTBOOT_UNIT", unit_path),
                 patch.object(firstboot, "VOICE_STATE", voice_path),
+                patch.object(firstboot, "_resolve_service_owner", return_value=(997, 997)),
+                patch.object(os, "fchown", side_effect=fake_fchown),
                 patch.object(partition_layout, "EXFATPROGS_SHA256", exfat_sha),
                 patch.object(partition_layout, "LOGROTATE_SHA256", logrotate_sha),
                 patch.object(device, "hardware", return_value="a" * 64),
@@ -258,7 +264,15 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads((state_root / "state.json").read_bytes())["phase"], "complete"
                 )
-                self.assertEqual(json.loads(voice_path.read_bytes())["volume"], 63)
+                self.assertEqual(
+                    json.loads(voice_path.read_bytes()),
+                    {
+                        "schema": "miro-ego.voice-settings.v1",
+                        "enabled": True,
+                        "volume": 63,
+                    },
+                )
+                self.assertEqual(chowned_voice, [(997, 997)])
 
                 # Verify ONLY status.json and DO_NOT_DELETE.txt remain on p1 CONFIG/miro-ego/.
                 remaining = {p.name for p in boot.iterdir()}
