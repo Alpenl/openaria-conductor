@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from .adapter import CaptureValidationError, LoadedCapture, load_capture
+from .adapter import DEVICE_SESSION_SCHEMAS, CaptureValidationError, LoadedCapture, load_capture
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +68,18 @@ class CaptureTiming:
         }
 
 
-def _percentile(values: list[float], fraction: float) -> float:
+def percentile(values: list[float], fraction: float, *, allow_empty: bool = False) -> float:
+    """Compute a nearest-rank percentile from a list of floats."""
     if not values:
+        if allow_empty:
+            return 0.0
         raise CaptureValidationError("cannot compute a timing percentile from no values")
     ordered = sorted(values)
     index = min(len(ordered) - 1, math.ceil(fraction * len(ordered)) - 1)
     return ordered[max(index, 0)]
+
+
+_percentile = percentile
 
 
 def _unwrap_contiguous(values: list[int], bits: int, label: str) -> list[int]:
@@ -125,16 +131,18 @@ def _fit_clock(
         raise CaptureValidationError(f"{label} host timestamps are not strictly increasing")
 
     origin = counters[0]
+    host_origin = host_ns[0]
     relative = [float(value - origin) for value in counters]
+    relative_hosts = [float(value - host_origin) for value in host_ns]
     mean_x = sum(relative) / len(relative)
-    mean_y = sum(host_ns) / len(host_ns)
+    mean_y = sum(relative_hosts) / len(relative_hosts)
     denominator = sum((value - mean_x) ** 2 for value in relative)
     if denominator == 0:
         raise CaptureValidationError(f"{label} clock has no counter variation")
     period_ns = (
         sum(
             (counter - mean_x) * (host - mean_y)
-            for counter, host in zip(relative, host_ns, strict=True)
+            for counter, host in zip(relative, relative_hosts, strict=True)
         )
         / denominator
     )
@@ -151,11 +159,14 @@ def _fit_clock(
             f"expected {expected_rate_hz:.6f} Hz by {rate_error_ppm:.1f} ppm"
         )
 
-    intercept_ns = median(
-        host - counter * period_ns for host, counter in zip(host_ns, relative, strict=True)
+    rel_intercept_ns = median(
+        host - counter * period_ns for host, counter in zip(relative_hosts, relative, strict=True)
     )
-    modeled = [intercept_ns + counter * period_ns for counter in relative]
-    residual_ms = [abs(host - model) / 1e6 for host, model in zip(host_ns, modeled, strict=True)]
+    rel_modeled = [rel_intercept_ns + counter * period_ns for counter in relative]
+    residual_ms = [
+        abs(host - model) / 1e6 for host, model in zip(relative_hosts, rel_modeled, strict=True)
+    ]
+    modeled = [float(host_origin) + rel_model for rel_model in rel_modeled]
     residual_p95_ms = _percentile(residual_ms, 0.95)
     if residual_p95_ms > max_residual_p95_ms:
         raise CaptureValidationError(
@@ -186,31 +197,33 @@ def _fit_timestamp_clock(
         raise CaptureValidationError(f"{label} host timestamps are not strictly increasing")
 
     origin = timestamps[0]
+    host_origin = host_ns[0]
     relative = [float(value - origin) for value in timestamps]
+    relative_hosts = [float(value - host_origin) for value in host_ns]
     mean_x = sum(relative) / len(relative)
-    mean_y = sum(host_ns) / len(host_ns)
+    mean_y = sum(relative_hosts) / len(relative_hosts)
     denominator = sum((value - mean_x) ** 2 for value in relative)
     if denominator == 0:
         raise CaptureValidationError(f"{label} device timestamp has no variation")
     nanoseconds_per_tick = (
         sum(
             (timestamp - mean_x) * (host - mean_y)
-            for timestamp, host in zip(relative, host_ns, strict=True)
+            for timestamp, host in zip(relative, relative_hosts, strict=True)
         )
         / denominator
     )
     if not math.isfinite(nanoseconds_per_tick) or nanoseconds_per_tick <= 0:
         raise CaptureValidationError(f"{label} device timestamp scale is non-positive")
 
-    intercept_ns = median(
+    rel_intercept_ns = median(
         host - timestamp * nanoseconds_per_tick
-        for host, timestamp in zip(host_ns, relative, strict=True)
+        for host, timestamp in zip(relative_hosts, relative, strict=True)
     )
-    modeled = [intercept_ns + timestamp * nanoseconds_per_tick for timestamp in relative]
-    duration_ns = modeled[-1] - modeled[0]
+    rel_modeled = [rel_intercept_ns + timestamp * nanoseconds_per_tick for timestamp in relative]
+    duration_ns = rel_modeled[-1] - rel_modeled[0]
     if duration_ns <= 0:
         raise CaptureValidationError(f"{label} modeled duration is non-positive")
-    measured_rate_hz = (len(modeled) - 1) * 1e9 / duration_ns
+    measured_rate_hz = (len(rel_modeled) - 1) * 1e9 / duration_ns
     rate_error_ppm = (measured_rate_hz / expected_event_rate_hz - 1) * 1e6
     if abs(rate_error_ppm) > max_rate_error_ppm:
         raise CaptureValidationError(
@@ -218,7 +231,10 @@ def _fit_timestamp_clock(
             f"expected {expected_event_rate_hz:.6f} Hz by {rate_error_ppm:.1f} ppm"
         )
 
-    residual_ms = [abs(host - model) / 1e6 for host, model in zip(host_ns, modeled, strict=True)]
+    residual_ms = [
+        abs(host - model) / 1e6 for host, model in zip(relative_hosts, rel_modeled, strict=True)
+    ]
+    modeled = [float(host_origin) + rel_model for rel_model in rel_modeled]
     residual_p95_ms = _percentile(residual_ms, 0.95)
     if residual_p95_ms > max_residual_p95_ms:
         raise CaptureValidationError(
@@ -270,11 +286,7 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
                 for sample in current
             ):
                 raise CaptureValidationError("records within an IMU packet disagree")
-            if capture.source_schema in {
-                "ylx.device-session.v2",
-                "ylx.device-session.v3",
-                "ylx.device-session.v4",
-            } and any(
+            if capture.source_schema in DEVICE_SESSION_SCHEMAS and any(
                 sample["packet_sequence"] != first["packet_sequence"]
                 or sample["device_ticks"] != first["device_ticks"]
                 for sample in current
@@ -291,11 +303,7 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
 
 def _packet_timestamps(capture: LoadedCapture, packets: list[list[dict[str, Any]]]) -> list[int]:
     first_records = [packet[0] for packet in packets]
-    if capture.source_schema in {
-        "ylx.device-session.v2",
-        "ylx.device-session.v3",
-        "ylx.device-session.v4",
-    }:
+    if capture.source_schema in DEVICE_SESSION_SCHEMAS:
         _unwrap_contiguous(
             [int(record["packet_sequence"]) for record in first_records],
             32,
@@ -331,11 +339,7 @@ def _analyze_capture(
     if imu_rate_hz is not None and (not math.isfinite(imu_rate_hz) or imu_rate_hz <= 0):
         raise CaptureValidationError("IMU rate must be positive")
     capture = load_capture(capture_dir)
-    if capture.source_schema in {
-        "ylx.device-session.v2",
-        "ylx.device-session.v3",
-        "ylx.device-session.v4",
-    }:
+    if capture.source_schema in DEVICE_SESSION_SCHEMAS:
         # Device Session source sequences advance by the declared frame
         # decimation. The adapter validates that exact relationship; the
         # contiguous recording domain is the clock-fit counter.
@@ -358,11 +362,7 @@ def _analyze_capture(
     packet_records = [packet[0] for packet in packets]
     device_timestamps = _packet_timestamps(capture, packets)
     packet_hosts = [int(record["host_monotonic_ns"]) for record in packet_records]
-    device_session = capture.source_schema in {
-        "ylx.device-session.v2",
-        "ylx.device-session.v3",
-        "ylx.device-session.v4",
-    }
+    device_session = capture.source_schema in DEVICE_SESSION_SCHEMAS
     if device_session:
         # The camera counter identifies VIDEO frames. Multiple changing IMU
         # packets can share it; neither a sample clock nor loss can be inferred

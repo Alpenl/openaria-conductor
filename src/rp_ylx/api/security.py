@@ -7,15 +7,45 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
-CUSTOMER_BEARER_TOKEN_MIN_LENGTH = 8
-CUSTOMER_BEARER_TOKEN_MAX_LENGTH = 512
+from rp_ylx.core.ids import (
+    CUSTOMER_BEARER_TOKEN_MAX_LENGTH,
+    CUSTOMER_BEARER_TOKEN_MIN_LENGTH,
+    valid_customer_bearer_token,
+)
+
+__all__ = [
+    "AuditEvent",
+    "CUSTOMER_BEARER_TOKEN_MAX_LENGTH",
+    "CUSTOMER_BEARER_TOKEN_MIN_LENGTH",
+    "Principal",
+    "SecurityPolicy",
+    "valid_customer_bearer_token",
+]
+
+_CUSTOMER_MUTATION_OPERATIONS = frozenset(
+    {
+        "startCapture",
+        "stopCapture",
+        "deleteSessions",
+        "applyNetworkDesiredState",
+        "retryNetworkTransaction",
+        "forgetNetworkClientProfile",
+        "createNetworkCredentialReference",
+        "firmwareUpdate",
+        "rollbackFirmware",
+        "setVoiceVolume",
+        "setCaptureTimer",
+        "setCameraFocus",
+        "syncDeviceClock",
+    }
+)
 
 
-def valid_customer_bearer_token(token: str) -> bool:
-    return CUSTOMER_BEARER_TOKEN_MIN_LENGTH <= len(
-        token
-    ) <= CUSTOMER_BEARER_TOKEN_MAX_LENGTH and all(
-        0x21 <= ord(character) <= 0x7E for character in token
+def _valid_token_characters(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= CUSTOMER_BEARER_TOKEN_MAX_LENGTH
+        and all(0x21 <= ord(character) <= 0x7E for character in value)
     )
 
 
@@ -79,6 +109,17 @@ class SecurityPolicy:
     ) -> SecurityPolicy:
         if not tokens:
             raise ValueError("customer profile 至少需要一个 Bearer token")
+        for token in tokens:
+            if not _valid_token_characters(token):
+                raise ValueError("customer Bearer token 格式无效")
+        if csrf_token is not None and not _valid_token_characters(csrf_token):
+            raise ValueError("csrf_token 格式无效")
+        if csrf_token is None and any(
+            op in principal.permissions
+            for principal in tokens.values()
+            for op in _CUSTOMER_MUTATION_OPERATIONS
+        ):
+            raise ValueError("customer 写权限部署必须配置 csrf_token")
         cls._validate_origins(allowed_origins)
         return cls(
             profile="customer",
@@ -95,6 +136,8 @@ class SecurityPolicy:
         allowed_origins: set[str] | frozenset[str] = frozenset(),
         csrf_token: str | None = None,
     ) -> SecurityPolicy:
+        if csrf_token is not None and not _valid_token_characters(csrf_token):
+            raise ValueError("csrf_token 格式无效")
         cls._validate_origins(allowed_origins)
         principal = Principal(
             "isolated-lab-device",
@@ -120,7 +163,12 @@ class SecurityPolicy:
         candidate = authorization.removeprefix("Bearer ")
         if not candidate:
             return None
+        try:
+            candidate_bytes = candidate.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        matched: Principal | None = None
         for token, principal in self.tokens.items():
-            if hmac.compare_digest(candidate, token):
-                return principal
-        return None
+            if hmac.compare_digest(candidate_bytes, token.encode("utf-8")):
+                matched = principal
+        return matched

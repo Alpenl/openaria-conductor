@@ -11,12 +11,65 @@ import ctypes as c
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+
+from rp_ylx.operational_logging import operational_logger
 
 # Preserve the camera's 3840x1080 stereo JPEG: each eye keeps all 1920x1080
 # pixels, with no extra compression loss or codec cost on the normal path.
 # Keep a bounded scaled-IDCT fallback for larger sources.
 PREVIEW_MAX_WIDTH = 3840
+PREVIEW_MAX_HEIGHT = 8192
 PREVIEW_JPEG_QUALITY = 85
+_SOF_MARKERS = frozenset(
+    {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+)
+
+
+def _jpeg_dimensions(jpeg: bytes) -> tuple[int, int] | None:
+    """Parse JPEG width and height from SOF headers without calling libturbojpeg."""
+    length = len(jpeg)
+    if length < 4 or jpeg[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    while offset < length:
+        while offset < length and jpeg[offset] != 0xFF:
+            offset += 1
+        while offset < length and jpeg[offset] == 0xFF:
+            offset += 1
+        if offset >= length:
+            return None
+        marker = jpeg[offset]
+        offset += 1
+        if marker in (0x00, 0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            continue
+        if marker in (0xD9, 0xDA) or offset + 2 > length:
+            return None
+        segment_len = int.from_bytes(jpeg[offset : offset + 2], "big")
+        if segment_len < 2 or offset + segment_len > length:
+            return None
+        if marker in _SOF_MARKERS:
+            if segment_len < 7:
+                return None
+            height = int.from_bytes(jpeg[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(jpeg[offset + 5 : offset + 7], "big")
+            return (width, height)
+        offset += segment_len
+    return None
 
 
 class ThumbnailCodec:
@@ -115,6 +168,17 @@ class PreviewThumbnails:
     def get(self):
         with self.condition:
             self.requested = time.monotonic()
+            if self.latest is not None and self.worker is not None:
+                return self.latest
+            need_probe = self.worker is None and self.latest is None
+        if need_probe:
+            # Probe snapshot before spawning any worker, executor, or JPEG codec.
+            try:
+                self.snapshot()
+            except Exception as error:
+                raise RuntimeError("preview thumbnail is not available") from error
+        with self.condition:
+            self.requested = time.monotonic()
             if self.worker is None:
                 self.worker = threading.Thread(
                     target=self._run, name="preview-thumbnail", daemon=True
@@ -135,35 +199,64 @@ class PreviewThumbnails:
             self.requested = 0.0
             self.condition.notify_all()
 
+    def _needs_codec(self, frame) -> bool:
+        if self.codec_factory is not ThumbnailCodec:
+            return True
+        dims = _jpeg_dimensions(frame.jpeg)
+        if dims is None:
+            return True
+        width, height = dims
+        return not (0 < width <= PREVIEW_MAX_WIDTH and 0 < height <= PREVIEW_MAX_HEIGHT)
+
+    def _publish_frame(self, frame, jpeg: bytes, generation: int) -> None:
+        with self.condition:
+            if generation == self.generation and (
+                self.latest is None or frame.sequence > self.latest.sequence
+            ):
+                self.latest = type(frame)(frame.sequence, jpeg)
+                self.condition.notify_all()
+
     def _run(self):
         codecs = []
         previous = None
-        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="preview-codec")
+        executor = None
+        pending = [None, None]
         try:
-            # HD scaling takes longer than a 40 ms frame period on RDK X5.
-            # Two independent codecs overlap work, with at most one frame per
-            # codec in flight. There is never a queue of waiting camera frames.
-            codecs = [self.codec_factory()]
-            codecs.append(self.codec_factory())
-            pending = [None, None]
             while True:
                 started = time.monotonic()
                 with self.condition:
                     if started - self.requested > 2:
+                        if self.worker is threading.current_thread():
+                            self.worker = None
+                            self.latest = None
+                            self.condition.notify_all()
                         return
                     generation = self.generation
-                for slot, future in enumerate(pending):
-                    if future is not None:
-                        if not future.done():
-                            continue
-                        future.result()
-                    frame = self.snapshot()
-                    if frame.sequence != previous:
-                        pending[slot] = executor.submit(
-                            self._encode, codecs[slot], frame, generation
-                        )
+                frame = self.snapshot()
+                if frame.sequence != previous:
+                    if not self._needs_codec(frame):
+                        self._publish_frame(frame, frame.jpeg, generation)
                         previous = frame.sequence
-                    break
+                    else:
+                        if executor is None:
+                            # Lazily spin up workers and dual codecs only when
+                            # resizing oversized frames or using a custom codec.
+                            executor = ThreadPoolExecutor(
+                                max_workers=2, thread_name_prefix="preview-codec"
+                            )
+                            codecs = []
+                            for _ in range(2):
+                                codecs.append(self.codec_factory())
+                        for slot, future in enumerate(pending):
+                            if future is not None:
+                                if not future.done():
+                                    continue
+                                future.result()
+                            pending[slot] = executor.submit(
+                                self._encode, codecs[slot], frame, generation
+                            )
+                            previous = frame.sequence
+                            break
                 deadline = started + 1 / 25
                 with self.condition:
                     # Completion notifications wake initial viewers, but must
@@ -172,23 +265,26 @@ class PreviewThumbnails:
                         lambda generation=generation: generation != self.generation,
                         timeout=max(0.001, deadline - time.monotonic()),
                     )
-        except Exception:
+        except Exception as error:
             # Unavailable camera / codec is retried on the next viewer request.
-            pass
+            with suppress(Exception):
+                operational_logger("preview-thumbnail").event(
+                    "preview_thumbnail_worker_failed",
+                    level="warning",
+                    exception_type=type(error).__name__,
+                )
         finally:
-            executor.shutdown(wait=True)
-            for codec in codecs:
-                codec.close()
             with self.condition:
-                self.worker = None
-                self.latest = None
-                self.condition.notify_all()
+                if self.worker is threading.current_thread():
+                    self.worker = None
+                    self.latest = None
+                    self.condition.notify_all()
+            if executor is not None:
+                executor.shutdown(wait=True)
+            for codec in codecs:
+                with suppress(Exception):
+                    codec.close()
 
     def _encode(self, codec, frame, generation):
         jpeg = codec.resize(frame.jpeg)
-        with self.condition:
-            if generation == self.generation and (
-                self.latest is None or frame.sequence > self.latest.sequence
-            ):
-                self.latest = type(frame)(frame.sequence, jpeg)
-                self.condition.notify_all()
+        self._publish_frame(frame, jpeg, generation)

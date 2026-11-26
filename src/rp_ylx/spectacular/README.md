@@ -4,13 +4,21 @@ This package is the active owner of capture ingestion for Spectacular calibratio
 It accepts exactly two inputs:
 
 - the historical `ylx.stereo_imu.raw.v2` calibration directory; or
-- a sealed `ylx.device-session.v2` with `capture_mode=calibration`, rolling paired
-  `split-eyes` H.264/MP4 segments, frame metadata, IMU metadata, and no audio artifact.
+- a sealed `ylx.device-session.v2`, `ylx.device-session.v3`, or `ylx.device-session.v4`
+  with `capture_mode=calibration`, rolling paired `split-eyes` H.264/MP4 segments, frame
+  metadata, IMU metadata, and no audio artifact.
 
-The adapter validates the Device Session schema, artifact roles, safe relative paths,
-regular-file identity, byte counts, and SHA-256 values before reading metadata. It does
-not infer layouts from filenames and does not fall back to raw SBS Device Session output,
+The adapter pins directory and file descriptors across manifest validation and bounded
+NDJSON ingestion (verifying regular-file identity, byte counts, SHA-256 digests, record
+counts up to `MAX_NDJSON_RECORDS`, and strict IMU `sync` invariants including
+`residual_ns >= 0` and null fields when `quality == "insufficient"`). It uses
+metadata-declared `start_frame` and `samples_per_packet` where provided, does not infer
+layouts from filenames, and does not fall back to raw SBS Device Session output,
 single-file MP4, embedded audio, or standalone audio delivery.
+
+Clock regression in `timebase.py` centers host monotonic timestamps around the initial
+observation to preserve nanosecond precision, and `model.py` serializes
+`time_origin_monotonic_ns` as an integer.
 
 The Device Session mapping is explicit: frame `frame`, `source_sequence`, and
 `host_monotonic_ns`, `segment_index`, and `segment_frame` become the model frame index,

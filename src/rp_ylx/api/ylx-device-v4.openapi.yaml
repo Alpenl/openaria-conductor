@@ -49,7 +49,12 @@ x-ylx-security-profiles:
     allowed_operation_ids:
       - getDevice
       - getDeviceClock
+      - inspectDeviceClock
       - syncDeviceClock
+      - firmwareStatus
+      - checkFirmware
+      - firmwareUpdate
+      - rollbackFirmware
       - getCaptureStatus
       - getVoice
       - setVoiceVolume
@@ -98,6 +103,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VoiceStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
     post:
       operationId: setVoiceVolume
       summary: Save voice prompt volume while idle
@@ -129,6 +140,10 @@ paths:
                 $ref: "#/components/schemas/VoiceStatus"
         "400":
           description: Invalid request
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           description: Device busy
         "500":
@@ -148,8 +163,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CaptureTimerStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           description: Invalid stored timer settings; replace them while idle
+        "500":
+          $ref: "#/components/responses/InternalError"
     post:
       tags: [Capture]
       operationId: setCaptureTimer
@@ -193,6 +214,10 @@ paths:
                 $ref: "#/components/schemas/CaptureTimerStatus"
         "400":
           description: Invalid closed request schema, boolean or integer duration
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           description: Recording, finalization or shutdown is active
         "500":
@@ -216,6 +241,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClockStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           description: Clock controller or NTP status is unavailable
   /clock/check:
@@ -224,7 +255,7 @@ paths:
       operationId: inspectDeviceClock
       summary: Read boot-bound calibration provenance and a resync challenge
       description: |
-        Uses getDeviceClock permission. Returns ylx.clock-status.v2 including boot_id,
+        Uses inspectDeviceClock permission. Returns ylx.clock-status.v2 including boot_id,
         synchronized_at_ms and age_seconds (both null while unsynchronized).
         Always issues a principal-bound challenge valid for 5000 ms. Reading never
         steps wall time. Calibration survives controller restarts within the same boot.
@@ -238,6 +269,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClockStatusV2"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           description: Clock controller unavailable
   /clock/sync:
@@ -280,10 +317,182 @@ paths:
                   - $ref: "#/components/schemas/ClockStatusV2"
         "400":
           description: Invalid timestamp or request
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           description: Capture active, expired challenge, or clock changed; retry with a new challenge
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           description: Clock controller, NTP state, or permission to set time unavailable
+  /firmware:
+    get:
+      tags: [Device]
+      operationId: firmwareStatus
+      summary: Read installed firmware versions, cached update status, and active task state
+      description: Uses firmwareStatus permission.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current firmware status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FirmwareStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Firmware control supervisor is unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /firmware/check:
+    get:
+      tags: [Device]
+      operationId: checkFirmware
+      summary: Check for newer signed firmware releases
+      description: Uses firmwareStatus permission.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: force
+          in: query
+          required: false
+          description: Bypass the cached check result when true.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Updated firmware status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FirmwareStatus"
+        "400":
+          description: Invalid force query parameter
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Firmware check failed or supervisor unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /firmware/update:
+    post:
+      tags: [Device]
+      operationId: firmwareUpdate
+      summary: Start an idempotent firmware update to a pinned release commit
+      description: Uses firmwareUpdate permission.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FirmwareCommitRequest"
+      responses:
+        "202":
+          description: Firmware update accepted or replayed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FirmwareTask"
+        "400":
+          description: Invalid commit request or Idempotency-Key
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Conflicting firmware operation or Idempotency-Key reuse
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Firmware supervisor unavailable or busy
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /firmware/rollback:
+    post:
+      tags: [Device]
+      operationId: rollbackFirmware
+      summary: Start an idempotent rollback to the previous installed commit
+      description: Uses firmwareUpdate permission.
+      x-ylx-lab-access: allowed
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FirmwareCommitRequest"
+      responses:
+        "202":
+          description: Firmware rollback accepted or replayed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FirmwareTask"
+        "400":
+          description: Invalid commit request or Idempotency-Key
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Rollback unavailable, active task conflict, or Idempotency-Key reuse
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Firmware supervisor unavailable or busy
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /sessions/delete:
     post:
       tags: [Sessions]
@@ -4019,3 +4228,110 @@ components:
               properties:
                 transaction_id:
                   $ref: "#/components/schemas/UuidV7"
+    FirmwareRelease:
+      type: object
+      additionalProperties: false
+      required: [version, commit]
+      properties:
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        commit:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+    FirmwareAvailableRelease:
+      type: object
+      additionalProperties: false
+      required: [version, commit]
+      properties:
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        commit:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        release_notes:
+          type: string
+          maxLength: 16000
+        published_at:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 128
+            - type: "null"
+    FirmwareTask:
+      type: object
+      additionalProperties: false
+      required: [id, action, target_commit, status, message, started_at, finished_at]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        action:
+          type: string
+          enum: [update, rollback]
+        target_commit:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        status:
+          type: string
+          enum: [accepted, running, succeeded, failed]
+        message:
+          type: string
+          maxLength: 4096
+        started_at:
+          type: integer
+          minimum: 0
+        finished_at:
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: "null"
+    FirmwareCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [commit]
+      properties:
+        commit:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+    FirmwareStatus:
+      type: object
+      additionalProperties: false
+      required: [schema, supported, current, previous, available, has_update, checked_at, warning, task]
+      properties:
+        schema:
+          const: openaria.firmware-status.v1
+        supported:
+          type: boolean
+        current:
+          oneOf:
+            - $ref: "#/components/schemas/FirmwareRelease"
+            - type: "null"
+        previous:
+          oneOf:
+            - $ref: "#/components/schemas/FirmwareRelease"
+            - type: "null"
+        available:
+          oneOf:
+            - $ref: "#/components/schemas/FirmwareAvailableRelease"
+            - type: "null"
+        has_update:
+          type: boolean
+        checked_at:
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: "null"
+        warning:
+          oneOf:
+            - type: string
+              maxLength: 1024
+            - type: "null"
+        task:
+          oneOf:
+            - $ref: "#/components/schemas/FirmwareTask"
+            - type: "null"

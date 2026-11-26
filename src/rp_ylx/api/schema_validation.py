@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import suppress
 
 from rp_ylx.native import native_schema_validator_or_none
+from rp_ylx.operational_logging import operational_logger
 
 
 def _plain_json(value: object) -> bool:
@@ -45,7 +47,12 @@ def validate_manifest_schema(validator, manifest: object) -> None:
                 is True
             ):
                 return
-    except Exception:
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, RecursionError) as error:
         # Unavailable acceleration must never turn a rejected manifest into success.
-        pass
+        with suppress(Exception):
+            operational_logger("schema-validation").event(
+                "native_schema_validation_fallback",
+                level="debug",
+                exception_type=type(error).__name__,
+            )
     validator.validate(manifest)
