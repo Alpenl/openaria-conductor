@@ -13,10 +13,11 @@ import tarfile
 from pathlib import Path, PurePosixPath
 
 if __package__:
-    from . import device, disks, provision, storage_firstboot
+    from . import device, disks, partition_layout, provision, storage_firstboot
 else:
     import device
     import disks
+    import partition_layout
     import provision
     import storage_firstboot
 
@@ -171,6 +172,11 @@ def execute():
     if state["phase"] == "configured":
         if "storage" in manifest:
             storage_firstboot.prepare(manifest["storage"], BOOT, ROOT, atomic_json)
+            if not shutil.which("logrotate"):
+                package = BOOT / partition_layout.LOGROTATE
+                if disks.digest(package) != partition_layout.LOGROTATE_SHA256:
+                    raise RuntimeError("Offline logrotate package digest mismatch")
+                run("dpkg", "-i", str(package))
         bundle = ROOT / "bundle"
         if bundle.is_symlink():
             raise RuntimeError("Unsafe staging directory")

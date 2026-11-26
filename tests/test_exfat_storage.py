@@ -27,11 +27,12 @@ def vendor_mbr():
 class ExfatStorageTests(unittest.TestCase):
     def test_layout_preserves_boot_and_root_start_and_uses_remaining_capacity(self):
         original = vendor_mbr()
-        for size in (32 * 1024**3, 127999672320, 256 * 1024**3):
+        for size in (32_000_000_000, 64_000_000_000, 127999672320, 256 * 1024**3, 512 * 1024**3):
             mbr, layout = partition_layout.plan(original, size)
             entries = partition_layout.partitions(mbr)
             self.assertEqual(mbr[:470], original[:470])
-            self.assertEqual(entries[1], (0x83, 532480, 16 * 1024**3 // 512))
+            self.assertEqual(layout["system_gib"], 20)
+            self.assertEqual(entries[1], (0x83, 532480, 20 * 1024**3 // 512))
             self.assertEqual(entries[2][1], entries[1][1] + entries[1][2])
             self.assertEqual(entries[2][0], 7)
             self.assertLess(size - sum(entries[2][1:]) * 512, 1024**2)
@@ -44,7 +45,12 @@ class ExfatStorageTests(unittest.TestCase):
                     partition_layout.check_fit(image, size - 1024**2)
 
     def test_rejects_nonvendor_layout_and_insufficient_capacity(self):
-        for size, system in ((16 * 1024**3, 16), (32 * 1024**3, 32), (64 * 1024**3, 8)):
+        for size, system in (
+            (24 * 1024**3, 20),
+            (64 * 1024**3, 16),
+            (32 * 1024**3, 32),
+            (64 * 1024**3, 8),
+        ):
             with self.assertRaises(RuntimeError):
                 partition_layout.plan(vendor_mbr(), size, system)
         changed = bytearray(vendor_mbr())

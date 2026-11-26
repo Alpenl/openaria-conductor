@@ -19,6 +19,7 @@
     "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "principal_id": {"type": ["string", "null"], "maxLength": 128},
     "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "poll_count": {"type": "integer", "minimum": 1, "description": "Allowed lab status polls represented by this sample."},
     "resource_id": {"type": ["string", "null"], "maxLength": 512},
     "outcome": {"type": "string", "minLength": 1, "maxLength": 128}
   }

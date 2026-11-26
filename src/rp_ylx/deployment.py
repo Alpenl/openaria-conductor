@@ -70,6 +70,15 @@ CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
 CUSTOMER_TLS_PRIVATE_KEY_RELATIVE = Path("tls/device.key")
 DEVICE_CONFIG_SNAPSHOT_DIRECTORY = ".release-configs"
 DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "openaria-journal.conf": ("etc/systemd/journald.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-logrotate.conf": ("etc/logrotate.d/00-openaria-defaults", 0o644),
+    "openaria-logrotate-timer.conf": (
+        "etc/systemd/system/logrotate.timer.d/60-openaria-space.conf",
+        0o644,
+    ),
+    "openaria-core-limits.conf": ("etc/systemd/system.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-coredump.conf": ("etc/systemd/coredump.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-apt-cache.conf": ("etc/apt/apt.conf.d/99openaria-cache", 0o644),
     "rp-ylx-idle-fstrim": ("usr/local/sbin/rp-ylx-idle-fstrim", 0o755),
     "openaria-idle-fstrim.conf": (
         "etc/systemd/system/fstrim.service.d/50-openaria-idle.conf",
@@ -2482,6 +2491,9 @@ class ReleaseManager:
         with self._service_recovery_readers():
             # Independent of capture/network units: never stop this supervisor while
             # it is executing the transaction that restarts those services.
+            self.runner(["systemctl", "try-restart", "systemd-journald.service"])
+            self.runner(["systemctl", "enable", "--now", "logrotate.timer"])
+            self.runner(["systemctl", "restart", "logrotate.timer"])
             self.runner(["systemctl", "enable", "--now", "openaria-update.service"])
             for unit in CORE_SYSTEMD_UNITS:
                 self.runner(["systemctl", "enable", "--now", unit])
@@ -2618,6 +2630,17 @@ class ReleaseManager:
         bundle = load_bundle(bundle_path)
         self._prepare_release(bundle)
         self._require_state_compatible_release(bundle.commit)
+        if self.executable_finder("logrotate") is None:
+            # Older boot media and updaters do not provision this dependency.
+            name = "logrotate_3.19.0-1ubuntu1.1_arm64.deb"
+            package = self.releases / bundle.commit / "site-packages/rp_ylx/deploy" / name
+            if (
+                not package.is_file()
+                or _sha256(package)
+                != "bd11fab1ae9c442f188fa06abfbc400365babbe1778afa53dd922968d31da106"
+            ):
+                raise DeploymentError("runtime_dependency_missing", "离线日志轮换工具校验失败")
+            self.runner(["dpkg", "-i", str(package)])
         current = self._link_target("current")
         old_current = current
         quiesced = old_current is not None and (activate or old_current != bundle.commit)

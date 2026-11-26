@@ -431,7 +431,11 @@ API_AUDIT_FILE_BYTES = 32 * 1024 * 1024
 def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
     archive = path.with_name(path.name + ".1")
 
-    def write(event: AuditEvent) -> None:
+    poll_lock = threading.Lock()
+    pending_polls = 0
+    next_poll_report = 0.0
+
+    def append(event: AuditEvent, poll_count: int = 0) -> None:
         value = {
             "schema": "ylx.api-audit-event.v1",
             "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -441,6 +445,8 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
             "resource_id": event.resource_id,
             "outcome": event.outcome,
         }
+        if poll_count:
+            value["poll_count"] = poll_count
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -484,6 +490,23 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
                 return
             finally:
                 os.close(descriptor)
+
+    def write(event: AuditEvent) -> None:
+        nonlocal pending_polls, next_poll_report
+        if (event.operation_id, event.outcome, event.principal_id) != (
+            "getCaptureStatus",
+            "allowed",
+            "isolated-lab-device",
+        ):
+            append(event)
+            return
+        with poll_lock:
+            pending_polls += 1
+            now = time.monotonic()
+            if now >= next_poll_report:
+                append(event, pending_polls)
+                pending_polls = 0
+                next_poll_report = now + 60
 
     return write
 

@@ -40,6 +40,19 @@ class AuditFileAdmissionTest(unittest.TestCase):
         self.assertTrue(all(row["request_id"] == "request" for row in rows))
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
+    def test_lab_status_polls_aggregate_without_coalescing_denials_or_customer_audit(self):
+        poll = AuditEvent("req", "isolated-lab-device", "getCaptureStatus", None, "allowed")
+        with patch("rp_ylx.daemon.time.monotonic", return_value=0):
+            with ThreadPoolExecutor(max_workers=6) as workers:
+                list(workers.map(self.sink, [poll] * 100))
+            self.sink(AuditEvent("denial", None, "getCaptureStatus", None, "forbidden"))
+            self.sink(AuditEvent("authorized", "customer", "getCaptureStatus", None, "allowed"))
+        with patch("rp_ylx.daemon.time.monotonic", return_value=60):
+            self.sink(poll)
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([r.get("poll_count") for r in rows], [1, None, None, 100])
+        self.assertEqual([r["request_id"] for r in rows[1:3]], ["denial", "authorized"])
+
     def test_fifo_without_reader_does_not_block_open(self):
         os.mkfifo(self.path)
         self.check_fifo_child(race=False)
