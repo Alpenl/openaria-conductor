@@ -1,0 +1,373 @@
+{
+  "schema": "miro-ego.device-api-consumer-support.v1",
+  "consumer": "miro-ego",
+  "supported_device_api_majors": [
+    1
+  ],
+  "unknown_major_policy": "fail_closed",
+  "required_contracts": [
+    {
+      "major": 1,
+      "path": "contracts/miro-ego-device-v1.openapi.yaml",
+      "sha256": "83a7b0caac1982a08d3a27fec56027233b440d75964c03904b0a6f921a379b61",
+      "bytes": 160114,
+      "info_version": "1.0.0",
+      "server_base_path": "/api/v1",
+      "lifecycle": "current"
+    }
+  ],
+  "headers": {
+    "response": [
+      "Miro-Ego-Audit-Status",
+      "Miro-Ego-Error-Code",
+      "Miro-Ego-Manifest-SHA256",
+      "Miro-Ego-Wait-State"
+    ]
+  },
+  "routes": [
+    {
+      "path": "/camera/focus",
+      "method": "get",
+      "operation_id": "getCameraFocus",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/camera/focus",
+      "method": "post",
+      "operation_id": "setCameraFocus",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/events",
+      "method": "get",
+      "operation_id": "streamCaptureEvents",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/readiness",
+      "method": "get",
+      "operation_id": "getCaptureReadiness",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/safe-swap",
+      "method": "get",
+      "operation_id": "getCurrentSafeSwapReceipt",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/start",
+      "method": "post",
+      "operation_id": "startCapture",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/status",
+      "method": "get",
+      "operation_id": "getCaptureStatus",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/stop",
+      "method": "post",
+      "operation_id": "stopCapture",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/timer",
+      "method": "get",
+      "operation_id": "getCaptureTimer",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/capture/timer",
+      "method": "post",
+      "operation_id": "setCaptureTimer",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/clock",
+      "method": "get",
+      "operation_id": "getDeviceClock",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/clock/check",
+      "method": "get",
+      "operation_id": "inspectDeviceClock",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/clock/sync",
+      "method": "post",
+      "operation_id": "syncDeviceClock",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/device",
+      "method": "get",
+      "operation_id": "getDevice",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/firmware",
+      "method": "get",
+      "operation_id": "firmwareStatus",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/firmware/check",
+      "method": "get",
+      "operation_id": "checkFirmware",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/firmware/rollback",
+      "method": "post",
+      "operation_id": "rollbackFirmware",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/firmware/update",
+      "method": "post",
+      "operation_id": "firmwareUpdate",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/logs",
+      "method": "get",
+      "operation_id": "listLogs",
+      "tag": "Logs",
+      "lab_access": true
+    },
+    {
+      "path": "/logs/{name}",
+      "method": "get",
+      "operation_id": "getLogFile",
+      "tag": "Logs",
+      "lab_access": true
+    },
+    {
+      "path": "/network",
+      "method": "get",
+      "operation_id": "getNetworkStatus",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/apply",
+      "method": "post",
+      "operation_id": "applyNetworkDesiredState",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/credentials",
+      "method": "post",
+      "operation_id": "createNetworkCredentialReference",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/events",
+      "method": "get",
+      "operation_id": "streamNetworkEvents",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/forget",
+      "method": "post",
+      "operation_id": "forgetNetworkClientProfile",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/retry",
+      "method": "post",
+      "operation_id": "retryNetworkTransaction",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/network/scan",
+      "method": "get",
+      "operation_id": "scanNetworks",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/preview",
+      "method": "get",
+      "operation_id": "getPreview",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/preview/h264",
+      "method": "get",
+      "operation_id": "getPreviewH264",
+      "tag": "Capture",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions",
+      "method": "get",
+      "operation_id": "listSessions",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions/delete",
+      "method": "post",
+      "operation_id": "deleteSessions",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions/{session_id}",
+      "method": "get",
+      "operation_id": "getSession",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions/{session_id}/artifacts/{artifact_id}",
+      "method": "get",
+      "operation_id": "getSessionArtifact",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions/{session_id}/artifacts/{artifact_id}",
+      "method": "head",
+      "operation_id": "headSessionArtifact",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/sessions/{session_id}/unsuccessful-outcome",
+      "method": "get",
+      "operation_id": "getRetainedUnsuccessfulSessionOutcome",
+      "tag": "Sessions",
+      "lab_access": true
+    },
+    {
+      "path": "/voice",
+      "method": "get",
+      "operation_id": "getVoice",
+      "tag": "Device",
+      "lab_access": true
+    },
+    {
+      "path": "/voice",
+      "method": "post",
+      "operation_id": "setVoiceVolume",
+      "tag": "Device",
+      "lab_access": true
+    }
+  ],
+  "schemas": [
+    {
+      "id": "urn:miro-ego:schema:api-audit-event:v1",
+      "schema": "miro-ego.api-audit-event.v1",
+      "path": "contracts/schemas/miro-ego-api-audit-event-v1.schema.json",
+      "sha256": "6e42174bf0d683c62ad93458bff820ece36b7203aad1b01a3722bb72e3ad0ece",
+      "bytes": 1372
+    },
+    {
+      "id": "urn:miro-ego:schema:device-session:v1",
+      "schema": "miro-ego.device-session.v1",
+      "path": "contracts/schemas/miro-ego-device-session-v1.schema.json",
+      "sha256": "892ec94bd9775c51175e80d40f7d702e287ca0084a34795ca0ae00aa44bc3035",
+      "bytes": 26811
+    },
+    {
+      "id": "urn:miro-ego:schema:operational-event:v1",
+      "schema": "miro-ego.operational-event.v1",
+      "path": "contracts/schemas/miro-ego-operational-event-v1.schema.json",
+      "sha256": "3c9587acce891c342a3b5229864681ef83e38952f44d73f9ee34f26cb5d0d5bb",
+      "bytes": 4287
+    },
+    {
+      "id": "urn:miro-ego:schema:performance-report:v1",
+      "schema": "miro-ego.performance-report.v1",
+      "path": "contracts/schemas/miro-ego-performance-report-v1.schema.json",
+      "sha256": "b20b5cf9447e35b9e7e966821315c7f3aa3b874aa7f34e0f9993667637c0e81d",
+      "bytes": 7648
+    },
+    {
+      "id": "urn:miro-ego:schema:recording-state:v1",
+      "schema": "miro-ego.recording-state.v1",
+      "path": "contracts/schemas/miro-ego-recording-state-v1.schema.json",
+      "sha256": "f6ad048cc9f543da25730c5fe8fcea859726ed7c596d775acdf8d55525d4799b",
+      "bytes": 11843
+    }
+  ],
+  "wire_schema_identifiers": [
+    "miro-ego.api-audit-event.v1",
+    "miro-ego.api-error.v1",
+    "miro-ego.audio-clock.v1",
+    "miro-ego.camera-connection.v1",
+    "miro-ego.camera-focus-set.v1",
+    "miro-ego.camera-focus.v1",
+    "miro-ego.capture-audit.v1",
+    "miro-ego.capture-diagnostic-event.v1",
+    "miro-ego.capture-event.v1",
+    "miro-ego.capture-progress-event.v1",
+    "miro-ego.capture-readiness.v1",
+    "miro-ego.capture-snapshot-event.v1",
+    "miro-ego.capture-start.v1",
+    "miro-ego.capture-state-event.v1",
+    "miro-ego.capture-status.v1",
+    "miro-ego.capture-stop.v1",
+    "miro-ego.capture-timer-set.v1",
+    "miro-ego.capture-timer.v1",
+    "miro-ego.clock-status.v1",
+    "miro-ego.clock-sync-request.v1",
+    "miro-ego.device-session.v1",
+    "miro-ego.device.v1",
+    "miro-ego.firmware-status.v1",
+    "miro-ego.log-list.v1",
+    "miro-ego.network-apply-request.v1",
+    "miro-ego.network-credential-receipt.v1",
+    "miro-ego.network-credential-request.v1",
+    "miro-ego.network-event.v1",
+    "miro-ego.network-forget-request.v1",
+    "miro-ego.network-retry-request.v1",
+    "miro-ego.network-scan.v1",
+    "miro-ego.network-status.v1",
+    "miro-ego.network-transaction-receipt.v1",
+    "miro-ego.network-transaction.v1",
+    "miro-ego.operational-event.v1",
+    "miro-ego.performance-report.v1",
+    "miro-ego.recording-encoding.v1",
+    "miro-ego.recording-state.v1",
+    "miro-ego.retained-unsuccessful-session-resource.v1",
+    "miro-ego.safe-swap-receipt-resource.v1",
+    "miro-ego.safe-swap-receipt.v1",
+    "miro-ego.session-delete-request.v1",
+    "miro-ego.session-delete-result.v1",
+    "miro-ego.session-list.v1",
+    "miro-ego.voice-set.v1",
+    "miro-ego.voice.v1"
+  ]
+}
