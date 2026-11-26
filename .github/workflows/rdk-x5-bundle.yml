@@ -19,6 +19,7 @@ on:
       - "crates/**"
       - "csrc/**"
       - "deploy/miro-ego/**"
+      - "share/voice/**"
       - "contracts/miro-ego-*"
       - "contracts/schemas/miro-ego-*"
       - "pyproject.toml"
@@ -105,20 +106,38 @@ jobs:
             csrc/miro-ego-encoder/miro_ego_split.c
             csrc/miro-ego-encoder/miro_ego_mp4_meta.c
           )
-          if [[ -n "${HOBOT_SDK_INCLUDE:-}" && -n "${HOBOT_SDK_LIB:-}" ]]; then
+          if [[ -n "${HOBOT_SDK_INCLUDE:-}" && -n "${HOBOT_SDK_LIB:-}" && -f "${HOBOT_SDK_LIB}/libmultimedia.so" ]]; then
             echo "Linking miro-ego-encoder against RDK X5 Hobot SDK"
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
               -I"$HOBOT_SDK_INCLUDE" -Icsrc/miro-ego-encoder \
               "${SRCS[@]}" \
               -L"$HOBOT_SDK_LIB" -lmultimedia -lpthread \
               -o dist-aarch64/miro-ego-encoder
+            {
+              echo "MIRO_EGO_MOCK_SDK=0"
+              echo "MIRO_EGO_ARCHIVE_NAME=miro-ego-rdk-x5-bundle.tar"
+              echo "MIRO_EGO_ARTIFACT_NAME=miro-ego-rdk-x5-${GITHUB_SHA}"
+            } >> "$GITHUB_ENV"
           else
-            echo "Building AArch64 miro-ego-encoder CI artifact against stub Hobot SDK (on-board builds link /usr/hobot/lib/libmultimedia.so)"
+            if [[ "${GITHUB_REF_TYPE:-}" == "tag" || "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+              echo "::error::Refusing to build release tag ${GITHUB_REF:-unknown} against mock_hobot_sdk.c: HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so are required for hardware release bundles." >&2
+              exit 1
+            fi
+            if [[ -n "${HOBOT_SDK_INCLUDE:-}" || -n "${HOBOT_SDK_LIB:-}" ]]; then
+              echo "::error::Partial or invalid Hobot SDK paths supplied (expected HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so)." >&2
+              exit 1
+            fi
+            echo "Building non-release CI smoke miro-ego-encoder against mock_hobot_sdk.c (-mock-sdk)"
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
               -Icsrc/miro-ego-encoder/tests/stubs -Icsrc/miro-ego-encoder -Icsrc/miro-ego-encoder/tests \
               "${SRCS[@]}" csrc/miro-ego-encoder/tests/mock_hobot_sdk.c \
               -lpthread \
               -o dist-aarch64/miro-ego-encoder
+            {
+              echo "MIRO_EGO_MOCK_SDK=1"
+              echo "MIRO_EGO_ARCHIVE_NAME=miro-ego-rdk-x5-bundle-mock-sdk.tar"
+              echo "MIRO_EGO_ARTIFACT_NAME=miro-ego-rdk-x5-${GITHUB_SHA}-mock-sdk"
+            } >> "$GITHUB_ENV"
           fi
 
       - name: Verify AArch64 ELF64 binary headers
@@ -143,24 +162,33 @@ jobs:
             --miro-ego-bin target/aarch64-unknown-linux-gnu/release/miro-ego \
             --encoder-bin dist-aarch64/miro-ego-encoder \
             --output dist-rdk-x5/bundle \
-            --archive dist-rdk-x5/miro-ego-rdk-x5-bundle.tar \
+            --archive "dist-rdk-x5/${MIRO_EGO_ARCHIVE_NAME}" \
             --version "$MIRO_EGO_VERSION" \
             --commit "$MIRO_EGO_COMMIT"
+          if [[ "${MIRO_EGO_MOCK_SDK}" == "1" ]]; then
+            cat > dist-rdk-x5/MOCK_SDK_WARNING.txt <<'EOF'
+          CI SMOKE ARTIFACT ONLY (-mock-sdk)
+          bin/miro-ego-encoder in this archive was linked against mock_hobot_sdk.c for CI packaging verification.
+          Do NOT deploy this mock-sdk archive onto RDK X5 hardware; hardware release bundles require libmultimedia.so.
+          EOF
+          fi
 
       - name: Verify SHA256SUMS and host factory-recovery bundle contract
         run: |
           (cd dist-rdk-x5/bundle && sha256sum --check --strict SHA256SUMS)
           PYTHONPATH=tools uv run --extra dev python - <<'PY'
+          import os
           from pathlib import Path
           from miro_ego_host.factory_recovery.provision import require_native_bundle
 
-          require_native_bundle(Path("dist-rdk-x5/miro-ego-rdk-x5-bundle.tar"))
-          print("Host provision.require_native_bundle() verification PASSED")
+          archive = Path("dist-rdk-x5") / os.environ["MIRO_EGO_ARCHIVE_NAME"]
+          require_native_bundle(archive)
+          print(f"Host provision.require_native_bundle({archive}) verification PASSED")
           PY
 
       - uses: actions/upload-artifact@v7
         with:
-          name: miro-ego-rdk-x5-${{ github.sha }}
+          name: ${{ env.MIRO_EGO_ARTIFACT_NAME }}
           path: dist-rdk-x5/
           if-no-files-found: error
           retention-days: 14

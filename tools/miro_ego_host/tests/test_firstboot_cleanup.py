@@ -229,7 +229,7 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 patch.object(firstboot, "FIRSTBOOT_UNIT", unit_path),
                 patch.object(firstboot, "VOICE_STATE", voice_path),
                 patch.object(firstboot, "_resolve_service_owner", return_value=(997, 997)),
-                patch.object(os, "fchown", side_effect=fake_fchown),
+                patch.object(os, "fchown", side_effect=fake_fchown, create=True),
                 patch.object(partition_layout, "EXFATPROGS_SHA256", exfat_sha),
                 patch.object(partition_layout, "LOGROTATE_SHA256", logrotate_sha),
                 patch.object(device, "hardware", return_value="a" * 64),
@@ -245,7 +245,7 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 ) as mount_mock,
                 patch.object(firstboot.shutil, "which", return_value=None),
                 patch.object(firstboot, "run", side_effect=fake_run),
-                patch.object(os, "sync") as sync_mock,
+                patch.object(os, "sync", create=True) as sync_mock,
             ):
                 # First run fails during deploy install; payload must remain intact for retry.
                 with self.assertRaisesRegex(RuntimeError, "simulated deploy"):
@@ -312,6 +312,198 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 call_count = len(calls)
                 firstboot.execute()
                 self.assertEqual(len(calls), call_count)
+
+    def test_firstboot_cleanup_failure_does_not_mark_complete_and_resumes_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            state_root = base / "state"
+            config_p1 = base / "boot_config"
+            boot = config_p1 / "miro-ego"
+            hook_path = config_p1 / "hobot_config.sh"
+            unit_path = base / "miro-ego-firstboot.service"
+            voice_path = base / "voice.json"
+            login_helper = base / "miro-ego-device-login"
+            state_root.mkdir()
+            boot.mkdir(parents=True)
+
+            hook_path.write_text(provision.HOOK, encoding="utf-8")
+            unit_path.write_text(firstboot.UNIT, encoding="utf-8")
+            login_helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (boot / "firstboot.py").write_text("# script\n", encoding="utf-8")
+
+            exfat_deb = boot / partition_layout.EXFATPROGS_PACKAGE
+            exfat_deb.write_bytes(b"exfatprogs-deb")
+            logrotate_deb = boot / partition_layout.LOGROTATE_PACKAGE
+            logrotate_deb.write_bytes(b"logrotate-deb")
+            exfat_sha = hashlib.sha256(exfat_deb.read_bytes()).hexdigest()
+            logrotate_sha = hashlib.sha256(logrotate_deb.read_bytes()).hexdigest()
+
+            _, layout = partition_layout.plan(vendor_mbr(), 64 * 1024**3)
+            layout["exfatprogs_sha256"] = exfat_sha
+            layout["logrotate_sha256"] = logrotate_sha
+            profile = factory_profile(board="a" * 64, voice_volume=50, voice_enabled=True)
+            sealed = provision.seal_profile(profile)
+            (boot / "profile.bin").write_bytes(sealed)
+            archive = make_native_bundle(boot / "bundle.tar")
+            (boot / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": provision.AUTOINSTALL_SCHEMA,
+                        "profile_sha256": hashlib.sha256(sealed).hexdigest(),
+                        "bundle_sha256": disks.sha256_file(archive),
+                        "storage": layout,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            real_cleanup = firstboot.cleanup_boot_partition
+            fail_cleanup = [True]
+            calls: list[tuple[str, ...]] = []
+
+            def flaky_cleanup(boot_dir: Path, **kw: object) -> list[str]:
+                if fail_cleanup[0]:
+                    # Simulate partial unlink (manifest.json + bundle.tar gone) before I/O failure.
+                    (boot_dir / "manifest.json").unlink(missing_ok=True)
+                    (boot_dir / "bundle.tar").unlink(missing_ok=True)
+                    raise OSError("simulated FAT32 cleanup interruption")
+                return real_cleanup(boot_dir, **kw)  # type: ignore[arg-type]
+
+            with (
+                patch.object(firstboot, "ROOT", state_root),
+                patch.object(firstboot, "BOOT", boot),
+                patch.object(firstboot, "HOBOT_HOOK", hook_path),
+                patch.object(firstboot, "FIRSTBOOT_UNIT", unit_path),
+                patch.object(firstboot, "VOICE_STATE", voice_path),
+                patch.object(firstboot, "DEVICE_LOGIN_HELPER", login_helper),
+                patch.object(firstboot, "_resolve_service_owner", return_value=None),
+                patch.object(partition_layout, "EXFATPROGS_SHA256", exfat_sha),
+                patch.object(partition_layout, "LOGROTATE_SHA256", logrotate_sha),
+                patch.object(device, "hardware", return_value="a" * 64),
+                patch.object(device, "require_fresh"),
+                patch.object(device, "write_files"),
+                patch.object(device, "apply_service_permissions") as perms_mock,
+                patch.object(
+                    storage_firstboot,
+                    "prepare",
+                    return_value=(Path("/dev/mmcblk0p3"), "ABCD-1234"),
+                ),
+                patch.object(storage_firstboot, "mount_and_initialize", return_value=True),
+                patch.object(firstboot.shutil, "which", return_value="/usr/sbin/logrotate"),
+                patch.object(firstboot, "cleanup_boot_partition", side_effect=flaky_cleanup),
+                patch.object(firstboot, "run", side_effect=lambda *a, **_k: calls.append(a)),
+                patch.object(os, "sync", create=True),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated FAT32 cleanup"):
+                    firstboot.execute()
+
+                # Must NOT be marked complete yet so next boot retries cleanup!
+                self.assertFalse(firstboot.complete())
+                self.assertEqual(
+                    json.loads((state_root / "state.json").read_bytes())["phase"], "cleaning"
+                )
+                self.assertIn((str(login_helper),), calls)
+                perms_mock.assert_called_once()
+
+                # Retry succeeds even though manifest.json and bundle.tar were already unlinked!
+                fail_cleanup[0] = False
+                firstboot.execute()
+                self.assertTrue(firstboot.complete())
+                self.assertEqual(
+                    {p.name for p in boot.iterdir()},
+                    {"status.json", "DO_NOT_DELETE.txt"},
+                )
+                self.assertEqual(hook_path.read_text(encoding="utf-8"), provision.CLEAN_HOOK)
+
+    def test_ensure_ssh_data_volume_preserves_exfat_and_provisions_missing_p3(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cfg_path = root / "etc/default/miro-ego-data-volume"
+            disk_img = root / "mmcblk0"
+            disk_img.write_bytes(vendor_mbr())
+
+            # Case 1: Existing p3 with exFAT is preserved without mkfs.exfat.
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run_existing(*args: str, **_kwargs: object) -> str:
+                calls.append(args)
+                if args[:2] == ("findmnt", "-n"):
+                    return "/dev/mmcblk0p2"
+                if args[0] == "blkid" and "PARTUUID" in args:
+                    return "db2e7205-03"
+                if args[0] == "blkid" and "TYPE" in args:
+                    return "exfat"
+                if args[0] == "blkid" and "UUID" in args:
+                    return "CAFE-BEEF"
+                return ""
+
+            blk_stat = os.stat_result((stat.S_IFBLK | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            with (
+                patch.object(storage_firstboot, "run", side_effect=fake_run_existing),
+                patch.object(Path, "resolve", lambda self: self),
+                patch.object(Path, "exists", lambda self: True),
+                patch.object(Path, "stat", lambda self: blk_stat),
+            ):
+                info = storage_firstboot.ensure_ssh_data_volume(config_path=cfg_path)
+            self.assertEqual(info["uuid"], "CAFE-BEEF")
+            self.assertFalse(any(c[0] == "mkfs.exfat" for c in calls))
+            self.assertIn("MIRO_EGO_DATA_VOLUME_UUID=CAFE-BEEF\n", cfg_path.read_text("utf-8"))
+
+            # Case 2: Missing p3 on a 64 GiB card creates MBR slot 3, formats exFAT, writes config.
+            calls.clear()
+            p3_created = [False]
+
+            def fake_run_create(*args: str, **_kwargs: object) -> str:
+                calls.append(args)
+                if args[:2] == ("findmnt", "-n"):
+                    return str(disk_img) + "p2"
+                if args[:2] == ("blockdev", "--getsize64"):
+                    return str(64 * 1024**3)
+                if args[0] in ("partx", "partprobe"):
+                    p3_created[0] = True
+                    return ""
+                if args[0] == "blkid" and "PARTUUID" in args:
+                    return "db2e7205-03"
+                if args[0] == "blkid" and "TYPE" in args:
+                    return ""
+                if args[0] == "blkid" and "-p" in args:
+                    return "1234-5678"
+                return ""
+
+            orig_exists = Path.exists
+            orig_stat = Path.stat
+
+            def fake_exists(self: Path) -> bool:
+                if str(self) == str(disk_img) + "p3":
+                    return p3_created[0]
+                return orig_exists(self)
+
+            def fake_stat(self: Path, *a: object, **kw: object):
+                if str(self) in (str(disk_img), str(disk_img) + "p2", str(disk_img) + "p3"):
+                    return blk_stat
+                return orig_stat(self, *a, **kw)  # type: ignore[arg-type]
+
+            with (
+                patch.object(storage_firstboot, "run", side_effect=fake_run_create),
+                patch.object(storage_firstboot.shutil, "which", return_value="/usr/bin/partx"),
+                patch.object(
+                    storage_firstboot.re,
+                    "fullmatch",
+                    side_effect=lambda pat, val: (
+                        True
+                        if pat == r"/dev/mmcblk[0-9]+p2" and val == disk_img.as_posix() + "p2"
+                        else __import__("re").compile(pat).fullmatch(val)
+                    ),
+                ),
+                patch.object(Path, "resolve", lambda self: self),
+                patch.object(Path, "exists", fake_exists),
+                patch.object(Path, "stat", fake_stat),
+            ):
+                info2 = storage_firstboot.ensure_ssh_data_volume(config_path=cfg_path)
+            self.assertEqual(info2["uuid"], "1234-5678")
+            self.assertTrue(any(c[:3] == ("mkfs.exfat", "-L", "MIRO-EGO") for c in calls))
+            entries = partition_layout.partitions(disk_img.read_bytes()[:512])
+            self.assertEqual(entries[2][0], 0x07)
 
     def test_wrong_board_aborts_before_touching_destination(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

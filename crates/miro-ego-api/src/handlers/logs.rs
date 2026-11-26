@@ -66,16 +66,22 @@ pub async fn list_logs(
 /// `GET /api/v1/logs/{*name}` (`getLogFile`)
 pub async fn get_log_file(
     State(state): State<Arc<GatewayState>>,
-    Path(decoded_name): Path<String>,
+    path_res: Result<Path<String>, axum::extract::rejection::PathRejection>,
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
     let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
 
-    // Authenticate BEFORE inspecting path syntax so unauthenticated Customer callers fail closed with 401.
+    // Authenticate BEFORE inspecting path syntax or UTF-8 decoding so unauthenticated Customer callers fail closed with 401.
     let principal = match ctx.authenticate_for_operation(&state, &parts.headers, "getLogFile") {
         Ok(p) => p,
         Err(resp) => return *resp,
+    };
+
+    let Ok(Path(decoded_name)) = path_res else {
+        return ctx.error_response(ApiError::bad_request(
+            "invalid diagnostic log path; traversal, percent-encoding, and hidden files are forbidden",
+        ));
     };
 
     // Inspect the raw URI path as well as decoded path to block `%2e`, `%2f`, `%5c`, `..`, etc.

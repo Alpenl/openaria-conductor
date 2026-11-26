@@ -23,7 +23,8 @@ pub use mdns::{
 pub use nmcli::{
     CommandOutput, CommandRunner, ConnectionSummary, DEFAULT_ETHERNET_INTERFACE,
     DEFAULT_HOTSPOT_IPV4_CIDR, DEFAULT_RESCUE_HOTSPOT_PSK, DEFAULT_WIFI_INTERFACE,
-    DeviceLinkSnapshot, NetworkDeviceInfo, NmcliBackend, ProfileSpec, RescueHotspotInfo,
+    DeviceLinkSnapshot, NetworkDeviceInfo, NmcliBackend, ObservedDefaultRoute,
+    ObservedInterfaceStatus, ObservedNetworkState, ProfileSpec, RescueHotspotInfo,
     StaticIpv4Config, SystemCommandRunner, WifiScanEntry, WifiSecurity, derive_rescue_identity,
     managed_profile_name, parse_wifi_scan_output,
 };

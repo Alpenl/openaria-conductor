@@ -289,10 +289,10 @@ fn load_schema(file_name: &str) -> SchemaValidator {
     SchemaValidator::new(&raw).unwrap()
 }
 
-fn make_coordinator(
+fn make_coordinator<B: CaptureBackend + 'static>(
     env: &TestEnv,
     probe: DynamicProbe,
-    backend: Arc<MockBackend>,
+    backend: Arc<B>,
 ) -> Arc<CaptureCoordinator> {
     let mut policy = VolumePolicy::production(1024 * 1024 * 1024, 100);
     policy.system_state_root = Some(env.root.clone());
@@ -948,8 +948,9 @@ fn coordinator_records_retained_outcome_on_backend_start_and_finish_failures() {
             .is_some()
     );
 
-    // Finish failure -> returns error, restores Idle, stores retained_unsuccessful for sid2
-    // while preserving historical sid1 resource too!
+    // Finish failure -> converges cleanly (`202 Accepted` terminal `failed` snapshot), restores
+    // Idle, quarantines `<sid2>.partial` so recovery never resurrects it, and stores idempotent
+    // receipt + per-session retained_unsuccessful while preserving historical sid1 resource too!
     backend.fail_on_start.store(false, Ordering::Release);
     backend.fail_on_finish.store(true, Ordering::Release);
     let started = coord
@@ -964,11 +965,28 @@ fn coordinator_records_retained_outcome_on_backend_start_and_finish_failures() {
         .recording_state
         .session_id
         .clone();
-    assert!(
-        coord
-            .stop_capture(CaptureStopRequest::user(), None)
-            .is_err()
+    let stop_failed = coord
+        .stop_capture(CaptureStopRequest::user(), Some("stop-fail-k1"))
+        .unwrap();
+    assert!(!stop_failed.replayed);
+    let failed_snap = stop_failed.value.as_ref().expect("expected 202 snapshot");
+    assert_eq!(failed_snap.snapshot.device_state, "idle");
+    assert_eq!(
+        failed_snap
+            .snapshot
+            .retained_unsuccessful
+            .as_ref()
+            .unwrap()
+            .recording_state
+            .session_id,
+        sid2
     );
+    let stop_replay = coord
+        .stop_capture(CaptureStopRequest::user(), Some("stop-fail-k1"))
+        .unwrap();
+    assert!(stop_replay.replayed);
+    assert_eq!(stop_replay.value, stop_failed.value);
+
     assert_eq!(coord.phase().unwrap(), CapturePhase::Idle);
     assert!(
         coord
@@ -982,6 +1000,8 @@ fn coordinator_records_retained_outcome_on_backend_start_and_finish_failures() {
             .unwrap()
             .is_some()
     );
+    // Staging must be completely clean (`failed_sid1` start failure + `sid2` stop failure quarantined/cleaned).
+    assert_eq!(fs::read_dir(env.paths().staging_dir()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1264,4 +1284,572 @@ fn concurrent_status_observes_finalizing_and_verifying_with_active_recording_dur
     assert!(stop_outcome.value.is_some());
     assert_eq!(coord.phase().unwrap(), CapturePhase::Idle);
     assert!(coord.catalog().get_session(&sid).unwrap().is_some());
+}
+
+struct AsyncFailingHandle {
+    staging_dir: PathBuf,
+    failure: Arc<Mutex<Option<(String, String)>>>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl ActiveCaptureHandle for AsyncFailingHandle {
+    fn progress(&self) -> CaptureProgressSnapshot {
+        CaptureProgressSnapshot {
+            elapsed_seconds: 3.0,
+            captured_frames: 90,
+            bytes_written: 2048,
+        }
+    }
+
+    fn finish(self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+        unreachable!("poll_active_failure should abort without calling finish")
+    }
+
+    fn abort(self: Box<Self>) {
+        // Even if the encoder already wrote a valid segment 0 into staging before crashing,
+        // `record_unsuccessful_stop` MUST quarantine it so next boot never resurrects it!
+        let _ = fs::write(
+            self.staging_dir.join("video/left_00000.mp4"),
+            synthetic_valid_mp4(b"crashed-seg0-l"),
+        );
+        let _ = fs::write(
+            self.staging_dir.join("video/right_00000.mp4"),
+            synthetic_valid_mp4(b"crashed-seg0-r"),
+        );
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    fn take_failure(&self) -> Option<(String, String)> {
+        self.failure.lock().unwrap().take()
+    }
+}
+
+struct AsyncFailingBackend {
+    failure: Arc<Mutex<Option<(String, String)>>>,
+    aborted: Arc<AtomicBool>,
+    disconnect_on_begin: AtomicBool,
+}
+
+impl CaptureBackend for AsyncFailingBackend {
+    fn is_camera_connected(&self) -> bool {
+        true
+    }
+
+    fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+        Ok(None)
+    }
+
+    fn set_camera_focus(&self, _req: &CameraFocusSetRequest) -> StorageResult<CameraFocusStatus> {
+        Err(StorageError::unsupported(
+            "camera_focus_unsupported",
+            "unsupported",
+        ))
+    }
+
+    fn begin_capture(
+        &self,
+        req: &BackendStartRequest,
+    ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+        if self.disconnect_on_begin.load(Ordering::Acquire) {
+            return Err(StorageError::camera_not_connected(
+                "camera unplugged right during open",
+            ));
+        }
+        Ok(Box::new(AsyncFailingHandle {
+            staging_dir: req.staging_dir.clone(),
+            failure: Arc::clone(&self.failure),
+            aborted: Arc::clone(&self.aborted),
+        }))
+    }
+
+    fn runtime_observation(&self) -> RuntimeObservation {
+        RuntimeObservation::default_with_camera(true, None)
+    }
+}
+
+#[test]
+fn coordinator_background_failure_polling_aborts_releases_lock_and_prevents_resurrection() {
+    use miro_ego_core::locks::{LockMode, acquire_maintenance_lock};
+
+    let env = TestEnv::new("bg-fail");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let failure_slot = Arc::new(Mutex::new(None));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(AsyncFailingBackend {
+        failure: Arc::clone(&failure_slot),
+        aborted: Arc::clone(&aborted),
+        disconnect_on_begin: AtomicBool::new(false),
+    });
+    let coord = make_coordinator(&env, probe, Arc::clone(&backend));
+    let sub = coord.subscribe_events();
+
+    let started = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid = started
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .session_id
+        .clone();
+
+    // While recording, exclusive `maintenance.lock` MUST be contended (held shared by coordinator).
+    assert!(acquire_maintenance_lock(&env.run_dir, LockMode::Exclusive, true).is_err());
+
+    // Inject mid-recording encoder crash and run periodic reserve/supervisor poll.
+    *failure_slot.lock().unwrap() = Some((
+        "encoder_crashed".to_owned(),
+        "simulated BPU/VPU hardware fault".to_owned(),
+    ));
+    let reserve_res = coord.enforce_storage_reserve().unwrap();
+    assert_eq!(reserve_res, ReserveEnforcementOutcome::Healthy);
+    assert!(aborted.load(Ordering::Acquire));
+    assert_eq!(coord.phase().unwrap(), CapturePhase::Idle);
+
+    // Exclusive `maintenance.lock` MUST now be immediately acquirable!
+    let excl = acquire_maintenance_lock(&env.run_dir, LockMode::Exclusive, true)
+        .expect("maintenance.lock should be released after background failure");
+    drop(excl);
+
+    // Status exposes terminal `failed` retained_unsuccessful and SSE emitted Diagnostic + State + Snapshot.
+    let snap = coord.capture_status().unwrap();
+    assert_eq!(snap.snapshot.device_state, "idle");
+    let ret = snap
+        .snapshot
+        .retained_unsuccessful
+        .as_ref()
+        .expect("retained_unsuccessful must be populated");
+    assert_eq!(ret.recording_state.session_id, sid);
+    assert_eq!(ret.recording_state.state, "failed");
+    assert_eq!(ret.recording_state.diagnostics[0].code, "encoder_crashed");
+
+    let mut saw_diag = false;
+    let mut saw_failed_state = false;
+    while let Ok(ev) = sub.try_recv() {
+        if ev.event_type == CaptureEventType::Diagnostic {
+            saw_diag = true;
+        }
+        if ev.event_type == CaptureEventType::State
+            && ev.data.get("state").and_then(|s| s.as_str()) == Some("failed")
+        {
+            saw_failed_state = true;
+        }
+    }
+    assert!(saw_diag && saw_failed_state);
+
+    // Subsequent `stop_capture` when already transitioned to Idle is a 204 no-op (`None`).
+    assert!(
+        coord
+            .stop_capture(CaptureStopRequest::user(), None)
+            .unwrap()
+            .value
+            .is_none()
+    );
+
+    // Running `recover_on_startup()` MUST NOT resurrect the committed `failed` session into `sealed`!
+    let rec_report = coord.recover_on_startup().unwrap();
+    assert_eq!(rec_report.recovered, 0);
+    assert!(coord.catalog().get_session(&sid).unwrap().is_none());
+
+    // Now test `camera_not_connected` during `begin_capture`: must NOT wipe `sid` from
+    // `retained_unsuccessful` and must NOT leave an orphan `.partial` directory in `staging/`.
+    backend.disconnect_on_begin.store(true, Ordering::Release);
+    let cam_err = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(cam_err.code(), "camera_not_connected");
+    assert_eq!(cam_err.http_status(), 503);
+    assert_eq!(fs::read_dir(env.paths().staging_dir()).unwrap().count(), 0);
+    let snap_after_cam = coord.capture_status().unwrap();
+    assert_eq!(
+        snap_after_cam
+            .snapshot
+            .retained_unsuccessful
+            .as_ref()
+            .unwrap()
+            .recording_state
+            .session_id,
+        sid
+    );
+}
+
+struct StartingBarrierBackend {
+    entered_begin: Arc<std::sync::Barrier>,
+    release_begin: Arc<std::sync::Barrier>,
+    aborted: Arc<AtomicBool>,
+}
+
+struct AbortTrackingHandle {
+    aborted: Arc<AtomicBool>,
+}
+
+impl ActiveCaptureHandle for AbortTrackingHandle {
+    fn progress(&self) -> CaptureProgressSnapshot {
+        CaptureProgressSnapshot::default()
+    }
+    fn finish(self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+        unreachable!()
+    }
+    fn abort(self: Box<Self>) {
+        self.aborted.store(true, Ordering::Release);
+    }
+}
+
+impl CaptureBackend for StartingBarrierBackend {
+    fn is_camera_connected(&self) -> bool {
+        true
+    }
+    fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+        Ok(None)
+    }
+    fn set_camera_focus(&self, _req: &CameraFocusSetRequest) -> StorageResult<CameraFocusStatus> {
+        Err(StorageError::unsupported("camera_focus_unsupported", "n/a"))
+    }
+    fn begin_capture(
+        &self,
+        _req: &BackendStartRequest,
+    ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+        self.entered_begin.wait();
+        self.release_begin.wait();
+        Ok(Box::new(AbortTrackingHandle {
+            aborted: Arc::clone(&self.aborted),
+        }))
+    }
+    fn runtime_observation(&self) -> RuntimeObservation {
+        RuntimeObservation::default_with_camera(true, None)
+    }
+}
+
+#[test]
+fn coordinator_stop_convergence_close_coordination_and_starting_snapshot_atomicity() {
+    // Part 1: During `Stopping`, repeated `stop_capture(user)` converges with `202`, conflicting
+    // `stop_capture(safe_swap)` returns `409`, and `close()` waits for sealing to finish!
+    let env1 = TestEnv::new("stop-close-race");
+    let probe1 = DynamicProbe::new(&env1.root, 20 * 1024 * 1024 * 1024);
+    let entered_finish = Arc::new(std::sync::Barrier::new(2));
+    let release_finish = Arc::new(std::sync::Barrier::new(2));
+    let backend1 = Arc::new(BarrierBackend {
+        entered_finish: Arc::clone(&entered_finish),
+        release_finish: Arc::clone(&release_finish),
+    });
+    let coord1 = make_coordinator(&env1, probe1, backend1);
+
+    let started = coord1
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid = started
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .session_id
+        .clone();
+
+    let stop_coord = Arc::clone(&coord1);
+    let stopper = thread::spawn(move || stop_coord.stop_capture(CaptureStopRequest::user(), None));
+    entered_finish.wait();
+
+    // Concurrent `stop_capture(user)` while `Stopping` converges cleanly with `202` finalizing snapshot.
+    let converged = coord1
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+    assert_eq!(
+        converged.value.as_ref().unwrap().snapshot.device_state,
+        "finalizing"
+    );
+    // Conflicting `safe_swap` stop while non-safe_swap stop is already in progress returns `409`.
+    assert_eq!(
+        coord1
+            .stop_capture(CaptureStopRequest::safe_swap(), None)
+            .unwrap_err()
+            .http_status(),
+        409
+    );
+
+    // Spawn `close()` while `Stopping` is in flight: `close()` MUST wait for sealing to complete!
+    let close_coord = Arc::clone(&coord1);
+    let closer = thread::spawn(move || close_coord.close());
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(coord1.phase().unwrap(), CapturePhase::Stopping);
+
+    release_finish.wait();
+    assert!(stopper.join().unwrap().unwrap().value.is_some());
+    closer.join().unwrap().unwrap();
+    assert_eq!(coord1.phase().unwrap(), CapturePhase::Closing);
+    assert!(coord1.catalog().get_session(&sid).unwrap().is_some());
+
+    // Part 2: During `Starting`, `capture_status()` reports `"recording"` (never `"blocked"`),
+    // and if `close()` transitions `Starting -> Closing`, `begin_capture`'s handle is aborted!
+    let env2 = TestEnv::new("starting-close-race");
+    let probe2 = DynamicProbe::new(&env2.root, 20 * 1024 * 1024 * 1024);
+    let entered_begin = Arc::new(std::sync::Barrier::new(2));
+    let release_begin = Arc::new(std::sync::Barrier::new(2));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let backend2 = Arc::new(StartingBarrierBackend {
+        entered_begin: Arc::clone(&entered_begin),
+        release_begin: Arc::clone(&release_begin),
+        aborted: Arc::clone(&aborted),
+    });
+    let coord2 = make_coordinator(&env2, probe2, backend2);
+
+    let start_coord = Arc::clone(&coord2);
+    let starter = thread::spawn(move || {
+        start_coord.start_capture(CaptureStartRequest::new_production(), None)
+    });
+    entered_begin.wait();
+
+    // While in `Starting`, snapshot atomicity guarantees `device_state == "recording"`!
+    let starting_snap = coord2.capture_status().unwrap();
+    assert_eq!(starting_snap.snapshot.device_state, "recording");
+    assert!(starting_snap.snapshot.active_recording.is_some());
+
+    // Close coordinator while `Starting` is inside `begin_capture`, then release `begin_capture`.
+    coord2.close().unwrap();
+    assert_eq!(coord2.phase().unwrap(), CapturePhase::Closing);
+    release_begin.wait();
+
+    assert!(starter.join().unwrap().is_err());
+    assert!(
+        aborted.load(Ordering::Acquire),
+        "handle returned after Starting -> Closing MUST be aborted"
+    );
+    assert_eq!(fs::read_dir(env2.paths().staging_dir()).unwrap().count(), 0);
+}
+
+#[test]
+fn coordinator_receipt_reload_principal_scoping_eviction_and_start_codes() {
+    let env = TestEnv::new("receipts-codes");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+
+    // 1. Seed a durable unsuccessful outcome + idempotency receipt on disk using a first coordinator.
+    let backend1 = Arc::new(MockBackend::new());
+    backend1.fail_on_start.store(true, Ordering::Release);
+    let coord1 = make_coordinator(&env, probe.clone(), backend1);
+    let _ = coord1.start_capture(CaptureStartRequest::new_production(), None);
+    let seeded_sid = coord1
+        .capture_status()
+        .unwrap()
+        .snapshot
+        .retained_unsuccessful
+        .unwrap()
+        .recording_state
+        .session_id;
+    drop(coord1);
+
+    // 2. Boot a second coordinator while `/data` is UNMOUNTED, then mount it later:
+    //    - `start_capture` while unmounted MUST return `422 storage_unavailable` (not `503`)!
+    //    - Once mounted, `seeded_sid` MUST be reloaded & merged from `coordinator-receipts.json`!
+    probe.set(|c| c.mounted = false);
+    let backend2 = Arc::new(MockBackend::new());
+    let mut policy = VolumePolicy::production(1024 * 1024 * 1024, 100);
+    policy.system_state_root = Some(env.root.clone());
+    let vol2 = Arc::new(ExfatVolumeManager::with_probe(
+        env.paths(),
+        policy,
+        Arc::new(probe.clone()),
+    ));
+    let cat2 = Arc::new(BinarySessionCatalog::open(env.paths()).unwrap());
+    let cfg2 = CoordinatorConfig {
+        device_id: new_uuid_v4(),
+        device_label: "Miro-Ego-ABCD1234".to_owned(),
+        hardware_fingerprint: format!("sha256:{}", "e".repeat(64)),
+        run_dir: Some(env.run_dir.clone()),
+        ..CoordinatorConfig::default()
+    };
+    let coord2 = Arc::new(CaptureCoordinator::new(cfg2, vol2, cat2, backend2));
+
+    let unmounted_start_err = coord2
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(unmounted_start_err.code(), "storage_unavailable");
+    assert_eq!(unmounted_start_err.http_status(), 422);
+
+    // Mount `/data` and verify `insufficient_inodes` reserve code is preserved on `start_capture`.
+    probe.set(|c| {
+        c.mounted = true;
+        c.available_inodes = 5;
+    });
+    let inodes_err = coord2
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(inodes_err.code(), "insufficient_inodes");
+    assert_eq!(inodes_err.http_status(), 422);
+
+    // Restore inodes: pre-existing on-disk `seeded_sid` unsuccessful receipt MUST still exist!
+    probe.set(|c| c.available_inodes = 100_000);
+    let adm = coord2.refresh_volume_admission().unwrap();
+    assert!(
+        coord2
+            .retained_unsuccessful_outcome(&seeded_sid)
+            .unwrap()
+            .is_some(),
+        "on-disk receipts must be reloaded on unmounted -> mounted transition"
+    );
+
+    // 3. Principal-scoped idempotency isolation + Unicode 160-char display_name + stable generation_id!
+    let mut unicode_req = CaptureStartRequest::new_production();
+    unicode_req.display_name = Some("あ".repeat(160));
+    let started_a = coord2
+        .start_capture_for_principal(unicode_req.clone(), Some("shared-key"), "principal-alpha")
+        .unwrap();
+    assert!(!started_a.replayed);
+    let gen1 = started_a
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .generation_id
+        .clone();
+    assert_eq!(gen1, adm.generation_id);
+
+    // Same key for same principal replays; same key for DIFFERENT principal does NOT replay!
+    let replay_a = coord2
+        .start_capture_for_principal(unicode_req.clone(), Some("shared-key"), "principal-alpha")
+        .unwrap();
+    assert!(replay_a.replayed);
+    let conflict_b = coord2
+        .start_capture_for_principal(unicode_req, Some("shared-key"), "principal-beta")
+        .unwrap_err();
+    assert_eq!(conflict_b.code(), "capture_busy");
+    assert_eq!(conflict_b.http_status(), 409);
+
+    // Safe-swap stop -> subsequent `start_capture` returns `409 volume_released` (not `423`)!
+    let _ = coord2
+        .stop_capture_for_principal(
+            CaptureStopRequest::safe_swap(),
+            Some("swap-k"),
+            "principal-alpha",
+        )
+        .unwrap();
+    let released_err = coord2
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(released_err.code(), "volume_released");
+    assert_eq!(released_err.http_status(), 409);
+
+    // Re-admit and verify back-to-back starts on unchanged mount keep identical `generation_id`.
+    let adm2 = coord2.refresh_volume_admission().unwrap();
+    assert_ne!(adm2.generation_id, gen1);
+    let s_next = coord2
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    assert_eq!(
+        s_next
+            .value
+            .snapshot
+            .active_recording
+            .as_ref()
+            .unwrap()
+            .generation_id,
+        adm2.generation_id
+    );
+    let _ = coord2
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+
+    // 4. Receipt file size bound (`<= 1 MiB`): even after many idempotent focus/start/stop calls,
+    //    `coordinator-receipts.json` stays <= 1 MiB and persists new outcomes.
+    let receipts_file = env.paths().receipts_dir().join("coordinator-receipts.json");
+    assert!(fs::metadata(&receipts_file).unwrap().len() <= 1024 * 1024);
+}
+
+#[test]
+fn recovery_preserves_partial_on_transient_write_failure_and_truncates_ndjson_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new("rec-enospc");
+    let paths = env.paths();
+    let _ = paths.ensure_layout().unwrap();
+    let cat = Arc::new(BinarySessionCatalog::open(paths.clone()).unwrap());
+
+    let sid = new_uuid_v7();
+    let partial = paths.staging_dir().join(format!("{sid}.partial"));
+    fs::create_dir_all(partial.join("video")).unwrap();
+    fs::write(
+        partial.join("capture.json"),
+        serde_json::to_vec(&json!({
+            "session_id": sid,
+            "take_id": sid,
+            "take_sequence": 1,
+            "volume_id": new_uuid_v4(),
+            "capture_mode": "production",
+            "display_name": "ENOSPC Deferred Take",
+            "started_at": "2026-11-26T16:45:00Z",
+            "segment_frames": 150,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        partial.join("video/left_00000.mp4"),
+        synthetic_valid_mp4(b"l0"),
+    )
+    .unwrap();
+    fs::write(
+        partial.join("video/right_00000.mp4"),
+        synthetic_valid_mp4(b"r0"),
+    )
+    .unwrap();
+    // Include interior blank line + valid JSON lines + unterminated tail to exercise streaming compact+ftruncate!
+    fs::write(
+        partial.join("frames.ndjson"),
+        b"{\"frame\":0}\n\n{\"frame\":1}\n{\"partial_eof",
+    )
+    .unwrap();
+    fs::write(partial.join("imu.ndjson"), b"{\"seq\":0}\n{bad_json\n").unwrap();
+
+    // Make `recordings/` read-only (`0o555`) to trigger transient write error during publish.
+    fs::set_permissions(paths.recordings_dir(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let recovery = StagingRecoveryManager::new(
+        paths.clone(),
+        RecoveryDefaults {
+            device_id: new_uuid_v4(),
+            device_label: "Miro-Ego-11223344".to_owned(),
+            ..RecoveryDefaults::default()
+        },
+        Some(Arc::clone(&cat)),
+    );
+    let deferred_report = recovery.recover_staging_detailed().unwrap();
+    // Restore permissions right away so cleanup never fails even on assertion panic!
+    fs::set_permissions(paths.recordings_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Only assert EACCES deferral if running as non-root (root bypasses 0o555 DAC checks).
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(deferred_report.summary.scanned, 1);
+        assert_eq!(deferred_report.summary.recovered, 0);
+        assert_eq!(deferred_report.summary.quarantined, 0);
+        assert!(matches!(
+            deferred_report.items.first(),
+            Some(RecoveryItemOutcome::Deferred { .. })
+        ));
+        assert!(
+            partial.is_dir(),
+            "recoverable .partial MUST stay in staging/ on transient write error"
+        );
+
+        // Now that writability is restored, re-running recovery succeeds cleanly!
+        let ok_report = recovery.recover_staging_detailed().unwrap();
+        assert_eq!(ok_report.summary.recovered, 1);
+        assert_eq!(ok_report.summary.quarantined, 0);
+    } else {
+        assert_eq!(deferred_report.summary.recovered, 1);
+    }
+
+    let entry = cat.get_indexed_session(&sid).unwrap().unwrap();
+    let published = paths.recordings_dir().join(&entry.relative_dir);
+    assert_eq!(
+        fs::read_to_string(published.join("frames.ndjson")).unwrap(),
+        "{\"frame\":0}\n{\"frame\":1}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(published.join("imu.ndjson")).unwrap(),
+        "{\"seq\":0}\n"
+    );
 }

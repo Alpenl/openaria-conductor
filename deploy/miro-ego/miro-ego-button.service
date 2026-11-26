@@ -10,6 +10,7 @@ ConditionPathExists=/opt/miro-ego/current/bin/miro-ego
 Type=simple
 User=root
 Group=miro-ego
+SupplementaryGroups=miro-ego
 Environment=RUST_LOG=info
 ExecStart=/opt/miro-ego/current/bin/miro-ego button --config /etc/miro-ego/button.json --device-config /etc/miro-ego/device.json
 LimitCORE=0
@@ -20,6 +21,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
+ProtectKernelTunables=no
+ReadOnlyPaths=/proc/sys -/proc/sysrq-trigger -/proc/latency_stats -/proc/acpi -/proc/timer_stats -/proc/fs -/proc/irq
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 CapabilityBoundingSet=

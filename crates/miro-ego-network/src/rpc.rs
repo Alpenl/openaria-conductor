@@ -26,7 +26,7 @@ pub const CONTROL_RESPONSE_SCHEMA: &str = "miro-ego.network-control-response.v1"
 pub const MAX_RPC_LINE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(45);
 pub const DEFAULT_MAX_CONCURRENT_CONNS: usize = 8;
 
 const MUTATION_INLINE_SECRET_KEYS: &[&str] = &["password", "passphrase", "psk", "secret", "token"];
@@ -157,7 +157,7 @@ impl NetworkRpcServer {
                 })?;
             }
         }
-        if path.exists() {
+        if fs::symlink_metadata(&path).is_ok() {
             let _ = fs::remove_file(&path);
         }
         let listener = UnixListener::bind(&path).map_err(|err| NetworkError::Backend {
@@ -316,6 +316,14 @@ fn handle_connection(
 
     let sealed = seal_rpc_response(response);
     let _ = write_framed_response(stream, &sealed, config.max_line_bytes, config.write_timeout);
+    if sealed.ok
+        && matches!(
+            sealed.operation.as_deref(),
+            Some("apply" | "retry" | "forget")
+        )
+    {
+        controller.notify_rpc_response_flushed();
+    }
 }
 
 /// Dispatch one parsed JSON line against the controller.
@@ -551,6 +559,8 @@ fn error_from_network_error(op: &str, error: &NetworkError) -> RpcResponse {
         NetworkError::Busy { message } => {
             let code = if message.contains("capture_active") {
                 "capture_active"
+            } else if message.contains("credential_store_full") {
+                "credential_store_full"
             } else {
                 "controller_busy"
             };
@@ -561,6 +571,10 @@ fn error_from_network_error(op: &str, error: &NetworkError) -> RpcResponse {
                 "idempotency_conflict"
             } else if message.contains("transaction_not_found") {
                 "transaction_not_found"
+            } else if message.contains("transaction_not_retryable") {
+                "transaction_not_retryable"
+            } else if message.contains("invalid_network_desired_state") {
+                "invalid_network_desired_state"
             } else if message.contains("credential_ref_expired") {
                 "credential_ref_expired"
             } else if message.contains("credential_ref_invalid") {
@@ -938,9 +952,28 @@ fn extract_body(resp: RpcResponse) -> NetworkResult<Value> {
             code: "controller_failure".to_owned(),
             message: "unknown RPC error".to_owned(),
         });
-        return Err(NetworkError::Backend {
-            message: format!("{}: {}", err.code, err.message),
-        });
+        let prefix = format!("{}:", err.code);
+        let formatted = if err.message.starts_with(&prefix) {
+            err.message
+        } else {
+            format!("{}: {}", err.code, err.message)
+        };
+        return match err.code.as_str() {
+            "capture_active" | "controller_busy" | "network_busy" | "credential_store_full" => {
+                Err(NetworkError::Busy { message: formatted })
+            }
+            "request_invalid"
+            | "operation_invalid"
+            | "inline_secret_rejected"
+            | "idempotency_conflict"
+            | "transaction_not_found"
+            | "network_transaction_not_found"
+            | "transaction_not_retryable"
+            | "invalid_network_desired_state"
+            | "credential_ref_expired"
+            | "credential_ref_invalid" => Err(NetworkError::Invalid { message: formatted }),
+            _ => Err(NetworkError::Backend { message: formatted }),
+        };
     }
     resp.body.ok_or_else(|| NetworkError::Backend {
         message: "response_invalid: missing body".to_owned(),
@@ -1098,8 +1131,10 @@ mod tests {
             .unwrap(),
         );
 
-        let server = NetworkRpcServer::bind(&sock, ctrl, RpcServerConfig::default()).unwrap();
+        let server =
+            NetworkRpcServer::bind(&sock, Arc::clone(&ctrl), RpcServerConfig::default()).unwrap();
         let client = NetworkRpcClient::new(&sock);
+        assert_eq!(DEFAULT_CLIENT_TIMEOUT, Duration::from_secs(45));
 
         let health = client.health().unwrap();
         assert_eq!(health["mutation_enabled"], true);
@@ -1115,6 +1150,24 @@ mod tests {
             .unwrap();
         assert!(cred.credential_ref.starts_with("cred-"));
 
+        // Invalid credential_ref reconstructs NetworkError::Invalid (not Backend)!
+        let invalid_cred_err = client
+            .apply(
+                "api-gw",
+                "idem-rpc-bad-cred",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "StudioNet".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some("cred-nonexistent".to_owned()),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(invalid_cred_err, NetworkError::Invalid { .. }));
+
         let applied = client
             .apply(
                 "api-gw",
@@ -1126,12 +1179,21 @@ mod tests {
                         security: WifiSecurity::Wpa2Personal,
                         credential_ref: Some(cred.credential_ref),
                     }),
-                    ethernet: None,
+                ethernet: None,
                 },
             )
             .unwrap();
-        assert_eq!(applied.final_status, TransactionStatus::Committed);
+        // Async RPC returns 202 Accepted immediately before tearing down AP!
+        assert_eq!(applied.final_status, TransactionStatus::Accepted);
+        let settled = ctrl
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, TransactionStatus::Committed);
         assert_eq!(client.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
+        let st = client.status().unwrap();
+        assert_eq!(st.observed.wifi_client.state, "connected");
+        assert_eq!(st.observed.wifi_client.addresses, vec!["192.168.50.10"]);
 
         // Inline secret in apply request MUST be rejected!
         let bad_resp = client

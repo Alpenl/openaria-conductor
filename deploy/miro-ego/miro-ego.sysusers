@@ -1,3 +1,4 @@
 u miro-ego - "Miro-Ego stereo capture service" /var/lib/miro-ego
+m miro-ego audio
 m miro-ego video
 m miro-ego misc

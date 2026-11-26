@@ -17,7 +17,7 @@ Environment=RUST_LOG=info
 ExecStart=/opt/miro-ego/current/bin/miro-ego network-control serve
 LimitCORE=0
 StandardInput=socket
-StandardOutput=socket
+StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=miro-ego-network
 Restart=on-failure
@@ -32,7 +32,7 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/miro-ego-network
 ReadWritePaths=/etc/NetworkManager/system-connections
 ReadWritePaths=-/etc/avahi/services
-ReadWritePaths=/run/miro-ego/network-operation.lock
+ReadWritePaths=-/run/miro-ego/network-operation.lock
 RestrictSUIDSGID=yes
 LockPersonality=yes
 ProtectKernelTunables=yes

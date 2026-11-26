@@ -61,10 +61,18 @@ if ! flock -n 9; then
     exit 0
 fi
 
-exec 8<>"$NETWORK_OPERATION_LOCK"
-if ! flock -n 8; then
-    log "network controller operation is active; deferring driver recovery"
+if [ -L "$NETWORK_OPERATION_LOCK" ]; then
+    log "network operation lock is an unsafe symlink; deferring Wi-Fi recovery"
     exit 0
+elif [ ! -f "$NETWORK_OPERATION_LOCK" ]; then
+    log "network operation lock is missing; deferring Wi-Fi recovery"
+    exit 0
+else
+    exec 8<"$NETWORK_OPERATION_LOCK"
+    if ! flock -x -n 8; then
+        log "network controller operation is active; deferring driver recovery"
+        exit 0
+    fi
 fi
 
 MAINTENANCE_LOCK_ACTIVE=0

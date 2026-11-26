@@ -30,8 +30,16 @@ BUNDLE_SCHEMA = "miro-ego.rdk-x5-bundle.v1"
 TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
 REQUIRED_BINARIES = ("bin/miro-ego", "bin/miro-ego-encoder")
 REQUIRED_DEPLOY_ASSETS = ("miro-ego-data-volume", "miro-ego-data-volume.service")
+REQUIRED_VOICE_ASSETS = (
+    "device_ready.wav",
+    "recording_started.wav",
+    "recording_stopped.wav",
+    "storage_low.wav",
+    "error_alert.wav",
+)
 MAX_BUNDLE_FILES = 256
 MAX_BINARY_BYTES = 256 * 1024 * 1024
+MAX_VOICE_WAV_BYTES = 4 * 1024 * 1024
 MAX_TOTAL_BUNDLE_BYTES = 512 * 1024 * 1024
 
 ELF_MAGIC = b"\x7fELF"
@@ -80,6 +88,39 @@ def validate_aarch64_elf64(header: bytes, label: str) -> None:
         raise ValueError(
             f"{label} is not an AArch64 binary (e_machine={elf_machine}, expected {EM_AARCH64})"
         )
+
+
+def validate_pcm16_wav(raw: bytes, label: str) -> None:
+    """Validate an uncompressed RIFF/WAVE PCM16 voice cue asset."""
+    if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError(f"{label} is not a valid RIFF/WAVE file")
+    offset = 12
+    fmt_ok = False
+    data_ok = False
+    while offset + 8 <= len(raw):
+        chunk_id = raw[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", raw, offset + 4)[0]
+        data_start = offset + 8
+        data_end = data_start + chunk_size
+        if data_end > len(raw):
+            raise ValueError(f"{label} has truncated WAV chunk {chunk_id!r}")
+        if chunk_id == b"fmt ":
+            if chunk_size < 16:
+                raise ValueError(f"{label} has undersized WAV fmt chunk")
+            audio_fmt = struct.unpack_from("<H", raw, data_start)[0]
+            bits_per_sample = struct.unpack_from("<H", raw, data_start + 14)[0]
+            if audio_fmt != 1 or bits_per_sample != 16:
+                raise ValueError(f"{label} must be uncompressed PCM16 WAV")
+            fmt_ok = True
+        elif chunk_id == b"data":
+            if not fmt_ok:
+                raise ValueError(f"{label} has WAV data chunk before fmt chunk")
+            if chunk_size == 0 or chunk_size % 2 != 0:
+                raise ValueError(f"{label} must have non-empty even-byte PCM16 data")
+            data_ok = True
+        offset = data_start + chunk_size + (chunk_size & 1)
+    if not fmt_ok or not data_ok:
+        raise ValueError(f"{label} is missing required PCM16 fmt/data chunks")
 
 
 def validate_relative_path(rel: str) -> None:
@@ -182,6 +223,7 @@ def build_bundle(
     version: str,
     commit: str,
     deploy_dir: Path = ROOT / "deploy" / "miro-ego",
+    voice_dir: Path = ROOT / "share" / "voice",
     archive: Path | None = None,
 ) -> dict[str, Any]:
     """Assemble a verified pure-native Miro-Ego RDK X5 bundle directory (and optional tar)."""
@@ -196,6 +238,10 @@ def build_bundle(
     deploy_dir = deploy_dir.resolve()
     if deploy_dir.is_symlink() or not deploy_dir.is_dir():
         raise ValueError(f"Deploy assets directory does not exist: {deploy_dir}")
+
+    voice_dir = voice_dir.resolve()
+    if voice_dir.is_symlink() or not voice_dir.is_dir():
+        raise ValueError(f"Voice assets directory does not exist: {voice_dir}")
 
     binary_sources = {
         "bin/miro-ego": miro_ego_bin.resolve(),
@@ -261,6 +307,42 @@ def build_bundle(
     for required_asset in REQUIRED_DEPLOY_ASSETS:
         if required_asset not in seen_deploy_names:
             raise ValueError(f"Missing required deploy asset: deploy/miro-ego/{required_asset}")
+
+    voice_out = output / "share" / "voice"
+    voice_out.mkdir(parents=True, exist_ok=True)
+    voice_files = sorted(voice_dir.iterdir(), key=lambda p: p.name)
+    seen_voice_names: set[str] = set()
+    for src in voice_files:
+        if src.is_symlink() or not src.is_file():
+            raise ValueError(f"Voice asset must be a regular non-symlink file: {src}")
+        if src.suffix != ".wav":
+            raise ValueError(f"Voice asset must be a .wav file: {src}")
+        rel = f"share/voice/{src.name}"
+        validate_relative_path(rel)
+        size, digest, _ = sha256_file(src)
+        if size == 0 or size > MAX_VOICE_WAV_BYTES:
+            raise ValueError(f"{rel} byte length {size} is out of bounds")
+        validate_pcm16_wav(src.read_bytes(), rel)
+        dst = output / rel
+        shutil.copyfile(src, dst)
+        dst.chmod(0o644)
+        assets.append(
+            {
+                "path": rel,
+                "bytes": size,
+                "sha256": digest,
+                "executable": False,
+            }
+        )
+        sums_entries.append((rel, digest))
+        seen_voice_names.add(src.name)
+        total_bytes += size
+
+    for required_voice in REQUIRED_VOICE_ASSETS:
+        if required_voice not in seen_voice_names:
+            raise ValueError(f"Missing required voice asset: share/voice/{required_voice}")
+
+    assets.sort(key=lambda entry: entry["path"])
 
     total_entries = len(binaries) + len(assets)
     if total_entries > MAX_BUNDLE_FILES:
@@ -337,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Source directory containing Miro-Ego deployment assets",
     )
     parser.add_argument(
+        "--voice-dir",
+        type=Path,
+        default=ROOT / "share" / "voice",
+        help="Source directory containing Miro-Ego PCM16 WAV voice cue assets",
+    )
+    parser.add_argument(
         "--version",
         help="Bundle version string (defaults to scripts/release_version.py)",
     )
@@ -355,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         version=version,
         commit=commit,
         deploy_dir=args.deploy_dir,
+        voice_dir=args.voice_dir,
         archive=args.archive,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))

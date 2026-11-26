@@ -36,6 +36,7 @@ MAX_PROFILE_BYTES = 16 * 1024**2
 MAX_BINARY_BYTES = 256 * 1024**2
 MAX_BUNDLE_MANIFEST_BYTES = 128 * 1024
 MAX_DEPLOY_ASSET_BYTES = 1024**2
+MAX_VOICE_ASSET_BYTES = 4 * 1024**2
 MAX_BUNDLE_MEMBERS = 10000
 MAX_BUNDLE_TOTAL_BYTES = 4 * 1024**3
 
@@ -177,8 +178,24 @@ def _validate_bundle_manifest(
                 raise RuntimeError(f"bundle.json entry {rel!r} missing or size mismatch in tar")
             if section_name == "binaries":
                 declared_binaries.add(rel)
-            elif not rel.startswith("deploy/miro-ego/"):
-                raise RuntimeError(f"bundle.json asset must live under deploy/miro-ego/: {rel}")
+            elif rel.startswith("deploy/miro-ego/"):
+                rest = rel.removeprefix("deploy/miro-ego/")
+                if not rest or "/" in rest or size > MAX_DEPLOY_ASSET_BYTES:
+                    raise RuntimeError(f"Invalid deploy asset in bundle.json: {rel}")
+            elif rel.startswith("share/voice/"):
+                rest = rel.removeprefix("share/voice/")
+                if (
+                    not rest
+                    or "/" in rest
+                    or not rest.endswith(".wav")
+                    or executable
+                    or size > MAX_VOICE_ASSET_BYTES
+                ):
+                    raise RuntimeError(f"Invalid voice asset in bundle.json: {rel}")
+            else:
+                raise RuntimeError(
+                    f"bundle.json asset must live under deploy/miro-ego/ or share/voice/: {rel}"
+                )
     for required in REQUIRED_NATIVE_BINARIES:
         if required not in declared_binaries:
             raise RuntimeError(f"bundle.json missing required binary declaration: {required}")

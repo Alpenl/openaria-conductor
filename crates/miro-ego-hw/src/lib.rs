@@ -13,7 +13,7 @@ use thiserror::Error;
 pub use button::{
     BUTTON_CONFIG_SCHEMA, ButtonClassifier, ButtonConfig, ButtonMonitor, CaptureToggleAction,
     CaptureToggleClient, DEFAULT_BUTTON_CONFIG_PATH, GpioButtonInput, GpioPin,
-    LocalHttpCaptureClient, RDK_X5_GPIO_PINS, SysfsGpioPin,
+    LocalHttpCaptureClient, RDK_X5_GPIO_PINS, SysfsGpioPin, rdk_x5_board_pin_to_soc_gpio,
 };
 pub use indicator::{
     DEFAULT_LEDS_SYSFS_ROOT, LedIo, LedPattern, SysfsLedController, SysfsLedIo, pattern_for_state,
@@ -75,6 +75,8 @@ pub enum VoiceCue {
 
 pub trait ButtonInput: Send + Sync {
     fn poll_event(&self, timeout_ms: u64) -> HwResult<Option<ButtonEvent>>;
+
+    fn disarm(&self) {}
 }
 
 pub trait IndicatorController: Send + Sync {

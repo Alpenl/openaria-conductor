@@ -217,16 +217,6 @@ impl SecurityPolicy {
         {
             return Err(ApiError::bad_request("invalid csrf_token format"));
         }
-        let has_mutation = tokens.values().any(|principal| {
-            MUTATION_OPERATION_IDS
-                .iter()
-                .any(|op| principal.permissions.contains_key(*op))
-        });
-        if has_mutation && csrf_token.is_none() {
-            return Err(ApiError::bad_request(
-                "customer profile with mutation permissions must configure csrf_token",
-            ));
-        }
         validate_origins(&allowed_origins)?;
         Ok(Self {
             profile: SecurityProfile::Customer,
@@ -294,8 +284,16 @@ impl SecurityPolicy {
 
     /// Authenticate a request using constant-time UTF-8 byte comparison for Customer bearer tokens.
     pub fn authenticate(&self, authorization: Option<&str>) -> Option<&Principal> {
+        self.authenticate_with_token(authorization).map(|(p, _)| p)
+    }
+
+    /// Authenticate a request and also return the matched Customer bearer token (if in `customer` profile).
+    pub fn authenticate_with_token(
+        &self,
+        authorization: Option<&str>,
+    ) -> Option<(&Principal, Option<&str>)> {
         if self.profile == SecurityProfile::Lab {
-            return self.lab_principal.as_ref();
+            return self.lab_principal.as_ref().map(|p| (p, None));
         }
         let header = authorization?;
         let candidate = header.strip_prefix("Bearer ")?;
@@ -303,13 +301,13 @@ impl SecurityPolicy {
             return None;
         }
         let candidate_bytes = candidate.as_bytes();
-        let mut matched: Option<&Principal> = None;
+        let mut matched: Option<(&Principal, &str)> = None;
         for (token, principal) in &self.tokens {
             if constant_time_eq_bytes(candidate_bytes, token.as_bytes()) {
-                matched = Some(principal);
+                matched = Some((principal, token.as_str()));
             }
         }
-        matched
+        matched.map(|(p, tok)| (p, Some(tok)))
     }
 
     pub fn verify_csrf(&self, candidate: Option<&str>) -> bool {
@@ -317,6 +315,26 @@ impl SecurityPolicy {
             (Some(expected), Some(actual)) => constant_time_eq(actual, expected),
             _ => false,
         }
+    }
+
+    /// Verify `X-CSRF-Token` in constant time against either an explicit configured `csrf_token`
+    /// or (in `customer` profile per `docs/miro-ego-v1-api-migration.md:195`) the caller's own
+    /// authenticated bearer token.
+    pub fn verify_csrf_for_caller(
+        &self,
+        candidate: Option<&str>,
+        authenticated_bearer: Option<&str>,
+    ) -> bool {
+        let Some(actual) = candidate else {
+            return false;
+        };
+        let matches_configured = self
+            .csrf_token
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(actual, expected));
+        let matches_bearer =
+            authenticated_bearer.is_some_and(|bearer| constant_time_eq(actual, bearer));
+        matches_configured | matches_bearer
     }
 }
 
@@ -567,11 +585,23 @@ mod tests {
     #[test]
     fn customer_policy_enforces_constant_time_bearer_and_csrf_requirement() {
         let full = Principal::all_v1_operations("operator-1").unwrap();
+        let second = Principal::all_v1_operations("operator-2").unwrap();
         let mut tokens = HashMap::new();
-        tokens.insert("super-secret-token-01".to_owned(), full.clone());
+        tokens.insert("super-secret-token-01".to_owned(), full);
+        tokens.insert("super-secret-token-02".to_owned(), second);
 
-        // Missing CSRF token when mutation permissions exist must fail closed.
-        assert!(SecurityPolicy::customer(tokens.clone(), HashSet::new(), None).is_err());
+        // Customer policy with `csrf_token = None` enforces per-caller echoed bearer token as X-CSRF-Token.
+        let bearer_csrf_policy =
+            SecurityPolicy::customer(tokens.clone(), HashSet::new(), None).unwrap();
+        assert!(bearer_csrf_policy.verify_csrf_for_caller(
+            Some("super-secret-token-01"),
+            Some("super-secret-token-01"),
+        ));
+        assert!(!bearer_csrf_policy.verify_csrf_for_caller(
+            Some("super-secret-token-02"),
+            Some("super-secret-token-01"),
+        ));
+        assert!(!bearer_csrf_policy.verify_csrf_for_caller(None, Some("super-secret-token-01")));
 
         // Wildcard origin must fail closed.
         let mut bad_origins = HashSet::new();
@@ -594,6 +624,10 @@ mod tests {
         assert!(policy.authenticate(Some("Basic abc")).is_none());
         assert!(policy.authenticate(None).is_none());
         assert!(policy.verify_csrf(Some("csrf-token-1")));
+        assert!(policy.verify_csrf_for_caller(
+            Some("super-secret-token-02"),
+            Some("super-secret-token-02"),
+        ));
         assert!(!policy.verify_csrf(Some("csrf-token-2")));
         assert!(!policy.verify_csrf(None));
     }

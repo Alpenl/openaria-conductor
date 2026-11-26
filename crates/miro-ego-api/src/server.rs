@@ -220,18 +220,37 @@ impl GatewayServer {
                     let tls_acceptor = self.tls_acceptor.clone();
                     let tls_timeout = self.tls_handshake_timeout;
                     let header_timeout = self.request_header_timeout;
+                    let drain_timeout = self.shutdown_drain_timeout;
                     let mut conn_shutdown_rx = shutdown_rx.clone();
 
                     join_set.spawn(async move {
                         let _permit = permit;
                         if let Some(acceptor) = tls_acceptor {
-                            let handshake = tokio::time::timeout(tls_timeout, acceptor.accept(stream)).await;
+                            let handshake = tokio::select! {
+                                biased;
+                                _ = wait_for_shutdown(&mut conn_shutdown_rx) => return,
+                                res = tokio::time::timeout(tls_timeout, acceptor.accept(stream)) => res,
+                            };
                             let Ok(Ok(tls_stream)) = handshake else {
                                 return;
                             };
-                            serve_http1_stream(tls_stream, router, header_timeout, &mut conn_shutdown_rx).await;
+                            serve_http1_stream(
+                                tls_stream,
+                                router,
+                                header_timeout,
+                                drain_timeout,
+                                &mut conn_shutdown_rx,
+                            )
+                            .await;
                         } else {
-                            serve_http1_stream(stream, router, header_timeout, &mut conn_shutdown_rx).await;
+                            serve_http1_stream(
+                                stream,
+                                router,
+                                header_timeout,
+                                drain_timeout,
+                                &mut conn_shutdown_rx,
+                            )
+                            .await;
                         }
                     });
 
@@ -258,6 +277,7 @@ async fn serve_http1_stream<IO>(
     io: IO,
     router: Router,
     header_timeout: Duration,
+    drain_timeout: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -274,7 +294,7 @@ async fn serve_http1_stream<IO>(
         _ = &mut conn => {}
         _ = wait_for_shutdown(shutdown_rx) => {
             conn.as_mut().graceful_shutdown();
-            let _ = tokio::time::timeout(Duration::from_secs(1), conn).await;
+            let _ = tokio::time::timeout(drain_timeout, conn).await;
         }
     }
 }

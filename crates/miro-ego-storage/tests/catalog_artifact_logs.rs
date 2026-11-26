@@ -599,3 +599,145 @@ fn log_store_lists_reads_and_blocks_symlinks_hidden_and_traversal() {
         503
     );
 }
+
+#[test]
+fn catalog_utc_sorting_unicode_display_name_schema_rejection_and_rollback_on_write_error() {
+    let tmp = TempVol::new("utc-schema-rollback");
+    let rec_root = tmp.paths().recordings_dir();
+
+    // Session A: 2026-11-26T20:00:00+08:00 == 12:00:00Z (older in UTC, lexically larger string!)
+    // Session B: 2026-11-26T13:00:00Z       == 13:00:00Z (newer in UTC, lexically smaller string!)
+    let sid_a = new_uuid_v7();
+    let sid_b = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/20-00-00",
+        &sid_a,
+        &new_uuid_v7(),
+        "2026-11-26T20:00:00+08:00",
+        false,
+    );
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/13-00-00",
+        &sid_b,
+        &new_uuid_v7(),
+        "2026-11-26T13:00:00Z",
+        false,
+    );
+    // Patch sid_b's display_name to 160 multi-byte CJK characters (480 UTF-8 bytes) -> MUST succeed!
+    let b_manifest_path = rec_root.join("2026-11-26/13-00-00/manifest.json");
+    let mut b_val: serde_json::Value =
+        serde_json::from_slice(&fs::read(&b_manifest_path).unwrap()).unwrap();
+    b_val["display_name"] = json!("鏡".repeat(160));
+    fs::write(&b_manifest_path, serde_json::to_vec_pretty(&b_val).unwrap()).unwrap();
+
+    // Session C: schema-invalid manifest with empty `video.segments: []` -> MUST become a diagnostic!
+    let sid_c = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/14-00-00",
+        &sid_c,
+        &new_uuid_v7(),
+        "2026-11-26T14:00:00Z",
+        false,
+    );
+    let c_manifest_path = rec_root.join("2026-11-26/14-00-00/manifest.json");
+    let mut c_val: serde_json::Value =
+        serde_json::from_slice(&fs::read(&c_manifest_path).unwrap()).unwrap();
+    c_val["video"]["segments"] = json!([]);
+    fs::write(&c_manifest_path, serde_json::to_vec_pretty(&c_val).unwrap()).unwrap();
+
+    // Session D: closed-schema violation (unexpected top-level field) -> MUST become a diagnostic!
+    let sid_d = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/15-00-00",
+        &sid_d,
+        &new_uuid_v7(),
+        "2026-11-26T15:00:00Z",
+        false,
+    );
+    let d_manifest_path = rec_root.join("2026-11-26/15-00-00/manifest.json");
+    let mut d_val: serde_json::Value =
+        serde_json::from_slice(&fs::read(&d_manifest_path).unwrap()).unwrap();
+    d_val["bogus_extra_field"] = json!(123);
+    fs::write(&d_manifest_path, serde_json::to_vec_pretty(&d_val).unwrap()).unwrap();
+
+    let cat = BinarySessionCatalog::open(tmp.paths()).unwrap();
+    let page = cat.list_sessions_page(Some(50), None, false, None).unwrap();
+    assert_eq!(page.items.len(), 2);
+    // True UTC newest-first: sid_b (13:00Z) MUST precede sid_a (20:00+08:00 == 12:00Z)!
+    assert_eq!(page.items[0].session_id, sid_b);
+    assert_eq!(page.items[0].display_name.chars().count(), 160);
+    assert_eq!(page.items[1].session_id, sid_a);
+    assert_eq!(page.diagnostics.len(), 2);
+    assert!(
+        page.diagnostics
+            .iter()
+            .all(|d| d.code == DiscoveryDiagnosticCode::ManifestInvalid)
+    );
+
+    // Commit-after-write guarantee: if `.miro-ego` is missing so `catalog.bin` cannot be written,
+    // `remove_session` MUST fail without mutating the in-RAM `CatalogIndex`!
+    let rev_before = cat.catalog_revision().unwrap();
+    fs::remove_dir_all(tmp.paths().hidden_meta_dir()).unwrap();
+    assert!(cat.remove_session(&sid_b).is_err());
+    assert!(cat.get_session(&sid_b).unwrap().is_some());
+    assert_eq!(cat.catalog_revision().unwrap(), rev_before);
+}
+
+#[test]
+fn artifact_missing_returns_409_integrity_and_log_truncation_detected() {
+    let tmp = TempVol::new("missing-art-trunc-log");
+    let rec_root = tmp.paths().recordings_dir();
+    let sid = new_uuid_v7();
+    let (_, left_sha, _) = write_sealed_session(
+        &rec_root,
+        "2026-11-26/16-00-00",
+        &sid,
+        &new_uuid_v7(),
+        "2026-11-26T16:00:00Z",
+        false,
+    );
+
+    // Undeclared artifact_id -> 404 NotFound.
+    let unknown_id = "f".repeat(64);
+    let err_unknown = open_verified_artifact(
+        &rec_root,
+        "2026-11-26/16-00-00",
+        &unknown_id,
+        Some(&sid),
+        false,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err_unknown.http_status(), 404);
+
+    // Declared artifact missing on disk -> 409 Integrity `artifact_missing`!
+    fs::remove_file(rec_root.join("2026-11-26/16-00-00/video/left_00000.mp4")).unwrap();
+    let err_missing = open_verified_artifact(
+        &rec_root,
+        "2026-11-26/16-00-00",
+        &left_sha,
+        Some(&sid),
+        false,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err_missing.code(), "artifact_missing");
+    assert_eq!(err_missing.http_status(), 409);
+
+    // Truncating an opened diagnostic log mid-flight fails closed with 409 `log_truncated`.
+    let log_path = tmp.paths().logs_dir().join("truncated.log");
+    fs::write(&log_path, b"0123456789abcdef0123456789abcdef").unwrap();
+    let store = LogStore::new(tmp.paths(), Arc::new(|| true));
+    let opened = store.open_log("truncated.log").unwrap();
+    fs::write(&log_path, b"short").unwrap();
+    let hash_err = opened.compute_sha256_and_etag().unwrap_err();
+    assert_eq!(hash_err.code(), "log_truncated");
+    assert_eq!(hash_err.http_status(), 409);
+    let read_err = opened.read_bounded(1024).unwrap_err();
+    assert_eq!(read_err.code(), "log_truncated");
+    assert_eq!(read_err.http_status(), 409);
+}

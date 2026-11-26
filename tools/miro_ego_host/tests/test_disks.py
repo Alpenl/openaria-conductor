@@ -224,6 +224,36 @@ class HostDisksTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 disks.verify(io.BytesIO(data), size, expected, lambda *_: None)
 
+    def test_windows_volume_locks_tolerates_raw_unpartitioned_cards_and_null_paths(self) -> None:
+        from types import SimpleNamespace
+
+        d = disks.Disk(r"\\.\PhysicalDrive3", 64 * 1024**3, "SER", "SD Reader")
+        seen_cmds: list[str] = []
+
+        class FakeWinDLL:
+            def __init__(self, *_a: object, **_kw: object) -> None:
+                self.CreateFileW = SimpleNamespace(argtypes=None, restype=None)
+                self.CloseHandle = SimpleNamespace(argtypes=None)
+                self.DeviceIoControl = SimpleNamespace(argtypes=None)
+
+        for ps_output in (b"[]\r\n", b'[null, ""]\r\n', b"\r\n"):
+
+            def fake_ps(cmd: str, out: bytes = ps_output) -> bytes:
+                seen_cmds.append(cmd)
+                return out
+
+            with (
+                patch.object(disks, "powershell", side_effect=fake_ps),
+                patch("ctypes.WinDLL", FakeWinDLL, create=True),
+                disks.windows_volume_locks(d),
+            ):
+                pass
+
+        self.assertEqual(len(seen_cmds), 3)
+        for cmd in seen_cmds:
+            self.assertIn("Get-Partition -DiskNumber 3 -ErrorAction SilentlyContinue", cmd)
+            self.assertIn("Get-Volume -ErrorAction SilentlyContinue", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

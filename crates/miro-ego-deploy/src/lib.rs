@@ -4,6 +4,7 @@
 
 pub mod bundle;
 pub mod manager;
+pub mod rpc;
 
 use miro_ego_core::CoreError;
 use serde::{Deserialize, Serialize};
@@ -14,15 +15,22 @@ pub use bundle::{
     BUNDLE_SCHEMA, BundleFileEntry, BundleManifest, DefaultOfflinePackageHook, LocalCasStore,
     MAX_BINARY_BYTES, MAX_BUNDLE_FILES, MAX_MANIFEST_BYTES, MAX_TOTAL_BUNDLE_BYTES,
     OfflinePackageDescriptor, OfflinePackageHook, REQUIRED_BINARIES, StoreLayer, TARGET_PLATFORM,
-    VerifiedBundle, hash_file_safe, validate_aarch64_elf64_header, validate_bundle_relative_path,
-    validate_commit_sha, verify_bundle_dir,
+    VerifiedBundle, copy_and_verify_safe, hash_file_safe, is_allowed_bundle_asset_path,
+    validate_aarch64_elf64_header, validate_bundle_relative_path, validate_commit_sha,
+    verify_bundle_dir,
 };
 pub use manager::{
-    ACTIVATION_FAILURE_SCHEMA, ActivationFailureRecord, AssetSpec, DEPLOYMENT_ASSETS,
-    DEPLOYMENT_LOCK_NAME, DeploymentStatus, HealthChecker, INSTALL_TRANSACTION_SCHEMA,
-    InstallTransaction, InstalledReleaseMetadata, LocalHttpHealthChecker, RELEASE_METADATA_SCHEMA,
-    RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths, SystemctlRunner, TransactionAction,
-    TransactionState, UninstallReport,
+    ACTIVATION_FAILURE_SCHEMA, ActivationFailureRecord, AssetSpec, BoundedSystemctlRunner,
+    DEPLOYMENT_ASSETS, DEPLOYMENT_LOCK_NAME, DeploymentStatus, HealthChecker,
+    INSTALL_TRANSACTION_SCHEMA, InstallTransaction, InstalledReleaseMetadata,
+    LocalHttpHealthChecker, RELEASE_METADATA_SCHEMA, RealSystemctlRunner, ReleaseManager,
+    ReleaseManagerPaths, SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
+};
+pub use rpc::{
+    DEFAULT_DEPLOY_CLIENT_TIMEOUT, DEFAULT_DEPLOY_SOCKET_PATH, DEPLOY_REQUEST_SCHEMA,
+    DEPLOY_RESPONSE_SCHEMA, DeployControlStatus, DeployRpcClient, DeployRpcErrorBody,
+    DeployRpcRequest, DeployRpcResponse, DeployRpcServer, DeployRpcServerConfig,
+    FirmwareTaskAction, FirmwareTaskSnapshot, FirmwareTaskStatus, MAX_DEPLOY_RPC_LINE_BYTES,
 };
 
 pub const FIRMWARE_STATUS_SCHEMA: &str = "miro-ego.firmware-status.v1";

@@ -3,25 +3,27 @@
 
 use crate::mdns::{AVAHI_SERVICE_FILENAME, AvahiServiceRecord, DEFAULT_MDNS_PORT, MdnsScheme};
 use crate::nmcli::{
-    DEFAULT_ACTIVATION_WAIT_SECS, DEFAULT_HOTSPOT_IPV4_CIDR, NmcliBackend, ProfileSpec,
-    RescueHotspotInfo, StaticIpv4Config, WifiScanEntry, WifiSecurity, managed_profile_name,
-    validate_wifi_psk, validate_wifi_ssid,
+    DEFAULT_ACTIVATION_WAIT_SECS, DEFAULT_HOTSPOT_IPV4_CIDR, NmcliBackend, ObservedNetworkState,
+    ProfileSpec, RescueHotspotInfo, StaticIpv4Config, WifiScanEntry, WifiSecurity,
+    derive_rescue_identity, managed_profile_name, validate_wifi_psk, validate_wifi_ssid,
 };
 use crate::state::{
     CredentialState, DesiredEthernet, DesiredMode, DesiredState, EthernetAddressing,
-    NetworkDeviceDeadline, NetworkStateStore, RecoveryAction, RetainedCandidate, StateSnapshot,
-    TransactionError, TransactionOperation, TransactionReceipt, TransactionStage,
-    TransactionStatus, TransactionUpdate, TransactionWindow, format_utc_iso8601, utc_now_iso8601,
+    NetworkDeviceDeadline, NetworkStateStore, NetworkTransaction, RecoveryAction,
+    RetainedCandidate, StateSnapshot, TransactionError, TransactionOperation, TransactionReceipt,
+    TransactionStage, TransactionStatus, TransactionUpdate, TransactionWindow, format_utc_iso8601,
+    utc_now_iso8601,
 };
 use crate::{NetworkController, NetworkError, NetworkResult, StationCredentials, WifiStatus};
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
-use miro_ego_core::locks::{LockMode, acquire_network_operation_lock};
+use miro_ego_core::locks::{FlockGuard, LockMode, acquire_network_operation_lock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const NETWORK_CONTROLLER_STATUS_SCHEMA: &str = "miro-ego.network-controller-status.v1";
@@ -237,6 +239,10 @@ pub struct ControllerStatus {
     pub saved: bool,
     pub verified: bool,
     pub desired: DesiredState,
+    #[serde(default)]
+    pub rescue_ssid: Option<String>,
+    #[serde(default)]
+    pub observed: ObservedNetworkState,
     pub transaction: TransactionWindow,
     pub capability: MutationCapability,
 }
@@ -268,6 +274,8 @@ pub struct ControllerConfig {
     pub mdns_port: u16,
     pub mdns_scheme: MdnsScheme,
     pub activation_wait_secs: u64,
+    pub mdns_hostname: Option<String>,
+    pub synchronous_mutations: bool,
 }
 
 impl ControllerConfig {
@@ -279,18 +287,78 @@ impl ControllerConfig {
             mdns_port: DEFAULT_MDNS_PORT,
             mdns_scheme: MdnsScheme::Http,
             activation_wait_secs: DEFAULT_ACTIVATION_WAIT_SECS,
+            mdns_hostname: None,
+            synchronous_mutations: false,
         }
+    }
+
+    /// Configure mutations (`apply`, `retry`, `forget`) to wait synchronously for terminal
+    /// completion instead of returning `Accepted` while the worker runs in the background.
+    pub fn with_synchronous_mutations(mut self, synchronous: bool) -> Self {
+        self.synchronous_mutations = synchronous;
+        self
+    }
+
+    pub fn with_mdns_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.mdns_hostname = Some(hostname.into());
+        self
     }
 }
 
-/// Authoritative privileged network controller coordinating `nmcli`, bounded state,
-/// rescue hotspot failover, and `network-operation.lock`.
-pub struct AuthoritativeNetworkController {
+enum BackgroundTask {
+    RescueCommit {
+        tx_id: String,
+    },
+    CandidateActivation {
+        tx_id: String,
+        profile_name: String,
+        spec: Box<ProfileSpec>,
+        desired: Box<DesiredState>,
+    },
+    Forget {
+        tx_id: String,
+    },
+}
+
+struct WorkerSync {
+    state: Mutex<WorkerState>,
+    idle_cv: Condvar,
+    response_flushed_cv: Condvar,
+}
+
+struct WorkerState {
+    active: bool,
+    response_flushed: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WorkerSync {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WorkerState {
+                active: false,
+                response_flushed: false,
+                handle: None,
+            }),
+            idle_cv: Condvar::new(),
+            response_flushed_cv: Condvar::new(),
+        })
+    }
+}
+
+struct ControllerCore {
     backend: NmcliBackend,
     state: NetworkStateStore,
     credentials: EphemeralCredentialStore,
     config: ControllerConfig,
     rescue_info: Mutex<Option<RescueHotspotInfo>>,
+    worker: Arc<WorkerSync>,
+}
+
+/// Authoritative privileged network controller coordinating `nmcli`, bounded state,
+/// rescue hotspot failover, and `network-operation.lock`.
+pub struct AuthoritativeNetworkController {
+    core: Arc<ControllerCore>,
 }
 
 impl AuthoritativeNetworkController {
@@ -300,22 +368,199 @@ impl AuthoritativeNetworkController {
         config: ControllerConfig,
     ) -> NetworkResult<Self> {
         let controller = Self {
-            backend,
-            state,
-            credentials: EphemeralCredentialStore::new(DEFAULT_CREDENTIAL_TTL_SECS),
-            config,
-            rescue_info: Mutex::new(None),
+            core: Arc::new(ControllerCore {
+                backend,
+                state,
+                credentials: EphemeralCredentialStore::new(DEFAULT_CREDENTIAL_TTL_SECS),
+                config,
+                rescue_info: Mutex::new(None),
+                worker: WorkerSync::new(),
+            }),
         };
         controller.ensure_rescue_hotspot(true)?;
+        // Perform startup recovery & link reconciliation; if physical radio hardware is
+        // temporarily absent at boot, interrupted transactions are still settled cleanly
+        // while keeping the RPC socket available.
+        let _ = controller.reconcile_startup();
         Ok(controller)
     }
 
     pub fn backend(&self) -> &NmcliBackend {
-        &self.backend
+        &self.core.backend
     }
 
     pub fn state_store(&self) -> &NetworkStateStore {
-        &self.state
+        &self.core.state
+    }
+
+    /// Reconcile interrupted transactions and active NetworkManager links on startup.
+    ///
+    /// Executed under `network-operation.lock`:
+    /// 1. Transitions any non-terminal `transaction.current` (`Accepted` / `Running`) to
+    ///    terminal `Rescued` (after bringing up the rescue AP) or `Failed` (`current = None`).
+    /// 2. Otherwise reconciles links to match `state.desired.mode`:
+    ///    - `WifiClient`: activates `lkg_wifi_profile` when verified/available, falling back
+    ///      automatically to the rescue hotspot if absent, rescued/failed, or unreachable.
+    ///    - `Hotspot`: ensures the rescue hotspot is active on `wlan0`.
+    ///    - `EthernetDhcp` / `EthernetStatic`: activates `lkg_ethernet_profile` if present.
+    pub fn reconcile_startup(&self) -> NetworkResult<()> {
+        let _lock = self.core.acquire_op_lock()?;
+        let info = self.core.ensure_rescue_hotspot_locked(true)?;
+        let full = self.core.state.full_state()?;
+
+        if full.transaction.current.is_some() {
+            let rescue_res = self.core.activate_rescue_hotspot_locked();
+            let rescued = rescue_res.is_ok();
+            let _ = self
+                .core
+                .state
+                .recover_interrupted_transaction(rescued, utc_now_iso8601())?;
+            return rescue_res;
+        }
+
+        match full.desired.mode {
+            DesiredMode::Hotspot => self.core.activate_rescue_hotspot_locked(),
+            DesiredMode::WifiClient => {
+                let latest_unhealthy = full.transaction.latest.as_ref().is_some_and(|tx| {
+                    matches!(
+                        tx.status,
+                        TransactionStatus::Rescued | TransactionStatus::Failed
+                    )
+                });
+                if latest_unhealthy {
+                    return self.core.activate_rescue_hotspot_locked();
+                }
+
+                if let (Some(lkg_profile), Some(wifi)) =
+                    (&full.lkg_wifi_profile, &full.desired.wifi_client)
+                {
+                    if self.core.backend.profile_path(lkg_profile).is_file() {
+                        let spec = ProfileSpec::WifiClient {
+                            ssid: wifi.ssid.clone(),
+                            security: wifi.security,
+                            psk: None,
+                        };
+                        let connected_ok = self
+                            .core
+                            .backend
+                            .activate_connection(
+                                lkg_profile,
+                                self.core.backend.wifi_interface(),
+                                self.core.config.activation_wait_secs,
+                                true,
+                            )
+                            .and_then(|()| {
+                                self.core
+                                    .backend
+                                    .verify_activated_profile(lkg_profile, &spec)
+                                    .map(|_| ())
+                            });
+                        if connected_ok.is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
+                self.core.activate_rescue_hotspot_locked()
+            }
+            DesiredMode::EthernetDhcp => {
+                if let Some(lkg_eth) = &full.lkg_ethernet_profile {
+                    if self.core.backend.profile_path(lkg_eth).is_file() {
+                        self.core.backend.activate_connection(
+                            lkg_eth,
+                            self.core.backend.ethernet_interface(),
+                            self.core.config.activation_wait_secs,
+                            false,
+                        )?;
+                        let _ = self
+                            .core
+                            .backend
+                            .verify_activated_profile(lkg_eth, &ProfileSpec::EthernetDhcp)?;
+                    }
+                }
+                let _ = info;
+                Ok(())
+            }
+            DesiredMode::EthernetStatic => {
+                if let (Some(lkg_eth), Some(cfg)) = (
+                    &full.lkg_ethernet_profile,
+                    full.desired
+                        .ethernet
+                        .as_ref()
+                        .and_then(|e| e.static_ipv4.clone()),
+                ) {
+                    if self.core.backend.profile_path(lkg_eth).is_file() {
+                        self.core.backend.activate_connection(
+                            lkg_eth,
+                            self.core.backend.ethernet_interface(),
+                            self.core.config.activation_wait_secs,
+                            false,
+                        )?;
+                        let _ = self.core.backend.verify_activated_profile(
+                            lkg_eth,
+                            &ProfileSpec::EthernetStatic(cfg),
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Notify any newly accepted background mutation that the RPC server has flushed its
+    /// `202 Accepted` response bytes to the client socket so interface changes can begin immediately.
+    pub fn notify_rpc_response_flushed(&self) {
+        if let Ok(mut guard) = self.core.worker.state.lock() {
+            guard.response_flushed = true;
+            self.core.worker.response_flushed_cv.notify_all();
+        }
+    }
+
+    /// Wait until any in-flight asynchronous network transaction finishes and return
+    /// `transaction.latest` once idle.
+    pub fn wait_for_idle(&self, timeout: Duration) -> NetworkResult<Option<NetworkTransaction>> {
+        self.notify_rpc_response_flushed();
+        let deadline = Instant::now() + timeout;
+        let mut handle_to_join = None;
+        {
+            let mut guard = self
+                .core
+                .worker
+                .state
+                .lock()
+                .map_err(|_| NetworkError::Backend {
+                    message: "network worker mutex poisoned".to_owned(),
+                })?;
+            while guard.active {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(NetworkError::Busy {
+                        message: "controller_busy: timed out waiting for active network transaction"
+                            .to_owned(),
+                    });
+                }
+                let wait_for = deadline.saturating_duration_since(now);
+                let (next_guard, _) = self
+                    .core
+                    .worker
+                    .idle_cv
+                    .wait_timeout(guard, wait_for)
+                    .map_err(|_| NetworkError::Backend {
+                        message: "network worker condvar poisoned".to_owned(),
+                    })?;
+                guard = next_guard;
+            }
+            if guard
+                .handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                handle_to_join = guard.handle.take();
+            }
+        }
+        if let Some(h) = handle_to_join {
+            let _ = h.join();
+        }
+        Ok(self.core.state.snapshot()?.transaction.latest)
     }
 
     /// Ensure the device rescue hotspot (`MiroEgo-XXXXXXXX`) exists, preserving any custom PSK.
@@ -323,57 +568,75 @@ impl AuthoritativeNetworkController {
         &self,
         preserve_existing_psk: bool,
     ) -> NetworkResult<RescueHotspotInfo> {
-        let _lock = self.acquire_op_lock()?;
-        let info = self
-            .backend
-            .ensure_rescue_hotspot(&self.config.device_id, preserve_existing_psk)?;
-        self.write_avahi_if_configured()?;
-        self.state
-            .set_rescue_info(info.profile_name.clone(), info.ssid.clone())?;
-        if let Ok(mut guard) = self.rescue_info.lock() {
-            *guard = Some(info.clone());
-        }
-        Ok(info)
+        let _lock = self.core.acquire_op_lock()?;
+        self.core.ensure_rescue_hotspot_locked(preserve_existing_psk)
     }
 
     /// Issue a short-lived single-use opaque `credential_ref` for a Wi-Fi passphrase.
     pub fn create_credential(&self, passphrase: &str) -> NetworkResult<CredentialReceipt> {
-        self.credentials.issue(passphrase)
+        self.core.credentials.issue(passphrase)
     }
 
-    /// Return the authoritative controller status projection.
+    /// Return the authoritative controller status projection, including live `observed` link state
+    /// and canonical `rescue_ssid`.
     pub fn controller_status(&self) -> NetworkResult<ControllerStatus> {
-        let snap = self.state.snapshot()?;
+        let full = self.core.state.full_state()?;
+        let rescue_ssid = self
+            .core
+            .rescue_info
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| i.ssid.clone()))
+            .or_else(|| full.rescue_ssid.clone())
+            .or_else(|| {
+                derive_rescue_identity(&self.core.config.device_id)
+                    .ok()
+                    .map(|(ssid, _)| ssid)
+            });
+        let hostname = self.core.resolve_mdns_hostname();
+        let observed = self.core.backend.observed_network_state(
+            rescue_ssid.as_deref(),
+            &hostname,
+            self.core.config.mdns_port,
+            self.core.config.mdns_scheme,
+        );
         Ok(ControllerStatus {
             schema: NETWORK_CONTROLLER_STATUS_SCHEMA.to_owned(),
-            authority_epoch: snap.authority_epoch,
-            source_revision: snap.source_revision,
-            saved: snap.saved,
-            verified: snap.verified,
-            desired: snap.desired,
-            transaction: snap.transaction,
+            authority_epoch: full.authority_epoch,
+            source_revision: full.source_revision,
+            saved: full.saved,
+            verified: full.verified,
+            desired: full.desired,
+            rescue_ssid,
+            observed,
+            transaction: full.transaction,
             capability: MutationCapability::enabled_default(),
         })
     }
 
     /// Return the `watchdog-mode` decision for `miro-ego-wifi-watchdog`.
     pub fn watchdog_mode(&self) -> NetworkResult<WatchdogMode> {
-        let snap = self.state.snapshot()?;
+        let snap = self.core.state.snapshot()?;
         Ok(compute_watchdog_mode(&snap))
     }
 
-    /// Scan Wi-Fi networks with `network-operation.lock` check and request coalescing.
+    /// Scan Wi-Fi networks while holding a shared `network-operation.lock` across the scan,
+    /// without mutating or fsyncing `network-state.json`.
     pub fn scan(&self) -> NetworkResult<ScanResponse> {
-        // Nonblocking check: do not scan while capture or another network mutation holds the lock.
-        {
-            let _lock = self.acquire_op_lock()?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
         }
-        let networks = self.backend.scan_wifi()?;
-        let (authority_epoch, source_revision) = self.state.bump_scan_revision()?;
+        let _lock =
+            acquire_network_operation_lock(&self.core.config.run_dir, LockMode::Shared, true)
+                .map_err(|err| self.core.map_lock_error(err))?;
+        let networks = self.core.backend.scan_wifi()?;
+        let snap = self.core.state.snapshot()?;
         Ok(ScanResponse {
             schema: NETWORK_SCAN_SCHEMA.to_owned(),
-            authority_epoch,
-            source_revision,
+            authority_epoch: snap.authority_epoch,
+            source_revision: snap.source_revision,
             scanned_at: utc_now_iso8601(),
             networks,
         })
@@ -390,16 +653,14 @@ impl AuthoritativeNetworkController {
         let fingerprint = compute_request_fingerprint("apply", desired_input)?;
 
         if let Some(receipt) =
-            self.state
+            self.core
+                .state
                 .replay_receipt(principal_id, idempotency_key, &fingerprint)?
         {
             let final_status = self
+                .core
                 .state
-                .snapshot()?
-                .transaction
-                .latest
-                .as_ref()
-                .map(|t| t.status)
+                .find_transaction_status(&receipt.transaction.transaction_id)?
                 .unwrap_or(receipt.transaction.status);
             return Ok(MutationOutcome {
                 receipt,
@@ -408,9 +669,21 @@ impl AuthoritativeNetworkController {
             });
         }
 
-        let _lock = self.acquire_op_lock()?;
-        let (normalized_desired, maybe_spec) = self.resolve_apply_spec(desired_input)?;
+        // Validate shape and verify controller is idle BEFORE consuming any single-use credential_ref!
+        validate_apply_input_shape(desired_input)?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
+        let lock_guard = self.core.acquire_op_lock()?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
 
+        let (normalized_desired, maybe_spec) = self.core.resolve_apply_spec(desired_input)?;
         let candidate_profile = maybe_spec.as_ref().map(|spec| {
             managed_profile_name(
                 spec.mode_slug(),
@@ -420,11 +693,14 @@ impl AuthoritativeNetworkController {
 
         // Write candidate profile before accepting the transaction so validation errors fail fast.
         if let (Some(profile), Some(spec)) = (&candidate_profile, &maybe_spec) {
-            self.backend.write_profile(profile, spec)?;
-            self.write_avahi_if_configured()?;
+            self.core.backend.write_profile(profile, spec)?;
+            if let Err(err) = self.core.write_avahi_if_configured() {
+                let _ = self.core.backend.delete_connection(profile);
+                return Err(err);
+            }
         }
 
-        let accepted = self.state.accept_transaction(
+        let accepted = match self.core.state.accept_transaction(
             TransactionOperation::Apply,
             normalized_desired.clone(),
             principal_id,
@@ -433,21 +709,37 @@ impl AuthoritativeNetworkController {
             utc_now_iso8601(),
             true,
             None,
-        )?;
+        ) {
+            Ok(acc) => acc,
+            Err(err) => {
+                if let Some(profile) = &candidate_profile {
+                    let _ = self.core.backend.delete_connection(profile);
+                }
+                return Err(err);
+            }
+        };
         if accepted.replayed {
+            let final_status = self
+                .core
+                .state
+                .find_transaction_status(&accepted.receipt.transaction.transaction_id)?
+                .unwrap_or(accepted.receipt.transaction.status);
             return Ok(MutationOutcome {
-                final_status: accepted.receipt.transaction.status,
+                final_status,
                 receipt: accepted.receipt,
                 replayed: true,
             });
         }
 
         let tx_id = accepted.receipt.transaction.transaction_id.clone();
-        let final_status = match (candidate_profile, maybe_spec) {
-            (None, None) => self.execute_rescue_commit(&tx_id)?,
-            (Some(profile), Some(spec)) => {
-                self.execute_candidate_activation(&tx_id, &profile, &spec, &normalized_desired)?
-            }
+        let task = match (candidate_profile, maybe_spec) {
+            (None, None) => BackgroundTask::RescueCommit { tx_id },
+            (Some(profile_name), Some(spec)) => BackgroundTask::CandidateActivation {
+                tx_id,
+                profile_name,
+                spec: Box::new(spec),
+                desired: Box::new(normalized_desired),
+            },
             _ => {
                 return Err(NetworkError::Backend {
                     message: "inconsistent candidate profile state".to_owned(),
@@ -455,11 +747,7 @@ impl AuthoritativeNetworkController {
             }
         };
 
-        Ok(MutationOutcome {
-            receipt: accepted.receipt,
-            replayed: false,
-            final_status,
-        })
+        self.dispatch_mutation_task(accepted.receipt, lock_guard, task)
     }
 
     /// Retry the latest `rescued` or `failed` transaction using its retained candidate profile.
@@ -473,16 +761,14 @@ impl AuthoritativeNetworkController {
         let fingerprint = compute_request_fingerprint("retry", &source_transaction_id)?;
 
         if let Some(receipt) =
-            self.state
+            self.core
+                .state
                 .replay_receipt(principal_id, idempotency_key, &fingerprint)?
         {
             let final_status = self
+                .core
                 .state
-                .snapshot()?
-                .transaction
-                .latest
-                .as_ref()
-                .map(|t| t.status)
+                .find_transaction_status(&receipt.transaction.transaction_id)?
                 .unwrap_or(receipt.transaction.status);
             return Ok(MutationOutcome {
                 receipt,
@@ -491,8 +777,19 @@ impl AuthoritativeNetworkController {
             });
         }
 
-        let _lock = self.acquire_op_lock()?;
-        let full = self.state.full_state()?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
+        let lock_guard = self.core.acquire_op_lock()?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
+
+        let full = self.core.state.full_state()?;
         let Some(latest) = &full.transaction.latest else {
             return Err(NetworkError::Invalid {
                 message: "transaction_not_found: no previous transaction to retry".to_owned(),
@@ -516,8 +813,9 @@ impl AuthoritativeNetworkController {
                 message: "transaction_not_retryable: no retained candidate profile".to_owned(),
             });
         };
+        let spec = spec_from_retained_desired(&retained.desired)?;
 
-        let accepted = self.state.accept_transaction(
+        let accepted = self.core.state.accept_transaction(
             TransactionOperation::Retry,
             retained.desired.clone(),
             principal_id,
@@ -528,26 +826,26 @@ impl AuthoritativeNetworkController {
             Some(retained.clone()),
         )?;
         if accepted.replayed {
+            let final_status = self
+                .core
+                .state
+                .find_transaction_status(&accepted.receipt.transaction.transaction_id)?
+                .unwrap_or(accepted.receipt.transaction.status);
             return Ok(MutationOutcome {
-                final_status: accepted.receipt.transaction.status,
+                final_status,
                 receipt: accepted.receipt,
                 replayed: true,
             });
         }
 
         let tx_id = accepted.receipt.transaction.transaction_id.clone();
-        let spec = spec_from_retained_desired(&retained.desired)?;
-        let final_status = self.execute_candidate_activation(
-            &tx_id,
-            &retained.profile_name,
-            &spec,
-            &retained.desired,
-        )?;
-        Ok(MutationOutcome {
-            receipt: accepted.receipt,
-            replayed: false,
-            final_status,
-        })
+        let task = BackgroundTask::CandidateActivation {
+            tx_id,
+            profile_name: retained.profile_name,
+            spec: Box::new(spec),
+            desired: Box::new(retained.desired),
+        };
+        self.dispatch_mutation_task(accepted.receipt, lock_guard, task)
     }
 
     /// Forget saved Wi-Fi client profiles and return safely to the rescue hotspot.
@@ -560,16 +858,14 @@ impl AuthoritativeNetworkController {
         let fingerprint = compute_request_fingerprint("forget", &serde_json::json!({}))?;
 
         if let Some(receipt) =
-            self.state
+            self.core
+                .state
                 .replay_receipt(principal_id, idempotency_key, &fingerprint)?
         {
             let final_status = self
+                .core
                 .state
-                .snapshot()?
-                .transaction
-                .latest
-                .as_ref()
-                .map(|t| t.status)
+                .find_transaction_status(&receipt.transaction.transaction_id)?
                 .unwrap_or(receipt.transaction.status);
             return Ok(MutationOutcome {
                 receipt,
@@ -578,8 +874,19 @@ impl AuthoritativeNetworkController {
             });
         }
 
-        let _lock = self.acquire_op_lock()?;
-        let accepted = self.state.accept_transaction(
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
+        let lock_guard = self.core.acquire_op_lock()?;
+        if self.core.is_busy()? {
+            return Err(NetworkError::Busy {
+                message: "controller_busy: another network transaction is still active".to_owned(),
+            });
+        }
+
+        let accepted = self.core.state.accept_transaction(
             TransactionOperation::Forget,
             DesiredState::hotspot(),
             principal_id,
@@ -590,16 +897,171 @@ impl AuthoritativeNetworkController {
             None,
         )?;
         if accepted.replayed {
+            let final_status = self
+                .core
+                .state
+                .find_transaction_status(&accepted.receipt.transaction.transaction_id)?
+                .unwrap_or(accepted.receipt.transaction.status);
             return Ok(MutationOutcome {
-                final_status: accepted.receipt.transaction.status,
+                final_status,
                 receipt: accepted.receipt,
                 replayed: true,
             });
         }
 
         let tx_id = accepted.receipt.transaction.transaction_id.clone();
+        let task = BackgroundTask::Forget { tx_id };
+        self.dispatch_mutation_task(accepted.receipt, lock_guard, task)
+    }
+
+    fn dispatch_mutation_task(
+        &self,
+        receipt: TransactionReceipt,
+        lock_guard: FlockGuard,
+        task: BackgroundTask,
+    ) -> NetworkResult<MutationOutcome> {
+        if self.core.config.synchronous_mutations {
+            let _held = lock_guard;
+            let final_status = self.core.run_task(task)?;
+            return Ok(MutationOutcome {
+                receipt,
+                replayed: false,
+                final_status,
+            });
+        }
+
+        let prev_handle = {
+            let mut guard = self
+                .core
+                .worker
+                .state
+                .lock()
+                .map_err(|_| NetworkError::Backend {
+                    message: "network worker mutex poisoned".to_owned(),
+                })?;
+            guard.active = true;
+            guard.response_flushed = false;
+            guard.handle.take()
+        };
+        if let Some(prev) = prev_handle {
+            let _ = prev.join();
+        }
+
+        let core_clone = Arc::clone(&self.core);
+        let spawn_res = std::thread::Builder::new()
+            .name("miro-ego-net-tx".to_owned())
+            .spawn(move || {
+                let _held_lock = lock_guard;
+                // Wait briefly (up to 30ms) for the RPC server to flush the 202 Accepted reply
+                // before tearing down wlan0 AP, with a bounded timeout so non-RPC callers never hang.
+                if let Ok(wguard) = core_clone.worker.state.lock() {
+                    if !wguard.response_flushed {
+                        let _ = core_clone
+                            .worker
+                            .response_flushed_cv
+                            .wait_timeout(wguard, Duration::from_millis(30));
+                    }
+                }
+                let _ = core_clone.run_task(task);
+                if let Ok(mut wguard) = core_clone.worker.state.lock() {
+                    wguard.active = false;
+                    core_clone.worker.idle_cv.notify_all();
+                }
+            });
+
+        match spawn_res {
+            Ok(handle) => {
+                if let Ok(mut guard) = self.core.worker.state.lock() {
+                    guard.handle = Some(handle);
+                }
+                Ok(MutationOutcome {
+                    receipt,
+                    replayed: false,
+                    final_status: TransactionStatus::Accepted,
+                })
+            }
+            Err(err) => {
+                if let Ok(mut guard) = self.core.worker.state.lock() {
+                    guard.active = false;
+                    self.core.worker.idle_cv.notify_all();
+                }
+                let tx_id = receipt.transaction.transaction_id.clone();
+                let spawn_err = NetworkError::Backend {
+                    message: format!("failed to spawn network transaction worker: {err}"),
+                };
+                let _ = self.core.fallback_to_rescue(&tx_id, &spawn_err, None);
+                Err(spawn_err)
+            }
+        }
+    }
+}
+
+impl Drop for AuthoritativeNetworkController {
+    fn drop(&mut self) {
+        self.notify_rpc_response_flushed();
+        let handle = self.core.worker.state.lock().ok().and_then(|mut g| g.handle.take());
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
+}
+
+impl ControllerCore {
+    fn is_busy(&self) -> NetworkResult<bool> {
+        let worker_busy = self
+            .worker
+            .state
+            .lock()
+            .map(|g| g.active)
+            .unwrap_or(false);
+        Ok(worker_busy || self.state.has_active_transaction()?)
+    }
+
+    fn ensure_rescue_hotspot_locked(
+        &self,
+        preserve_existing_psk: bool,
+    ) -> NetworkResult<RescueHotspotInfo> {
+        let info = self
+            .backend
+            .ensure_rescue_hotspot(&self.config.device_id, preserve_existing_psk)?;
+        self.write_avahi_if_configured()?;
+        self.state
+            .set_rescue_info(info.profile_name.clone(), info.ssid.clone())?;
+        if let Ok(mut guard) = self.rescue_info.lock() {
+            *guard = Some(info.clone());
+        }
+        Ok(info)
+    }
+
+    fn resolve_mdns_hostname(&self) -> String {
+        if let Some(host) = &self.config.mdns_hostname {
+            if !host.trim().is_empty() {
+                return host.trim().to_owned();
+            }
+        }
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "miro-ego".to_owned())
+    }
+
+    fn run_task(&self, task: BackgroundTask) -> NetworkResult<TransactionStatus> {
+        match task {
+            BackgroundTask::RescueCommit { tx_id } => self.execute_rescue_commit(&tx_id),
+            BackgroundTask::CandidateActivation {
+                tx_id,
+                profile_name,
+                spec,
+                desired,
+            } => self.execute_candidate_activation(&tx_id, &profile_name, &spec, &desired),
+            BackgroundTask::Forget { tx_id } => self.execute_forget(&tx_id),
+        }
+    }
+
+    fn execute_forget(&self, tx_id: &str) -> NetworkResult<TransactionStatus> {
         self.state.transition(
-            &tx_id,
+            tx_id,
             TransactionUpdate {
                 status: TransactionStatus::Running,
                 stage: TransactionStage::Forgetting,
@@ -618,16 +1080,19 @@ impl AuthoritativeNetworkController {
 
         let result = (|| -> NetworkResult<()> {
             self.activate_rescue_hotspot_locked()?;
-            let _ = self.backend.remove_managed_wifi_client_profiles()?;
+            self.cleanup_managed_ethernet_if_leaving()?;
+            let keep = HashSet::new();
+            let _ = self.backend.prune_managed_profiles(&keep)?;
             self.credentials.clear();
             self.state.set_lkg_profile(true, None)?;
+            self.state.set_lkg_profile(false, None)?;
             Ok(())
         })();
 
-        let final_status = match result {
+        match result {
             Ok(()) => {
                 self.state.transition(
-                    &tx_id,
+                    tx_id,
                     TransactionUpdate {
                         status: TransactionStatus::Committed,
                         stage: TransactionStage::Forgotten,
@@ -643,16 +1108,32 @@ impl AuthoritativeNetworkController {
                         retained_candidate: Some(None),
                     },
                 )?;
-                TransactionStatus::Committed
+                Ok(TransactionStatus::Committed)
             }
-            Err(err) => self.fallback_to_rescue(&tx_id, &err, None)?,
-        };
+            Err(err) => self.fallback_to_rescue(tx_id, &err, None),
+        }
+    }
 
-        Ok(MutationOutcome {
-            receipt: accepted.receipt,
-            replayed: false,
-            final_status,
-        })
+    fn cleanup_managed_ethernet_if_leaving(&self) -> NetworkResult<()> {
+        let had_lkg_eth = self
+            .state
+            .full_state()
+            .ok()
+            .and_then(|s| s.lkg_ethernet_profile)
+            .is_some();
+        let active_managed_eth = self
+            .backend
+            .inspect_device(self.backend.ethernet_interface())
+            .ok()
+            .and_then(|snap| snap.connection)
+            .is_some_and(|conn| conn.starts_with("miro-ego-ethernet-"));
+        if had_lkg_eth || active_managed_eth {
+            let _ = self
+                .backend
+                .disconnect_device(self.backend.ethernet_interface());
+            self.state.set_lkg_profile(false, None)?;
+        }
+        Ok(())
     }
 
     fn execute_rescue_commit(&self, tx_id: &str) -> NetworkResult<TransactionStatus> {
@@ -676,6 +1157,11 @@ impl AuthoritativeNetworkController {
 
         match self.activate_rescue_hotspot_locked() {
             Ok(()) => {
+                let _ = self.cleanup_managed_ethernet_if_leaving();
+                let keep = HashSet::new();
+                let _ = self.backend.prune_managed_profiles(&keep);
+                let _ = self.state.set_lkg_profile(true, None);
+                let _ = self.state.set_lkg_profile(false, None);
                 self.state.transition(
                     tx_id,
                     TransactionUpdate {
@@ -866,8 +1352,25 @@ impl AuthoritativeNetworkController {
 
         match outcome {
             Ok(()) => {
-                self.state
-                    .set_lkg_profile(is_wifi_client, Some(profile_name.to_owned()))?;
+                let mut keep = HashSet::new();
+                keep.insert(profile_name.to_owned());
+                if is_wifi_client {
+                    let _ = self.cleanup_managed_ethernet_if_leaving();
+                    self.state
+                        .set_lkg_profile(true, Some(profile_name.to_owned()))?;
+                } else {
+                    if let Some(existing_wifi) = self
+                        .state
+                        .full_state()
+                        .ok()
+                        .and_then(|s| s.lkg_wifi_profile)
+                    {
+                        keep.insert(existing_wifi);
+                    }
+                    self.state
+                        .set_lkg_profile(false, Some(profile_name.to_owned()))?;
+                }
+                let _ = self.backend.prune_managed_profiles(&keep);
                 self.state.transition(
                     tx_id,
                     TransactionUpdate {
@@ -1054,15 +1557,27 @@ impl AuthoritativeNetworkController {
         }
     }
 
-    fn acquire_op_lock(&self) -> NetworkResult<miro_ego_core::locks::FlockGuard> {
-        acquire_network_operation_lock(&self.config.run_dir, LockMode::Exclusive, true).map_err(
-            |err| match err {
-                miro_ego_core::CoreError::LockBusy { message } => NetworkError::Busy {
-                    message: format!("capture_active: {message}"),
-                },
-                other => NetworkError::Core(other),
-            },
-        )
+    fn acquire_op_lock(&self) -> NetworkResult<FlockGuard> {
+        acquire_network_operation_lock(&self.config.run_dir, LockMode::Exclusive, true)
+            .map_err(|err| self.map_lock_error(err))
+    }
+
+    fn map_lock_error(&self, err: miro_ego_core::CoreError) -> NetworkError {
+        match err {
+            miro_ego_core::CoreError::LockBusy { message } => {
+                if self.is_busy().unwrap_or(false) {
+                    NetworkError::Busy {
+                        message: "controller_busy: another network transaction is still active"
+                            .to_owned(),
+                    }
+                } else {
+                    NetworkError::Busy {
+                        message: format!("capture_active: {message}"),
+                    }
+                }
+            }
+            other => NetworkError::Core(other),
+        }
     }
 
     fn write_avahi_if_configured(&self) -> NetworkResult<()> {
@@ -1075,16 +1590,66 @@ impl AuthoritativeNetworkController {
     }
 }
 
+fn validate_apply_input_shape(input: &ApplyDesiredState) -> NetworkResult<()> {
+    match input.mode {
+        DesiredMode::Hotspot => Ok(()),
+        DesiredMode::WifiClient => {
+            let Some(wifi) = &input.wifi_client else {
+                return Err(NetworkError::Invalid {
+                    message: "wifi-client mode requires wifi_client object".to_owned(),
+                });
+            };
+            validate_wifi_ssid(&wifi.ssid)?;
+            match wifi.security {
+                WifiSecurity::Open => {
+                    if wifi.credential_ref.is_some() {
+                        return Err(NetworkError::Invalid {
+                            message: "open Wi-Fi must not include credential_ref".to_owned(),
+                        });
+                    }
+                }
+                _ => {
+                    if wifi.credential_ref.as_deref().is_none_or(str::is_empty) {
+                        return Err(NetworkError::Invalid {
+                            message: "protected Wi-Fi requires credential_ref".to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+        DesiredMode::EthernetDhcp => Ok(()),
+        DesiredMode::EthernetStatic => {
+            let Some(eth) = &input.ethernet else {
+                return Err(NetworkError::Invalid {
+                    message: "ethernet-static requires ethernet object".to_owned(),
+                });
+            };
+            if eth.addressing != EthernetAddressing::Static {
+                return Err(NetworkError::Invalid {
+                    message: "ethernet-static requires addressing=static".to_owned(),
+                });
+            }
+            let Some(static_cfg) = &eth.static_ipv4 else {
+                return Err(NetworkError::Invalid {
+                    message: "ethernet-static requires static_ipv4 configuration".to_owned(),
+                });
+            };
+            static_cfg.validate()
+        }
+    }
+}
+
 impl NetworkController for AuthoritativeNetworkController {
     fn status(&self) -> NetworkResult<WifiStatus> {
-        self.backend.wifi_status()
+        self.core.backend.wifi_status()
     }
 
     fn start_hotspot(&self, ssid: &str) -> NetworkResult<WifiStatus> {
         validate_wifi_ssid(ssid)?;
-        let _lock = self.acquire_op_lock()?;
+        let _lock = self.core.acquire_op_lock()?;
         let profile_name = managed_profile_name("hotspot", ssid);
-        let existing_path = self.backend.profile_path(&profile_name);
+        let existing_path = self.core.backend.profile_path(&profile_name);
         let spec = ProfileSpec::Hotspot {
             ssid: ssid.to_owned(),
             psk: crate::nmcli::DEFAULT_RESCUE_HOTSPOT_PSK.to_owned(),
@@ -1092,18 +1657,19 @@ impl NetworkController for AuthoritativeNetworkController {
         };
         // Preserve any existing hotspot profile & PSK rather than overwriting it.
         if !existing_path.exists() {
-            self.backend.write_profile(&profile_name, &spec)?;
+            self.core.backend.write_profile(&profile_name, &spec)?;
         }
-        self.backend.activate_connection(
+        self.core.backend.activate_connection(
             &profile_name,
-            self.backend.wifi_interface(),
-            self.config.activation_wait_secs,
+            self.core.backend.wifi_interface(),
+            self.core.config.activation_wait_secs,
             false,
         )?;
         let _ = self
+            .core
             .backend
             .verify_activated_profile(&profile_name, &spec)?;
-        self.backend.wifi_status()
+        self.core.backend.wifi_status()
     }
 
     fn connect_station(&self, credentials: &StationCredentials) -> NetworkResult<WifiStatus> {
@@ -1136,15 +1702,25 @@ impl NetworkController for AuthoritativeNetworkController {
                 ethernet: None,
             },
         )?;
-        if outcome.final_status != TransactionStatus::Committed {
+        let terminal_status = if outcome.final_status.is_terminal() {
+            outcome.final_status
+        } else {
+            let wait_timeout =
+                Duration::from_secs(self.core.config.activation_wait_secs.saturating_mul(3).max(15));
+            let _ = self.wait_for_idle(wait_timeout)?;
+            self.core
+                .state
+                .find_transaction_status(&outcome.receipt.transaction.transaction_id)?
+                .unwrap_or(outcome.final_status)
+        };
+        if terminal_status != TransactionStatus::Committed {
             return Err(NetworkError::Backend {
                 message: format!(
-                    "station connection did not commit (status={:?}; fell back to rescue hotspot)",
-                    outcome.final_status
+                    "station connection did not commit (status={terminal_status:?}; fell back to rescue hotspot)"
                 ),
             });
         }
-        self.backend.wifi_status()
+        self.core.backend.wifi_status()
     }
 }
 
@@ -1312,6 +1888,23 @@ mod tests {
                 });
             }
 
+            if args.len() == 3 && args[0] == "device" && args[1] == "disconnect" {
+                if args[2] == "eth0" {
+                    st.active_eth_profile = None;
+                    st.active_eth_ip = None;
+                    st.active_eth_route = None;
+                } else if args[2] == "wlan0" {
+                    st.active_wlan_profile = None;
+                    st.active_wlan_ip = None;
+                    st.active_wlan_route = None;
+                }
+                return Ok(CommandOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+
             if args.contains(&"connection") && args.contains(&"up") {
                 let id_idx = args.iter().position(|a| *a == "id").unwrap();
                 let if_idx = args.iter().position(|a| *a == "ifname").unwrap();
@@ -1425,8 +2018,13 @@ mod tests {
         let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
 
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
+        let init_status = ctrl.controller_status().unwrap();
+        assert!(init_status.rescue_ssid.as_deref().unwrap().starts_with("MiroEgo-"));
+        assert_eq!(init_status.observed.ap.state, "active");
+        assert_eq!(init_status.observed.ap.addresses, vec!["10.42.0.1"]);
 
         let cred = ctrl.create_credential("wrong-passphrase").unwrap();
+        let cred_ref = cred.credential_ref.clone();
         let outcome = ctrl
             .apply(
                 "client-1",
@@ -1436,13 +2034,41 @@ mod tests {
                     wifi_client: Some(ApplyWifiClient {
                         ssid: "LabWiFi".to_owned(),
                         security: WifiSecurity::Wpa2Personal,
-                        credential_ref: Some(cred.credential_ref),
+                        credential_ref: Some(cred_ref.clone()),
                     }),
                     ethernet: None,
                 },
             )
             .unwrap();
-        assert_eq!(outcome.final_status, TransactionStatus::Rescued);
+        assert_eq!(outcome.final_status, TransactionStatus::Accepted);
+        let settled = ctrl
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, TransactionStatus::Rescued);
+
+        // Idempotent replay of the rescued request reflects terminal Rescued status!
+        let replayed = ctrl
+            .apply(
+                "client-1",
+                "idem-failover-1",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "LabWiFi".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred_ref),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.final_status, TransactionStatus::Rescued);
+        assert_eq!(
+            replayed.receipt.transaction.status,
+            TransactionStatus::Rescued
+        );
 
         // Watchdog MUST defer when desired is wifi-client and latest tx is rescued!
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::Defer);
@@ -1461,23 +2087,53 @@ mod tests {
                 &outcome.receipt.transaction.transaction_id,
             )
             .unwrap();
-        assert_eq!(retry_outcome.final_status, TransactionStatus::Committed);
-        assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
-        let committed_latest = ctrl
-            .controller_status()
+        assert_eq!(retry_outcome.final_status, TransactionStatus::Accepted);
+        let retry_settled = ctrl
+            .wait_for_idle(Duration::from_secs(5))
             .unwrap()
-            .transaction
-            .latest
             .unwrap();
+        assert_eq!(retry_settled.status, TransactionStatus::Committed);
+        assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
+        let committed_status = ctrl.controller_status().unwrap();
+        assert_eq!(committed_status.observed.wifi_client.state, "connected");
+        assert_eq!(
+            committed_status.observed.wifi_client.addresses,
+            vec!["192.168.1.50"]
+        );
+        assert_eq!(
+            committed_status.observed.default_route,
+            crate::nmcli::ObservedDefaultRoute::WifiClient
+        );
+        let committed_latest = committed_status.transaction.latest.unwrap();
         assert!(committed_latest.rescue.ap_validated);
         assert!(committed_latest.deadline.is_none());
         let tx_json = serde_json::to_value(&committed_latest).unwrap();
         assert!(tx_json.as_object().unwrap().contains_key("deadline"));
         assert!(tx_json["deadline"].is_null());
 
+        // Replay of retry idempotency key returns Committed (even after later transactions!).
+        let retry_replay = ctrl
+            .retry(
+                "client-1",
+                "idem-retry-1",
+                &outcome.receipt.transaction.transaction_id,
+            )
+            .unwrap();
+        assert!(retry_replay.replayed);
+        assert_eq!(retry_replay.final_status, TransactionStatus::Committed);
+        assert_eq!(
+            retry_replay.receipt.transaction.status,
+            TransactionStatus::Committed
+        );
+
         // Forget restores hotspot and removes managed wifi-client profiles.
         let forget_outcome = ctrl.forget("client-1", "idem-forget-1").unwrap();
-        assert_eq!(forget_outcome.final_status, TransactionStatus::Committed);
+        assert_eq!(forget_outcome.final_status, TransactionStatus::Accepted);
+        let forget_settled = ctrl
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(forget_settled.status, TransactionStatus::Committed);
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
         assert!(!ctrl.controller_status().unwrap().saved);
 
@@ -1590,7 +2246,8 @@ mod tests {
         let mock = MockNmcli::new(false);
         let backend = NmcliBackend::new(mock.clone(), root.join("profiles"), "wlan0", "eth0");
         let state = NetworkStateStore::open_or_init(root.join("network-state.json")).unwrap();
-        let cfg = ControllerConfig::new("rdk-x5-eth", root.join("run"));
+        let cfg = ControllerConfig::new("rdk-x5-eth", root.join("run"))
+            .with_synchronous_mutations(true);
         let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
 
         let dhcp = ctrl
@@ -1639,6 +2296,158 @@ mod tests {
             .unwrap();
         assert!(eth_latest.rescue.ap_validated);
         assert!(eth_latest.deadline.is_none());
+
+        // Superseded ethernet-dhcp profile must have been pruned on EthernetStatic commit!
+        let remaining_profiles: Vec<String> = fs::read_dir(root.join("profiles"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !remaining_profiles
+                .iter()
+                .any(|n| n.starts_with("miro-ego-ethernet-dhcp-"))
+        );
+        assert!(
+            remaining_profiles
+                .iter()
+                .any(|n| n.starts_with("miro-ego-ethernet-static-"))
+        );
+
+        // Switching back to hotspot disconnects managed eth0 and prunes ethernet-static!
+        let back_to_ap = ctrl
+            .apply(
+                "client-eth",
+                "idem-back-ap",
+                &ApplyDesiredState {
+                    mode: DesiredMode::Hotspot,
+                    wifi_client: None,
+                    ethernet: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(back_to_ap.final_status, TransactionStatus::Committed);
+        assert!(mock.inner.lock().unwrap().active_eth_profile.is_none());
+        let after_ap_profiles: Vec<String> = fs::read_dir(root.join("profiles"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(after_ap_profiles.len(), 1);
+        assert!(after_ap_profiles[0].starts_with("miro-ego-hotspot-rescue-"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciliation_recovers_interrupted_tx_and_preserves_credential_when_busy() {
+        let root = temp_root("startup-reconcile");
+        let state_path = root.join("network-state.json");
+
+        // Seed an interrupted `Running` transaction on disk to simulate SIGKILL/power-loss.
+        {
+            let store = NetworkStateStore::open_or_init(&state_path).unwrap();
+            let _ = store
+                .accept_transaction(
+                    TransactionOperation::Apply,
+                    DesiredState::wifi_client(
+                        "DeadRouter",
+                        WifiSecurity::Wpa2Personal,
+                        CredentialState::Stored,
+                    ),
+                    "client-crash",
+                    "idem-crashed",
+                    "fp-crashed",
+                    "2026-11-26T00:00:00Z".to_owned(),
+                    true,
+                    None,
+                )
+                .unwrap();
+            assert!(store.has_active_transaction().unwrap());
+        }
+
+        // Constructing a new controller reconciles startup: brings up rescue AP and settles
+        // the interrupted transaction to `Rescued` (`current = None`)!
+        let mock = MockNmcli::new(false);
+        let backend = NmcliBackend::new(mock.clone(), root.join("profiles"), "wlan0", "eth0");
+        let state = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let cfg = ControllerConfig::new("rdk-x5-crash", root.join("run"));
+        let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
+
+        let status = ctrl.controller_status().unwrap();
+        assert!(status.transaction.current.is_none());
+        let latest = status.transaction.latest.unwrap();
+        assert_eq!(latest.status, TransactionStatus::Rescued);
+        assert_eq!(latest.recovery_action, RecoveryAction::ReconnectRescueAp);
+        assert_eq!(status.observed.ap.state, "active");
+
+        // Scan must NOT increment source_revision or rewrite network-state.json!
+        let rev_before = status.source_revision;
+        let scan_res = ctrl.scan().unwrap();
+        assert_eq!(scan_res.source_revision, rev_before);
+        assert_eq!(ctrl.controller_status().unwrap().source_revision, rev_before);
+
+        // When network-operation.lock is held, `apply` MUST reject with Busy BEFORE consuming
+        // single-use `credential_ref`, allowing the same `credential_ref` to succeed once idle!
+        let cred = ctrl.create_credential("valid-passphrase-123").unwrap();
+        {
+            let _ext_lock =
+                acquire_network_operation_lock(root.join("run"), LockMode::Exclusive, true)
+                    .unwrap();
+            let busy_err = ctrl
+                .apply(
+                    "client-1",
+                    "idem-after-lock",
+                    &ApplyDesiredState {
+                        mode: DesiredMode::WifiClient,
+                        wifi_client: Some(ApplyWifiClient {
+                            ssid: "LabWiFi".to_owned(),
+                            security: WifiSecurity::Wpa2Personal,
+                            credential_ref: Some(cred.credential_ref.clone()),
+                        }),
+                        ethernet: None,
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(busy_err, NetworkError::Busy { .. }));
+            assert!(busy_err.to_string().contains("capture_active"));
+        }
+
+        // Now that the lock is released, the SAME single-use credential_ref succeeds!
+        let ok_apply = ctrl
+            .apply(
+                "client-1",
+                "idem-after-lock",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "LabWiFi".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred.credential_ref),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(ok_apply.final_status, TransactionStatus::Accepted);
+        let settled = ctrl
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, TransactionStatus::Committed);
+
+        // Simulate reboot in WifiClient mode when upstream router is down -> falls back to rescue AP!
+        drop(ctrl);
+        let mock_down = MockNmcli::new(true);
+        let backend2 = NmcliBackend::new(mock_down, root.join("profiles"), "wlan0", "eth0");
+        let state2 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let ctrl2 = AuthoritativeNetworkController::new(
+            backend2,
+            state2,
+            ControllerConfig::new("rdk-x5-crash", root.join("run")),
+        )
+        .unwrap();
+        assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
 
         fs::remove_dir_all(root).unwrap();
     }

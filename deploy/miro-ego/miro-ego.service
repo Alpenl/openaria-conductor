@@ -1,15 +1,15 @@
 [Unit]
 Description=Miro-Ego RDK X5 stereo capture service
-Requires=miro-ego-recover.service miro-ego-network.socket miro-ego-network.service
-After=miro-ego-data-volume.service miro-ego-recover.service miro-ego-network.socket miro-ego-network.service network-online.target NetworkManager.service systemd-tmpfiles-setup.service
-Wants=miro-ego-data-volume.service network-online.target
+Requires=miro-ego-recover.service miro-ego-network.socket
+Wants=miro-ego-data-volume.service miro-ego-network.service miro-ego-deploy.socket network-online.target
+After=miro-ego-data-volume.service miro-ego-recover.service miro-ego-network.socket miro-ego-network.service miro-ego-deploy.socket network-online.target NetworkManager.service systemd-tmpfiles-setup.service
 
 [Service]
 Type=simple
 User=miro-ego
 Group=miro-ego
-# vpu/jpu/vps carry codec nodes; misc carries the RDK X5 ION allocator.
-SupplementaryGroups=video vpu jpu vps misc
+# audio carries ALSA capture/playback; vpu/jpu/vps carry codec nodes; misc carries the RDK X5 ION allocator.
+SupplementaryGroups=audio video vpu jpu vps misc
 Environment=MIRO_EGO_NETWORK_OPERATION_LOCK_PATH=/run/miro-ego/network-operation.lock
 Environment=MIRO_EGO_MAINTENANCE_LOCK=/run/miro-ego/maintenance.lock
 Environment=MIRO_EGO_ENCODER_BIN=/opt/miro-ego/current/bin/miro-ego-encoder
@@ -27,7 +27,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ProtectKernelTunables=yes
+ProtectKernelTunables=no
+ReadOnlyPaths=/proc/sys -/proc/sysrq-trigger -/proc/latency_stats -/proc/acpi -/proc/timer_stats -/proc/fs -/proc/irq
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
@@ -36,8 +37,9 @@ ProtectHostname=yes
 CapabilityBoundingSet=
 ReadWritePaths=/var/lib/miro-ego
 ReadWritePaths=-/data
-ReadWritePaths=/run/miro-ego/network-operation.lock
-ReadWritePaths=/run/miro-ego/maintenance.lock
+ReadWritePaths=-/sys/class/leds
+ReadWritePaths=-/run/miro-ego/network-operation.lock
+ReadWritePaths=-/run/miro-ego/maintenance.lock
 RestrictSUIDSGID=yes
 LockPersonality=yes
 

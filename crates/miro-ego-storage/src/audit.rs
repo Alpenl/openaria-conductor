@@ -9,7 +9,7 @@
 use crate::util::now_rfc3339_utc;
 use crate::{StorageError, StorageResult};
 use miro_ego_core::paths::DataVolumePaths;
-use miro_ego_core::sys::fs::{fstat, fsync_directory, open_directory_safe};
+use miro_ego_core::sys::fs::{fstat, fsync_directory, open_directory_safe, pread_retry};
 use miro_ego_core::telemetry::{
     BoundedRingLog, LogLevel, MAX_RING_BYTES, RingStats, TelemetryEntry,
 };
@@ -73,26 +73,26 @@ impl ApiAuditEvent {
                 format!("audit event schema must be {API_AUDIT_EVENT_SCHEMA}"),
             ));
         }
-        if self.request_id.is_empty() || self.request_id.len() > 128 {
+        if !(1..=128).contains(&self.request_id.chars().count()) {
             return Err(StorageError::invalid_input(
                 "invalid_audit_event",
                 "audit request_id must be 1..=128 chars",
             ));
         }
-        if self.operation_id.is_empty() || self.operation_id.len() > 128 {
+        if !(1..=128).contains(&self.operation_id.chars().count()) {
             return Err(StorageError::invalid_input(
                 "invalid_audit_event",
                 "audit operation_id must be 1..=128 chars",
             ));
         }
-        if self.outcome.is_empty() || self.outcome.len() > 128 {
+        if !(1..=128).contains(&self.outcome.chars().count()) {
             return Err(StorageError::invalid_input(
                 "invalid_audit_event",
                 "audit outcome must be 1..=128 chars",
             ));
         }
         if let Some(principal) = &self.principal_id {
-            if principal.len() > 128 {
+            if principal.chars().count() > 128 {
                 return Err(StorageError::invalid_input(
                     "invalid_audit_event",
                     "audit principal_id exceeds 128 chars",
@@ -100,7 +100,7 @@ impl ApiAuditEvent {
             }
         }
         if let Some(resource) = &self.resource_id {
-            if resource.len() > 512 {
+            if resource.chars().count() > 512 {
                 return Err(StorageError::invalid_input(
                     "invalid_audit_event",
                     "audit resource_id exceeds 512 chars",
@@ -293,7 +293,17 @@ impl AuditLogger {
             .map_err(|err| io::Error::other(err.to_string()))?;
         let mut flushed = 0_usize;
         for (idx, entry) in entries.iter().enumerate() {
-            let mut line = serde_json::to_vec(&entry.payload)
+            if entry.payload.get("truncated") == Some(&serde_json::Value::Bool(true)) {
+                continue;
+            }
+            let Ok(valid_event) = serde_json::from_value::<ApiAuditEvent>(entry.payload.clone())
+            else {
+                continue;
+            };
+            if valid_event.validate().is_err() {
+                continue;
+            }
+            let mut line = serde_json::to_vec(&valid_event)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
             line.push(b'\n');
             if let Err(err) = self.append_line_locked(guard, &line) {
@@ -389,6 +399,7 @@ impl AuditLogger {
 
 fn open_active_audit_file(path: &Path) -> io::Result<(File, u64)> {
     let file = OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .mode(0o640)
@@ -411,5 +422,102 @@ fn open_active_audit_file(path: &Path) -> io::Result<(File, u64)> {
     }
     let size = u64::try_from(st.st_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative audit log size"))?;
-    Ok((file, size))
+    let repaired_size = repair_active_audit_tail(&file, size)?;
+    Ok((file, repaired_size))
+}
+
+fn ftruncate_audit_fd(fd: libc::c_int, new_size: u64) -> io::Result<()> {
+    let off = libc::off_t::try_from(new_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "audit truncate size overflow"))?;
+    loop {
+        // SAFETY: `fd` is a valid open regular file descriptor owned by `File`.
+        if unsafe { libc::ftruncate(fd, off) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn find_last_newline_before(file: &File, end_offset: u64) -> io::Result<Option<u64>> {
+    const CHUNK: usize = 8192;
+    let mut cursor = end_offset;
+    let mut buf = [0_u8; CHUNK];
+    while cursor > 0 {
+        let read_len = usize::try_from(cursor.min(CHUNK as u64)).unwrap_or(CHUNK);
+        let start = cursor - read_len as u64;
+        let off = libc::off_t::try_from(start)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "audit offset overflow"))?;
+        let n = pread_retry(file.as_raw_fd(), &mut buf[..read_len], off)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(rel) = buf[..n].iter().rposition(|&b| b == b'\n') {
+            return Ok(Some(start + rel as u64));
+        }
+        cursor = start;
+    }
+    Ok(None)
+}
+
+/// Inspect the tail of a reopened non-empty `api-audit.ndjson` file and truncate any
+/// unterminated partial line (or corrupt trailing line from an interrupted write) back to
+/// the last clean `\n` boundary before appending new records.
+fn repair_active_audit_tail(file: &File, initial_size: u64) -> io::Result<u64> {
+    if initial_size == 0 {
+        return Ok(0);
+    }
+
+    let mut last_byte = [0_u8; 1];
+    let last_off = libc::off_t::try_from(initial_size - 1)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "audit offset overflow"))?;
+    let n = pread_retry(file.as_raw_fd(), &mut last_byte, last_off)?;
+    let mut clean_size = initial_size;
+
+    if n != 1 || last_byte[0] != b'\n' {
+        clean_size = match find_last_newline_before(file, initial_size)? {
+            Some(nl_pos) => nl_pos + 1,
+            None => 0,
+        };
+        ftruncate_audit_fd(file.as_raw_fd(), clean_size)?;
+        file.sync_all()?;
+    }
+
+    // Also verify the trailing newline-terminated record is schema-valid JSON so a prior
+    // fused/corrupt line cannot remain at the tail.
+    if clean_size > 0 {
+        let prev_boundary = match find_last_newline_before(file, clean_size - 1)? {
+            Some(nl_pos) => nl_pos + 1,
+            None => 0,
+        };
+        let line_len = clean_size - prev_boundary;
+        const MAX_AUDIT_LINE_BYTES: u64 = 64 * 1024;
+        let line_valid = if line_len == 0 || line_len > MAX_AUDIT_LINE_BYTES {
+            false
+        } else {
+            let len_usize = line_len as usize;
+            let mut line_buf = vec![0_u8; len_usize];
+            let off = libc::off_t::try_from(prev_boundary).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "audit offset overflow")
+            })?;
+            let read = pread_retry(file.as_raw_fd(), &mut line_buf, off)?;
+            if read != len_usize {
+                false
+            } else {
+                let trimmed = line_buf.strip_suffix(b"\n").unwrap_or(&line_buf);
+                let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+                serde_json::from_slice::<ApiAuditEvent>(trimmed)
+                    .is_ok_and(|ev| ev.validate().is_ok())
+            }
+        };
+        if !line_valid {
+            clean_size = prev_boundary;
+            ftruncate_audit_fd(file.as_raw_fd(), clean_size)?;
+            file.sync_all()?;
+        }
+    }
+
+    Ok(clean_size)
 }

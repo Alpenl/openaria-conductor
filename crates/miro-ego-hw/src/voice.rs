@@ -40,7 +40,7 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             schema: VOICE_SETTINGS_SCHEMA.to_owned(),
-            enabled: false,
+            enabled: true,
             volume: 80,
         }
     }
@@ -102,39 +102,53 @@ impl AplayAudioPlayer {
 
 impl AudioPlayer for AplayAudioPlayer {
     fn play_wav(&self, device: &str, wav_bytes: &[u8], timeout: Duration) -> HwResult<()> {
-        let mut child = Command::new(&self.aplay_bin)
-            .args(["-q", "-D", device, "-"])
+        let mut cmd = Command::new(&self.aplay_bin);
+        cmd.args(["-q", "-D", device, "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    HwError::Unavailable {
-                        message: format!("aplay binary unavailable: {}", self.aplay_bin.display()),
-                    }
-                } else {
-                    HwError::Io {
-                        message: format!("failed to spawn aplay: {err}"),
-                    }
-                }
-            })?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(wav_bytes).map_err(|err| {
-                let _ = child.kill();
-                let _ = child.wait();
-                HwError::Io {
-                    message: format!("failed writing WAV bytes to aplay stdin: {err}"),
-                }
-            })?;
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
+        let mut child = cmd.spawn().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                HwError::Unavailable {
+                    message: format!("aplay binary unavailable: {}", self.aplay_bin.display()),
+                }
+            } else {
+                HwError::Io {
+                    message: format!("failed to spawn aplay: {err}"),
+                }
+            }
+        })?;
+
+        let stdin_pipe = child.stdin.take();
+        let payload = wav_bytes.to_vec();
+        let writer_handle = std::thread::spawn(move || -> Result<(), std::io::Error> {
+            if let Some(mut stdin) = stdin_pipe {
+                for chunk in payload.chunks(16 * 1024) {
+                    stdin.write_all(chunk)?;
+                }
+                stdin.flush()?;
+            }
+            Ok(())
+        });
 
         let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let write_res = writer_handle.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("aplay stdin writer thread panicked"))
+                    });
                     if status.success() {
+                        if let Err(err) = write_res {
+                            return Err(HwError::Io {
+                                message: format!("failed writing WAV bytes to aplay stdin: {err}"),
+                            });
+                        }
                         return Ok(());
                     }
                     return Err(HwError::Io {
@@ -143,8 +157,8 @@ impl AudioPlayer for AplayAudioPlayer {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_child_process_group(&mut child);
+                        let _ = writer_handle.join();
                         return Err(HwError::Io {
                             message: "aplay playback timed out".to_owned(),
                         });
@@ -152,8 +166,8 @@ impl AudioPlayer for AplayAudioPlayer {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_child_process_group(&mut child);
+                    let _ = writer_handle.join();
                     return Err(HwError::Io {
                         message: format!("failed waiting on aplay: {err}"),
                     });
@@ -161,6 +175,19 @@ impl AudioPlayer for AplayAudioPlayer {
             }
         }
     }
+}
+
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        if pid > 0 {
+            // SAFETY: `child` was placed in its own process group (`process_group(0)`),
+            // so `-pid` targets only `aplay` and any descendants holding the stdin pipe.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Map a [`VoiceCue`] to its bundled `.wav` filename stem.
@@ -351,6 +378,7 @@ impl VoiceController {
         })?;
         let mut next = guard.clone();
         next.volume = volume;
+        next.enabled = volume > 0;
         persist_voice_settings(&self.settings_path, &next)?;
         *guard = next;
         Ok(guard.to_status())
@@ -488,15 +516,28 @@ mod tests {
         )
         .unwrap();
 
-        // Disabled by default -> play_cue is a no-op.
+        // Enabled by default (volume 80) -> plays scaled samples out of the box!
+        assert_eq!(
+            ctrl.status().unwrap(),
+            VoiceStatus {
+                schema: VOICE_STATUS_SCHEMA.to_owned(),
+                enabled: true,
+                volume: 80,
+            }
+        );
+        ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        assert_eq!(player.played.lock().unwrap().len(), 1);
+        player.played.lock().unwrap().clear();
+
+        // Explicit disable makes play_cue a no-op; set_volume(>0) re-enables automatically!
+        ctrl.set_enabled(false).unwrap();
         ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
         assert!(player.played.lock().unwrap().is_empty());
 
         // Reject out-of-range volume > 100.
         assert!(ctrl.set_volume(101).is_err());
 
-        // Enable + set volume 50% -> persists and plays scaled samples.
-        ctrl.set_enabled(true).unwrap();
+        // Setting volume 50% automatically sets enabled=true, persists, and plays scaled samples.
         let status = ctrl.set_volume(50).unwrap();
         assert_eq!(status.schema, VOICE_STATUS_SCHEMA);
         assert!(status.enabled);
@@ -525,10 +566,44 @@ mod tests {
         .unwrap();
         assert_eq!(reloaded.status().unwrap(), status);
 
-        // Volume 0 mutes without invoking player.
-        reloaded.set_volume(0).unwrap();
+        // Volume 0 sets enabled=false and mutes without invoking player.
+        let muted = reloaded.set_volume(0).unwrap();
+        assert!(!muted.enabled);
+        assert_eq!(muted.volume, 0);
         reloaded.play_cue(VoiceCue::RecordingStarted).unwrap();
         assert_eq!(player.played.lock().unwrap().len(), 1);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn aplay_player_streams_large_wav_without_pipe_deadlock_on_timeout() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "miro-ego-aplay-timeout-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hang-aplay.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 10\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 256 KiB WAV (> 64 KiB Linux pipe capacity) against a child that never reads stdin.
+        let large_wav = make_pcm16_wav(&vec![1234i16; 131_072]);
+        let player = AplayAudioPlayer::with_binary(&script);
+        let started = Instant::now();
+        let err = player
+            .play_wav(DEFAULT_VOICE_DEVICE, &large_wav, Duration::from_millis(120))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
 
         fs::remove_dir_all(dir).unwrap();
     }

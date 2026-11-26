@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -107,8 +108,11 @@ class FactoryRecoveryTests(unittest.TestCase):
             "etc/miro-ego/device.json",
             "etc/miro-ego/settings.json",
             "etc/miro-ego/button.json",
+            "etc/miro-ego/bearer.token",
+            "etc/default/miro-ego-data-volume",
             "etc/NetworkManager/system-connections/lab.nmconnection",
             "var/lib/miro-ego/network-state.json",
+            "var/lib/miro-ego-network/state.json",
         ):
             self.assertTrue(device.allowed(ok_path))
 
@@ -173,14 +177,30 @@ class FactoryRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "etc/miro-ego").mkdir(parents=True)
-            (root / "etc/machine-id").symlink_to(root / "secret")
+            link_target = root / "etc/machine-id"
+            used_mock_symlink = False
+            try:
+                link_target.symlink_to(root / "secret")
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
+                link_target.write_bytes(b"placeholder")
+                used_mock_symlink = True
 
             def rooted(*parts: str) -> Path:
                 return root / Path(*parts).relative_to("/")
 
+            orig_is_symlink = Path.is_symlink
+
+            def fake_is_symlink(self_path: Path) -> bool:
+                if used_mock_symlink and self_path == link_target:
+                    return True
+                return orig_is_symlink(self_path)
+
             with (
                 patch.object(device, "hardware", return_value="a" * 64),
                 patch.object(device, "Path", side_effect=rooted),
+                patch.object(Path, "is_symlink", fake_is_symlink),
                 self.assertRaises(RuntimeError),
             ):
                 device.restore(profile)
@@ -201,8 +221,119 @@ class FactoryRecoveryTests(unittest.TestCase):
             self.assertTrue(result["restored"])
             self.assertEqual((root / "etc/machine-id").read_bytes(), b"a" * 32)
             if os.name == "posix":
-                self.assertEqual((root / "etc/miro-ego/device.json").stat().st_mode & 0o777, 0o600)
+                self.assertEqual((root / "etc/miro-ego/device.json").stat().st_mode & 0o777, 0o640)
                 self.assertEqual((root / "etc/machine-id").stat().st_mode & 0o777, 0o644)
+
+    def test_device_permissions_ownership_and_live_capture_guard(self) -> None:
+        profile = factory_profile(
+            board="a" * 64,
+            extra_files={
+                "etc/miro-ego/settings.json": b'{"ok":true}\n',
+                "etc/miro-ego/button.json": b'{"enabled":true}\n',
+                "etc/miro-ego/bearer.token": b"secret-bearer-token\n",
+                "etc/default/miro-ego-data-volume": (
+                    b"MIRO_EGO_DATA_VOLUME_MODE=exfat\n"
+                    b"MIRO_EGO_DATA_VOLUME_PARTUUID=db2e7205-03\n"
+                    b"MIRO_EGO_DATA_VOLUME_UUID=ABCD-1234\n"
+                ),
+                "var/lib/miro-ego/voice.json": (
+                    b'{"schema":"miro-ego.voice-settings.v1","enabled":true,"volume":80}\n'
+                ),
+                "var/lib/miro-ego-network/state.json": b'{"desired":{"mode":"hotspot"}}\n',
+                "var/lib/miro-ego-network/rescue.json": b'{"psk":"secret"}\n',
+            },
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            chowned: dict[str, tuple[int, int]] = {}
+
+            def rooted(*parts: str) -> Path:
+                return root / Path(*parts).relative_to("/")
+
+            def fake_chown(path: Path, uid: int, gid: int, **_kwargs: object) -> None:
+                rel = Path(path).relative_to(root).as_posix()
+                chowned[rel] = (uid, gid)
+
+            with (
+                patch.object(device, "Path", side_effect=rooted),
+                patch.object(device.os, "chown", side_effect=fake_chown, create=True),
+            ):
+                device.write_files(device.validate(profile), service_ids=(997, 998))
+
+            self.assertEqual(chowned["etc/miro-ego"], (0, 998))
+            self.assertEqual(chowned["etc/miro-ego/device.json"], (0, 998))
+            self.assertEqual(chowned["etc/miro-ego/settings.json"], (0, 998))
+            self.assertEqual(chowned["etc/miro-ego/bearer.token"], (0, 998))
+            self.assertEqual(chowned["etc/miro-ego/button.json"], (0, 0))
+            self.assertEqual(chowned["var/lib/miro-ego"], (997, 998))
+            self.assertEqual(chowned["var/lib/miro-ego/voice.json"], (997, 998))
+            self.assertEqual(chowned["var/lib/miro-ego-network"], (0, 0))
+            self.assertEqual(chowned["var/lib/miro-ego-network/state.json"], (0, 0))
+            self.assertEqual(chowned["var/lib/miro-ego-network/rescue.json"], (0, 0))
+
+            if os.name == "posix":
+                self.assertEqual((root / "etc/miro-ego").stat().st_mode & 0o777, 0o750)
+                self.assertEqual((root / "etc/miro-ego/device.json").stat().st_mode & 0o777, 0o640)
+                self.assertEqual((root / "etc/miro-ego/bearer.token").stat().st_mode & 0o777, 0o640)
+                self.assertEqual((root / "etc/miro-ego/button.json").stat().st_mode & 0o777, 0o644)
+                self.assertEqual(
+                    (root / "etc/default/miro-ego-data-volume").stat().st_mode & 0o777, 0o644
+                )
+                self.assertEqual((root / "var/lib/miro-ego").stat().st_mode & 0o777, 0o750)
+                self.assertEqual(
+                    (root / "var/lib/miro-ego/voice.json").stat().st_mode & 0o777, 0o640
+                )
+                self.assertEqual((root / "var/lib/miro-ego-network").stat().st_mode & 0o777, 0o750)
+                self.assertEqual(
+                    (root / "var/lib/miro-ego-network/state.json").stat().st_mode & 0o777, 0o600
+                )
+
+            # Live staging recording.json blocks backup even without legacy capture-state.json.
+            staging = root / "data/.miro-ego/staging/0198c9a8.partial"
+            staging.mkdir(parents=True)
+            (staging / "recording.json").write_text('{"state":"recording"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "idle without active capture"):
+                device._probe_live_capture_idle(
+                    {"storage": {"mountpoint": str(root / "data")}, "listen": {"port": 9}}
+                )
+
+    def test_bundle_builder_includes_voice_cues_and_new_deploy_assets(self) -> None:
+        import sys as _sys
+
+        repo_root = Path(__file__).resolve().parents[3]
+        if str(repo_root) not in _sys.path:
+            _sys.path.insert(0, str(repo_root))
+        from scripts.build_rdk_x5_bundle import REQUIRED_VOICE_ASSETS, build_bundle
+
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            miro_bin = tmp / "miro-ego"
+            enc_bin = tmp / "miro-ego-encoder"
+            miro_bin.write_bytes(aarch64_elf_stub(payload=b"miro-ego"))
+            enc_bin.write_bytes(aarch64_elf_stub(payload=b"encoder"))
+            out_dir = tmp / "bundle"
+            archive = tmp / "bundle.tar"
+
+            build_bundle(
+                miro_ego_bin=miro_bin,
+                encoder_bin=enc_bin,
+                output=out_dir,
+                archive=archive,
+                version="0.3.0",
+                commit="2" * 40,
+            )
+            provision.require_native_bundle(archive)
+            manifest = json.loads((out_dir / "bundle.json").read_text(encoding="utf-8"))
+            asset_paths = {item["path"] for item in manifest["assets"]}
+            for cue in REQUIRED_VOICE_ASSETS:
+                self.assertIn(f"share/voice/{cue}", asset_paths)
+                self.assertTrue((out_dir / "share/voice" / cue).is_file())
+            for expected_deploy in (
+                "deploy/miro-ego/90-miro-ego-leds.rules",
+                "deploy/miro-ego/miro-ego-deploy.socket",
+                "deploy/miro-ego/miro-ego-deploy.service",
+            ):
+                self.assertIn(expected_deploy, asset_paths)
 
     def test_native_bundle_validation_checks_aarch64_elf_and_exfat_support(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -460,7 +591,7 @@ class FactoryRecoveryTests(unittest.TestCase):
                         if consume_pw:
                             data = data.split(b"\n", 1)[1]
                         args = shlex.split(command)
-                        args = args[args.index("python3") :]
+                        args = [sys.executable, *args[args.index("python3") + 1 :]]
                         result.append(subprocess.run(args, input=data, capture_output=True))
                     return result[0]
 

@@ -3,13 +3,14 @@
 //! CAS store (`StoreLayer`) & `/data/updates/` offline package (`OfflinePackageHook`) traits.
 
 use crate::{DeployError, DeployResult};
-use miro_ego_core::ids::{hex_encode, is_valid_sha256};
-use miro_ego_core::sys::fs::{open_readonly_safe, read_bounded_json, write_bytes_atomic};
+use miro_ego_core::ids::{hex_encode, is_valid_sha256, new_uuid_v4};
+use miro_ego_core::sys::fs::{fsync_directory, open_readonly_safe, read_bounded_json};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_SCHEMA: &str = "miro-ego.rdk-x5-bundle.v1";
@@ -321,10 +322,10 @@ pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
         }
     }
     for entry in &manifest.assets {
-        if !entry.path.starts_with("deploy/miro-ego/") {
+        if !is_allowed_bundle_asset_path(&entry.path) {
             return Err(DeployError::InvalidBundle {
                 message: format!(
-                    "bundle asset must live under deploy/miro-ego/: {}",
+                    "bundle asset must live under deploy/miro-ego/ or share/voice/*.wav: {}",
                     entry.path
                 ),
             });
@@ -338,6 +339,169 @@ pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
         manifest_sha256,
         total_bytes,
     })
+}
+
+/// Check whether a bundle asset relative path is in an allowed namespace:
+/// `deploy/miro-ego/<asset>` or `share/voice/<cue>.wav`.
+pub fn is_allowed_bundle_asset_path(path: &str) -> bool {
+    if let Some(rest) = path.strip_prefix("deploy/miro-ego/") {
+        return !rest.is_empty();
+    }
+    if let Some(wav_file) = path.strip_prefix("share/voice/") {
+        if let Some(stem) = wav_file.strip_suffix(".wav") {
+            return !stem.is_empty()
+                && !stem.contains('/')
+                && stem
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+        }
+    }
+    false
+}
+
+/// Stream-copy a regular file opened with `O_NOFOLLOW` into an exclusive temporary file under
+/// `dst`'s parent directory, verifying byte length, SHA-256, and optional AArch64 ELF64 header
+/// on the exact copied stream BEFORE atomic rename + parent directory fsync.
+pub fn copy_and_verify_safe(
+    bundle_root: Option<&Path>,
+    src_path_or_rel: &Path,
+    dst: &Path,
+    mode: u32,
+    expected_bytes: Option<u64>,
+    expected_sha256: &str,
+    require_aarch64_elf: bool,
+) -> DeployResult<u64> {
+    if !is_valid_sha256(expected_sha256) {
+        return Err(DeployError::InvalidBundle {
+            message: format!("invalid expected sha256: {expected_sha256}"),
+        });
+    }
+    let resolved_src = match bundle_root {
+        Some(root) => resolve_no_symlinks(root, src_path_or_rel)?,
+        None => src_path_or_rel.to_path_buf(),
+    };
+    let mut src_file =
+        open_readonly_safe(&resolved_src).map_err(|err| DeployError::InvalidBundle {
+            message: format!("cannot safely open {}: {err}", resolved_src.display()),
+        })?;
+
+    let parent = dst.parent().ok_or_else(|| DeployError::Failed {
+        message: format!("destination path has no parent: {}", dst.display()),
+    })?;
+    fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
+        message: format!("failed creating destination dir {}: {err}", parent.display()),
+    })?;
+
+    let file_name = dst
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_owned());
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        new_uuid_v4().replace('-', "")
+    ));
+
+    let copy_res = (|| -> DeployResult<u64> {
+        let mut out_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp_path)
+            .map_err(|err| DeployError::Failed {
+                message: format!(
+                    "failed creating staging temp file {}: {err}",
+                    tmp_path.display()
+                ),
+            })?;
+
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        let mut header = Vec::with_capacity(64);
+
+        loop {
+            let n = src_file
+                .read(&mut buf)
+                .map_err(|err| DeployError::InvalidBundle {
+                    message: format!("failed reading {}: {err}", resolved_src.display()),
+                })?;
+            if n == 0 {
+                break;
+            }
+            if header.len() < 64 {
+                let need = (64 - header.len()).min(n);
+                header.extend_from_slice(&buf[..need]);
+            }
+            hasher.update(&buf[..n]);
+            out_file
+                .write_all(&buf[..n])
+                .map_err(|err| DeployError::Failed {
+                    message: format!("failed writing {}: {err}", tmp_path.display()),
+                })?;
+            total = total
+                .checked_add(n as u64)
+                .ok_or_else(|| DeployError::InvalidBundle {
+                    message: "copied file byte length overflow".to_owned(),
+                })?;
+            if total > MAX_BINARY_BYTES {
+                return Err(DeployError::InvalidBundle {
+                    message: format!(
+                        "copied file {} exceeded max size {MAX_BINARY_BYTES}",
+                        resolved_src.display()
+                    ),
+                });
+            }
+        }
+
+        if let Some(exp_len) = expected_bytes {
+            if total != exp_len {
+                return Err(DeployError::InvalidBundle {
+                    message: format!(
+                        "size mismatch while staging {} (expected {exp_len}, got {total})",
+                        resolved_src.display()
+                    ),
+                });
+            }
+        }
+        let actual_sha = hex_encode(hasher.finalize().as_slice());
+        if actual_sha != expected_sha256 {
+            return Err(DeployError::InvalidBundle {
+                message: format!(
+                    "SHA-256 mismatch while staging {} (expected {expected_sha256}, got {actual_sha})",
+                    resolved_src.display()
+                ),
+            });
+        }
+        if require_aarch64_elf {
+            validate_aarch64_elf64_header(&header, &resolved_src.display().to_string())?;
+        }
+
+        out_file
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|err| DeployError::Failed {
+                message: format!("failed chmod on {}: {err}", tmp_path.display()),
+            })?;
+        out_file.sync_all().map_err(|err| DeployError::Failed {
+            message: format!("failed fsync on {}: {err}", tmp_path.display()),
+        })?;
+        drop(out_file);
+
+        fs::rename(&tmp_path, dst).map_err(|err| DeployError::Failed {
+            message: format!(
+                "failed atomically promoting {} to {}: {err}",
+                tmp_path.display(),
+                dst.display()
+            ),
+        })?;
+        let _ = fsync_directory(parent);
+        Ok(total)
+    })();
+
+    if copy_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    copy_res
 }
 
 fn verify_single_entry(
@@ -448,45 +612,13 @@ impl StoreLayer for LocalCasStore {
 
     fn fetch_object(&self, sha256: &str, dest: &Path) -> DeployResult<u64> {
         let path = self.object_path(sha256)?;
-        let (bytes, actual_sha, _) = hash_file_safe(&path)?;
-        if actual_sha != sha256 {
-            return Err(DeployError::InvalidBundle {
-                message: format!("CAS object corruption detected for {sha256}"),
-            });
-        }
-        let payload = fs::read(&path).map_err(|err| DeployError::Failed {
-            message: format!("failed reading CAS object {sha256}: {err}"),
-        })?;
-        write_bytes_atomic(dest, &payload, 0o644, true).map_err(|err| DeployError::Failed {
-            message: format!(
-                "failed materializing CAS object to {}: {err}",
-                dest.display()
-            ),
-        })?;
-        Ok(bytes)
+        copy_and_verify_safe(None, &path, dest, 0o644, None, sha256, false)
     }
 
     fn put_object(&self, src: &Path, expected_sha256: &str) -> DeployResult<()> {
         let dest = self.object_path(expected_sha256)?;
-        let (_, actual_sha, _) = hash_file_safe(src)?;
-        if actual_sha != expected_sha256 {
-            return Err(DeployError::InvalidBundle {
-                message: format!(
-                    "CAS ingest digest mismatch: expected {expected_sha256}, got {actual_sha}"
-                ),
-            });
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
-                message: format!("failed creating CAS shard dir: {err}"),
-            })?;
-        }
-        let payload = fs::read(src).map_err(|err| DeployError::Failed {
-            message: format!("failed reading CAS source {}: {err}", src.display()),
-        })?;
-        write_bytes_atomic(&dest, &payload, 0o644, true).map_err(|err| DeployError::Failed {
-            message: format!("failed storing CAS object {expected_sha256}: {err}"),
-        })
+        let _ = copy_and_verify_safe(None, src, &dest, 0o644, None, expected_sha256, false)?;
+        Ok(())
     }
 }
 
@@ -597,7 +729,11 @@ pub(crate) mod test_support {
 
         let mut asset_entries = Vec::new();
         for &(name, content, exec) in assets {
-            let rel = format!("deploy/miro-ego/{name}");
+            let rel = if name.contains('/') {
+                name.to_owned()
+            } else {
+                format!("deploy/miro-ego/{name}")
+            };
             let full = dir.join(&rel);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             fs::write(&full, content).unwrap();
@@ -652,7 +788,10 @@ mod tests {
             &bundle_dir,
             "0.3.0",
             &commit,
-            &[("miro-ego.service", b"[Unit]\nDescription=Miro-Ego\n", false)],
+            &[
+                ("miro-ego.service", b"[Unit]\nDescription=Miro-Ego\n", false),
+                ("share/voice/device_ready.wav", b"RIFF$\x00\x00\x00WAVE", false),
+            ],
         );
 
         let verified = verify_bundle_dir(&bundle_dir).unwrap();
