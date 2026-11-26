@@ -1,9 +1,20 @@
-//! exFAT recording-volume management, binary session catalog, and crash recovery traits
-//! for Miro-Ego 0.3.0.
+//! ExFAT recording-volume management, atomic binary session catalog (`catalog.bin`),
+//! explicit-FSM capture coordinator, crash prefix recovery, safe artifact/log I/O,
+//! and bounded rotating audit logging for Miro-Ego 0.3.0.
+
+pub mod artifact_io;
+pub mod audit;
+pub mod catalog;
+pub mod coordinator;
+pub mod logs;
+pub mod recovery;
+pub mod util;
+pub mod volume;
 
 use miro_ego_core::CoreError;
 use miro_ego_core::paths::DataVolumePaths;
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -26,8 +37,136 @@ pub enum StorageError {
     #[error("catalog error: {message}")]
     Catalog { message: String },
 
+    #[error("catalog changed (current revision: {catalog_revision})")]
+    CatalogChanged { catalog_revision: String },
+
+    #[error("{code}: {message}")]
+    InvalidInput { code: &'static str, message: String },
+
+    #[error("{code}: {message}")]
+    Conflict { code: &'static str, message: String },
+
+    #[error("{code}: {message}")]
+    Unprocessable { code: &'static str, message: String },
+
+    #[error("{code}: {message}")]
+    Locked { code: &'static str, message: String },
+
+    #[error("{code}: {message}")]
+    Unsupported { code: &'static str, message: String },
+
+    #[error("{code}: {message}")]
+    Integrity { code: &'static str, message: String },
+
+    #[error("byte range not satisfiable for total length {total_bytes}")]
+    RangeNotSatisfiable { total_bytes: u64 },
+
+    #[error("{code} ({context}): {source}")]
+    Io {
+        code: &'static str,
+        context: String,
+        #[source]
+        source: io::Error,
+    },
+
     #[error(transparent)]
     Core(#[from] CoreError),
+}
+
+impl StorageError {
+    pub fn invalid_input(code: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Conflict {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Unprocessable {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn locked(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Locked {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Unsupported {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn integrity(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Integrity {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn io(code: &'static str, context: impl Into<String>, source: io::Error) -> Self {
+        Self::Io {
+            code,
+            context: context.into(),
+            source,
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Unavailable { .. } => "storage_unavailable",
+            Self::VolumeInvalid { .. } => "volume_invalid",
+            Self::NotFound { .. } => "not_found",
+            Self::Catalog { .. } => "catalog_error",
+            Self::CatalogChanged { .. } => "catalog_changed",
+            Self::InvalidInput { code, .. }
+            | Self::Conflict { code, .. }
+            | Self::Unprocessable { code, .. }
+            | Self::Locked { code, .. }
+            | Self::Unsupported { code, .. }
+            | Self::Integrity { code, .. }
+            | Self::Io { code, .. } => code,
+            Self::RangeNotSatisfiable { .. } => "range_not_satisfiable",
+            Self::Core(err) => err.code(),
+        }
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::Unavailable { .. } => 503,
+            Self::VolumeInvalid { .. } | Self::Catalog { .. } | Self::Io { .. } => 500,
+            Self::NotFound { .. } | Self::Unsupported { .. } => 404,
+            Self::CatalogChanged { .. } | Self::Conflict { .. } | Self::Integrity { .. } => 409,
+            Self::InvalidInput { .. } => 400,
+            Self::Unprocessable { .. } => 422,
+            Self::Locked { .. } => 423,
+            Self::RangeNotSatisfiable { .. } => 416,
+            Self::Core(err) => match err {
+                CoreError::InvalidInput { .. } | CoreError::InvalidConfig { .. } => 400,
+                CoreError::LockBusy { .. } => 409,
+                CoreError::Io { .. } | CoreError::Poisoned { .. } => 500,
+            },
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable { .. } | Self::CatalogChanged { .. } | Self::Locked { .. }
+        )
+    }
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -90,3 +229,33 @@ pub trait SessionCatalog: Send + Sync {
 pub trait RecoveryManager: Send + Sync {
     fn recover_staging(&self) -> StorageResult<RecoveryReport>;
 }
+
+// Convenient top-level re-exports for downstream crates (`miro-ego-api`, `miro-ego-cli`).
+pub use artifact_io::{
+    ByteRange, ManifestArtifactDescriptor, OpenedManifest, VerifiedArtifactFile, open_manifest,
+    open_verified_artifact, parse_single_byte_range,
+};
+pub use audit::{ApiAuditEvent, AuditConfig, AuditLogger, AuditWriteTarget, BoundedRingBuffer};
+pub use catalog::{
+    BinarySessionCatalog, CatalogIndex, DiscoveryDiagnosticCode, GatewayVerification,
+    IndexedSession, SessionDiscoveryDiagnostic, SessionListPage, SessionSummary,
+};
+pub use coordinator::{
+    ActiveCaptureHandle, BackendStartRequest, CameraFocusSetRequest, CameraFocusStatus,
+    CaptureBackend, CaptureCoordinator, CaptureEvent, CaptureEventBroadcaster, CaptureEventType,
+    CaptureMode, CapturePhase, CaptureProgressSnapshot, CaptureReadiness, CaptureStartRequest,
+    CaptureStatusSnapshot, CaptureStopRequest, CaptureTimerSetRequest, CaptureTimerSettings,
+    CaptureTimerStatus, CapturedArtifact, CapturedAudioOutcome, CapturedAudioSegment,
+    CapturedSessionArtifacts, CapturedVideoSegment, CoordinatorConfig, DeleteSessionTarget,
+    DeleteSessionsRequest, DeleteSessionsResult, IdempotentOutcome, ReserveEnforcementOutcome,
+    RetainedUnsuccessfulSessionResource, RuntimeObservation, SafeSwapReceipt,
+    SafeSwapReceiptResource, StopReason, TakeRequest,
+};
+pub use logs::{LogFileEntry, LogList, LogStore, OpenedLogFile};
+pub use recovery::{
+    DetailedRecoveryReport, RecoveryDefaults, RecoveryItemOutcome, StagingRecoveryManager,
+};
+pub use volume::{
+    CaptureStorageBudget, ExfatVolumeManager, FsCapacity, PosixVolumeProbe, ReserveStatus,
+    VolumeAdmission, VolumeMetadata, VolumePolicy, VolumeProbe,
+};
