@@ -1,28 +1,34 @@
-use crate::active_take;
-use crate::imu::{Collector, ImuError};
-use crate::metrics::Metrics;
-use crate::native_camera::{Frame, FrameValidator, Stream, StreamError};
-use crate::preview::{LatestBuffer, PreviewError};
-use crate::recording::{self, CaptureFanoutState, RecordingError};
-use crate::stereo_encoder;
-use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use crate::audio::Recorder;
+use crate::hardware::imu::{Collector, ImuError};
+use crate::hardware::metrics::Metrics;
+use crate::hardware::native_camera::{Frame, FrameValidator, Stream, StreamError};
+use crate::hardware::preview::{LatestBuffer, PreviewError};
+use crate::hardware::v4l2;
+use crate::session::active_take::{self, ActiveTakeError, ActiveTakeWriter};
+use crate::session::recording::{self, CaptureFanoutState, FrameTimestampAudit, RecordingError};
+use crate::session::stereo_encoder::{self, EncoderProcessError};
+use crate::sys::clock::monotonic_ns;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+pub(crate) trait FailureSink: Send + Sync {
+    fn on_failure(&self, code: &str, message: &str);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeError {
-    pub(crate) code: &'static str,
+    pub(crate) code: Cow<'static, str>,
     pub(crate) message: String,
 }
 
 impl RuntimeError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
@@ -40,8 +46,8 @@ impl From<PreviewError> for RuntimeError {
     }
 }
 
-impl From<active_take::ActiveTakeError> for RuntimeError {
-    fn from(error: active_take::ActiveTakeError) -> Self {
+impl From<ActiveTakeError> for RuntimeError {
+    fn from(error: ActiveTakeError) -> Self {
         Self::new(error.code, error.message)
     }
 }
@@ -70,16 +76,30 @@ pub(crate) struct RuntimeSnapshot {
     pub(crate) last_preview_error: Option<RuntimeError>,
 }
 
+pub(crate) struct RecordingTarget {
+    pub(crate) active_take: Arc<Mutex<ActiveTakeWriter>>,
+    pub(crate) sink: Arc<Mutex<recording::RecordingSink>>,
+    pub(crate) encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
+    pub(crate) segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
+    pub(crate) recording_start_monotonic_ns: u64,
+    pub(crate) on_failure: Arc<dyn FailureSink>,
+    pub(crate) imu: Option<Arc<Collector>>,
+    pub(crate) imu_timeout: Duration,
+    pub(crate) audio: Option<Arc<Recorder>>,
+    pub(crate) capture_stopped_monotonic_ns: Arc<AtomicU64>,
+    pub(crate) recover_source_gaps: bool,
+}
+
 struct SplitSinkRecording {
-    active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
+    active_take: Arc<Mutex<ActiveTakeWriter>>,
     sink: Arc<Mutex<recording::RecordingSink>>,
     encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
     segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
     recording_start_monotonic_ns: u64,
     capture_stopped_monotonic_ns: Arc<AtomicU64>,
-    on_failure: Arc<Py<PyAny>>,
+    on_failure: Arc<dyn FailureSink>,
     imu: Option<Arc<Collector>>,
-    audio: Option<Arc<crate::audio::Recorder>>,
+    audio: Option<Arc<Recorder>>,
 }
 
 impl SplitSinkRecording {
@@ -89,22 +109,11 @@ impl SplitSinkRecording {
         }
         // Preserve the first gate closure across repeated calls, without
         // waiting for encoder or sink locks held by an in-flight frame.
-        let mut timestamp = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: timestamp points to writable storage. A clock failure marks
-        // the boundary invalid but must not prevent resource drain/cleanup.
-        let stopped = if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0
-        {
-            (timestamp.tv_sec as u64)
-                .checked_mul(1_000_000_000)
-                .and_then(|seconds| seconds.checked_add(timestamp.tv_nsec as u64))
-                .filter(|value| *value > 0)
-                .unwrap_or(u64::MAX)
-        } else {
-            u64::MAX
-        };
+        // A clock failure marks the boundary invalid without blocking cleanup.
+        let stopped = monotonic_ns()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(u64::MAX);
         let _ = self.capture_stopped_monotonic_ns.compare_exchange(
             0,
             stopped,
@@ -126,20 +135,28 @@ struct SourceFrameEvidence {
 }
 
 impl SourceFrameEvidence {
-    fn from_frame(frame: &Frame) -> Self {
+    fn extract_from_frame(frame: &Frame) -> (Self, Option<&[u8]>) {
         let raw = &frame.raw_side_by_side;
-        let counter = raw
-            .windows(2)
-            .position(|window| window == b"\xff\xd8")
-            .and_then(|start| recording::avi1_counter(&raw[start..]));
-        Self {
+        let payload = if raw.is_empty() {
+            None
+        } else {
+            recording::jpeg_payload(raw).ok()
+        };
+        let counter = payload.and_then(recording::avi1_counter);
+        let evidence = Self {
             source_sequence: frame.source_sequence,
             host_monotonic_ns: frame.host_monotonic_ns,
             dequeue_monotonic_ns: frame.dequeue_monotonic_ns,
             buffer_flags: frame.buffer_flags,
             payload_bytes: usize_to_u64(raw.len()),
             camera_counter_raw: counter,
-        }
+        };
+        (evidence, payload)
+    }
+
+    #[cfg(test)]
+    fn from_frame(frame: &Frame) -> Self {
+        Self::extract_from_frame(frame).0
     }
 }
 
@@ -157,6 +174,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    imu_stop: Arc<AtomicBool>,
 }
 
 struct WorkerHandle {
@@ -190,6 +208,7 @@ impl Runtime {
                 "read timeout must be positive",
             ));
         }
+        let imu_stop = Arc::new(AtomicBool::new(false));
         Ok(Self {
             stream,
             preview,
@@ -205,9 +224,10 @@ impl Runtime {
                     max_consumer_frame_ns: 0,
                 }),
                 changed: Condvar::new(),
+                imu_stop: Arc::clone(&imu_stop),
             }),
             stop: Arc::new(AtomicBool::new(false)),
-            imu_stop: Arc::new(AtomicBool::new(false)),
+            imu_stop,
             worker: Mutex::new(None),
             imu_worker: Mutex::new(None),
             read_timeout,
@@ -229,6 +249,7 @@ impl Runtime {
         self.stop.store(false, Ordering::Release);
         {
             let mut state = self.shared.state.lock().map_err(|_| {
+                let _ = self.stream.stop();
                 RuntimeError::new(
                     "capture_runtime_poisoned",
                     "capture runtime state mutex is poisoned",
@@ -246,27 +267,45 @@ impl Runtime {
         let stop = Arc::clone(&self.stop);
         let read_timeout = self.read_timeout;
         let metrics = self.metrics.as_ref().map(Arc::clone);
-        *worker = Some(thread::spawn(move || {
-            run_loop(stream, preview, shared, stop, read_timeout, metrics);
-        }));
+        let handle = match thread::Builder::new()
+            .name("capture-runtime".to_owned())
+            .spawn(move || {
+                run_loop(stream, preview, shared, stop, read_timeout, metrics);
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Ok(mut state) = self.shared.state.lock() {
+                    state.running = false;
+                    self.shared.changed.notify_all();
+                }
+                let _ = self.stream.stop();
+                return Err(RuntimeError::new(
+                    "capture_runtime_worker_failed",
+                    format!("failed to start capture runtime worker: {error}"),
+                ));
+            }
+        };
+        *worker = Some(handle);
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_recording(
         &self,
-        active_take: Arc<Mutex<active_take::ActiveTakeWriter>>,
-        sink: Arc<Mutex<recording::RecordingSink>>,
-        encoder: Arc<Mutex<stereo_encoder::EncoderProcess>>,
-        segment_planner: Arc<Mutex<recording::RecordingSegmentPlanner>>,
-        recording_start_monotonic_ns: u64,
-        on_failure: Py<PyAny>,
-        imu: Option<Arc<Collector>>,
-        imu_timeout: Duration,
-        audio: Option<Arc<crate::audio::Recorder>>,
-        capture_stopped_monotonic_ns: Arc<AtomicU64>,
-        recover_source_gaps: bool,
+        target: RecordingTarget,
     ) -> Result<RuntimeSnapshot, RuntimeError> {
+        let RecordingTarget {
+            active_take,
+            sink,
+            encoder,
+            segment_planner,
+            recording_start_monotonic_ns,
+            on_failure,
+            imu,
+            imu_timeout,
+            audio,
+            capture_stopped_monotonic_ns,
+            recover_source_gaps,
+        } = target;
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
                 "invalid_argument",
@@ -298,7 +337,6 @@ impl Runtime {
             ));
         }
         let imu_for_worker = imu.clone();
-        let on_failure = Arc::new(on_failure);
         let on_failure_for_imu = imu_for_worker.as_ref().map(|_| Arc::clone(&on_failure));
         let sink_for_worker = Arc::clone(&sink);
         let mut state = self.shared.state.lock().map_err(|_| {
@@ -320,6 +358,7 @@ impl Runtime {
             ));
         }
         state.fanout.start_recording(recover_source_gaps)?;
+        let previous_max_consumer_frame_ns = state.max_consumer_frame_ns;
         state.max_consumer_frame_ns = 0;
         state.recording = Some(Arc::new(SplitSinkRecording {
             active_take,
@@ -332,33 +371,47 @@ impl Runtime {
             imu,
             audio: audio.clone(),
         }));
-        self.shared.changed.notify_all();
-        let snapshot = snapshot_locked(&state);
-        drop(state);
         if let (Some(collector), Some(on_failure)) = (imu_for_worker, on_failure_for_imu) {
             self.imu_stop.store(false, Ordering::Release);
             let shared = Arc::clone(&self.shared);
             let stop = Arc::clone(&self.imu_stop);
             let metrics = self.metrics.as_ref().map(Arc::clone);
             let (done_tx, done_rx) = mpsc::channel();
+            let handle =
+                match thread::Builder::new()
+                    .name("capture-imu".to_owned())
+                    .spawn(move || {
+                        run_imu_loop(ImuLoopContext {
+                            collector,
+                            sink: sink_for_worker,
+                            on_failure,
+                            audio,
+                            shared,
+                            stop,
+                            timeout: imu_timeout,
+                            metrics,
+                        });
+                        let _ = done_tx.send(());
+                    }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        state.recording = None;
+                        state.fanout.start_stopping();
+                        state.max_consumer_frame_ns = previous_max_consumer_frame_ns;
+                        self.shared.changed.notify_all();
+                        return Err(RuntimeError::new(
+                            "capture_runtime_imu_worker_failed",
+                            format!("failed to start capture IMU worker: {error}"),
+                        ));
+                    }
+                };
             *imu_worker = Some(WorkerHandle {
-                handle: thread::spawn(move || {
-                    run_imu_loop(
-                        collector,
-                        sink_for_worker,
-                        on_failure,
-                        audio,
-                        shared,
-                        stop,
-                        imu_timeout,
-                        metrics,
-                    );
-                    let _ = done_tx.send(());
-                }),
+                handle,
                 done: done_rx,
             });
         }
-        Ok(snapshot)
+        self.shared.changed.notify_all();
+        Ok(snapshot_locked(&state))
     }
 
     pub(crate) fn prepare_recording(&self, timeout: Duration) -> Result<(), RuntimeError> {
@@ -386,7 +439,7 @@ impl Runtime {
         }
         let (inflight, imu) = self.begin_recording_stop()?;
 
-        // Close the frame gate before collector shutdown can block.  This
+        // Close the frame gate before collector shutdown can block. This
         // prevents frames arriving during IMU cleanup from entering a session
         // that is already stopping.
         self.imu_stop.store(true, Ordering::Release);
@@ -394,12 +447,17 @@ impl Runtime {
             imu.close();
         }
 
-        let mut state = self.shared.state.lock().map_err(|_| {
-            RuntimeError::new(
-                "capture_runtime_poisoned",
-                "capture runtime state mutex is poisoned",
-            )
-        })?;
+        let state = match self.shared.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                let _ = self.stop_imu_worker(timeout);
+                return Err(RuntimeError::new(
+                    "capture_runtime_poisoned",
+                    "capture runtime state mutex is poisoned",
+                ));
+            }
+        };
+        let mut state = state;
         if inflight == 0 {
             state.recording = None;
             self.shared.changed.notify_all();
@@ -408,17 +466,24 @@ impl Runtime {
             self.stop_imu_worker(timeout)?;
             return Ok(snapshot);
         }
-        let (state, wait_result) = self
-            .shared
-            .changed
-            .wait_timeout_while(state, timeout, |state| state.recording.is_some())
-            .map_err(|_| {
-                RuntimeError::new(
-                    "capture_runtime_poisoned",
-                    "capture runtime state mutex is poisoned",
-                )
-            })?;
+        let (state, wait_result) =
+            match self
+                .shared
+                .changed
+                .wait_timeout_while(state, timeout, |state| state.recording.is_some())
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let _ = self.stop_imu_worker(timeout);
+                    return Err(RuntimeError::new(
+                        "capture_runtime_poisoned",
+                        "capture runtime state mutex is poisoned",
+                    ));
+                }
+            };
         if wait_result.timed_out() && state.recording.is_some() {
+            drop(state);
+            let _ = self.stop_imu_worker(timeout);
             return Err(RuntimeError::new(
                 "capture_runtime_stop_timeout",
                 "capture runtime recording frames did not drain before timeout",
@@ -452,41 +517,65 @@ impl Runtime {
 
     pub(crate) fn close(&self, timeout: Duration) -> Result<RuntimeSnapshot, RuntimeError> {
         self.stop.store(true, Ordering::Release);
-        // A poisoned state must not bypass the remaining resource cleanup.
-        // The final state read below still returns the original state error.
+        let mut first_error: Option<RuntimeError> = None;
         let _ = self.begin_recording_stop();
-        self.request_imu_stop()?;
-        self.stop_imu_worker(timeout)?;
+        capture_first_error(&mut first_error, self.request_imu_stop());
+        capture_first_error(&mut first_error, self.stop_imu_worker(timeout));
+        // Always stop the camera stream and join the capture worker even if IMU
+        // cleanup timed out or failed, returning the first failure afterwards.
         let _ = self.stream.close();
-        let worker = self
-            .worker
-            .lock()
-            .map_err(|_| {
-                RuntimeError::new(
-                    "capture_runtime_poisoned",
-                    "capture runtime worker mutex is poisoned",
-                )
-            })?
-            .take();
-        if let Some(worker) = worker {
-            if worker.join().is_err() {
-                return Err(RuntimeError::new(
-                    "capture_runtime_worker_failed",
-                    "capture runtime worker panicked",
-                ));
+        match self.worker.lock() {
+            Ok(mut worker) => {
+                if let Some(handle) = worker.take() {
+                    if handle.join().is_err() {
+                        capture_first_error(
+                            &mut first_error,
+                            Err(RuntimeError::new(
+                                "capture_runtime_worker_failed",
+                                "capture runtime worker panicked",
+                            )),
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                capture_first_error(
+                    &mut first_error,
+                    Err(RuntimeError::new(
+                        "capture_runtime_poisoned",
+                        "capture runtime worker mutex is poisoned",
+                    )),
+                );
             }
         }
-        let mut state = self.shared.state.lock().map_err(|_| {
+        let snapshot = match self.shared.state.lock() {
+            Ok(mut state) => {
+                state.running = false;
+                state.recording = None;
+                state.fanout.start_stopping();
+                self.shared.changed.notify_all();
+                Some(snapshot_locked(&state))
+            }
+            Err(_) => {
+                capture_first_error(
+                    &mut first_error,
+                    Err(RuntimeError::new(
+                        "capture_runtime_poisoned",
+                        "capture runtime state mutex is poisoned",
+                    )),
+                );
+                None
+            }
+        };
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        snapshot.ok_or_else(|| {
             RuntimeError::new(
                 "capture_runtime_poisoned",
                 "capture runtime state mutex is poisoned",
             )
-        })?;
-        state.running = false;
-        state.recording = None;
-        state.fanout.start_stopping();
-        self.shared.changed.notify_all();
-        Ok(snapshot_locked(&state))
+        })
     }
 
     pub(crate) fn snapshot(&self) -> Result<RuntimeSnapshot, RuntimeError> {
@@ -553,6 +642,14 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.close(Duration::from_secs(5));
+    }
+}
+
+fn capture_first_error(first_error: &mut Option<RuntimeError>, result: Result<(), RuntimeError>) {
+    if first_error.is_none() {
+        if let Err(error) = result {
+            *first_error = Some(error);
+        }
     }
 }
 
@@ -643,7 +740,8 @@ fn process_frame(
                     "application dropped frame count is out of range",
                 )
             })?;
-        let current_source_frame = SourceFrameEvidence::from_frame(&frame);
+        let (current_source_frame, pre_extracted_jpeg) =
+            SourceFrameEvidence::extract_from_frame(&frame);
         let (decision, validation, previous_source_frame, dispatch) = {
             let mut state = shared.state.lock().map_err(|_| {
                 RuntimeError::new(
@@ -679,18 +777,6 @@ fn process_frame(
                     recovery_time_ns,
                 )
                 .map_err(RuntimeError::from)?;
-            if decision.publish_preview {
-                let publish_started = start_stage(metrics);
-                let published = if has_left {
-                    preview.publish(&frame.left)
-                } else {
-                    preview.publish_shared(Arc::clone(&frame.raw_side_by_side))
-                };
-                if let Err(error) = published {
-                    state.last_preview_error = Some(RuntimeError::from(error));
-                }
-                finish_stage(metrics, "native_preview_publish", publish_started);
-            }
             let dispatch = if decision.record {
                 state.recording.clone()
             } else {
@@ -698,6 +784,20 @@ fn process_frame(
             };
             (decision, validation, previous_source_frame, dispatch)
         };
+        if decision.publish_preview {
+            let publish_started = start_stage(metrics);
+            let published = if has_left {
+                preview.publish(&frame.left)
+            } else {
+                preview.publish_shared(Arc::clone(&frame.raw_side_by_side))
+            };
+            if let Err(error) = published {
+                if let Ok(mut state) = shared.state.lock() {
+                    state.last_preview_error = Some(RuntimeError::from(error));
+                }
+            }
+            finish_stage(metrics, "native_preview_publish", publish_started);
+        }
         if decision.recovered_source_gap > 0 {
             eprintln!(
                 "recording continued after source gap: missing={}, next_source_sequence={}, host_monotonic_ns={}",
@@ -706,7 +806,13 @@ fn process_frame(
         }
         if let Some(dispatch) = dispatch {
             let write_started = start_stage(metrics);
-            let write_result = write_split_sink_frame(&dispatch, &frame, decision.dropped_before);
+            let write_result = write_split_sink_frame(
+                &dispatch,
+                &frame,
+                decision.dropped_before,
+                pre_extracted_jpeg,
+                current_source_frame.camera_counter_raw,
+            );
             finish_stage(metrics, "native_recording_split_sink", write_started);
             finish_recording_frame(shared)?;
             if let Err(mut error) = write_result {
@@ -753,6 +859,8 @@ fn write_split_sink_frame(
     recording: &SplitSinkRecording,
     frame: &Frame,
     dropped_before: u64,
+    pre_extracted_jpeg: Option<&[u8]>,
+    pre_extracted_counter: Option<u32>,
 ) -> Result<(), RuntimeError> {
     if frame.raw_side_by_side.is_empty() {
         return Err(RuntimeError::new(
@@ -760,7 +868,10 @@ fn write_split_sink_frame(
             "production split-eye recording is missing raw side-by-side MJPEG frame",
         ));
     }
-    let payload = recording::jpeg_payload(&frame.raw_side_by_side)?;
+    let payload = match pre_extracted_jpeg {
+        Some(payload) => payload,
+        None => recording::jpeg_payload(&frame.raw_side_by_side)?,
+    };
     let reserved = {
         let mut writer = recording.active_take.lock().map_err(|_| {
             RuntimeError::new(
@@ -794,6 +905,7 @@ fn write_split_sink_frame(
         })?;
         encoder.submit(payload).map_err(encoder_runtime_error)?;
     }
+    let camera_counter_raw = pre_extracted_counter.or_else(|| recording::avi1_counter(payload));
     let written = {
         let mut sink = recording.sink.lock().map_err(|_| {
             RuntimeError::new(
@@ -807,21 +919,25 @@ fn write_split_sink_frame(
             reserved.host_monotonic_ns,
             plan.segment_index,
             plan.segment_frame,
-            Some(serde_json::json!({
-                "schema": "openaria.frame-timestamp-audit.v1",
-                "v4l2_buffer_flags": frame.buffer_flags,
-                "host_dequeue_monotonic_ns": frame.dequeue_monotonic_ns,
-                "timestamp_clock": if frame.buffer_flags & 0x2000 != 0 {
+            Some(FrameTimestampAudit {
+                camera_counter_raw,
+                counter_bits: 24,
+                host_dequeue_monotonic_ns: frame.dequeue_monotonic_ns,
+                schema: "openaria.frame-timestamp-audit.v1",
+                timestamp_clock: if v4l2::is_monotonic_timestamp(frame.buffer_flags) {
                     "v4l2_monotonic"
-                } else { "host_monotonic_fallback" },
-                "timestamp_source": if frame.buffer_flags & 0x70000 == 0x10000 {
+                } else {
+                    "host_monotonic_fallback"
+                },
+                timestamp_source: if frame.buffer_flags & 0x70000 == 0x10000 {
                     "start_of_exposure"
                 } else if frame.buffer_flags & 0x70000 == 0 {
                     "end_of_frame"
-                } else { "unknown" },
-                "camera_counter_raw": recording::avi1_counter(payload),
-                "counter_bits": 24,
-            })),
+                } else {
+                    "unknown"
+                },
+                v4l2_buffer_flags: frame.buffer_flags,
+            }),
         )?
     };
     {
@@ -836,15 +952,11 @@ fn write_split_sink_frame(
     Ok(())
 }
 
-fn encoder_runtime_error(error: stereo_encoder::EncoderProcessError) -> RuntimeError {
-    let code = match error.code.as_str() {
-        "invalid_argument" => "invalid_argument",
-        "invalid_state" => "invalid_state",
-        "encoder_unavailable" => "encoder_unavailable",
-        "encoder_failed" => "encoder_failed",
-        "counter_overflow" => "counter_overflow",
-        "send_failed" => "send_failed",
-        _ => "encoder_failed",
+fn encoder_runtime_error(error: EncoderProcessError) -> RuntimeError {
+    let code = if error.code.is_empty() {
+        Cow::Borrowed("encoder_failed")
+    } else {
+        Cow::Owned(error.code)
     };
     RuntimeError::new(code, error.message)
 }
@@ -864,18 +976,28 @@ fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-// These owners are moved together into the single IMU/audio monitoring thread.
-#[allow(clippy::too_many_arguments)]
-fn run_imu_loop(
+struct ImuLoopContext {
     collector: Arc<Collector>,
     sink: Arc<Mutex<recording::RecordingSink>>,
-    on_failure: Arc<Py<PyAny>>,
-    audio: Option<Arc<crate::audio::Recorder>>,
+    on_failure: Arc<dyn FailureSink>,
+    audio: Option<Arc<Recorder>>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     timeout: Duration,
     metrics: Option<Arc<Metrics>>,
-) {
+}
+
+fn run_imu_loop(ctx: ImuLoopContext) {
+    let ImuLoopContext {
+        collector,
+        sink,
+        on_failure,
+        audio,
+        shared,
+        stop,
+        timeout,
+        metrics,
+    } = ctx;
     loop {
         if stop.load(Ordering::Acquire) || !recording_present(&shared) {
             break;
@@ -978,8 +1100,9 @@ fn recording_present(shared: &Shared) -> bool {
 fn report_recording_failure(
     shared: &Shared,
     error: RuntimeError,
-    preferred_callback: Option<Arc<Py<PyAny>>>,
+    preferred_callback: Option<Arc<dyn FailureSink>>,
 ) {
+    shared.imu_stop.store(true, Ordering::Release);
     let callback = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
@@ -1006,13 +1129,12 @@ fn report_recording_failure(
         callback
     };
     if let Some(callback) = callback {
-        Python::with_gil(|py| {
-            let _ = callback.call1(py, (error.code, error.message));
-        });
+        callback.on_failure(&error.code, &error.message);
     }
 }
 
 fn set_terminal_error(shared: &Shared, error: RuntimeError) {
+    shared.imu_stop.store(true, Ordering::Release);
     let callback = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
@@ -1037,9 +1159,7 @@ fn set_terminal_error(shared: &Shared, error: RuntimeError) {
         callback
     };
     if let Some(callback) = callback {
-        Python::with_gil(|py| {
-            let _ = callback.call1(py, (error.code, error.message));
-        });
+        callback.on_failure(&error.code, &error.message);
     }
 }
 
@@ -1060,11 +1180,26 @@ fn snapshot_locked(state: &State) -> RuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyo3::types::PyBytes;
+    use crate::hardware::native_camera::Stream;
+    use crate::hardware::preview::LatestBuffer;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct TestFailureSink {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FailureSink for TestFailureSink {
+        fn on_failure(&self, code: &str, message: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((code.to_owned(), message.to_owned()));
+        }
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1110,7 +1245,7 @@ mod tests {
         assert!(!runtime.snapshot().unwrap().recording_present);
     }
 
-    fn test_recording(py: Python<'_>, root: &std::path::Path) -> SplitSinkRecording {
+    fn test_recording(root: &std::path::Path, sink_cb: Arc<TestFailureSink>) -> SplitSinkRecording {
         fs::create_dir_all(root.join("video")).unwrap();
         SplitSinkRecording {
             active_take: Arc::new(Mutex::new(
@@ -1120,16 +1255,16 @@ mod tests {
                 recording::RecordingSink::create(root, "session").unwrap(),
             )),
             encoder: Arc::new(Mutex::new(
-                stereo_encoder::EncoderProcess::new(
-                    &root.join("video"),
-                    std::path::Path::new("/bin/cat"),
-                    3840,
-                    1080,
-                    60,
-                    8192,
-                    3,
-                    "video/",
-                )
+                stereo_encoder::EncoderProcess::new(stereo_encoder::EncoderConfig {
+                    out_dir: &root.join("video"),
+                    executable: std::path::Path::new("/bin/cat"),
+                    width: 3840,
+                    height: 1080,
+                    fps: 60,
+                    bitrate_kbps: 8192,
+                    segment_frames: 3,
+                    path_prefix: "video/",
+                })
                 .unwrap(),
             )),
             segment_planner: Arc::new(Mutex::new(
@@ -1137,7 +1272,7 @@ mod tests {
             )),
             recording_start_monotonic_ns: 1,
             capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
-            on_failure: Arc::new(PyBytes::new(py, b"on-failure").into_any().unbind()),
+            on_failure: sink_cb,
             imu: None,
             audio: None,
         }
@@ -1170,11 +1305,11 @@ mod tests {
 
     #[test]
     fn source_gap_callback_keeps_real_adjacent_frames_and_rejects_gap_before_reservation() {
-        pyo3::prepare_freethreaded_python();
         // A gap on a normally decimated frame must still fail immediately.
         for decimation in [1, 2, 3] {
             let root = temp_root("source-gap-evidence");
-            let mut target = Python::with_gil(|py| test_recording(py, &root));
+            let callbacks = Arc::new(TestFailureSink::default());
+            let mut target = test_recording(&root, Arc::clone(&callbacks));
             let helper = root.join("encoder-helper.sh");
             fs::write(
                 &helper,
@@ -1182,29 +1317,19 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
-            let mut encoder = stereo_encoder::EncoderProcess::new(
-                &root.join("video"),
-                &helper,
-                3840,
-                1080,
-                60,
-                8192,
-                3,
-                "video/",
-            )
+            let mut encoder = stereo_encoder::EncoderProcess::new(stereo_encoder::EncoderConfig {
+                out_dir: &root.join("video"),
+                executable: &helper,
+                width: 3840,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 8192,
+                segment_frames: 3,
+                path_prefix: "video/",
+            })
             .unwrap();
             encoder.start().unwrap();
             target.encoder = Arc::new(Mutex::new(encoder));
-            let callbacks = Python::with_gil(|py| {
-                let module = pyo3::types::PyModule::from_code(
-                    py,
-                    c"calls = []\ndef on_failure(code, message):\n    calls.append((code, message))\n",
-                    c"source_gap_test.py",
-                    c"source_gap_test",
-                ).unwrap();
-                target.on_failure = Arc::new(module.getattr("on_failure").unwrap().unbind());
-                module.getattr("calls").unwrap().unbind()
-            });
             let active_take = Arc::clone(&target.active_take);
             let encoder = Arc::clone(&target.encoder);
             let runtime = Runtime::new(
@@ -1250,23 +1375,21 @@ mod tests {
             assert_eq!(summary.frames_written, 1);
             assert_eq!(summary.frame_domain, 1);
             assert_eq!(summary.pending_frames, 0);
-            Python::with_gil(|py| {
-                let calls: Vec<(String, String)> = callbacks.bind(py).extract().unwrap();
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].0, "source_sequence_gap");
-                assert!(calls[0].1.contains(
-                    "previous_sequence=10, current_sequence=13, source_gap=2, queue_rejected=0"
-                ));
-                let (_, evidence) = calls[0].1.split_once("; source_frame_evidence=").unwrap();
-                let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
-                assert_eq!(evidence["previous"]["source_sequence"], 10);
-                assert_eq!(evidence["previous"]["camera_counter_raw"], 110);
-                assert_eq!(evidence["current"]["camera_counter_raw"], 113);
-                assert_eq!(evidence["previous"]["host_monotonic_ns"], 200_000_000);
-                assert_eq!(evidence["current"]["host_monotonic_ns"], 260_000_000);
-                assert_eq!(evidence["current"]["dequeue_monotonic_ns"], 260_100_000);
-                assert_eq!(evidence["current"]["buffer_flags"], 0x2000);
-            });
+            let calls = callbacks.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "source_sequence_gap");
+            assert!(calls[0].1.contains(
+                "previous_sequence=10, current_sequence=13, source_gap=2, queue_rejected=0"
+            ));
+            let (_, evidence) = calls[0].1.split_once("; source_frame_evidence=").unwrap();
+            let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
+            assert_eq!(evidence["previous"]["source_sequence"], 10);
+            assert_eq!(evidence["previous"]["camera_counter_raw"], 110);
+            assert_eq!(evidence["current"]["camera_counter_raw"], 113);
+            assert_eq!(evidence["previous"]["host_monotonic_ns"], 200_000_000);
+            assert_eq!(evidence["current"]["host_monotonic_ns"], 260_000_000);
+            assert_eq!(evidence["current"]["dequeue_monotonic_ns"], 260_100_000);
+            assert_eq!(evidence["current"]["buffer_flags"], 0x2000);
             drop(runtime);
             drop(encoder);
             let _ = fs::remove_dir_all(root);
@@ -1283,6 +1406,16 @@ mod tests {
     }
 
     #[test]
+    fn encoder_runtime_error_preserves_helper_error_code() {
+        let err = super::encoder_runtime_error(EncoderProcessError {
+            code: "vpu_hw_timeout".to_owned(),
+            message: "timed out".to_owned(),
+        });
+        assert_eq!(err.code, "vpu_hw_timeout");
+        assert_eq!(err.message, "timed out");
+    }
+
+    #[test]
     fn split_sink_frame_writes_index_and_finishes_active_take() {
         let root = temp_root("split-sink");
         fs::create_dir_all(root.join("video")).unwrap();
@@ -1296,42 +1429,37 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&helper, permissions).unwrap();
 
-        pyo3::prepare_freethreaded_python();
         {
-            let mut target = Python::with_gil(|py| test_recording(py, &root));
-            let mut encoder = stereo_encoder::EncoderProcess::new(
-                &root.join("video"),
-                &helper,
-                3840,
-                1080,
-                60,
-                8192,
-                3,
-                "video/",
-            )
+            let mut target = test_recording(&root, Arc::new(TestFailureSink::default()));
+            let mut encoder = stereo_encoder::EncoderProcess::new(stereo_encoder::EncoderConfig {
+                out_dir: &root.join("video"),
+                executable: &helper,
+                width: 3840,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 8192,
+                segment_frames: 3,
+                path_prefix: "video/",
+            })
             .unwrap();
             encoder.start().unwrap();
             target.encoder = Arc::new(Mutex::new(encoder));
             target.recording_start_monotonic_ns = 1_000_000;
 
-            write_split_sink_frame(
-                &target,
-                &Frame {
-                    buffer_flags: 0,
-                    dequeue_monotonic_ns: 0,
-                    source_sequence: 9,
-                    host_monotonic_ns: 34_000_000,
-                    application_dropped_before: 0,
-                    producer_max_interval_ns: 0,
-                    producer_max_control_ns: 0,
-                    producer_max_read_ns: 0,
-                    left: Vec::new(),
-                    right: Vec::new(),
-                    raw_side_by_side: Arc::from(&b"prefix\xff\xd8payload\xff\xd9suffix"[..]),
-                },
-                0,
-            )
-            .unwrap();
+            let frame = Frame {
+                buffer_flags: 0,
+                dequeue_monotonic_ns: 0,
+                source_sequence: 9,
+                host_monotonic_ns: 34_000_000,
+                application_dropped_before: 0,
+                producer_max_interval_ns: 0,
+                producer_max_control_ns: 0,
+                producer_max_read_ns: 0,
+                left: Vec::new(),
+                right: Vec::new(),
+                raw_side_by_side: Arc::from(&b"prefix\xff\xd8payload\xff\xd9suffix"[..]),
+            };
+            write_split_sink_frame(&target, &frame, 0, None, None).unwrap();
 
             let summary = target.active_take.lock().unwrap().finish().unwrap();
             assert_eq!(summary.frames_written, 1);
@@ -1364,120 +1492,198 @@ mod tests {
 
     #[test]
     fn prepare_recording_reaps_failed_imu_worker_and_allows_retry() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let root = temp_root("failed-recording-retry");
-            let runtime = Runtime::new(
-                Arc::new(Stream::test_idle(1)),
-                Arc::new(LatestBuffer::new(30).unwrap()),
-                1,
-                Duration::from_millis(10),
-                None,
-            )
-            .unwrap();
-            {
-                let mut state = runtime.shared.state.lock().unwrap();
-                state.running = true;
-                state.fanout.start_recording(false).unwrap();
-                state.recording = Some(Arc::new(test_recording(py, &root)));
+        let root = temp_root("failed-recording-retry");
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(test_recording(
+                &root,
+                Arc::new(TestFailureSink::default()),
+            )));
+        }
+        let stop = Arc::clone(&runtime.imu_stop);
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // Exercise cleanup while the old monitoring thread still exists.
+            while !stop.load(Ordering::Acquire) {
+                thread::yield_now();
             }
-            let stop = Arc::clone(&runtime.imu_stop);
-            let (done_tx, done_rx) = mpsc::channel();
-            let handle = thread::spawn(move || {
-                // Exercise cleanup while the old monitoring thread still exists.
-                while !stop.load(Ordering::Acquire) {
-                    thread::yield_now();
-                }
-                let _ = done_tx.send(());
-            });
-            *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
-                handle,
-                done: done_rx,
-            });
-            report_recording_failure(
-                &runtime.shared,
-                RuntimeError::new(
-                    "source_sequence_gap",
-                    "source frame sequence has a gap of 8",
-                ),
-                None,
-            );
-            assert!(!runtime.snapshot().unwrap().recording_present);
-            assert!(runtime.imu_worker.lock().unwrap().is_some());
-            runtime.prepare_recording(Duration::from_secs(1)).unwrap();
-            assert!(runtime.imu_worker.lock().unwrap().is_none());
-            let next = test_recording(py, &root.join("next"));
-            let snapshot = runtime
-                .start_recording(
-                    Arc::clone(&next.active_take),
-                    Arc::clone(&next.sink),
-                    Arc::clone(&next.encoder),
-                    Arc::clone(&next.segment_planner),
-                    1,
-                    PyBytes::new(py, b"callback").into_any().unbind(),
-                    None,
-                    Duration::from_millis(10),
-                    None,
-                    Arc::clone(&next.capture_stopped_monotonic_ns),
-                    false,
-                )
-                .unwrap();
-            assert!(snapshot.recording_active);
-            let error = runtime
-                .prepare_recording(Duration::from_secs(1))
-                .unwrap_err();
-            assert_eq!(error.code, "invalid_state");
-            assert!(runtime.snapshot().unwrap().recording_active);
-            runtime.stop_recording(Duration::from_secs(1)).unwrap();
-            assert!(next.capture_stopped_monotonic_ns.load(Ordering::Acquire) > 0);
-            let _ = fs::remove_dir_all(root);
+            let _ = done_tx.send(());
         });
+        *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
+            handle,
+            done: done_rx,
+        });
+        report_recording_failure(
+            &runtime.shared,
+            RuntimeError::new(
+                "source_sequence_gap",
+                "source frame sequence has a gap of 8",
+            ),
+            None,
+        );
+        assert!(runtime.imu_stop.load(Ordering::Acquire));
+        assert!(!runtime.snapshot().unwrap().recording_present);
+        assert!(runtime.imu_worker.lock().unwrap().is_some());
+        runtime.prepare_recording(Duration::from_secs(1)).unwrap();
+        assert!(runtime.imu_worker.lock().unwrap().is_none());
+        let next = test_recording(&root.join("next"), Arc::new(TestFailureSink::default()));
+        let snapshot = runtime
+            .start_recording(RecordingTarget {
+                active_take: Arc::clone(&next.active_take),
+                sink: Arc::clone(&next.sink),
+                encoder: Arc::clone(&next.encoder),
+                segment_planner: Arc::clone(&next.segment_planner),
+                recording_start_monotonic_ns: 1,
+                on_failure: Arc::clone(&next.on_failure),
+                imu: None,
+                imu_timeout: Duration::from_millis(10),
+                audio: None,
+                capture_stopped_monotonic_ns: Arc::clone(&next.capture_stopped_monotonic_ns),
+                recover_source_gaps: false,
+            })
+            .unwrap();
+        assert!(snapshot.recording_active);
+        let error = runtime
+            .prepare_recording(Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_state");
+        assert!(runtime.snapshot().unwrap().recording_active);
+        runtime.stop_recording(Duration::from_secs(1)).unwrap();
+        assert!(next.capture_stopped_monotonic_ns.load(Ordering::Acquire) > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn close_still_joins_worker_and_closes_stream_when_imu_stop_times_out() {
+        let stream = Arc::new(Stream::test_idle(1));
+        let runtime = Runtime::new(
+            Arc::clone(&stream),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+        }
+        let stop = Arc::clone(&runtime.stop);
+        let worker = thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        });
+        *runtime.worker.lock().unwrap() = Some(worker);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (_done_tx, done_rx) = mpsc::channel();
+        let stalled_imu = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
+            handle: stalled_imu,
+            done: done_rx,
+        });
+        let err = runtime.close(Duration::from_millis(20)).unwrap_err();
+        assert_eq!(err.code, "capture_runtime_imu_stop_timeout");
+        // Stream worker must still be joined and running cleared despite IMU timeout.
+        assert!(runtime.worker.lock().unwrap().is_none());
+        assert!(!runtime.snapshot().unwrap().running);
+        let _ = release_tx.send(());
+        if let Some(handle) = runtime.imu_worker.lock().unwrap().take() {
+            let _ = handle.handle.join();
+        }
     }
 
     #[test]
     fn stop_recording_clears_imu_worker_when_no_frames_are_inflight() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let root = temp_root("stop-recording");
-            let runtime = Runtime::new(
-                Arc::new(Stream::test_idle(1)),
-                Arc::new(LatestBuffer::new(30).unwrap()),
-                1,
-                Duration::from_millis(10),
-                None,
-            )
-            .unwrap();
-            {
-                let mut state = runtime.shared.state.lock().unwrap();
-                state.running = true;
-                state.fanout.start_recording(false).unwrap();
-                state.recording = Some(Arc::new(test_recording(py, &root)));
-            }
-            let (done_tx, done_rx) = mpsc::channel();
-            let handle = thread::spawn(move || {
-                let _ = done_tx.send(());
-            });
-            *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
-                handle,
-                done: done_rx,
-            });
-
-            let snapshot = runtime.stop_recording(Duration::from_secs(1)).unwrap();
-
-            assert!(!snapshot.recording_present);
-            assert!(
-                runtime.imu_worker.lock().unwrap().is_none(),
-                "stop_recording must clear a completed IMU worker even when no frames are inflight",
-            );
-            let _ = fs::remove_dir_all(root);
+        let root = temp_root("stop-recording");
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(test_recording(
+                &root,
+                Arc::new(TestFailureSink::default()),
+            )));
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = done_tx.send(());
         });
+        *runtime.imu_worker.lock().unwrap() = Some(WorkerHandle {
+            handle,
+            done: done_rx,
+        });
+
+        let snapshot = runtime.stop_recording(Duration::from_secs(1)).unwrap();
+
+        assert!(!snapshot.recording_present);
+        assert!(
+            runtime.imu_worker.lock().unwrap().is_none(),
+            "stop_recording must clear a completed IMU worker even when no frames are inflight",
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn begin_recording_stop_closes_frame_gate_before_resource_cleanup() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let root = temp_root("begin-stop");
+        let root = temp_root("begin-stop");
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        let audio = Arc::new(Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap());
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            let mut target = test_recording(&root, Arc::new(TestFailureSink::default()));
+            target.audio = Some(Arc::clone(&audio));
+            state.recording = Some(Arc::new(target));
+        }
+        assert!(!audio.stop_requested());
+        let (inflight, imu) = runtime.begin_recording_stop().unwrap();
+        assert!(audio.stop_requested());
+        assert_eq!(inflight, 0);
+        assert!(imu.is_none());
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            assert!(state.recording.is_some());
+            let fanout = state.fanout.snapshot();
+            assert!(!fanout.recording_active);
+            assert!(!fanout.recording_present);
+            state.recording = None;
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recording_failure_terminal_error_and_close_signal_audio_stop() {
+        for cause in ["recording", "terminal", "close"] {
+            let root = temp_root("audio-stop-failure");
             let runtime = Runtime::new(
                 Arc::new(Stream::test_idle(1)),
                 Arc::new(LatestBuffer::new(30).unwrap()),
@@ -1486,83 +1692,38 @@ mod tests {
                 None,
             )
             .unwrap();
-            let audio = Arc::new(
-                crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap(),
-            );
+            let audio =
+                Arc::new(Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap());
+            let mut target = test_recording(&root, Arc::new(TestFailureSink::default()));
+            target.audio = Some(Arc::clone(&audio));
             {
                 let mut state = runtime.shared.state.lock().unwrap();
                 state.running = true;
                 state.fanout.start_recording(false).unwrap();
-                let mut target = test_recording(py, &root);
-                target.audio = Some(Arc::clone(&audio));
                 state.recording = Some(Arc::new(target));
             }
             assert!(!audio.stop_requested());
-            let (inflight, imu) = runtime.begin_recording_stop().unwrap();
-            assert!(audio.stop_requested());
-            assert_eq!(inflight, 0);
-            assert!(imu.is_none());
-            {
-                let mut state = runtime.shared.state.lock().unwrap();
-                assert!(state.recording.is_some());
-                let fanout = state.fanout.snapshot();
-                assert!(!fanout.recording_active);
-                assert!(!fanout.recording_present);
-                state.recording = None;
+            let error = super::RuntimeError::new("audio_failed", "test failure");
+            match cause {
+                "recording" => super::report_recording_failure(&runtime.shared, error, None),
+                "terminal" => super::set_terminal_error(&runtime.shared, error),
+                "close" => {
+                    runtime.close(Duration::from_secs(1)).unwrap();
+                }
+                _ => unreachable!(),
             }
+            assert!(audio.stop_requested());
+            assert!(runtime.imu_stop.load(Ordering::Acquire));
+            assert!(!runtime.snapshot().unwrap().recording_present);
+            drop(runtime);
             let _ = fs::remove_dir_all(root);
-        });
-    }
-
-    #[test]
-    fn recording_failure_terminal_error_and_close_signal_audio_stop() {
-        pyo3::prepare_freethreaded_python();
-        for cause in ["recording", "terminal", "close"] {
-            Python::with_gil(|py| {
-                let root = temp_root("audio-stop-failure");
-                let runtime = Runtime::new(
-                    Arc::new(Stream::test_idle(1)),
-                    Arc::new(LatestBuffer::new(30).unwrap()),
-                    1,
-                    Duration::from_millis(10),
-                    None,
-                )
-                .unwrap();
-                let audio = Arc::new(
-                    crate::audio::Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0)
-                        .unwrap(),
-                );
-                let mut target = test_recording(py, &root);
-                target.audio = Some(Arc::clone(&audio));
-                {
-                    let mut state = runtime.shared.state.lock().unwrap();
-                    state.running = true;
-                    state.fanout.start_recording(false).unwrap();
-                    state.recording = Some(Arc::new(target));
-                }
-                assert!(!audio.stop_requested());
-                let error = super::RuntimeError::new("audio_failed", "test failure");
-                match cause {
-                    "recording" => super::report_recording_failure(&runtime.shared, error, None),
-                    "terminal" => super::set_terminal_error(&runtime.shared, error),
-                    "close" => {
-                        runtime.close(Duration::from_secs(1)).unwrap();
-                    }
-                    _ => unreachable!(),
-                }
-                assert!(audio.stop_requested());
-                assert!(!runtime.snapshot().unwrap().recording_present);
-                drop(runtime);
-                let _ = fs::remove_dir_all(root);
-            });
         }
     }
 
     #[test]
     fn stop_preserves_inflight_frame_until_encoder_and_index_finish() {
-        pyo3::prepare_freethreaded_python();
         let root = temp_root("inflight-stop");
-        let mut target = Python::with_gil(|py| test_recording(py, &root));
+        let mut target = test_recording(&root, Arc::new(TestFailureSink::default()));
         let helper = root.join("encoder-helper.sh");
         fs::write(
             &helper,
@@ -1570,16 +1731,16 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut encoder = stereo_encoder::EncoderProcess::new(
-            &root.join("video"),
-            &helper,
-            3840,
-            1080,
-            60,
-            8192,
-            3,
-            "video/",
-        )
+        let mut encoder = stereo_encoder::EncoderProcess::new(stereo_encoder::EncoderConfig {
+            out_dir: &root.join("video"),
+            executable: &helper,
+            width: 3840,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 8192,
+            segment_frames: 3,
+            path_prefix: "video/",
+        })
         .unwrap();
         encoder.start().unwrap();
         target.encoder = Arc::new(Mutex::new(encoder));

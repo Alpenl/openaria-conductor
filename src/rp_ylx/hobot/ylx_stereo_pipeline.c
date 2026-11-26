@@ -68,6 +68,8 @@ typedef struct closed_pair {
 
 struct ylx_pipeline {
     ylx_pipeline_config_t config;
+    char *out_dir_owned;
+    char *path_prefix_owned;
     int eye_width;
     int segment_frames;
 
@@ -75,8 +77,10 @@ struct ylx_pipeline {
     eye_t eyes[YLX_EYES];
     pthread_t split_thread;
     int decoder_started, split_started, closer_started, committer_started;
-    int ledger_initialized, error_initialized;
+    int finish_lock_initialized, ledger_initialized, error_initialized;
     int closer_lock_initialized, closer_signal_initialized, commit_signal_initialized;
+    pthread_mutex_t finish_lock;
+    int finished;
 
     ylx_segment_closed_fn on_segment;
     void *user;
@@ -204,7 +208,7 @@ static void configure_decoder(media_codec_context_t *context,
     params->feed_mode = MC_FEEDING_MODE_FRAME_SIZE;
     params->pix_fmt = MC_PIXEL_FORMAT_NV12;
     params->bitstream_buf_size =
-        (uint32_t)((config->sbs_width * config->height * 3 / 2 + 0x3ff) & ~0x3ff);
+        (uint32_t)(((uint64_t)config->sbs_width * (uint64_t)config->height * 3ULL / 2ULL + 0x3ffULL) & ~0x3ffULL);
     params->bitstream_buf_count = 6;
     params->frame_buf_count = 6;
     params->mjpeg_dec_config.rot_degree = MC_CCW_0;
@@ -223,7 +227,7 @@ static int configure_encoder(media_codec_context_t *context,
     params->height = config->height;
     params->pix_fmt = MC_PIXEL_FORMAT_NV12;
     params->bitstream_buf_size =
-        (uint32_t)((eye_width * config->height * 3 / 2 + 0x3ff) & ~0x3ff);
+        (uint32_t)(((uint64_t)eye_width * (uint64_t)config->height * 3ULL / 2ULL + 0x3ffULL) & ~0x3ffULL);
     params->frame_buf_count = 8;
     params->external_frame_buf = false;
     params->bitstream_buf_count = 8;
@@ -314,6 +318,11 @@ static uint32_t read_u32(const unsigned char *cursor)
            ((uint32_t)cursor[2] << 8) | (uint32_t)cursor[3];
 }
 
+static uint64_t read_u64(const unsigned char *cursor)
+{
+    return ((uint64_t)read_u32(cursor) << 32) | (uint64_t)read_u32(cursor + 4);
+}
+
 static void write_u32(unsigned char *cursor, uint32_t value)
 {
     cursor[0] = (unsigned char)(value >> 24);
@@ -322,59 +331,166 @@ static void write_u32(unsigned char *cursor, uint32_t value)
     cursor[3] = (unsigned char)value;
 }
 
-/* Offset of a version-0 box's duration field, relative to its 4CC. */
+static int pread_full(int fd, void *buffer, size_t length, off_t offset)
+{
+    unsigned char *cursor = (unsigned char *)buffer;
+    size_t remaining = length;
+    while (remaining > 0) {
+        ssize_t got = pread(fd, cursor, remaining, offset);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (got == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        cursor += (size_t)got;
+        offset += got;
+        remaining -= (size_t)got;
+    }
+    return 0;
+}
+
+static int pwrite_full(int fd, const void *buffer, size_t length, off_t offset)
+{
+    const unsigned char *cursor = (const unsigned char *)buffer;
+    size_t remaining = length;
+    while (remaining > 0) {
+        ssize_t wrote = pwrite(fd, cursor, remaining, offset);
+        if (wrote < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (wrote == 0) {
+            errno = EIO;
+            return -1;
+        }
+        cursor += (size_t)wrote;
+        offset += wrote;
+        remaining -= (size_t)wrote;
+    }
+    return 0;
+}
+
+/* Offset of a version-0 box's duration field, relative to the box header. */
 typedef struct {
     const char *type;
+    const char *path[4];
+    size_t depth;
     size_t timescale_offset; /* 0 when the box carries no timescale */
     size_t duration_offset;
 } duration_box_t;
 
 static const duration_box_t DURATION_BOXES[] = {
-    {"mvhd", 16, 20},
-    {"tkhd", 0, 24},
-    {"mdhd", 16, 20},
-    {"elst", 0, 12},
+    {"mvhd", {"mvhd", NULL, NULL, NULL}, 1, 20, 24},
+    {"tkhd", {"trak", "tkhd", NULL, NULL}, 2, 0, 28},
+    {"mdhd", {"trak", "mdia", "mdhd", NULL}, 3, 20, 24},
+    {"elst", {"trak", "edts", "elst", NULL}, 3, 0, 16},
 };
 
-static unsigned char *find_box(unsigned char *buffer, size_t length, const char *type)
+static int parse_box_header(const unsigned char *buf, size_t avail,
+                            uint64_t *box_size, size_t *header_len)
 {
-    for (size_t offset = 4; offset + 4 <= length; offset += 1) {
-        if (memcmp(buffer + offset, type, 4) == 0) {
-            return buffer + offset;
-        }
+    if (avail < 8) {
+        return -1;
     }
-    return NULL;
+    const uint32_t size32 = read_u32(buf);
+    if (size32 == 1) {
+        if (avail < 16) {
+            return -1;
+        }
+        const uint64_t large = read_u64(buf + 8);
+        if (large < 16 || large > avail) {
+            return -1;
+        }
+        *box_size = large;
+        *header_len = 16;
+        return 0;
+    }
+    if (size32 == 0) {
+        *box_size = avail;
+        *header_len = 8;
+        return 0;
+    }
+    if (size32 < 8 || (uint64_t)size32 > avail) {
+        return -1;
+    }
+    *box_size = size32;
+    *header_len = 8;
+    return 0;
 }
 
-static unsigned char *child_box(unsigned char *parent, size_t skip, const char *type)
+static unsigned char *child_box(unsigned char *parent, size_t parent_avail,
+                                size_t skip, const char *type, size_t *child_avail)
 {
-    const size_t length = read_u32(parent);
-    for (size_t offset = skip; offset + 8 <= length;) {
-        const size_t size = read_u32(parent + offset);
-        if (size < 8 || size > length - offset) {
+    uint64_t length = 0;
+    size_t parent_hdr = 0;
+    if (parse_box_header(parent, parent_avail, &length, &parent_hdr) != 0) {
+        return NULL;
+    }
+    const size_t header_delta = parent_hdr - 8;
+    if (skip > (size_t)length || header_delta > (size_t)length - skip) {
+        return NULL;
+    }
+    for (size_t offset = skip + header_delta; offset + 8 <= (size_t)length;) {
+        uint64_t size = 0;
+        size_t child_hdr = 0;
+        if (parse_box_header(parent + offset, (size_t)length - offset,
+                             &size, &child_hdr) != 0) {
             return NULL;
         }
         if (memcmp(parent + offset + 4, type, 4) == 0) {
+            if (child_avail != NULL) {
+                *child_avail = (size_t)size;
+            }
             return parent + offset;
         }
-        offset += size;
+        offset += (size_t)size;
     }
     return NULL;
 }
 
-static int mp4_fix_color(unsigned char *moov, char *reason, size_t reason_len)
+static unsigned char *find_box_path(unsigned char *moov, size_t moov_size,
+                                    const char *const *path, size_t depth,
+                                    size_t *out_size)
+{
+    unsigned char *current = moov;
+    size_t current_avail = moov_size;
+    for (size_t index = 0; index < depth; index += 1) {
+        current = child_box(current, current_avail, 8, path[index], &current_avail);
+        if (current == NULL) {
+            return NULL;
+        }
+    }
+    if (out_size != NULL) {
+        *out_size = current_avail;
+    }
+    return current;
+}
+
+static int mp4_fix_color(unsigned char *moov, size_t moov_size,
+                         char *reason, size_t reason_len)
 {
     static const struct { const char *type; size_t skip; } path[] = {
         {"trak", 8}, {"mdia", 8}, {"minf", 8}, {"stbl", 8},
         {"stsd", 8}, {"avc1", 16}, {"colr", 86},
     };
     unsigned char *box = moov;
+    size_t box_avail = moov_size;
     for (size_t index = 0; index < sizeof(path) / sizeof(path[0]); index++) {
         unsigned char *parent = box;
-        box = child_box(parent, path[index].skip, path[index].type);
+        size_t parent_avail = box_avail;
+        box = child_box(parent, parent_avail, path[index].skip, path[index].type, &box_avail);
         if (box == NULL && strcmp(path[index].type, "avc1") == 0) {
-            box = child_box(parent, path[index].skip, "hvc1");
-            if (box == NULL) box = child_box(parent, path[index].skip, "hev1");
+            box = child_box(parent, parent_avail, path[index].skip, "hvc1", &box_avail);
+            if (box == NULL) {
+                box = child_box(parent, parent_avail, path[index].skip, "hev1", &box_avail);
+            }
         }
         if (box == NULL) {
             /* Some vendor versions omit colr and leave the SPS authoritative. */
@@ -383,7 +499,13 @@ static int mp4_fix_color(unsigned char *moov, char *reason, size_t reason_len)
             return -1;
         }
     }
-    const size_t size = read_u32(box);
+    uint64_t colr_size = 0;
+    size_t colr_hdr = 0;
+    if (parse_box_header(box, box_avail, &colr_size, &colr_hdr) != 0 || colr_hdr != 8) {
+        snprintf(reason, reason_len, "unsupported colr header");
+        return -1;
+    }
+    const size_t size = (size_t)colr_size;
     if (size < 18 || (memcmp(box + 8, "nclx", 4) != 0 &&
                       memcmp(box + 8, "nclc", 4) != 0)) {
         snprintf(reason, reason_len, "unsupported colr box");
@@ -406,6 +528,10 @@ static int mp4_fix_color(unsigned char *moov, char *reason, size_t reason_len)
 
 static int mp4_extend_durations(const char *path, int fps, char *reason, size_t reason_len)
 {
+    if (fps <= 0) {
+        snprintf(reason, reason_len, "invalid fps");
+        return -1;
+    }
     int fd = open(path, O_RDWR);
     if (fd < 0) {
         snprintf(reason, reason_len, "open: %s", strerror(errno));
@@ -413,25 +539,49 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
     }
 
     off_t offset = 0;
-    uint32_t moov_size = 0;
+    size_t moov_size = 0;
     off_t moov_offset = -1;
     for (;;) {
         unsigned char header[8];
-        if (pread(fd, header, sizeof(header), offset) != (ssize_t)sizeof(header)) {
+        if (pread_full(fd, header, sizeof(header), offset) != 0) {
             break;
         }
-        const uint32_t size = read_u32(header);
-        if (size < 8) {
+        const uint32_t size32 = read_u32(header);
+        uint64_t box_size = size32;
+        if (size32 == 1) {
+            unsigned char ext[8];
+            if (pread_full(fd, ext, sizeof(ext), offset + 8) != 0) {
+                break;
+            }
+            box_size = read_u64(ext);
+            if (box_size < 16) {
+                break;
+            }
+        } else if (size32 == 0) {
+            off_t file_end = lseek(fd, 0, SEEK_END);
+            if (file_end < 0 || file_end <= offset ||
+                (uint64_t)(file_end - offset) < 8) {
+                break;
+            }
+            box_size = (uint64_t)(file_end - offset);
+        } else if (size32 < 8) {
             break;
         }
         if (memcmp(header + 4, "moov", 4) == 0) {
+            if (box_size > 8u * 1024u * 1024u) {
+                break;
+            }
             moov_offset = offset;
-            moov_size = size;
+            moov_size = (size_t)box_size;
             break;
         }
-        offset += size;
+        if (offset < 0 || (uint64_t)offset > (uint64_t)INT64_MAX ||
+            box_size > (uint64_t)INT64_MAX - (uint64_t)offset) {
+            break;
+        }
+        offset += (off_t)box_size;
     }
-    if (moov_offset < 0 || moov_size > 8u * 1024u * 1024u) {
+    if (moov_offset < 0 || moov_size < 8 || moov_size > 8u * 1024u * 1024u) {
         snprintf(reason, reason_len, "no usable moov box");
         close(fd);
         return -1;
@@ -443,7 +593,7 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
         close(fd);
         return -1;
     }
-    if (pread(fd, moov, moov_size, moov_offset) != (ssize_t)moov_size) {
+    if (pread_full(fd, moov, moov_size, moov_offset) != 0) {
         snprintf(reason, reason_len, "short moov read");
         free(moov);
         close(fd);
@@ -455,16 +605,49 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
     for (size_t index = 0; index < sizeof(DURATION_BOXES) / sizeof(DURATION_BOXES[0]);
          index += 1) {
         const duration_box_t *box = &DURATION_BOXES[index];
-        unsigned char *found = find_box(moov, moov_size, box->type);
-        if (found == NULL || (size_t)(found - moov) + box->duration_offset + 4 > moov_size) {
+        size_t found_size = 0;
+        unsigned char *found = find_box_path(moov, moov_size, box->path, box->depth,
+                                             &found_size);
+        uint64_t parsed_size = 0;
+        size_t found_hdr = 0;
+        if (found == NULL ||
+            parse_box_header(found, found_size, &parsed_size, &found_hdr) != 0 ||
+            found_hdr != 8 || parsed_size < (uint64_t)box->duration_offset + 4u) {
             snprintf(reason, reason_len, "%s box missing", box->type);
             result = -1;
             break;
         }
-        if (found[4] != 0) {
+        if (found[8] != 0) {
             snprintf(reason, reason_len, "%s is not version 0", box->type);
             result = -1;
             break;
+        }
+        unsigned char *field = found + box->duration_offset;
+        if (strcmp(box->type, "elst") == 0) {
+            const uint32_t entry_count = read_u32(found + 12);
+            if (entry_count == 0) {
+                snprintf(reason, reason_len, "elst has no entries");
+                result = -1;
+                break;
+            }
+            if ((uint64_t)entry_count > (parsed_size - 16u) / 12u) {
+                snprintf(reason, reason_len, "elst entries exceed box size");
+                result = -1;
+                break;
+            }
+            field = NULL;
+            for (uint32_t entry = 0; entry < entry_count; entry += 1) {
+                unsigned char *entry_ptr = found + 16 + (size_t)entry * 12u;
+                if (read_u32(entry_ptr + 4) != 0xffffffffu) {
+                    field = entry_ptr;
+                    break;
+                }
+            }
+            if (field == NULL) {
+                snprintf(reason, reason_len, "elst has no media entry");
+                result = -1;
+                break;
+            }
         }
         uint32_t timescale = movie_timescale;
         if (box->timescale_offset != 0) {
@@ -478,13 +661,25 @@ static int mp4_extend_durations(const char *path, int fps, char *reason, size_t 
             result = -1;
             break;
         }
-        const uint32_t frame_ticks = (timescale + (uint32_t)fps - 1) / (uint32_t)fps;
-        unsigned char *field = found + box->duration_offset;
-        write_u32(field, read_u32(field) + frame_ticks);
+        const uint64_t frame_ticks64 =
+            ((uint64_t)timescale + (uint64_t)(uint32_t)fps - 1ULL) / (uint64_t)(uint32_t)fps;
+        if (frame_ticks64 > UINT32_MAX) {
+            snprintf(reason, reason_len, "%s frame ticks overflow", box->type);
+            result = -1;
+            break;
+        }
+        const uint32_t frame_ticks = (uint32_t)frame_ticks64;
+        const uint32_t current_duration = read_u32(field);
+        if (current_duration > UINT32_MAX - frame_ticks) {
+            snprintf(reason, reason_len, "%s duration overflow", box->type);
+            result = -1;
+            break;
+        }
+        write_u32(field, current_duration + frame_ticks);
     }
 
-    if (result == 0) result = mp4_fix_color(moov, reason, reason_len);
-    if (result == 0 && pwrite(fd, moov, moov_size, moov_offset) != (ssize_t)moov_size) {
+    if (result == 0) result = mp4_fix_color(moov, moov_size, reason, reason_len);
+    if (result == 0 && pwrite_full(fd, moov, moov_size, moov_offset) != 0) {
         snprintf(reason, reason_len, "moov write failed: %s", strerror(errno));
         result = -1;
     }
@@ -517,10 +712,18 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     segment->eye = eye->eye;
     segment->index = index;
     segment->start_frame = start_frame;
-    snprintf(segment->relative, sizeof(segment->relative), "%s%s_%05d.mp4",
-             pipeline->config.path_prefix, EYE_NAMES[eye->eye], index);
-    snprintf(segment->absolute, sizeof(segment->absolute), "%s/%s_%05d.mp4",
-             pipeline->config.out_dir, EYE_NAMES[eye->eye], index);
+    int rel_len = snprintf(segment->relative, sizeof(segment->relative), "%s%s_%05d.mp4",
+                           pipeline->config.path_prefix, EYE_NAMES[eye->eye], index);
+    int abs_len = snprintf(segment->absolute, sizeof(segment->absolute), "%s/%s_%05d.mp4",
+                           pipeline->config.out_dir, EYE_NAMES[eye->eye], index);
+    if (rel_len < 0 || (size_t)rel_len >= sizeof(segment->relative) ||
+        abs_len < 0 || (size_t)abs_len >= sizeof(segment->absolute)) {
+        fail(pipeline, "segment_path_too_long: eye=%s index=%d",
+             EYE_NAMES[eye->eye], index);
+        free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1);
+        return -1;
+    }
 
     if (hb_mm_mx_get_default_context(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: default context for %s", segment->relative);
@@ -550,6 +753,8 @@ static int segment_open(ylx_pipeline_t *pipeline, eye_t *eye, int index,
     if (hb_mm_mx_add_stream(&segment->muxer, &params) < 0 ||
         hb_mm_mx_start(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: start %s", segment->relative);
+        hb_mm_mx_stop(&segment->muxer);
+        unlink(segment->absolute);
         free(segment);
         atomic_fetch_sub(&pipeline->pending_segments, 1);
         return -1;
@@ -563,6 +768,11 @@ static void ledger_record(ylx_pipeline_t *pipeline, int eye_index, int segment_i
                           unsigned long long start_frame, unsigned long long end_frame)
 {
     pthread_mutex_lock(&pipeline->ledger_lock);
+    if (segment_index < pipeline->reported_pairs) {
+        fail(pipeline, "segment_boundary_mismatch: segment=%d", segment_index);
+        pthread_mutex_unlock(&pipeline->ledger_lock);
+        return;
+    }
     closed_pair_t **position = &pipeline->closed_pairs;
     while (*position && (*position)->index < segment_index) position = &(*position)->next;
     closed_pair_t *pair = *position;
@@ -581,26 +791,43 @@ static void ledger_record(ylx_pipeline_t *pipeline, int eye_index, int segment_i
         pipeline->pending_pairs++;
     }
     if (pair->start != start_frame || pair->end != end_frame ||
-        (pair->eyes & (1 << eye_index)) || segment_index < pipeline->reported_pairs) {
+        (pair->eyes & (1 << eye_index))) {
         fail(pipeline, "segment_boundary_mismatch: segment=%d", segment_index);
         pthread_mutex_unlock(&pipeline->ledger_lock);
         return;
     }
+    int path_len = snprintf(pair->paths[eye_index], PATH_LEN, "%s", relative);
+    if (path_len < 0 || (size_t)path_len >= PATH_LEN) {
+        fail(pipeline, "segment_path_too_long: segment=%d", segment_index);
+        pthread_mutex_unlock(&pipeline->ledger_lock);
+        return;
+    }
     pair->eyes |= 1 << eye_index;
-    snprintf(pair->paths[eye_index], PATH_LEN, "%s", relative);
     pair->bytes[eye_index] = bytes;
+
+    closed_pair_t *ready_head = NULL;
+    closed_pair_t **ready_tail = &ready_head;
     while ((pair = pipeline->closed_pairs) && pair->eyes == 3 &&
            pair->index == pipeline->reported_pairs) {
-        if (pipeline->on_segment) {
-            pipeline->on_segment(pipeline->user, pair->index, pair->start, pair->end,
-                                 pair->paths[0], pair->bytes[0], pair->paths[1], pair->bytes[1]);
-        }
         pipeline->closed_pairs = pair->next;
         pipeline->pending_pairs--;
         pipeline->reported_pairs++;
-        free(pair);
+        pair->next = NULL;
+        *ready_tail = pair;
+        ready_tail = &pair->next;
     }
     pthread_mutex_unlock(&pipeline->ledger_lock);
+
+    while (ready_head != NULL) {
+        closed_pair_t *ready = ready_head;
+        ready_head = ready->next;
+        if (pipeline->on_segment) {
+            pipeline->on_segment(pipeline->user, ready->index, ready->start, ready->end,
+                                 ready->paths[0], ready->bytes[0],
+                                 ready->paths[1], ready->bytes[1]);
+        }
+        free(ready);
+    }
 }
 
 static void queue_segment(segment_t **head, segment_t **tail, segment_t *segment)
@@ -654,6 +881,14 @@ static void segment_seal(ylx_pipeline_t *pipeline, segment_t *segment)
         if (fd >= 0) close(fd);
         return;
     }
+    struct stat metadata;
+    memset(&metadata, 0, sizeof(metadata));
+    if (fstat(fd, &metadata) != 0 || metadata.st_size < 0) {
+        fail(pipeline, "segment_seal_failed: fstat %s: %s", segment->relative, strerror(errno));
+        close(fd);
+        return;
+    }
+    const unsigned long long bytes = (unsigned long long)metadata.st_size;
     close(fd);
     fd = open(pipeline->config.out_dir, O_RDONLY | O_DIRECTORY);
     if (fd < 0 || fsync(fd) != 0) {
@@ -662,14 +897,6 @@ static void segment_seal(ylx_pipeline_t *pipeline, segment_t *segment)
         return;
     }
     close(fd);
-    struct stat metadata;
-    unsigned long long bytes = 0;
-    if (stat(segment->absolute, &metadata) == 0) {
-        bytes = (unsigned long long)metadata.st_size;
-    } else {
-        fail(pipeline, "segment_seal_failed: stat %s", segment->relative);
-        return;
-    }
     ledger_record(pipeline, segment->eye, segment->index, segment->relative, bytes,
                   segment->start_frame, segment->end_frame);
 }
@@ -743,9 +970,11 @@ static void *committer_thread_main(void *argument)
 
 static unsigned long long monotonic_time_ns(void)
 {
-    struct timespec value;
-    clock_gettime(CLOCK_MONOTONIC, &value);
-    return (unsigned long long)value.tv_sec * 1000000000ULL + value.tv_nsec;
+    struct timespec value = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+        return 0;
+    }
+    return (unsigned long long)value.tv_sec * 1000000000ULL + (unsigned long long)value.tv_nsec;
 }
 
 static void observe_max(atomic_ullong *counter, unsigned long long elapsed)
@@ -831,20 +1060,31 @@ static void *encoder_output_thread(void *argument)
             continue;
         }
         idle_polls = 0;
-        int queued = 0;
-        if (buffer.vstream_buf.size > 0) {
-            int key_frame = (pipeline->config.hevc ? h265_has_idr : h264_has_idr)(
-                buffer.vstream_buf.vir_ptr, (size_t)buffer.vstream_buf.size);
-            queued = ylx_packet_queue_push(&eye->packets, buffer.vstream_buf.vir_ptr,
-                                           (size_t)buffer.vstream_buf.size, key_frame);
-        } else {
-            queued = -1;
+        if (buffer.vstream_buf.size == 0 || buffer.vstream_buf.vir_ptr == NULL) {
+            fail(pipeline, "encoder_output_invalid: eye=%s bytes=%u",
+                 EYE_NAMES[eye->eye], buffer.vstream_buf.size);
+            int qret = hb_mm_mc_queue_output_buffer(&eye->codec, &buffer,
+                                                    ENCODER_OUTPUT_TIMEOUT_MS);
+            if (qret != 0) {
+                fail(pipeline, "encoder_output_queue_failed: eye=%s ret=%d",
+                     EYE_NAMES[eye->eye], qret);
+            }
+            break;
         }
+        int key_frame = (pipeline->config.hevc ? h265_has_idr : h264_has_idr)(
+            buffer.vstream_buf.vir_ptr, (size_t)buffer.vstream_buf.size);
+        int queued = ylx_packet_queue_push(&eye->packets, buffer.vstream_buf.vir_ptr,
+                                           (size_t)buffer.vstream_buf.size, key_frame);
         // Release the VPU buffer before any filesystem operation can block.
-        hb_mm_mc_queue_output_buffer(&eye->codec, &buffer, ENCODER_OUTPUT_TIMEOUT_MS);
+        int qret = hb_mm_mc_queue_output_buffer(&eye->codec, &buffer, ENCODER_OUTPUT_TIMEOUT_MS);
         if (queued != 0) {
             fail(pipeline, "video_write_backpressure: eye=%s capacity_bytes=%u capacity_frames=%u",
                  EYE_NAMES[eye->eye], MUX_QUEUE_BYTES, pipeline->config.fps * MUX_QUEUE_SECONDS);
+            break;
+        }
+        if (qret != 0) {
+            fail(pipeline, "encoder_output_queue_failed: eye=%s ret=%d",
+                 EYE_NAMES[eye->eye], qret);
             break;
         }
         atomic_fetch_add(&pipeline->encoded[eye->eye], 1ULL);
@@ -856,23 +1096,51 @@ static void *encoder_output_thread(void *argument)
 static void split_eye(const media_codec_buffer_t *source, media_codec_buffer_t *target,
                       int eye_width, int height, int x_offset)
 {
+    if (target == NULL) {
+        return;
+    }
+    const uint32_t target_capacity = target->vframe_buf.size;
+    target->vframe_buf.size = 0;
+    if (source == NULL || eye_width <= 0 || height <= 0 || (height % 2) != 0 ||
+        (eye_width % 2) != 0 || x_offset < 0 || (x_offset % 2) != 0 ||
+        source->vframe_buf.pix_fmt != MC_PIXEL_FORMAT_NV12 ||
+        source->vframe_buf.vir_ptr[0] == NULL || source->vframe_buf.vir_ptr[1] == NULL ||
+        target->vframe_buf.vir_ptr[0] == NULL || target->vframe_buf.vir_ptr[1] == NULL) {
+        return;
+    }
     const int src_stride = source->vframe_buf.stride > 0 ? source->vframe_buf.stride
                                                          : source->vframe_buf.width;
     const int dst_stride =
         target->vframe_buf.stride > 0 ? target->vframe_buf.stride : eye_width;
+    if (src_stride <= 0 || dst_stride <= 0 ||
+        x_offset > src_stride - eye_width || dst_stride < eye_width) {
+        return;
+    }
+    const uint64_t total_rows = (uint64_t)height + (uint64_t)height / 2ULL;
+    if ((uint64_t)src_stride > UINT64_MAX / total_rows ||
+        (uint64_t)dst_stride > UINT64_MAX / total_rows) {
+        return;
+    }
+    const uint64_t src_bytes = (uint64_t)src_stride * total_rows;
+    const uint64_t dst_bytes = (uint64_t)dst_stride * total_rows;
+    if (src_bytes > (uint64_t)source->vframe_buf.size ||
+        dst_bytes > (uint64_t)target_capacity || dst_bytes > UINT32_MAX) {
+        return;
+    }
     const uint8_t *src_y = source->vframe_buf.vir_ptr[0] + x_offset;
     const uint8_t *src_uv = source->vframe_buf.vir_ptr[1] + x_offset;
     uint8_t *dst_y = target->vframe_buf.vir_ptr[0];
     uint8_t *dst_uv = target->vframe_buf.vir_ptr[1];
 
     for (int row = 0; row < height; row += 1) {
-        memcpy(dst_y + (size_t)row * dst_stride, src_y + (size_t)row * src_stride,
-               (size_t)eye_width);
+        memcpy(dst_y + (size_t)row * (size_t)dst_stride,
+               src_y + (size_t)row * (size_t)src_stride, (size_t)eye_width);
     }
     for (int row = 0; row < height / 2; row += 1) {
-        memcpy(dst_uv + (size_t)row * dst_stride, src_uv + (size_t)row * src_stride,
-               (size_t)eye_width);
+        memcpy(dst_uv + (size_t)row * (size_t)dst_stride,
+               src_uv + (size_t)row * (size_t)src_stride, (size_t)eye_width);
     }
+    target->vframe_buf.size = (uint32_t)dst_bytes;
 }
 
 static void *split_thread_main(void *argument)
@@ -935,8 +1203,16 @@ static void *split_thread_main(void *argument)
             input.vframe_buf.width = eye_width;
             input.vframe_buf.height = height;
             input.vframe_buf.pix_fmt = MC_PIXEL_FORMAT_NV12;
-            input.vframe_buf.size = (uint32_t)(eye_width * height * 3 / 2);
             split_eye(&frame, &input, eye_width, height, eye * eye_width);
+            if (input.vframe_buf.size == 0) {
+                atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
+                fail(pipeline, "encoder_split_failed: eye=%s pix_fmt=%d",
+                     EYE_NAMES[eye], frame.vframe_buf.pix_fmt);
+                input.vframe_buf.size = 0;
+                hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
+                                            ENCODER_INPUT_TIMEOUT_MS);
+                break;
+            }
             ret = hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
                                               ENCODER_INPUT_TIMEOUT_MS);
             if (ret != 0) {
@@ -963,7 +1239,8 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
 {
     if (out != NULL) *out = NULL;
     if (config == NULL || out == NULL || config->out_dir == NULL ||
-        config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->height <= 0 ||
+        config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->sbs_width > 16384 ||
+        config->height <= 0 || config->height % 2 != 0 || config->height > 16384 ||
         config->fps <= 0 || config->fps > 60 || config->segment_frames < 0 || config->intra_period < 0 ||
         config->intra_period > 300 || config->hevc < 0 || config->hevc > 1 ||
         config->rate_control < 0 || config->rate_control > 3 ||
@@ -974,25 +1251,34 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
         config->vbv_ms < 1 || config->vbv_ms > 3000 ||
         (config->segment_frames > 0 && config->segment_frames %
          (config->intra_period > 0 ? config->intra_period : config->fps) != 0)) {
-        snprintf(error, error_len, "invalid_configuration");
+        if (error != NULL && error_len > 0) snprintf(error, error_len, "invalid_configuration");
         return -1;
     }
 
     ylx_pipeline_t *pipeline = calloc(1, sizeof(*pipeline));
     if (pipeline == NULL) {
-        snprintf(error, error_len, "out_of_memory");
+        if (error != NULL && error_len > 0) snprintf(error, error_len, "out_of_memory");
         return -1;
     }
     pipeline->config = *config;
-    if (pipeline->config.path_prefix == NULL) {
-        pipeline->config.path_prefix = "";
+    pipeline->out_dir_owned = strdup(config->out_dir);
+    pipeline->path_prefix_owned = strdup(config->path_prefix != NULL ? config->path_prefix : "");
+    if (pipeline->out_dir_owned == NULL || pipeline->path_prefix_owned == NULL) {
+        if (error != NULL && error_len > 0) snprintf(error, error_len, "out_of_memory");
+        goto open_failed;
     }
+    pipeline->config.out_dir = pipeline->out_dir_owned;
+    pipeline->config.path_prefix = pipeline->path_prefix_owned;
     pipeline->eye_width = config->sbs_width / YLX_EYES;
     pipeline->segment_frames = config->segment_frames;
     pipeline->on_segment = on_segment;
     pipeline->user = user;
-    const char *resource = "ledger lock";
-    int ret = pthread_mutex_init(&pipeline->ledger_lock, NULL);
+    const char *resource = "finish lock";
+    int ret = pthread_mutex_init(&pipeline->finish_lock, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->finish_lock_initialized = 1;
+    resource = "ledger lock";
+    ret = pthread_mutex_init(&pipeline->ledger_lock, NULL);
     if (ret != 0) goto sync_failed;
     pipeline->ledger_initialized = 1;
     resource = "error lock";
@@ -1026,7 +1312,9 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     configure_decoder(&pipeline->decoder, &pipeline->config);
     ret = codec_start(&pipeline->decoder);
     if (ret != 0) {
-        snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
+        if (error != NULL && error_len > 0) {
+            snprintf(error, error_len, "jpu_unavailable: MJPEG decoder start failed (%d)", ret);
+        }
         goto open_failed;
     }
     pipeline->decoder_started = 1;
@@ -1036,8 +1324,10 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
                           pipeline->eye_width);
         if (ret == 0) ret = codec_start(&pipeline->eyes[eye].codec);
         if (ret != 0) {
-            snprintf(error, error_len, "vpu_unavailable: %s video encoder start failed (%d)",
-                     EYE_NAMES[eye], ret);
+            if (error != NULL && error_len > 0) {
+                snprintf(error, error_len, "vpu_unavailable: %s video encoder start failed (%d)",
+                         EYE_NAMES[eye], ret);
+            }
             goto open_failed;
         }
         pipeline->eyes[eye].codec_started = 1;
@@ -1072,10 +1362,14 @@ int ylx_pipeline_open(const ylx_pipeline_config_t *config,
     return 0;
 
 thread_failed:
-    snprintf(error, error_len, "thread_start_failed: %s (%d)", worker, ret);
+    if (error != NULL && error_len > 0) {
+        snprintf(error, error_len, "thread_start_failed: %s (%d)", worker, ret);
+    }
     goto open_failed;
 sync_failed:
-    snprintf(error, error_len, "sync_init_failed: %s (%d)", resource, ret);
+    if (error != NULL && error_len > 0) {
+        snprintf(error, error_len, "sync_init_failed: %s (%d)", resource, ret);
+    }
 open_failed:
     atomic_store(&pipeline->failed, 1);
     ylx_pipeline_close(pipeline);
@@ -1106,9 +1400,11 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
              ret, timeout, length);
         return -1;
     }
-    if ((size_t)input.vstream_buf.size < length) {
+    if ((size_t)input.vstream_buf.size < length || input.vstream_buf.vir_ptr == NULL) {
         fail(pipeline, "decoder_input_capacity: bytes=%zu capacity=%u",
              length, input.vstream_buf.size);
+        input.vstream_buf.size = 0;
+        input.vstream_buf.stream_end = 0;
         hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         return -1;
@@ -1129,32 +1425,41 @@ int ylx_pipeline_submit(ylx_pipeline_t *pipeline, const unsigned char *jpeg,
 
 int ylx_pipeline_finish(ylx_pipeline_t *pipeline)
 {
-    if (atomic_exchange(&pipeline->stopping, 1) != 0) {
+    if (pipeline == NULL) {
+        return -1;
+    }
+    atomic_store(&pipeline->stopping, 1);
+    if (!pipeline->finish_lock_initialized) {
         return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
     }
-    if (pipeline->split_started) pthread_join(pipeline->split_thread, NULL);
-    else atomic_store(&pipeline->split_done, 1);
-    for (int eye = 0; eye < YLX_EYES; eye += 1) {
-        if (pipeline->eyes[eye].output_started) pthread_join(pipeline->eyes[eye].thread, NULL);
-        /* Startup can fail after a writer starts but before its producer does. */
-        if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_close(&pipeline->eyes[eye].packets);
-        if (pipeline->eyes[eye].writer_started) pthread_join(pipeline->eyes[eye].writer_thread, NULL);
+    pthread_mutex_lock(&pipeline->finish_lock);
+    if (!pipeline->finished) {
+        if (pipeline->split_started) pthread_join(pipeline->split_thread, NULL);
+        else atomic_store(&pipeline->split_done, 1);
+        for (int eye = 0; eye < YLX_EYES; eye += 1) {
+            if (pipeline->eyes[eye].output_started) pthread_join(pipeline->eyes[eye].thread, NULL);
+            /* Startup can fail after a writer starts but before its producer does. */
+            if (pipeline->eyes[eye].packets_initialized) ylx_packet_queue_close(&pipeline->eyes[eye].packets);
+            if (pipeline->eyes[eye].writer_started) pthread_join(pipeline->eyes[eye].writer_thread, NULL);
+        }
+        /* Only once both eyes stopped queueing can the closer drain to empty. */
+        if (pipeline->closer_started) {
+            pthread_mutex_lock(&pipeline->closer_lock);
+            pipeline->closer_stop = 1;
+            pthread_cond_signal(&pipeline->closer_signal);
+            pthread_mutex_unlock(&pipeline->closer_lock);
+            pthread_join(pipeline->closer_thread, NULL);
+        }
+        if (pipeline->committer_started) {
+            pthread_mutex_lock(&pipeline->closer_lock);
+            pipeline->commit_stop = 1;
+            pthread_cond_signal(&pipeline->commit_signal);
+            pthread_mutex_unlock(&pipeline->closer_lock);
+            pthread_join(pipeline->committer_thread, NULL);
+        }
+        pipeline->finished = 1;
     }
-    /* Only once both eyes stopped queueing can the closer drain to empty. */
-    if (pipeline->closer_started) {
-        pthread_mutex_lock(&pipeline->closer_lock);
-        pipeline->closer_stop = 1;
-        pthread_cond_signal(&pipeline->closer_signal);
-        pthread_mutex_unlock(&pipeline->closer_lock);
-        pthread_join(pipeline->closer_thread, NULL);
-    }
-    if (pipeline->committer_started) {
-        pthread_mutex_lock(&pipeline->closer_lock);
-        pipeline->commit_stop = 1;
-        pthread_cond_signal(&pipeline->commit_signal);
-        pthread_mutex_unlock(&pipeline->closer_lock);
-        pthread_join(pipeline->committer_thread, NULL);
-    }
+    pthread_mutex_unlock(&pipeline->finish_lock);
     return atomic_load(&pipeline->failed) == 0 ? 0 : -1;
 }
 
@@ -1179,6 +1484,9 @@ void ylx_pipeline_close(ylx_pipeline_t *pipeline)
     if (pipeline->commit_signal_initialized) pthread_cond_destroy(&pipeline->commit_signal);
     if (pipeline->closer_lock_initialized) pthread_mutex_destroy(&pipeline->closer_lock);
     if (pipeline->closer_signal_initialized) pthread_cond_destroy(&pipeline->closer_signal);
+    if (pipeline->finish_lock_initialized) pthread_mutex_destroy(&pipeline->finish_lock);
+    free(pipeline->out_dir_owned);
+    free(pipeline->path_prefix_owned);
     free(pipeline);
 }
 

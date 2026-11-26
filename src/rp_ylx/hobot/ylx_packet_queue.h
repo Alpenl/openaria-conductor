@@ -41,15 +41,16 @@ static int ylx_packet_queue_init(ylx_packet_queue_t *queue, size_t bytes, size_t
 static int ylx_packet_queue_push(ylx_packet_queue_t *queue, const void *data,
                                  size_t size, int key_frame)
 {
-    pthread_mutex_lock(&queue->lock);
-    if (queue->closed || size == 0 || size > queue->max_bytes - queue->bytes ||
-        queue->frames >= queue->max_frames) {
+    if (size == 0 || data == NULL || size > queue->max_bytes ||
+        size > (size_t)-1 - sizeof(ylx_packet_t)) {
+        pthread_mutex_lock(&queue->lock);
         queue->rejected++;
         pthread_mutex_unlock(&queue->lock);
         return -1;
     }
     ylx_packet_t *packet = malloc(sizeof(*packet) + size);
     if (packet == NULL) {
+        pthread_mutex_lock(&queue->lock);
         queue->rejected++;
         pthread_mutex_unlock(&queue->lock);
         return -1;
@@ -58,6 +59,15 @@ static int ylx_packet_queue_push(ylx_packet_queue_t *queue, const void *data,
     packet->size = size;
     packet->key_frame = key_frame;
     memcpy(packet->data, data, size);
+
+    pthread_mutex_lock(&queue->lock);
+    if (queue->closed || size > queue->max_bytes - queue->bytes ||
+        queue->frames >= queue->max_frames) {
+        queue->rejected++;
+        pthread_mutex_unlock(&queue->lock);
+        free(packet);
+        return -1;
+    }
     if (queue->tail) queue->tail->next = packet;
     else queue->head = packet;
     queue->tail = packet;

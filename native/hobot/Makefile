@@ -11,7 +11,7 @@ TARGET := sbs_live_encode
 
 all: $(TARGET)
 
-$(TARGET): sbs_live_encode.c $(PIPELINE_DIR)/ylx_stereo_pipeline.c
+$(TARGET): sbs_live_encode.c $(PIPELINE_DIR)/ylx_stereo_pipeline.c $(PIPELINE_DIR)/ylx_stereo_pipeline.h $(PIPELINE_DIR)/ylx_cli_common.h
 	$(CC) $(CFLAGS) -o $@ sbs_live_encode.c $(PIPELINE_DIR)/ylx_stereo_pipeline.c \
 		$(LDFLAGS) $(LDLIBS)
 

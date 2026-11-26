@@ -1,0 +1,11 @@
+pub(crate) mod active_take;
+pub(crate) mod audio_checkpoint;
+pub(crate) mod capture_runtime;
+pub(crate) mod catalog_admission;
+pub(crate) mod catalog_signature;
+pub(crate) mod frame_stream;
+pub(crate) mod recording;
+pub(crate) mod schema_validation;
+pub(crate) mod session_io;
+pub(crate) mod session_store;
+pub(crate) mod stereo_encoder;

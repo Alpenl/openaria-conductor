@@ -173,6 +173,7 @@ impl LatestBuffer {
     }
 
     pub(crate) fn wake_streams(&self) {
+        let _guard = self.state.lock();
         self.changed.notify_all();
     }
 }

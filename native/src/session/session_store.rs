@@ -1,10 +1,12 @@
-use crate::active_take::{self, ActiveTakeSnapshot, ActiveTakeWriter};
 use crate::audio::{self, AudioRecordingResult, AudioRecordingSnapshot, Recorder};
-use crate::recording::{
+use crate::session::active_take::{self, ActiveTakeSnapshot, ActiveTakeWriter};
+use crate::session::recording::{
     self, RecordingSegmentPlanner, RecordingSink, RecordingSinkSnapshot, SegmentBoundary,
     SegmentPlannerSnapshot,
 };
-use crate::stereo_encoder::{self, EncoderProcess, SegmentEvent};
+use crate::session::stereo_encoder::{
+    EncoderConfig, EncoderProcess, EncoderProcessError, SegmentEvent,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,8 +53,8 @@ impl From<recording::RecordingError> for StoreError {
     }
 }
 
-impl From<stereo_encoder::EncoderProcessError> for StoreError {
-    fn from(error: stereo_encoder::EncoderProcessError) -> Self {
+impl From<EncoderProcessError> for StoreError {
+    fn from(error: EncoderProcessError) -> Self {
         Self::new(error.code, error.message)
     }
 }
@@ -87,7 +89,7 @@ pub(crate) struct TransactionSnapshot {
     pub(crate) audio_failure: Option<audio::AudioError>,
     pub(crate) submitted_frames: u64,
     pub(crate) encoder_stats: BTreeMap<String, i64>,
-    pub(crate) encoder_failure: Option<crate::stereo_encoder::EncoderProcessError>,
+    pub(crate) encoder_failure: Option<EncoderProcessError>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,16 +144,16 @@ impl SessionTransaction {
         let segment_planner = Arc::new(Mutex::new(RecordingSegmentPlanner::new(
             plan.segment_frames,
         )?));
-        let mut encoder = EncoderProcess::new(
-            &plan.session_root.join("video"),
-            plan.encoder_executable,
-            plan.width,
-            plan.height,
-            plan.fps,
-            plan.bitrate_kbps,
-            plan.segment_frames,
-            "video/",
-        )?;
+        let mut encoder = EncoderProcess::new(EncoderConfig {
+            out_dir: &plan.session_root.join("video"),
+            executable: plan.encoder_executable,
+            width: plan.width,
+            height: plan.height,
+            fps: plan.fps,
+            bitrate_kbps: plan.bitrate_kbps,
+            segment_frames: plan.segment_frames,
+            path_prefix: "video/",
+        })?;
         encoder.configure(plan.encoder_arguments)?;
         if let Err(error) = encoder.start() {
             if let Ok(mut sink) = sink.lock() {
@@ -399,6 +401,12 @@ impl SessionTransaction {
                     .state
                     .lock()
                     .map_err(|_| StoreError::poisoned("state"))?;
+                if state.lifecycle != Lifecycle::Finishing {
+                    return Err(StoreError::new(
+                        "invalid_state",
+                        "session transaction was aborted while finishing",
+                    ));
+                }
                 state.lifecycle = Lifecycle::Finished;
                 state.outcome = Some(outcome.clone());
                 Ok(outcome)
@@ -406,7 +414,9 @@ impl SessionTransaction {
             Err(error) => {
                 self.abort_resources();
                 if let Ok(mut state) = self.state.lock() {
-                    state.lifecycle = Lifecycle::Aborted;
+                    if state.lifecycle == Lifecycle::Finishing {
+                        state.lifecycle = Lifecycle::Aborted;
+                    }
                 }
                 Err(error)
             }

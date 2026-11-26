@@ -1,5 +1,3 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -48,6 +46,56 @@ struct PayloadStats {
     acquired: u64,
     peak_live: u64,
     peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageSnapshot {
+    pub(crate) name: String,
+    pub(crate) samples: u64,
+    pub(crate) p50_ns: u64,
+    pub(crate) p95_ns: u64,
+    pub(crate) total_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopySnapshot {
+    pub(crate) name: String,
+    pub(crate) count: u64,
+    pub(crate) bytes_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PayloadSnapshot {
+    pub(crate) name: String,
+    pub(crate) acquired: u64,
+    pub(crate) live: i64,
+    pub(crate) live_bytes: i64,
+    pub(crate) peak_live: u64,
+    pub(crate) peak_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueSnapshot {
+    pub(crate) capacity: u64,
+    pub(crate) peak_depth: u64,
+    pub(crate) rejected: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LossSnapshot {
+    pub(crate) source_gap: u64,
+    pub(crate) queue_rejected: u64,
+    pub(crate) write_failure: u64,
+    pub(crate) unknown_gap: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetricsSnapshot {
+    pub(crate) stages: Vec<StageSnapshot>,
+    pub(crate) copies: Vec<CopySnapshot>,
+    pub(crate) payloads: Vec<PayloadSnapshot>,
+    pub(crate) queue: QueueSnapshot,
+    pub(crate) loss: LossSnapshot,
 }
 
 struct QueueStats {
@@ -240,67 +288,58 @@ impl Metrics {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self, py: Python<'_>) -> Result<Py<PyDict>, MetricsError> {
+    pub(crate) fn snapshot(&self) -> Result<MetricsSnapshot, MetricsError> {
         let state = self.state.lock().map_err(|_| {
             MetricsError::new("metrics_poisoned", "performance metrics mutex is poisoned")
         })?;
-        let result = PyDict::new(py);
-
-        let stages = PyList::empty(py);
-        for (name, stats) in &state.stages {
-            let item = PyDict::new(py);
-            item.set_item("name", name)?;
-            item.set_item("samples", stats.samples)?;
-            item.set_item("p50_ns", percentile(&stats.histogram, stats.samples, 0.50))?;
-            item.set_item("p95_ns", percentile(&stats.histogram, stats.samples, 0.95))?;
-            item.set_item("total_ns", stats.total_ns)?;
-            stages.append(item)?;
-        }
-        result.set_item("stages", stages)?;
-
-        let copies = PyList::empty(py);
-        for (name, stats) in &state.copies {
-            let item = PyDict::new(py);
-            item.set_item("name", name)?;
-            item.set_item("count", stats.count)?;
-            item.set_item("bytes_total", stats.bytes_total)?;
-            copies.append(item)?;
-        }
-        result.set_item("copies", copies)?;
-
-        let payloads = PyList::empty(py);
-        for (name, stats) in &state.payloads {
-            let item = PyDict::new(py);
-            item.set_item("name", name)?;
-            item.set_item("acquired", stats.acquired)?;
-            item.set_item("live", stats.live)?;
-            item.set_item("live_bytes", stats.live_bytes)?;
-            item.set_item("peak_live", stats.peak_live)?;
-            item.set_item("peak_bytes", stats.peak_bytes)?;
-            payloads.append(item)?;
-        }
-        result.set_item("payloads", payloads)?;
-
-        let queue = PyDict::new(py);
-        queue.set_item("capacity", state.queue.capacity)?;
-        queue.set_item("peak_depth", state.queue.peak_depth)?;
-        queue.set_item("rejected", state.queue.rejected)?;
-        result.set_item("queue", queue)?;
-
-        let loss = PyDict::new(py);
-        loss.set_item("source_gap", state.source_gap)?;
-        loss.set_item("queue_rejected", state.queue_rejected)?;
-        loss.set_item("write_failure", state.write_failure)?;
-        loss.set_item("unknown_gap", state.unknown_gap)?;
-        result.set_item("loss", loss)?;
-
-        Ok(result.unbind())
-    }
-}
-
-impl From<PyErr> for MetricsError {
-    fn from(error: PyErr) -> Self {
-        Self::new("metrics_snapshot_failed", error.to_string())
+        let stages = state
+            .stages
+            .iter()
+            .map(|(name, stats)| StageSnapshot {
+                name: name.clone(),
+                samples: stats.samples,
+                p50_ns: percentile(&stats.histogram, stats.samples, 0.50),
+                p95_ns: percentile(&stats.histogram, stats.samples, 0.95),
+                total_ns: stats.total_ns,
+            })
+            .collect();
+        let copies = state
+            .copies
+            .iter()
+            .map(|(name, stats)| CopySnapshot {
+                name: name.clone(),
+                count: stats.count,
+                bytes_total: stats.bytes_total,
+            })
+            .collect();
+        let payloads = state
+            .payloads
+            .iter()
+            .map(|(name, stats)| PayloadSnapshot {
+                name: name.clone(),
+                acquired: stats.acquired,
+                live: stats.live,
+                live_bytes: stats.live_bytes,
+                peak_live: stats.peak_live,
+                peak_bytes: stats.peak_bytes,
+            })
+            .collect();
+        Ok(MetricsSnapshot {
+            stages,
+            copies,
+            payloads,
+            queue: QueueSnapshot {
+                capacity: state.queue.capacity,
+                peak_depth: state.queue.peak_depth,
+                rejected: state.queue.rejected,
+            },
+            loss: LossSnapshot {
+                source_gap: state.source_gap,
+                queue_rejected: state.queue_rejected,
+                write_failure: state.write_failure,
+                unknown_gap: state.unknown_gap,
+            },
+        })
     }
 }
 
@@ -313,7 +352,7 @@ fn stage_bucket(elapsed_ns: u64) -> usize {
 }
 
 fn percentile(histogram: &[u64; 64], samples: u64, percentile: f64) -> u64 {
-    let threshold = ((samples as f64) * percentile).ceil().max(1.0) as u64;
+    let threshold = ((samples as f64) * percentile + 0.999999).max(1.0) as u64;
     let mut seen = 0_u64;
     for (bucket, count) in histogram.iter().enumerate() {
         seen += count;

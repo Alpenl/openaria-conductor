@@ -1,9 +1,9 @@
-use crate::bounded::{self, Consumer, Producer};
-use crate::turbojpeg::{TransformHandle, TurboJpegError};
-use crate::v4l2::{Capture, CaptureError, FocusStatus};
+use crate::hardware::bounded::{self, Consumer, Producer};
+use crate::hardware::turbojpeg::{TransformHandle, TurboJpegError};
+use crate::hardware::v4l2::{Capture, CaptureError, FocusStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -178,6 +178,7 @@ enum ControlCommand {
 enum State {
     Open,
     Running,
+    Stopping,
     Stopped,
     Closed,
 }
@@ -185,11 +186,23 @@ enum State {
 struct Lifecycle {
     state: State,
     resources: Option<Resources>,
-    worker: Option<JoinHandle<Resources>>,
+    worker: Option<JoinHandle<Option<Resources>>>,
+}
+
+pub(crate) struct StreamConfig<'a> {
+    pub(crate) device: &'a str,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) fps: u32,
+    pub(crate) encoding: &'a str,
+    pub(crate) buffer_count: u32,
+    pub(crate) queue_capacity: usize,
+    pub(crate) split_eyes: bool,
 }
 
 pub(crate) struct Stream {
     lifecycle: Mutex<Lifecycle>,
+    lifecycle_changed: Condvar,
     stop: Arc<AtomicBool>,
     producer: Producer<Frame>,
     consumer: Consumer<Frame>,
@@ -202,29 +215,42 @@ impl Stream {
         self.consumer.queue_stats()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open(
-        device: &str,
-        width: u32,
-        height: u32,
-        fps: u32,
-        encoding: &str,
-        buffer_count: u32,
-        queue_capacity: usize,
-        split_eyes: bool,
-    ) -> Result<Self, StreamError> {
-        if queue_capacity == 0 {
+    pub(crate) fn open(config: StreamConfig<'_>) -> Result<Self, StreamError> {
+        if config.queue_capacity == 0 {
             return Err(StreamError::new(
                 "invalid_argument",
                 "native camera queue capacity must be positive",
             ));
         }
-        let capture = Capture::open(device, width, height, fps, encoding, buffer_count)?;
-        let splitter = if split_eyes {
+        let capture = Capture::open(
+            config.device,
+            config.width,
+            config.height,
+            config.fps,
+            config.encoding,
+            config.buffer_count,
+        )?;
+        let splitter = if config.split_eyes {
             Some(TransformHandle::open()?)
         } else {
             None
         };
+        Self::from_parts(
+            capture,
+            splitter,
+            config.width,
+            config.height,
+            config.queue_capacity,
+        )
+    }
+
+    fn from_parts(
+        capture: Capture,
+        splitter: Option<TransformHandle>,
+        width: u32,
+        height: u32,
+        queue_capacity: usize,
+    ) -> Result<Self, StreamError> {
         // Absorb short codec/storage stalls without allowing large MJPEG frames
         // to turn a frame-count bound into unbounded memory pressure.
         let (producer, consumer) =
@@ -248,6 +274,7 @@ impl Stream {
                 }),
                 worker: None,
             }),
+            lifecycle_changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
             producer,
             consumer,
@@ -272,19 +299,53 @@ impl Stream {
         if let Err(error) = resources.capture.start() {
             resources.close();
             lifecycle.state = State::Closed;
+            self.lifecycle_changed.notify_all();
             return Err(error.into());
         }
         self.stop.store(false, Ordering::Release);
         self.consumer.reopen();
-        *self.terminal_error.lock().unwrap() = None;
+        *self
+            .terminal_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let stop = Arc::clone(&self.stop);
         let producer = self.producer.clone();
         let terminal_error = Arc::clone(&self.terminal_error);
-        lifecycle.worker = Some(thread::spawn(move || {
-            run_producer(&mut resources, &producer, &stop, &terminal_error);
-            resources
-        }));
+        let slot = Arc::new(Mutex::new(Some(resources)));
+        let worker_slot = Arc::clone(&slot);
+        let worker = thread::Builder::new()
+            .name("native-camera".to_owned())
+            .spawn(move || {
+                let mut resources = match worker_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    Some(resources) => resources,
+                    None => {
+                        producer.close();
+                        return None;
+                    }
+                };
+                run_producer(&mut resources, &producer, &stop, &terminal_error);
+                drain_pending_controls(&resources.controls);
+                producer.close();
+                Some(resources)
+            })
+            .map_err(|error| {
+                if let Some(mut resources) = slot.lock().ok().and_then(|mut guard| guard.take()) {
+                    resources.close();
+                }
+                lifecycle.state = State::Closed;
+                self.lifecycle_changed.notify_all();
+                StreamError::new(
+                    "native_camera_start_failed",
+                    format!("spawn camera worker: {error}"),
+                )
+            })?;
+        lifecycle.worker = Some(worker);
         lifecycle.state = State::Running;
+        self.lifecycle_changed.notify_all();
         Ok(())
     }
 
@@ -305,7 +366,12 @@ impl Stream {
         match self.consumer.receive(timeout) {
             Ok(frame) => Ok(frame),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                if let Some(error) = self.terminal_error.lock().unwrap().clone() {
+                let terminal = self
+                    .terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(error) = terminal {
                     Err(error)
                 } else {
                     Err(StreamError::new(
@@ -332,7 +398,6 @@ impl Stream {
                 .focus_status()
                 .map_err(StreamError::from),
             State::Running => {
-                drop(lifecycle);
                 let (response, result) = mpsc::channel();
                 self.controls
                     .send(ControlCommand::FocusStatus(response))
@@ -342,6 +407,7 @@ impl Stream {
                             "native camera control channel is closed",
                         )
                     })?;
+                drop(lifecycle);
                 result
                     .recv_timeout(CONTROL_TIMEOUT)
                     .map_err(|_| {
@@ -352,7 +418,9 @@ impl Stream {
                     })?
                     .map_err(StreamError::from)
             }
-            State::Closed => Err(StreamError::new("invalid_state", "native camera is closed")),
+            State::Stopping | State::Closed => {
+                Err(StreamError::new("invalid_state", "native camera is closed"))
+            }
         }
     }
 
@@ -375,7 +443,6 @@ impl Stream {
                 .set_focus(value, auto_enabled)
                 .map_err(StreamError::from),
             State::Running => {
-                drop(lifecycle);
                 let (response, result) = mpsc::channel();
                 self.controls
                     .send(ControlCommand::SetFocus {
@@ -389,6 +456,7 @@ impl Stream {
                             "native camera control channel is closed",
                         )
                     })?;
+                drop(lifecycle);
                 result
                     .recv_timeout(CONTROL_TIMEOUT)
                     .map_err(|_| {
@@ -399,7 +467,9 @@ impl Stream {
                     })?
                     .map_err(StreamError::from)
             }
-            State::Closed => Err(StreamError::new("invalid_state", "native camera is closed")),
+            State::Stopping | State::Closed => {
+                Err(StreamError::new("invalid_state", "native camera is closed"))
+            }
         }
     }
 
@@ -408,40 +478,72 @@ impl Stream {
             let mut lifecycle = self.lifecycle.lock().map_err(|_| {
                 StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
             })?;
+            while lifecycle.state == State::Stopping {
+                lifecycle = self.lifecycle_changed.wait(lifecycle).map_err(|_| {
+                    StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
+                })?;
+            }
             match lifecycle.state {
                 State::Open => {
                     lifecycle.state = State::Stopped;
+                    self.lifecycle_changed.notify_all();
                     return Ok(());
                 }
                 State::Stopped | State::Closed => return Ok(()),
+                State::Stopping => unreachable!("waited until Stopping finished"),
                 State::Running => {
                     self.stop.store(true, Ordering::Release);
+                    lifecycle.state = State::Stopping;
                     lifecycle.worker.take()
                 }
             }
         };
-        let mut resources = worker
-            .ok_or_else(|| StreamError::new("invalid_state", "native camera worker is missing"))?
-            .join()
-            .map_err(|_| {
-                StreamError::new(
-                    "native_camera_worker_failed",
-                    "native camera worker panicked",
-                )
-            })?;
-        let stop_result = resources.capture.stop().map_err(StreamError::from);
-        let mut lifecycle = self.lifecycle.lock().map_err(|_| {
-            resources.close();
-            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
-        })?;
-        lifecycle.resources = Some(resources);
-        lifecycle.state = State::Stopped;
-        *self.terminal_error.lock().unwrap() = Some(StreamError::new(
-            "capture_stopped",
-            "native camera capture stopped",
-        ));
-        self.consumer.close_and_clear();
-        stop_result
+        let joined = worker
+            .ok_or_else(|| StreamError::new("invalid_state", "native camera worker is missing"))
+            .and_then(|handle| {
+                handle.join().map_err(|_| {
+                    StreamError::new(
+                        "native_camera_worker_failed",
+                        "native camera worker panicked",
+                    )
+                })
+            })
+            .and_then(|maybe_resources| {
+                maybe_resources.ok_or_else(|| {
+                    StreamError::new("invalid_state", "native camera resources are missing")
+                })
+            });
+        match joined {
+            Ok(mut resources) => {
+                drain_pending_controls(&resources.controls);
+                let stop_result = resources.capture.stop().map_err(StreamError::from);
+                let mut lifecycle = self.lifecycle.lock().map_err(|_| {
+                    resources.close();
+                    StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
+                })?;
+                drain_pending_controls(&resources.controls);
+                lifecycle.resources = Some(resources);
+                lifecycle.state = State::Stopped;
+                *self
+                    .terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StreamError::new(
+                    "capture_stopped",
+                    "native camera capture stopped",
+                ));
+                self.consumer.close_and_clear();
+                self.lifecycle_changed.notify_all();
+                stop_result
+            }
+            Err(error) => {
+                if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                    lifecycle.state = State::Closed;
+                }
+                self.consumer.close_and_clear();
+                self.lifecycle_changed.notify_all();
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn close(&self) -> Result<(), StreamError> {
@@ -457,6 +559,7 @@ impl Stream {
         }
         lifecycle.resources = None;
         lifecycle.state = State::Closed;
+        self.lifecycle_changed.notify_all();
         stop_result
     }
 
@@ -470,6 +573,7 @@ impl Stream {
                 resources: None,
                 worker: None,
             }),
+            lifecycle_changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
             producer,
             consumer,
@@ -503,7 +607,9 @@ fn run_producer(
             Ok(()) => {}
             Err(error) if error.code == "frame_timeout" => continue,
             Err(error) => {
-                *terminal_error.lock().unwrap() = Some(error.into());
+                *terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.into());
                 return;
             }
         }
@@ -553,7 +659,9 @@ fn run_producer(
             Ok(frame) => frame,
             Err(error) => {
                 resources.capture.close();
-                *terminal_error.lock().unwrap() = Some(error);
+                *terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
                 return;
             }
         };
@@ -578,6 +686,20 @@ fn process_control_commands(resources: &Resources) {
                 let _ = response.send(resources.capture.set_focus(value, auto_enabled));
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+fn drain_pending_controls(controls: &Receiver<ControlCommand>) {
+    while let Ok(command) = controls.try_recv() {
+        let error = CaptureError::new("invalid_state", "native camera is stopped");
+        match command {
+            ControlCommand::FocusStatus(response) => {
+                let _ = response.send(Err(error));
+            }
+            ControlCommand::SetFocus { response, .. } => {
+                let _ = response.send(Err(error));
+            }
         }
     }
 }
@@ -627,5 +749,54 @@ mod tests {
         assert_eq!(result.dropped_before, 1);
         assert_eq!(result.queue_rejected, 1);
         assert_eq!(result.source_gap, 0);
+    }
+
+    #[test]
+    fn stream_start_failure_closes_and_rolls_back_state() {
+        let capture = crate::hardware::v4l2::Capture::test_fake(true).unwrap();
+        let stream = super::Stream::from_parts(capture, None, 3840, 1080, 4).unwrap();
+        let err = stream.start().unwrap_err();
+        assert_eq!(err.code, "v4l2_ioctl_failed");
+        assert_eq!(stream.lifecycle.lock().unwrap().state, super::State::Closed);
+        assert!(stream.lifecycle.lock().unwrap().resources.is_none());
+    }
+
+    #[test]
+    fn stream_stop_drains_pending_controls_and_unblocks_callers_promptly() {
+        let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        drain_tx
+            .send(super::ControlCommand::FocusStatus(status_tx))
+            .unwrap();
+        super::drain_pending_controls(&drain_rx);
+        assert_eq!(
+            status_rx.try_recv().unwrap().unwrap_err().code,
+            "invalid_state"
+        );
+
+        let capture = crate::hardware::v4l2::Capture::test_fake(false).unwrap();
+        let stream =
+            std::sync::Arc::new(super::Stream::from_parts(capture, None, 3840, 1080, 4).unwrap());
+        stream.start().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        stream
+            .controls
+            .send(super::ControlCommand::FocusStatus(tx))
+            .unwrap();
+        let started = std::time::Instant::now();
+        stream.stop().unwrap();
+        let result = rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        if let Err(err) = result {
+            assert_eq!(err.code, "invalid_state");
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            stream.lifecycle.lock().unwrap().state,
+            super::State::Stopped
+        );
+        // Subsequent focus_status on Stopped returns directly from capture.
+        assert!(stream.focus_status().unwrap().is_some());
     }
 }

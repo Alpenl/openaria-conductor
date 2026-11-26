@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ylx_cli_common.h"
 #include "ylx_stereo_pipeline.h"
 
 #define FRAME_MAGIC 0x46584c59u /* "YLXF" little-endian */
@@ -88,55 +90,14 @@ static void emit(const char *format, ...)
     funlockfile(stream);
 }
 
-static void write_json_string(const char *value)
-{
-    FILE *stream = event_output();
-    const unsigned char *cursor = (const unsigned char *)(value == NULL ? "" : value);
-    fputc('"', stream);
-    while (*cursor != '\0') {
-        switch (*cursor) {
-        case '"':
-            fputs("\\\"", stream);
-            break;
-        case '\\':
-            fputs("\\\\", stream);
-            break;
-        case '\b':
-            fputs("\\b", stream);
-            break;
-        case '\f':
-            fputs("\\f", stream);
-            break;
-        case '\n':
-            fputs("\\n", stream);
-            break;
-        case '\r':
-            fputs("\\r", stream);
-            break;
-        case '\t':
-            fputs("\\t", stream);
-            break;
-        default:
-            if (*cursor < 0x20) {
-                fprintf(stream, "\\u%04x", *cursor);
-            } else {
-                fputc(*cursor, stream);
-            }
-            break;
-        }
-        cursor += 1;
-    }
-    fputc('"', stream);
-}
-
 static void emit_error_event(const char *code, const char *message)
 {
     FILE *stream = event_output();
     flockfile(stream);
     fputs("{\"event\":\"error\",\"code\":", stream);
-    write_json_string(code);
+    ylx_write_json_string(stream, code);
     fputs(",\"message\":", stream);
-    write_json_string(message);
+    ylx_write_json_string(stream, message);
     fputs("}\n", stream);
     fflush(stream);
     funlockfile(stream);
@@ -160,6 +121,10 @@ static void emit_stats(const char *event, const ylx_pipeline_stats_t *stats)
          stats->max_write_ns[0], stats->max_write_ns[1], stats->max_seal_ns);
 }
 
+typedef struct {
+    atomic_int stats_pending;
+} encoder_callback_ctx_t;
+
 static void on_segment(void *user, int index, unsigned long long start_frame,
                        unsigned long long end_frame, const char *left_path,
                        unsigned long long left_bytes, const char *right_path,
@@ -171,16 +136,14 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
             "{\"event\":\"segment\",\"index\":%d,\"start_frame\":%llu,\"end_frame\":%llu,"
             "\"left\":{\"path\":",
             index, start_frame, end_frame);
-    write_json_string(left_path);
+    ylx_write_json_string(stream, left_path);
     fprintf(stream, ",\"bytes\":%llu},\"right\":{\"path\":", left_bytes);
-    write_json_string(right_path);
+    ylx_write_json_string(stream, right_path);
     fprintf(stream, ",\"bytes\":%llu}}\n", right_bytes);
     fflush(stream);
     funlockfile(stream);
-    if (user != NULL && *(ylx_pipeline_t **)user != NULL) {
-        ylx_pipeline_stats_t stats;
-        ylx_pipeline_stats(*(ylx_pipeline_t **)user, &stats);
-        emit_stats("stats", &stats);
+    if (user != NULL) {
+        atomic_store(&((encoder_callback_ctx_t *)user)->stats_pending, 1);
     }
 }
 
@@ -212,18 +175,6 @@ static input_result_t read_exact(void *destination, size_t length)
     return INPUT_COMPLETE;
 }
 
-static int parse_integer(const char *value)
-{
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 1000000) {
-        fprintf(stderr, "invalid integer: %s\n", value);
-        exit(2);
-    }
-    return (int)parsed;
-}
-
 static void usage(const char *program)
 {
     fprintf(stderr,
@@ -253,46 +204,47 @@ int main(int argc, char **argv)
         .path_prefix = "video/",
     };
 
+    const struct {
+        const char *flag;
+        int *target;
+    } int_options[] = {
+        {"--width", &config.sbs_width},
+        {"--height", &config.height},
+        {"--fps", &config.fps},
+        {"--bitrate-kbps", &config.bitrate_kbps},
+        {"--segment-frames", &config.segment_frames},
+        {"--intra-period", &config.intra_period},
+        {"--min-qp", &config.min_qp},
+        {"--max-qp", &config.max_qp},
+        {"--intra-qp", &config.intra_qp},
+        {"--initial-qp", &config.initial_qp},
+        {"--vbv-ms", &config.vbv_ms},
+    };
+
     for (int index = 1; index < argc; index += 1) {
         const char *name = argv[index];
         const bool has_value = index + 1 < argc;
         if (strcmp(name, "--codec") == 0 && has_value) {
-            const char *codec = argv[++index];
-            if (strcmp(codec, "h264") != 0 && strcmp(codec, "hevc") != 0) return 2;
-            config.hevc = strcmp(codec, "hevc") == 0;
+            if (ylx_parse_codec(argv[++index], &config.hevc) != 0) return 2;
         } else if (strcmp(name, "--rc-mode") == 0 && has_value) {
-            const char *mode = argv[++index];
-            if (strcmp(mode, "cbr") == 0) config.rate_control = 0;
-            else if (strcmp(mode, "vbr") == 0) config.rate_control = 1;
-            else if (strcmp(mode, "fixqp") == 0) config.rate_control = 2;
-            else if (strcmp(mode, "avbr") == 0) config.rate_control = 3;
-            else return 2;
+            if (ylx_parse_rc_mode(argv[++index], &config.rate_control) != 0) return 2;
         } else if (strcmp(name, "--out-dir") == 0 && has_value) {
             config.out_dir = argv[++index];
         } else if (strcmp(name, "--path-prefix") == 0 && has_value) {
             config.path_prefix = argv[++index];
-        } else if (strcmp(name, "--width") == 0 && has_value) {
-            config.sbs_width = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--height") == 0 && has_value) {
-            config.height = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--fps") == 0 && has_value) {
-            config.fps = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--bitrate-kbps") == 0 && has_value) {
-            config.bitrate_kbps = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--segment-frames") == 0 && has_value) {
-            config.segment_frames = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--intra-period") == 0 && has_value) {
-            config.intra_period = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--min-qp") == 0 && has_value) {
-            config.min_qp = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--max-qp") == 0 && has_value) {
-            config.max_qp = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--intra-qp") == 0 && has_value) {
-            config.intra_qp = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--initial-qp") == 0 && has_value) {
-            config.initial_qp = parse_integer(argv[++index]);
-        } else if (strcmp(name, "--vbv-ms") == 0 && has_value) {
-            config.vbv_ms = parse_integer(argv[++index]);
+        } else if (has_value) {
+            bool matched = false;
+            for (size_t opt = 0; opt < sizeof(int_options) / sizeof(int_options[0]); opt += 1) {
+                if (strcmp(name, int_options[opt].flag) == 0) {
+                    *int_options[opt].target = ylx_parse_integer(argv[++index]);
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                usage(argv[0]);
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
@@ -309,8 +261,9 @@ int main(int argc, char **argv)
     }
 
     char error[256] = {0};
+    encoder_callback_ctx_t callback_ctx = {0};
     ylx_pipeline_t *pipeline = NULL;
-    if (ylx_pipeline_open(&config, on_segment, &pipeline, &pipeline, error, sizeof(error)) != 0) {
+    if (ylx_pipeline_open(&config, on_segment, &callback_ctx, &pipeline, error, sizeof(error)) != 0) {
         emit_error_event("pipeline_open_failed", error);
         return 3;
     }
@@ -358,6 +311,11 @@ int main(int argc, char **argv)
             /* Fail closed: a frame that cannot enter the codec ends the take. */
             failure_code = "frame_rejected";
             break;
+        }
+        if (atomic_exchange(&callback_ctx.stats_pending, 0) != 0) {
+            ylx_pipeline_stats_t snapshot;
+            ylx_pipeline_stats(pipeline, &snapshot);
+            emit_stats("stats", &snapshot);
         }
     }
 

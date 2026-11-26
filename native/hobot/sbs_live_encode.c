@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,6 +27,7 @@
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+#include "ylx_cli_common.h"
 #include "ylx_stereo_pipeline.h"
 
 #define CAPTURE_BUFFERS 8
@@ -42,7 +44,7 @@ typedef struct {
 } capture_t;
 
 static volatile sig_atomic_t g_stop = 0;
-static unsigned long long g_segments = 0;
+static atomic_ullong g_segments = 0;
 
 static void handle_signal(int signum)
 {
@@ -52,8 +54,10 @@ static void handle_signal(int signum)
 
 static double now_monotonic(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0.0;
+    }
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
@@ -89,6 +93,23 @@ static double read_cpu_temp_c(void)
     return milli < 0 ? -1.0 : (double)milli / 1000.0;
 }
 
+static void capture_release_resources(capture_t *capture)
+{
+    for (unsigned int index = 0; index < CAPTURE_BUFFERS; index += 1) {
+        if (capture->buffers[index].start != NULL &&
+            capture->buffers[index].start != MAP_FAILED) {
+            munmap(capture->buffers[index].start, capture->buffers[index].length);
+        }
+        capture->buffers[index].start = NULL;
+        capture->buffers[index].length = 0;
+    }
+    capture->buffer_count = 0;
+    if (capture->fd >= 0) {
+        close(capture->fd);
+        capture->fd = -1;
+    }
+}
+
 static int capture_open(capture_t *capture, const char *device, int width, int height,
                         int fps)
 {
@@ -110,7 +131,7 @@ static int capture_open(capture_t *capture, const char *device, int width, int h
         (int)format.fmt.pix.width != width || (int)format.fmt.pix.height != height ||
         format.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
         fprintf(stderr, "camera refused %dx%d MJPEG\n", width, height);
-        return -1;
+        goto fail;
     }
 
     struct v4l2_streamparm parm;
@@ -120,7 +141,7 @@ static int capture_open(capture_t *capture, const char *device, int width, int h
     parm.parm.capture.timeperframe.denominator = (unsigned int)fps;
     if (ioctl(capture->fd, VIDIOC_S_PARM, &parm) < 0) {
         fprintf(stderr, "VIDIOC_S_PARM: %s\n", strerror(errno));
-        return -1;
+        goto fail;
     }
 
     struct v4l2_requestbuffers request;
@@ -130,7 +151,12 @@ static int capture_open(capture_t *capture, const char *device, int width, int h
     request.memory = V4L2_MEMORY_MMAP;
     if (ioctl(capture->fd, VIDIOC_REQBUFS, &request) < 0) {
         fprintf(stderr, "VIDIOC_REQBUFS: %s\n", strerror(errno));
-        return -1;
+        goto fail;
+    }
+    if (request.count == 0 || request.count > CAPTURE_BUFFERS) {
+        fprintf(stderr, "VIDIOC_REQBUFS invalid buffer count: %u (max %u)\n",
+                request.count, (unsigned int)CAPTURE_BUFFERS);
+        goto fail;
     }
     capture->buffer_count = request.count;
 
@@ -142,24 +168,32 @@ static int capture_open(capture_t *capture, const char *device, int width, int h
         buffer.index = index;
         if (ioctl(capture->fd, VIDIOC_QUERYBUF, &buffer) < 0) {
             fprintf(stderr, "VIDIOC_QUERYBUF: %s\n", strerror(errno));
-            return -1;
+            goto fail;
+        }
+        void *mapped = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, capture->fd, buffer.m.offset);
+        if (mapped == MAP_FAILED) {
+            fprintf(stderr, "capture buffer mmap: %s\n", strerror(errno));
+            goto fail;
         }
         capture->buffers[index].length = buffer.length;
-        capture->buffers[index].start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE,
-                                             MAP_SHARED, capture->fd, buffer.m.offset);
-        if (capture->buffers[index].start == MAP_FAILED ||
-            ioctl(capture->fd, VIDIOC_QBUF, &buffer) < 0) {
+        capture->buffers[index].start = mapped;
+        if (ioctl(capture->fd, VIDIOC_QBUF, &buffer) < 0) {
             fprintf(stderr, "capture buffer setup: %s\n", strerror(errno));
-            return -1;
+            goto fail;
         }
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(capture->fd, VIDIOC_STREAMON, &type) < 0) {
         fprintf(stderr, "VIDIOC_STREAMON: %s\n", strerror(errno));
-        return -1;
+        goto fail;
     }
     return 0;
+
+fail:
+    capture_release_resources(capture);
+    return -1;
 }
 
 static void capture_close(capture_t *capture)
@@ -169,14 +203,7 @@ static void capture_close(capture_t *capture)
     }
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(capture->fd, VIDIOC_STREAMOFF, &type);
-    for (unsigned int index = 0; index < capture->buffer_count; index += 1) {
-        if (capture->buffers[index].start != NULL &&
-            capture->buffers[index].start != MAP_FAILED) {
-            munmap(capture->buffers[index].start, capture->buffers[index].length);
-        }
-    }
-    close(capture->fd);
-    capture->fd = -1;
+    capture_release_resources(capture);
 }
 
 static void on_segment(void *user, int index, unsigned long long start_frame,
@@ -185,9 +212,21 @@ static void on_segment(void *user, int index, unsigned long long start_frame,
                        unsigned long long right_bytes)
 {
     (void)user;
-    g_segments += 1;
+    atomic_fetch_add(&g_segments, 1ULL);
     fprintf(stderr, "segment %d frames [%llu,%llu) %s(%llu) %s(%llu)\n", index,
             start_frame, end_frame, left_path, left_bytes, right_path, right_bytes);
+}
+
+static double parse_positive_double(const char *value)
+{
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno != 0 || end == value || *end != '\0' || !(parsed > 0.0)) {
+        fprintf(stderr, "invalid duration: %s\n", value);
+        exit(2);
+    }
+    return parsed;
 }
 
 static void usage(const char *program)
@@ -195,100 +234,163 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s --out-dir DIR [--device /dev/video0] [--width 3840]\n"
             "          [--height 1080] [--sensor-fps 60] [--decimation 2]\n"
-            "          [--bitrate-kbps 8192] [--segment-frames 900] [--duration 600]\n",
+            "          [--bitrate-kbps 8192] [--segment-frames 900] [--duration 600]\n"
+            "          [--min-qp 20] [--intra-qp 22] [--initial-qp 24] [--max-qp 51]\n"
+            "          [--intra-period 0] [--vbv-ms 3000]\n"
+            "          [--codec h264|hevc] [--rc-mode cbr|vbr|fixqp|avbr]\n",
             program);
 }
 
-int main(int argc, char **argv)
+typedef struct {
+    const char *device;
+    const char *out_dir;
+    int sensor_fps;
+    int decimation;
+    double duration_s;
+    ylx_pipeline_config_t config;
+} gate_options_t;
+
+typedef struct {
+    double peak_temp;
+    long peak_rss;
+    long first_rss;
+    long last_rss;
+} resource_tracker_t;
+
+typedef struct {
+    unsigned long long captured;
+    unsigned long long capture_gaps;
+} run_metrics_t;
+
+static int parse_args(int argc, char **argv, gate_options_t *opts)
 {
-    const char *device = "/dev/video0";
-    const char *out_dir = NULL;
-    int width = 3840;
-    int height = 1080;
-    int sensor_fps = 60;
-    int decimation = 2;
-    int bitrate_kbps = 8192;
-    int segment_frames = 900;
-    double duration_s = 600.0;
+    *opts = (gate_options_t){
+        .device = "/dev/video0",
+        .out_dir = NULL,
+        .sensor_fps = 60,
+        .decimation = 2,
+        .duration_s = 600.0,
+        .config = {
+            .sbs_width = 3840,
+            .height = 1080,
+            .fps = 30,
+            .bitrate_kbps = 8192,
+            .hevc = 0,
+            .rate_control = 0,
+            .intra_period = 0,
+            .min_qp = 20,
+            .max_qp = 51,
+            .intra_qp = 22,
+            .initial_qp = 24,
+            .vbv_ms = 3000,
+            .segment_frames = 900,
+            .out_dir = NULL,
+            .path_prefix = "",
+        },
+    };
+
+    const struct {
+        const char *flag;
+        int *target;
+    } int_options[] = {
+        {"--width", &opts->config.sbs_width},
+        {"--height", &opts->config.height},
+        {"--sensor-fps", &opts->sensor_fps},
+        {"--decimation", &opts->decimation},
+        {"--bitrate-kbps", &opts->config.bitrate_kbps},
+        {"--segment-frames", &opts->config.segment_frames},
+        {"--intra-period", &opts->config.intra_period},
+        {"--min-qp", &opts->config.min_qp},
+        {"--max-qp", &opts->config.max_qp},
+        {"--intra-qp", &opts->config.intra_qp},
+        {"--initial-qp", &opts->config.initial_qp},
+        {"--vbv-ms", &opts->config.vbv_ms},
+    };
 
     for (int index = 1; index < argc; index += 1) {
         const char *name = argv[index];
         const bool has_value = index + 1 < argc;
         if (strcmp(name, "--device") == 0 && has_value) {
-            device = argv[++index];
+            opts->device = argv[++index];
         } else if (strcmp(name, "--out-dir") == 0 && has_value) {
-            out_dir = argv[++index];
-        } else if (strcmp(name, "--width") == 0 && has_value) {
-            width = atoi(argv[++index]);
-        } else if (strcmp(name, "--height") == 0 && has_value) {
-            height = atoi(argv[++index]);
-        } else if (strcmp(name, "--sensor-fps") == 0 && has_value) {
-            sensor_fps = atoi(argv[++index]);
-        } else if (strcmp(name, "--decimation") == 0 && has_value) {
-            decimation = atoi(argv[++index]);
-        } else if (strcmp(name, "--bitrate-kbps") == 0 && has_value) {
-            bitrate_kbps = atoi(argv[++index]);
-        } else if (strcmp(name, "--segment-frames") == 0 && has_value) {
-            segment_frames = atoi(argv[++index]);
+            opts->out_dir = argv[++index];
+        } else if (strcmp(name, "--codec") == 0 && has_value) {
+            if (ylx_parse_codec(argv[++index], &opts->config.hevc) != 0) {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(name, "--rc-mode") == 0 && has_value) {
+            if (ylx_parse_rc_mode(argv[++index], &opts->config.rate_control) != 0) {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (strcmp(name, "--duration") == 0 && has_value) {
-            duration_s = atof(argv[++index]);
+            opts->duration_s = parse_positive_double(argv[++index]);
+        } else if (has_value) {
+            bool matched = false;
+            for (size_t opt = 0; opt < sizeof(int_options) / sizeof(int_options[0]); opt += 1) {
+                if (strcmp(name, int_options[opt].flag) == 0) {
+                    *int_options[opt].target = ylx_parse_integer(argv[++index]);
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                usage(argv[0]);
+                return 2;
+            }
         } else {
             usage(argv[0]);
             return 2;
         }
     }
-    if (out_dir == NULL || decimation < 1 || sensor_fps < 1) {
+
+    if (opts->out_dir == NULL || opts->decimation < 1 || opts->sensor_fps < 1 ||
+        opts->sensor_fps / opts->decimation < 1) {
         usage(argv[0]);
         return 2;
     }
-    mkdir(out_dir, 0755);
+    opts->config.fps = opts->sensor_fps / opts->decimation;
+    opts->config.out_dir = opts->out_dir;
+    return 0;
+}
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
-
-    ylx_pipeline_config_t config = {
-        .sbs_width = width,
-        .height = height,
-        .fps = sensor_fps / decimation,
-        .bitrate_kbps = bitrate_kbps,
-        .intra_period = 0,
-        .min_qp = 20,
-        .max_qp = 51,
-        .intra_qp = 22,
-        .initial_qp = 24,
-        .vbv_ms = 3000,
-        .segment_frames = segment_frames,
-        .out_dir = out_dir,
-        .path_prefix = "",
-    };
-
-    char error[256] = {0};
-    ylx_pipeline_t *pipeline = NULL;
-    if (ylx_pipeline_open(&config, on_segment, NULL, &pipeline, error, sizeof(error)) != 0) {
-        fprintf(stderr, "pipeline open failed: %s\n", error);
-        return 3;
+static void update_resource_peaks(resource_tracker_t *tracker, bool update_last,
+                                  double *temp_out, long *rss_out)
+{
+    const double temp = read_cpu_temp_c();
+    const long rss = read_rss_kb();
+    if (temp > tracker->peak_temp) {
+        tracker->peak_temp = temp;
     }
-
-    capture_t capture;
-    if (capture_open(&capture, device, width, height, sensor_fps) != 0) {
-        ylx_pipeline_close(pipeline);
-        return 4;
+    if (rss > tracker->peak_rss) {
+        tracker->peak_rss = rss;
     }
+    if (tracker->first_rss < 0) {
+        tracker->first_rss = rss;
+    }
+    if (update_last || tracker->last_rss < 0) {
+        tracker->last_rss = rss;
+    }
+    if (temp_out != NULL) {
+        *temp_out = temp;
+    }
+    if (rss_out != NULL) {
+        *rss_out = rss;
+    }
+}
 
-    const double started = now_monotonic();
+static void run_capture_loop(capture_t *capture, ylx_pipeline_t *pipeline,
+                             const gate_options_t *opts, double started,
+                             run_metrics_t *metrics, resource_tracker_t *tracker)
+{
     double next_sample = started + 60.0;
-    double peak_temp = -1.0;
-    long peak_rss = -1;
-    long first_rss = -1;
-    long last_rss = -1;
-    unsigned long long captured = 0;
-    unsigned long long capture_gaps = 0;
     uint64_t previous_sequence = 0;
     bool have_sequence = false;
     uint64_t capture_index = 0;
 
-    while (g_stop == 0 && (now_monotonic() - started) < duration_s) {
-        struct pollfd pfd = {.fd = capture.fd, .events = POLLIN};
+    while (g_stop == 0 && (now_monotonic() - started) < opts->duration_s) {
+        struct pollfd pfd = {.fd = capture->fd, .events = POLLIN};
         int ready = poll(&pfd, 1, 1000);
         if (ready < 0) {
             if (errno == EINTR) {
@@ -305,7 +407,7 @@ int main(int argc, char **argv)
         memset(&buffer, 0, sizeof(buffer));
         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buffer.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(capture.fd, VIDIOC_DQBUF, &buffer) < 0) {
+        if (ioctl(capture->fd, VIDIOC_DQBUF, &buffer) < 0) {
             if (errno == EAGAIN) {
                 continue;
             }
@@ -313,45 +415,139 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (buffer.index >= capture->buffer_count) {
+            fprintf(stderr, "VIDIOC_DQBUF returned out-of-range index %u (count=%u)\n",
+                    buffer.index, capture->buffer_count);
+            break;
+        }
         if ((buffer.flags & V4L2_BUF_FLAG_ERROR) == 0 && buffer.bytesused > 0) {
-            captured += 1;
+            if (buffer.bytesused > capture->buffers[buffer.index].length) {
+                fprintf(stderr, "VIDIOC_DQBUF bytesused %u exceeds buffer length %zu\n",
+                        buffer.bytesused, capture->buffers[buffer.index].length);
+                ioctl(capture->fd, VIDIOC_QBUF, &buffer);
+                break;
+            }
+            metrics->captured += 1;
             if (have_sequence && buffer.sequence > previous_sequence + 1) {
-                capture_gaps += buffer.sequence - previous_sequence - 1;
+                metrics->capture_gaps += buffer.sequence - previous_sequence - 1;
             }
             previous_sequence = buffer.sequence;
             have_sequence = true;
-            if ((capture_index % (uint64_t)decimation) == 0) {
-                ylx_pipeline_submit(pipeline, capture.buffers[buffer.index].start,
+            if ((capture_index % (uint64_t)opts->decimation) == 0) {
+                ylx_pipeline_submit(pipeline, capture->buffers[buffer.index].start,
                                     buffer.bytesused, 0);
             }
             capture_index += 1;
         }
-        ioctl(capture.fd, VIDIOC_QBUF, &buffer);
+        if (ioctl(capture->fd, VIDIOC_QBUF, &buffer) < 0) {
+            fprintf(stderr, "VIDIOC_QBUF: %s\n", strerror(errno));
+            break;
+        }
 
         const double now = now_monotonic();
         if (now >= next_sample) {
-            const double temp = read_cpu_temp_c();
-            const long rss = read_rss_kb();
-            if (temp > peak_temp) {
-                peak_temp = temp;
-            }
-            if (rss > peak_rss) {
-                peak_rss = rss;
-            }
-            if (first_rss < 0) {
-                first_rss = rss;
-            }
-            last_rss = rss;
+            double temp = -1.0;
+            long rss = -1;
+            update_resource_peaks(tracker, true, &temp, &rss);
             ylx_pipeline_stats_t sample;
             ylx_pipeline_stats(pipeline, &sample);
+            const unsigned long long segments = atomic_load(&g_segments);
             fprintf(stderr,
                     "[%6.1fs] captured=%llu submitted=%llu decoded=%llu left=%llu "
                     "right=%llu segments=%llu temp=%.1fC rss=%ldkB\n",
-                    now - started, captured, sample.submitted, sample.decoded,
-                    sample.encoded[0], sample.encoded[1], g_segments, temp, rss);
+                    now - started, metrics->captured, sample.submitted, sample.decoded,
+                    sample.encoded[0], sample.encoded[1], segments, temp, rss);
             next_sample = now + 60.0;
         }
     }
+}
+
+static void write_summary_json(const char *out_dir, double elapsed,
+                               const run_metrics_t *metrics,
+                               const ylx_pipeline_stats_t *stats,
+                               unsigned long long total_segments,
+                               unsigned long long application_drop,
+                               double pair_fps, const resource_tracker_t *tracker,
+                               const char *pipeline_error)
+{
+    char summary_path[512];
+    int path_len = snprintf(summary_path, sizeof(summary_path), "%s/summary.json", out_dir);
+    if (path_len < 0 || (size_t)path_len >= sizeof(summary_path)) {
+        fprintf(stderr, "summary path too long: %s/summary.json\n", out_dir);
+        return;
+    }
+    FILE *summary = fopen(summary_path, "w");
+    if (summary == NULL) {
+        return;
+    }
+    fprintf(summary,
+            "{\n"
+            "  \"duration_seconds\": %.3f,\n"
+            "  \"captured_frames\": %llu,\n"
+            "  \"capture_sequence_gaps\": %llu,\n"
+            "  \"submitted_frames\": %llu,\n"
+            "  \"decoded_frames\": %llu,\n"
+            "  \"left_frames\": %llu,\n"
+            "  \"right_frames\": %llu,\n"
+            "  \"left_bytes\": %llu,\n"
+            "  \"right_bytes\": %llu,\n"
+            "  \"segments_closed\": %llu,\n"
+            "  \"drop_decoder_input\": %llu,\n"
+            "  \"drop_encoder_input\": %llu,\n"
+            "  \"drop_decoder_output\": %llu,\n"
+            "  \"application_drop\": %llu,\n"
+            "  \"effective_pair_fps\": %.3f,\n"
+            "  \"peak_cpu_temp_c\": %.1f,\n"
+            "  \"first_sample_rss_kb\": %ld,\n"
+            "  \"last_sample_rss_kb\": %ld,\n"
+            "  \"peak_rss_kb\": %ld,\n"
+            "  \"pipeline_error\": ",
+            elapsed, metrics->captured, metrics->capture_gaps, stats->submitted,
+            stats->decoded, stats->encoded[0], stats->encoded[1], stats->bytes[0],
+            stats->bytes[1], total_segments, stats->drop_decoder_input,
+            stats->drop_encoder_input, stats->drop_decoder_output, application_drop,
+            pair_fps, tracker->peak_temp, tracker->first_rss, tracker->last_rss,
+            tracker->peak_rss);
+    ylx_write_json_string(summary, pipeline_error);
+    fputs("\n}\n", summary);
+    fclose(summary);
+}
+
+int main(int argc, char **argv)
+{
+    gate_options_t opts;
+    int parse_status = parse_args(argc, argv, &opts);
+    if (parse_status != 0) {
+        return parse_status;
+    }
+    mkdir(opts.out_dir, 0755);
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    char error[256] = {0};
+    ylx_pipeline_t *pipeline = NULL;
+    if (ylx_pipeline_open(&opts.config, on_segment, NULL, &pipeline, error, sizeof(error)) != 0) {
+        fprintf(stderr, "pipeline open failed: %s\n", error);
+        return 3;
+    }
+
+    capture_t capture;
+    if (capture_open(&capture, opts.device, opts.config.sbs_width, opts.config.height,
+                     opts.sensor_fps) != 0) {
+        ylx_pipeline_close(pipeline);
+        return 4;
+    }
+
+    const double started = now_monotonic();
+    run_metrics_t metrics = {0};
+    resource_tracker_t tracker = {
+        .peak_temp = -1.0,
+        .peak_rss = -1,
+        .first_rss = -1,
+        .last_rss = -1,
+    };
+    run_capture_loop(&capture, pipeline, &opts, started, &metrics, &tracker);
 
     const double elapsed = now_monotonic() - started;
     capture_close(&capture);
@@ -359,21 +555,9 @@ int main(int argc, char **argv)
     ylx_pipeline_stats_t stats;
     ylx_pipeline_stats(pipeline, &stats);
     const char *pipeline_error = ylx_pipeline_error(pipeline);
+    const unsigned long long total_segments = atomic_load(&g_segments);
 
-    const double final_temp = read_cpu_temp_c();
-    const long final_rss = read_rss_kb();
-    if (final_temp > peak_temp) {
-        peak_temp = final_temp;
-    }
-    if (final_rss > peak_rss) {
-        peak_rss = final_rss;
-    }
-    if (first_rss < 0) {
-        first_rss = final_rss;
-    }
-    if (last_rss < 0) {
-        last_rss = final_rss;
-    }
+    update_resource_peaks(&tracker, false, NULL, NULL);
 
     const unsigned long long left = stats.encoded[0];
     const unsigned long long right = stats.encoded[1];
@@ -385,47 +569,16 @@ int main(int argc, char **argv)
         (stats.submitted > right ? stats.submitted - right : 0);
     const double pair_fps = elapsed > 0 ? (double)pairs / elapsed : 0.0;
 
-    char summary_path[512];
-    snprintf(summary_path, sizeof(summary_path), "%s/summary.json", out_dir);
-    FILE *summary = fopen(summary_path, "w");
-    if (summary != NULL) {
-        fprintf(summary,
-                "{\n"
-                "  \"duration_seconds\": %.3f,\n"
-                "  \"captured_frames\": %llu,\n"
-                "  \"capture_sequence_gaps\": %llu,\n"
-                "  \"submitted_frames\": %llu,\n"
-                "  \"decoded_frames\": %llu,\n"
-                "  \"left_frames\": %llu,\n"
-                "  \"right_frames\": %llu,\n"
-                "  \"left_bytes\": %llu,\n"
-                "  \"right_bytes\": %llu,\n"
-                "  \"segments_closed\": %llu,\n"
-                "  \"drop_decoder_input\": %llu,\n"
-                "  \"drop_encoder_input\": %llu,\n"
-                "  \"drop_decoder_output\": %llu,\n"
-                "  \"application_drop\": %llu,\n"
-                "  \"effective_pair_fps\": %.3f,\n"
-                "  \"peak_cpu_temp_c\": %.1f,\n"
-                "  \"first_sample_rss_kb\": %ld,\n"
-                "  \"last_sample_rss_kb\": %ld,\n"
-                "  \"peak_rss_kb\": %ld,\n"
-                "  \"pipeline_error\": \"%s\"\n"
-                "}\n",
-                elapsed, captured, capture_gaps, stats.submitted, stats.decoded, left,
-                right, stats.bytes[0], stats.bytes[1], g_segments,
-                stats.drop_decoder_input, stats.drop_encoder_input,
-                stats.drop_decoder_output, application_drop, pair_fps, peak_temp,
-                first_rss, last_rss, peak_rss, pipeline_error);
-        fclose(summary);
-    }
+    write_summary_json(opts.out_dir, elapsed, &metrics, &stats, total_segments,
+                       application_drop, pair_fps, &tracker, pipeline_error);
 
     fprintf(stderr,
             "done in %.1fs: captured=%llu submitted=%llu left=%llu right=%llu "
             "segments=%llu application_drop=%llu pair_fps=%.2f peak_temp=%.1fC "
             "rss %ld->%ld kB\n",
-            elapsed, captured, stats.submitted, left, right, g_segments,
-            application_drop, pair_fps, peak_temp, first_rss, last_rss);
+            elapsed, metrics.captured, stats.submitted, left, right, total_segments,
+            application_drop, pair_fps, tracker.peak_temp, tracker.first_rss,
+            tracker.last_rss);
 
     ylx_pipeline_close(pipeline);
     return (application_drop == 0 && finished == 0) ? 0 : 1;

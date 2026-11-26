@@ -1,46 +1,64 @@
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("V4L2 ioctl ABI layouts require 64-bit pointer width");
+
+use crate::sys::clock;
 use std::ffi::{CString, c_ulong, c_void};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const BUF_TYPE_CAPTURE: u32 = 1;
-const MEMORY_MMAP: u32 = 1;
-const CAP_VIDEO_CAPTURE: u32 = 0x0000_0001;
-const CAP_STREAMING: u32 = 0x0400_0000;
-const CAP_DEVICE_CAPS: u32 = 0x8000_0000;
-const BUF_FLAG_ERROR: u32 = 0x0000_0040;
-const BUF_FLAG_TIMESTAMP_MONOTONIC: u32 = 0x0000_2000;
-const IOC_READ: u32 = 2;
-const IOC_WRITE: u32 = 1;
-const FOURCC_MJPG: u32 = u32::from_le_bytes(*b"MJPG");
-const FOURCC_JPEG: u32 = u32::from_le_bytes(*b"JPEG");
+#[cfg(target_pointer_width = "64")]
+mod abi {
+    use std::ffi::c_ulong;
 
-const fn ioc(direction: u32, number: u32, size: u32) -> c_ulong {
-    ((direction << 30) | (size << 16) | ((b'V' as u32) << 8) | number) as c_ulong
+    pub(super) const BUF_TYPE_CAPTURE: u32 = 1;
+    pub(super) const MEMORY_MMAP: u32 = 1;
+    pub(super) const CAP_VIDEO_CAPTURE: u32 = 0x0000_0001;
+    pub(super) const CAP_STREAMING: u32 = 0x0400_0000;
+    pub(super) const CAP_DEVICE_CAPS: u32 = 0x8000_0000;
+    pub(super) const BUF_FLAG_ERROR: u32 = 0x0000_0040;
+    pub(super) const BUF_FLAG_TIMESTAMP_MONOTONIC: u32 = 0x0000_2000;
+    pub(super) const BUF_FLAG_TIMESTAMP_MASK: u32 = 0x0000_e000;
+    pub(super) const IOC_READ: u32 = 2;
+    pub(super) const IOC_WRITE: u32 = 1;
+    pub(super) const FOURCC_MJPG: u32 = u32::from_le_bytes(*b"MJPG");
+    pub(super) const FOURCC_JPEG: u32 = u32::from_le_bytes(*b"JPEG");
+
+    pub(super) const fn ioc(direction: u32, number: u32, size: u32) -> c_ulong {
+        ((direction << 30) | (size << 16) | ((b'V' as u32) << 8) | number) as c_ulong
+    }
+
+    pub(super) const QUERYCAP: c_ulong = ioc(IOC_READ, 0, 104);
+    pub(super) const SET_FORMAT: c_ulong = ioc(IOC_READ | IOC_WRITE, 5, 208);
+    pub(super) const GET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 21, 204);
+    pub(super) const SET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 22, 204);
+    pub(super) const REQUEST_BUFFERS: c_ulong = ioc(IOC_READ | IOC_WRITE, 8, 20);
+    pub(super) const QUERY_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 9, 88);
+    pub(super) const QUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 15, 88);
+    pub(super) const DEQUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 17, 88);
+    pub(super) const STREAM_ON: c_ulong = ioc(IOC_WRITE, 18, 4);
+    pub(super) const STREAM_OFF: c_ulong = ioc(IOC_WRITE, 19, 4);
+    pub(super) const GET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 27, 8);
+    pub(super) const SET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 28, 8);
+    pub(super) const QUERY_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 36, 68);
+    pub(super) const CTRL_TYPE_INTEGER: u32 = 1;
+    pub(super) const CTRL_TYPE_BOOLEAN: u32 = 2;
+    pub(super) const CTRL_FLAG_DISABLED: u32 = 0x0000_0001;
+    pub(super) const CTRL_CLASS_CAMERA: u32 = 0x009a_0000;
+    pub(super) const CID_CAMERA_CLASS_BASE: u32 = CTRL_CLASS_CAMERA | 0x900;
+    pub(super) const CID_EXPOSURE_AUTO: u32 = CID_CAMERA_CLASS_BASE + 1;
+    pub(super) const CID_EXPOSURE_ABSOLUTE: u32 = CID_CAMERA_CLASS_BASE + 2;
+    pub(super) const CID_FOCUS_ABSOLUTE: u32 = CID_CAMERA_CLASS_BASE + 10;
+    pub(super) const CID_FOCUS_AUTO: u32 = CID_CAMERA_CLASS_BASE + 12;
 }
 
-const QUERYCAP: c_ulong = ioc(IOC_READ, 0, 104);
-const SET_FORMAT: c_ulong = ioc(IOC_READ | IOC_WRITE, 5, 208);
-const GET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 21, 204);
-const SET_PARM: c_ulong = ioc(IOC_READ | IOC_WRITE, 22, 204);
-const REQUEST_BUFFERS: c_ulong = ioc(IOC_READ | IOC_WRITE, 8, 20);
-const QUERY_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 9, 88);
-const QUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 15, 88);
-const DEQUEUE_BUFFER: c_ulong = ioc(IOC_READ | IOC_WRITE, 17, 88);
-const STREAM_ON: c_ulong = ioc(IOC_WRITE, 18, 4);
-const STREAM_OFF: c_ulong = ioc(IOC_WRITE, 19, 4);
-const GET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 27, 8);
-const SET_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 28, 8);
-const QUERY_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 36, 68);
-const CTRL_TYPE_INTEGER: u32 = 1;
-const CTRL_TYPE_BOOLEAN: u32 = 2;
-const CTRL_FLAG_DISABLED: u32 = 0x0000_0001;
-const CTRL_CLASS_CAMERA: u32 = 0x009a_0000;
-const CID_CAMERA_CLASS_BASE: u32 = CTRL_CLASS_CAMERA | 0x900;
-const CID_FOCUS_ABSOLUTE: u32 = CID_CAMERA_CLASS_BASE + 10;
-const CID_FOCUS_AUTO: u32 = CID_CAMERA_CLASS_BASE + 12;
+use abi::*;
+
+pub(crate) fn is_monotonic_timestamp(flags: u32) -> bool {
+    (flags & BUF_FLAG_TIMESTAMP_MASK) == BUF_FLAG_TIMESTAMP_MONOTONIC
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureError {
@@ -57,6 +75,12 @@ pub(crate) struct FocusStatus {
     pub(crate) default_value: i32,
     pub(crate) auto_supported: bool,
     pub(crate) auto_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExposureConfig {
+    pub(crate) auto_exposure: i32,
+    pub(crate) exposure_time_absolute: Option<i32>,
 }
 
 impl CaptureError {
@@ -130,17 +154,21 @@ struct SystemIo;
 
 impl V4l2Io for SystemIo {
     fn open(&self, path: &CString) -> io::Result<RawFd> {
-        // SAFETY: CString guarantees a NUL-terminated path.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(fd)
+        loop {
+            // SAFETY: CString guarantees a NUL-terminated path.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                return Ok(fd);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
     }
 
@@ -181,27 +209,37 @@ impl V4l2Io for SystemIo {
         if pointer == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Box::new(MmapBuffer {
-            pointer: NonNull::new(pointer.cast()).expect("mmap success cannot be null"),
-            length,
-        }))
+        let Some(pointer) = NonNull::new(pointer.cast()) else {
+            return Err(io::Error::other("mmap returned null pointer"));
+        };
+        Ok(Box::new(MmapBuffer { pointer, length }))
     }
 
     fn wait_readable(&self, fd: RawFd, timeout: Duration) -> io::Result<bool> {
-        let timeout_ms = i32::try_from(timeout.as_millis())
-            .unwrap_or(i32::MAX)
-            .max(1);
+        let deadline = Instant::now() + timeout;
         let mut descriptor = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = if remaining.is_zero() {
+                0
+            } else {
+                i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .max(1)
+            };
+            descriptor.revents = 0;
             // SAFETY: descriptor points to one writable pollfd.
             let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
                     continue;
                 }
                 return Err(error);
@@ -217,15 +255,7 @@ impl V4l2Io for SystemIo {
     }
 
     fn monotonic_ns(&self) -> io::Result<u64> {
-        let mut timestamp = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: timestamp points to writable storage.
-        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(timestamp.tv_sec as u64 * 1_000_000_000 + timestamp.tv_nsec as u64)
+        clock::monotonic_ns()
     }
 }
 
@@ -236,14 +266,21 @@ struct ControlDevice {
 }
 
 impl ControlDevice {
-    fn open(device: &str) -> Result<Self, CaptureError> {
-        let io = Arc::new(SystemIo);
+    fn open(device: &str, open_error_code: &'static str) -> Result<Self, CaptureError> {
+        Self::open_with_io(Arc::new(SystemIo), device, open_error_code)
+    }
+
+    fn open_with_io(
+        io: Arc<dyn V4l2Io>,
+        device: &str,
+        open_error_code: &'static str,
+    ) -> Result<Self, CaptureError> {
         let path = CString::new(device).map_err(|_| {
             CaptureError::new("camera_focus_invalid_device", "device path contains NUL")
         })?;
         let fd = io
             .open(&path)
-            .map_err(|error| CaptureError::io("camera_focus_open_failed", "open", error))?;
+            .map_err(|error| CaptureError::io(open_error_code, "open", error))?;
         Ok(Self {
             io,
             fd: Some(fd),
@@ -310,32 +347,37 @@ impl ControlDevice {
         }))
     }
 
-    fn get_control(&self, id: u32) -> Result<i32, CaptureError> {
+    fn get_control(&self, id: u32, error_code: &'static str) -> Result<i32, CaptureError> {
         let mut payload = [0; 8];
         write_u32(&mut payload, 0, id);
         self.io
             .ioctl(self.fd()?, GET_CONTROL, &mut payload)
-            .map_err(|error| CaptureError::io("camera_focus_get_failed", "VIDIOC_G_CTRL", error))?;
+            .map_err(|error| CaptureError::io(error_code, "VIDIOC_G_CTRL", error))?;
         Ok(read_i32(&payload, 4))
     }
 
-    fn set_control(&self, id: u32, value: i32) -> Result<(), CaptureError> {
+    fn set_control(
+        &self,
+        id: u32,
+        value: i32,
+        error_code: &'static str,
+    ) -> Result<(), CaptureError> {
         let mut payload = [0; 8];
         write_u32(&mut payload, 0, id);
         write_i32(&mut payload, 4, value);
         self.io
             .ioctl(self.fd()?, SET_CONTROL, &mut payload)
-            .map_err(|error| CaptureError::io("camera_focus_set_failed", "VIDIOC_S_CTRL", error))
+            .map_err(|error| CaptureError::io(error_code, "VIDIOC_S_CTRL", error))
     }
 
     fn focus_status(&self) -> Result<Option<FocusStatus>, CaptureError> {
         let Some(focus) = self.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
             return Ok(None);
         };
-        let value = self.get_control(CID_FOCUS_ABSOLUTE)?;
+        let value = self.get_control(CID_FOCUS_ABSOLUTE, "camera_focus_get_failed")?;
         let auto = self.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
         let auto_enabled = if auto.is_some() {
-            Some(self.get_control(CID_FOCUS_AUTO)? != 0)
+            Some(self.get_control(CID_FOCUS_AUTO, "camera_focus_get_failed")? != 0)
         } else {
             None
         };
@@ -361,20 +403,10 @@ impl ControlDevice {
                 "V4L2 device does not expose focus_absolute",
             ));
         };
-        let auto = self.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
-        if let Some(enabled) = auto_enabled {
-            if auto.is_none() {
-                return Err(CaptureError::new(
-                    "camera_focus_auto_unsupported",
-                    "V4L2 device does not expose focus_auto",
-                ));
-            }
-            self.set_control(CID_FOCUS_AUTO, i32::from(enabled))?;
-        }
         if let Some(next) = value {
             if next < focus.minimum
                 || next > focus.maximum
-                || (next - focus.minimum) % focus.step != 0
+                || (i64::from(next) - i64::from(focus.minimum)) % i64::from(focus.step) != 0
             {
                 return Err(CaptureError::new(
                     "invalid_camera_focus",
@@ -384,14 +416,83 @@ impl ControlDevice {
                     ),
                 ));
             }
+        }
+        let auto = self.query_control(CID_FOCUS_AUTO, CTRL_TYPE_BOOLEAN)?;
+        if auto_enabled.is_some() && auto.is_none() {
+            return Err(CaptureError::new(
+                "camera_focus_auto_unsupported",
+                "V4L2 device does not expose focus_auto",
+            ));
+        }
+        if let Some(enabled) = auto_enabled {
+            self.set_control(
+                CID_FOCUS_AUTO,
+                i32::from(enabled),
+                "camera_focus_set_failed",
+            )?;
+        }
+        if let Some(next) = value {
             if auto.is_some() && auto_enabled != Some(false) {
-                self.set_control(CID_FOCUS_AUTO, 0)?;
+                self.set_control(CID_FOCUS_AUTO, 0, "camera_focus_set_failed")?;
             }
-            self.set_control(CID_FOCUS_ABSOLUTE, next)?;
+            self.set_control(CID_FOCUS_ABSOLUTE, next, "camera_focus_set_failed")?;
         }
         self.focus_status()?.ok_or_else(|| {
             CaptureError::new("camera_focus_unsupported", "focus control disappeared")
         })
+    }
+
+    fn configure_exposure(
+        &self,
+        absolute: Option<i32>,
+        auto: bool,
+    ) -> Result<ExposureConfig, CaptureError> {
+        let auto_value = if auto {
+            if absolute.is_some() {
+                return Err(CaptureError::new(
+                    "invalid_argument",
+                    "auto exposure cannot be combined with exposure_time_absolute",
+                ));
+            }
+            3
+        } else {
+            let Some(value) = absolute else {
+                return Err(CaptureError::new(
+                    "invalid_argument",
+                    "manual exposure requires exposure_time_absolute in 1..=100",
+                ));
+            };
+            if !(1..=100).contains(&value) {
+                return Err(CaptureError::new(
+                    "invalid_argument",
+                    "exposure_time_absolute must be in 1..=100",
+                ));
+            }
+            1
+        };
+        self.set_and_verify_control("auto_exposure", CID_EXPOSURE_AUTO, auto_value)?;
+        let exposure_time_absolute = if let Some(value) = absolute.filter(|_| !auto) {
+            self.set_and_verify_control("exposure_time_absolute", CID_EXPOSURE_ABSOLUTE, value)?;
+            Some(value)
+        } else {
+            None
+        };
+        Ok(ExposureConfig {
+            auto_exposure: auto_value,
+            exposure_time_absolute,
+        })
+    }
+
+    fn set_and_verify_control(&self, name: &str, id: u32, value: i32) -> Result<(), CaptureError> {
+        self.set_control(id, value, "exposure_set_failed")?;
+        let actual = self.get_control(id, "exposure_get_failed")?;
+        if actual != value {
+            return Err(CaptureError::new(
+                "exposure_readback_failed",
+                format!("{name} requested={value}, actual={actual}"),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -418,19 +519,38 @@ fn write_i32(payload: &mut [u8], offset: usize, value: i32) {
 }
 
 fn read_u32(payload: &[u8], offset: usize) -> u32 {
-    u32::from_ne_bytes(payload[offset..offset + 4].try_into().unwrap())
+    u32::from_ne_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ])
 }
 
 fn read_i32(payload: &[u8], offset: usize) -> i32 {
-    i32::from_ne_bytes(payload[offset..offset + 4].try_into().unwrap())
+    i32::from_ne_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ])
 }
 
 fn read_i64(payload: &[u8], offset: usize) -> i64 {
-    i64::from_ne_bytes(payload[offset..offset + 8].try_into().unwrap())
+    i64::from_ne_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+        payload[offset + 4],
+        payload[offset + 5],
+        payload[offset + 6],
+        payload[offset + 7],
+    ])
 }
 
 pub(crate) fn focus_status(device: &str) -> Result<Option<FocusStatus>, CaptureError> {
-    let control = ControlDevice::open(device)?;
+    let control = ControlDevice::open(device, "camera_focus_open_failed")?;
     control.focus_status()
 }
 
@@ -439,8 +559,17 @@ pub(crate) fn set_focus(
     value: Option<i32>,
     auto_enabled: Option<bool>,
 ) -> Result<FocusStatus, CaptureError> {
-    let control = ControlDevice::open(device)?;
+    let control = ControlDevice::open(device, "camera_focus_open_failed")?;
     control.set_focus(value, auto_enabled)
+}
+
+pub(crate) fn configure_exposure(
+    device: &str,
+    absolute: Option<i32>,
+    auto: bool,
+) -> Result<ExposureConfig, CaptureError> {
+    let control = ControlDevice::open(device, "open_failed")?;
+    control.configure_exposure(absolute, auto)
 }
 
 fn queue_payload(index: u32) -> [u8; 88] {
@@ -699,6 +828,9 @@ impl Capture {
     }
 
     fn start_inner(&mut self) -> Result<(), CaptureError> {
+        if let Some(last) = self.last_raw_sequence.take() {
+            self.sequence_epoch = self.sequence_epoch.saturating_add(u64::from(last) + 1);
+        }
         for index in 0..self.buffers.len() {
             let mut payload = queue_payload(index as u32);
             self.call(QUEUE_BUFFER, &mut payload, "VIDIOC_QBUF")?;
@@ -711,6 +843,12 @@ impl Capture {
 
     fn source_sequence(&mut self, raw: u32) -> Result<u64, CaptureError> {
         if let Some(previous) = self.last_raw_sequence {
+            if raw == previous {
+                return Err(CaptureError::new(
+                    "sequence_regression",
+                    "V4L2 source sequence repeated",
+                ));
+            }
             if raw < previous {
                 if previous - raw > 0x8000_0000 {
                     self.sequence_epoch += 1_u64 << 32;
@@ -727,12 +865,15 @@ impl Capture {
     }
 
     fn timestamp(&mut self, buffer: &[u8], flags: u32) -> Result<u64, CaptureError> {
-        let driver_monotonic = flags & BUF_FLAG_TIMESTAMP_MONOTONIC != 0;
+        let driver_monotonic = is_monotonic_timestamp(flags);
         let mut value = if driver_monotonic {
             let seconds = read_i64(buffer, 24);
             let micros = read_i64(buffer, 32);
-            if seconds >= 0 && micros >= 0 {
-                seconds as u64 * 1_000_000_000 + micros as u64 * 1_000
+            if seconds >= 0 && (0..1_000_000).contains(&micros) {
+                (seconds as u64)
+                    .checked_mul(1_000_000_000)
+                    .and_then(|sec_ns| sec_ns.checked_add((micros as u64) * 1_000))
+                    .unwrap_or(0)
             } else {
                 0
             }
@@ -753,7 +894,7 @@ impl Capture {
                         "V4L2 monotonic timestamp repeated or regressed",
                     ));
                 }
-                value = value.max(previous + 1);
+                value = value.max(previous.saturating_add(1));
             }
         }
         self.last_timestamp_ns = Some(value);
@@ -812,11 +953,6 @@ impl Capture {
         let index = read_u32(&dequeue, 0) as usize;
         let bytes_used = read_u32(&dequeue, 8) as usize;
         let flags = read_u32(&dequeue, 12);
-        self.last_buffer_flags = flags;
-        self.last_dequeue_monotonic_ns = self
-            .io
-            .monotonic_ns()
-            .map_err(|error| CaptureError::io("clock_failed", "clock_gettime", error))?;
         let raw_sequence = read_u32(&dequeue, 56);
         if index >= self.buffers.len() {
             let error = CaptureError::new("bad_frame", "invalid V4L2 buffer index");
@@ -824,6 +960,11 @@ impl Capture {
             return Err(error);
         }
         let result = (|| {
+            self.last_buffer_flags = flags;
+            self.last_dequeue_monotonic_ns = self
+                .io
+                .monotonic_ns()
+                .map_err(|error| CaptureError::io("clock_failed", "clock_gettime", error))?;
             if flags & BUF_FLAG_ERROR != 0 {
                 return Err(CaptureError::new(
                     "bad_frame",
@@ -894,6 +1035,14 @@ impl Capture {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_fake(fail_stream_on: bool) -> Result<Self, CaptureError> {
+        let io = Arc::new(tests::FakeIo::with_stream_on_error(
+            fail_stream_on.then_some(libc::EIO),
+        ));
+        Self::with_io(io, "/dev/video0", 3840, 1080, 60, "mjpg", 2)
+    }
+
     pub(crate) fn close(&mut self) {
         if self.streaming {
             let mut stream_type = BUF_TYPE_CAPTURE.to_ne_bytes();
@@ -931,32 +1080,55 @@ mod tests {
         }
     }
 
-    struct FakeIo {
+    pub(super) struct FakeIo {
         calls: Mutex<Vec<c_ulong>>,
         opened: Mutex<usize>,
         closed: Mutex<usize>,
         frames: Mutex<VecDeque<FakeFrame>>,
         focus: Mutex<i32>,
+        focus_min: i32,
+        focus_max: i32,
         auto_focus: Mutex<i32>,
+        auto_exposure: Mutex<i32>,
+        exposure_absolute: Mutex<i32>,
+        exposure_readback_override: Option<i32>,
         frame_interval: (u32, u32),
         set_parm_error: Option<i32>,
         get_parm_error: Option<i32>,
+        pub(super) stream_on_error: Option<i32>,
+        control_ioctl_error: Option<(c_ulong, i32)>,
+        fail_monotonic: bool,
     }
 
     type FakeFrame = (u32, u64, Vec<u8>, u32);
 
     impl FakeIo {
-        fn new(frames: Vec<FakeFrame>) -> Self {
+        pub(super) fn with_stream_on_error(stream_on_error: Option<i32>) -> Self {
+            Self {
+                stream_on_error,
+                ..Self::new(vec![])
+            }
+        }
+
+        pub(super) fn new(frames: Vec<FakeFrame>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 opened: Mutex::new(0),
                 closed: Mutex::new(0),
                 frames: Mutex::new(frames.into()),
                 focus: Mutex::new(32),
+                focus_min: 0,
+                focus_max: 255,
                 auto_focus: Mutex::new(1),
+                auto_exposure: Mutex::new(3),
+                exposure_absolute: Mutex::new(50),
+                exposure_readback_override: None,
                 frame_interval: (1, 60),
                 set_parm_error: None,
                 get_parm_error: None,
+                stream_on_error: None,
+                control_ioctl_error: None,
+                fail_monotonic: false,
             }
         }
     }
@@ -1009,14 +1181,19 @@ mod tests {
                         &((timestamp % 1_000_000_000) as i64 / 1_000).to_ne_bytes(),
                     );
                 }
-                QUEUE_BUFFER | STREAM_ON | STREAM_OFF => {}
+                QUEUE_BUFFER | STREAM_OFF => {}
+                STREAM_ON => {
+                    if let Some(errno) = self.stream_on_error {
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
+                }
                 QUERY_CONTROL => {
                     let id = read_u32(payload, 0);
                     match id {
                         CID_FOCUS_ABSOLUTE => {
                             write_u32(payload, 4, CTRL_TYPE_INTEGER);
-                            write_i32(payload, 40, 0);
-                            write_i32(payload, 44, 255);
+                            write_i32(payload, 40, self.focus_min);
+                            write_i32(payload, 44, self.focus_max);
                             write_i32(payload, 48, 1);
                             write_i32(payload, 52, 32);
                         }
@@ -1031,22 +1208,40 @@ mod tests {
                     }
                 }
                 GET_CONTROL => {
+                    if let Some((GET_CONTROL, errno)) = self.control_ioctl_error {
+                        return Err(io::Error::from_raw_os_error(errno));
+                    }
                     let value = match read_u32(payload, 0) {
                         CID_FOCUS_ABSOLUTE => *self.focus.lock().unwrap(),
                         CID_FOCUS_AUTO => *self.auto_focus.lock().unwrap(),
+                        CID_EXPOSURE_AUTO => *self.auto_exposure.lock().unwrap(),
+                        CID_EXPOSURE_ABSOLUTE => self
+                            .exposure_readback_override
+                            .unwrap_or(*self.exposure_absolute.lock().unwrap()),
                         _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
                     };
                     write_i32(payload, 4, value);
                 }
-                SET_CONTROL => match read_u32(payload, 0) {
-                    CID_FOCUS_ABSOLUTE => {
-                        *self.focus.lock().unwrap() = read_i32(payload, 4);
+                SET_CONTROL => {
+                    if let Some((SET_CONTROL, errno)) = self.control_ioctl_error {
+                        return Err(io::Error::from_raw_os_error(errno));
                     }
-                    CID_FOCUS_AUTO => {
-                        *self.auto_focus.lock().unwrap() = read_i32(payload, 4);
+                    match read_u32(payload, 0) {
+                        CID_FOCUS_ABSOLUTE => {
+                            *self.focus.lock().unwrap() = read_i32(payload, 4);
+                        }
+                        CID_FOCUS_AUTO => {
+                            *self.auto_focus.lock().unwrap() = read_i32(payload, 4);
+                        }
+                        CID_EXPOSURE_AUTO => {
+                            *self.auto_exposure.lock().unwrap() = read_i32(payload, 4);
+                        }
+                        CID_EXPOSURE_ABSOLUTE => {
+                            *self.exposure_absolute.lock().unwrap() = read_i32(payload, 4);
+                        }
+                        _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
                     }
-                    _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
-                },
+                }
                 _ => panic!("unexpected ioctl {request:#x}"),
             }
             Ok(())
@@ -1074,7 +1269,11 @@ mod tests {
         }
 
         fn monotonic_ns(&self) -> io::Result<u64> {
-            Ok(99)
+            if self.fail_monotonic {
+                Err(io::Error::other("clock_gettime failed"))
+            } else {
+                Ok(99)
+            }
         }
     }
 
@@ -1184,6 +1383,73 @@ mod tests {
     }
 
     #[test]
+    fn restart_advances_sequence_epoch_and_clears_last_raw_sequence() {
+        let io = Arc::new(FakeIo::new(vec![
+            (
+                5,
+                1_000_000_000,
+                b"first-run".to_vec(),
+                BUF_FLAG_TIMESTAMP_MONOTONIC,
+            ),
+            (
+                0,
+                2_000_000_000,
+                b"second-run".to_vec(),
+                BUF_FLAG_TIMESTAMP_MONOTONIC,
+            ),
+        ]));
+        let mut capture =
+            Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
+        capture.start().unwrap();
+        assert_eq!(
+            capture
+                .read(Duration::from_secs(1))
+                .unwrap()
+                .source_sequence,
+            5
+        );
+        capture.stop().unwrap();
+
+        capture.start().unwrap();
+        assert_eq!(
+            capture
+                .read(Duration::from_secs(1))
+                .unwrap()
+                .source_sequence,
+            6
+        );
+        capture.close();
+    }
+
+    #[test]
+    fn monotonic_clock_failure_requeues_buffer_before_closing() {
+        let io = Arc::new(FakeIo {
+            fail_monotonic: true,
+            ..FakeIo::new(vec![(
+                9,
+                1_000_000_000,
+                b"frame".to_vec(),
+                BUF_FLAG_TIMESTAMP_MONOTONIC,
+            )])
+        });
+        let mut capture =
+            Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
+        capture.start().unwrap();
+        assert_eq!(
+            capture.read(Duration::from_secs(1)).unwrap_err().code,
+            "clock_failed"
+        );
+        assert_eq!(*io.closed.lock().unwrap(), 1);
+        let calls = io.calls.lock().unwrap();
+        let dequeue = calls
+            .iter()
+            .position(|request| *request == DEQUEUE_BUFFER)
+            .unwrap();
+        assert_eq!(calls[dequeue + 1], QUEUE_BUFFER);
+        assert!(calls[dequeue + 2..].contains(&STREAM_OFF));
+    }
+
+    #[test]
     fn active_capture_focus_reuses_the_capture_file_descriptor() {
         let io = Arc::new(FakeIo::new(vec![]));
         let mut capture =
@@ -1201,6 +1467,67 @@ mod tests {
 
         capture.close();
         assert_eq!(*io.closed.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn set_focus_avoids_i32_overflow_with_extreme_bounds() {
+        let io = Arc::new(FakeIo {
+            focus_min: i32::MIN,
+            focus_max: i32::MAX,
+            ..FakeIo::new(vec![])
+        });
+        let control =
+            ControlDevice::open_with_io(io, "/dev/video0", "camera_focus_open_failed").unwrap();
+        let status = control.set_focus(Some(10), Some(false)).unwrap();
+        assert_eq!(status.value, 10);
+    }
+
+    #[test]
+    fn configure_exposure_verifies_auto_manual_and_readback() {
+        let io = Arc::new(FakeIo::new(vec![]));
+        let control =
+            ControlDevice::open_with_io(io.clone(), "/dev/video0", "open_failed").unwrap();
+        let auto_cfg = control.configure_exposure(None, true).unwrap();
+        assert_eq!(
+            auto_cfg,
+            ExposureConfig {
+                auto_exposure: 3,
+                exposure_time_absolute: None,
+            }
+        );
+        let manual_cfg = control.configure_exposure(Some(42), false).unwrap();
+        assert_eq!(
+            manual_cfg,
+            ExposureConfig {
+                auto_exposure: 1,
+                exposure_time_absolute: Some(42),
+            }
+        );
+        assert_eq!(
+            control.configure_exposure(Some(0), false).unwrap_err().code,
+            "invalid_argument"
+        );
+        assert_eq!(
+            control
+                .configure_exposure(Some(101), false)
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+
+        let mismatched = Arc::new(FakeIo {
+            exposure_readback_override: Some(99),
+            ..FakeIo::new(vec![])
+        });
+        let bad_control =
+            ControlDevice::open_with_io(mismatched, "/dev/video0", "open_failed").unwrap();
+        assert_eq!(
+            bad_control
+                .configure_exposure(Some(50), false)
+                .unwrap_err()
+                .code,
+            "exposure_readback_failed"
+        );
     }
 
     #[test]
@@ -1319,5 +1646,77 @@ mod tests {
             assert_eq!(calls[dequeues[1] + 1], QUEUE_BUFFER);
             assert!(calls[dequeues[1] + 2..].contains(&STREAM_OFF));
         }
+    }
+
+    #[test]
+    fn sequence_rejects_duplicate_and_timestamp_validates_mask_and_micros() {
+        let mut capture = Capture::with_io(
+            Arc::new(FakeIo::new(vec![])),
+            "/dev/video0",
+            3840,
+            1080,
+            60,
+            "mjpg",
+            2,
+        )
+        .unwrap();
+        capture.last_raw_sequence = Some(10);
+        assert_eq!(
+            capture.source_sequence(10).unwrap_err().code,
+            "sequence_regression"
+        );
+
+        assert!(is_monotonic_timestamp(0x2000));
+        assert!(!is_monotonic_timestamp(0x4000));
+        assert!(!is_monotonic_timestamp(0x6000));
+
+        let mut buffer = [0_u8; 88];
+        buffer[24..32].copy_from_slice(&5_i64.to_ne_bytes());
+        buffer[32..40].copy_from_slice(&1_000_000_i64.to_ne_bytes());
+        // Out-of-range micros falls back to monotonic_ns (99 in FakeIo).
+        assert_eq!(
+            capture
+                .timestamp(&buffer, BUF_FLAG_TIMESTAMP_MONOTONIC)
+                .unwrap(),
+            99
+        );
+        // Non-monotonic timestamp flag (0x6000) falls back and enforces saturating_add(1).
+        capture.last_timestamp_ns = Some(u64::MAX);
+        assert_eq!(capture.timestamp(&buffer, 0x6000).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn focus_validates_before_mutating_auto_and_exposure_uses_exposure_error_codes() {
+        let io = Arc::new(FakeIo::new(vec![]));
+        let control =
+            ControlDevice::open_with_io(io.clone(), "/dev/video0", "camera_focus_open_failed")
+                .unwrap();
+        assert_eq!(
+            control.set_focus(Some(999), Some(false)).unwrap_err().code,
+            "invalid_camera_focus"
+        );
+        assert_eq!(*io.auto_focus.lock().unwrap(), 1);
+
+        let set_err_io = Arc::new(FakeIo {
+            control_ioctl_error: Some((SET_CONTROL, libc::EIO)),
+            ..FakeIo::new(vec![])
+        });
+        let set_err_ctl =
+            ControlDevice::open_with_io(set_err_io, "/dev/video0", "open_failed").unwrap();
+        assert_eq!(
+            set_err_ctl.configure_exposure(None, true).unwrap_err().code,
+            "exposure_set_failed"
+        );
+
+        let get_err_io = Arc::new(FakeIo {
+            control_ioctl_error: Some((GET_CONTROL, libc::EIO)),
+            ..FakeIo::new(vec![])
+        });
+        let get_err_ctl =
+            ControlDevice::open_with_io(get_err_io, "/dev/video0", "open_failed").unwrap();
+        assert_eq!(
+            get_err_ctl.configure_exposure(None, true).unwrap_err().code,
+            "exposure_get_failed"
+        );
     }
 }

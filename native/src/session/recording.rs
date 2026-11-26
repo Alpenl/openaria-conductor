@@ -1,4 +1,5 @@
-use crate::imu;
+use crate::hardware::imu;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -55,6 +56,29 @@ pub(crate) struct RecordingSinkSnapshot {
     pub(crate) index_pending_bytes: u64,
     pub(crate) index_peak_bytes: u64,
     pub(crate) index_max_write_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FrameTimestampAudit {
+    pub(crate) camera_counter_raw: Option<u32>,
+    pub(crate) counter_bits: u8,
+    pub(crate) host_dequeue_monotonic_ns: u64,
+    pub(crate) schema: &'static str,
+    pub(crate) timestamp_clock: &'static str,
+    pub(crate) timestamp_source: &'static str,
+    pub(crate) v4l2_buffer_flags: u32,
+}
+
+#[derive(Serialize)]
+struct AuditedFrameIndexRecord<'a> {
+    frame: u64,
+    host_monotonic_ns: u64,
+    schema: &'static str,
+    segment_frame: u64,
+    segment_index: u64,
+    session_id: &'a str,
+    source_sequence: u64,
+    timestamp_audit: FrameTimestampAudit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,7 +544,6 @@ impl RecordingSink {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_audited_frame_index(
         &mut self,
         frame: u64,
@@ -528,26 +551,35 @@ impl RecordingSink {
         host_monotonic_ns: u64,
         segment_index: u64,
         segment_frame: u64,
-        audit: Option<serde_json::Value>,
+        audit: Option<FrameTimestampAudit>,
     ) -> Result<u64, RecordingError> {
         self.ensure_open()?;
-        let mut record = split_frame_index_record(
-            &self.session_id,
-            frame,
-            source_sequence,
-            host_monotonic_ns,
-            segment_index,
-            segment_frame,
-        );
-        if let Some(audit) = audit {
-            let mut row: serde_json::Value = serde_json::from_slice(&record)
-                .map_err(|error| RecordingError::new("write_failed", error.to_string()))?;
-            row["schema"] = serde_json::json!("ylx.frame-index.v2");
-            row["timestamp_audit"] = audit;
-            record = serde_json::to_vec(&row)
-                .map_err(|error| RecordingError::new("write_failed", error.to_string()))?;
-            record.push(b'\n');
-        }
+        let record = match audit {
+            Some(timestamp_audit) => {
+                let row = AuditedFrameIndexRecord {
+                    frame,
+                    host_monotonic_ns,
+                    schema: "ylx.frame-index.v2",
+                    segment_frame,
+                    segment_index,
+                    session_id: &self.session_id,
+                    source_sequence,
+                    timestamp_audit,
+                };
+                let mut encoded = serde_json::to_vec(&row)
+                    .map_err(|error| RecordingError::new("write_failed", error.to_string()))?;
+                encoded.push(b'\n');
+                encoded
+            }
+            None => split_frame_index_record(
+                &self.session_id,
+                frame,
+                source_sequence,
+                host_monotonic_ns,
+                segment_index,
+                segment_frame,
+            ),
+        };
         let written = self.frames.write(&record)?;
         self.bytes_written = self
             .bytes_written
@@ -560,40 +592,12 @@ impl RecordingSink {
         Ok(written)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_imu_sample(
+    pub(crate) fn write_imu_sample_record(
         &mut self,
-        sequence: u64,
-        packet_sequence: u64,
-        sample_index: u8,
-        device_timestamp_raw: u32,
-        device_ticks: u64,
-        host_read_start_ns: u64,
-        host_read_end_ns: u64,
-        host_monotonic_ns: u64,
-        accelerometer: (i16, i16, i16),
-        gyroscope: (i16, i16, i16),
-        sync_offset_ns: Option<i64>,
-        sync_residual_ns: Option<u64>,
-        sync_quality: &str,
+        input: &ImuSampleRecord<'_>,
     ) -> Result<u64, RecordingError> {
         self.ensure_open()?;
-        let record = imu_sample_record(
-            &self.session_id,
-            sequence,
-            packet_sequence,
-            sample_index,
-            device_timestamp_raw,
-            device_ticks,
-            host_read_start_ns,
-            host_read_end_ns,
-            host_monotonic_ns,
-            accelerometer,
-            gyroscope,
-            sync_offset_ns,
-            sync_residual_ns,
-            sync_quality,
-        );
+        let record = imu_sample_record(&self.session_id, input);
         let written = self.imu.write(&record)?;
         self.bytes_written = self
             .bytes_written
@@ -612,25 +616,25 @@ impl RecordingSink {
     ) -> Result<u64, RecordingError> {
         let mut bytes_written = 0_u64;
         for sample in &observation.samples {
-            let written = self.write_imu_sample(
-                sample.sequence,
-                sample.packet_sequence,
-                sample.sample_index,
-                sample.device_timestamp_raw,
-                sample.device_ticks,
-                sample.host_read_start_ns,
-                sample.host_read_end_ns,
-                sample.host_monotonic_ns,
-                (
+            let written = self.write_imu_sample_record(&ImuSampleRecord {
+                sequence: sample.sequence,
+                packet_sequence: sample.packet_sequence,
+                sample_index: sample.sample_index,
+                device_timestamp_raw: sample.device_timestamp_raw,
+                device_ticks: sample.device_ticks,
+                host_read_start_ns: sample.host_read_start_ns,
+                host_read_end_ns: sample.host_read_end_ns,
+                host_monotonic_ns: sample.host_monotonic_ns,
+                accelerometer: (
                     sample.accelerometer.x,
                     sample.accelerometer.y,
                     sample.accelerometer.z,
                 ),
-                (sample.gyroscope.x, sample.gyroscope.y, sample.gyroscope.z),
-                sample.sync_offset_ns,
-                sample.sync_residual_ns,
-                sample.sync_quality,
-            )?;
+                gyroscope: (sample.gyroscope.x, sample.gyroscope.y, sample.gyroscope.z),
+                sync_offset_ns: sample.sync_offset_ns,
+                sync_residual_ns: sample.sync_residual_ns,
+                sync_quality: sample.sync_quality,
+            })?;
             bytes_written = bytes_written.checked_add(written).ok_or_else(|| {
                 RecordingError::new("write_failed", "IMU observation byte count overflow")
             })?;
@@ -640,8 +644,12 @@ impl RecordingSink {
 
     pub(crate) fn flush_and_close(&mut self) -> Result<RecordingSinkSnapshot, RecordingError> {
         self.ensure_open()?;
-        let artifacts = vec![self.frames.flush_and_close()?, self.imu.flush_and_close()?];
+        let frames_result = self.frames.flush_and_close();
+        let imu_result = self.imu.flush_and_close();
         self.closed = true;
+        let frames = frames_result?;
+        let imu = imu_result?;
+        let artifacts = vec![frames, imu];
         Ok(RecordingSinkSnapshot {
             artifacts,
             bytes_written: self.bytes_written,
@@ -774,7 +782,10 @@ impl ArtifactWriter {
                             "write_failed",
                             format!("write {relative_path} failed: {error}"),
                         );
-                        *state.error.lock().unwrap() = Some(error.clone());
+                        *state
+                            .error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
                         return Err(error);
                     }
                     state.records.fetch_add(1, Ordering::Release);
@@ -796,7 +807,13 @@ impl ArtifactWriter {
     }
 
     fn check(&self) -> Result<(), RecordingError> {
-        match self.progress.error.lock().unwrap().as_ref() {
+        let guard = self.progress.error.lock().map_err(|_| {
+            RecordingError::new(
+                "native_recording_poisoned",
+                "index writer error mutex is poisoned",
+            )
+        })?;
+        match guard.as_ref() {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
@@ -810,17 +827,14 @@ impl ArtifactWriter {
             .sender
             .as_ref()
             .ok_or_else(|| RecordingError::new("invalid_state", "artifact writer is closed"))?;
-        let previous = self
-            .progress
-            .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                pending
-                    .checked_add(payload.len())
-                    .filter(|total| *total <= INDEX_PENDING_BYTES)
-            })
-            .map_err(|_| {
-                RecordingError::new("write_failed", "index writer byte backlog exhausted")
-            })?;
+        let previous = crate::sys::try_reserve_bounded(
+            &self.progress.pending,
+            payload.len(),
+            INDEX_PENDING_BYTES,
+        )
+        .ok_or_else(|| {
+            RecordingError::new("write_failed", "index writer byte backlog exhausted")
+        })?;
         self.progress
             .peak
             .fetch_max(previous + payload.len(), Ordering::Relaxed);
@@ -910,7 +924,11 @@ impl ArtifactWriter {
             // Drain before recovery can inspect/rename files. Never detach an
             // outstanding writer, even when another artifact already failed.
             if worker.join().is_err() {
-                *self.progress.error.lock().unwrap() =
+                *self
+                    .progress
+                    .error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(RecordingError::new("write_failed", "index writer panicked"));
             }
         }
@@ -958,25 +976,54 @@ pub(crate) fn avi1_counter(jpeg: &[u8]) -> Option<u32> {
         return None;
     }
     let mut offset = 2usize;
-    while offset + 4 <= jpeg.len() {
+    while offset < jpeg.len() {
         if jpeg[offset] != 0xff {
             return None;
         }
-        let marker = jpeg[offset + 1];
+        while offset < jpeg.len() && jpeg[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= jpeg.len() {
+            return None;
+        }
+        let marker = jpeg[offset];
+        offset += 1;
         if marker == 0xda || marker == 0xd9 {
             return None;
         }
-        let length = u16::from_be_bytes([jpeg[offset + 2], jpeg[offset + 3]]) as usize;
-        if length < 2 || offset + 2 + length > jpeg.len() {
+        if marker == 0x00 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if offset + 2 > jpeg.len() {
             return None;
         }
-        let data = &jpeg[offset + 4..offset + 2 + length];
+        let length = u16::from_be_bytes([jpeg[offset], jpeg[offset + 1]]) as usize;
+        if length < 2 || offset + length > jpeg.len() {
+            return None;
+        }
+        let data = &jpeg[offset + 2..offset + length];
         if marker == 0xe0 && data.len() == 31 && data.starts_with(b"AVI1\0\x01\x01\x01") {
             return Some(((data[10] as u32) << 16) | ((data[11] as u32) << 8) | data[12] as u32);
         }
-        offset += 2 + length;
+        offset += length;
     }
     None
+}
+
+pub(crate) struct ImuSampleRecord<'a> {
+    pub(crate) sequence: u64,
+    pub(crate) packet_sequence: u64,
+    pub(crate) sample_index: u8,
+    pub(crate) device_timestamp_raw: u32,
+    pub(crate) device_ticks: u64,
+    pub(crate) host_read_start_ns: u64,
+    pub(crate) host_read_end_ns: u64,
+    pub(crate) host_monotonic_ns: u64,
+    pub(crate) accelerometer: (i16, i16, i16),
+    pub(crate) gyroscope: (i16, i16, i16),
+    pub(crate) sync_offset_ns: Option<i64>,
+    pub(crate) sync_residual_ns: Option<u64>,
+    pub(crate) sync_quality: &'a str,
 }
 
 pub(crate) fn split_frame_index_record(
@@ -997,36 +1044,28 @@ pub(crate) fn split_frame_index_record(
     .into_bytes()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn imu_sample_record(
-    session_id: &str,
-    sequence: u64,
-    packet_sequence: u64,
-    sample_index: u8,
-    device_timestamp_raw: u32,
-    device_ticks: u64,
-    host_read_start_ns: u64,
-    host_read_end_ns: u64,
-    host_monotonic_ns: u64,
-    accelerometer: (i16, i16, i16),
-    gyroscope: (i16, i16, i16),
-    sync_offset_ns: Option<i64>,
-    sync_residual_ns: Option<u64>,
-    sync_quality: &str,
-) -> Vec<u8> {
+pub(crate) fn imu_sample_record(session_id: &str, input: &ImuSampleRecord<'_>) -> Vec<u8> {
     let session_id = json_string(session_id);
-    let sync_quality = json_string(sync_quality);
-    let sync_offset = optional_i64(sync_offset_ns);
-    let sync_residual = optional_u64(sync_residual_ns);
+    let sync_quality = json_string(input.sync_quality);
+    let sync_offset = optional_i64(input.sync_offset_ns);
+    let sync_residual = optional_u64(input.sync_residual_ns);
+    let (ax, ay, az) = input.accelerometer;
+    let (gx, gy, gz) = input.gyroscope;
     format!(
-        "{{\"device_ticks\":{device_ticks},\"device_timestamp_raw\":{device_timestamp_raw},\
-         \"format\":\"ylx.imu.v0\",\"host_monotonic_ns\":{host_monotonic_ns},\
-         \"host_read_end_ns\":{host_read_end_ns},\"host_read_start_ns\":{host_read_start_ns},\
-         \"packet_sequence\":{packet_sequence},\"raw\":{{\"accelerometer\":[{},{},{}],\
-         \"gyroscope\":[{},{},{}]}},\"sequence\":{sequence},\"session_id\":{session_id},\
-         \"sample_index\":{sample_index},\"sync\":{{\"offset_ns\":{sync_offset},\
-         \"quality\":{sync_quality},\"residual_ns\":{sync_residual}}}}}\n",
-        accelerometer.0, accelerometer.1, accelerometer.2, gyroscope.0, gyroscope.1, gyroscope.2,
+        "{{\"device_ticks\":{},\"device_timestamp_raw\":{},\"format\":\"ylx.imu.v0\",\
+         \"host_monotonic_ns\":{},\"host_read_end_ns\":{},\"host_read_start_ns\":{},\
+         \"packet_sequence\":{},\"raw\":{{\"accelerometer\":[{ax},{ay},{az}],\
+         \"gyroscope\":[{gx},{gy},{gz}]}},\"sequence\":{},\"session_id\":{session_id},\
+         \"sample_index\":{},\"sync\":{{\"offset_ns\":{sync_offset},\"quality\":{sync_quality},\
+         \"residual_ns\":{sync_residual}}}}}\n",
+        input.device_ticks,
+        input.device_timestamp_raw,
+        input.host_monotonic_ns,
+        input.host_read_end_ns,
+        input.host_read_start_ns,
+        input.packet_sequence,
+        input.sequence,
+        input.sample_index,
     )
     .into_bytes()
 }
@@ -1064,8 +1103,8 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureFanoutState, RecordingSegmentPlanner, RecordingSink, imu_sample_record,
-        jpeg_payload, split_frame_index_record,
+        CaptureFanoutState, FrameTimestampAudit, ImuSampleRecord, RecordingSegmentPlanner,
+        RecordingSink, avi1_counter, imu_sample_record, jpeg_payload, split_frame_index_record,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1119,22 +1158,52 @@ mod tests {
     }
 
     #[test]
+    fn encodes_audited_frame_index_directly_as_compact_sorted_json() {
+        let root = temp_root("audited-v2");
+        let mut sink = RecordingSink::create(&root, "session").unwrap();
+        sink.write_audited_frame_index(
+            7,
+            99,
+            1234,
+            2,
+            3,
+            Some(FrameTimestampAudit {
+                camera_counter_raw: Some(42),
+                counter_bits: 24,
+                host_dequeue_monotonic_ns: 1200,
+                schema: "openaria.frame-timestamp-audit.v1",
+                timestamp_clock: "v4l2_monotonic",
+                timestamp_source: "start_of_exposure",
+                v4l2_buffer_flags: 0x12000,
+            }),
+        )
+        .unwrap();
+        sink.flush_and_close().unwrap();
+        let written = fs::read_to_string(root.join("frames.ndjson")).unwrap();
+        let expected = "{\"frame\":7,\"host_monotonic_ns\":1234,\"schema\":\"ylx.frame-index.v2\",\"segment_frame\":3,\"segment_index\":2,\"session_id\":\"session\",\"source_sequence\":99,\"timestamp_audit\":{\"camera_counter_raw\":42,\"counter_bits\":24,\"host_dequeue_monotonic_ns\":1200,\"schema\":\"openaria.frame-timestamp-audit.v1\",\"timestamp_clock\":\"v4l2_monotonic\",\"timestamp_source\":\"start_of_exposure\",\"v4l2_buffer_flags\":73728}}\n";
+        assert_eq!(written, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn encodes_imu_sample_like_python_compact_sorted_json() {
         let record = imu_sample_record(
             "session",
-            1,
-            2,
-            1,
-            1000,
-            2000,
-            10,
-            20,
-            15,
-            (1, -2, 3),
-            (4, 5, -6),
-            None,
-            Some(100),
-            "good",
+            &ImuSampleRecord {
+                sequence: 1,
+                packet_sequence: 2,
+                sample_index: 1,
+                device_timestamp_raw: 1000,
+                device_ticks: 2000,
+                host_read_start_ns: 10,
+                host_read_end_ns: 20,
+                host_monotonic_ns: 15,
+                accelerometer: (1, -2, 3),
+                gyroscope: (4, 5, -6),
+                sync_offset_ns: None,
+                sync_residual_ns: Some(100),
+                sync_quality: "good",
+            },
         );
         assert_eq!(
             record,
@@ -1407,23 +1476,22 @@ mod tests {
         let root = temp_root("split");
         let mut sink = RecordingSink::create(&root, "session").unwrap();
         let frame_bytes = sink.write_split_frame_index(7, 99, 1234, 2, 3).unwrap();
-        let imu_bytes = sink
-            .write_imu_sample(
-                1,
-                2,
-                1,
-                1000,
-                2000,
-                10,
-                20,
-                15,
-                (1, -2, 3),
-                (4, 5, -6),
-                None,
-                Some(100),
-                "good",
-            )
-            .unwrap();
+        let sample = ImuSampleRecord {
+            sequence: 1,
+            packet_sequence: 2,
+            sample_index: 1,
+            device_timestamp_raw: 1000,
+            device_ticks: 2000,
+            host_read_start_ns: 10,
+            host_read_end_ns: 20,
+            host_monotonic_ns: 15,
+            accelerometer: (1, -2, 3),
+            gyroscope: (4, 5, -6),
+            sync_offset_ns: None,
+            sync_residual_ns: Some(100),
+            sync_quality: "good",
+        };
+        let imu_bytes = sink.write_imu_sample_record(&sample).unwrap();
         let snapshot = sink.flush_and_close().unwrap();
         assert_eq!(snapshot.frames_written, 1);
         assert_eq!(snapshot.imu_samples_written, 1);
@@ -1434,22 +1502,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(root.join("imu.ndjson")).unwrap(),
-            imu_sample_record(
-                "session",
-                1,
-                2,
-                1,
-                1000,
-                2000,
-                10,
-                20,
-                15,
-                (1, -2, 3),
-                (4, 5, -6),
-                None,
-                Some(100),
-                "good",
-            )
+            imu_sample_record("session", &sample)
         );
         let roles: Vec<_> = snapshot.artifacts.iter().map(|item| item.role).collect();
         assert_eq!(roles, vec!["frames.index", "imu.samples"]);
@@ -1469,21 +1522,21 @@ mod tests {
         assert!(snapshot.artifacts.is_empty());
 
         let imu_bytes = sink
-            .write_imu_sample(
-                1,
-                2,
-                1,
-                1000,
-                2000,
-                10,
-                20,
-                15,
-                (1, -2, 3),
-                (4, 5, -6),
-                None,
-                Some(100),
-                "good",
-            )
+            .write_imu_sample_record(&ImuSampleRecord {
+                sequence: 1,
+                packet_sequence: 2,
+                sample_index: 1,
+                device_timestamp_raw: 1000,
+                device_ticks: 2000,
+                host_read_start_ns: 10,
+                host_read_end_ns: 20,
+                host_monotonic_ns: 15,
+                accelerometer: (1, -2, 3),
+                gyroscope: (4, 5, -6),
+                sync_offset_ns: None,
+                sync_residual_ns: Some(100),
+                sync_quality: "good",
+            })
             .unwrap();
         let final_snapshot = sink.flush_and_close().unwrap();
         assert_eq!(final_snapshot.frames_written, 1);
@@ -1491,6 +1544,7 @@ mod tests {
         assert_eq!(final_snapshot.bytes_written, frame_bytes + imu_bytes);
         fs::remove_dir_all(root).unwrap();
     }
+
     #[test]
     fn blocked_imu_writer_does_not_block_frame_acceptance_or_claim_completion() {
         use std::io::Write;
@@ -1589,5 +1643,46 @@ mod tests {
             super::INDEX_PENDING_BYTES as u64
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flush_and_close_flushes_both_writers_even_on_first_error_and_marks_closed() {
+        let root = temp_root("flush-both");
+        let frames = super::ArtifactWriter::with_writer(
+            fs::File::create(root.join("frames.ndjson")).unwrap(),
+            "frames.index",
+            "frames.ndjson",
+            |_, _| Err(std::io::Error::other("frames failed")),
+        )
+        .unwrap();
+        let imu = super::ArtifactWriter::create(&root, "imu.samples", "imu.ndjson").unwrap();
+        let mut sink = RecordingSink {
+            session_id: "session".to_owned(),
+            frames,
+            imu,
+            bytes_written: 0,
+            frames_written: 0,
+            imu_samples_written: 0,
+            closed: false,
+        };
+        sink.frames.write(b"frame\n").unwrap();
+        sink.imu.write(b"imu\n").unwrap();
+        let err = sink.flush_and_close().unwrap_err();
+        assert!(err.message.contains("frames failed"));
+        assert!(sink.closed);
+        assert!(sink.imu.worker.is_none());
+        assert_eq!(fs::read(root.join("imu.ndjson")).unwrap(), b"imu\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn avi1_counter_skips_repeated_ff_fill_bytes() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xff, 0xe0];
+        jpeg.extend_from_slice(&33_u16.to_be_bytes());
+        jpeg.extend_from_slice(b"AVI1\0\x01\x01\x01\x00\x00");
+        jpeg.extend_from_slice(&[0x12, 0x34, 0x56]);
+        jpeg.resize(jpeg.len() + 18, 0);
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(avi1_counter(&jpeg), Some(0x12_3456));
     }
 }

@@ -8,6 +8,7 @@ struct State<T> {
     bytes: usize,
     closed: bool,
     peak: usize,
+    producers: usize,
 }
 
 struct Shared<T> {
@@ -18,12 +19,22 @@ struct Shared<T> {
     readable: Condvar,
 }
 
+impl<T> Shared<T> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, State<T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 pub(crate) struct Producer<T> {
     shared: Arc<Shared<T>>,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
+        let mut state = self.shared.lock_state();
+        state.producers += 1;
         Self {
             shared: Arc::clone(&self.shared),
         }
@@ -33,7 +44,7 @@ impl<T> Clone for Producer<T> {
 impl<T> Producer<T> {
     pub(crate) fn try_push(&self, value: T) -> Result<(), T> {
         let bytes = (self.shared.weight)(&value);
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock_state();
         if state.closed
             || state.queue.len() == self.shared.capacity
             || bytes > self.shared.byte_capacity.saturating_sub(state.bytes)
@@ -45,6 +56,23 @@ impl<T> Producer<T> {
         state.peak = state.peak.max(state.queue.len());
         self.shared.readable.notify_one();
         Ok(())
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.shared.lock_state();
+        state.closed = true;
+        self.shared.readable.notify_all();
+    }
+}
+
+impl<T> Drop for Producer<T> {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock_state();
+        state.producers = state.producers.saturating_sub(1);
+        if state.producers == 0 {
+            state.closed = true;
+            self.shared.readable.notify_all();
+        }
     }
 }
 
@@ -62,35 +90,38 @@ impl<T> Clone for Consumer<T> {
 
 impl<T> Consumer<T> {
     pub(crate) fn queue_stats(&self) -> (usize, usize, usize) {
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.lock_state();
         (state.queue.len(), self.shared.capacity, state.peak)
     }
 
     pub(crate) fn receive(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        let state = self.shared.state.lock().unwrap();
+        let state = self.shared.lock_state();
         let (mut state, result) = self
             .shared
             .readable
             .wait_timeout_while(state, timeout, |state| {
                 state.queue.is_empty() && !state.closed
             })
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.closed && state.queue.is_empty() {
             return Err(RecvTimeoutError::Disconnected);
         }
         if result.timed_out() && state.queue.is_empty() {
             return Err(RecvTimeoutError::Timeout);
         }
-        let (value, bytes) = state
-            .queue
-            .pop_front()
-            .expect("readable bounded queue must contain one value");
-        state.bytes -= bytes;
+        let Some((value, bytes)) = state.queue.pop_front() else {
+            return Err(if state.closed {
+                RecvTimeoutError::Disconnected
+            } else {
+                RecvTimeoutError::Timeout
+            });
+        };
+        state.bytes = state.bytes.saturating_sub(bytes);
         Ok(value)
     }
 
     pub(crate) fn close_and_clear(&self) {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock_state();
         state.closed = true;
         state.queue.clear();
         state.bytes = 0;
@@ -98,7 +129,7 @@ impl<T> Consumer<T> {
     }
 
     pub(crate) fn reopen(&self) {
-        let mut state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.lock_state();
         debug_assert!(state.queue.is_empty());
         state.closed = false;
         state.peak = 0;
@@ -125,6 +156,7 @@ pub(crate) fn weighted_channel<T>(
             bytes: 0,
             closed: false,
             peak: 0,
+            producers: 1,
         }),
         readable: Condvar::new(),
     });
@@ -202,6 +234,21 @@ mod tests {
     }
 
     #[test]
+    fn producer_drop_wakes_waiting_receiver_immediately() {
+        let (producer, consumer) = channel::<u8>(1);
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = consumer.receive(Duration::from_secs(5));
+            (result, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(producer);
+        let (result, elapsed) = handle.join().unwrap();
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
     fn close_releases_owned_values_and_allows_reopening() {
         let (producer, consumer) = channel(2);
         let frame = Arc::new(String::from("owned-frame"));
@@ -220,5 +267,19 @@ mod tests {
         consumer.reopen();
         producer.try_push(Arc::clone(&frame)).unwrap();
         assert_eq!(consumer.receive(Duration::from_millis(1)), Ok(frame));
+    }
+
+    #[test]
+    fn cloned_producer_drop_does_not_close_until_last_producer_drops() {
+        let (producer, consumer) = channel::<u8>(2);
+        let cloned = producer.clone();
+        drop(cloned);
+        assert_eq!(producer.try_push(42), Ok(()));
+        assert_eq!(consumer.receive(Duration::from_millis(10)), Ok(42));
+        drop(producer);
+        assert_eq!(
+            consumer.receive(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Disconnected)
+        );
     }
 }

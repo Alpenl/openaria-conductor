@@ -1,14 +1,18 @@
+use crate::sys::fs::{
+    dup_cloexec, fstat, is_exfat_or_msdos, openat_retry, pread_retry as sys_pread_retry,
+    read_retry, renameat2_noreplace,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const READ_CHUNK: usize = 1024 * 1024;
 const SENDFILE_CHUNK: u64 = 8 * 1024 * 1024;
@@ -54,21 +58,6 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, SessionIoError> {
-        let modified_ns = metadata
-            .mtime()
-            .checked_mul(1_000_000_000)
-            .and_then(|value| value.checked_add(metadata.mtime_nsec()))
-            .ok_or_else(|| SessionIoError::new("artifact_invalid", "文件修改时间超出可表示范围"))?;
-        Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified_ns,
-            nlink: metadata.nlink(),
-        })
-    }
-
     fn from_fd(fd: libc::c_int) -> Result<Self, SessionIoError> {
         let raw = fstat_raw(fd)?;
         identity_from_stat(&raw)
@@ -111,34 +100,32 @@ pub struct DeviceSessionSealResult {
 }
 
 pub fn hash_file(path: &Path) -> Result<FileDigest, SessionIoError> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|error| SessionIoError::os("artifact_invalid", "无法打开 artifact", error))?;
-    let metadata = file.metadata().map_err(|error| {
-        SessionIoError::os("artifact_invalid", "无法读取 artifact 元数据", error)
-    })?;
-    if !metadata.file_type().is_file() {
+    let raw = fstat_raw(file.as_raw_fd())?;
+    let before = identity_from_stat(&raw)?;
+    before.require_regular(raw.st_mode)?;
+    if before.nlink != 1 {
         return Err(SessionIoError::new(
             "artifact_invalid",
-            "artifact 不是普通文件",
+            "artifact 不是独占普通文件",
         ));
     }
-    let before = FileIdentity::from_metadata(&metadata)?;
-    let mut reader = std::io::BufReader::with_capacity(READ_CHUNK, file);
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; READ_CHUNK];
+    let chunk_len = usize::try_from(before.size.clamp(1, READ_CHUNK as u64)).unwrap_or(READ_CHUNK);
+    let mut buffer = vec![0_u8; chunk_len];
     loop {
-        let read = reader
-            .read(&mut buffer)
+        let read = read_retry(&mut file, &mut buffer)
             .map_err(|error| SessionIoError::os("artifact_invalid", "读取 artifact 失败", error))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    let after = FileIdentity::from_fd(reader.get_ref().as_raw_fd())?;
+    let after = FileIdentity::from_fd(file.as_raw_fd())?;
     if after != before {
         return Err(SessionIoError::new(
             "artifact_invalid",
@@ -196,7 +183,12 @@ pub fn verify_fd_interruptible(
     let mut hasher = Sha256::new();
     let mut remaining = expected_bytes;
     let mut offset: u64 = 0;
-    let mut buffer = vec![0_u8; READ_CHUNK];
+    let chunk_len =
+        usize::try_from(expected_bytes.clamp(1, READ_CHUNK as u64)).unwrap_or(READ_CHUNK);
+    let mut buffer = vec![0_u8; chunk_len];
+    if remaining == 0 {
+        interrupt_check()?;
+    }
     while remaining > 0 {
         interrupt_check()?;
         let selected = usize::try_from(remaining.min(READ_CHUNK as u64))
@@ -298,35 +290,22 @@ pub fn open_relative_regular(
     }
     validate_relative_regular_path(relative_path)?;
     let components = relative_path.split('/').collect::<Vec<_>>();
-    let mut current = dup_fd(root_fd)?;
-    let mut final_descriptor: Option<libc::c_int> = None;
-    let result = (|| {
-        for component in &components[..components.len() - 1] {
-            let next = openat_component(current, component, true)?;
-            close_fd(current);
-            current = next;
-        }
-        let descriptor = openat_component(current, components[components.len() - 1], false)?;
-        final_descriptor = Some(descriptor);
-        let raw = fstat_raw(descriptor)?;
-        let identity = identity_from_stat(&raw)?;
-        identity.require_regular(raw.st_mode)?;
-        if identity.nlink != 1 {
-            return Err(SessionIoError::new(
-                "artifact_invalid",
-                "artifact 不是独占普通文件",
-            ));
-        }
-        final_descriptor = None;
-        Ok(descriptor)
-    })();
-    close_fd(current);
-    if result.is_err() {
-        if let Some(descriptor) = final_descriptor.take() {
-            close_fd(descriptor);
-        }
+    // SAFETY: dup_fd returns a newly duplicated owned descriptor.
+    let mut current = unsafe { OwnedFd::from_raw_fd(dup_fd(root_fd)?) };
+    for component in &components[..components.len() - 1] {
+        current = OwnedFd::from(openat_component(current.as_raw_fd(), component, true)?);
     }
-    result
+    let file = openat_component(current.as_raw_fd(), components[components.len() - 1], false)?;
+    let raw = fstat_raw(file.as_raw_fd())?;
+    let identity = identity_from_stat(&raw)?;
+    identity.require_regular(raw.st_mode)?;
+    if identity.nlink != 1 {
+        return Err(SessionIoError::new(
+            "artifact_invalid",
+            "artifact 不是独占普通文件",
+        ));
+    }
+    Ok(file.into_raw_fd())
 }
 
 pub fn open_verified_artifact(
@@ -359,32 +338,7 @@ pub fn read_fd_bounded(fd: libc::c_int, maximum_bytes: usize) -> Result<Vec<u8>,
     let mut buffer = vec![0_u8; READ_CHUNK.min(limit.max(1))];
     while payload.len() < limit {
         let selected = READ_CHUNK.min(limit - payload.len());
-        let offset: libc::off_t = payload
-            .len()
-            .try_into()
-            .map_err(|_| SessionIoError::new("artifact_invalid", "文件偏移超出可表示范围"))?;
-        let read = loop {
-            let read = unsafe {
-                libc::pread(
-                    fd,
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    selected,
-                    offset,
-                )
-            };
-            if read >= 0 {
-                break read as usize;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(SessionIoError::os(
-                "artifact_invalid",
-                "读取文件失败",
-                error,
-            ));
-        };
+        let read = pread_retry(fd, &mut buffer[..selected], payload.len() as u64)?;
         if read == 0 {
             break;
         }
@@ -396,12 +350,25 @@ pub fn read_fd_bounded(fd: libc::c_int, maximum_bytes: usize) -> Result<Vec<u8>,
     Ok(payload)
 }
 
+#[cfg(test)]
 pub fn device_session_v1_artifacts(
     payload: &[u8],
     expected_session_id: &str,
 ) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
     let root = parse_device_session_manifest(payload, expected_session_id)?;
-    collect_device_session_v1_artifacts(manifest_object(&root)?)
+    let mut collector = ContentAddressedArtifactCollector::default();
+    collect_device_session_artifacts(manifest_object(&root)?, &mut collector)?;
+    collector.finish()
+}
+
+fn device_session_path_artifacts(
+    payload: &[u8],
+    expected_session_id: &str,
+) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
+    let root = parse_device_session_manifest(payload, expected_session_id)?;
+    let mut collector = ArtifactCollector::default();
+    collect_device_session_artifacts(manifest_object(&root)?, &mut collector)?;
+    collector.finish()
 }
 
 fn parse_device_session_manifest(
@@ -445,10 +412,14 @@ fn manifest_object(root: &Value) -> Result<&Map<String, Value>, SessionIoError> 
         .ok_or_else(|| SessionIoError::new("manifest_invalid", "manifest 必须是对象"))
 }
 
-fn collect_device_session_v1_artifacts(
+trait ArtifactSink {
+    fn collect(&mut self, raw: &Value) -> Result<(), SessionIoError>;
+}
+
+fn collect_device_session_artifacts(
     object: &Map<String, Value>,
-) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
-    let mut collector = ArtifactCollector::default();
+    collector: &mut impl ArtifactSink,
+) -> Result<(), SessionIoError> {
     let video = object_field(object, "video", "manifest video 结构无效")?;
     match string_field(video, "layout")? {
         "raw-side-by-side" => {
@@ -503,14 +474,24 @@ fn collect_device_session_v1_artifacts(
         }
     }
 
-    let artifacts = collector.finish();
-    if artifacts.is_empty() {
-        return Err(SessionIoError::new(
-            "manifest_invalid",
-            "manifest 未声明 artifact",
-        ));
+    Ok(())
+}
+
+fn identities_match(
+    actual: &FileIdentity,
+    expected: &FileIdentity,
+    omit_volatile_inode: bool,
+) -> bool {
+    if omit_volatile_inode {
+        // exFAT / FAT Linux drivers synthesize ephemeral i_ino values when inodes leave
+        // the dcache or across remounts; keep device/size/mtime/nlink checks intact.
+        actual.device == expected.device
+            && actual.size == expected.size
+            && actual.modified_ns == expected.modified_ns
+            && actual.nlink == expected.nlink
+    } else {
+        actual == expected
     }
-    Ok(artifacts)
 }
 
 pub fn verify_device_session_artifacts(
@@ -519,7 +500,7 @@ pub fn verify_device_session_artifacts(
     expected_session_id: &str,
     expected_identities: &[ExpectedArtifactIdentity],
 ) -> Result<u64, SessionIoError> {
-    let artifacts = device_session_v1_artifacts(manifest_payload, expected_session_id)?;
+    let artifacts = device_session_path_artifacts(manifest_payload, expected_session_id)?;
     let expected = expected_identity_map(expected_identities)?;
     if expected.len() != artifacts.len() {
         return Err(SessionIoError::new(
@@ -528,6 +509,8 @@ pub fn verify_device_session_artifacts(
         ));
     }
     let root = open_directory(session_root, "artifact_invalid", "无法安全打开会话目录")?;
+    let omit_volatile_inode = is_exfat_or_msdos(root.as_raw_fd())
+        .map_err(|error| SessionIoError::os("artifact_invalid", "读取会话文件系统失败", error))?;
     for artifact in &artifacts {
         let expected_identity = expected
             .get(artifact.path.as_str())
@@ -542,7 +525,7 @@ pub fn verify_device_session_artifacts(
         let actual = FileIdentity::from_fd(descriptor);
         close_fd(descriptor);
         let actual = actual?;
-        if actual != **expected_identity {
+        if !identities_match(&actual, expected_identity, omit_volatile_inode) {
             return Err(SessionIoError::new(
                 "digest_mismatch",
                 "artifact 在封存前发生变化",
@@ -561,12 +544,17 @@ pub fn seal_device_session(
     expected_identities: &[ExpectedArtifactIdentity],
     control_names: &[String],
 ) -> Result<DeviceSessionSealResult, SessionIoError> {
-    if final_root.exists() {
+    for control_name in control_names {
+        validate_control_name(control_name)?;
+    }
+    if std::fs::symlink_metadata(final_root).is_ok() {
         return Err(SessionIoError::new(
             "session_exists",
             "最终会话目录已经存在",
         ));
     }
+    // Verify artifacts before writing manifest or publishing so failed seals leave
+    // partial_root intact with all control files untouched.
     let artifact_count = verify_device_session_artifacts(
         partial_root,
         manifest_payload,
@@ -574,11 +562,21 @@ pub fn seal_device_session(
         expected_identities,
     )?;
     let manifest_path = partial_root.join("manifest.json");
-    write_manifest(&manifest_path, manifest_payload)?;
-    fsync_directory(partial_root, "write_failed", "同步会话目录失败")?;
+    write_manifest_atomic(partial_root, &manifest_path, manifest_payload)?;
+    if let Err(error) = fsync_directory(partial_root, "write_failed", "同步会话目录失败")
+        .and_then(|()| publish_directory_noreplace(partial_root, final_root))
+    {
+        let _ = std::fs::remove_file(&manifest_path);
+        let _ = fsync_directory(partial_root, "write_failed", "同步会话目录失败");
+        return Err(error);
+    }
+    if let Some(parent) = final_root.parent() {
+        fsync_directory(parent, "write_failed", "同步 generation 根目录失败")?;
+    }
+    // Unlink control markers only after final_root is published so a failed rename
+    // never leaves partial_root without recording.json / capture.json.
     for control_name in control_names {
-        validate_control_name(control_name)?;
-        match std::fs::remove_file(partial_root.join(control_name)) {
+        match std::fs::remove_file(final_root.join(control_name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -590,12 +588,7 @@ pub fn seal_device_session(
             }
         }
     }
-    fsync_directory(partial_root, "write_failed", "同步会话目录失败")?;
-    std::fs::rename(partial_root, final_root)
-        .map_err(|error| SessionIoError::os("write_failed", "发布会话目录失败", error))?;
-    if let Some(parent) = final_root.parent() {
-        fsync_directory(parent, "write_failed", "同步 generation 根目录失败")?;
-    }
+    fsync_directory(final_root, "write_failed", "同步会话目录失败")?;
     verify_device_session_artifacts(
         final_root,
         manifest_payload,
@@ -610,14 +603,100 @@ pub fn seal_device_session(
     })
 }
 
+fn path_cstring(path: &Path, code: &'static str) -> Result<CString, SessionIoError> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| SessionIoError::new(code, "路径包含 NUL 字节"))
+}
+
+fn publish_directory_noreplace(
+    partial_root: &Path,
+    final_root: &Path,
+) -> Result<(), SessionIoError> {
+    let old_c = path_cstring(partial_root, "write_failed")?;
+    let new_c = path_cstring(final_root, "write_failed")?;
+    match renameat2_noreplace(&old_c, &new_c) {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => Err(
+            SessionIoError::new("session_exists", "最终会话目录已经存在"),
+        ),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+            // Filesystems or kernels without RENAME_NOREPLACE support fall back to an
+            // explicit O_DIRECTORY/lstat pre-check plus standard rename.
+            if open_directory(final_root, "session_exists", "检查最终会话目录失败").is_ok()
+                || std::fs::symlink_metadata(final_root).is_ok()
+            {
+                return Err(SessionIoError::new(
+                    "session_exists",
+                    "最终会话目录已经存在",
+                ));
+            }
+            std::fs::rename(partial_root, final_root).map_err(|rename_err| {
+                SessionIoError::os("write_failed", "发布会话目录失败", rename_err)
+            })
+        }
+        Err(error) => Err(SessionIoError::os(
+            "write_failed",
+            "发布会话目录失败",
+            error,
+        )),
+    }
+}
+
 #[derive(Default)]
 struct ArtifactCollector {
+    descriptors: Vec<ArtifactDescriptor>,
+    paths: HashSet<String>,
+}
+
+impl ArtifactCollector {
+    fn finish(self) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
+        if self.descriptors.is_empty() {
+            return Err(SessionIoError::new(
+                "manifest_invalid",
+                "manifest 未声明 artifact",
+            ));
+        }
+        Ok(self.descriptors)
+    }
+}
+
+impl ArtifactSink for ArtifactCollector {
+    fn collect(&mut self, raw: &Value) -> Result<(), SessionIoError> {
+        let descriptor = parse_artifact_descriptor(raw)?;
+        if !self.paths.insert(descriptor.path.clone()) {
+            return Err(SessionIoError::new(
+                "manifest_invalid",
+                "manifest artifact 路径重复",
+            ));
+        }
+        self.descriptors.push(descriptor);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ContentAddressedArtifactCollector {
     descriptors: Vec<ArtifactDescriptor>,
     by_id: HashMap<String, usize>,
     paths: HashSet<String>,
 }
 
-impl ArtifactCollector {
+#[cfg(test)]
+impl ContentAddressedArtifactCollector {
+    fn finish(self) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
+        if self.descriptors.is_empty() {
+            return Err(SessionIoError::new(
+                "manifest_invalid",
+                "manifest 未声明 artifact",
+            ));
+        }
+        Ok(self.descriptors)
+    }
+}
+
+#[cfg(test)]
+impl ArtifactSink for ContentAddressedArtifactCollector {
     fn collect(&mut self, raw: &Value) -> Result<(), SessionIoError> {
         let descriptor = parse_artifact_descriptor(raw)?;
         if !self.paths.insert(descriptor.path.clone()) {
@@ -643,10 +722,6 @@ impl ArtifactCollector {
             .insert(descriptor.artifact_id.clone(), self.descriptors.len());
         self.descriptors.push(descriptor);
         Ok(())
-    }
-
-    fn finish(self) -> Vec<ArtifactDescriptor> {
-        self.descriptors
     }
 }
 
@@ -831,28 +906,15 @@ fn validate_relative_regular_path(path: &str) -> Result<(), SessionIoError> {
 }
 
 fn dup_fd(fd: libc::c_int) -> Result<libc::c_int, SessionIoError> {
-    loop {
-        let result = unsafe { libc::dup(fd) };
-        if result >= 0 {
-            return Ok(result);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(SessionIoError::os(
-            "artifact_invalid",
-            "无法复制根目录文件描述符",
-            error,
-        ));
-    }
+    dup_cloexec(fd)
+        .map_err(|error| SessionIoError::os("artifact_invalid", "无法复制根目录文件描述符", error))
 }
 
 fn openat_component(
     parent_fd: libc::c_int,
     component: &str,
     directory: bool,
-) -> Result<libc::c_int, SessionIoError> {
+) -> Result<File, SessionIoError> {
     let name = CString::new(component)
         .map_err(|_| SessionIoError::new("artifact_invalid", "路径组件包含 NUL"))?;
     let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -861,21 +923,9 @@ fn openat_component(
     } else {
         flags |= libc::O_NONBLOCK;
     }
-    loop {
-        let descriptor = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
-        if descriptor >= 0 {
-            return Ok(descriptor);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(SessionIoError::os(
-            "artifact_invalid",
-            "无法安全打开 artifact 路径",
-            error,
-        ));
-    }
+    openat_retry(parent_fd, &name, flags).map_err(|error| {
+        SessionIoError::os("artifact_invalid", "无法安全打开 artifact 路径", error)
+    })
 }
 
 fn close_fd(fd: libc::c_int) {
@@ -915,15 +965,39 @@ pub fn writev_all(fd: libc::c_int, chunks: &[&[u8]]) -> Result<u64, SessionIoErr
             break;
         }
 
-        let mut vectors: Vec<libc::iovec> =
-            Vec::with_capacity((chunks.len() - index).min(WRITEV_MAX));
-        vectors.push(iovec(&chunks[index][offset..]));
-        for chunk in chunks[index + 1..].iter().filter(|chunk| !chunk.is_empty()) {
-            if vectors.len() == WRITEV_MAX {
-                break;
+        const STACK_IOVEC: usize = 8;
+        let mut stack_vectors = [iovec(&[]); STACK_IOVEC];
+        let mut heap_vectors: Vec<libc::iovec> = Vec::new();
+        let mut stack_count = 0_usize;
+        for (chunk_idx, chunk) in chunks[index..].iter().enumerate() {
+            let slice = if chunk_idx == 0 {
+                &chunk[offset..]
+            } else {
+                *chunk
+            };
+            if slice.is_empty() {
+                continue;
             }
-            vectors.push(iovec(chunk));
+            let vec = iovec(slice);
+            if heap_vectors.is_empty() && stack_count < STACK_IOVEC {
+                stack_vectors[stack_count] = vec;
+                stack_count += 1;
+            } else {
+                if heap_vectors.is_empty() {
+                    heap_vectors.reserve((chunks.len() - index).min(WRITEV_MAX));
+                    heap_vectors.extend_from_slice(&stack_vectors[..stack_count]);
+                }
+                if heap_vectors.len() == WRITEV_MAX {
+                    break;
+                }
+                heap_vectors.push(vec);
+            }
         }
+        let vectors = if heap_vectors.is_empty() {
+            &stack_vectors[..stack_count]
+        } else {
+            &heap_vectors[..]
+        };
         let written = unsafe {
             libc::writev(
                 fd,
@@ -975,22 +1049,12 @@ fn iovec(payload: &[u8]) -> libc::iovec {
 }
 
 fn fstat_raw(fd: libc::c_int) -> Result<libc::stat, SessionIoError> {
-    if fd < 0 {
-        return Err(SessionIoError::new("artifact_invalid", "文件描述符无效"));
-    }
-    let mut raw = MaybeUninit::<libc::stat>::uninit();
-    let result = unsafe { libc::fstat(fd, raw.as_mut_ptr()) };
-    if result != 0 {
-        return Err(SessionIoError::os(
-            "artifact_invalid",
-            "无法读取文件身份",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(unsafe { raw.assume_init() })
+    fstat(fd).map_err(|error| SessionIoError::os("artifact_invalid", "无法读取文件身份", error))
 }
 
 fn identity_from_stat(raw: &libc::stat) -> Result<FileIdentity, SessionIoError> {
+    let size = u64::try_from(raw.st_size)
+        .map_err(|_| SessionIoError::new("artifact_invalid", "文件大小为负"))?;
     let modified_ns = raw
         .st_mtime
         .checked_mul(1_000_000_000)
@@ -999,7 +1063,7 @@ fn identity_from_stat(raw: &libc::stat) -> Result<FileIdentity, SessionIoError> 
     Ok(FileIdentity {
         device: raw.st_dev,
         inode: raw.st_ino,
-        size: raw.st_size as u64,
+        size,
         modified_ns,
         nlink: nlink_to_u64(raw.st_nlink),
     })
@@ -1015,28 +1079,8 @@ fn nlink_to_u64(nlink: libc::nlink_t) -> u64 {
 fn pread_retry(fd: libc::c_int, buffer: &mut [u8], offset: u64) -> Result<usize, SessionIoError> {
     let offset = libc::off_t::try_from(offset)
         .map_err(|_| SessionIoError::new("artifact_invalid", "artifact 偏移超出平台限制"))?;
-    loop {
-        let result = unsafe {
-            libc::pread(
-                fd,
-                buffer.as_mut_ptr().cast::<libc::c_void>(),
-                buffer.len(),
-                offset,
-            )
-        };
-        if result >= 0 {
-            return Ok(result as usize);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(SessionIoError::os(
-            "artifact_invalid",
-            "读取 artifact 失败",
-            error,
-        ));
-    }
+    sys_pread_retry(fd, buffer, offset)
+        .map_err(|error| SessionIoError::os("artifact_invalid", "读取 artifact 失败", error))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -1087,18 +1131,58 @@ fn open_directory(path: &Path, code: &'static str, context: &str) -> Result<File
     Ok(file)
 }
 
-fn write_manifest(path: &Path, payload: &[u8]) -> Result<(), SessionIoError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o640)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| SessionIoError::os("write_failed", "创建 manifest 失败", error))?;
-    file.write_all(payload)
-        .map_err(|error| SessionIoError::os("write_failed", "写入 manifest 失败", error))?;
-    file.sync_all()
-        .map_err(|error| SessionIoError::os("write_failed", "同步 manifest 失败", error))
+static TEMP_MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn write_manifest_atomic(
+    partial_root: &Path,
+    manifest_path: &Path,
+    payload: &[u8],
+) -> Result<(), SessionIoError> {
+    if std::fs::symlink_metadata(manifest_path).is_ok() {
+        return Err(SessionIoError::new("write_failed", "manifest 已经存在"));
+    }
+    let seq = TEMP_MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = partial_root.join(format!("manifest.json.tmp.{}.{}", std::process::id(), seq));
+    let write_result = (|| -> Result<(), SessionIoError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temp_path)
+            .map_err(|error| {
+                SessionIoError::os("write_failed", "创建 manifest 临时文件失败", error)
+            })?;
+        file.write_all(payload)
+            .map_err(|error| SessionIoError::os("write_failed", "写入 manifest 失败", error))?;
+        file.sync_all()
+            .map_err(|error| SessionIoError::os("write_failed", "同步 manifest 失败", error))?;
+        drop(file);
+        let old_c = path_cstring(&temp_path, "write_failed")?;
+        let new_c = path_cstring(manifest_path, "write_failed")?;
+        match renameat2_noreplace(&old_c, &new_c) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EEXIST)) => {
+                Err(SessionIoError::new("write_failed", "manifest 已经存在"))
+            }
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+                if std::fs::symlink_metadata(manifest_path).is_ok() {
+                    return Err(SessionIoError::new("write_failed", "manifest 已经存在"));
+                }
+                std::fs::rename(&temp_path, manifest_path)
+                    .map_err(|err| SessionIoError::os("write_failed", "发布 manifest 失败", err))
+            }
+            Err(error) => Err(SessionIoError::os(
+                "write_failed",
+                "发布 manifest 失败",
+                error,
+            )),
+        }
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 fn fsync_directory(path: &Path, code: &'static str, context: &str) -> Result<(), SessionIoError> {
@@ -1123,9 +1207,10 @@ fn validate_control_name(name: &str) -> Result<(), SessionIoError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExpectedArtifactIdentity, device_session_v1_artifacts, finalize_artifact, hash_file,
-        open_relative_regular, open_verified_artifact, read_fd_bounded, seal_device_session,
-        sendfile_all, verify_device_session_artifacts, verify_fd, write_encoder_frame,
+        ExpectedArtifactIdentity, FileIdentity, device_session_v1_artifacts, finalize_artifact,
+        hash_file, identities_match, open_relative_regular, open_verified_artifact,
+        read_fd_bounded, seal_device_session, sendfile_all, verify_device_session_artifacts,
+        verify_fd, write_encoder_frame,
     };
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom};
@@ -1145,6 +1230,42 @@ mod tests {
         );
         assert_eq!(digest.identity.size, 3);
         assert!(digest.identity.inode > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hash_file_rejects_hard_linked_artifacts() {
+        let root = tempfile_dir();
+        let path = root.join("artifact.bin");
+        let alias = root.join("alias.bin");
+        fs::write(&path, b"abc").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        let error = hash_file(&path).unwrap_err();
+        assert_eq!(error.code, "artifact_invalid");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exfat_mode_omits_volatile_inode_while_posix_requires_exact_match() {
+        let expected = FileIdentity {
+            device: 8,
+            inode: 1001,
+            size: 4096,
+            modified_ns: 1_700_000_000_000_000_000,
+            nlink: 1,
+        };
+        let remounted_same_file = FileIdentity {
+            inode: 2048,
+            ..expected
+        };
+        assert!(!identities_match(&remounted_same_file, &expected, false));
+        assert!(identities_match(&remounted_same_file, &expected, true));
+
+        let modified = FileIdentity {
+            size: 4097,
+            ..remounted_same_file
+        };
+        assert!(!identities_match(&modified, &expected, true));
     }
 
     #[test]
@@ -1160,6 +1281,7 @@ mod tests {
         assert_eq!(digest.identity.size, 3);
         let error = finalize_artifact(&path, Some(4)).unwrap_err();
         assert_eq!(error.code, "artifact_invalid");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1175,6 +1297,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.size, 3);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1190,6 +1313,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "digest_mismatch");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1228,6 +1352,7 @@ mod tests {
             || Ok(()),
         )
         .unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1245,6 +1370,7 @@ mod tests {
         right.read_to_end(&mut received).unwrap();
         assert_eq!(received, b"bcd");
         assert_eq!(file.stream_position().unwrap(), 5);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1316,6 +1442,7 @@ mod tests {
         assert_eq!(error.code, "artifact_invalid");
         let error = open_relative_regular(root_file.as_raw_fd(), "../escape.mp4").unwrap_err();
         assert_eq!(error.code, "manifest_invalid");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1337,6 +1464,7 @@ mod tests {
         let mut payload = Vec::new();
         file.read_to_end(&mut payload).unwrap();
         assert_eq!(payload, b"abc");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1359,6 +1487,7 @@ mod tests {
             .filter_map(|entry| fs::read_link(entry.path()).ok())
             .any(|target| target == path);
         assert!(!leaked, "failed verification leaked an artifact descriptor");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1381,6 +1510,7 @@ mod tests {
         assert_eq!(file.stream_position().unwrap(), 4);
         let error = read_fd_bounded(file.as_raw_fd(), 5).unwrap_err();
         assert_eq!(error.code, "artifact_invalid");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1527,6 +1657,68 @@ mod tests {
             verify_device_session_artifacts(&final_root, &manifest, session_id, &expected).unwrap(),
             3
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_failure_preserves_control_files_in_partial_root() {
+        let root = tempfile_dir();
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = root.join(format!("{session_id}.partial"));
+        let final_root = root.join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        fs::write(partial.join("recording.json"), b"recording").unwrap();
+        fs::write(partial.join("capture.json"), b"capture").unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"frame").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"frame-index\n").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"imu\n").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(5)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(12)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(4)).unwrap();
+        let manifest = format!(
+            r#"{{
+              "schema":"ylx.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{video_sha}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":5,"sha256":"{video_sha}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{frames_sha}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"{frames_sha}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{imu_sha}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":4,"sha256":"{imu_sha}"}}}}
+            }}"#,
+            video_sha = video.sha256,
+            frames_sha = frames.sha256,
+            imu_sha = imu.sha256,
+        );
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+        ];
+        fs::create_dir(&final_root).unwrap();
+        let error = seal_device_session(
+            &partial,
+            &final_root,
+            manifest.as_bytes(),
+            session_id,
+            &expected,
+            &["recording.json".to_owned(), "capture.json".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "session_exists");
+        assert!(partial.join("recording.json").exists());
+        assert!(partial.join("capture.json").exists());
+        assert!(!partial.join("manifest.json").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1586,6 +1778,7 @@ mod tests {
         assert!(partial.exists());
         assert!(!partial.join("manifest.json").exists());
         assert!(!final_root.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1601,6 +1794,177 @@ mod tests {
         let error = device_session_v1_artifacts(payload, "01989f6a-2c00-7a1b-8c2d-3e4f50617283")
             .unwrap_err();
         assert_eq!(error.code, "manifest_invalid");
+    }
+
+    #[test]
+    fn seals_duplicate_content_artifacts_with_distinct_paths_and_media_types() {
+        let root = tempfile_dir();
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = root.join(format!("{session_id}.partial"));
+        let final_root = root.join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        fs::create_dir(partial.join("logs")).unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"same-bytes").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"same-bytes").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"").unwrap();
+        fs::write(partial.join("logs/a.txt"), b"").unwrap();
+        fs::write(partial.join("logs/b.json"), b"").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(10)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(10)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(0)).unwrap();
+        let log_a = finalize_artifact(&partial.join("logs/a.txt"), Some(0)).unwrap();
+        let log_b = finalize_artifact(&partial.join("logs/b.json"), Some(0)).unwrap();
+        assert_eq!(video.sha256, frames.sha256);
+        assert_eq!(imu.sha256, log_a.sha256);
+        assert_eq!(log_a.sha256, log_b.sha256);
+
+        let manifest = format!(
+            r#"{{
+              "schema":"ylx.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{same}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":10,"sha256":"{same}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{same}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":10,"sha256":"{same}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{empty}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":0,"sha256":"{empty}"}}}},
+              "logs":[
+                {{"artifact_id":"{empty}","role":"log.text","path":"logs/a.txt","media_type":"text/plain","bytes":0,"sha256":"{empty}"}},
+                {{"artifact_id":"{empty}","role":"log.json","path":"logs/b.json","media_type":"application/json","bytes":0,"sha256":"{empty}"}}
+              ]
+            }}"#,
+            same = video.sha256,
+            empty = imu.sha256,
+        );
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "logs/a.txt".to_owned(),
+                identity: log_a.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "logs/b.json".to_owned(),
+                identity: log_b.identity,
+            },
+        ];
+
+        let sealed = seal_device_session(
+            &partial,
+            &final_root,
+            manifest.as_bytes(),
+            session_id,
+            &expected,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sealed.artifact_count, 5);
+        assert!(final_root.join("logs/b.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_publish_failure_removes_partial_manifest_and_preserves_control_files() {
+        let root = tempfile_dir();
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = root.join(format!("{session_id}.partial"));
+        let final_root = root.join("missing-parent").join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        fs::write(partial.join("recording.json"), b"recording").unwrap();
+        fs::write(partial.join("capture.json"), b"capture").unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"frame").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"frame-index\n").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"imu\n").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(5)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(12)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(4)).unwrap();
+        let manifest = format!(
+            r#"{{
+              "schema":"ylx.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{video_sha}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":5,"sha256":"{video_sha}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{frames_sha}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"{frames_sha}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{imu_sha}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":4,"sha256":"{imu_sha}"}}}}
+            }}"#,
+            video_sha = video.sha256,
+            frames_sha = frames.sha256,
+            imu_sha = imu.sha256,
+        );
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+        ];
+
+        let error = seal_device_session(
+            &partial,
+            &final_root,
+            manifest.as_bytes(),
+            session_id,
+            &expected,
+            &["recording.json".to_owned(), "capture.json".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "write_failed");
+        assert!(partial.join("recording.json").exists());
+        assert!(partial.join("capture.json").exists());
+        assert!(!partial.join("manifest.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_fd_interruptible_runs_check_on_empty_file_and_writev_handles_many_chunks() {
+        let root = tempfile_dir();
+        let empty_path = root.join("empty.bin");
+        fs::write(&empty_path, b"").unwrap();
+        let empty = File::open(&empty_path).unwrap();
+        let mut checks = 0_usize;
+        let error = super::verify_fd_interruptible(
+            empty.as_raw_fd(),
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            || {
+                checks += 1;
+                Err(super::SessionIoError::new(
+                    "verification_changed",
+                    "interrupted on empty file",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(checks, 1);
+        assert_eq!(error.code, "verification_changed");
+
+        let (left, mut right) = UnixStream::pair().unwrap();
+        let chunks: Vec<&[u8]> = (0..12).map(|_| b"ab".as_slice()).collect();
+        assert_eq!(super::writev_all(left.as_raw_fd(), &chunks).unwrap(), 24);
+        drop(left);
+        let mut received = Vec::new();
+        right.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"ab".repeat(12));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

@@ -1,7 +1,9 @@
+use crate::hardware::jpeg;
+use crate::sys::dynlib::load_symbol;
 use libloading::Library;
 use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const TJXOP_NONE: c_int = 0;
 const TJXOPT_CROP: c_int = 4;
@@ -64,7 +66,17 @@ struct DynamicApi {
     error: ErrorString,
 }
 
+static TURBOJPEG_API: OnceLock<Arc<DynamicApi>> = OnceLock::new();
+
 impl DynamicApi {
+    fn cached() -> Result<Arc<Self>, TurboJpegError> {
+        if let Some(api) = TURBOJPEG_API.get() {
+            return Ok(Arc::clone(api));
+        }
+        let loaded = Arc::new(Self::load()?);
+        Ok(Arc::clone(TURBOJPEG_API.get_or_init(|| loaded)))
+    }
+
     fn load() -> Result<Self, TurboJpegError> {
         let mut last_error = None;
         for name in ["libturbojpeg.so.0", "libturbojpeg.so"] {
@@ -78,20 +90,15 @@ impl DynamicApi {
             };
             // SAFETY: Symbol names and C signatures match the TurboJPEG public ABI.
             unsafe {
-                let init_transform = *library
-                    .get::<InitTransform>(b"tjInitTransform\0")
+                let init_transform = load_symbol(&library, b"tjInitTransform\0")
                     .map_err(|error| TurboJpegError::unavailable(error.to_string()))?;
-                let transform = *library
-                    .get::<TransformJpeg>(b"tjTransform\0")
+                let transform = load_symbol(&library, b"tjTransform\0")
                     .map_err(|error| TurboJpegError::unavailable(error.to_string()))?;
-                let destroy = *library
-                    .get::<Destroy>(b"tjDestroy\0")
+                let destroy = load_symbol(&library, b"tjDestroy\0")
                     .map_err(|error| TurboJpegError::unavailable(error.to_string()))?;
-                let free = *library
-                    .get::<Free>(b"tjFree\0")
+                let free = load_symbol(&library, b"tjFree\0")
                     .map_err(|error| TurboJpegError::unavailable(error.to_string()))?;
-                let error = *library
-                    .get::<ErrorString>(b"tjGetErrorStr2\0")
+                let error = load_symbol(&library, b"tjGetErrorStr2\0")
                     .map_err(|error| TurboJpegError::unavailable(error.to_string()))?;
                 return Ok(Self {
                     _library: library,
@@ -213,7 +220,7 @@ unsafe impl Send for TransformHandle {}
 
 impl TransformHandle {
     pub(crate) fn open() -> Result<Self, TurboJpegError> {
-        Self::with_api(Arc::new(DynamicApi::load()?))
+        Self::with_api(DynamicApi::cached()?)
     }
 
     fn with_api(api: Arc<dyn TurboApi>) -> Result<Self, TurboJpegError> {
@@ -320,7 +327,7 @@ impl TransformHandle {
         width: i32,
         height: i32,
     ) -> Result<(Vec<u8>, Vec<u8>), TurboJpegError> {
-        let ranges = crate::jpeg::ranges(payload);
+        let ranges = jpeg::ranges(payload);
         if ranges.len() == 2 {
             let (left_start, left_end) = ranges[0];
             let (right_start, right_end) = ranges[1];
@@ -341,10 +348,18 @@ impl TransformHandle {
                 message: "SBS dimensions must be positive with an even width".to_owned(),
             });
         }
+        let width_u16 = u16::try_from(width).map_err(|_| TurboJpegError {
+            code: "bad_frame",
+            message: "SBS width exceeds JPEG 16-bit dimension limit".to_owned(),
+        })?;
+        let height_u16 = u16::try_from(height).map_err(|_| TurboJpegError {
+            code: "bad_frame",
+            message: "SBS height exceeds JPEG 16-bit dimension limit".to_owned(),
+        })?;
         let (start, end) = ranges[0];
         let selected = &payload[start..end];
-        if let Some(actual) = crate::jpeg::dimensions(selected) {
-            if actual != (width as u16, height as u16) {
+        if let Some(actual) = jpeg::dimensions(selected) {
+            if actual != (width_u16, height_u16) {
                 return Err(TurboJpegError {
                     code: "bad_frame",
                     message: format!(
@@ -355,10 +370,8 @@ impl TransformHandle {
             }
         }
         let (left, right) = self.split(selected, width, height)?;
-        let expected = (width as u16 / 2, height as u16);
-        if crate::jpeg::dimensions(&left) != Some(expected)
-            || crate::jpeg::dimensions(&right) != Some(expected)
-        {
+        let expected = (width_u16 / 2, height_u16);
+        if jpeg::dimensions(&left) != Some(expected) || jpeg::dimensions(&right) != Some(expected) {
             return Err(TurboJpegError::operation(
                 "output eye dimensions are invalid".to_owned(),
             ));
@@ -495,6 +508,13 @@ mod tests {
         let mut handle = TransformHandle::with_api(api).unwrap();
         assert_eq!(
             handle.split_sbs(b"bad", 3840, 1080).unwrap_err().code,
+            "bad_frame"
+        );
+        assert_eq!(
+            handle
+                .split_sbs(b"\xff\xd8x\xff\xd9", 70_000, 1080)
+                .unwrap_err()
+                .code,
             "bad_frame"
         );
         handle.close();

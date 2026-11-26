@@ -1,13 +1,14 @@
 //! Fresh, bounded manifest signatures without per-file Python I/O bookkeeping.
+use crate::sys::fs as sys_fs;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
-use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::ffi::CStr;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-const NAME: &[u8] = b"manifest.json\0";
+const NAME: &CStr = c"manifest.json";
 type Identity = (
     libc::dev_t,
     libc::ino_t,
@@ -34,30 +35,14 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
-    let mut value = MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, value.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { value.assume_init() })
-}
-
-fn read_retry(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
-    loop {
-        match file.read(buffer) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => return result,
-        }
-    }
-}
-
 pub fn signature(path: &Path, maximum_bytes: usize) -> io::Result<String> {
-    signature_inner(path, maximum_bytes, || {})
+    signature_inner(path, maximum_bytes, None, || {})
 }
 
 fn signature_inner(
     path: &Path,
     maximum_bytes: usize,
+    force_exfat: Option<bool>,
     after_read: impl FnOnce(),
 ) -> io::Result<String> {
     let parent = fs::symlink_metadata(path)?;
@@ -68,28 +53,20 @@ fn signature_inner(
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)?;
-    let opened = fstat(directory.as_raw_fd())?;
+    let opened = sys_fs::fstat(directory.as_raw_fd())?;
     if parent.dev() != opened.st_dev || parent.ino() != opened.st_ino {
         return Err(invalid("catalog directory changed during open"));
     }
-    let mut file = loop {
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                NAME.as_ptr().cast(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            )
-        };
-        if fd >= 0 {
-            // File owns the descriptor before any fallible allocation/read.
-            break unsafe { File::from_raw_fd(fd) };
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+    let exfat = match force_exfat {
+        Some(value) => value,
+        None => sys_fs::is_exfat_or_msdos(directory.as_raw_fd())?,
     };
-    let before = fstat(file.as_raw_fd())?;
+    let mut file = sys_fs::openat_retry(
+        directory.as_raw_fd(),
+        NAME,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
+    let before = sys_fs::fstat(file.as_raw_fd())?;
     if before.st_mode & libc::S_IFMT != libc::S_IFREG
         || before.st_nlink != 1
         || before.st_size < 0
@@ -105,7 +82,7 @@ fn signature_inner(
     let mut digest = Sha256::new();
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
-        let read = read_retry(&mut file, &mut buffer[..count])?;
+        let read = sys_fs::read_retry(&mut file, &mut buffer[..count])?;
         if read == 0 {
             return Err(invalid("catalog manifest truncated during read"));
         }
@@ -113,33 +90,29 @@ fn signature_inner(
         remaining -= read as u64;
     }
     after_read();
-    if read_retry(&mut file, &mut [0_u8; 1])? != 0
-        || identity(&fstat(file.as_raw_fd())?) != expected
+    if sys_fs::read_retry(&mut file, &mut [0_u8; 1])? != 0
+        || identity(&sys_fs::fstat(file.as_raw_fd())?) != expected
     {
         return Err(invalid("catalog manifest changed during read"));
     }
-    let mut current = MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            NAME.as_ptr().cast(),
-            current.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if identity(&unsafe { current.assume_init() }) != expected {
+    let current = sys_fs::fstatat_nofollow(directory.as_raw_fd(), NAME)?;
+    if identity(&current) != expected {
         return Err(invalid("catalog manifest replaced during read"));
     }
+    // On exFAT/FAT, kernel st_ino is an ephemeral dcache counter that changes across
+    // cache evictions and reboots, so omit volatile inodes from persisted signatures.
+    let (reported_parent_ino, reported_file_ino) = if exfat {
+        (0, 0)
+    } else {
+        (parent.ino(), expected.1)
+    };
     // Preserve the existing json.dumps signature byte-for-byte, including spaces.
     Ok(format!(
         "[{}, {}, {}, {}, {}, {}, {}, {}, {}, \"{:x}\"]",
         parent.dev(),
-        parent.ino(),
+        reported_parent_ino,
         expected.0,
-        expected.1,
+        reported_file_ino,
         expected.2,
         expected.3,
         expected.4,
@@ -152,6 +125,7 @@ fn signature_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     struct Fixture(std::path::PathBuf);
@@ -189,6 +163,35 @@ mod tests {
     }
 
     #[test]
+    fn exfat_mode_omits_volatile_parent_and_file_inodes() {
+        let f = Fixture::new();
+        let exfat_sig = signature_inner(&f.0, 100, Some(true), || {}).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&exfat_sig).unwrap();
+        assert_eq!(parsed[1], 0);
+        assert_eq!(parsed[3], 0);
+        assert_eq!(parsed[6], 8);
+        assert_eq!(parsed[9], format!("{:x}", Sha256::digest(b"original")));
+
+        // Replacing the file with identical content/timestamps on exFAT yields the same signature.
+        let mtime = fs::metadata(f.0.join("manifest.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::remove_file(f.0.join("manifest.json")).unwrap();
+        fs::write(f.0.join("manifest.json"), b"original").unwrap();
+        File::open(f.0.join("manifest.json"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let exfat_sig_recreated = signature_inner(&f.0, 100, Some(true), || {}).unwrap();
+        let parsed_recreated: serde_json::Value =
+            serde_json::from_str(&exfat_sig_recreated).unwrap();
+        assert_eq!(parsed_recreated[1], 0);
+        assert_eq!(parsed_recreated[3], 0);
+        assert_eq!(parsed_recreated[9], parsed[9]);
+    }
+
+    #[test]
     fn signature_rejects_file_and_directory_symlinks_and_hardlinks() {
         let f = Fixture::new();
         let link = f.0.join("linked-directory");
@@ -207,7 +210,7 @@ mod tests {
     #[test]
     fn signature_rejects_replacement_before_final_identity_check() {
         let f = Fixture::new();
-        let result = signature_inner(&f.0, 100, || {
+        let result = signature_inner(&f.0, 100, None, || {
             fs::rename(f.0.join("manifest.json"), f.0.join("old")).unwrap();
             fs::write(f.0.join("manifest.json"), b"original").unwrap();
         });
@@ -225,7 +228,7 @@ mod tests {
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
             .unwrap();
         assert!(
-            signature_inner(&f.0, 100, || {
+            signature_inner(&f.0, 100, None, || {
                 fs::write(f.0.join("manifest.json"), b"modified").unwrap();
             })
             .is_err()
@@ -236,7 +239,7 @@ mod tests {
     fn signature_rejects_growth_after_read() {
         let f = Fixture::new();
         assert!(
-            signature_inner(&f.0, 100, || {
+            signature_inner(&f.0, 100, None, || {
                 fs::write(f.0.join("manifest.json"), b"original plus tail").unwrap();
             })
             .is_err()
@@ -247,7 +250,7 @@ mod tests {
     fn signature_rejects_permission_change_after_read() {
         let f = Fixture::new();
         assert!(
-            signature_inner(&f.0, 100, || {
+            signature_inner(&f.0, 100, None, || {
                 fs::set_permissions(f.0.join("manifest.json"), fs::Permissions::from_mode(0o400))
                     .unwrap();
             })

@@ -1,6 +1,6 @@
 //! Idle IMU owner. Recording stops and joins it before opening its own collector,
 //! so preview never consumes packets belonging to the recording session.
-use crate::imu::{Collector, ImuObservation};
+use crate::hardware::imu::{Collector, ImuObservation};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -39,50 +39,55 @@ impl Preview {
             state.latest = None;
         }
         let shared = Arc::clone(&self.state);
-        *worker = Some(thread::spawn(move || {
-            loop {
-                if stopped(&shared) {
-                    break;
-                }
-                if let Ok(collector) = Collector::open(
-                    &config.device,
-                    config.unit,
-                    config.selector,
-                    Some(config.stale_poll_interval),
-                ) {
-                    while !stopped(&shared) {
-                        match collector.read(config.timeout.min(Duration::from_millis(200))) {
-                            Ok(observation) => {
-                                if let Ok(mut state) = shared.0.lock() {
-                                    if !state.stop {
-                                        state.latest = Some((Instant::now(), observation));
-                                    }
-                                    // UI preview needs at most 50 Hz. Release the USB
-                                    // control channel between polls; stop remains interruptible.
-                                    let _ = shared.1.wait_timeout_while(
-                                        state,
-                                        Duration::from_millis(20),
-                                        |s| !s.stop,
-                                    );
-                                }
-                            }
-                            Err(_) => break,
-                        }
+        if let Ok(handle) = thread::Builder::new()
+            .name("imu-preview".to_owned())
+            .spawn(move || {
+                loop {
+                    if stopped(&shared) {
+                        break;
                     }
-                    collector.close();
+                    if let Ok(collector) = Collector::open(
+                        &config.device,
+                        config.unit,
+                        config.selector,
+                        Some(config.stale_poll_interval),
+                    ) {
+                        while !stopped(&shared) {
+                            match collector.read(config.timeout.min(Duration::from_millis(200))) {
+                                Ok(observation) => {
+                                    if let Ok(mut state) = shared.0.lock() {
+                                        if !state.stop {
+                                            state.latest = Some((Instant::now(), observation));
+                                        }
+                                        // UI preview needs at most 50 Hz. Release the USB
+                                        // control channel between polls; stop remains interruptible.
+                                        let _ = shared.1.wait_timeout_while(
+                                            state,
+                                            Duration::from_millis(20),
+                                            |s| !s.stop,
+                                        );
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        collector.close();
+                    }
+                    let Ok(mut state) = shared.0.lock() else {
+                        break;
+                    };
+                    state.latest = None;
+                    if state.stop {
+                        break;
+                    }
+                    let _ = shared
+                        .1
+                        .wait_timeout_while(state, Duration::from_millis(500), |s| !s.stop);
                 }
-                let Ok(mut state) = shared.0.lock() else {
-                    break;
-                };
-                state.latest = None;
-                if state.stop {
-                    break;
-                }
-                let _ = shared
-                    .1
-                    .wait_timeout_while(state, Duration::from_millis(500), |s| !s.stop);
-            }
-        }));
+            })
+        {
+            *worker = Some(handle);
+        }
     }
 
     pub(crate) fn stop(&self) {
@@ -124,7 +129,7 @@ impl Drop for Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::imu::{ImuSample, RawVector3};
+    use crate::hardware::imu::{ImuSample, RawVector3};
 
     #[test]
     fn latest_is_bounded_by_freshness_and_cleared_on_stop() {

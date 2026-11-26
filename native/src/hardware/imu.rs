@@ -1,5 +1,4 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use crate::sys::clock;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs;
@@ -8,6 +7,7 @@ use std::os::fd::RawFd;
 use std::os::raw::c_ulong;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const UVC_GET_CUR: u8 = 0x81;
@@ -93,50 +93,6 @@ pub(crate) struct ImuObservation {
     pub(crate) dropped_samples: u64,
 }
 
-pub(crate) fn observation_dict(py: Python<'_>, result: &ImuObservation) -> PyResult<Py<PyDict>> {
-    let value = PyDict::new(py);
-    value.set_item("dropped_samples", result.dropped_samples)?;
-    // No independent IMU sample counter is present in the camera's payload.
-    value.set_item("missed_packets_estimate_available", false)?;
-    let samples = PyList::empty(py);
-    for sample in &result.samples {
-        let item = PyDict::new(py);
-        item.set_item("sequence", sample.sequence)?;
-        item.set_item("packet_sequence", sample.packet_sequence)?;
-        item.set_item("sample_index", sample.sample_index)?;
-        item.set_item("device_timestamp_raw", sample.device_timestamp_raw)?;
-        item.set_item("device_ticks", sample.device_ticks)?;
-        item.set_item("host_read_start_ns", sample.host_read_start_ns)?;
-        item.set_item("host_read_end_ns", sample.host_read_end_ns)?;
-        item.set_item("host_monotonic_ns", sample.host_monotonic_ns)?;
-
-        let raw = PyDict::new(py);
-        raw.set_item(
-            "accelerometer",
-            vec![
-                sample.accelerometer.x,
-                sample.accelerometer.y,
-                sample.accelerometer.z,
-            ],
-        )?;
-        raw.set_item(
-            "gyroscope",
-            vec![sample.gyroscope.x, sample.gyroscope.y, sample.gyroscope.z],
-        )?;
-        item.set_item("raw", raw)?;
-
-        let sync = PyDict::new(py);
-        sync.set_item("offset_ns", sample.sync_offset_ns)?;
-        sync.set_item("residual_ns", sample.sync_residual_ns)?;
-        sync.set_item("quality", sample.sync_quality)?;
-        item.set_item("sync", sync)?;
-
-        samples.append(item)?;
-    }
-    value.set_item("samples", samples)?;
-    Ok(value.unbind())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PacketRead {
     payload: [u8; PACKET_BYTES],
@@ -157,7 +113,7 @@ struct DecodedPacket {
     samples: [DecodedRawSample; SAMPLES_PER_PACKET],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SyncEstimate {
     offset_ns: Option<i64>,
     residual_ns: Option<u64>,
@@ -172,16 +128,17 @@ struct SyncPoint {
 }
 
 pub(crate) struct Collector {
-    state: Mutex<State>,
+    io: Mutex<IoState>,
+    latest_observation: Mutex<Option<ImuObservation>>,
+    stop: AtomicBool,
 }
 
-struct State {
+struct IoState {
     fd: Option<RawFd>,
     unit: u8,
     selector: u8,
     stale_poll_interval: Duration,
     last_payload: Option<[u8; PACKET_BYTES]>,
-    latest_observation: Option<ImuObservation>,
     unwrapper: TimestampUnwrapper,
     synchronizer: TimeSynchronizer,
     packet_sequence: u64,
@@ -212,24 +169,25 @@ impl Collector {
             None => discover_uvc_xu_unit(device)?,
         };
         let fd = open_device(device)?;
-        let mut state = State {
+        let mut io = IoState {
             fd: Some(fd),
             unit,
             selector,
             stale_poll_interval: stale_poll_interval.unwrap_or(DEFAULT_STALE_POLL),
             last_payload: None,
-            latest_observation: None,
             unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
             synchronizer: TimeSynchronizer::default(),
             packet_sequence: 0,
             sample_sequence: 0,
         };
-        if let Err(error) = state.verify_packet_length() {
-            state.close();
+        if let Err(error) = io.verify_packet_length() {
+            io.close();
             return Err(error);
         }
         Ok(Self {
-            state: Mutex::new(state),
+            io: Mutex::new(io),
+            latest_observation: Mutex::new(None),
+            stop: AtomicBool::new(false),
         })
     }
 
@@ -240,38 +198,67 @@ impl Collector {
                 "IMU timeout must be positive",
             ));
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))?;
-        let result = state.read(timeout);
-        if result.is_err() {
-            state.close();
+        let result = {
+            let mut io = self
+                .io
+                .lock()
+                .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))?;
+            if self.stop.load(Ordering::Acquire) {
+                io.close();
+                return Err(ImuError::new("invalid_state", "IMU source is closed"));
+            }
+            let result = io.read(timeout, &self.stop);
+            match &result {
+                Ok(observation) => {
+                    if let Ok(mut latest) = self.latest_observation.lock() {
+                        *latest = Some(observation.clone());
+                    }
+                    if self.stop.load(Ordering::Acquire) {
+                        io.close();
+                    }
+                }
+                Err(error) if error.retryable && !self.stop.load(Ordering::Acquire) => {}
+                Err(_) => {
+                    io.close();
+                }
+            }
+            result
+        };
+        // Symmetric SeqCst check so a concurrent close() that missed try_lock()
+        // while we held `io` never leaves the device descriptor open.
+        if self.stop.load(Ordering::SeqCst) {
+            if let Ok(mut io) = self.io.try_lock() {
+                io.close();
+            }
         }
         result
     }
 
     pub(crate) fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.close();
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut io) = self.io.try_lock() {
+            io.close();
         }
     }
 
     pub(crate) fn latest_observation(&self) -> Result<Option<ImuObservation>, ImuError> {
-        self.state
+        self.latest_observation
             .lock()
-            .map(|state| state.latest_observation.clone())
+            .map(|latest| latest.clone())
             .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))
     }
 }
 
 impl Drop for Collector {
     fn drop(&mut self) {
-        self.close();
+        self.stop.store(true, Ordering::Release);
+        if let Ok(io) = self.io.get_mut() {
+            io.close();
+        }
     }
 }
 
-impl State {
+impl IoState {
     fn verify_packet_length(&mut self) -> Result<(), ImuError> {
         let payload = self.query(UVC_GET_LEN, 2, "xu_query_failed")?;
         if payload.len() != 2 {
@@ -292,8 +279,8 @@ impl State {
         Ok(())
     }
 
-    fn read(&mut self, timeout: Duration) -> Result<ImuObservation, ImuError> {
-        let packet_read = self.read_fresh_packet(timeout)?;
+    fn read(&mut self, timeout: Duration, stop: &AtomicBool) -> Result<ImuObservation, ImuError> {
+        let packet_read = self.read_fresh_packet(timeout, stop)?;
         self.observe_packet(packet_read)
     }
 
@@ -330,17 +317,22 @@ impl State {
         });
         self.packet_sequence += 1;
         self.sample_sequence += SAMPLES_PER_PACKET as u64;
-        let observation = ImuObservation {
+        Ok(ImuObservation {
             samples,
             dropped_samples: 0,
-        };
-        self.latest_observation = Some(observation.clone());
-        Ok(observation)
+        })
     }
 
-    fn read_fresh_packet(&mut self, timeout: Duration) -> Result<PacketRead, ImuError> {
+    fn read_fresh_packet(
+        &mut self,
+        timeout: Duration,
+        stop: &AtomicBool,
+    ) -> Result<PacketRead, ImuError> {
         let deadline = monotonic_ns()?.saturating_add(duration_ns(timeout)?);
         loop {
+            if stop.load(Ordering::Acquire) {
+                return Err(ImuError::new("invalid_state", "IMU source is closed"));
+            }
             let host_read_start_ns = monotonic_ns()?;
             let payload = self.query(UVC_GET_CUR, PACKET_BYTES, "disconnected")?;
             let host_read_end_ns = monotonic_ns()?;
@@ -361,6 +353,9 @@ impl State {
                     host_read_start_ns,
                     host_read_end_ns,
                 });
+            }
+            if stop.load(Ordering::Acquire) {
+                return Err(ImuError::new("invalid_state", "IMU source is closed"));
             }
             if host_read_end_ns >= deadline {
                 return Err(ImuError::retryable(
@@ -406,9 +401,23 @@ impl State {
             size: size as u16,
             data: buffer.as_mut_ptr(),
         };
-        let result = unsafe { libc::ioctl(fd, uvc_ioctl_ctrl_query(), &mut query) };
-        if result != 0 {
+        let status = loop {
+            let result = unsafe { libc::ioctl(fd, uvc_ioctl_ctrl_query(), &mut query) };
+            if result == 0 {
+                break Ok(());
+            }
             if result > 0 {
+                break Err(Ok(result));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(Err(error));
+        };
+        match status {
+            Ok(()) => Ok(buffer),
+            Err(Ok(result)) => {
                 let message = format!("UVC XU query returned non-zero status {result}");
                 if error_code == "disconnected" {
                     return Err(ImuError::retryable(
@@ -416,18 +425,18 @@ impl State {
                         format!("IMU read failed: {message}"),
                     ));
                 }
-                return Err(ImuError::new(error_code, message));
+                Err(ImuError::new(error_code, message))
             }
-            let error = io::Error::last_os_error();
-            if error_code == "disconnected" {
-                return Err(ImuError::retryable(
-                    "disconnected",
-                    format!("IMU read failed: {error}"),
-                ));
+            Err(Err(error)) => {
+                if error_code == "disconnected" {
+                    return Err(ImuError::retryable(
+                        "disconnected",
+                        format!("IMU read failed: {error}"),
+                    ));
+                }
+                Err(ImuError::io(error_code, "UVC XU query failed", error))
             }
-            return Err(ImuError::io(error_code, "UVC XU query failed", error));
         }
-        Ok(buffer)
     }
 
     fn close(&mut self) {
@@ -477,14 +486,16 @@ fn validate_xu_query(unit: u8, selector: u8, request: u8, size: usize) -> Result
 fn open_device(device: &str) -> Result<RawFd, ImuError> {
     let device = CString::new(device)
         .map_err(|_| ImuError::new("invalid_argument", "device contains NUL"))?;
-    let fd = unsafe { libc::open(device.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(ImuError::io(
-            "disconnected",
-            "open IMU video device",
-            io::Error::last_os_error(),
-        ));
-    }
+    let fd = loop {
+        let fd = unsafe { libc::open(device.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            break fd;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(ImuError::io("disconnected", "open IMU video device", error));
+        }
+    };
     Ok(fd)
 }
 
@@ -780,7 +791,8 @@ impl TimeSynchronizer {
             .points
             .iter()
             .map(|point| {
-                (point.host_ns as f64 - (offset + scale * point.device_ticks as f64)).abs()
+                ((point.host_ns as f64 - mean_y) - scale * (point.device_ticks as f64 - mean_x))
+                    .abs()
             })
             .fold(0.0_f64, f64::max);
         let uncertainty = self
@@ -789,32 +801,22 @@ impl TimeSynchronizer {
             .map(|point| point.uncertainty_ns)
             .max()
             .unwrap_or(0);
-        let residual = fit_residual.ceil() as u64 + uncertainty;
+        let residual = (fit_residual.ceil() as u64).saturating_add(uncertainty);
+        let quality = if residual > self.good_residual_ns {
+            "degraded"
+        } else {
+            "good"
+        };
         Ok(SyncEstimate {
             offset_ns: Some(offset.round() as i64),
             residual_ns: Some(residual),
-            quality: if residual > self.good_residual_ns {
-                "degraded"
-            } else {
-                "good"
-            },
+            quality,
         })
     }
 }
 
 fn monotonic_ns() -> Result<u64, ImuError> {
-    let mut timestamp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
-        return Err(ImuError::io(
-            "clock_failed",
-            "clock_gettime",
-            io::Error::last_os_error(),
-        ));
-    }
-    Ok(timestamp.tv_sec as u64 * 1_000_000_000 + timestamp.tv_nsec as u64)
+    clock::monotonic_ns().map_err(|error| ImuError::io("clock_failed", "clock_gettime", error))
 }
 
 fn duration_ns(duration: Duration) -> Result<u64, ImuError> {
@@ -833,11 +835,13 @@ pub(crate) fn available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEVICE_TIMESTAMP_MODULUS, PACKET_BYTES, PacketRead, State, TimeSynchronizer,
+        Collector, DEVICE_TIMESTAMP_MODULUS, IoState, PACKET_BYTES, PacketRead, TimeSynchronizer,
         TimestampUnwrapper, UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, UVC_GET_CUR, UVC_GET_LEN,
         XU_GUID_BYTES, decode_packet, find_uvc_xu_unit, validate_xu_query,
     };
-    use std::time::Duration;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     fn packet(timestamp: u32, seed: i16) -> [u8; PACKET_BYTES] {
         let mut payload = [0_u8; PACKET_BYTES];
@@ -862,19 +866,19 @@ mod tests {
 
     #[test]
     fn same_frame_updates_survive_filter_clock_and_observation() {
-        let mut state = State {
+        let mut state = IoState {
             fd: None,
             unit: 3,
             selector: 1,
             stale_poll_interval: Duration::from_millis(1),
             last_payload: None,
-            latest_observation: None,
             unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
             synchronizer: TimeSynchronizer::default(),
             packet_sequence: 0,
             sample_sequence: 0,
         };
         let mut samples = Vec::new();
+        let mut last_observation = None;
         for (index, (frame, seed)) in [(0xFF_FFFF, -6), (0xFF_FFFF, -5), (0, -4), (3, -3)]
             .into_iter()
             .enumerate()
@@ -898,7 +902,8 @@ mod tests {
                 assert_eq!(observation.samples[0].sync_quality, "insufficient");
                 assert_eq!(observation.samples[0].sync_offset_ns, None);
             }
-            samples.extend(observation.samples);
+            samples.extend(observation.samples.clone());
+            last_observation = Some(observation);
         }
         assert_eq!(
             samples
@@ -909,7 +914,40 @@ mod tests {
         );
         assert_eq!(samples[4].device_ticks, 0x1_000000);
         assert_eq!(samples[6].device_ticks, 0x1_000003);
-        assert_eq!(state.latest_observation.unwrap().samples[1].sequence, 7);
+        assert_eq!(last_observation.unwrap().samples[1].sequence, 7);
+    }
+
+    #[test]
+    fn latest_observation_and_close_never_block_on_io_lock() {
+        let mut io = IoState {
+            fd: None,
+            unit: 3,
+            selector: 1,
+            stale_poll_interval: Duration::from_millis(1),
+            last_payload: None,
+            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
+            synchronizer: TimeSynchronizer::default(),
+            packet_sequence: 0,
+            sample_sequence: 0,
+        };
+        let obs = io
+            .observe_packet(PacketRead {
+                payload: packet(10, 1),
+                host_read_start_ns: 1_000,
+                host_read_end_ns: 2_000,
+            })
+            .unwrap();
+        let collector = Collector {
+            io: Mutex::new(io),
+            latest_observation: Mutex::new(Some(obs.clone())),
+            stop: AtomicBool::new(false),
+        };
+        let _io_guard = collector.io.lock().unwrap();
+        let started = Instant::now();
+        assert_eq!(collector.latest_observation().unwrap(), Some(obs));
+        collector.close();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(collector.stop.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -968,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronizer_reports_insufficient_then_good() {
+    fn synchronizer_reports_insufficient_then_good_and_degraded_residual() {
         let mut sync = TimeSynchronizer::default();
         assert_eq!(
             sync.add(1_000, 10_999_900, 11_000_100).unwrap().quality,
@@ -982,5 +1020,47 @@ mod tests {
         assert_eq!(estimate.quality, "good");
         assert_eq!(estimate.offset_ns, Some(10_000_000));
         assert_eq!(estimate.residual_ns, Some(100));
+
+        let mut jittered = TimeSynchronizer::default();
+        jittered.add(1_000, 10_999_900, 11_000_100).unwrap();
+        jittered.add(2_000, 12_999_900, 13_000_100).unwrap();
+        let degraded = jittered.add(3_000, 18_999_900, 19_000_100).unwrap();
+        assert_eq!(degraded.quality, "degraded");
+        assert!(degraded.residual_ns.unwrap() > 1_000_000);
+    }
+
+    #[test]
+    fn collector_read_preserves_io_on_retryable_error_and_closes_on_fatal() {
+        let collector = Collector {
+            io: Mutex::new(IoState {
+                fd: None,
+                unit: 3,
+                selector: 1,
+                stale_poll_interval: Duration::from_millis(1),
+                last_payload: None,
+                unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
+                synchronizer: TimeSynchronizer::default(),
+                packet_sequence: 0,
+                sample_sequence: 0,
+            }),
+            latest_observation: Mutex::new(None),
+            stop: AtomicBool::new(false),
+        };
+        let mut pipe_fds = [-1_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let fd = pipe_fds[0];
+        unsafe { libc::close(pipe_fds[1]) };
+        collector.io.lock().unwrap().fd = Some(fd);
+        let err = collector.read(Duration::from_millis(1)).unwrap_err();
+        assert!(err.retryable);
+        assert_eq!(err.code, "disconnected");
+        assert_eq!(collector.io.lock().unwrap().fd, Some(fd));
+
+        collector
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        let err = collector.read(Duration::from_millis(1)).unwrap_err();
+        assert_eq!(err.code, "invalid_state");
+        assert_eq!(collector.io.lock().unwrap().fd, None);
     }
 }

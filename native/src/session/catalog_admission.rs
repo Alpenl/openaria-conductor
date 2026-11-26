@@ -1,13 +1,14 @@
 //! Metadata-only catalog admission. Payload hashes remain download-time checks.
+use crate::sys::fs as sys_fs;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 type Identity = (u64, u64, u32, i64, i64, i64, i64);
+
 fn identity(m: &fs::Metadata) -> Identity {
     (
         m.dev(),
@@ -19,6 +20,7 @@ fn identity(m: &fs::Metadata) -> Identity {
         m.ctime_nsec(),
     )
 }
+
 fn stat_identity(m: &libc::stat) -> Identity {
     (
         m.st_dev,
@@ -30,47 +32,19 @@ fn stat_identity(m: &libc::stat) -> Identity {
         m.st_ctime_nsec,
     )
 }
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid indexed artifact path")
 }
-fn stat_at(fd: i32, name: &CString) -> io::Result<libc::stat> {
-    loop {
-        let mut result = MaybeUninit::<libc::stat>::uninit();
-        if unsafe {
-            libc::fstatat(
-                fd,
-                name.as_ptr(),
-                result.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-        {
-            return Ok(unsafe { result.assume_init() });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+
+fn open_dir_at(fd: i32, name: &CString) -> io::Result<File> {
+    sys_fs::openat_retry(
+        fd,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )
 }
-fn open_at(fd: i32, name: &CString) -> io::Result<File> {
-    loop {
-        let child = unsafe {
-            libc::openat(
-                fd,
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if child >= 0 {
-            return Ok(unsafe { File::from_raw_fd(child) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
+
 fn parts(path: &[u8]) -> io::Result<Vec<&[u8]>> {
     if path.starts_with(b"/") || path.contains(&0) {
         return Err(invalid());
@@ -84,19 +58,22 @@ fn parts(path: &[u8]) -> io::Result<Vec<&[u8]>> {
     }
     Ok(parts)
 }
+
 fn check_parents(root: &File, opened: &[(File, CString, Identity)]) -> io::Result<bool> {
     let mut parent = root.as_raw_fd();
     for (file, name, expected) in opened {
-        if stat_identity(&stat_at(parent, name)?) != *expected {
+        if stat_identity(&sys_fs::fstatat_nofollow(parent, name)?) != *expected {
             return Ok(false);
         }
         parent = file.as_raw_fd();
     }
     Ok(true)
 }
+
 pub fn matches(root: &Path, artifacts: &[(Vec<u8>, i64)]) -> io::Result<bool> {
     matches_inner(root, artifacts, |_| {})
 }
+
 fn matches_inner(
     root: &Path,
     artifacts: &[(Vec<u8>, i64)],
@@ -120,7 +97,7 @@ fn matches_inner(
             let mut fd = directory.as_raw_fd();
             for part in parent {
                 let name = CString::new(*part).map_err(|_| invalid())?;
-                let child = open_at(fd, &name)?;
+                let child = open_dir_at(fd, &name)?;
                 let id = identity(&child.metadata()?);
                 fd = child.as_raw_fd();
                 opened.push((child, name, id));
@@ -131,7 +108,7 @@ fn matches_inner(
             .last()
             .map_or(directory.as_raw_fd(), |(f, _, _)| f.as_raw_fd());
         let name = CString::new(parts[parts.len() - 1]).map_err(|_| invalid())?;
-        let meta = stat_at(fd, &name)?;
+        let meta = sys_fs::fstatat_nofollow(fd, &name)?;
         after_file(index);
         if meta.st_mode & libc::S_IFMT != libc::S_IFREG
             || meta.st_size != *expected_bytes
@@ -148,7 +125,9 @@ fn matches_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
     struct Fixture(std::path::PathBuf);
+
     impl Fixture {
         fn new() -> Self {
             let p = std::env::temp_dir().join(format!(
@@ -163,15 +142,18 @@ mod tests {
             fs::write(p.join("video/left/file"), b"x").unwrap();
             Self(p)
         }
+
         fn artifacts(&self) -> Vec<(Vec<u8>, i64)> {
             vec![(b"video/left/file".to_vec(), 1)]
         }
     }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+
     #[test]
     fn normalizes_posix_paths_and_checks_exact_size() {
         let f = Fixture::new();
@@ -181,6 +163,7 @@ mod tests {
         }
         assert!(matches(&f.0, &[]).unwrap());
     }
+
     #[test]
     fn rejects_escape_nul_empty_paths_and_links() {
         let f = Fixture::new();
@@ -202,6 +185,7 @@ mod tests {
         fs::hard_link(f.0.join("old"), &p).unwrap();
         assert!(!matches(&f.0, &f.artifacts()).unwrap());
     }
+
     #[test]
     fn rejects_parent_replacement_after_file_check() {
         let f = Fixture::new();
@@ -211,6 +195,7 @@ mod tests {
         });
         assert!(!result.unwrap());
     }
+
     #[test]
     fn rejects_root_replacement_after_file_check() {
         let f = Fixture::new();
@@ -223,6 +208,7 @@ mod tests {
         fs::rename(&old, &f.0).unwrap();
         assert!(!result.unwrap());
     }
+
     #[test]
     fn checks_previous_group_before_opening_next() {
         let f = Fixture::new();

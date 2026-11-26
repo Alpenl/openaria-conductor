@@ -1,7 +1,7 @@
-use crate::session_io;
+use crate::session::session_io;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, Read};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -10,6 +10,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
+const MAX_STDERR_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncoderEventError {
@@ -78,6 +81,7 @@ struct ProcessState {
     failure: Option<EncoderProcessError>,
     segments: Vec<SegmentEvent>,
     stats: BTreeMap<String, i64>,
+    stderr_ring: VecDeque<u8>,
 }
 
 impl ProcessState {
@@ -88,7 +92,34 @@ impl ProcessState {
             failure: None,
             segments: Vec::new(),
             stats: BTreeMap::new(),
+            stderr_ring: VecDeque::new(),
         }
+    }
+
+    fn append_stderr(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() >= MAX_STDERR_BYTES {
+            self.stderr_ring.clear();
+            self.stderr_ring
+                .extend(bytes[bytes.len() - MAX_STDERR_BYTES..].iter().copied());
+            return;
+        }
+        let excess = (self.stderr_ring.len() + bytes.len()).saturating_sub(MAX_STDERR_BYTES);
+        if excess > 0 {
+            self.stderr_ring.drain(..excess);
+        }
+        self.stderr_ring.extend(bytes.iter().copied());
+    }
+
+    fn stderr_snippet(&self) -> Option<String> {
+        if self.stderr_ring.is_empty() {
+            return None;
+        }
+        let bytes: Vec<u8> = self.stderr_ring.iter().copied().collect();
+        let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+        if text.is_empty() { None } else { Some(text) }
     }
 }
 
@@ -104,27 +135,29 @@ pub(crate) struct EncoderProcess {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     submitted: u64,
 }
 
+pub(crate) struct EncoderConfig<'a> {
+    pub(crate) out_dir: &'a Path,
+    pub(crate) executable: &'a Path,
+    pub(crate) width: u64,
+    pub(crate) height: u64,
+    pub(crate) fps: u64,
+    pub(crate) bitrate_kbps: u64,
+    pub(crate) segment_frames: u64,
+    pub(crate) path_prefix: &'a str,
+}
+
 impl EncoderProcess {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        out_dir: &Path,
-        executable: &Path,
-        width: u64,
-        height: u64,
-        fps: u64,
-        bitrate_kbps: u64,
-        segment_frames: u64,
-        path_prefix: &str,
-    ) -> Result<Self, EncoderProcessError> {
-        if width == 0
-            || width % 4 != 0
-            || height == 0
-            || fps == 0
-            || bitrate_kbps == 0
-            || segment_frames == 0
+    pub(crate) fn new(config: EncoderConfig<'_>) -> Result<Self, EncoderProcessError> {
+        if config.width == 0
+            || config.width % 4 != 0
+            || config.height == 0
+            || config.fps == 0
+            || config.bitrate_kbps == 0
+            || config.segment_frames == 0
         {
             return Err(EncoderProcessError::new(
                 "invalid_argument",
@@ -132,22 +165,22 @@ impl EncoderProcess {
             ));
         }
         Ok(Self {
-            executable: executable.to_path_buf(),
+            executable: config.executable.to_path_buf(),
             args: vec![
                 "--out-dir".to_owned(),
-                out_dir.to_string_lossy().into_owned(),
+                config.out_dir.to_string_lossy().into_owned(),
                 "--path-prefix".to_owned(),
-                path_prefix.to_owned(),
+                config.path_prefix.to_owned(),
                 "--width".to_owned(),
-                width.to_string(),
+                config.width.to_string(),
                 "--height".to_owned(),
-                height.to_string(),
+                config.height.to_string(),
                 "--fps".to_owned(),
-                fps.to_string(),
+                config.fps.to_string(),
                 "--bitrate-kbps".to_owned(),
-                bitrate_kbps.to_string(),
+                config.bitrate_kbps.to_string(),
                 "--segment-frames".to_owned(),
-                segment_frames.to_string(),
+                config.segment_frames.to_string(),
             ],
             shared: Arc::new(SharedProcess {
                 state: Mutex::new(ProcessState::new()),
@@ -156,6 +189,7 @@ impl EncoderProcess {
             child: None,
             stdin: None,
             reader: None,
+            stderr_reader: None,
             submitted: 0,
         })
     }
@@ -177,21 +211,58 @@ impl EncoderProcess {
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
                 EncoderProcessError::new("encoder_unavailable", format!("无法启动助手：{error}"))
             })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| EncoderProcessError::new("encoder_failed", "无法打开助手事件输出"))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         self.stdin = child.stdin.take();
-        let shared = Arc::clone(&self.shared);
-        self.reader = Some(thread::spawn(move || {
-            read_events(stdout, shared);
-        }));
         self.child = Some(child);
+        let Some(stdout) = stdout else {
+            self.abort();
+            return Err(EncoderProcessError::new(
+                "encoder_failed",
+                "无法打开助手事件输出",
+            ));
+        };
+        let shared = Arc::clone(&self.shared);
+        self.reader = Some(
+            match thread::Builder::new()
+                .name("encoder-events".to_owned())
+                .spawn(move || {
+                    read_events(stdout, shared);
+                }) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.abort();
+                    return Err(EncoderProcessError::new(
+                        "encoder_failed",
+                        format!("启动助手事件线程失败：{error}"),
+                    ));
+                }
+            },
+        );
+        if let Some(stderr) = stderr {
+            let shared_err = Arc::clone(&self.shared);
+            self.stderr_reader = Some(
+                match thread::Builder::new()
+                    .name("encoder-stderr".to_owned())
+                    .spawn(move || {
+                        read_stderr(stderr, shared_err);
+                    }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        self.abort();
+                        return Err(EncoderProcessError::new(
+                            "encoder_failed",
+                            format!("启动助手错误流线程失败：{error}"),
+                        ));
+                    }
+                },
+            );
+        }
         if self.stdin.is_none() {
             self.abort();
             return Err(EncoderProcessError::new(
@@ -273,7 +344,10 @@ impl EncoderProcess {
         // full pipe could block forever before wait_child's timeout even began.
         drop(self.stdin.take());
         let status = {
-            let child = self.child.as_mut().expect("child checked above");
+            let child = self
+                .child
+                .as_mut()
+                .ok_or_else(|| EncoderProcessError::new("invalid_state", "助手进程未启动"))?;
             wait_child(child, timeout).map_err(|error| {
                 EncoderProcessError::new("encoder_failed", format!("助手等待失败：{error}"))
             })?
@@ -282,15 +356,15 @@ impl EncoderProcess {
             self.abort();
             return Err(EncoderProcessError::new(
                 "encoder_failed",
-                "助手未在期限内退出",
+                self.with_stderr("助手未在期限内退出"),
             ));
         };
-        self.join_reader()?;
+        self.join_readers()?;
         self.raise_if_failed()?;
         if !status.success() {
             return Err(EncoderProcessError::new(
                 "encoder_failed",
-                format!("助手退出码 {}", status.code().unwrap_or(-1)),
+                self.with_stderr(format!("助手退出码 {}", status.code().unwrap_or(-1))),
             ));
         }
         Ok(self.segments())
@@ -298,13 +372,26 @@ impl EncoderProcess {
 
     pub(crate) fn abort(&mut self) {
         let _ = self.stdin.take();
-        if let Some(child) = self.child.as_mut() {
+        let mut child_reaped = true;
+        if let Some(mut child) = self.child.take() {
             if matches!(child.try_wait(), Ok(None)) {
                 let _ = child.kill();
             }
-            let _ = child.wait();
+            match wait_child(&mut child, ABORT_WAIT_TIMEOUT) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    // Uninterruptible kernel D-state child cannot be waited forever on close.
+                    child_reaped = false;
+                }
+            }
         }
-        let _ = self.join_reader();
+        if child_reaped {
+            let _ = self.join_readers();
+        } else {
+            // Child pipes may remain open until kernel unblocks; detach reader handles.
+            self.reader.take();
+            self.stderr_reader.take();
+        }
     }
 
     pub(crate) fn segments(&self) -> Vec<SegmentEvent> {
@@ -342,6 +429,20 @@ impl EncoderProcess {
         self.submitted
     }
 
+    fn with_stderr(&self, message: impl Into<String>) -> String {
+        let base = message.into();
+        let snippet = self
+            .shared
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.stderr_snippet());
+        match snippet {
+            Some(stderr) => format!("{base}; stderr={stderr}"),
+            None => base,
+        }
+    }
+
     fn wait_ready(&mut self) -> Result<(), EncoderProcessError> {
         let deadline = Instant::now() + READY_TIMEOUT;
         let mut state = self.shared.state.lock().map_err(|_| {
@@ -376,11 +477,11 @@ impl EncoderProcess {
             self.abort();
             return Err(EncoderProcessError::new(
                 "encoder_unavailable",
-                if closed {
+                self.with_stderr(if closed {
                     "助手未就绪就退出"
                 } else {
                     "助手未在期限内就绪"
-                },
+                }),
             ));
         }
         Ok(())
@@ -396,7 +497,10 @@ impl EncoderProcess {
         Ok(())
     }
 
-    fn join_reader(&mut self) -> Result<(), EncoderProcessError> {
+    fn join_readers(&mut self) -> Result<(), EncoderProcessError> {
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
+        }
         if let Some(reader) = self.reader.take() {
             if reader.join().is_err() {
                 return Err(EncoderProcessError::new(
@@ -415,21 +519,64 @@ impl Drop for EncoderProcess {
     }
 }
 
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, EncoderProcessError> {
+    let mut line = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(EncoderProcessError::new(
+                    "encoder_failed",
+                    format!("助手事件流中断：{error}"),
+                ));
+            }
+        };
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(line));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if line.len() + pos > limit {
+                return Err(EncoderProcessError::new(
+                    "encoder_failed",
+                    "助手输出行超出长度限制",
+                ));
+            }
+            line.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(line));
+        }
+        let consumed = available.len();
+        if line.len() + consumed > limit {
+            return Err(EncoderProcessError::new(
+                "encoder_failed",
+                "助手输出行超出长度限制",
+            ));
+        }
+        line.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
 fn read_events(stdout: std::process::ChildStdout, shared: Arc<SharedProcess>) {
-    let reader = BufReader::new(stdout);
-    for line in reader.split(b'\n') {
-        match line {
-            Ok(line) => {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        match read_bounded_line(&mut reader, MAX_EVENT_LINE_BYTES) {
+            Ok(Some(line)) => {
                 if let Err(error) = handle_event(&shared, &line) {
                     set_failure(&shared, error);
                     break;
                 }
             }
+            Ok(None) => break,
             Err(error) => {
-                set_failure(
-                    &shared,
-                    EncoderProcessError::new("encoder_failed", format!("助手事件流中断：{error}")),
-                );
+                set_failure(&shared, error);
                 break;
             }
         }
@@ -437,6 +584,22 @@ fn read_events(stdout: std::process::ChildStdout, shared: Arc<SharedProcess>) {
     if let Ok(mut state) = shared.state.lock() {
         state.closed = true;
         shared.changed.notify_all();
+    }
+}
+
+fn read_stderr(mut stderr: std::process::ChildStderr, shared: Arc<SharedProcess>) {
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Ok(mut state) = shared.state.lock() {
+                    state.append_stderr(&buffer[..read]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
     }
 }
 
@@ -594,21 +757,25 @@ fn required_artifact_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::{EncoderEvent, SegmentEvent, parse_event};
+    use super::{
+        EncoderEvent, MAX_EVENT_LINE_BYTES, MAX_STDERR_BYTES, ProcessState, SegmentEvent,
+        parse_event, read_bounded_line,
+    };
     use std::collections::BTreeMap;
+    use std::io::Cursor;
 
     #[test]
     fn preserves_first_codec_failure_after_later_errors_and_stats() {
-        let encoder = super::EncoderProcess::new(
-            std::path::Path::new("/unused"),
-            std::path::Path::new("/unused/helper"),
-            3840,
-            1080,
-            30,
-            12000,
-            150,
-            "video/",
-        )
+        let encoder = super::EncoderProcess::new(super::EncoderConfig {
+            out_dir: std::path::Path::new("/unused"),
+            executable: std::path::Path::new("/unused/helper"),
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 12000,
+            segment_frames: 150,
+            path_prefix: "video/",
+        })
         .unwrap();
         super::handle_event(&encoder.shared,
             br#"{"event":"error","code":"frame_rejected","message":"decoder_input_dequeue_failed: ret=-42"}"#).unwrap();
@@ -673,5 +840,94 @@ mod tests {
         let error = parse_event(b"not-json").unwrap_err();
         assert_eq!(error.code, "encoder_failed");
         assert_eq!(error.message, "助手输出不是 JSON");
+    }
+
+    #[test]
+    fn caps_stdout_event_lines_at_64_kib() {
+        let mut cursor = Cursor::new(vec![b'x'; MAX_EVENT_LINE_BYTES + 10]);
+        let error = read_bounded_line(&mut cursor, MAX_EVENT_LINE_BYTES).unwrap_err();
+        assert_eq!(error.code, "encoder_failed");
+        assert!(error.message.contains("超出长度限制"));
+
+        let mut ok_payload = vec![b'a'; MAX_EVENT_LINE_BYTES];
+        ok_payload.push(b'\n');
+        let mut ok_cursor = Cursor::new(ok_payload);
+        let line = read_bounded_line(&mut ok_cursor, MAX_EVENT_LINE_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_EVENT_LINE_BYTES);
+    }
+
+    #[test]
+    fn stderr_ring_buffer_keeps_only_bounded_tail() {
+        let mut state = ProcessState::new();
+        let prefix = vec![b'A'; MAX_STDERR_BYTES];
+        state.append_stderr(&prefix);
+        state.append_stderr(b"tail-diagnostic");
+        let snippet = state.stderr_snippet().unwrap();
+        assert_eq!(snippet.len(), MAX_STDERR_BYTES);
+        assert!(snippet.ends_with("tail-diagnostic"));
+    }
+
+    #[test]
+    fn finish_timeout_escalates_to_sigkill_and_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rp-ylx-encoder-kill-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("child.pid");
+        let helper = root.join("stall-helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\necho $$ > \"{}\"\nprintf '{{\"event\":\"ready\"}}\\n'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&helper, perms).unwrap();
+
+        let mut encoder = super::EncoderProcess::new(super::EncoderConfig {
+            out_dir: &root,
+            executable: &helper,
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 8192,
+            segment_frames: 30,
+            path_prefix: "video/",
+        })
+        .unwrap();
+        encoder.start().unwrap();
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = encoder
+            .finish(std::time::Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(err.code, "encoder_failed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(encoder.child.is_none());
+        // Child was SIGKILLed and reaped (kill(pid, 0) fails with ESRCH).
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(alive, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
