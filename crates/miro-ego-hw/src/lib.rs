@@ -1,9 +1,34 @@
-//! On-device peripheral control traits: GPIO recording button, LED status indicator,
-//! and voice feedback cues for Miro-Ego.
+//! On-device peripheral control implementations and traits: 40-pin GPIO recording button,
+//! sysfs LED status indicator, voice feedback cues, and RDK X5 thermal/board inspection.
+
+pub mod button;
+pub mod indicator;
+pub mod thermal;
+pub mod voice;
 
 use miro_ego_core::CoreError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use button::{
+    BUTTON_CONFIG_SCHEMA, ButtonClassifier, ButtonConfig, ButtonMonitor, CaptureToggleAction,
+    CaptureToggleClient, DEFAULT_BUTTON_CONFIG_PATH, GpioButtonInput, GpioPin,
+    LocalHttpCaptureClient, RDK_X5_GPIO_PINS, SysfsGpioPin,
+};
+pub use indicator::{
+    DEFAULT_LEDS_SYSFS_ROOT, LedIo, LedPattern, SysfsLedController, SysfsLedIo, pattern_for_state,
+};
+pub use thermal::{
+    DEFAULT_BOARD_MODEL_PATH, DEFAULT_THERMAL_ROOT, MAX_VALID_TEMP_C, MIN_VALID_TEMP_C,
+    RDK_X5_BOARD_MODEL, ThermalZoneReading, is_rdk_x5_model, read_board_model,
+    read_board_model_from, read_soc_temperature_c, read_soc_temperature_c_in,
+    read_thermal_zones_in,
+};
+pub use voice::{
+    AplayAudioPlayer, AudioPlayer, DEFAULT_VOICE_DEVICE, VOICE_SETTINGS_SCHEMA,
+    VOICE_STATUS_SCHEMA, VoiceController, VoiceSettings, VoiceStatus, cue_asset_filename,
+    scale_pcm16_wav,
+};
 
 #[derive(Debug, Error)]
 pub enum HwError {

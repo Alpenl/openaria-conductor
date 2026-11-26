@@ -1,9 +1,46 @@
-//! Wi-Fi hotspot/station management, privileged network control socket, and mDNS
-//! service configuration (`_miro-ego._tcp`) for Miro-Ego.
+//! Wi-Fi hotspot/station management, privileged network control socket, bounded network
+//! state store, and mDNS service configuration (`_miro-ego._tcp`) for Miro-Ego.
+
+pub mod controller;
+pub mod mdns;
+pub mod nmcli;
+pub mod rpc;
+pub mod state;
 
 use miro_ego_core::CoreError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use controller::{
+    ApplyDesiredState, ApplyWifiClient, AuthoritativeNetworkController, ControllerConfig,
+    ControllerStatus, CredentialReceipt, EphemeralCredentialStore, MutationCapability,
+    MutationOutcome, ScanResponse, WatchdogMode, compute_watchdog_mode,
+};
+pub use mdns::{
+    AVAHI_SERVICE_FILENAME, AvahiServiceRecord, DEFAULT_AVAHI_SERVICES_DIR, DEFAULT_MDNS_API_PATH,
+    DEFAULT_MDNS_PORT, MdnsScheme, MdnsServiceConfig, MdnsStatus,
+};
+pub use nmcli::{
+    CommandOutput, CommandRunner, ConnectionSummary, DEFAULT_ETHERNET_INTERFACE,
+    DEFAULT_HOTSPOT_IPV4_CIDR, DEFAULT_RESCUE_HOTSPOT_PSK, DEFAULT_WIFI_INTERFACE,
+    DeviceLinkSnapshot, NetworkDeviceInfo, NmcliBackend, ProfileSpec, RescueHotspotInfo,
+    StaticIpv4Config, SystemCommandRunner, WifiScanEntry, WifiSecurity, derive_rescue_identity,
+    managed_profile_name, parse_wifi_scan_output,
+};
+pub use rpc::{
+    CONTROL_REQUEST_SCHEMA, CONTROL_RESPONSE_SCHEMA, DEFAULT_CONTROL_SOCKET_PATH,
+    MAX_RPC_LINE_BYTES, NetworkRpcClient, NetworkRpcServer, RpcErrorBody, RpcRequest, RpcResponse,
+    RpcServerConfig,
+};
+pub use state::{
+    CredentialState, DEFAULT_NETWORK_STATE_FILE, DEVICE_MONOTONIC_TIME_BASE, DesiredEthernet,
+    DesiredMode, DesiredState, DesiredWifiClient, EthernetAddressing, MAX_RETAINED_RECEIPTS,
+    MAX_STATE_FILE_BYTES, NETWORK_RECEIPT_SCHEMA, NETWORK_STATE_SCHEMA, NETWORK_TRANSACTION_SCHEMA,
+    NetworkDeviceDeadline, NetworkStateStore, NetworkTransaction, PersistedNetworkState,
+    RecoveryAction, RescueMetadata, RetainedCandidate, StateSnapshot, TransactionError,
+    TransactionOperation, TransactionReceipt, TransactionStage, TransactionStatus,
+    TransactionUpdate, TransactionWindow,
+};
 
 pub const MDNS_SERVICE_TYPE: &str = "_miro-ego._tcp";
 pub const HOTSPOT_SSID_PREFIX: &str = "MiroEgo-";
@@ -51,24 +88,7 @@ pub struct StationCredentials {
     pub country_code: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MdnsServiceConfig {
-    pub service_type: String,
-    pub instance_name: String,
-    pub port: u16,
-}
-
-impl MdnsServiceConfig {
-    pub fn for_host(hostname: &str, port: u16) -> Self {
-        Self {
-            service_type: MDNS_SERVICE_TYPE.to_owned(),
-            instance_name: format!("Miro-Ego on {hostname}"),
-            port,
-        }
-    }
-}
-
-/// Privileged network control-plane trait implemented in Wave 3.
+/// Privileged network control-plane trait implemented by [`AuthoritativeNetworkController`].
 pub trait NetworkController: Send + Sync {
     fn status(&self) -> NetworkResult<WifiStatus>;
     fn start_hotspot(&self, ssid: &str) -> NetworkResult<WifiStatus>;
