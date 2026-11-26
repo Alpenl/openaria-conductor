@@ -1,0 +1,14 @@
+[Unit]
+Description=Miro-Ego privileged network-control socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/miro-ego/network-control.sock
+SocketUser=miro-ego
+SocketGroup=miro-ego
+SocketMode=0600
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

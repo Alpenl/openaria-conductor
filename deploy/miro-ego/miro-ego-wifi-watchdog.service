@@ -1,0 +1,37 @@
+[Unit]
+Description=Miro-Ego RDK X5 Wi-Fi health and recovery check
+After=systemd-tmpfiles-setup.service NetworkManager.service network.target miro-ego-network.socket miro-ego-network.service miro-ego-data-volume.service
+Wants=NetworkManager.service miro-ego-network.socket
+
+[Service]
+Type=oneshot
+SupplementaryGroups=miro-ego
+EnvironmentFile=-/etc/default/miro-ego-wifi-watchdog
+Environment=MIRO_EGO_NETWORK_OPERATION_LOCK_PATH=/run/miro-ego/network-operation.lock
+Environment=MIRO_EGO_MAINTENANCE_LOCK=/run/miro-ego/maintenance.lock
+Environment=MIRO_EGO_DATA_MOUNT=/data
+ExecStart=/usr/local/sbin/miro-ego-wifi-watchdog check
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=miro-ego-wifi-watchdog
+StateDirectory=miro-ego-wifi-watchdog
+RuntimeDirectory=miro-ego-wifi-watchdog
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/miro-ego/network-operation.lock
+ReadWritePaths=-/run/miro-ego/maintenance.lock
+ReadWritePaths=-/data/logs
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT CAP_SYS_MODULE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_BOOT CAP_SYS_MODULE
+RestrictSUIDSGID=yes
+LockPersonality=yes

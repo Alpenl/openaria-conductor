@@ -1,0 +1,34 @@
+[Unit]
+Description=Miro-Ego RDK X5 physical recording button
+Wants=miro-ego.service
+After=miro-ego.service systemd-tmpfiles-setup.service
+PartOf=miro-ego.service
+ConditionPathExists=/etc/miro-ego/button.json
+ConditionPathExists=/opt/miro-ego/current/bin/miro-ego
+
+[Service]
+Type=simple
+User=root
+Group=miro-ego
+Environment=RUST_LOG=info
+ExecStart=/opt/miro-ego/current/bin/miro-ego button --config /etc/miro-ego/button.json --device-config /etc/miro-ego/device.json
+LimitCORE=0
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=miro-ego-button
+
+[Install]
+WantedBy=miro-ego.service

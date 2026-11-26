@@ -1,0 +1,15 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">Miro-Ego on %h</name>
+  <service>
+    <type>_miro-ego._tcp</type>
+    <port>8080</port>
+    <txt-record>scheme=https</txt-record>
+    <txt-record>api=/api/v1/device</txt-record>
+  </service>
+  <service>
+    <type>_https._tcp</type>
+    <port>8080</port>
+  </service>
+</service-group>

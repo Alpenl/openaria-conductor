@@ -1,0 +1,47 @@
+[Unit]
+Description=Recover interrupted Miro-Ego release transaction
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=miro-ego-data-volume.service miro-ego-network.service miro-ego.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=RUST_LOG=info
+ExecStart=/opt/miro-ego/current/bin/miro-ego deploy recover --service-start
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=miro-ego-recover
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/miro-ego
+ReadWritePaths=/var/lib/miro-ego
+ReadWritePaths=/etc/miro-ego
+ReadWritePaths=-/etc/avahi/services
+ReadWritePaths=/usr/local/sbin
+ReadWritePaths=/usr/lib/systemd/system
+ReadWritePaths=/usr/lib/sysusers.d
+ReadWritePaths=/usr/lib/tmpfiles.d
+ReadWritePaths=-/etc/systemd/system/fstrim.service.d
+ReadWritePaths=-/etc/systemd/system/logrotate.timer.d
+ReadWritePaths=-/etc/systemd/journald.conf.d
+ReadWritePaths=-/etc/systemd/system.conf.d
+ReadWritePaths=-/etc/systemd/coredump.conf.d
+ReadWritePaths=-/etc/logrotate.d
+ReadWritePaths=-/etc/apt/apt.conf.d
+ReadWritePaths=-/etc/modprobe.d
+ReadWritePaths=-/etc/NetworkManager/conf.d
+ReadWritePaths=/etc/default
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
