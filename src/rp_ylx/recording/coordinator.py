@@ -5251,6 +5251,7 @@ class CaptureCoordinator:
         limit: int,
         take_id: str | None,
         api_version: str = "v3",
+        include_recovery: bool = False,
     ) -> Mapping[str, object]:
         try:
             self._check_generation(force=True)
@@ -5261,7 +5262,7 @@ class CaptureCoordinator:
                 status=HTTPStatus.CONFLICT,
                 retryable=True,
             ) from error
-        self._require_admission()
+        admission = self._require_admission()
         # Listing is deliberately metadata-only. Full artifact hashing is
         # deferred until a caller requests a concrete artifact, so a large
         # recording volume does not block the initial web UI render.
@@ -5270,6 +5271,12 @@ class CaptureCoordinator:
             # Keep the catalog stable while selecting the page. Only response
             # entries need isolated copies; unselected nested data never escapes.
             all_items = list(self._session_summaries.values())
+            if api_version == "v4" and include_recovery:
+                recovered = self._catalog_db.recovered_sessions(admission.volume_id)
+                all_items = [
+                    {**item, "recovered_prefix": True} if item["session_id"] in recovered else item
+                    for item in all_items
+                ]
             diagnostics = list(self._session_diagnostics.values())
             all_items.sort(
                 key=lambda item: (str(item["started_at"]), str(item["session_id"])),

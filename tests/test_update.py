@@ -133,6 +133,51 @@ class OnlineUpdateTest(unittest.TestCase):
             self.assertEqual(download.call_count, 2)
             self.assertEqual(update.sha256(target), self.manifest["bundle"]["sha256"])
 
+    def test_exfat_install_verifies_extracted_bytes_and_reclaims_staging(self):
+        from contextlib import nullcontext
+
+        medium = self.root / "medium"
+        medium.mkdir()
+        cache = self.root / "cache"
+        cache.mkdir()
+        with (
+            patch.object(update, "require_configured_exfat_volume", return_value=True),
+            patch.object(update, "recording_scratch", return_value=nullcontext(medium)),
+            patch.object(update, "CONFIG", self.root / "missing"),
+            patch.object(update, "download", side_effect=self.download),
+        ):
+            stage = self.root / "stage"
+            stage.mkdir()
+            update.unpack_for_install(self.manifest, cache, stage)
+            update.verify_bundle(stage, self.manifest)
+            self.assertEqual(list(medium.iterdir()), [])
+            self.assertEqual(list(cache.iterdir()), [])
+            wrong = dict(self.manifest, bundle={**self.manifest["bundle"], "sha256": "0" * 64})
+            stage = self.root / "bad"
+            stage.mkdir()
+            with self.assertRaisesRegex(ValueError, "校验"):
+                update.unpack_for_install(wrong, cache, stage)
+            self.assertEqual(list(medium.iterdir()), [])
+            with (
+                patch.object(update.shutil, "disk_usage", return_value=Mock(free=2 * 1024**3)),
+                self.assertRaisesRegex(ValueError, "空间不足"),
+            ):
+                update.unpack_for_install(self.manifest, cache, stage)
+
+    def test_cache_sweep_keeps_active_transaction_and_unrelated_files(self):
+        cache = self.root / "cache"
+        cache.mkdir()
+        active = cache / ".stage-bbbbbbbb"
+        active.mkdir()
+        stale = cache / ".stage-12345678"
+        stale.mkdir()
+        (stale / "partial").touch()
+        current = "1" * 64 + ".tar.gz"
+        for name in (current, "0" * 64 + ".tar.gz", "user.tar.gz"):
+            (cache / name).touch()
+        update.prune_update_cache(cache, current, active)
+        self.assertEqual({p.name for p in cache.iterdir()}, {current, active.name, "user.tar.gz"})
+
     def test_failed_download_never_leaves_verified_cache(self):
         cache = self.root / "cache"
         cache.mkdir()

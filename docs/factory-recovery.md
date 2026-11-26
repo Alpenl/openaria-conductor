@@ -57,17 +57,17 @@ python recover.py auto-flash --disk <整盘> --image <官方.img> --sha256 <官�
 
 ## 独立 exFAT 录像区（2026-11-06 验收候选）
 
-菜单5/`auto-flash` 默认使用新布局：官方 CONFIG 256 MiB、ext4 系统区16 GiB、
+菜单5/`auto-flash` 默认使用新布局：官方 CONFIG 256 MiB、固定 20 GiB ext4 系统区、
 其余容量为 exFAT `RECORDINGS`（最多不足1 MiB对齐余量）。系统、录制软件和状态数据库在ext4；
 录像区挂载 `/data`，录像路径 `/data/recordings`，Windows/macOS读卡器中对应 `RECORDINGS/recordings`。
 普通升级保留旧80 GiB loop卷；转换布局必须重新刷卡，不能在原卡上直接缩系统区。
 
-`--system-gib` 可设置16–64 GiB，必须为录像保留至少4 GiB。
+`--system-gib` 仅接受20 GiB，必须为录像保留至少4 GiB。
 生成镜像仍只写约10.4 GB官方有效载荷，分区表按目标卡实际容量生成；
 不能把为大卡生成的镜像刷到更小卡，工具会在擦写前拒绝。大于目标的卡不会自动扩展额外空间，需重新生成镜像。
-新布局要求支持exFAT的固件；旧包会在合成前被拒绝。`--storage legacy-loop` 可显式生成旧布局。
+新布局要求支持exFAT的固件；旧包会在合成前被拒绝。新制卡统一采用上述布局。
 
-电脑合成前取得官方Ubuntu Jammy ARM64 `exfatprogs` 包并校验固定SHA-256，包随CONFIG分区写入；
+电脑合成前取得官方Ubuntu Jammy ARM64 `exfatprogs` 和 `logrotate` 包并校验固定SHA-256，包随CONFIG分区写入；
 首次开机离线安装。工具包中的 `tools/` 可预置此包，因此现场刷卡不必联网。
 依赖来源：[Ubuntu exfatprogs](https://packages.ubuntu.com/jammy-updates/arm64/exfatprogs/download)。
 

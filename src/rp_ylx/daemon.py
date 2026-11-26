@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import json
 import os
@@ -424,10 +425,17 @@ def _enable_customer_tls(server: Any, config: ProductionConfig) -> None:
         raise ProductionConfigError("无法启用 Customer TLS") from error
 
 
-def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
-    lock = threading.Lock()
+API_AUDIT_FILE_BYTES = 32 * 1024 * 1024
 
-    def write(event: AuditEvent) -> None:
+
+def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
+    archive = path.with_name(path.name + ".1")
+
+    poll_lock = threading.Lock()
+    pending_polls = 0
+    next_poll_report = 0.0
+
+    def append(event: AuditEvent, poll_count: int = 0) -> None:
         value = {
             "schema": "ylx.api-audit-event.v1",
             "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -437,11 +445,15 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
             "resource_id": event.resource_id,
             "outcome": event.outcome,
         }
+        if poll_count:
+            value["poll_count"] = poll_count
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= os.O_NONBLOCK
-        with lock:
+        if len(payload) > API_AUDIT_FILE_BYTES:
+            raise OSError("API audit record exceeds the log file budget")
+        while True:
             # Reject special files before open can block or affect a device.
             # The descriptor check below also covers replacement after lstat.
             try:
@@ -453,19 +465,48 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
                     raise OSError("API audit target must be an exclusively linked regular file")
             descriptor = os.open(path, flags, 0o600)
             try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
                 metadata = os.fstat(descriptor)
+                # Another writer may have rotated this inode while we waited.
+                try:
+                    current = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if not os.path.samestat(metadata, current):
+                    continue
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise OSError("API audit target must be an exclusively linked regular file")
                 if metadata.st_mode & 0o777 != 0o600:
                     os.fchmod(descriptor, 0o600)
+                if metadata.st_size + len(payload) > API_AUDIT_FILE_BYTES:
+                    os.replace(path, archive)
+                    continue
                 remaining = memoryview(payload)
                 while remaining:
                     written = os.write(descriptor, remaining)
                     if written <= 0:
                         raise OSError("API audit record was not fully written")
                     remaining = remaining[written:]
+                return
             finally:
                 os.close(descriptor)
+
+    def write(event: AuditEvent) -> None:
+        nonlocal pending_polls, next_poll_report
+        if (event.operation_id, event.outcome, event.principal_id) != (
+            "getCaptureStatus",
+            "allowed",
+            "isolated-lab-device",
+        ):
+            append(event)
+            return
+        with poll_lock:
+            pending_polls += 1
+            now = time.monotonic()
+            if now >= next_poll_report:
+                append(event, pending_polls)
+                pending_polls = 0
+                next_poll_report = now + 60
 
     return write
 

@@ -40,9 +40,43 @@ class AuditFileAdmissionTest(unittest.TestCase):
         self.assertTrue(all(row["request_id"] == "request" for row in rows))
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
+    def test_lab_status_polls_aggregate_without_coalescing_denials_or_customer_audit(self):
+        poll = AuditEvent("req", "isolated-lab-device", "getCaptureStatus", None, "allowed")
+        with patch("rp_ylx.daemon.time.monotonic", return_value=0):
+            with ThreadPoolExecutor(max_workers=6) as workers:
+                list(workers.map(self.sink, [poll] * 100))
+            self.sink(AuditEvent("denial", None, "getCaptureStatus", None, "forbidden"))
+            self.sink(AuditEvent("authorized", "customer", "getCaptureStatus", None, "allowed"))
+        with patch("rp_ylx.daemon.time.monotonic", return_value=60):
+            self.sink(poll)
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([r.get("poll_count") for r in rows], [1, None, None, 100])
+        self.assertEqual([r["request_id"] for r in rows[1:3]], ["denial", "authorized"])
+
     def test_fifo_without_reader_does_not_block_open(self):
         os.mkfifo(self.path)
         self.check_fifo_child(race=False)
+
+    def test_multiple_writers_rotate_whole_records_and_bound_both_files(self):
+        sinks = [_audit_sink(self.path) for _ in range(4)]
+
+        def write(i):
+            sinks[i % 4](AuditEvent(str(i), None, "getDevice", None, "allowed"))
+
+        with patch("rp_ylx.daemon.API_AUDIT_FILE_BYTES", 4096):
+            with ThreadPoolExecutor(max_workers=8) as workers:
+                list(workers.map(write, range(240)))
+            write(240)
+        archive = self.path.with_name(self.path.name + ".1")
+        ids = []
+        for p in (archive, self.path):
+            self.assertLessEqual(p.stat().st_size, 4096)
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+            ids.extend(json.loads(line)["request_id"] for line in p.read_text().splitlines())
+        self.assertEqual(ids[-1], "240")
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreater(len(ids), 15)
+        self.assertEqual(set(self.root.iterdir()), {archive, self.path})
 
     def test_fifo_replacing_regular_file_between_inspection_and_open_does_not_block(self):
         self.path.write_text("")

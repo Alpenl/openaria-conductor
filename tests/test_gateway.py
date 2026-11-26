@@ -674,10 +674,12 @@ class DeviceProvider:
         limit: int,
         take_id: str | None,
         api_version: str,
+        include_recovery: bool = False,
     ) -> dict[str, object]:
         self.last_list_query = (cursor, limit, take_id)
         if self.list_error is not None:
             raise self.list_error
+        self.last_include_recovery = include_recovery
         return deepcopy(SESSION_LIST_V4 if api_version == "v4" else SESSION_LIST)
 
     def open_manifest(self, session_id: str, api_version: str) -> MemoryRepresentation:
@@ -2345,6 +2347,12 @@ class GatewayHttpTest(unittest.TestCase):
         self.assertEqual(json.loads(payload)["error"]["code"], "camera_focus_unsupported")
 
     def test_session_listing_validates_query_and_preserves_provider_projection(self) -> None:
+        status, opted_in, _ = self.request(
+            "/api/v4/sessions", token="reader-token", headers={"Prefer": "include-recovery"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(opted_in), SESSION_LIST_V4)
+        self.assertTrue(self.server.provider.last_include_recovery)
         take_id = "01989f69-f000-7c3d-ae4f-5061728394a5"
         status, payload, _ = self.request(
             f"/api/v3/sessions?cursor=next-page&limit=17&take_id={take_id}",

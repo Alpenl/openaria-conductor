@@ -121,7 +121,7 @@ def compose(
     output,
     *,
     card_bytes=None,
-    system_gib=16,
+    system_gib=partition_layout.SYSTEM_GIB,
     tools_directory=None,
 ):
     from pyfatfs.PyFatFS import PyFatFS
@@ -138,7 +138,14 @@ def compose(
         require_partition_firmware(bundle)
         with base.open("rb") as src:
             mbr, layout = partition_layout.plan(src.read(512), card_bytes, system_gib)
-        package = partition_layout.prepare_tools(tools_directory or output.parent / "tools")
+        tools = tools_directory or output.parent / "tools"
+        package = partition_layout.prepare_tools(tools)
+        logrotate = partition_layout.prepare_tools(
+            tools,
+            partition_layout.LOGROTATE,
+            partition_layout.LOGROTATE_URL,
+            partition_layout.LOGROTATE_SHA256,
+        )
     with PyFatFS(str(base), offset=offset, read_only=True) as fat:
         hook = fat.readtext("/hobot_config.sh")
         lines = [s.strip() for s in hook.splitlines() if s.strip() and not s.startswith("#")]
@@ -171,6 +178,7 @@ def compose(
                 fat.writebytes("/openaria/" + name, (source / name).read_bytes())
             if layout is not None:
                 fat.writebytes("/openaria/" + package.name, package.read_bytes())
+                fat.writebytes("/openaria/" + partition_layout.LOGROTATE, logrotate.read_bytes())
             fat.writebytes("/openaria/profile.bin", sealed)
             with bundle.open("rb") as src, fat.openbin("/openaria/bundle.tar", "w") as dst:
                 shutil.copyfileobj(src, dst, 4 * 1024**2)
