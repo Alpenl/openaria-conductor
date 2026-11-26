@@ -1,50 +1,55 @@
-//! Miro-Ego v1 HTTP API contract constants, structured error types, and service traits.
+//! Miro-Ego v1 async `tokio` + `axum` + `rustls` HTTP/HTTPS device gateway.
+//!
+//! Implements all 37 OpenAPI v1 operations under `/api/v1/...`, zero-copy MJPEG & H.264 preview
+//! streaming, RFC 9110 `Range`/`If-Range` downloads with `posix_fadvise` page-cache eviction,
+//! bounded SSE replay buffers with DoS-safe `Last-Event-ID`, and strict Host/Origin/CORS/CSRF
+//! security enforcement.
 
-use miro_ego_core::CoreError;
+pub mod backend;
+pub mod downloads;
+pub mod error;
+pub mod handlers;
+pub mod middleware;
+pub mod preview;
+pub mod range;
+pub mod router;
+pub mod security;
+pub mod server;
+pub mod sse;
+
+pub use backend::{
+    CommandOutcome, GatewayBackend, IdempotentCommand, ListLogsQuery, ListSessionsQuery,
+    MockArtifact, MockArtifactBacking, MockGatewayBackend, MockLogEntry, MockSession, RawManifest,
+    StaticAsset,
+};
+pub use downloads::{DownloadSource, OpenRepresentation, ResolvedRange, open_safe_log_file};
+pub use error::{
+    API_ERROR_SCHEMA, ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE,
+    HEADER_MANIFEST_SHA256, HEADER_WAIT_STATE,
+};
+pub use middleware::{CORS_EXPOSE_HEADERS, GatewayRuntimeConfig, GatewayState, MAX_BODY_BYTES};
+pub use preview::{
+    H264PreviewHub, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, MjpegPreviewHub, PreviewFrame,
+};
+pub use range::{
+    ByteRange, UnsatisfiableRange, infer_log_media_type, is_valid_log_name, is_valid_log_prefix,
+    parse_single_range,
+};
+pub use router::{API_V1_PREFIX, ROUTE_TABLE, RouteOperationSpec, build_router};
+pub use security::{
+    ALL_V1_OPERATION_IDS, AUDIT_EVENT_SCHEMA, AuditEvent, IDEMPOTENCY_OPERATION_IDS,
+    MUTATION_OPERATION_IDS, Principal, SecurityPolicy, SecurityProfile, extract_host_hostname,
+    is_allowed_gateway_host, is_valid_idempotency_key, normalize_allowed_hosts,
+};
+pub use server::{GatewayServer, GatewayServerConfig, TlsConfig};
+pub use sse::{
+    CAPTURE_EVENT_SCHEMA, DEFAULT_REPLAY_CAPACITY, EventCursor, EventReplayBuffer,
+    NETWORK_EVENT_SCHEMA, NetworkEventReplayBuffer, SseEvent, parse_last_event_id,
+};
+
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-pub const API_V1_PREFIX: &str = "/api/v1";
-pub const API_ERROR_SCHEMA: &str = "miro-ego.api-error.v1";
-
-pub const HEADER_AUDIT_STATUS: &str = "Miro-Ego-Audit-Status";
-pub const HEADER_ERROR_CODE: &str = "Miro-Ego-Error-Code";
-pub const HEADER_MANIFEST_SHA256: &str = "Miro-Ego-Manifest-SHA256";
-pub const HEADER_WAIT_STATE: &str = "Miro-Ego-Wait-State";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
-#[error("{code}: {message}")]
-pub struct ApiError {
-    pub schema: String,
-    pub status_code: u16,
-    pub code: String,
-    pub message: String,
-}
-
-impl ApiError {
-    pub fn new(status_code: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            schema: API_ERROR_SCHEMA.to_owned(),
-            status_code,
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-}
-
-impl From<CoreError> for ApiError {
-    fn from(error: CoreError) -> Self {
-        let status_code = match &error {
-            CoreError::InvalidInput { .. } | CoreError::InvalidConfig { .. } => 400,
-            CoreError::LockBusy { .. } => 409,
-            CoreError::Io { .. } | CoreError::Poisoned { .. } => 500,
-        };
-        Self::new(status_code, error.code(), error.to_string())
-    }
-}
-
-pub type ApiResult<T> = Result<T, ApiError>;
-
+/// Legacy Wave 1/2 bootstrap server configuration kept for workspace compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiServerConfig {
     pub bind_host: String,
@@ -64,6 +69,7 @@ impl Default for ApiServerConfig {
     }
 }
 
+/// Summary of a user-visible diagnostic log file under `/data/logs/`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogFileSummary {
     pub name: String,
@@ -71,7 +77,7 @@ pub struct LogFileSummary {
     pub modified_epoch_secs: u64,
 }
 
-/// Core control-plane service contract wired to `/api/v1/...` HTTP handlers in Wave 3.
+/// Synchronous summary control-plane trait preserved from Wave 1/2 workspace scaffolding.
 pub trait ApiService: Send + Sync {
     fn health_json(&self) -> ApiResult<serde_json::Value>;
     fn device_info_json(&self) -> ApiResult<serde_json::Value>;
