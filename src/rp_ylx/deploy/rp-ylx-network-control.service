@@ -1,7 +1,7 @@
 [Unit]
 Description=Open Aria privileged network and clock control worker
 Requires=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
-After=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket
+After=NetworkManager.service rp-ylx-recover.service rp-ylx-network-control.socket systemd-tmpfiles-setup.service
 Before=rp-ylx.service
 
 [Service]
@@ -10,6 +10,7 @@ NotifyAccess=main
 TimeoutStartSec=120s
 User=root
 Group=root
+SupplementaryGroups=rp-ylx
 Environment=RP_YLX_NETWORK_STATE_DIR=/var/lib/rp-ylx-network
 Environment=RP_YLX_NETWORK_OPERATION_LOCK_PATH=/run/rp-ylx/network-operation.lock
 Environment=PYTHONUNBUFFERED=1
@@ -28,7 +29,7 @@ ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/rp-ylx-network
 ReadWritePaths=/etc/NetworkManager/system-connections
-ReadWritePaths=/etc/avahi/services
+ReadWritePaths=-/etc/avahi/services
 ReadWritePaths=/run/rp-ylx/network-operation.lock
 RestrictSUIDSGID=yes
 LockPersonality=yes

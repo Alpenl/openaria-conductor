@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes.util
 import fcntl
+import grp
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -42,44 +45,96 @@ UPDATER_DIRECTORY = Path("/usr/local/lib/openaria")
 UPDATE_COMMAND = Path("/usr/local/sbin/openaria-update")
 DATA_VOLUME_CONFIG = Path("/etc/default/rp-ylx-data-volume")
 FACTORY_STORAGE_STATE = Path("/var/lib/openaria-factory/firstboot/storage.json")
+RELEASE_SIGNING_PUBLIC_KEY = Path("/usr/local/lib/openaria/release-signing.pub")
+OPENARIA_UPDATE_PUBLIC_KEY_ENV = "OPENARIA_UPDATE_PUBLIC_KEY"
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 class MaintenanceBusyError(ValueError):
     """A cooperating capture or maintenance process currently holds the lease."""
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def _unique_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON 包含重复键")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"JSON 包含非法数值常量：{value}")
+
+
+def _loads_strict_json(raw: str | bytes) -> object:
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+    return json.loads(
+        text,
+        object_pairs_hook=_unique_json_pairs,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    error_message: str,
+    too_large_message: str | None = None,
+    forbidden_mode: int = 0,
+) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(error_message) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(error_message)
+        if forbidden_mode and (stat.S_IMODE(info.st_mode) & forbidden_mode):
+            raise ValueError(error_message)
+        if info.st_size > max_bytes:
+            raise ValueError(too_large_message or error_message)
+        chunks = bytearray()
+        while len(chunks) <= max_bytes:
+            block = os.read(fd, min(8192, max_bytes + 1 - len(chunks)))
+            if not block:
+                break
+            chunks.extend(block)
+        if len(chunks) > max_bytes:
+            raise ValueError(too_large_message or error_message)
+        return bytes(chunks)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path: Path, value: dict, *, mode: int = 0o600) -> None:
     """Publish a durable JSON file, cleaning only our unpublished temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            json.dump(value, stream, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except BaseException:
-        # Cleanup covers serialization and file fsync too, not just replace.
-        # A failed cleanup must not hide the original I/O or cancellation error.
-        # Once replace succeeds, never remove or roll back the published path.
-        if temporary is not None:
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
-        raise
+    payload = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    _atomic_write_file(path, payload, mode)
 
 
 def sqlite_state_required() -> bool:
     root = Path("/var/lib/rp-ylx")
-    if CONFIG.exists():
-        value = json.loads(CONFIG.read_bytes())
+    if os.path.lexists(CONFIG):
+        value = _loads_strict_json(
+            _read_bounded_regular_file(
+                CONFIG,
+                max_bytes=128 * 1024,
+                error_message="设备配置文件无效",
+                forbidden_mode=0o022,
+            )
+        )
+        if not isinstance(value, dict):
+            raise ValueError("设备配置文件无效")
         root = Path(value.get("state_root", str(root)))
     return any((root / (name + ".sqlite3.initialized")).exists() for name in ("state", "settings"))
 
@@ -89,6 +144,82 @@ def require_sqlite_wheel(path: Path) -> None:
         with zipfile.ZipFile(path) as wheel:
             if "rp_ylx/persistence.py" not in wheel.namelist():
                 raise ValueError("设备已迁移 SQLite，目标固件不支持当前状态；禁止直接降级")
+
+
+def _parse_data_volume_config() -> dict[str, str]:
+    values: dict[str, str] = {}
+    if os.path.lexists(DATA_VOLUME_CONFIG):
+        raw = _read_bounded_regular_file(
+            DATA_VOLUME_CONFIG,
+            max_bytes=64 * 1024,
+            error_message="录像分区配置不可读或无效",
+        )
+        for line in raw.decode("utf-8").splitlines():
+            fields = shlex.split(line, comments=True)
+            if not fields:
+                continue
+            if len(fields) != 1 or "=" not in fields[0]:
+                raise ValueError("录像分区配置格式无效")
+            key, value = fields[0].split("=", 1)
+            if key in values:
+                raise ValueError("录像分区配置项重复")
+            values[key] = value
+    return values
+
+
+def exfat_storage_required() -> bool:
+    if os.environ.get("RP_YLX_DATA_VOLUME_MODE") == "exfat" or os.path.lexists(
+        FACTORY_STORAGE_STATE
+    ):
+        return True
+    values = _parse_data_volume_config()
+    return values.get("RP_YLX_DATA_VOLUME_MODE") == "exfat"
+
+
+def release_supports_exfat(package_root: Path) -> bool:
+    """Verify an unpacked rp_ylx release handles exFAT f_files == 0 and PARTUUID."""
+    recording_candidates = (
+        package_root / "recording" / "volume.py",
+        package_root / "recording" / "fs_safety.py",
+        package_root / "recording" / "coordinator.py",
+    )
+    has_recording_exfat = any(
+        candidate.is_file() and "f_files" in candidate.read_text(encoding="utf-8", errors="ignore")
+        for candidate in recording_candidates
+    )
+    data_volume_script = package_root / "deploy" / "rp-ylx-data-volume"
+    has_deploy_exfat = False
+    if data_volume_script.is_file():
+        script_text = data_volume_script.read_text(encoding="utf-8", errors="ignore")
+        has_deploy_exfat = "exfat" in script_text and "PARTUUID" in script_text
+    return has_recording_exfat and has_deploy_exfat
+
+
+def require_storage_compatible_wheel(path: Path) -> None:
+    if not exfat_storage_required():
+        return
+    with zipfile.ZipFile(path) as wheel:
+        names = set(wheel.namelist())
+
+        def contains(member: str, token: str) -> bool:
+            if member not in names:
+                return False
+            return token in wheel.read(member).decode("utf-8", errors="ignore")
+
+        has_recording_exfat = any(
+            contains(member, "f_files")
+            for member in (
+                "rp_ylx/recording/volume.py",
+                "rp_ylx/recording/fs_safety.py",
+                "rp_ylx/recording/coordinator.py",
+            )
+        )
+        script_member = "rp_ylx/deploy/rp-ylx-data-volume"
+        has_deploy_exfat = contains(script_member, "exfat") and contains(script_member, "PARTUUID")
+        if not (has_recording_exfat and has_deploy_exfat):
+            raise ValueError(
+                "设备已启用 exFAT 独立录像分区，目标固件不支持 exFAT（f_files == 0）；禁止直接降级"
+            )
 
 
 @contextmanager
@@ -109,13 +240,26 @@ def maintenance_lock(*, shared: bool = False):
     ):
         yield
         return
-    if not shared:
-        # A pristine board has not installed the tmpfiles configuration yet.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if not shared or "OPENARIA_MAINTENANCE_LOCK" in os.environ:
+        # A pristine board or isolated test env may not have the parent directory yet.
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        if os.geteuid() == 0 and (path.parent.stat().st_mode & 0o050) != 0o050:
+            os.chmod(path.parent, 0o755)
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o660)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError("更新维护锁不是普通文件")
+        # Preserve group-writable permissions even under firmware_control's umask(0077).
+        if os.geteuid() == 0 or info.st_uid == os.geteuid():
+            os.fchmod(fd, 0o660)
+        if os.geteuid() == 0:
+            with suppress(KeyError):
+                gid = grp.getgrnam("rp-ylx").gr_gid
+                if info.st_gid != gid:
+                    os.fchown(fd, -1, gid)
         try:
             fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -144,6 +288,7 @@ def prepare_first_install_network(
         # This updater also runs standalone, before the application is importable.
         db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
         try:
+            db.execute("PRAGMA busy_timeout=5000")
             if (
                 db.execute("PRAGMA application_id").fetchone()[0] != 0x594C5801
                 or db.execute("PRAGMA user_version").fetchone()[0] != 1
@@ -152,11 +297,13 @@ def prepare_first_install_network(
             row = db.execute("SELECT body FROM documents WHERE name='controller'").fetchone()
             if row is None:
                 raise ValueError("网络控制器状态缺失")
-            controller = json.loads(row[0])
+            controller = _loads_strict_json(row[0])
         finally:
             db.close()
     else:
-        controller = json.loads(controller_path.read_bytes()) if controller_path.exists() else None
+        controller = (
+            _loads_strict_json(controller_path.read_bytes()) if controller_path.exists() else None
+        )
     if controller is not None and not isinstance(controller, dict):
         raise ValueError("网络控制器状态无效，停止继承 Wi-Fi")
     if controller is not None and not (
@@ -303,23 +450,46 @@ def prepare_first_install_network(
                 source_revision=controller["source_revision"] + 1,
             )
             if database.exists():
-                db = sqlite3.connect(database.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+                db = sqlite3.connect(
+                    database.absolute().as_uri() + "?mode=rw",
+                    uri=True,
+                    timeout=5,
+                    isolation_level=None,
+                )
                 try:
+                    db.execute("PRAGMA busy_timeout=5000")
                     db.execute("PRAGMA synchronous=FULL")
-                    with db:
-                        db.execute(
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        payload = json.dumps(
+                            controller,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        )
+                        cursor = db.execute(
                             "UPDATE documents SET body=?,revision=revision+1,"
                             "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                             "WHERE name='controller'",
-                            (json.dumps(controller),),
+                            (payload,),
                         )
+                        if cursor.rowcount != 1:
+                            raise ValueError("网络控制器状态行缺失")
+                        db.execute("COMMIT")
+                    except BaseException:
+                        with suppress(sqlite3.Error):
+                            db.execute("ROLLBACK")
+                        raise
                 finally:
                     db.close()
             else:
                 atomic_json(controller_path, controller)
     except BaseException:
-        (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
-        nmcli("connection", "delete", "id", profile)
+        with suppress(OSError):
+            (state_dir / "lkg-wlan0.json").unlink(missing_ok=True)
+        with suppress(OSError, ValueError, subprocess.SubprocessError):
+            nmcli("connection", "delete", "id", profile)
         raise
     print("已保留当前 Wi-Fi 连接，并保存自动重连配置", file=sys.stderr, flush=True)
 
@@ -425,7 +595,147 @@ def manifest_display_metadata(value: object) -> dict:
     return metadata
 
 
-def validate_manifest(value: object) -> dict:
+def _raw_ed25519_to_pem(raw_key: bytes) -> bytes:
+    if len(raw_key) != 32:
+        raise ValueError("Ed25519 公钥长度无效")
+    der = _ED25519_SPKI_PREFIX + raw_key
+    encoded = base64.encodebytes(der).decode("ascii")
+    return f"-----BEGIN PUBLIC KEY-----\n{encoded}-----END PUBLIC KEY-----\n".encode("ascii")
+
+
+def _configured_public_key_pem() -> bytes | None:
+    configured = os.environ.get(OPENARIA_UPDATE_PUBLIC_KEY_ENV, "").strip()
+    if configured:
+        if "-----BEGIN PUBLIC KEY-----" in configured:
+            raw = configured.encode("ascii")
+            if len(raw) > 16 * 1024:
+                raise ValueError("发布签名公钥过大")
+            return raw
+        raw = _read_bounded_regular_file(
+            Path(configured),
+            max_bytes=16 * 1024,
+            error_message="发布签名公钥文件缺失或无效",
+            too_large_message="发布签名公钥过大",
+        )
+    elif os.path.lexists(RELEASE_SIGNING_PUBLIC_KEY):
+        raw = _read_bounded_regular_file(
+            RELEASE_SIGNING_PUBLIC_KEY,
+            max_bytes=16 * 1024,
+            error_message="发布签名公钥文件缺失或无效",
+            too_large_message="发布签名公钥过大",
+        )
+    else:
+        return None
+    if len(raw) > 16 * 1024:
+        raise ValueError("发布签名公钥过大")
+    if b"-----BEGIN PUBLIC KEY-----" in raw:
+        return raw
+    if len(raw) == 32:
+        return _raw_ed25519_to_pem(raw)
+    try:
+        decoded = base64.b64decode(raw.strip(), validate=True)
+    except ValueError as error:
+        raise ValueError("发布签名公钥格式无效") from error
+    return _raw_ed25519_to_pem(decoded)
+
+
+def _decode_ed25519_signature(value: object) -> bytes:
+    if isinstance(value, dict):
+        if set(value) != {"alg", "sig"} or value.get("alg") != "ed25519":
+            raise ValueError("发布清单签名字段无效")
+        value = value.get("sig")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("发布清单签名格式无效")
+    try:
+        decoded = base64.b64decode(value.strip(), validate=True)
+    except ValueError as error:
+        raise ValueError("发布清单签名 Base64 无效") from error
+    if len(decoded) != 64:
+        raise ValueError("发布清单 Ed25519 签名长度无效")
+    return decoded
+
+
+def _verify_ed25519_bytes(public_key_pem: bytes, message: bytes, signature: bytes) -> None:
+    try:
+        from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    except ImportError:
+        load_pem_public_key = None
+    if load_pem_public_key is not None:
+        try:
+            key = load_pem_public_key(public_key_pem)
+        except (UnsupportedAlgorithm, TypeError, ValueError) as error:
+            raise ValueError("发布签名公钥无效") from error
+        if not isinstance(key, Ed25519PublicKey):
+            raise ValueError("发布签名公钥不是 Ed25519")
+        try:
+            key.verify(signature, message)
+            return
+        except InvalidSignature as error:
+            raise ValueError("发布清单 Ed25519 签名校验失败") from error
+    with tempfile.TemporaryDirectory(prefix=".sig-") as temp:
+        root = Path(temp)
+        key_file = root / "pub.pem"
+        msg_file = root / "msg.bin"
+        sig_file = root / "sig.bin"
+        key_file.write_bytes(public_key_pem)
+        msg_file.write_bytes(message)
+        sig_file.write_bytes(signature)
+        result = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-verify",
+                "-pubin",
+                "-inkey",
+                str(key_file),
+                "-rawin",
+                "-in",
+                str(msg_file),
+                "-sigfile",
+                str(sig_file),
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError("发布清单 Ed25519 签名校验失败")
+
+
+def verify_manifest_signature(
+    manifest: dict, *, raw_manifest: bytes | None = None, signature_bytes: bytes | None = None
+) -> None:
+    """Verify Ed25519 manifest signature when a signing public key is configured."""
+    if "signature" in manifest:
+        embedded_sig = _decode_ed25519_signature(manifest["signature"])
+    else:
+        embedded_sig = None
+    public_key_pem = _configured_public_key_pem()
+    if public_key_pem is None:
+        return
+    if embedded_sig is not None:
+        canonical = json.dumps(
+            {k: v for k, v in manifest.items() if k != "signature"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        _verify_ed25519_bytes(public_key_pem, canonical, embedded_sig)
+        return
+    if signature_bytes is not None and raw_manifest is not None:
+        if len(signature_bytes) == 64:
+            detached_sig = signature_bytes
+        else:
+            detached_sig = _decode_ed25519_signature(signature_bytes.decode("ascii"))
+        _verify_ed25519_bytes(public_key_pem, raw_manifest, detached_sig)
+        return
+    raise ValueError("发布清单缺少 Ed25519 签名")
+
+
+def validate_manifest(value: object, *, verify_detached: bool = True) -> dict:
     if not isinstance(value, dict) or value.get("schema") != RELEASE_SCHEMA:
         raise ValueError("发布清单 schema 无效")
     if value.get("platform") != PLATFORM:
@@ -439,13 +749,26 @@ def validate_manifest(value: object) -> dict:
         raise ValueError("发布清单 updater 无效")
     validate_descriptor(value["updater"], 1024 * 1024)
     https_url(value["updater"].get("url"))
+    if "signature" in value:
+        _decode_ed25519_signature(value["signature"])
+    if verify_detached:
+        verify_manifest_signature(value)
     return value
 
 
 def fetch_manifest(url: str, directory: Path) -> dict:
     target = directory / "manifest.json"
     download(url, target, 128 * 1024)
-    return validate_manifest(json.loads(target.read_bytes()))
+    raw = target.read_bytes()
+    parsed = _loads_strict_json(raw)
+    validate_manifest(parsed, verify_detached=False)
+    if "signature" in parsed or _configured_public_key_pem() is None:
+        verify_manifest_signature(parsed, raw_manifest=raw)
+    else:
+        sig_path = directory / "manifest.sig"
+        download(url + ".sig", sig_path, 4096)
+        verify_manifest_signature(parsed, raw_manifest=raw, signature_bytes=sig_path.read_bytes())
+    return parsed
 
 
 def fetch_bundle(manifest: dict, cache: Path) -> Path:
@@ -500,7 +823,7 @@ def verify_bundle(root: Path, manifest: dict) -> None:
     data = (root / "bundle.json").read_bytes()
     if len(data) > 128 * 1024:
         raise ValueError("bundle.json 过大")
-    bundle = json.loads(data)
+    bundle = _loads_strict_json(data)
     if not isinstance(bundle, dict) or bundle.get("schema") != "ylx.rdk-x5-bundle.v1":
         raise ValueError("bundle.json schema 无效")
     for field in ("commit", "version", "platform"):
@@ -535,6 +858,7 @@ def verify_bundle(root: Path, manifest: dict) -> None:
     if {path.name for path in root.iterdir()} - names:
         raise ValueError("bundle 包含未声明文件")
     require_sqlite_wheel(root / bundle["application_wheel"])
+    require_storage_compatible_wheel(root / bundle["application_wheel"])
 
 
 def current_commit() -> str | None:
@@ -558,31 +882,68 @@ def require_target() -> None:
         raise ValueError("必须在使用 systemd 的 RDK 系统中安装")
 
 
+def _resolve_local_host(raw_host: object) -> str:
+    if not isinstance(raw_host, str) or not raw_host:
+        return "127.0.0.1"
+    mapped = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(raw_host, raw_host)
+    return f"[{mapped}]" if ":" in mapped and not mapped.startswith("[") else mapped
+
+
 def require_idle() -> None:
     if not current_commit():
         return
-    config = json.loads(CONFIG.read_bytes())
+    config = _loads_strict_json(
+        _read_bounded_regular_file(
+            CONFIG,
+            max_bytes=128 * 1024,
+            error_message="设备配置文件无效",
+            forbidden_mode=0o022,
+        )
+    )
+    if not isinstance(config, dict):
+        raise ValueError("设备配置文件无效")
     security = config["security"]
     headers = {}
     scheme, context = "http", None
     if security["profile"] == "customer":
         scheme = "https"
-        context = ssl.create_default_context(cafile=security["tls_certificate_file"])
-        headers["Authorization"] = (
-            "Bearer " + Path(security["bearer_token_file"]).read_text().strip()
+        cafile = security.get("ca_file") or security["tls_certificate_file"]
+        _read_bounded_regular_file(
+            Path(cafile),
+            max_bytes=1024 * 1024,
+            error_message="设备证书文件无效",
+            forbidden_mode=0o022,
         )
-    port = config["listen"]["port"]
+        context = ssl.create_default_context(cafile=cafile)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = False
+        partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        if partial_chain:
+            context.verify_flags |= partial_chain
+        token_raw = _read_bounded_regular_file(
+            Path(security["bearer_token_file"]),
+            max_bytes=64 * 1024,
+            error_message="访问令牌文件无效",
+            forbidden_mode=0o027,
+        )
+        headers["Authorization"] = "Bearer " + token_raw.decode("utf-8").strip()
+    listen = config["listen"]
+    host = _resolve_local_host(listen.get("host", "127.0.0.1"))
+    port = listen["port"]
     request = urllib.request.Request(
-        f"{scheme}://127.0.0.1:{port}/api/v4/capture/status", headers=headers
+        f"{scheme}://{host}:{port}/api/v4/capture/status", headers=headers
     )
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
     )
     try:
         with opener.open(request, timeout=15) as response:
-            value = json.loads(response.read(1024 * 1024))
-    except (OSError, ValueError) as error:
+            value = _loads_strict_json(response.read(1024 * 1024))
+    except (OSError, ValueError, http.client.HTTPException) as error:
         raise ValueError("无法确认设备空闲；请先检查 rp-ylx 服务") from error
+    if not isinstance(value, dict):
+        raise ValueError("无法确认设备空闲；请先检查 rp-ylx 服务")
     snapshot = value.get("snapshot", {})
     if snapshot.get("device_state") != "idle" or snapshot.get("active_recording") is not None:
         raise ValueError("设备尚未空闲，请先停止录制并等待封存完成")
@@ -595,6 +956,7 @@ def prepare_dependencies() -> None:
         "cc": "gcc",
         "openssl": "openssl",
         "mkfs.ext4": "e2fsprogs",
+        "fsck.exfat": "exfatprogs",
         "avahi-daemon": "avahi-daemon",
         "sshd": "openssh-server",
         "sudo": "sudo",
@@ -631,18 +993,7 @@ def data_volume_size(free_bytes: int) -> int:
 
 
 def require_configured_exfat_volume() -> bool:
-    values = {}
-    if DATA_VOLUME_CONFIG.exists():
-        for line in DATA_VOLUME_CONFIG.read_text().splitlines():
-            fields = shlex.split(line, comments=True)
-            if not fields:
-                continue
-            if len(fields) != 1 or "=" not in fields[0]:
-                raise ValueError("录像分区配置格式无效")
-            key, value = fields[0].split("=", 1)
-            if key in values:
-                raise ValueError("录像分区配置项重复")
-            values[key] = value
+    values = _parse_data_volume_config()
     mode = values.get("RP_YLX_DATA_VOLUME_MODE", "loop")
     if mode != "exfat":
         if mode != "loop" or FACTORY_STORAGE_STATE.exists():
@@ -674,11 +1025,14 @@ def require_configured_exfat_volume() -> bool:
         text=True,
         timeout=15,
     )
-    mounts = json.loads(result.stdout).get("filesystems", [])
+    mounts = _loads_strict_json(result.stdout)
+    if not isinstance(mounts, dict):
+        raise ValueError("/data 挂载信息无效")
+    filesystems = mounts.get("filesystems", [])
     if (
-        len(mounts) != 1
-        or mounts[0].get("fstype") != "exfat"
-        or Path(mounts[0].get("source", "")).resolve() != device.resolve()
+        len(filesystems) != 1
+        or filesystems[0].get("fstype") != "exfat"
+        or Path(filesystems[0].get("source", "")).resolve() != device.resolve()
     ):
         raise ValueError("/data挂载的不是配置的录像分区")
     return True
@@ -711,23 +1065,76 @@ def fetch_updater(manifest: dict, directory: Path) -> Path:
     return target
 
 
-def install_update_command(source: Path) -> None:
+def _atomic_write_file(target: Path, payload: bytes, mode: int) -> None:
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    replaced = False
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        mode,
+    )
+    try:
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(f"short write to {target}")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, target)
+        replaced = True
+        dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        if not replaced:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
+
+
+def prune_bundle_cache(cache: Path, *, keep: int = 2, preserve: Path | None = None) -> None:
+    """Keep only the newest verified *.tar.gz release bundles in cache."""
+    candidates: list[tuple[int, Path]] = []
+    for entry in cache.iterdir():
+        if entry.name.startswith(".") or not entry.name.endswith(".tar.gz"):
+            continue
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        if preserve is not None and entry == preserve:
+            continue
+        with suppress(OSError):
+            candidates.append((entry.stat().st_mtime_ns, entry))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    allowed_remaining = max(0, keep - (1 if preserve is not None else 0))
+    for _, stale in candidates[allowed_remaining:]:
+        with suppress(OSError):
+            stale.unlink(missing_ok=True)
+
+
+def install_update_command(source: Path, *, firmware_control: Path | None = None) -> None:
     directory = UPDATER_DIRECTORY
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o755)
-    target = directory / "update.py"
-    temporary = directory / ".update.py.tmp"
-    temporary.write_bytes(source.read_bytes())
-    temporary.chmod(0o644)
-    temporary.replace(target)
+    _atomic_write_file(directory / "update.py", source.read_bytes(), 0o644)
+    fw_source = (
+        firmware_control if firmware_control is not None else source.parent / "firmware_control.py"
+    )
+    if fw_source.is_file() and not fw_source.is_symlink():
+        _atomic_write_file(directory / "firmware_control.py", fw_source.read_bytes(), 0o644)
     launcher = UPDATE_COMMAND
     launcher.parent.mkdir(parents=True, exist_ok=True)
-    temporary = launcher.with_name(".openaria-update.tmp")
-    temporary.write_text(
-        '#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/openaria/update.py "$@"\n'
+    _atomic_write_file(
+        launcher,
+        b'#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/openaria/update.py "$@"\n',
+        0o755,
     )
-    temporary.chmod(0o755)
-    temporary.replace(launcher)
 
 
 @contextmanager
@@ -783,7 +1190,7 @@ def main(argv=None) -> int:
                     previous = CURRENT.parent / "previous"
                     if not previous.is_symlink() or previous.resolve().name != args.expected_commit:
                         raise ValueError("上一版本已变化，请重新确认回退目标")
-                return subprocess.call(["/usr/local/sbin/rp-ylx-deploy", "rollback"])
+                return subprocess.call(["/usr/local/sbin/rp-ylx-deploy", "rollback"], umask=0o022)
             directory = Path(temp)
             manifest = fetch_manifest(args.manifest, directory)
             if args.expected_commit is not None and manifest["commit"] != args.expected_commit:
@@ -799,7 +1206,11 @@ def main(argv=None) -> int:
                 return 0
             updater = fetch_updater(manifest, directory)
             if current == manifest["commit"] and not (args.reinstall or args.download_only):
-                install_update_command(updater)
+                fw_path = CURRENT / "site-packages" / "rp_ylx" / "firmware_control.py"
+                install_update_command(
+                    updater,
+                    firmware_control=fw_path if fw_path.is_file() else None,
+                )
                 print(json.dumps({**result, "changed": False}))
                 return 0
             archive = fetch_bundle(manifest, cache)
@@ -807,6 +1218,7 @@ def main(argv=None) -> int:
             bundle.mkdir()
             extract_bundle(archive, bundle)
             verify_bundle(bundle, manifest)
+            prune_bundle_cache(cache, keep=2, preserve=archive)
             if args.download_only:
                 print(json.dumps({**result, "archive": str(archive), "verified": True}))
                 return 0
@@ -827,8 +1239,21 @@ def main(argv=None) -> int:
             )
             if current_commit() != manifest["commit"]:
                 raise ValueError("安装后版本不匹配")
-            install_update_command(updater)
-            config = json.loads(CONFIG.read_bytes())
+            fw_path = CURRENT / "site-packages" / "rp_ylx" / "firmware_control.py"
+            install_update_command(
+                updater,
+                firmware_control=fw_path if fw_path.is_file() else None,
+            )
+            config = _loads_strict_json(
+                _read_bounded_regular_file(
+                    CONFIG,
+                    max_bytes=128 * 1024,
+                    error_message="设备配置文件无效",
+                    forbidden_mode=0o022,
+                )
+            )
+            if not isinstance(config, dict):
+                raise ValueError("设备配置文件无效")
             scheme = "https" if config["security"]["profile"] == "customer" else "http"
             print(json.dumps({**result, "installed": True, "changed": True}))
             print(
@@ -850,6 +1275,9 @@ def main(argv=None) -> int:
         ValueError,
         KeyError,
         TypeError,
+        RecursionError,
+        http.client.HTTPException,
+        sqlite3.Error,
         tarfile.TarError,
         subprocess.SubprocessError,
     ) as error:

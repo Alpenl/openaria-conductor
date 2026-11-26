@@ -6,8 +6,9 @@ LOGIN_PASSWORD_HASH='$6$OpenAria$sG47eil4DeVNV.9dRDeX15Fev0WuDuVolbkGFH.FJ/4elFe
 
 if ! getent passwd "$LOGIN_USER" >/dev/null; then
     useradd --badname --create-home --shell /bin/bash --user-group "$LOGIN_USER"
+    usermod --append --groups sudo --shell /bin/bash "$LOGIN_USER"
+    usermod --password "$LOGIN_PASSWORD_HASH" "$LOGIN_USER"
+    chage --maxdays -1 --expiredate -1 "$LOGIN_USER"
+else
+    usermod --shell /bin/bash "$LOGIN_USER"
 fi
-
-usermod --append --groups sudo --shell /bin/bash "$LOGIN_USER"
-usermod --password "$LOGIN_PASSWORD_HASH" "$LOGIN_USER"
-chage --maxdays -1 --expiredate -1 "$LOGIN_USER"

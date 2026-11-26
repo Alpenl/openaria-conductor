@@ -7,7 +7,7 @@ import logging
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from typing import Protocol
+from typing import Any, Protocol
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
@@ -65,6 +65,28 @@ def _supported_ipv4_addresses(status: object) -> tuple[str, ...]:
     return tuple(discovered)
 
 
+def _ordered_interface_names(network: Mapping[str, Any]) -> list[str]:
+    default_route = network.get("default_route")
+    names = [default_route] if default_route in {"wifi_client", "wired"} else []
+    names.extend(name for name in ("ap", "wifi_client", "wired") if name not in names)
+    return names
+
+
+def all_runtime_ipv4_addresses() -> tuple[str, ...]:
+    """Return all active non-loopback, non-link-local IPv4 addresses across interfaces."""
+
+    runtime = collect_linux_runtime()
+    network = runtime.get("network")
+    if not isinstance(network, Mapping):
+        return ()
+    discovered: list[str] = []
+    for name in _ordered_interface_names(network):
+        for address in _supported_ipv4_addresses(network.get(name)):
+            if address not in discovered:
+                discovered.append(address)
+    return tuple(discovered)
+
+
 def runtime_ipv4_addresses() -> tuple[str, ...]:
     """Return one reachable IPv4 address for the fixed device hostname."""
 
@@ -72,18 +94,44 @@ def runtime_ipv4_addresses() -> tuple[str, ...]:
     network = runtime.get("network")
     if not isinstance(network, Mapping):
         return ()
-    default_route = network.get("default_route")
-    names = [default_route] if default_route in {"wifi_client", "wired"} else []
-    names.extend(name for name in ("ap", "wifi_client", "wired") if name not in names)
-    for name in names:
+    for name in _ordered_interface_names(network):
         addresses = _supported_ipv4_addresses(network.get(name))
         if addresses:
             return addresses[:1]
     return ()
 
 
+class _CooperatingZeroconf:
+    """Adapter enabling cooperating_responders=True alongside Avahi on Zeroconf."""
+
+    def __init__(self, addresses: tuple[str, ...]) -> None:
+        self._zeroconf = Zeroconf(interfaces=list(addresses), ip_version=IPVersion.V4Only)
+
+    def register_service(
+        self,
+        info: ServiceInfo,
+        ttl: int | None = None,
+        allow_name_change: bool = False,
+        cooperating_responders: bool = True,
+        strict: bool = True,
+    ) -> None:
+        self._zeroconf.register_service(
+            info,
+            ttl=ttl,
+            allow_name_change=allow_name_change,
+            cooperating_responders=cooperating_responders,
+            strict=strict,
+        )
+
+    def unregister_service(self, info: ServiceInfo) -> None:
+        self._zeroconf.unregister_service(info)
+
+    def close(self) -> None:
+        self._zeroconf.close()
+
+
 def _default_responder(addresses: tuple[str, ...]) -> ZeroconfResponder:
-    return Zeroconf(interfaces=list(addresses), ip_version=IPVersion.V4Only)
+    return _CooperatingZeroconf(addresses)
 
 
 def _service_infos(
@@ -113,7 +161,7 @@ class MdnsPublisher:
         port: int,
         *,
         scheme: str = "http",
-        address_provider: AddressProvider = runtime_ipv4_addresses,
+        address_provider: AddressProvider = all_runtime_ipv4_addresses,
         responder_factory: ResponderFactory = _default_responder,
         interval: float = 2.0,
         logger: logging.Logger | None = None,
@@ -149,7 +197,7 @@ class MdnsPublisher:
             thread: threading.Thread | None = None
             try:
                 thread = threading.Thread(
-                    target=self._run, args=(stop,), name="rp-ylx-mdns", daemon=False
+                    target=self._run, args=(stop,), name="rp-ylx-mdns", daemon=True
                 )
                 self._thread = thread
                 thread.start()
@@ -225,7 +273,7 @@ class MdnsPublisher:
         try:
             while not stop.is_set():
                 try:
-                    self._reconcile()
+                    self._reconcile(stop=stop)
                 except Exception as error:
                     self._record_failure(error)
                 else:
@@ -238,20 +286,27 @@ class MdnsPublisher:
                 # Keep the responder owned for close() to retry after joining.
                 self._record_failure(error)
 
-    def _reconcile(self) -> None:
+    def _reconcile(self, *, stop: threading.Event | None = None) -> None:
         if self._responder is not None and not self._addresses:
             self._unpublish()
+        if stop is not None and stop.is_set():
+            return
         addresses = self._address_provider()
+        if stop is not None and stop.is_set():
+            return
         if addresses and addresses == self._addresses and self._responder is not None:
             return
         self._unpublish()
-        if not addresses:
+        if not addresses or (stop is not None and stop.is_set()):
             return
         responder = self._responder_factory(addresses)
         self._responder = responder
         self._services = ()
         try:
             for service in _service_infos(self._port, addresses, self._scheme):
+                if stop is not None and stop.is_set():
+                    self._unpublish()
+                    return
                 # A register call may publish before it raises. Own the attempt
                 # before calling out, so rollback also unregisters that service.
                 self._services = (*self._services, service)
@@ -314,9 +369,8 @@ class MdnsPublisher:
             thread = self._thread
             had_resources = thread is not None or self._responder is not None
             if thread is not None:
-                thread.join(timeout=self._interval + 2.0)
-                if thread.is_alive():
-                    raise RuntimeError("mDNS publisher did not stop before its deadline")
+                if thread is not threading.current_thread():
+                    thread.join(timeout=5.0)
                 self._thread = None
             self._unpublish()
             if had_resources:
@@ -328,5 +382,6 @@ __all__ = [
     "MDNS_HOSTNAME",
     "MDNS_SERVICE_TYPES",
     "MdnsPublisher",
+    "all_runtime_ipv4_addresses",
     "runtime_ipv4_addresses",
 ]

@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 import queue
+import signal
 import socket
+import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -14,6 +17,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext, suppress
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
@@ -22,14 +26,18 @@ from rp_ylx.clock_sync import (
     ClockSyncError,
     ClockSynchronizer,
     valid_clock_request,
-    valid_clock_response,
 )
+from rp_ylx.core.rpc import (
+    ControlRpcServer,
+    RpcFramingError,
+    RpcTimeoutError,
+    decode_ndjson_object,
+    encode_ndjson_object,
+    read_ndjson_line,
+    write_all_with_deadline,
+)
+from rp_ylx.core.time import utc_now_iso
 from rp_ylx.network import (
-    NETWORK_ACTIVATION_TIMEOUT_SECONDS,
-    NetworkError,
-    _network_operation_lock,
-    _profile_dir,
-    _state_dir,
     activate_network_candidate,
     cleanup_orphan_network_candidates,
     commit_network_candidate,
@@ -37,75 +45,58 @@ from rp_ylx.network import (
     ensure_rescue_ap,
     forget_network_client_profiles,
     prepare_network_candidate,
+    register_controller_status_provider,
     rescue_network,
     saved_network_candidate,
     saved_network_is_healthy,
     scan_wifi_networks,
 )
 from rp_ylx.network_credentials import NetworkCredentialError, NetworkCredentialStore
+from rp_ylx.network_paths import (
+    CONTROL_REQUEST_SCHEMA,
+    CONTROL_RESPONSE_SCHEMA,
+    CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    CONTROL_SOCKET_PATH,
+    CONTROL_SOCKET_TIMEOUT_SECONDS,
+    MAX_CONTROL_REQUEST_BYTES,
+    MAX_CONTROL_RESPONSE_BYTES,
+    MUTATION_OPERATIONS,
+    SECRET_FIELD_NAMES,
+    SUPPORTED_OPERATIONS,
+    NetworkControlClientError,
+    NetworkError,
+    desired_state_from_disk,
+    lkg_path,
+    network_operation_lock,
+    profile_dir,
+    read_json,
+    seal_response,
+    state_dir,
+)
+from rp_ylx.network_paths import (
+    error_response as _error_response,
+)
+from rp_ylx.network_paths import (
+    request_control as _paths_request_control,
+)
 from rp_ylx.network_state import (
     NetworkStateError,
     NetworkStateStore,
-    valid_desired_state,
-    valid_transaction,
 )
 from rp_ylx.network_validation import (
-    NETWORK_CREDENTIAL_REF,
-    WIFI_SECURITY,
-    valid_network_request,
+    valid_network_request_shape,
+    validate_desired_state_policy,
 )
 from rp_ylx.operational_logging import operational_logger
 from rp_ylx.update import prepare_first_install_network
 
-CONTROL_REQUEST_SCHEMA = "ylx.network-control-request.v1"
-CONTROL_RESPONSE_SCHEMA = "ylx.network-control-response.v1"
-MAX_CONTROL_REQUEST_BYTES = 64 * 1024
-MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
-CONTROL_SOCKET_PATH = Path("/run/rp-ylx/network-control.sock")
-CONTROL_SOCKET_TIMEOUT_SECONDS = 2.0
-CONTROL_RESPONSE_TIMEOUT_SECONDS = (
-    NETWORK_ACTIVATION_TIMEOUT_SECONDS + 4 * CONTROL_SOCKET_TIMEOUT_SECONDS
-)
 NETWORK_HEALTH_POLL_SECONDS = 1.0
 NETWORK_HEALTH_FAILURE_SECONDS = 10.0
 NETWORK_RESCUE_REACHABILITY_SECONDS = 15.0
 NETWORK_MONITOR_ERROR_LOG_INTERVAL_SECONDS = 60.0
-MUTATION_OPERATIONS = frozenset({"apply", "retry", "forget"})
-ROOT_OPERATIONS = frozenset(
-    {"create_credential", "health", "scan", "status", "clock_status", "clock_inspect", "clock_sync"}
-)
-SUPPORTED_OPERATIONS = MUTATION_OPERATIONS | ROOT_OPERATIONS
-SECRET_FIELD_NAMES = frozenset({"password", "psk", "secret", "token"})
-RESPONSE_SECRET_FIELD_NAMES = SECRET_FIELD_NAMES | {"credential", "passphrase"}
+FAST_READ_OPERATIONS = frozenset({"health", "status", "clock_status", "clock_inspect", "scan"})
 _OPERATIONAL_LOG = operational_logger("network-control")
-
-
-class NetworkControlClientError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        self.message = message
-        super().__init__(f"{code}: {message}")
-
-
-def _error_response(
-    code: str,
-    message: str,
-    *,
-    operation: str | None = None,
-    retryable: bool = False,
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "schema": CONTROL_RESPONSE_SCHEMA,
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-        "retryable": retryable,
-    }
-    if operation is not None:
-        response["operation"] = operation
-    return response
+_seal_response = seal_response
 
 
 def _contains_inline_secret(value: object) -> bool:
@@ -165,12 +156,12 @@ def _valid_control_request(operation: str, request: Mapping[str, object]) -> boo
         set(request) == {"schema", "operation", "principal_id", "idempotency_key", "body"}
         and _valid_principal_id(request.get("principal_id"))
         and _valid_idempotency_key(request.get("idempotency_key"))
-        and valid_network_request(operation, request.get("body"))
+        and valid_network_request_shape(operation, request.get("body"))
     )
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return utc_now_iso()
 
 
 def _uuid7() -> str:
@@ -192,27 +183,6 @@ def _request_fingerprint(operation: str, body: Mapping[str, object]) -> str:
     return hashlib.sha256(rendered.encode()).hexdigest()
 
 
-def _response_contains_secret_field(value: object) -> bool:
-    if isinstance(value, Mapping):
-        return any(
-            isinstance(key, str)
-            and key.casefold() in RESPONSE_SECRET_FIELD_NAMES
-            or _response_contains_secret_field(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, list):
-        return any(_response_contains_secret_field(item) for item in value)
-    return False
-
-
-def _valid_uuid4(value: object) -> bool:
-    try:
-        parsed = uuid.UUID(str(value))
-    except (AttributeError, ValueError):
-        return False
-    return parsed.version == 4 and str(parsed) == value
-
-
 def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -221,225 +191,6 @@ def _parse_timestamp(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
-
-
-def _valid_capability(value: object) -> bool:
-    return (
-        isinstance(value, Mapping)
-        and set(value)
-        == {
-            "enabled",
-            "disabled_reason",
-            "operations",
-            "idempotency_key_required",
-            "secret_handling",
-            "active_state_policy",
-        }
-        and type(value.get("enabled")) is bool
-        and (
-            value.get("disabled_reason") is None
-            if value.get("enabled") is True
-            else value.get("disabled_reason")
-            in {
-                "not_enabled",
-                "auth_profile_unavailable",
-                "controller_unavailable",
-                "network_manager_unavailable",
-                "rescue_ap_not_validated",
-                "capture_active",
-                "recovery_required",
-                "maintenance_window_closed",
-                "unsupported_concurrency",
-            }
-        )
-        and value.get("operations") == ["apply", "retry", "forget"]
-        and value.get("idempotency_key_required") is True
-        and value.get("secret_handling") == "opaque_credential_reference_only"
-        and value.get("active_state_policy") == "idle_only"
-    )
-
-
-def _valid_scan_body(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema",
-        "authority_epoch",
-        "source_revision",
-        "scanned_at",
-        "networks",
-    }:
-        return False
-    try:
-        authority = uuid.UUID(str(value.get("authority_epoch")))
-    except (AttributeError, ValueError):
-        return False
-    networks = value.get("networks")
-    if not isinstance(networks, list) or len(networks) > 256:
-        return False
-    for entry in networks:
-        if not isinstance(entry, Mapping) or set(entry) != {
-            "ssid",
-            "hidden",
-            "security",
-            "signal_dbm",
-            "credential_required",
-        }:
-            return False
-        ssid = entry.get("ssid")
-        hidden = entry.get("hidden")
-        security = entry.get("security")
-        signal = entry.get("signal_dbm")
-        if (
-            type(hidden) is not bool
-            or security not in WIFI_SECURITY
-            or type(signal) is not int
-            or not -127 <= signal <= 0
-            or type(entry.get("credential_required")) is not bool
-            or entry["credential_required"] != (security != "open")
-            or hidden
-            and ssid is not None
-            or not hidden
-            and (not isinstance(ssid, str) or not 1 <= len(ssid.encode("utf-8")) <= 32)
-        ):
-            return False
-    return (
-        value.get("schema") == "ylx.network-scan.v1"
-        and authority.version == 4
-        and str(authority) == value.get("authority_epoch")
-        and type(value.get("source_revision")) is int
-        and value["source_revision"] >= 0
-        and isinstance(value.get("scanned_at"), str)
-        and bool(value["scanned_at"])
-    )
-
-
-def _valid_controller_success(response: Mapping[str, Any]) -> bool:
-    operation = response.get("operation")
-    if operation in {"clock_status", "clock_inspect", "clock_sync"}:
-        return (
-            set(response) == {"schema", "ok", "operation", "status", "body"}
-            and response.get("status") == 200
-            and valid_clock_response(response.get("body"))
-        )
-    if operation == "health":
-        capabilities = response.get("capabilities")
-        return (
-            set(response) == {"schema", "ok", "operation", "capabilities"}
-            and isinstance(capabilities, Mapping)
-            and set(capabilities) == {"mutation_enabled", "operations", "secret_handling"}
-            and type(capabilities.get("mutation_enabled")) is bool
-            and capabilities.get("operations") == ["apply", "forget", "retry"]
-            and capabilities.get("secret_handling") == "opaque_credential_reference_only"
-        )
-    if operation == "create_credential":
-        body = response.get("body")
-        issued_at = _parse_timestamp(body.get("issued_at")) if isinstance(body, Mapping) else None
-        expires_at = _parse_timestamp(body.get("expires_at")) if isinstance(body, Mapping) else None
-        return (
-            set(response) == {"schema", "ok", "operation", "status", "body"}
-            and response.get("status") == 201
-            and isinstance(body, Mapping)
-            and set(body)
-            == {
-                "schema",
-                "credential_ref",
-                "issued_at",
-                "expires_at",
-                "ttl_seconds",
-                "single_use",
-            }
-            and body.get("schema") == "ylx.network-credential-receipt.v1"
-            and isinstance(body.get("credential_ref"), str)
-            and NETWORK_CREDENTIAL_REF.fullmatch(str(body["credential_ref"])) is not None
-            and issued_at is not None
-            and expires_at is not None
-            and type(body.get("ttl_seconds")) is int
-            and 1 <= body["ttl_seconds"] <= 120
-            and body.get("single_use") is True
-            and expires_at - issued_at == timedelta(seconds=body["ttl_seconds"])
-        )
-    if operation == "status":
-        body = response.get("body")
-        transaction = body.get("transaction") if isinstance(body, Mapping) else None
-        capability = body.get("capability") if isinstance(body, Mapping) else None
-        return (
-            set(response) == {"schema", "ok", "operation", "status", "body"}
-            and response.get("status") == 200
-            and isinstance(body, Mapping)
-            and set(body)
-            == {
-                "schema",
-                "authority_epoch",
-                "source_revision",
-                "saved",
-                "verified",
-                "desired",
-                "transaction",
-                "capability",
-            }
-            and body.get("schema") == "ylx.network-controller-status.v1"
-            and _valid_uuid4(body.get("authority_epoch"))
-            and type(body.get("source_revision")) is int
-            and body["source_revision"] >= 0
-            and type(body.get("saved")) is bool
-            and type(body.get("verified")) is bool
-            and (not body["verified"] or body["saved"])
-            and valid_desired_state(body.get("desired"))
-            and isinstance(transaction, Mapping)
-            and set(transaction) == {"current", "latest"}
-            and all(
-                item is None or valid_transaction(item)
-                for item in (transaction.get("current"), transaction.get("latest"))
-            )
-            and all(
-                item is None
-                or item["authority_epoch"] == body["authority_epoch"]
-                and item["source_revision"] <= body["source_revision"]
-                for item in (transaction.get("current"), transaction.get("latest"))
-            )
-            and _valid_capability(capability)
-        )
-    if operation == "scan":
-        return (
-            set(response) == {"schema", "ok", "operation", "status", "body"}
-            and response.get("status") == 200
-            and _valid_scan_body(response.get("body"))
-        )
-    if operation in MUTATION_OPERATIONS:
-        body = response.get("body")
-        return (
-            set(response) == {"schema", "ok", "operation", "status", "body", "replayed"}
-            and response.get("status") == 202
-            and isinstance(body, Mapping)
-            and set(body) == {"schema", "accepted_at", "transaction"}
-            and body.get("schema") == "ylx.network-transaction-receipt.v1"
-            and valid_transaction(body.get("transaction"))
-            and body.get("accepted_at") == body["transaction"]["accepted_at"]
-            and type(response.get("replayed")) is bool
-        )
-    return False
-
-
-def _seal_response(response: dict[str, Any]) -> dict[str, Any]:
-    if response.get("schema") != CONTROL_RESPONSE_SCHEMA or type(response.get("ok")) is not bool:
-        return _error_response("response_invalid", "network-control response was rejected")
-    if response["ok"] is False:
-        allowed = {"schema", "ok", "error", "retryable"}
-        if "operation" in response:
-            allowed.add("operation")
-        error = response.get("error")
-        valid = (
-            set(response) == allowed
-            and isinstance(error, Mapping)
-            and set(error) == {"code", "message"}
-            and isinstance(error.get("code"), str)
-            and isinstance(error.get("message"), str)
-            and type(response.get("retryable")) is bool
-        )
-    else:
-        valid = _valid_controller_success(response)
-    if not valid or _response_contains_secret_field(response):
-        return _error_response("response_invalid", "network-control response was rejected")
-    return response
 
 
 def _controller_device_id() -> str:
@@ -465,6 +216,15 @@ def _controller_boot_id() -> str:
     return value
 
 
+@dataclass
+class _ScanJob:
+    """Single-generation Wi-Fi scan holder shared by concurrent waiters."""
+
+    event: threading.Event = field(default_factory=threading.Event)
+    result: list[dict[str, Any]] | None = None
+    error: BaseException | None = None
+
+
 class NetworkController:
     """Root-owned exclusive-mode state machine around the synchronous NM writer."""
 
@@ -476,6 +236,7 @@ class NetworkController:
         start_worker: bool = True,
         require_root: bool = True,
         defer_execution_until_response: bool = False,
+        deferred_release_timeout_seconds: float = 30.0,
         health_poll_seconds: float = NETWORK_HEALTH_POLL_SECONDS,
         health_failure_seconds: float = NETWORK_HEALTH_FAILURE_SECONDS,
         monotonic_ns: Callable[[], int] | None = None,
@@ -484,19 +245,35 @@ class NetworkController:
             raise NetworkError("root_required", "network controller must run as root")
         if health_poll_seconds <= 0 or health_failure_seconds <= 0:
             raise ValueError("network health intervals must be positive")
+        if deferred_release_timeout_seconds <= 0:
+            raise ValueError("deferred release timeout must be positive")
         self._credentials = credential_store or NetworkCredentialStore()
-        self._clock = ClockSynchronizer(_state_dir() / "clock.json")
+        self._clock = ClockSynchronizer(state_dir() / "clock.json")
         self._boot_id = _controller_boot_id()
-        with _network_operation_lock():
-            prepare_first_install_network(state_dir=_state_dir(), profile_dir=_profile_dir())
-        self._state = NetworkStateStore(_state_dir())
-        with _network_operation_lock():
-            self._rescue = ensure_rescue_ap(device_id or _controller_device_id())
+        try:
+            with network_operation_lock():
+                prepare_first_install_network(state_dir=state_dir(), profile_dir=profile_dir())
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            _OPERATIONAL_LOG.event(
+                "network_first_install_skipped",
+                level="warning",
+                exception_type=type(exc).__name__,
+            )
+        self._state = NetworkStateStore(state_dir())
+        with network_operation_lock():
+            self._rescue = ensure_rescue_ap(
+                device_id or _controller_device_id(),
+                preserve_existing_psk=True,
+            )
         self._submit_lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._scan_job: _ScanJob | None = None
         self._condition = threading.Condition()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._queued: set[str] = set()
         self._deferred: set[str] = set()
+        self._deferred_since_ns: dict[str, int] = {}
+        self._deferred_release_timeout_seconds = float(deferred_release_timeout_seconds)
         self._pending = 0
         self._thread: threading.Thread | None = None
         self._monitor_thread: threading.Thread | None = None
@@ -513,7 +290,7 @@ class NetworkController:
         self._closed = False
         self._defer_execution_until_response = defer_execution_until_response
         self._boot_reconcile()
-        with _network_operation_lock():
+        with network_operation_lock():
             cleanup_orphan_network_candidates(self._state.retained_profiles())
         if start_worker:
             self.start()
@@ -673,6 +450,55 @@ class NetworkController:
             "cleanup_work_ids": [str(latest["transaction_id"]), *cleanup_ids],
         }
 
+    def _abort_unreleased_transaction(self, transaction_id: str, *, reason: str) -> None:
+        current = self._state.snapshot()["transaction"]["current"]
+        operation = current.get("operation") if isinstance(current, Mapping) else None
+        try:
+            work = self._state.work_for(transaction_id)
+        except NetworkStateError:
+            work = {}
+        candidate = work.get("candidate") if isinstance(work, Mapping) else None
+        if operation == "apply" and isinstance(candidate, Mapping):
+            current_state_dir = state_dir()
+            lkg_profiles: set[str] = set()
+            for iface in ("wlan0", "eth0"):
+                with suppress(NetworkError):
+                    record = read_json(lkg_path(current_state_dir, iface))
+                    if isinstance(record, Mapping) and isinstance(record.get("profile"), str):
+                        lkg_profiles.add(str(record["profile"]))
+            if candidate.get("profile") not in lkg_profiles:
+                with suppress(NetworkError, OSError), network_operation_lock():
+                    discard_network_candidate(candidate)
+        try:
+            desired = desired_state_from_disk(state_dir())
+            saved = desired.get("mode") != "hotspot"
+        except NetworkError:
+            desired = None
+            saved = None
+        error_message = (
+            "network-control response delivery failed before execution release"
+            if reason == "response_write_failed"
+            else "stale unacknowledged network transaction was aborted"
+        )
+        with suppress(NetworkStateError):
+            self._transition(
+                transaction_id,
+                status="failed",
+                stage="failed",
+                updated_at=_now(),
+                desired=desired,
+                publish_desired=desired is not None,
+                saved=saved,
+                verified=False if desired is not None else None,
+                error={
+                    "code": "network_manager_unavailable",
+                    "message": error_message,
+                    "retryable": True,
+                },
+                recovery_action="none",
+                retain_work=False,
+            )
+
     def _boot_reconcile(self) -> None:
         snapshot = self._state.snapshot()
         current = snapshot["transaction"]["current"]
@@ -687,17 +513,31 @@ class NetworkController:
             saved=bool(snapshot["saved"]),
             verified=bool(snapshot["verified"]),
         )
-        self._state.mark_boot_reconciled(self._boot_id)
         if isinstance(current, Mapping):
-            _OPERATIONAL_LOG.event(
-                "network_boot_reconcile_completed",
-                desired_mode=mode,
-                outcome="active_transaction_retained",
-            )
-            return
+            tx_id = str(current["transaction_id"])
+            if new_boot and not self._state.execution_released(tx_id):
+                self._abort_unreleased_transaction(tx_id, reason="stale_boot_deferred")
+                _OPERATIONAL_LOG.event(
+                    "network_boot_stale_deferred_aborted",
+                    level="warning",
+                    transaction_id=tx_id,
+                )
+                snapshot = self._state.snapshot()
+                current = snapshot["transaction"]["current"]
+                desired = snapshot["desired"]
+                mode = str(desired["mode"])
+            else:
+                self._state.mark_boot_reconciled(self._boot_id)
+                _OPERATIONAL_LOG.event(
+                    "network_boot_reconcile_completed",
+                    desired_mode=mode,
+                    outcome="active_transaction_retained",
+                )
+                return
         try:
-            with _network_operation_lock():
+            with network_operation_lock():
                 if saved_network_is_healthy(mode):
+                    self._state.mark_boot_reconciled(self._boot_id)
                     _OPERATIONAL_LOG.event(
                         "network_boot_reconcile_completed",
                         desired_mode=mode,
@@ -713,8 +553,9 @@ class NetworkController:
                     error_code=error.code,
                 )
         if mode == "hotspot":
-            with _network_operation_lock():
+            with network_operation_lock():
                 rescue_network()
+            self._state.mark_boot_reconciled(self._boot_id)
             _OPERATIONAL_LOG.event(
                 "network_boot_reconcile_completed",
                 desired_mode=mode,
@@ -728,8 +569,9 @@ class NetworkController:
             "failed",
         }
         if terminal_retry and not new_boot:
-            with _network_operation_lock():
+            with network_operation_lock():
                 rescue_network()
+            self._state.mark_boot_reconciled(self._boot_id)
             _OPERATIONAL_LOG.event(
                 "network_boot_reconcile_completed",
                 desired_mode=mode,
@@ -740,11 +582,12 @@ class NetworkController:
         work = self._retained_retry_work(snapshot) if new_boot else None
         if work is None:
             try:
-                with _network_operation_lock():
+                with network_operation_lock():
                     candidate = saved_network_candidate(mode)
             except NetworkError as error:
-                with _network_operation_lock():
+                with network_operation_lock():
                     rescue_network()
+                self._state.mark_boot_reconciled(self._boot_id)
                 _OPERATIONAL_LOG.event(
                     "network_boot_reconcile_completed",
                     level="warning",
@@ -778,6 +621,7 @@ class NetworkController:
             saved=bool(snapshot["saved"]),
             verified=bool(snapshot["verified"]),
         )
+        self._state.mark_boot_reconciled(self._boot_id)
         _OPERATIONAL_LOG.event(
             "network_boot_reconcile_completed",
             desired_mode=mode,
@@ -809,9 +653,12 @@ class NetworkController:
             transaction_id = str(current["transaction_id"])
             if self._state.execution_released(transaction_id):
                 self._enqueue(transaction_id)
-            else:
+            elif self._defer_execution_until_response:
                 with self._condition:
                     self._deferred.add(transaction_id)
+                    self._deferred_since_ns[transaction_id] = self._monotonic_ns()
+            else:
+                self._abort_unreleased_transaction(transaction_id, reason="non_deferred_unreleased")
 
     def close(self) -> None:
         with self._submit_lock, self._condition:
@@ -822,10 +669,10 @@ class NetworkController:
             monitor_thread = self._monitor_thread
             self._monitor_stop.set()
         if monitor_thread is not None:
-            monitor_thread.join()
+            monitor_thread.join(timeout=5.0)
         if thread is not None:
             self._queue.put(None)
-            thread.join()
+            thread.join(timeout=5.0)
         self._credentials.clear()
         _OPERATIONAL_LOG.event("network_controller_stopped", outcome="closed")
 
@@ -853,6 +700,7 @@ class NetworkController:
         if self._defer_execution_until_response:
             with self._condition:
                 self._deferred.add(transaction_id)
+                self._deferred_since_ns[transaction_id] = self._monotonic_ns()
             return
         self._enqueue(transaction_id)
 
@@ -871,12 +719,57 @@ class NetworkController:
                 return
             if not self._state.release_execution(transaction_id):
                 self._deferred.remove(transaction_id)
+                self._deferred_since_ns.pop(transaction_id, None)
                 self._condition.notify_all()
                 return
             self._deferred.remove(transaction_id)
+            self._deferred_since_ns.pop(transaction_id, None)
             self._enqueue(transaction_id)
 
+    def abort_deferred_response(self, response: Mapping[str, Any]) -> None:
+        if response.get("ok") is not True or response.get("operation") not in MUTATION_OPERATIONS:
+            return
+        body = response.get("body")
+        transaction = body.get("transaction") if isinstance(body, Mapping) else None
+        transaction_id = (
+            transaction.get("transaction_id") if isinstance(transaction, Mapping) else None
+        )
+        if not isinstance(transaction_id, str):
+            return
+        with self._condition:
+            if transaction_id not in self._deferred:
+                return
+            self._deferred.remove(transaction_id)
+            self._deferred_since_ns.pop(transaction_id, None)
+            self._condition.notify_all()
+        self._abort_unreleased_transaction(transaction_id, reason="response_write_failed")
+
+    def _expire_stale_deferred(self, *, now_ns: int | None = None) -> None:
+        observed_ns = self._monotonic_ns() if now_ns is None else now_ns
+        ttl_ns = int(self._deferred_release_timeout_seconds * 1_000_000_000)
+        expired: list[str] = []
+        with self._condition:
+            for tx_id in list(self._deferred):
+                started_ns = self._deferred_since_ns.get(tx_id)
+                if started_ns is None:
+                    self._deferred_since_ns[tx_id] = observed_ns
+                elif observed_ns - started_ns >= ttl_ns:
+                    self._deferred.discard(tx_id)
+                    self._deferred_since_ns.pop(tx_id, None)
+                    expired.append(tx_id)
+            if expired:
+                self._condition.notify_all()
+        for tx_id in expired:
+            if not self._state.execution_released(tx_id):
+                self._abort_unreleased_transaction(tx_id, reason="deferred_release_timeout")
+                _OPERATIONAL_LOG.event(
+                    "network_stale_deferred_aborted",
+                    level="warning",
+                    transaction_id=tx_id,
+                )
+
     def _monitor_once(self, *, now_ns: int | None = None) -> None:
+        self._expire_stale_deferred(now_ns=now_ns)
         snapshot = self._state.snapshot()
         transaction = snapshot["transaction"]
         if transaction["current"] is not None:
@@ -884,13 +777,13 @@ class NetworkController:
             return
         desired = snapshot["desired"]
         mode = str(desired["mode"])
-        if mode == "hotspot" or not snapshot["saved"]:
+        if mode == "hotspot" or (mode == "wifi-client" and not snapshot["saved"]):
             self._health_failure_started_ns = None
             self._health_fallback_latched = False
             return
         health_error_code: str | None = None
         try:
-            with _network_operation_lock(blocking=False):
+            with network_operation_lock(blocking=False):
                 # The read-only health probe below must not block interactive requests.
                 pass
         except NetworkError as exc:
@@ -952,8 +845,21 @@ class NetworkController:
                 return
             desired = snapshot["desired"]
             mode = str(desired["mode"])
+            if mode == "hotspot" or (mode == "wifi-client" and not snapshot["saved"]):
+                self._health_failure_started_ns = None
+                self._health_fallback_latched = False
+                return
+            latest = snapshot["transaction"]["latest"]
+            if (
+                self._health_fallback_latched
+                or isinstance(latest, Mapping)
+                and latest.get("status") in {"rescued", "failed"}
+            ):
+                self._health_fallback_latched = True
+                self._health_failure_started_ns = None
+                return
             try:
-                with _network_operation_lock(blocking=False):
+                with network_operation_lock(blocking=False):
                     try:
                         candidate = saved_network_candidate(mode)
                     except NetworkError as exc:
@@ -1210,7 +1116,7 @@ class NetworkController:
             self._fallback_transaction(transaction_id, error)
 
     def _execute(self, transaction_id: str) -> None:
-        with _network_operation_lock():
+        with network_operation_lock():
             self._execute_locked(transaction_id)
 
     def _rescue_deadline(self, work: Mapping[str, Any]) -> int | None:
@@ -1335,7 +1241,7 @@ class NetworkController:
                 commit_network_candidate(candidate)
             elif kind != "rescue":
                 raise NetworkError("candidate_invalid", "候选网络配置无效")
-            is_wifi = desired.get("mode") == "wifi-client"
+            is_client = desired.get("mode") != "hotspot"
             cleanup_work = work.get("cleanup_work_ids", [])
             cleanup_ids = (
                 tuple(item for item in cleanup_work if isinstance(item, str))
@@ -1351,11 +1257,13 @@ class NetworkController:
                 recovery_action=(
                     "reconnect_target_lan" if kind == "candidate" else "reconnect_rescue_ap"
                 ),
-                saved=is_wifi,
-                verified=is_wifi,
+                saved=is_client,
+                verified=is_client,
                 retain_work=False,
                 remove_work=cleanup_ids,
             )
+            if cleanup_ids or kind == "rescue":
+                cleanup_orphan_network_candidates(self._state.retained_profiles())
         except (NetworkError, NetworkStateError) as exc:
             error = (
                 exc
@@ -1451,13 +1359,14 @@ class NetworkController:
                     "body": replay,
                     "replayed": True,
                 }
-            stack.enter_context(_network_operation_lock(blocking=False))
+            stack.enter_context(network_operation_lock(blocking=False))
             if self._state.snapshot()["transaction"]["current"] is not None:
                 raise NetworkStateError(
                     "controller_busy",
                     "another network transaction is still active",
                     retryable=True,
                 )
+            prior_work_ids = list(self._state.work_ids())
             desired_input = body["desired"]
             assert isinstance(desired_input, Mapping)
             transaction_id = _uuid7()
@@ -1485,9 +1394,18 @@ class NetworkController:
                         if config is not None:
                             candidate = prepare_network_candidate(transaction_id, config)
                     work = (
-                        {"kind": "rescue", "desired": desired}
+                        {
+                            "kind": "rescue",
+                            "desired": desired,
+                            "cleanup_work_ids": prior_work_ids,
+                        }
                         if candidate is None
-                        else {"kind": "candidate", "candidate": candidate, "desired": desired}
+                        else {
+                            "kind": "candidate",
+                            "candidate": candidate,
+                            "desired": desired,
+                            "cleanup_work_ids": prior_work_ids,
+                        }
                     )
                     accepted_desired = deepcopy(desired)
                     accepted_wifi = accepted_desired.get("wifi_client")
@@ -1508,7 +1426,7 @@ class NetworkController:
                         reservation.commit()
             except (NetworkError, NetworkStateError, OSError):
                 if candidate is not None:
-                    with suppress(NetworkError, OSError), _network_operation_lock():
+                    with suppress(NetworkError, OSError), network_operation_lock():
                         discard_network_candidate(candidate)
                 raise
             self._log_transaction_accepted("apply", receipt, replayed=replayed)
@@ -1547,7 +1465,7 @@ class NetworkController:
                     "body": replay,
                     "replayed": True,
                 }
-            stack.enter_context(_network_operation_lock(blocking=False))
+            stack.enter_context(network_operation_lock(blocking=False))
             snapshot = self._state.snapshot()
             if snapshot["transaction"]["current"] is not None:
                 raise NetworkStateError(
@@ -1649,7 +1567,7 @@ class NetworkController:
                     "body": replay,
                     "replayed": True,
                 }
-            stack.enter_context(_network_operation_lock(blocking=False))
+            stack.enter_context(network_operation_lock(blocking=False))
             snapshot = self._state.snapshot()
             if snapshot["transaction"]["current"] is not None:
                 raise NetworkStateError(
@@ -1685,8 +1603,33 @@ class NetworkController:
         }
 
     def _scan(self) -> dict[str, Any]:
-        with _network_operation_lock(blocking=False):
-            networks = scan_wifi_networks()
+        with network_operation_lock(blocking=False):
+            pass
+        with self._scan_lock:
+            job = self._scan_job
+            is_leader = job is None
+            if is_leader:
+                job = _ScanJob()
+                self._scan_job = job
+        if not is_leader:
+            job.event.wait()
+            if job.error is not None:
+                raise job.error
+            assert job.result is not None
+            networks = deepcopy(job.result)
+        else:
+            try:
+                scanned = scan_wifi_networks()
+                job.result = scanned
+                networks = deepcopy(scanned)
+            except BaseException as exc:
+                job.error = exc
+                raise
+            finally:
+                with self._scan_lock:
+                    if self._scan_job is job:
+                        self._scan_job = None
+                job.event.set()
         authority_epoch, source_revision = self._state.scan_stamp()
         return {
             "schema": "ylx.network-scan.v1",
@@ -1726,7 +1669,7 @@ class NetworkController:
             else:
                 # Capture holds this same flock for its entire lifetime, including
                 # finalization. It also protects against a queued, timed-out caller.
-                with _network_operation_lock(blocking=False):
+                with network_operation_lock(blocking=False):
                     result = self._clock.sync(principal_id, body)
             return {
                 "schema": CONTROL_RESPONSE_SCHEMA,
@@ -1827,6 +1770,13 @@ def handle_control_request(
         )
     if not _valid_control_request(str(operation), request):
         return _error_response("request_invalid", "network-control request shape is invalid")
+    if operation == "apply":
+        body = request.get("body")
+        assert isinstance(body, Mapping)
+        policy_error = validate_desired_state_policy(body.get("desired"))
+        if policy_error is not None:
+            code, message = policy_error
+            return _error_response(code, message, operation="apply", retryable=False)
     if controller is not None:
         try:
             response = controller._handle_validated(str(operation), request)
@@ -1859,15 +1809,22 @@ def handle_control_request(
                 retryable=exc.retryable,
             )
         except NetworkError as exc:
+            is_invalid = exc.code in {
+                "config_invalid",
+                "candidate_invalid",
+                "network_config_invalid",
+            }
             response = _error_response(
                 exc.code,
                 (
                     "capture is active; network mutation was not started"
                     if exc.code == "capture_active"
+                    else exc.message
+                    if is_invalid
                     else "NetworkManager operation failed"
                 ),
                 operation=str(operation),
-                retryable=True,
+                retryable=not is_invalid,
             )
         except (OSError, RuntimeError, ValueError):
             response = _error_response(
@@ -1920,27 +1877,108 @@ def _render_response(response: Mapping[str, Any]) -> str:
     return json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
-def _read_socket_request(connection: socket.socket) -> dict[str, Any] | str:
-    chunks: list[bytes] = []
-    size = 0
-    while True:
+def _is_concurrent_control_request(request: Mapping[str, Any]) -> bool:
+    return request.get("operation") in FAST_READ_OPERATIONS
+
+
+class _NetworkControlRpcServer(ControlRpcServer):
+    """Concurrent bounded NDJSON Unix-socket server with deferred-response ownership."""
+
+    def __init__(
+        self,
+        listener: socket.socket,
+        controller: NetworkController | None,
+        *,
+        max_connections: int | None = None,
+    ) -> None:
+        self._controller = controller
+        super().__init__(
+            None,
+            lambda req: handle_control_request(req, controller=controller),
+            max_workers=8,
+            max_pending=32,
+            max_request_bytes=MAX_CONTROL_REQUEST_BYTES,
+            max_response_bytes=MAX_CONTROL_RESPONSE_BYTES,
+            request_timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
+            max_connections=max_connections,
+            concurrent_predicate=_is_concurrent_control_request,
+            listener=listener,
+        )
+
+    def _reject_busy(self, conn: socket.socket) -> None:
+        response = _error_response(
+            "controller_busy",
+            "network-control server is busy",
+            retryable=True,
+        )
         try:
-            chunk = connection.recv(4096)
-        except (OSError, TimeoutError):
-            return _error_response("request_invalid", "network-control request was incomplete")
-        if not chunk:
-            break
-        chunks.append(chunk)
-        size += len(chunk)
-        if size > MAX_CONTROL_REQUEST_BYTES:
-            return _error_response("request_too_large", "network-control request is too large")
-        if b"\n" in chunk:
-            break
-    payload, _, _ = b"".join(chunks).partition(b"\n")
-    try:
-        return payload.decode("utf-8")
-    except UnicodeDecodeError:
-        return _error_response("request_invalid", "request must be valid UTF-8 JSON")
+            payload = encode_ndjson_object(response, max_bytes=self.max_response_bytes)
+            write_all_with_deadline(conn, payload, deadline=time.monotonic() + 0.1)
+        except (OSError, RpcFramingError):
+            pass
+        finally:
+            with suppress(OSError):
+                conn.close()
+
+    def _handle_connection(self, conn: socket.socket, deadline: float) -> None:
+        read_deadline = min(deadline, time.monotonic() + CONTROL_SOCKET_TIMEOUT_SECONDS)
+        try:
+            with conn:
+                response: dict[str, Any] | None = None
+                try:
+                    raw = read_ndjson_line(
+                        conn,
+                        max_bytes=self.max_request_bytes,
+                        deadline=read_deadline,
+                        allow_empty_eof=True,
+                    )
+                except RpcFramingError as exc:
+                    code = "request_too_large" if "size limit" in str(exc) else "request_invalid"
+                    response = _error_response(code, "network-control request was invalid")
+                except RpcTimeoutError:
+                    response = _error_response(
+                        "request_invalid", "network-control request timed out"
+                    )
+                else:
+                    if not raw:
+                        return
+                    try:
+                        request = decode_ndjson_object(
+                            raw,
+                            max_bytes=self.max_request_bytes,
+                            max_depth=self.max_depth,
+                        )
+                    except RpcFramingError:
+                        response = _error_response("request_invalid", "request must be valid JSON")
+                    else:
+                        if _is_concurrent_control_request(request):
+                            response = handle_control_request(request, controller=self._controller)
+                        else:
+                            with self._mutation_lock:
+                                response = handle_control_request(
+                                    request, controller=self._controller
+                                )
+                assert response is not None
+                if not response.get("ok") and self._controller is not None:
+                    self._controller._log_control_failure(response)
+                encoded = encode_ndjson_object(response, max_bytes=self.max_response_bytes)
+                try:
+                    write_all_with_deadline(conn, encoded, deadline=deadline)
+                except OSError as error:
+                    _OPERATIONAL_LOG.event(
+                        "network_control_response_write_failed",
+                        level="warning",
+                        transport="socket",
+                        error_code="response_write_failed",
+                        exception_type=type(error).__name__,
+                    )
+                    if self._controller is not None:
+                        self._controller.abort_deferred_response(response)
+                else:
+                    if self._controller is not None:
+                        self._controller.release_response(response)
+        except (OSError, RpcFramingError):
+            return
 
 
 def _serve_socket(
@@ -1948,50 +1986,35 @@ def _serve_socket(
     controller: NetworkController | None,
     *,
     max_connections: int | None,
+    stop_requested: threading.Event | None = None,
+    on_server_ready: Callable[[_NetworkControlRpcServer], None] | None = None,
 ) -> int:
-    served = 0
-    while max_connections is None or served < max_connections:
-        try:
-            connection, _ = listener.accept()
-        except OSError as error:
-            _OPERATIONAL_LOG.event(
-                "network_control_listener_stopped",
-                level="warning",
-                transport="socket",
-                connections_served=served,
-                error_code="listener_accept_failed",
-                exception_type=type(error).__name__,
-            )
-            return 0
-        with connection:
-            connection.settimeout(CONTROL_SOCKET_TIMEOUT_SECONDS)
-            payload = _read_socket_request(connection)
-            response = (
-                payload
-                if isinstance(payload, dict)
-                else handle_control_payload(payload, controller=controller)
-            )
-            if isinstance(payload, dict) and controller is not None:
-                controller._log_control_failure(response)
-            try:
-                connection.sendall(_render_response(response).encode("utf-8"))
-            except OSError as error:
-                _OPERATIONAL_LOG.event(
-                    "network_control_response_write_failed",
-                    level="warning",
-                    transport="socket",
-                    error_code="response_write_failed",
-                    exception_type=type(error).__name__,
-                )
-            else:
-                if controller is not None:
-                    controller.release_response(response)
-        served += 1
+    server = _NetworkControlRpcServer(
+        listener,
+        controller,
+        max_connections=max_connections,
+    )
+    if on_server_ready is not None:
+        on_server_ready(server)
+    try:
+        if stop_requested is None or not stop_requested.is_set():
+            server.serve_forever()
+    finally:
+        server.shutdown(timeout=CONTROL_RESPONSE_TIMEOUT_SECONDS)
+    outcome = (
+        "signal"
+        if stop_requested is not None and stop_requested.is_set()
+        else (
+            "connection_limit_reached"
+            if max_connections is not None and server._connections_accepted >= max_connections
+            else "closed"
+        )
+    )
     _OPERATIONAL_LOG.event(
         "network_control_listener_stopped",
         transport="socket",
-        connections_served=served,
-        outcome="connection_limit_reached",
+        connections_served=server._connections_accepted,
+        outcome=outcome,
     )
     return 0
 
@@ -2044,6 +2067,29 @@ def serve_stdio(
     if controller is None:
         controller = NetworkController(defer_execution_until_response=True)
     transport = "stdio"
+    stop_requested = threading.Event()
+    active_server: _NetworkControlRpcServer | None = None
+    previous_handlers: dict[int, object] = {}
+
+    def _on_shutdown_signal(_signum: int, _frame: object) -> None:
+        stop_requested.set()
+        server = active_server
+        if server is not None:
+            with suppress(OSError):
+                os.write(server._wakeup_w, b"x")
+
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with suppress(OSError, ValueError):
+                previous_handlers[sig] = signal.signal(sig, _on_shutdown_signal)
+
+    def _register_server(server: _NetworkControlRpcServer) -> None:
+        nonlocal active_server
+        active_server = server
+        if stop_requested.is_set():
+            with suppress(OSError):
+                os.write(server._wakeup_w, b"x")
+
     try:
         _notify_ready()
         listener = _listening_socket(stdin)
@@ -2058,17 +2104,33 @@ def serve_stdio(
                     listener,
                     controller,
                     max_connections=max_connections,
+                    stop_requested=stop_requested,
+                    on_server_ready=_register_server,
                 )
         _OPERATIONAL_LOG.event(
             "network_control_server_ready",
             transport=transport,
         )
         handled = 0
-        while max_connections is None or handled < max_connections:
-            payload = stdin.readline(MAX_CONTROL_REQUEST_BYTES + 2)
+        while not stop_requested.is_set() and (
+            max_connections is None or handled < max_connections
+        ):
+            payload = stdin.readline(MAX_CONTROL_REQUEST_BYTES + 1)
             if payload == "":
                 break
-            response = handle_control_payload(payload, controller=controller)
+            if not payload.endswith("\n") and (
+                len(payload) > MAX_CONTROL_REQUEST_BYTES
+                or len(payload.encode("utf-8", errors="replace")) > MAX_CONTROL_REQUEST_BYTES
+            ):
+                while True:
+                    discard = stdin.readline(MAX_CONTROL_REQUEST_BYTES + 1)
+                    if not discard or discard.endswith("\n"):
+                        break
+                response = _error_response(
+                    "request_too_large", "network-control request is too large"
+                )
+            else:
+                response = handle_control_payload(payload, controller=controller)
             rendered = _render_response(response)
             try:
                 if stdout.write(rendered) != len(rendered):
@@ -2082,6 +2144,7 @@ def serve_stdio(
                     error_code="response_write_failed",
                     exception_type=type(error).__name__,
                 )
+                controller.abort_deferred_response(response)
                 raise
             controller.release_response(response)
             handled += 1
@@ -2089,10 +2152,13 @@ def serve_stdio(
             "network_control_listener_stopped",
             transport=transport,
             connections_served=handled,
-            outcome="input_closed",
+            outcome="signal" if stop_requested.is_set() else "input_closed",
         )
         return 0
     finally:
+        for sig, previous in previous_handlers.items():
+            with suppress(OSError, ValueError):
+                signal.signal(sig, previous)  # type: ignore[arg-type]
         if owns_controller:
             controller.close()
         _OPERATIONAL_LOG.event(
@@ -2100,26 +2166,6 @@ def serve_stdio(
             transport=transport,
             outcome="closed",
         )
-
-
-def _read_socket_response(client: socket.socket) -> bytes:
-    chunks: list[bytes] = []
-    size = 0
-    while True:
-        chunk = client.recv(4096)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        size += len(chunk)
-        if size > MAX_CONTROL_RESPONSE_BYTES:
-            raise NetworkControlClientError(
-                "response_too_large",
-                "network-control response exceeded the size limit",
-            )
-        if b"\n" in chunk:
-            break
-    line, _, _ = b"".join(chunks).partition(b"\n")
-    return line
 
 
 def request_control(
@@ -2131,58 +2177,29 @@ def request_control(
     socket_path: Path = CONTROL_SOCKET_PATH,
     timeout_seconds: float = CONTROL_SOCKET_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    request: dict[str, object] = {
-        "schema": CONTROL_REQUEST_SCHEMA,
-        "operation": operation,
-    }
-    if operation in MUTATION_OPERATIONS:
-        if principal_id is None or idempotency_key is None or body is None:
-            raise NetworkControlClientError(
-                "request_invalid",
-                "network-control mutation request is incomplete",
-            )
-        request.update(
-            {
-                "principal_id": principal_id,
-                "idempotency_key": idempotency_key,
-                "body": dict(body),
-            }
-        )
-    elif operation in {"create_credential", "clock_status", "clock_inspect", "clock_sync"}:
-        if principal_id is None or body is None:
-            raise NetworkControlClientError(
-                "request_invalid",
-                "network credential request is incomplete",
-            )
-        request.update({"principal_id": principal_id, "body": dict(body)})
-    payload = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _paths_request_control(
+        operation,
+        principal_id=principal_id,
+        idempotency_key=idempotency_key,
+        body=body,
+        socket_path=socket_path,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _project_controller_status() -> dict[str, Any] | None:
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(timeout_seconds)
-            client.connect(str(socket_path))
-            client.sendall(payload.encode("utf-8") + b"\n")
-            client.shutdown(socket.SHUT_WR)
-            rendered = _read_socket_response(client)
-    except OSError as exc:
-        raise NetworkControlClientError(
-            "network_controller_unavailable",
-            "network-control socket is unavailable",
-        ) from exc
-    try:
-        response = json.loads(rendered.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise NetworkControlClientError(
-            "response_invalid",
-            "network-control response is not valid JSON",
-        ) from exc
-    if not isinstance(response, dict):
-        raise NetworkControlClientError(
-            "response_invalid",
-            "network-control response must be a JSON object",
+        response = request_control(
+            "status",
+            timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
         )
-    if response.get("schema") != CONTROL_RESPONSE_SCHEMA:
-        raise NetworkControlClientError(
-            "response_invalid",
-            "network-control response schema is invalid",
-        )
-    return _seal_response(response)
+    except NetworkControlClientError:
+        return None
+    sealed = seal_response(response)
+    if sealed.get("ok") is not True or sealed.get("operation") != "status":
+        return None
+    body = sealed.get("body")
+    return deepcopy(dict(body)) if isinstance(body, Mapping) else None
+
+
+register_controller_status_provider(_project_controller_status)

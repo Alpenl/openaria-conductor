@@ -16,6 +16,8 @@ RUNTIME_DIRECTORY=${RUNTIME_DIRECTORY:-/run/rp-ylx-wifi-watchdog}
 SYS_CLASS_NET=${WIFI_SYS_CLASS_NET:-/sys/class/net}
 RP_YLX_COMMAND=${RP_YLX_COMMAND:-/opt/rp-ylx/current/bin/rp-ylx}
 NETWORK_OPERATION_LOCK=${RP_YLX_NETWORK_OPERATION_LOCK_PATH:-/run/rp-ylx/network-operation.lock}
+MAINTENANCE_LOCK=${OPENARIA_MAINTENANCE_LOCK:-/run/rp-ylx/maintenance.lock}
+DIAGNOSTIC_LOG_LIMIT=${WIFI_DIAGNOSTIC_LOG_LIMIT:-10}
 
 FAILURE_FILE=$RUNTIME_DIRECTORY/failures
 LOCK_FILE=$RUNTIME_DIRECTORY/lock
@@ -45,6 +47,7 @@ require_unsigned_integer WIFI_RELOAD_TIMEOUT_SECONDS "$RELOAD_TIMEOUT"
 require_unsigned_integer WIFI_NMCLI_TIMEOUT_SECONDS "$NMCLI_TIMEOUT"
 require_unsigned_integer WIFI_RECOVERY_COOLDOWN_SECONDS "$RECOVERY_COOLDOWN"
 require_unsigned_integer WIFI_REBOOT_COOLDOWN_SECONDS "$REBOOT_COOLDOWN"
+require_unsigned_integer WIFI_DIAGNOSTIC_LOG_LIMIT "$DIAGNOSTIC_LOG_LIMIT"
 
 mkdir -p "$STATE_DIRECTORY" "$RUNTIME_DIRECTORY"
 chmod 0700 "$STATE_DIRECTORY" "$RUNTIME_DIRECTORY"
@@ -57,6 +60,22 @@ exec 8<>"$NETWORK_OPERATION_LOCK"
 if ! flock -n 8; then
     log "network controller operation is active; deferring driver recovery"
     exit 0
+fi
+
+MAINTENANCE_LOCK_ACTIVE=0
+if [ -L "$MAINTENANCE_LOCK" ]; then
+    log "maintenance lock is an unsafe symlink; deferring Wi-Fi recovery"
+    exit 0
+elif [ ! -f "$MAINTENANCE_LOCK" ]; then
+    log "maintenance lock is missing; deferring Wi-Fi recovery"
+    exit 0
+else
+    exec 7<"$MAINTENANCE_LOCK"
+    if ! flock -x -n 7; then
+        log "maintenance operation is active; deferring Wi-Fi recovery"
+        exit 0
+    fi
+    MAINTENANCE_LOCK_ACTIVE=1
 fi
 
 desired_mode=$("$RP_YLX_COMMAND" network-control watchdog-mode 2>/dev/null || printf 'unknown')
@@ -154,7 +173,25 @@ record_diagnostics()
         journalctl -u wpa_supplicant.service --since=-15min --no-pager 2>&1 || true
     } >"$output"
     chmod 0600 "$output"
+    rotate_diagnostics
     log "saved diagnostics to $output"
+}
+
+rotate_diagnostics()
+{
+    [ "$DIAGNOSTIC_LOG_LIMIT" -gt 0 ] || return 0
+    old_ifs=$IFS
+    IFS='
+'
+    set -f
+    kept=0
+    for entry in $(set +f; ls -1t -- "$STATE_DIRECTORY"/diagnostic-*.log 2>/dev/null || true); do
+        [ -f "$entry" ] || continue
+        kept=$((kept + 1))
+        [ "$kept" -gt "$DIAGNOSTIC_LOG_LIMIT" ] && rm -f -- "$entry"
+    done
+    set +f
+    IFS=$old_ifs
 }
 
 recovery_is_in_cooldown()
@@ -244,6 +281,22 @@ maybe_reboot_after_recovery_failure()
     [ "$REBOOT_ON_FAILURE" = 1 ] || return 0
     if automatic_reboot_is_in_cooldown; then
         log "automatic reboot is in cooldown"
+        return 0
+    fi
+    if ! flock -n 8; then
+        log "network controller operation is active; deferring automatic reboot"
+        return 0
+    fi
+    if [ -L "$MAINTENANCE_LOCK" ]; then
+        log "maintenance lock is an unsafe symlink; deferring automatic reboot"
+        return 0
+    fi
+    if [ "$MAINTENANCE_LOCK_ACTIVE" != 1 ] || [ ! -f "$MAINTENANCE_LOCK" ]; then
+        log "maintenance lock is missing; deferring automatic reboot"
+        return 0
+    fi
+    if ! flock -x -n 7; then
+        log "maintenance or capture operation is active; deferring automatic reboot"
         return 0
     fi
     date +%s >"$LAST_REBOOT_FILE"

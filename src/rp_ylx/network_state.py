@@ -12,73 +12,36 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from rp_ylx.network import (
-    _desired_state_from_disk,
-    _network_lock,
-    _prepare_state_dir,
+from rp_ylx.core.ids import UUID_V7_RE, valid_sha256, valid_uuid4, valid_uuid7
+from rp_ylx.network_paths import desired_state_from_disk, network_lock, prepare_state_dir
+from rp_ylx.network_validation import (
+    CONTROLLER_STATE_SCHEMA,
+    RECEIPT_SCHEMA,
+    RECOVERY_ACTIONS,
+    TERMINAL_STATUSES,
+    TRANSACTION_SCHEMA,
+    TRANSACTION_STAGES,
+    TRANSACTION_STATUSES,
+    valid_deadline,
+    valid_desired_state,
+    valid_transaction,
+)
+from rp_ylx.network_validation import (
+    STAGE_STATUS as STAGE_STATUS,
+)
+from rp_ylx.network_validation import (
+    TRANSACTION_ERROR_CODES as TRANSACTION_ERROR_CODES,
+)
+from rp_ylx.network_validation import (
+    WIFI_SECURITY as WIFI_SECURITY,
 )
 from rp_ylx.persistence import StateDatabase
 
-CONTROLLER_STATE_SCHEMA = "ylx.network-controller-state.v1"
-TRANSACTION_SCHEMA = "ylx.network-transaction.v1"
-RECEIPT_SCHEMA = "ylx.network-transaction-receipt.v1"
-UUID_V7_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
+MAX_RETAINED_RECEIPTS = 2048
+UUID_V7_PATTERN = UUID_V7_RE
 FORBIDDEN_PERSISTED_KEYS = frozenset(
     {"credential_ref", "password", "passphrase", "psk", "secret", "token"}
 )
-TERMINAL_STATUSES = frozenset({"committed", "rescued", "failed"})
-WIFI_SECURITY = frozenset({"open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"})
-TRANSACTION_STATUSES = frozenset({"accepted", "running", *TERMINAL_STATUSES})
-TRANSACTION_STAGES = frozenset(
-    {
-        "accepted",
-        "prepared",
-        "ap_ready",
-        "activating",
-        "verifying",
-        "committed",
-        "falling_back",
-        "rescued",
-        "failed",
-        "forgetting",
-        "forgotten",
-    }
-)
-RECOVERY_ACTIONS = frozenset(
-    {
-        "await_device",
-        "reconnect_target_lan",
-        "reconnect_rescue_ap",
-        "retry",
-        "service_required",
-        "none",
-    }
-)
-TRANSACTION_ERROR_CODES = frozenset(
-    {
-        "rescue_ap_unavailable",
-        "credential_rejected",
-        "dhcp_timeout",
-        "route_lost",
-        "network_manager_unavailable",
-        "concurrency_unsupported",
-    }
-)
-STAGE_STATUS = {
-    "accepted": "accepted",
-    "prepared": "running",
-    "ap_ready": "running",
-    "activating": "running",
-    "verifying": "running",
-    "committed": "committed",
-    "falling_back": "running",
-    "rescued": "rescued",
-    "failed": "failed",
-    "forgetting": "running",
-    "forgotten": "committed",
-}
 
 
 class NetworkStateError(RuntimeError):
@@ -102,56 +65,6 @@ def _contains_forbidden_key(value: object) -> bool:
     return False
 
 
-def valid_desired_state(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {"mode", "wifi_client", "ethernet"}:
-        return False
-    mode = value.get("mode")
-    if mode not in {"hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"}:
-        return False
-    wifi = value.get("wifi_client")
-    if mode == "wifi-client":
-        if (
-            not isinstance(wifi, Mapping)
-            or set(wifi) != {"ssid", "security", "credential_state"}
-            or not isinstance(wifi.get("ssid"), str)
-            or not 1 <= len(str(wifi["ssid"]).encode("utf-8")) <= 32
-            or wifi.get("security") not in WIFI_SECURITY
-            or wifi.get("credential_state") not in {"absent", "pending_input", "stored"}
-        ):
-            return False
-        if (wifi.get("security") == "open") != (wifi.get("credential_state") == "absent"):
-            return False
-    elif wifi is not None:
-        return False
-    ethernet = value.get("ethernet")
-    if ethernet is not None:
-        if not isinstance(ethernet, Mapping) or set(ethernet) != {"addressing", "static_ipv4"}:
-            return False
-        if ethernet.get("addressing") == "dhcp":
-            if ethernet.get("static_ipv4") is not None:
-                return False
-        elif ethernet.get("addressing") == "static":
-            static = ethernet.get("static_ipv4")
-            if not isinstance(static, Mapping) or set(static) != {
-                "address",
-                "prefix_length",
-                "gateway",
-                "dns",
-            }:
-                return False
-        else:
-            return False
-    return not (mode == "ethernet-static" and ethernet is None)
-
-
-def _valid_uuid4(value: object) -> bool:
-    try:
-        parsed = uuid.UUID(str(value))
-    except (ValueError, AttributeError):
-        return False
-    return parsed.version == 4 and str(parsed) == value
-
-
 def _valid_boot_id(value: object) -> bool:
     if value is None:
         return True
@@ -162,92 +75,15 @@ def _valid_boot_id(value: object) -> bool:
     return isinstance(value, str) and str(parsed) == value
 
 
-def _valid_deadline(value: object) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, Mapping) or set(value) != {
-        "time_base",
-        "deadline_ns",
-        "remaining_seconds",
-    }:
-        return False
-    remaining = value.get("remaining_seconds")
-    return (
-        value.get("time_base") == "device_monotonic"
-        and type(value.get("deadline_ns")) is int
-        and value["deadline_ns"] >= 0
-        and isinstance(remaining, (int, float))
-        and not isinstance(remaining, bool)
-        and 0 <= remaining <= 10
-    )
-
-
-def valid_transaction(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema",
-        "authority_epoch",
-        "source_revision",
-        "transaction_id",
-        "operation",
-        "status",
-        "stage",
-        "desired",
-        "accepted_at",
-        "updated_at",
-        "deadline",
-        "recovery_action",
-        "rescue",
-        "error",
-    }:
-        return False
-    transaction_id = value.get("transaction_id")
-    rescue = value.get("rescue")
-    error = value.get("error")
-    return (
-        value.get("schema") == TRANSACTION_SCHEMA
-        and _valid_uuid4(value.get("authority_epoch"))
-        and type(value.get("source_revision")) is int
-        and value["source_revision"] >= 0
-        and isinstance(transaction_id, str)
-        and UUID_V7_PATTERN.fullmatch(transaction_id) is not None
-        and value.get("operation") in {"apply", "retry", "forget"}
-        and value.get("status") in TRANSACTION_STATUSES
-        and value.get("stage") in TRANSACTION_STAGES
-        and STAGE_STATUS.get(str(value.get("stage"))) == value.get("status")
-        and valid_desired_state(value.get("desired"))
-        and isinstance(value.get("accepted_at"), str)
-        and bool(value["accepted_at"])
-        and isinstance(value.get("updated_at"), str)
-        and bool(value["updated_at"])
-        and _valid_deadline(value.get("deadline"))
-        and value.get("recovery_action") in RECOVERY_ACTIONS
-        and isinstance(rescue, Mapping)
-        and set(rescue) == {"ap_validated", "fallback_mode", "failure_trigger_seconds"}
-        and type(rescue.get("ap_validated")) is bool
-        and rescue.get("fallback_mode") == "hotspot"
-        and rescue.get("failure_trigger_seconds") == 10
-        and (
-            error is None
-            or isinstance(error, Mapping)
-            and set(error) == {"code", "message", "retryable"}
-            and error.get("code") in TRANSACTION_ERROR_CODES
-            and isinstance(error.get("message"), str)
-            and bool(error["message"])
-            and type(error.get("retryable")) is bool
-        )
-    )
-
-
 def _valid_receipts(value: object, authority_epoch: str, source_revision: int) -> bool:
     if not isinstance(value, Mapping):
         return False
     for scope, entry in value.items():
         if (
-            not isinstance(scope, str)
-            or re.fullmatch(r"[0-9a-f]{64}", scope) is None
+            not valid_sha256(scope)
             or not isinstance(entry, Mapping)
             or set(entry) != {"request_fingerprint", "receipt"}
-            or re.fullmatch(r"[0-9a-f]{64}", str(entry.get("request_fingerprint"))) is None
+            or not valid_sha256(entry.get("request_fingerprint"))
         ):
             return False
         receipt = entry.get("receipt")
@@ -296,7 +132,7 @@ def _valid_state(value: object) -> bool:
     execution_release = value.get("execution_release")
     return (
         value.get("schema") == CONTROLLER_STATE_SCHEMA
-        and _valid_uuid4(authority_epoch)
+        and valid_uuid4(authority_epoch)
         and type(source_revision) is int
         and source_revision >= 0
         and type(value.get("saved")) is bool
@@ -318,9 +154,7 @@ def _valid_state(value: object) -> bool:
         and isinstance(execution_release, Mapping)
         and _valid_boot_id(value.get("rescue_boot_id"))
         and all(
-            isinstance(transaction_id, str)
-            and UUID_V7_PATTERN.fullmatch(transaction_id) is not None
-            and type(released) is bool
+            valid_uuid7(transaction_id) and type(released) is bool
             for transaction_id, released in execution_release.items()
         )
         and (
@@ -332,6 +166,37 @@ def _valid_state(value: object) -> bool:
     )
 
 
+def _prune_receipts_locked(
+    state: dict[str, Any], *, max_entries: int = MAX_RETAINED_RECEIPTS
+) -> None:
+    receipts = state.get("receipts")
+    if not isinstance(receipts, dict) or len(receipts) <= max_entries:
+        return
+    protected: set[str] = set()
+    transaction = state.get("transaction", {})
+    for key in ("current", "latest"):
+        item = transaction.get(key) if isinstance(transaction, Mapping) else None
+        if isinstance(item, Mapping) and isinstance(item.get("transaction_id"), str):
+            protected.add(str(item["transaction_id"]))
+    work = state.get("work")
+    if isinstance(work, Mapping):
+        protected.update(str(work_id) for work_id in work)
+
+    removable: list[tuple[int, str, str]] = []
+    for scope, entry in receipts.items():
+        tx = entry.get("receipt", {}).get("transaction", {}) if isinstance(entry, Mapping) else {}
+        tx_id = tx.get("transaction_id") if isinstance(tx, Mapping) else None
+        if isinstance(tx_id, str) and tx_id in protected:
+            continue
+        revision = tx.get("source_revision") if isinstance(tx, Mapping) else 0
+        accepted_at = str(tx.get("accepted_at", "")) if isinstance(tx, Mapping) else ""
+        removable.append((revision if type(revision) is int else 0, accepted_at, scope))
+    removable.sort()
+    excess = len(receipts) - max_entries
+    for _, _, scope in removable[:excess]:
+        receipts.pop(scope, None)
+
+
 class NetworkStateStore:
     """Persist one authoritative desired state and current/latest v1 transaction window."""
 
@@ -339,7 +204,7 @@ class NetworkStateStore:
         self._state_dir = Path(state_dir)
         self._path = self._state_dir / "controller-state.json"
         self._thread_lock = threading.RLock()
-        _prepare_state_dir(self._state_dir)
+        prepare_state_dir(self._state_dir)
         self._database = StateDatabase(self._state_dir / "controller.sqlite3")
 
         def validate_import(value):
@@ -353,8 +218,8 @@ class NetworkStateStore:
             self._validate(migrated)
 
         def initial_state():
-            desired = _desired_state_from_disk(self._state_dir)
-            saved = desired.get("mode") == "wifi-client"
+            desired = desired_state_from_disk(self._state_dir)
+            saved = desired.get("mode") != "hotspot"
             return {
                 "schema": CONTROLLER_STATE_SCHEMA,
                 "authority_epoch": str(uuid.uuid4()),
@@ -369,7 +234,7 @@ class NetworkStateStore:
                 "rescue_boot_id": None,
             }
 
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._database.import_json(
                 "controller", self._path, validate=validate_import, default_factory=initial_state
             )
@@ -409,7 +274,7 @@ class NetworkStateStore:
                 raise
 
     def snapshot(self) -> dict[str, Any]:
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
         return {
             "schema": CONTROLLER_STATE_SCHEMA,
@@ -433,7 +298,7 @@ class NetworkStateStore:
         request_fingerprint: str,
     ) -> dict[str, Any] | None:
         scope = self._scope(principal_id, idempotency_key)
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             existing = state["receipts"].get(scope)
             if existing is None:
@@ -470,10 +335,10 @@ class NetworkStateStore:
         if (
             operation not in {"apply", "retry", "forget"}
             or not valid_desired_state(desired)
-            or UUID_V7_PATTERN.fullmatch(transaction_id) is None
+            or not valid_uuid7(transaction_id)
             or not isinstance(accepted_at, str)
             or not accepted_at
-            or re.fullmatch(r"[0-9a-f]{64}", request_fingerprint) is None
+            or not valid_sha256(request_fingerprint)
             or _contains_forbidden_key(work)
             or type(execution_released) is not bool
             or type(publish_desired) is not bool
@@ -484,7 +349,7 @@ class NetworkStateStore:
         ):
             raise NetworkStateError("state_input_invalid", "network transaction input is invalid")
         scope = self._scope(principal_id, idempotency_key)
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             existing = state["receipts"].get(scope)
             if existing is not None:
@@ -538,7 +403,7 @@ class NetworkStateStore:
             if saved is not None:
                 state["saved"] = saved
             elif publish_desired:
-                state["saved"] = desired.get("mode") == "wifi-client"
+                state["saved"] = desired.get("mode") != "hotspot"
             if verified is not None:
                 state["verified"] = verified
             elif publish_desired:
@@ -550,12 +415,13 @@ class NetworkStateStore:
                 "receipt": receipt,
             }
             state["work"][transaction_id] = deepcopy(dict(work))
+            _prune_receipts_locked(state)
             self._validate(state)
             self._write_locked(state)
         return deepcopy(receipt), False
 
     def execution_released(self, transaction_id: str) -> bool:
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             current = state["transaction"]["current"]
             return bool(
@@ -567,7 +433,7 @@ class NetworkStateStore:
     def boot_needs_reconcile(self, boot_id: str) -> bool:
         if not _valid_boot_id(boot_id):
             raise NetworkStateError("state_input_invalid", "Linux boot ID is invalid")
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             return self._load_locked()["rescue_boot_id"] != boot_id
 
     def mark_boot_reconciled(self, boot_id: str) -> None:
@@ -575,7 +441,7 @@ class NetworkStateStore:
         # It tracks boot reconciliation, not whether an AP was activated.
         if not _valid_boot_id(boot_id):
             raise NetworkStateError("state_input_invalid", "Linux boot ID is invalid")
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             if state["rescue_boot_id"] == boot_id:
                 return
@@ -584,7 +450,7 @@ class NetworkStateStore:
             self._write_locked(state)
 
     def release_execution(self, transaction_id: str) -> bool:
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             current = state["transaction"]["current"]
             if not isinstance(current, Mapping) or current.get("transaction_id") != transaction_id:
@@ -596,7 +462,7 @@ class NetworkStateStore:
             return True
 
     def work_for(self, transaction_id: str) -> dict[str, Any]:
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             work = state["work"].get(transaction_id)
             if not isinstance(work, Mapping):
@@ -605,9 +471,14 @@ class NetworkStateStore:
                 )
             return deepcopy(dict(work))
 
+    def work_ids(self) -> tuple[str, ...]:
+        with self._thread_lock, network_lock(self._state_dir):
+            state = self._load_locked()
+            return tuple(str(key) for key in state["work"])
+
     def retained_profiles(self) -> set[str]:
         retained: set[str] = set()
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             for work in state["work"].values():
                 candidate = work.get("candidate") if isinstance(work, Mapping) else None
@@ -646,7 +517,7 @@ class NetworkStateStore:
             or (ap_validated is not None and type(ap_validated) is not bool)
             or (desired is not None and not valid_desired_state(desired))
             or type(publish_desired) is not bool
-            or not _valid_deadline(deadline)
+            or not valid_deadline(deadline)
             or recovery_action not in RECOVERY_ACTIONS
             or (saved is not None and type(saved) is not bool)
             or (verified is not None and type(verified) is not bool)
@@ -657,7 +528,7 @@ class NetworkStateStore:
             or any(not isinstance(item, str) for item in remove_work)
         ):
             raise NetworkStateError("state_input_invalid", "network transition is invalid")
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             current = state["transaction"]["current"]
             if not isinstance(current, dict) or current.get("transaction_id") != transaction_id:
@@ -691,12 +562,13 @@ class NetworkStateStore:
             else:
                 for work_id in remove_work:
                     state["work"].pop(work_id, None)
+            _prune_receipts_locked(state)
             self._validate(state)
             self._write_locked(state)
             return deepcopy(current)
 
     def scan_stamp(self) -> tuple[str, int]:
-        with self._thread_lock, _network_lock(self._state_dir):
+        with self._thread_lock, network_lock(self._state_dir):
             state = self._load_locked()
             state["source_revision"] += 1
             self._validate(state)

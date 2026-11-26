@@ -2,34 +2,99 @@
 
 from __future__ import annotations
 
-import errno
-import fcntl
+import configparser
 import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from copy import deepcopy
-from datetime import UTC, datetime
 from importlib.resources import files as resource_files
 from pathlib import Path
 from typing import Any, TextIO
 
+from rp_ylx.core.fs import fsync_directory
+from rp_ylx.core.time import utc_now_iso
+from rp_ylx.network_paths import (
+    CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    ETHERNET_INTERFACE,
+    LKG_FORMAT,
+    NETWORK_ACTIVATION_TIMEOUT_SECONDS,
+    NETWORK_ACTIVATION_WAIT_SECONDS,
+    SUPPORTED_MODES,
+    WIFI_INTERFACE,
+    NetworkControlClientError,
+    NetworkError,
+)
+from rp_ylx.network_paths import (
+    NETWORK_OPERATION_LOCK_PATH as NETWORK_OPERATION_LOCK_PATH,
+)
+from rp_ylx.network_paths import (
+    avahi_dir as _paths_avahi_dir,
+)
+from rp_ylx.network_paths import (
+    desired_state_from_config as _paths_desired_state_from_config,
+)
+from rp_ylx.network_paths import (
+    desired_state_from_disk as _paths_desired_state_from_disk,
+)
+from rp_ylx.network_paths import (
+    interface_for_mode as _paths_interface_for_mode,
+)
+from rp_ylx.network_paths import (
+    lkg_path as _paths_lkg_path,
+)
+from rp_ylx.network_paths import (
+    monotonic_deadline_timeout as _paths_deadline_timeout,
+)
+from rp_ylx.network_paths import (
+    network_lock as _paths_network_lock,
+)
+from rp_ylx.network_paths import (
+    network_operation_lease as network_operation_lease,
+)
+from rp_ylx.network_paths import (
+    network_operation_lock as _paths_network_operation_lock,
+)
+from rp_ylx.network_paths import (
+    network_operation_lock_path as network_operation_lock_path,
+)
+from rp_ylx.network_paths import (
+    prepare_state_dir as _paths_prepare_state_dir,
+)
+from rp_ylx.network_paths import (
+    profile_dir as _paths_profile_dir,
+)
+from rp_ylx.network_paths import (
+    read_json as _paths_read_json,
+)
+from rp_ylx.network_paths import (
+    request_control as _paths_request_control,
+)
+from rp_ylx.network_paths import (
+    seal_response as _paths_seal_response,
+)
+from rp_ylx.network_paths import (
+    state_dir as _paths_state_dir,
+)
+from rp_ylx.network_validation import (
+    usable_ipv4_address,
+    validate_static_ipv4_fields,
+    validate_wifi_ssid,
+)
+
 NETWORK_STATUS_FORMAT = "ylx.network-status.v0"
-SUPPORTED_MODES = ["hotspot", "wifi-client", "ethernet-dhcp", "ethernet-static"]
 WIFI_SECURITY = ["open", "wpa2-personal", "wpa3-personal", "wpa2-wpa3-personal"]
-WIFI_INTERFACE = "wlan0"
-ETHERNET_INTERFACE = "eth0"
 MDNS_HOSTNAME = "rp-ylx.local"
 MDNS_SERVICE = "_ylx-capture._tcp"
 MDNS_SERVICE_ALIASES = ["_http._tcp"]
@@ -38,32 +103,21 @@ MDNS_ASSET_NAME = "rp-ylx.avahi"
 CUSTOMER_MDNS_ASSET_NAME = "rp-ylx-customer.avahi"
 MDNS_SERVICE_FILENAME = "rp-ylx.service"
 DEVICE_CONFIG_PATH = Path("/etc/rp-ylx/device.json")
-NETWORK_OPERATION_LOCK_PATH = Path("/run/rp-ylx/network-operation.lock")
-NETWORK_ACTIVATION_WAIT_SECONDS = 10
-NETWORK_ACTIVATION_TIMEOUT_SECONDS = 12
 MAX_CONFIG_BYTES = 64 * 1024
 JOURNAL_FORMAT = "ylx.network-journal.v0"
 RESULT_FORMAT = "ylx.network-result.v0"
-LKG_FORMAT = "ylx.network-lkg.v0"
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 FALLBACK_NETWORK_AUTHORITY_EPOCH = str(uuid.uuid4())
 PUBLIC_RESCUE_AP_PSK = "12345678"
+_CONTROLLER_STATUS_PROVIDER: Callable[[], dict[str, Any] | None] | None = None
 
 
-class NetworkError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        exit_code: int = 3,
-        recovery: str | None = None,
-    ) -> None:
-        self.code = code
-        self.message = message
-        self.exit_code = exit_code
-        self.recovery = recovery
-        super().__init__(f"{code}: {message}")
+def register_controller_status_provider(
+    provider: Callable[[], dict[str, Any] | None] | None,
+) -> None:
+    """Register an optional controller status projection hook without back-imports."""
+    global _CONTROLLER_STATUS_PROVIDER
+    _CONTROLLER_STATUS_PROVIDER = provider
 
 
 def _config_error(message: str) -> NetworkError:
@@ -138,18 +192,20 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {"mode": mode}
     if mode == "hotspot":
         allowed = {"mode", "ssid", "psk"}
-        ssid = _text_field(config, "ssid")
+        try:
+            ssid = validate_wifi_ssid(config.get("ssid"))
+        except ValueError as exc:
+            raise _config_error(str(exc)) from exc
         psk = _text_field(config, "psk")
-        if len(ssid.encode("utf-8")) > 32:
-            raise _config_error("SSID 必须为 1 至 32 字节")
         if not 8 <= len(psk.encode("utf-8")) <= 63:
             raise _config_error("Wi-Fi 密码必须为 8 至 63 字节")
         normalized.update({"ssid": ssid, "psk": psk})
     elif mode == "wifi-client":
         allowed = {"mode", "ssid", "security", "psk"}
-        ssid = _text_field(config, "ssid")
-        if len(ssid.encode("utf-8")) > 32:
-            raise _config_error("SSID 必须为 1 至 32 字节")
+        try:
+            ssid = validate_wifi_ssid(config.get("ssid"))
+        except ValueError as exc:
+            raise _config_error(str(exc)) from exc
         security = config.get("security", "wpa2-personal")
         if security not in WIFI_SECURITY:
             raise _config_error("security 必须是受支持的 Wi-Fi 安全类型")
@@ -167,33 +223,17 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     else:
         allowed = {"mode", "address", "gateway", "dns"}
         try:
-            address = ipaddress.IPv4Interface(_text_field(config, "address"))
+            interface, parsed_gateway, normalized_dns = validate_static_ipv4_fields(
+                config.get("address"),
+                config.get("gateway"),
+                config.get("dns", []),
+            )
         except ValueError as exc:
-            raise _config_error("address 必须是有效 IPv4 CIDR") from exc
-        if not _usable_ipv4_addresses([str(address)]):
-            raise _config_error("address 必须是可用的非 link-local IPv4 主机地址")
-        if address.network.overlaps(ipaddress.IPv4Network("10.42.0.0/24")):
-            raise _config_error("有线静态地址不能与热点网段重叠")
-        normalized["address"] = str(address)
-        gateway = config.get("gateway")
-        if gateway is not None:
-            try:
-                parsed_gateway = ipaddress.IPv4Address(_text_field(config, "gateway"))
-            except ValueError as exc:
-                raise _config_error("gateway 必须是有效 IPv4 地址") from exc
-            if parsed_gateway not in address.network or parsed_gateway in {
-                address.network.network_address,
-                address.network.broadcast_address,
-            }:
-                raise _config_error("gateway 必须是同一子网中的可用主机地址")
+            raise _config_error(str(exc)) from exc
+        normalized["address"] = str(interface)
+        if parsed_gateway is not None:
             normalized["gateway"] = str(parsed_gateway)
-        dns = config.get("dns", [])
-        if not isinstance(dns, list) or len(dns) > 3:
-            raise _config_error("dns 必须是最多三个 IPv4 地址的数组")
-        try:
-            normalized["dns"] = [str(ipaddress.IPv4Address(item)) for item in dns]
-        except (TypeError, ValueError) as exc:
-            raise _config_error("dns 必须是最多三个 IPv4 地址的数组") from exc
+        normalized["dns"] = normalized_dns
     if set(config) != allowed and not set(config).issubset(allowed):
         raise _config_error("网络配置包含未知字段")
     if mode == "ethernet-static" and not set(config).issubset(allowed):
@@ -202,37 +242,19 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _state_dir() -> Path:
-    return Path(os.environ.get("RP_YLX_NETWORK_STATE_DIR", "/var/lib/rp-ylx-network"))
+    return _paths_state_dir()
 
 
 def _profile_dir() -> Path:
-    return Path(
-        os.environ.get(
-            "RP_YLX_NM_PROFILE_DIR",
-            "/etc/NetworkManager/system-connections",
-        )
-    )
+    return _paths_profile_dir()
 
 
 def _avahi_dir() -> Path:
-    return Path(os.environ.get("RP_YLX_AVAHI_SERVICE_DIR", "/etc/avahi/services"))
+    return _paths_avahi_dir()
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _ensure_directory(path: Path, mode: int) -> None:
-    existed = path.exists()
-    path.mkdir(mode=mode, parents=True, exist_ok=True)
-    os.chmod(path, mode)
-    _fsync_directory(path)
-    if not existed:
-        _fsync_directory(path.parent)
+    fsync_directory(path)
 
 
 def _write_atomic(path: Path, data: bytes, mode: int) -> None:
@@ -264,76 +286,13 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise NetworkError("state_invalid", f"网络状态文件 {path.name} 无效") from exc
-    if not isinstance(value, dict):
-        raise NetworkError("state_invalid", f"网络状态文件 {path.name} 无效")
-    return value
+    return _paths_read_json(path)
 
 
 @contextmanager
 def _network_lock(state_dir: Path) -> Iterator[None]:
-    lock_path = state_dir / ".lock"
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-    except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise NetworkError("state_lock_failed", "无法锁定网络配置状态") from exc
-    try:
+    with _paths_network_lock(state_dir):
         yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
-def network_operation_lock_path() -> Path:
-    return Path(
-        os.environ.get("RP_YLX_NETWORK_OPERATION_LOCK_PATH", str(NETWORK_OPERATION_LOCK_PATH))
-    ).absolute()
-
-
-@contextmanager
-def network_operation_lease(*, blocking: bool = True) -> Iterator[None]:
-    """Hold the cross-process lease shared by capture and root network mutation."""
-
-    path = network_operation_lock_path()
-    try:
-        path.parent.mkdir(mode=0o770, parents=True, exist_ok=True)
-    except OSError as exc:
-        raise NetworkError("operation_lock_failed", "无法创建网络控制锁目录") from exc
-    with _OPERATION_LOCKS_GUARD:
-        process_lock = _OPERATION_LOCKS.setdefault(path, threading.RLock())
-    acquired = process_lock.acquire(blocking=blocking)
-    if not acquired:
-        raise NetworkError("capture_active", "录制期间不能修改网络")
-    held_paths = getattr(_OPERATION_LOCK_LOCAL, "held_paths", None)
-    if held_paths is None:
-        held_paths = set()
-        _OPERATION_LOCK_LOCAL.held_paths = held_paths
-    try:
-        if path in held_paths:
-            yield
-            return
-        with _file_operation_lock(path, blocking=blocking):
-            held_paths.add(path)
-            try:
-                yield
-            finally:
-                held_paths.remove(path)
-    finally:
-        process_lock.release()
 
 
 @contextmanager
@@ -342,55 +301,12 @@ def _network_operation_lock(
     *,
     blocking: bool = True,
 ) -> Iterator[None]:
-    del state_dir
-    with network_operation_lease(blocking=blocking):
+    with _paths_network_operation_lock(state_dir, blocking=blocking):
         yield
-
-
-_OPERATION_LOCKS_GUARD = threading.Lock()
-_OPERATION_LOCKS: dict[Path, threading.RLock] = {}
-_OPERATION_LOCK_LOCAL = threading.local()
-
-
-@contextmanager
-def _file_operation_lock(path: Path, *, blocking: bool) -> Iterator[None]:
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            0o660,
-        )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError("network operation lock is not a regular file")
-        if metadata.st_uid == os.geteuid():
-            os.fchmod(descriptor, 0o660)
-        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-        fcntl.flock(descriptor, flags)
-    except BlockingIOError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise NetworkError("capture_active", "录制期间不能修改网络") from exc
-    except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
-            raise NetworkError("capture_active", "录制期间不能修改网络") from exc
-        raise NetworkError("operation_lock_failed", "无法锁定网络控制操作") from exc
-    try:
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 def _prepare_state_dir(state_dir: Path) -> None:
-    try:
-        _ensure_directory(state_dir, 0o700)
-        _ensure_directory(state_dir / "requests", 0o700)
-    except OSError as exc:
-        raise NetworkError("state_unwritable", "无法创建网络状态目录") from exc
+    _paths_prepare_state_dir(state_dir)
 
 
 def _idempotency_key(state_dir: Path) -> bytes:
@@ -444,99 +360,41 @@ def _remember_failed_request(state_dir: Path, journal: Mapping[str, Any]) -> Non
 
 
 def _lkg_path(state_dir: Path, interface: str) -> Path:
-    if interface not in {WIFI_INTERFACE, ETHERNET_INTERFACE}:
-        raise NetworkError("state_invalid", "最后已验证网络配置的接口无效")
-    return state_dir / f"lkg-{interface}.json"
+    return _paths_lkg_path(state_dir, interface)
 
 
 def _safe_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in config.items() if key != "psk"}
 
 
-def _network_static_ipv4(config: Mapping[str, Any]) -> dict[str, Any]:
-    interface = ipaddress.IPv4Interface(str(config["address"]))
-    gateway = config.get("gateway")
-    dns = config.get("dns", [])
-    return {
-        "address": str(interface.ip),
-        "prefix_length": interface.network.prefixlen,
-        "gateway": str(gateway) if isinstance(gateway, str) else None,
-        "dns": [str(item) for item in dns] if isinstance(dns, list) else [],
-    }
-
-
 def _desired_state_from_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
-    if config is None or config.get("mode") not in SUPPORTED_MODES:
-        return {
-            "mode": "hotspot",
-            "wifi_client": None,
-            "ethernet": None,
-        }
-    mode = str(config["mode"])
-    wifi_client = None
-    ethernet = None
-    if mode == "wifi-client":
-        ssid = config.get("ssid")
-        security = config.get("security", "wpa2-personal")
-        if security not in WIFI_SECURITY:
-            security = "wpa2-personal"
-        wifi_client = {
-            "ssid": ssid if isinstance(ssid, str) and ssid else "",
-            "security": security,
-            "credential_state": "absent" if security == "open" else "stored",
-        }
-    elif mode == "ethernet-dhcp":
-        ethernet = {"addressing": "dhcp", "static_ipv4": None}
-    elif mode == "ethernet-static":
-        try:
-            static_ipv4 = _network_static_ipv4(config)
-        except (KeyError, ValueError):
-            static_ipv4 = None
-        ethernet = {"addressing": "static", "static_ipv4": static_ipv4}
-    return {
-        "mode": mode,
-        "wifi_client": wifi_client,
-        "ethernet": ethernet,
-    }
+    return _paths_desired_state_from_config(config)
 
 
 def _desired_state_from_disk(state_dir: Path) -> dict[str, Any]:
-    for path in (
-        _lkg_path(state_dir, WIFI_INTERFACE),
-        _lkg_path(state_dir, ETHERNET_INTERFACE),
-        state_dir / "rescue.json",
-    ):
-        record = _read_json(path)
-        if record is None:
-            continue
-        config = record.get("config")
-        if isinstance(config, Mapping):
-            return _desired_state_from_config(config)
-    return _desired_state_from_config(None)
+    return _paths_desired_state_from_disk(state_dir)
 
 
 def _fallback_saved_state(state_dir: Path) -> tuple[bool, bool]:
-    lkg = _read_json(_lkg_path(state_dir, WIFI_INTERFACE))
-    saved = lkg is not None and lkg.get("mode") == "wifi-client"
+    wifi_lkg = _read_json(_lkg_path(state_dir, WIFI_INTERFACE))
+    if wifi_lkg is not None and wifi_lkg.get("mode") == "wifi-client":
+        return True, True
+    eth_lkg = _read_json(_lkg_path(state_dir, ETHERNET_INTERFACE))
+    saved = eth_lkg is not None and eth_lkg.get("mode") in {"ethernet-dhcp", "ethernet-static"}
     return saved, saved
 
 
 def _controller_status_projection() -> dict[str, Any] | None:
-    from rp_ylx.network_control import (  # noqa: PLC0415
-        CONTROL_RESPONSE_TIMEOUT_SECONDS,
-        NetworkControlClientError,
-        _seal_response,
-        request_control,
-    )
-
+    if _CONTROLLER_STATUS_PROVIDER is not None:
+        return _CONTROLLER_STATUS_PROVIDER()
     try:
-        response = request_control(
+        response = _paths_request_control(
             "status",
             timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
         )
     except NetworkControlClientError:
         return None
-    sealed = _seal_response(response)
+    sealed = _paths_seal_response(response)
     if sealed.get("ok") is not True or sealed.get("operation") != "status":
         return None
     body = sealed.get("body")
@@ -574,7 +432,7 @@ def network_status_v1(
     second_wifi = capabilities.get("second_wifi") is True
     observed_at = runtime.get("observed_at")
     if not isinstance(observed_at, str) or not observed_at:
-        observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        observed_at = utc_now_iso()
     state_dir = _state_dir()
     controller = _controller_status_projection()
     if controller is None:
@@ -639,7 +497,7 @@ def _valid_saved_profile(value: object) -> str | None:
 
 
 def _interface(mode: str) -> str:
-    return WIFI_INTERFACE if mode in {"hotspot", "wifi-client"} else ETHERNET_INTERFACE
+    return _paths_interface_for_mode(mode)
 
 
 def _keyfile_string(value: object) -> str:
@@ -730,24 +588,102 @@ def _public_rescue_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return deepcopy(dict(record))
 
 
-def _migrate_rescue_profile(record: Mapping[str, Any]) -> None:
+def _parse_rescue_customization(
+    previous: bytes,
+    *,
+    ssid: str,
+) -> tuple[bool, str | None, bool]:
+    """Inspect an existing rescue .nmconnection for operator customizations."""
+    try:
+        text = previous.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, None, False
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return False, None, False
+    autoconnect_false = parser.get("connection", "autoconnect", fallback="").strip() == "false"
+    existing_psk = parser.get("wifi-security", "psk", fallback=None)
+    if existing_psk is not None and not existing_psk:
+        existing_psk = None
+    customized_outside_psk = (
+        parser.has_option("connection", "timestamp")
+        or parser.has_option("connection", "permissions")
+        or parser.get("wifi-security", "key-mgmt", fallback="wpa-psk") != "wpa-psk"
+        or parser.get("wifi", "ssid", fallback="") != _keyfile_string(ssid)
+        or parser.get("ipv4", "address1", fallback="") != "10.42.0.1/24"
+    )
+    return customized_outside_psk, existing_psk, autoconnect_false
+
+
+def _rewrite_rescue_autoconnect_false(previous: bytes) -> bytes | None:
+    try:
+        text = previous.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = text.splitlines(keepends=True)
+    in_connection = False
+    updated: list[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_connection and not replaced:
+                updated.append("autoconnect=false\n")
+                replaced = True
+            in_connection = stripped == "[connection]"
+            updated.append(line)
+            continue
+        if in_connection and stripped.startswith("autoconnect="):
+            ending = "\n" if line.endswith("\n") else ""
+            updated.append(f"autoconnect=false{ending}")
+            replaced = True
+        else:
+            updated.append(line)
+    if in_connection and not replaced:
+        updated.append("autoconnect=false\n")
+    return "".join(updated).encode("utf-8")
+
+
+def _migrate_rescue_profile(
+    record: Mapping[str, Any],
+    *,
+    preserve_existing_psk: bool = False,
+) -> None:
     profile = str(record["profile"])
+    ssid = str(record["config"]["ssid"])
     profile_path = _profile_dir() / f"{profile}.nmconnection"
-    config = {
-        "mode": "hotspot",
-        "ssid": str(record["config"]["ssid"]),
-        "psk": PUBLIC_RESCUE_AP_PSK,
-    }
-    expected = _network_manager_profile(profile, config)
     try:
         previous = profile_path.read_bytes()
     except OSError as exc:
         raise NetworkError("profile_unreadable", "救援热点 NetworkManager profile 不可读") from exc
-    if previous == expected:
-        return
+
+    customized_outside_psk, existing_psk, autoconnect_false = _parse_rescue_customization(
+        previous,
+        ssid=ssid,
+    )
+    if customized_outside_psk or (preserve_existing_psk and existing_psk is not None):
+        if autoconnect_false:
+            return
+        updated = _rewrite_rescue_autoconnect_false(previous)
+        if updated is None or updated == previous:
+            return
+        target_bytes = updated
+    else:
+        config = {
+            "mode": "hotspot",
+            "ssid": ssid,
+            "psk": PUBLIC_RESCUE_AP_PSK,
+        }
+        expected = _network_manager_profile(profile, config)
+        if previous == expected:
+            return
+        target_bytes = expected
 
     try:
-        _write_atomic(profile_path, expected, 0o600)
+        _write_atomic(profile_path, target_bytes, 0o600)
         reload_result = _run_nmcli(["connection", "reload"], timeout=10)
         if reload_result.returncode != 0:
             raise NetworkError("reload_failed", "NetworkManager 无法加载固定救援热点")
@@ -767,7 +703,11 @@ def _migrate_rescue_profile(record: Mapping[str, Any]) -> None:
         raise NetworkError("profile_write_failed", "无法更新固定救援热点") from exc
 
 
-def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
+def ensure_rescue_ap(
+    device_id: str,
+    *,
+    preserve_existing_psk: bool = False,
+) -> dict[str, Any]:
     """Create the per-device rescue AP with the public WPA2 password."""
 
     if (
@@ -784,7 +724,7 @@ def ensure_rescue_ap(device_id: str) -> dict[str, Any]:
         existing = _read_json(rescue_path)
         if existing is not None:
             public = _public_rescue_record(existing)
-            _migrate_rescue_profile(public)
+            _migrate_rescue_profile(public, preserve_existing_psk=preserve_existing_psk)
             return public
 
         digest = hashlib.sha256(device_id.encode()).hexdigest()
@@ -1229,10 +1169,7 @@ def _deadline_timeout(
     monotonic_ns: Callable[[], int],
     maximum_seconds: float,
 ) -> float:
-    remaining_ns = deadline_ns - monotonic_ns()
-    if remaining_ns <= 0:
-        raise NetworkError("network_timeout", "网络激活超过十秒期限")
-    return min(maximum_seconds, remaining_ns / 1_000_000_000)
+    return _paths_deadline_timeout(deadline_ns, monotonic_ns, maximum_seconds)
 
 
 def _device_snapshot(
@@ -1301,13 +1238,7 @@ def _usable_ipv4_addresses(addresses: object) -> list[str]:
             interface = ipaddress.IPv4Interface(value)
         except ValueError:
             continue
-        address = interface.ip
-        if (
-            address.is_link_local
-            or address.is_loopback
-            or address.is_multicast
-            or address.is_unspecified
-        ):
+        if not usable_ipv4_address(interface.ip):
             continue
         usable.append(value)
     return usable
@@ -1335,19 +1266,20 @@ def _activate(
 ) -> dict[str, Any]:
     interface = _interface(mode)
     clock = monotonic_ns or time.monotonic_ns
-    timeout = (
-        NETWORK_ACTIVATION_TIMEOUT_SECONDS
-        if deadline_ns is None
-        else _deadline_timeout(
+    if deadline_ns is None:
+        timeout: float = NETWORK_ACTIVATION_TIMEOUT_SECONDS
+        wait_seconds = NETWORK_ACTIVATION_WAIT_SECONDS
+    else:
+        timeout = _deadline_timeout(
             deadline_ns,
             clock,
             maximum_seconds=NETWORK_ACTIVATION_TIMEOUT_SECONDS,
         )
-    )
+        wait_seconds = max(1, min(NETWORK_ACTIVATION_WAIT_SECONDS, math.floor(timeout - 0.5)))
     result = _run_nmcli(
         [
             "--wait",
-            str(NETWORK_ACTIVATION_WAIT_SECONDS),
+            str(wait_seconds),
             "connection",
             "up",
             "id",

@@ -1,6 +1,6 @@
 [Unit]
 Description=Recover interrupted Open Aria release transaction
-After=local-fs.target
+After=local-fs.target systemd-tmpfiles-setup.service
 Before=rp-ylx-data-volume.service rp-ylx-network-control.service rp-ylx.service
 
 [Service]
@@ -22,7 +22,17 @@ ReadWritePaths=/opt/rp-ylx
 ReadWritePaths=/var/lib/rp-ylx
 ReadWritePaths=/var/lib/openaria-update
 ReadWritePaths=/etc/rp-ylx
-ReadWritePaths=/etc/avahi/services
+ReadWritePaths=-/etc/avahi/services
+ReadWritePaths=/usr/local/lib/rp-ylx
+ReadWritePaths=/usr/local/lib/openaria
+ReadWritePaths=/usr/local/sbin
+ReadWritePaths=/usr/lib/systemd/system
+ReadWritePaths=/usr/lib/sysusers.d
+ReadWritePaths=/usr/lib/tmpfiles.d
+ReadWritePaths=-/etc/systemd/system/fstrim.service.d
+ReadWritePaths=-/etc/modprobe.d
+ReadWritePaths=-/etc/NetworkManager/conf.d
+ReadWritePaths=/etc/default
 RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=yes
 LockPersonality=yes

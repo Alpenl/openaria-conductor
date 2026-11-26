@@ -2,7 +2,8 @@
 Description=Open Aria /data internal recording volume
 DefaultDependencies=no
 Requires=rp-ylx-recover.service
-After=local-fs.target rp-ylx-recover.service
+After=local-fs.target rp-ylx-recover.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 Before=rp-ylx.service
 
 [Service]

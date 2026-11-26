@@ -12,6 +12,11 @@ UMask=0077
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
+PrivateTmp=yes
+ProtectHome=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
