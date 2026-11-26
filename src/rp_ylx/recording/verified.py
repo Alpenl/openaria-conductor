@@ -9,61 +9,47 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+
+from rp_ylx.recording.fs_safety import file_identity, open_regular
 
 
-def identity(metadata: os.stat_result) -> tuple[int, ...]:
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise ValueError("verified artifact must be an exclusively linked regular file")
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_nlink,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
-def open_regular(path: Path) -> BinaryIO:
-    """Reject links and special files on the opened fd without waiting on a FIFO."""
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        identity(os.fstat(descriptor))
-        return os.fdopen(descriptor, "rb")
-    except BaseException:
-        os.close(descriptor)
-        raise
+def identity(metadata: os.stat_result, *, include_inode: bool = True) -> tuple[int, ...]:
+    return file_identity(metadata, include_inode=include_inode)
 
 
 @dataclass(frozen=True)
 class VerifiedArtifact:
     identity: tuple[int, ...]
     sha256: str
+    include_inode: bool = True
+
+    def _stat_identity(self, metadata: os.stat_result) -> tuple[int, ...]:
+        if self.include_inode:
+            return identity(metadata)
+        return identity(metadata, include_inode=False)
 
     def matches(self, metadata: os.stat_result, size: int, digest: str) -> bool:
         """Compare descriptor metadata only; this does not verify current bytes."""
         return (
             metadata.st_size == size
             and self.sha256 == digest
-            and identity(metadata) == self.identity
+            and self._stat_identity(metadata) == self.identity
         )
 
     def unchanged(self, path: Path) -> bool:
-        if identity(path.stat(follow_symlinks=False)) != self.identity:
+        if self._stat_identity(path.stat(follow_symlinks=False)) != self.identity:
             return False
         with open_regular(path) as source:
-            if identity(os.fstat(source.fileno())) != self.identity:
+            pinned_before = identity(os.fstat(source.fileno()))
+            if self._stat_identity(os.fstat(source.fileno())) != self.identity:
                 return False
             digest = hashlib.sha256()
             for block in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(block)
             return (
                 digest.hexdigest() == self.sha256
-                and identity(os.fstat(source.fileno())) == self.identity
-                and identity(path.stat(follow_symlinks=False)) == self.identity
+                and identity(os.fstat(source.fileno())) == pinned_before
+                and self._stat_identity(path.stat(follow_symlinks=False)) == self.identity
             )

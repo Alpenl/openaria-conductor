@@ -13,7 +13,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +21,7 @@ from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
 
 DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME = re.compile(r"^\d{2}-\d{2}-\d{2}(?:_\d+)?$")
+UNKNOWN_TIME_CHILD = re.compile(r"^录制_\d+$")
 UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -49,8 +50,17 @@ def open_relative_directory(root_fd: int, relative: Path) -> int:
 
 
 def _manifest_id(fd: int) -> str:
-    manifest_fd = os.open("manifest.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-    with os.fdopen(manifest_fd, "rb") as stream:
+    manifest_fd = os.open(
+        "manifest.json",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        dir_fd=fd,
+    )
+    try:
+        stream = os.fdopen(manifest_fd, "rb")
+    except BaseException:
+        os.close(manifest_fd)
+        raise
+    with stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MANIFEST_BYTES:
             raise ValueError("invalid manifest")
@@ -61,43 +71,73 @@ def _manifest_id(fd: int) -> str:
     return identity
 
 
-def iter_recordings(root: Path, *, root_fd: int | None = None) -> Iterator[tuple[Path, str]]:
+manifest_id = _manifest_id
+
+
+def iter_recording_entries(
+    root: Path,
+    *,
+    root_fd: int | None = None,
+    lookup_cached_id: Callable[[str], str | None] | None = None,
+) -> Iterator[tuple[Path, str, bool]]:
     """Scan only the legacy level and the new date/time level, not media trees."""
     fd = os.open(root, FLAGS) if root_fd is None else os.dup(root_fd)
     try:
         for name in sorted(os.listdir(fd)):
             if name.endswith(".partial") or name.startswith("."):
                 continue
-            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             if stat.S_ISLNK(info.st_mode) and UUID.fullmatch(name):
                 # Preserve the identity for diagnostics/deletion preflight;
                 # readers still reject opening the linked directory.
-                yield root / name, name
+                yield root / name, name, False
                 continue
             if not stat.S_ISDIR(info.st_mode):
                 continue
             if DAY.fullmatch(name) is None and name != "录制时间未知":
-                yield root / name, name
+                yield root / name, name, False
                 continue
-            day = open_relative_directory(fd, Path(name))
+            try:
+                day = open_relative_directory(fd, Path(name))
+            except FileNotFoundError:
+                continue
             try:
                 for child in sorted(os.listdir(day)):
-                    if TIME.fullmatch(child) is None and not child.startswith("录制_"):
+                    if (
+                        TIME.fullmatch(child) is None
+                        and UNKNOWN_TIME_CHILD.fullmatch(child) is None
+                    ):
                         continue
+                    if lookup_cached_id is not None:
+                        cached_sid = lookup_cached_id(f"{name}/{child}")
+                        if cached_sid is not None:
+                            yield root / name / child, cached_sid, True
+                            continue
                     try:
                         recording = open_relative_directory(day, Path(child))
-                        try:
-                            identity = _manifest_id(recording)
-                        finally:
-                            os.close(recording)
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        identity = _manifest_id(recording)
                     except (OSError, ValueError, RecursionError):
                         # Keep malformed recordings visible to catalog diagnostics.
                         identity = child
-                    yield root / name / child, identity
+                    finally:
+                        os.close(recording)
+                    yield root / name / child, identity, False
             finally:
                 os.close(day)
     finally:
         os.close(fd)
+
+
+def iter_recordings(root: Path, *, root_fd: int | None = None) -> Iterator[tuple[Path, str]]:
+    """Scan only the legacy level and the new date/time level, not media trees."""
+    for path, identity, _ in iter_recording_entries(root, root_fd=root_fd):
+        yield path, identity
 
 
 def resolve_recording(root: Path, session_id: str, *, root_fd: int | None = None) -> Path:
@@ -113,7 +153,7 @@ def resolve_recording(root: Path, session_id: str, *, root_fd: int | None = None
 
 def manifest_identity(root: Path, manifest: Mapping[str, object]) -> object:
     if (DAY.fullmatch(root.parent.name) and TIME.fullmatch(root.name)) or (
-        root.parent.name == "录制时间未知" and re.fullmatch(r"录制_\d+", root.name)
+        root.parent.name == "录制时间未知" and UNKNOWN_TIME_CHILD.fullmatch(root.name) is not None
     ):
         return manifest.get("session_id") if isinstance(manifest, Mapping) else None
     return root.name
@@ -123,7 +163,8 @@ def publish_readable(path: Path, manifest: Mapping[str, object]) -> Path:
     """Move a newly sealed UUID directory; preserve all old or occupied paths."""
     if path.name != manifest.get("session_id"):
         return path
-    started = manifest.get("time", {}).get("started_at")
+    time_info = manifest.get("time")
+    started = time_info.get("started_at") if isinstance(time_info, Mapping) else None
     try:
         stamp = datetime.fromisoformat(started.replace("Z", "+00:00"))
         if stamp.tzinfo is None or not 2020 <= stamp.year < 2100:

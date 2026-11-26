@@ -19,6 +19,7 @@ from rp_ylx.native import (
     NativeCapturePlan,
     create_native_capture_engine,
 )
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
 
 
@@ -95,6 +96,8 @@ class NativeContinuousCaptureSources:
         self.exposure_readback: dict[str, int] | None = None
         self._engine_factory = engine_factory
         self._lock = threading.RLock()
+        self._opening_condition = threading.Condition(self._lock)
+        self._opening = False
         self._engine: NativeCaptureEngine | None = None
         self._recording: _EngineRecording | None = None
         self._open_handles = 0
@@ -126,70 +129,86 @@ class NativeContinuousCaptureSources:
 
     def start_preview(self) -> None:
         stale_engine: NativeCaptureEngine | None = None
-        with self._lock:
+        with self._opening_condition:
+            while self._opening:
+                self._opening_condition.wait()
             engine = self._engine
             if engine is not None:
                 try:
                     running = engine.snapshot().get("running") is True
-                except BaseException:
+                except Exception as error:
+                    operational_logger("recording").event(
+                        "native_preview_snapshot_failed",
+                        level="warning",
+                        exception_type=type(error).__name__,
+                    )
                     running = False
                 if running or self._recording is not None:
                     return
                 stale_engine = engine
                 self._engine = None
                 self._open_handles -= 1
-        if stale_engine is not None:
-            with suppress(BaseException):
-                stale_engine.close(self._read_timeout + 1.0)
-        native_preview = self._preview.native_owner
-        if native_preview is None:
-            raise RuntimeError("正式连续采集需要 Rust preview buffer")
-        self.exposure_readback = configure_exposure(self._device, self._exposure_time_absolute)
-        plan = NativeCapturePlan(
-            device=self._device,
-            width=self._camera_mode.width,
-            height=self._camera_mode.height,
-            fps=int(self._camera_mode.fps),
-            encoding=self._camera_mode.encoding,
-            buffer_count=self._buffer_count,
-            queue_capacity=self._queue_capacity,
-            frame_decimation=self._frame_decimation,
-            read_timeout_seconds=self._read_timeout,
-            imu_timeout_seconds=self._read_timeout,
-        )
-        engine: NativeCaptureEngine | None = None
+            self._opening = True
         try:
-            if self._engine_factory is None:
-                engine = create_native_capture_engine(
-                    plan,
-                    native_preview,
-                    metrics=None if self._metrics is None else self._metrics.native_owner,
-                )
-            else:
-                engine = self._engine_factory(
-                    plan,
-                    native_preview,
-                    None if self._metrics is None else self._metrics.native_owner,
-                )
-            engine.start_preview()
-        except BaseException as error:
-            if engine is not None:
+            if stale_engine is not None:
                 with suppress(BaseException):
-                    engine.close(self._read_timeout + 1.0)
-            code = str(getattr(error, "code", "camera_preview_unavailable"))
-            message = str(getattr(error, "message", error)) or code
-            with self._lock:
-                self._last_preview_error = (code, message)
-            raise
-        assert engine is not None
-        with self._lock:
-            if self._engine is not None:
+                    stale_engine.close(self._read_timeout + 1.0)
+            native_preview = self._preview.native_owner
+            if native_preview is None:
+                raise RuntimeError("正式连续采集需要 Rust preview buffer")
+            self.exposure_readback = configure_exposure(self._device, self._exposure_time_absolute)
+            plan = NativeCapturePlan(
+                device=self._device,
+                width=self._camera_mode.width,
+                height=self._camera_mode.height,
+                fps=int(self._camera_mode.fps),
+                encoding=self._camera_mode.encoding,
+                buffer_count=self._buffer_count,
+                queue_capacity=self._queue_capacity,
+                frame_decimation=self._frame_decimation,
+                read_timeout_seconds=self._read_timeout,
+                imu_timeout_seconds=self._read_timeout,
+            )
+            new_engine: NativeCaptureEngine | None = None
+            try:
+                if self._engine_factory is None:
+                    new_engine = create_native_capture_engine(
+                        plan,
+                        native_preview,
+                        metrics=None if self._metrics is None else self._metrics.native_owner,
+                    )
+                else:
+                    new_engine = self._engine_factory(
+                        plan,
+                        native_preview,
+                        None if self._metrics is None else self._metrics.native_owner,
+                    )
+                new_engine.start_preview()
+            except BaseException as error:
+                if new_engine is not None:
+                    with suppress(BaseException):
+                        new_engine.close(self._read_timeout + 1.0)
+                code = str(getattr(error, "code", "camera_preview_unavailable"))
+                message = str(getattr(error, "message", error)) or code
+                with self._lock:
+                    self._last_preview_error = (code, message)
+                raise
+            assert new_engine is not None
+            discard_engine: NativeCaptureEngine | None = None
+            with self._opening_condition:
+                if self._engine is not None:
+                    discard_engine = new_engine
+                else:
+                    self._engine = new_engine
+                    self._open_handles += 1
+                    self._last_preview_error = None
+            if discard_engine is not None:
                 with suppress(BaseException):
-                    engine.close(self._read_timeout + 1.0)
-                return
-            self._engine = engine
-            self._open_handles += 1
-            self._last_preview_error = None
+                    discard_engine.close(self._read_timeout + 1.0)
+        finally:
+            with self._opening_condition:
+                self._opening = False
+                self._opening_condition.notify_all()
 
     def start(
         self,
@@ -367,6 +386,7 @@ class ContinuousCaptureSources:
         self._camera_thread: threading.Thread | None = None
         self._recording: _RecordingTap | None = None
         self._preview_started = False
+        self._opening = False
         self._open_handles = 0
         self._last_preview_error: tuple[str, str] | None = None
 
@@ -381,11 +401,14 @@ class ContinuousCaptureSources:
             return self._last_preview_error
 
     def start_preview(self) -> None:
-        with self._lock:
-            if self._camera_thread is not None or self._camera is not None:
+        with self._condition:
+            while self._opening and not self._stop.is_set():
+                self._condition.wait()
+            if self._stop.is_set() or self._camera_thread is not None or self._camera is not None:
                 return
             self._stop.clear()
             self._last_preview_error = None
+            self._opening = True
         camera = self._camera_factory()
         registered = False
         try:
@@ -416,7 +439,14 @@ class ContinuousCaptureSources:
                     raise RuntimeError("采集来源已经停止")
                 self._camera_thread = thread
                 self._preview_started = True
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                with self._lock:
+                    if self._camera_thread is thread:
+                        self._camera_thread = None
+                        self._preview_started = False
+                raise
         except BaseException:
             if registered:
                 with suppress(BaseException):
@@ -425,6 +455,10 @@ class ContinuousCaptureSources:
                 with suppress(BaseException):
                     camera.close()
             raise
+        finally:
+            with self._condition:
+                self._opening = False
+                self._condition.notify_all()
 
     def _camera_for_control(self) -> CaptureCamera:
         self.start_preview()
@@ -682,7 +716,11 @@ class ContinuousCaptureSources:
         if camera is not None:
             with suppress(BaseException):
                 camera.close()
-        if camera_thread is not None and camera_thread is not threading.current_thread():
+        if (
+            camera_thread is not None
+            and camera_thread.is_alive()
+            and camera_thread is not threading.current_thread()
+        ):
             camera_thread.join(timeout=self._read_timeout + 1.0)
             if camera_thread.is_alive():
                 raise RuntimeError("预览相机线程未能在关闭期限内退出")

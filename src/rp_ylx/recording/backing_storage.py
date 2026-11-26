@@ -47,7 +47,10 @@ def backing_capacity(mountpoint: Path) -> tuple[int, int] | None:
             if not stat.S_ISREG(mode):
                 raise ValueError("录制卷镜像不是普通文件")
             capacity = os.statvfs(backing)
-            available = (capacity.f_bavail * capacity.f_frsize, capacity.f_favail)
+            available = (
+                capacity.f_bavail * capacity.f_frsize,
+                capacity.f_bavail if capacity.f_files == 0 else capacity.f_favail,
+            )
             result = (
                 available
                 if result is None

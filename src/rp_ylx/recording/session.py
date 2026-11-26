@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import queue
@@ -12,15 +11,17 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from rp_ylx.camera import FrameObservation
 from rp_ylx.contracts import validate_session
 from rp_ylx.contracts.frame_stream import MAGIC, encode_frame
+from rp_ylx.core.fs import fsync_directory, sha256_file
+from rp_ylx.core.time import utc_now_iso
 from rp_ylx.imu import ImuObservation
 from rp_ylx.performance.metrics import PayloadLease, PerformanceMetrics
+from rp_ylx.recording.fs_safety import write_json_atomic
 
 
 class RecordingError(RuntimeError):
@@ -71,7 +72,7 @@ _STOP = object()
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return utc_now_iso()
 
 
 def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
@@ -83,29 +84,15 @@ def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
 
 
 def _digest(path: Path) -> str:
-    result = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            result.update(block)
-    return result.hexdigest()
+    return sha256_file(path)
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    fsync_directory(path)
 
 
 def _write_json_atomic(path: Path, value: object) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("wb") as stream:
-        stream.write(_json_bytes(value, pretty=True))
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
+    write_json_atomic(path, value, pretty=True)
 
 
 class SessionRecorder:
@@ -207,13 +194,15 @@ class SessionRecorder:
                     self._partial_path / "session.json",
                     self._session_state("recording", failure=None),
                 )
-                self._files = {
-                    "video.left": (self._partial_path / "video/left.bin").open("xb"),
-                    "video.right": (self._partial_path / "video/right.bin").open("xb"),
-                    "frames.timeline": (self._partial_path / "frames.ndjson").open("xb"),
-                    "imu.samples": (self._partial_path / "imu.ndjson").open("xb"),
-                    "diagnostics.events": (self._partial_path / "diagnostics.ndjson").open("xb"),
-                }
+                self._files = {}
+                for role, relative in (
+                    ("video.left", "video/left.bin"),
+                    ("video.right", "video/right.bin"),
+                    ("frames.timeline", "frames.ndjson"),
+                    ("imu.samples", "imu.ndjson"),
+                    ("diagnostics.events", "diagnostics.ndjson"),
+                ):
+                    self._files[role] = (self._partial_path / relative).open("xb")
                 self._write("video.left", MAGIC)
                 self._write("video.right", MAGIC)
                 self._write_diagnostic("info", "recording_started", "录制开始", 1)

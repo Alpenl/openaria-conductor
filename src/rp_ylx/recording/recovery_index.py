@@ -12,7 +12,8 @@ from pathlib import Path
 
 import zstandard
 
-from rp_ylx.recording.storage import BLOCK_BYTES, _decoded_metadata, _digest
+from rp_ylx.recording.fs_safety import write_zstd_frame_checked
+from rp_ylx.recording.storage import BLOCK_BYTES, decoded_metadata, digest
 from rp_ylx.recording.verified import open_regular
 
 
@@ -68,29 +69,31 @@ class RecoveryIndex:
         )
 
     def rollback(self, output, checkpoint):
-        offset, self.size, digest, self.encoded_size, encoded_digest = checkpoint
+        offset, self.size, digest_state, self.encoded_size, encoded_digest = checkpoint
         self.encoded_digest = encoded_digest.copy()
         output.seek(offset)
         output.truncate()
         self.pending.clear()
-        self.digest = digest.copy()
+        self.digest = digest_state.copy()
 
     def finish(self, output):
         if self.compressor is None:
             return
         self._flush(output)
         if self.size == 0:
-            self._write(output, self.compressor.compress(b""))
+            encoded = write_zstd_frame_checked(output, self.compressor, b"")
+            self.encoded_size += len(encoded)
+            self.encoded_digest.update(encoded)
 
     def verify(self, temporary: Path) -> dict | None:
         if self.compressor is None:
             return None
         with open_regular(temporary) as raw:
-            if _digest(raw) != (self.encoded_size, self.encoded_digest.hexdigest()):
+            if digest(raw) != (self.encoded_size, self.encoded_digest.hexdigest()):
                 raise ValueError("recovery index compressed-byte readback mismatch")
             raw.seek(0)
-            with _decoded_metadata(raw) as decoded:
-                if _digest(decoded) != (self.size, self.digest.hexdigest()):
+            with decoded_metadata(raw) as decoded:
+                if digest(decoded) != (self.size, self.digest.hexdigest()):
                     raise ValueError("recovery index compression round-trip mismatch")
         return {
             "codec": "zstd",

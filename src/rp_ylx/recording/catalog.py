@@ -10,7 +10,7 @@ import stat
 import sys
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from itertools import groupby
 from pathlib import Path
@@ -28,6 +28,8 @@ class SessionCatalog(StateDatabase):
     def __init__(self, path: Path) -> None:
         self._scan_state = threading.local()
         self._validation_lock = threading.Lock()
+        self._admitted_lock = threading.Lock()
+        self._paths_lock = threading.Lock()
         self._validated_summaries: OrderedDict[
             tuple[str, str], tuple[str, str | bytes, Callable[[object], None]]
         ] = OrderedDict()
@@ -36,6 +38,8 @@ class SessionCatalog(StateDatabase):
         # One current identity per session; replaced manifests must not retain
         # every historical signature for the lifetime of the process.
         self._admitted: dict[tuple[str, str], str] = {}
+        self._paths: dict[tuple[str, str], tuple[str, str]] = {}
+        self._reverse_paths: dict[tuple[str, str, str], str] = {}
         with self.connection() as db, db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS verifications ("
@@ -64,6 +68,49 @@ class SessionCatalog(StateDatabase):
                 "PRIMARY KEY(volume,session,path), FOREIGN KEY(volume,session) "
                 "REFERENCES sessions(volume,session) ON DELETE CASCADE)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS session_paths ("
+                "volume TEXT NOT NULL, session TEXT NOT NULL, root TEXT NOT NULL, "
+                "relative_path TEXT NOT NULL, PRIMARY KEY(volume,session), "
+                "FOREIGN KEY(volume,session) REFERENCES sessions(volume,session) ON DELETE CASCADE)"
+            )
+            for volume, session, root, relative_path in db.execute(
+                "SELECT volume, session, root, relative_path FROM session_paths"
+            ):
+                self._paths[(volume, session)] = (root, relative_path)
+                self._reverse_paths[(volume, root, relative_path)] = session
+
+    def _set_path_locked(self, volume: str, session: str, entry: tuple[str, str]) -> None:
+        previous = self._paths.get((volume, session))
+        if previous is not None and previous != entry:
+            previous_reverse = (volume, previous[0], previous[1])
+            if self._reverse_paths.get(previous_reverse) == session:
+                self._reverse_paths.pop(previous_reverse, None)
+        target_reverse = (volume, entry[0], entry[1])
+        displaced = self._reverse_paths.get(target_reverse)
+        if displaced is not None and displaced != session:
+            self._paths.pop((volume, displaced), None)
+        self._paths[(volume, session)] = entry
+        self._reverse_paths[target_reverse] = session
+
+    def _pop_path_locked(self, volume: str, session: str) -> None:
+        previous = self._paths.pop((volume, session), None)
+        if previous is not None:
+            reverse_key = (volume, previous[0], previous[1])
+            if self._reverse_paths.get(reverse_key) == session:
+                self._reverse_paths.pop(reverse_key, None)
+
+    def _reload_paths(self, db: sqlite3.Connection) -> None:
+        loaded: dict[tuple[str, str], tuple[str, str]] = {}
+        reverse: dict[tuple[str, str, str], str] = {}
+        for volume, session, root, relative_path in db.execute(
+            "SELECT volume, session, root, relative_path FROM session_paths"
+        ):
+            loaded[(volume, session)] = (root, relative_path)
+            reverse[(volume, root, relative_path)] = session
+        with self._paths_lock:
+            self._paths = loaded
+            self._reverse_paths = reverse
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -90,7 +137,9 @@ class SessionCatalog(StateDatabase):
                 db.commit()
             except BaseException:
                 db.rollback()
-                self._admitted.clear()
+                with self._admitted_lock:
+                    self._admitted.clear()
+                self._reload_paths(db)
                 with self._validation_lock:
                     self._validated_summaries.clear()
                     self._validated_summary_bytes = 0
@@ -185,8 +234,25 @@ class SessionCatalog(StateDatabase):
                     current = os.stat("manifest.json", dir_fd=parent_fd, follow_symlinks=False)
                     if fields(current) != fields(metadata):
                         raise OSError("catalog manifest replaced during read")
+                    # exFAT has no fixed inode table and kernel st_ino is volatile
+                    # across cache evictions/reboots; omit volatile inodes there while
+                    # preserving st_ino swap detection on POSIX filesystems.
+                    is_exfat = os.fstatvfs(stream.fileno()).f_files == 0
+                    parent_ino = 0 if is_exfat else parent.st_ino
+                    file_ino = 0 if is_exfat else metadata.st_ino
                     return json.dumps(
-                        [parent.st_dev, parent.st_ino, *fields(metadata), digest.hexdigest()]
+                        [
+                            parent.st_dev,
+                            parent_ino,
+                            metadata.st_dev,
+                            file_ino,
+                            metadata.st_mode,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            metadata.st_ctime_ns,
+                            digest.hexdigest(),
+                        ]
                     )
             finally:
                 os.close(fd)
@@ -295,23 +361,29 @@ class SessionCatalog(StateDatabase):
         except (TypeError, ValueError, RecursionError):
             # Only this rebuildable row is invalid. Leave database I/O/schema
             # failures visible; never replace or reinitialize state authority.
-            self._admitted.pop(key, None)
+            with self._admitted_lock:
+                self._admitted.pop(key, None)
             with self._validation_lock:
                 self._forget_summary_validation((volume, session))
             return None
-        if directory is not None and self._admitted.get(key) != signature:
-            with self.connection() as db:
-                artifacts = db.execute(
-                    "SELECT path,bytes FROM artifacts WHERE volume=? AND session=? ORDER BY path",
-                    (volume, session),
-                ).fetchall()
-            if not self._artifacts_match(directory, artifacts):
-                return None
-            # Bind the admission to the manifest inspected before the scan,
-            # including replacement of the session root during that scan.
-            if self.signature(directory) != signature:
-                return None
-            self._admitted[key] = signature
+        if directory is not None:
+            with self._admitted_lock:
+                admitted = self._admitted.get(key) == signature
+            if not admitted:
+                with self.connection() as db:
+                    artifacts = db.execute(
+                        "SELECT path,bytes FROM artifacts "
+                        "WHERE volume=? AND session=? ORDER BY path",
+                        (volume, session),
+                    ).fetchall()
+                if not self._artifacts_match(directory, artifacts):
+                    return None
+                # Bind the admission to the manifest inspected before the scan,
+                # including replacement of the session root during that scan.
+                if self.signature(directory) != signature:
+                    return None
+                with self._admitted_lock:
+                    self._admitted[key] = signature
         return value
 
     @staticmethod
@@ -398,6 +470,7 @@ class SessionCatalog(StateDatabase):
         manifest: Mapping[str, object],
         *,
         expected_signature: str | None = None,
+        root: Path | None = None,
     ) -> None:
         signature = self.signature(directory)
         if expected_signature is not None and signature != expected_signature:
@@ -415,6 +488,12 @@ class SessionCatalog(StateDatabase):
                     yield from artifacts(child)
 
         sid = str(summary["session_id"])
+        relative_entry: tuple[str, str] | None = None
+        if root is not None:
+            try:
+                relative_entry = (str(root), str(directory.relative_to(root)))
+            except ValueError:
+                relative_entry = None
         with self._write_transaction() as db:
             db.execute(
                 "INSERT INTO sessions VALUES (?,?,?,?,?,?,?) ON CONFLICT(volume,session) "
@@ -438,6 +517,12 @@ class SessionCatalog(StateDatabase):
                     for a in artifacts(manifest)
                 ],
             )
+            if relative_entry is not None:
+                db.execute(
+                    "INSERT INTO session_paths VALUES (?,?,?,?) ON CONFLICT(volume,session) "
+                    "DO UPDATE SET root=excluded.root,relative_path=excluded.relative_path",
+                    (volume, sid, relative_entry[0], relative_entry[1]),
+                )
             verification = summary.get("verification")
             if isinstance(verification, Mapping):
                 db.execute(
@@ -451,17 +536,85 @@ class SessionCatalog(StateDatabase):
                         json.dumps(dict(verification)),
                     ),
                 )
+        if relative_entry is not None:
+            with self._paths_lock:
+                self._set_path_locked(volume, sid, relative_entry)
+
+    def remember_path(
+        self, volume: str, session: str, root: Path, relative_path: Path | str
+    ) -> None:
+        entry = (str(root), str(relative_path))
+        with self._paths_lock:
+            previous = self._paths.get((volume, session))
+            if previous == entry:
+                return
+        updated = False
+        with self._write_transaction() as db:
+            if (
+                db.execute(
+                    "SELECT 1 FROM sessions WHERE volume=? AND session=?", (volume, session)
+                ).fetchone()
+                is not None
+            ):
+                db.execute(
+                    "INSERT INTO session_paths VALUES (?,?,?,?) ON CONFLICT(volume,session) "
+                    "DO UPDATE SET root=excluded.root,relative_path=excluded.relative_path",
+                    (volume, session, entry[0], entry[1]),
+                )
+                updated = True
+        if updated:
+            with self._paths_lock:
+                self._set_path_locked(volume, session, entry)
+
+    def forget_path(self, volume: str, session: str) -> None:
+        with self._write_transaction() as db:
+            db.execute(
+                "DELETE FROM session_paths WHERE volume=? AND session=?",
+                (volume, session),
+            )
+        with self._paths_lock:
+            self._pop_path_locked(volume, session)
+
+    def cached_paths(self, volume: str) -> dict[Path, dict[str, Path]]:
+        result: dict[Path, dict[str, Path]] = {}
+        with self._paths_lock:
+            items = list(self._paths.items())
+        for (entry_volume, session), (root_text, rel_text) in items:
+            if entry_volume == volume:
+                result.setdefault(Path(root_text), {})[session] = Path(rel_text)
+        return result
+
+    def cached_session_for_path(self, volume: str, root: Path, relative_path: str) -> str | None:
+        key = (volume, str(root), relative_path)
+        with self._paths_lock:
+            return self._reverse_paths.get(key)
+
+    def _evict_in_memory(self, volume: str, remove_ids: Iterable[str]) -> None:
+        target = set(remove_ids)
+        if not target:
+            return
+        with self._admitted_lock:
+            for sid in target:
+                self._admitted.pop((volume, sid), None)
+        with self._paths_lock:
+            for sid in target:
+                self._pop_path_locked(volume, sid)
+        with self._validation_lock:
+            for sid in target:
+                self._forget_summary_validation((volume, sid))
+
+    def discard_sessions(self, volume: str, session_ids: Iterable[str]) -> None:
+        target = sorted(set(session_ids))
+        if not target:
+            return
+        with self._write_transaction() as db:
+            db.executemany(
+                "DELETE FROM sessions WHERE volume=? AND session=?",
+                [(volume, sid) for sid in target],
+            )
+        self._evict_in_memory(volume, target)
 
     def discard_missing(self, volume: str, discovered: set[str]) -> None:
-        self._admitted = {
-            key: signature
-            for key, signature in self._admitted.items()
-            if key[0] != volume or key[1] in discovered
-        }
-        with self._validation_lock:
-            for key in list(self._validated_summaries):
-                if key[0] == volume and key[1] not in discovered:
-                    self._forget_summary_validation(key)
         with self._write_transaction() as db:
             existing = db.execute(
                 "SELECT session FROM sessions WHERE volume=?", (volume,)
@@ -470,6 +623,21 @@ class SessionCatalog(StateDatabase):
                 "DELETE FROM sessions WHERE volume=? AND session=?",
                 [(volume, row[0]) for row in existing if row[0] not in discovered],
             )
+        with self._admitted_lock:
+            self._admitted = {
+                key: signature
+                for key, signature in self._admitted.items()
+                if key[0] != volume or key[1] in discovered
+            }
+        with self._paths_lock:
+            for key in [
+                key for key in self._paths if key[0] == volume and key[1] not in discovered
+            ]:
+                self._pop_path_locked(key[0], key[1])
+        with self._validation_lock:
+            for key in list(self._validated_summaries):
+                if key[0] == volume and key[1] not in discovered:
+                    self._forget_summary_validation(key)
 
     def summaries(
         self, volume: str, *, take_id: str | None = None, limit: int | None = None, offset: int = 0

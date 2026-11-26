@@ -13,6 +13,7 @@ import os
 import re
 from pathlib import Path
 
+from rp_ylx.recording.fs_safety import is_exfat_or_msdos_fd
 from rp_ylx.recording.verified import identity, open_regular
 
 SCHEMA = "openaria.audio-checkpoint.v3"
@@ -106,8 +107,14 @@ class AudioJournalReader:
         sample_count, previous = self.sample_count, self.last_anchor
         anchors, segments = [], []
         with open_regular(path) as source:
+            exfat = is_exfat_or_msdos_fd(source.fileno())
             before = identity(os.fstat(source.fileno()))
-            if before[4] < end or (self.file_id is not None and before[:2] != self.file_id):
+            same_file = (
+                before[0] == self.file_id[0]
+                if exfat and self.file_id is not None
+                else before[:2] == self.file_id
+            )
+            if before[4] < end or (self.file_id is not None and not same_file):
                 raise ValueError("audio journal replaced or truncated")
             source.seek(self.offset)
             remaining = end - self.offset
@@ -157,7 +164,8 @@ class AudioJournalReader:
                     sample_count = stop
             after = identity(os.fstat(source.fileno()))
             named = identity(path.stat(follow_symlinks=False))
-            if before[:2] != after[:2] or after[:2] != named[:2] or min(after[4], named[4]) < end:
+            same_named = after[0] == named[0] if exfat else after[:2] == named[:2]
+            if before[:2] != after[:2] or not same_named or min(after[4], named[4]) < end:
                 raise ValueError("audio journal replaced or truncated during read")
         if (
             digest.hexdigest() != expected_hash

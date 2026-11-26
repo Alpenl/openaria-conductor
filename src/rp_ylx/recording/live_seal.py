@@ -13,18 +13,21 @@ import json
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-
-import zstandard
 
 from rp_ylx.native import audio_checkpoint_segments
 from rp_ylx.recording.audio_journal import SCHEMA as AUDIO_JOURNAL_SCHEMA
 from rp_ylx.recording.audio_journal import AudioJournalReader
 from rp_ylx.recording.audit import capture_audit
-from rp_ylx.recording.storage import BLOCK_BYTES, _digest, compact_audio
+from rp_ylx.recording.fs_safety import (
+    is_exfat_or_msdos_fd,
+    make_zstd_compressor,
+    write_zstd_frame_checked,
+)
+from rp_ylx.recording.storage import BLOCK_BYTES, compact_audio, digest
 from rp_ylx.recording.verified import VerifiedArtifact, identity, open_regular
 
 
@@ -53,11 +56,15 @@ class PreparedArtifact:
             path.stat(follow_symlinks=False), descriptor["bytes"], descriptor["sha256"]
         ) or not self.source.unchanged(path):
             raise ValueError("source changed after incremental lossless compaction")
-        if identity(self.target.stat(follow_symlinks=False)) != self.output.identity:
+        target_stat = self.target.stat(follow_symlinks=False)
+        if identity(target_stat, include_inode=self.output.include_inode) != self.output.identity:
             raise ValueError("incremental compacted output changed")
         if path.suffix == ".wav":
             with open_regular(self.target) as stream:
-                if identity(os.fstat(stream.fileno())) != self.output.identity:
+                if (
+                    identity(os.fstat(stream.fileno()), include_inode=self.output.include_inode)
+                    != self.output.identity
+                ):
                     raise ValueError("prepared audio replaced before durable admission")
                 os.fsync(stream.fileno())
         return self.target, self.compression, descriptor["path"], path.suffix == ".wav"
@@ -65,11 +72,16 @@ class PreparedArtifact:
 
 def _read_back(path: Path) -> VerifiedArtifact:
     with open_regular(path) as source:
-        before = identity(os.fstat(source.fileno()))
-        _, digest = _digest(source)
-        if identity(os.fstat(source.fileno())) != before:
+        exfat = is_exfat_or_msdos_fd(source.fileno())
+        pinned_before = identity(os.fstat(source.fileno()))
+        _, computed_digest = digest(source)
+        pinned_after = os.fstat(source.fileno())
+        if identity(pinned_after) != pinned_before:
             raise ValueError("artifact changed during independent read-back")
-    return VerifiedArtifact(before, digest)
+        stored_identity = (
+            pinned_before if not exfat else identity(pinned_after, include_inode=False)
+        )
+    return VerifiedArtifact(stored_identity, computed_digest, include_inode=not exfat)
 
 
 class _Journal:
@@ -83,11 +95,15 @@ class _Journal:
         self.digest = hashlib.sha256()
         self.encoded_digest = hashlib.sha256()
         self.size = 0
-        self.compressor = zstandard.ZstdCompressor(level=1, write_checksum=True)
+        self.compressor = make_zstd_compressor(level=1)
+        self._owns_temporary = False
+        self._published = False
         self.source = open_regular(path)
+        self._exfat = is_exfat_or_msdos_fd(self.source.fileno())
         try:
             self.source_id = identity(os.fstat(self.source.fileno()))[:2]
             self.output = self.temporary.open("x+b")
+            self._owns_temporary = True
         except BaseException:
             self.source.close()
             raise
@@ -103,66 +119,92 @@ class _Journal:
                 block, self.pending = self.pending, bytearray()
                 self.digest.update(block)
                 self.size += len(block)
-                encoded = self.compressor.compress(block)
+                encoded = write_zstd_frame_checked(
+                    self.output,
+                    self.compressor,
+                    block,
+                    verify_pread=True,
+                )
                 self.encoded_digest.update(encoded)
-                offset = self.output.tell()
-                if self.output.write(encoded) != len(encoded):
-                    raise OSError("short incremental journal write")
-                self.output.flush()
-                stored = os.pread(self.output.fileno(), len(encoded), offset)
-                if zstandard.ZstdDecompressor().decompress(stored) != block:
-                    raise ValueError("incremental metadata round-trip mismatch")
             if not data:
                 break
 
     def finish(self) -> PreparedArtifact:
-        self.pump(final=True)
-        if not self.size:
-            encoded = self.compressor.compress(b"")
-            self.output.write(encoded)
-            self.encoded_digest.update(encoded)
-        self.output.flush()
-        os.fsync(self.output.fileno())
-        source_identity = identity(os.fstat(self.source.fileno()))
-        if source_identity[:2] != self.source_id or source_identity[4] != self.size:
-            raise ValueError("incremental journal source changed")
-        if identity(self.path.stat(follow_symlinks=False)) != source_identity:
-            raise ValueError("incremental journal source was replaced")
-        self.close()
-        os.replace(self.temporary, self.target)
-        digest = self.digest.hexdigest()
-        output = _read_back(self.target)
-        if output.sha256 != self.encoded_digest.hexdigest():
-            raise ValueError("incremental compressed journal changed after block verification")
-        return PreparedArtifact(
-            VerifiedArtifact(source_identity, digest),
-            self.target,
-            output,
-            {
-                "codec": "zstd",
-                "level": 1,
-                "block_bytes": BLOCK_BYTES,
-                "uncompressed_bytes": self.size,
-                "uncompressed_sha256": digest,
-            },
-        )
+        try:
+            self.pump(final=True)
+            if not self.size:
+                encoded = write_zstd_frame_checked(self.output, self.compressor, b"")
+                self.encoded_digest.update(encoded)
+            self.output.flush()
+            os.fsync(self.output.fileno())
+            source_stat = os.fstat(self.source.fileno())
+            source_identity = identity(source_stat)
+            if source_identity[:2] != self.source_id or source_identity[4] != self.size:
+                raise ValueError("incremental journal source changed")
+            path_identity = identity(
+                self.path.stat(follow_symlinks=False),
+                include_inode=not self._exfat,
+            )
+            expected_path_identity = (
+                source_identity if not self._exfat else identity(source_stat, include_inode=False)
+            )
+            if path_identity != expected_path_identity:
+                raise ValueError("incremental journal source was replaced")
+            self._close_streams()
+            os.replace(self.temporary, self.target)
+            self._published = True
+            computed_digest = self.digest.hexdigest()
+            output = _read_back(self.target)
+            if output.sha256 != self.encoded_digest.hexdigest():
+                raise ValueError("incremental compressed journal changed after block verification")
+            return PreparedArtifact(
+                VerifiedArtifact(
+                    expected_path_identity,
+                    computed_digest,
+                    include_inode=not self._exfat,
+                ),
+                self.target,
+                output,
+                {
+                    "codec": "zstd",
+                    "level": 1,
+                    "block_bytes": BLOCK_BYTES,
+                    "uncompressed_bytes": self.size,
+                    "uncompressed_sha256": computed_digest,
+                },
+            )
+        except BaseException:
+            self.close()
+            raise
 
-    def close(self) -> None:
+    def _close_streams(self) -> None:
         try:
             self.source.close()
         finally:
             self.output.close()
 
+    def close(self) -> None:
+        try:
+            self._close_streams()
+        finally:
+            if self._owns_temporary and not self._published:
+                with suppress(OSError):
+                    self.temporary.unlink(missing_ok=True)
 
-def _checkpoint_identity(metadata: os.stat_result, *, force: bool) -> tuple[int, ...] | None:
+
+def _checkpoint_identity(
+    metadata: os.stat_result, *, force: bool, include_inode: bool = True
+) -> tuple[int, ...] | None:
     # Atomic publication can unlink the old regular inode at any read boundary.
     # Skip it during capture; the forced post-producer read remains strict.
     if not force and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
         return None
-    return identity(metadata)
+    return identity(metadata, include_inode=include_inode)
 
 
-def _read_audio_checkpoint(path: Path, expected: tuple[int, ...], *, force: bool) -> bytes | None:
+def _read_audio_checkpoint(
+    path: Path, expected: tuple[int, ...], *, force: bool, include_inode: bool = True
+) -> bytes | None:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -175,19 +217,28 @@ def _read_audio_checkpoint(path: Path, expected: tuple[int, ...], *, force: bool
         os.close(descriptor)
         raise
     with source:
+        exfat = is_exfat_or_msdos_fd(source.fileno())
         metadata = os.fstat(source.fileno())
-        before = _checkpoint_identity(metadata, force=force)
-        if before is None:
+        before_pinned = _checkpoint_identity(metadata, force=force, include_inode=True)
+        before_cmp = _checkpoint_identity(
+            metadata, force=force, include_inode=include_inode and not exfat
+        )
+        if before_pinned is None or before_cmp is None:
             return None
-        if force and before != expected:
+        expected_cmp = (
+            expected
+            if (include_inode and not exfat) or len(expected) == 6
+            else (expected[0], *expected[2:])
+        )
+        if force and before_cmp != expected_cmp:
             raise ValueError("audio checkpoint changed before final read")
         # Read at most the observed size plus one; concurrent growth cannot
         # keep this read chasing an ever-growing file.
         payload = source.read(metadata.st_size + 1)
-        after = _checkpoint_identity(os.fstat(source.fileno()), force=force)
+        after = _checkpoint_identity(os.fstat(source.fileno()), force=force, include_inode=True)
         if after is None:
             return None
-        if after != before or len(payload) != metadata.st_size:
+        if after != before_pinned or len(payload) != metadata.st_size:
             raise ValueError("audio checkpoint changed during read")
         return payload
 

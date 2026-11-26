@@ -2,6 +2,7 @@
 
 from rp_ylx.recording.coordinator import (
     CaptureCoordinator,
+    CapturePhase,
     CaptureSources,
     CoordinatorConfig,
     VolumeAdmission,
@@ -28,6 +29,7 @@ __all__ = [
     "DeviceSessionConfig",
     "DeviceSessionRecorder",
     "CaptureCoordinator",
+    "CapturePhase",
     "CaptureSources",
     "CoordinatorConfig",
     "RecordingConfig",

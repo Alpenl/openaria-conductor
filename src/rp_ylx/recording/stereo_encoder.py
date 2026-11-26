@@ -167,10 +167,15 @@ class StereoEncoderProcess:
             )
         except OSError as error:
             raise StereoEncoderError("encoder_unavailable", f"无法启动助手：{error}") from error
-        self._reader = threading.Thread(
-            target=self._read_events, name="rp-ylx-stereo-encoder-events", daemon=True
-        )
-        self._reader.start()
+        try:
+            self._reader = threading.Thread(
+                target=self._read_events, name="rp-ylx-stereo-encoder-events", daemon=True
+            )
+            self._reader.start()
+        except BaseException:
+            self._reader = None
+            self.abort()
+            raise
         if not self._ready.wait(_READY_TIMEOUT_SECONDS):
             self.abort()
             raise StereoEncoderError("encoder_unavailable", "助手未在期限内就绪")
@@ -196,20 +201,30 @@ class StereoEncoderProcess:
         process = self._process
         if process is None:
             raise StereoEncoderError("invalid_state", "助手进程未启动")
-        if process.stdin is not None:
-            try:
-                process.stdin.write(_HEADER.pack(_FRAME_MAGIC, 0))
-                process.stdin.flush()
-                process.stdin.close()
-            except OSError:
-                pass
         try:
-            code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            self.abort()
-            raise StereoEncoderError("encoder_failed", "助手未在期限内退出") from error
-        if self._reader is not None:
-            self._reader.join(timeout=timeout)
+            if process.stdin is not None:
+                try:
+                    process.stdin.write(_HEADER.pack(_FRAME_MAGIC, 0))
+                    process.stdin.flush()
+                except OSError:
+                    pass
+                finally:
+                    with suppress(OSError):
+                        process.stdin.close()
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                self.abort()
+                raise StereoEncoderError("encoder_failed", "助手未在期限内退出") from error
+        finally:
+            if process.stdin is not None:
+                with suppress(OSError):
+                    process.stdin.close()
+            if self._reader is not None:
+                self._reader.join(timeout=timeout)
+            if process.stdout is not None:
+                with suppress(OSError):
+                    process.stdout.close()
         self._raise_if_failed()
         if code != 0:
             raise StereoEncoderError("encoder_failed", f"助手退出码 {code}")
@@ -219,19 +234,24 @@ class StereoEncoderProcess:
         process = self._process
         if process is None:
             return
-        if process.stdin is not None:
-            with suppress(OSError):
-                process.stdin.close()
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        try:
+            if process.stdin is not None:
                 with suppress(OSError):
+                    process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
                     process.wait(timeout=5)
-        if self._reader is not None:
-            self._reader.join(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    with suppress(OSError, subprocess.TimeoutExpired):
+                        process.wait(timeout=5)
+            if self._reader is not None:
+                self._reader.join(timeout=5)
+        finally:
+            if process.stdout is not None:
+                with suppress(OSError):
+                    process.stdout.close()
 
     def _raise_if_failed(self) -> None:
         with self._lock:
@@ -245,7 +265,7 @@ class StereoEncoderProcess:
         try:
             for line in process.stdout:
                 self._handle_event(line)
-        except OSError as error:
+        except (OSError, ValueError, KeyError, TypeError) as error:
             with self._lock:
                 self._failure = self._failure or StereoEncoderError(
                     "encoder_failed", f"助手事件流中断：{error}"

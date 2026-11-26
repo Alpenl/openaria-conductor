@@ -2,45 +2,26 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import copy
-import errno
-import fcntl
-import hashlib
-import hmac
-import json
-import math
-import os
-import re
+import os  # noqa: F401
 import sqlite3
-import stat
 import threading
 import time
-import uuid
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, closing, nullcontext, suppress
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack, closing, suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Protocol
 
-from rp_ylx.api.downloads import (
-    ArtifactAccessError,
-    DirectorySessionStore,
-    LockedArtifact,
-    LockedBytes,
-    LockedManifest,
-    iter_device_session_v1_artifacts,
-)
+import rp_ylx.recording.failure_recovery as failure_recovery
+import rp_ylx.recording.recovery_orchestrator as recovery_orchestrator
+import rp_ylx.recording.stop_workflow as stop_workflow
+from rp_ylx.api.downloads import ArtifactAccessError
+from rp_ylx.api.downloads import DirectorySessionStore as DirectorySessionStore
 from rp_ylx.api.events import (
-    InvalidSourceEvent,
     project_device_descriptor,
     validate_capture_status,
-    validate_recording_state,
-    validate_retained_unsuccessful_outcome,
-    validate_safe_swap_v3_receipt,
     validate_session_summary,
 )
 from rp_ylx.api.gateway import (
@@ -53,720 +34,79 @@ from rp_ylx.api.gateway import (
 )
 from rp_ylx.api.preview import LatestPreviewBuffer, PreviewFrameUnavailable, PreviewResponse
 from rp_ylx.camera import CameraError, FrameObservation
-from rp_ylx.camera_focus import valid_camera_focus_status
-from rp_ylx.capture_readiness import SYSTEM_RESERVE_BYTES, SYSTEM_RESERVE_INODES, system_capacity
-from rp_ylx.capture_timer import DEFAULT_TIMER, valid_timer_settings
+from rp_ylx.capture_readiness import system_capacity
+from rp_ylx.capture_timer import valid_timer_settings
 from rp_ylx.clock_sync import valid_clock_response
-from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
-from rp_ylx.manifest_limits import MAX_MANIFEST_BYTES
-from rp_ylx.network import NetworkError, network_operation_lock_path
+from rp_ylx.errors import ProviderError as CoreProviderError
+from rp_ylx.imu import ImuObservation
+from rp_ylx.network import network_operation_lock_path
 from rp_ylx.network import network_status as collect_network_status
-from rp_ylx.network import network_status_v1 as project_network_status_v1
-from rp_ylx.network_control import CONTROL_RESPONSE_TIMEOUT_SECONDS, NetworkControlClientError
 from rp_ylx.network_control import request_control as request_network_control
 from rp_ylx.operational_logging import operational_logger
 from rp_ylx.performance.metrics import PerformanceMetrics
-from rp_ylx.persistence import PersistenceError, StateDatabase
-from rp_ylx.recording.backing_storage import backing_capacity, require_backing_reserve
-from rp_ylx.recording.catalog import SessionCatalog
+from rp_ylx.persistence import PersistenceError
+from rp_ylx.recording.backing_storage import backing_capacity
+from rp_ylx.recording.deletion import delete_recordings, valid_delete_request
 from rp_ylx.recording.device_session import (
     DeviceRecordingError,
-    DeviceSessionConfig,
     DeviceSessionRecorder,
+    SealedDeviceSession,
     SessionPlan,
     StorageStatus,
-    fsync_directory,
     inspect_device_session_directory,
-    manifest_artifact_bytes_total,
     uuid7,
     validate_device_session_directory,
-    write_json_atomic,
 )
-from rp_ylx.recording.recovery import (
-    MAX_RECOVERY_METADATA_BYTES,
-    RECOVERY_ROLE,
-    recover_device_session,
+from rp_ylx.recording.hardware_proxies import (
+    LIVE_IMU_STALE_SECONDS,
+    CameraFocusProxy,
+    CaptureLeaseManager,
+    CaptureSources,
+    ClockSyncProxy,
+    LiveImuTracker,
+    NetworkControllerProxy,
 )
-from rp_ylx.recording_layout import (
-    iter_recordings,
-    open_relative_directory,
-    publish_readable,
-    resolve_recording,
+from rp_ylx.recording.lifecycle import CaptureLifecycle, CapturePhase
+from rp_ylx.recording.recovery import RECOVERY_ROLE, recover_device_session  # noqa: F401
+from rp_ylx.recording.recovery_orchestrator import read_recovery_metadata
+from rp_ylx.recording.session_catalog import (
+    SESSION_CATALOG_REVISION_DOMAIN,
+    CatalogService,
+    _MultiRootSessionStore,
+    _TrackedRepresentation,
+    _VerifiedSessionSnapshot,
+    canonical_json_bytes,
+    encode_session_cursor,
+    session_catalog_revision,
+)
+from rp_ylx.recording.state_store import SAFE_SWAP_FAILURES, CoordinatorStateStore
+from rp_ylx.recording.volume import (
+    LEGACY_SESSIONS_DIRECTORY,
+    SESSIONS_DIRECTORY,
+    VOLUME_MARKER,
+    CoordinatorConfig,
+    VolumeAdmission,
+    VolumeManager,
+    initialize_capture_volume,
+    stat_capacity,
 )
 from rp_ylx.runtime import collect_linux_runtime
 from rp_ylx.voice_feedback import notify as notify_voice
 from rp_ylx.voice_feedback import valid_volume
 
-
-def _validated_command_receipt(item: Mapping[str, object]) -> tuple[bytes, CaptureCommandResult]:
-    """Validate a durable response before replaying it or deriving side effects."""
-    if set(item) != {
-        "principal_id",
-        "operation",
-        "idempotency_key",
-        "canonical_body",
-        "status",
-        "body",
-    }:
-        raise ValueError("invalid command receipt fields")
-    canonical = item["canonical_body"]
-    if not isinstance(canonical, str) or not canonical:
-        raise ValueError("invalid canonical request")
-    payload = canonical.encode("utf-8")
-    request = json.loads(payload)
-    if not isinstance(request, dict):
-        raise ValueError("invalid canonical request object")
-    json.dumps(request, allow_nan=False, ensure_ascii=False).encode("utf-8")
-    json.dumps(item["body"], allow_nan=False, ensure_ascii=False).encode("utf-8")
-    status, body, operation = item["status"], item["body"], item["operation"]
-    if type(status) is not int:
-        raise ValueError("invalid command response status")
-    if operation in {"start", "stop"} and status == HTTPStatus.ACCEPTED:
-        validate_capture_status(body)
-    elif operation == "stop" and status == HTTPStatus.NO_CONTENT and body is None:
-        pass
-    elif operation == "set_camera_focus" and status == HTTPStatus.OK:
-        if not valid_camera_focus_status(body):
-            raise ValueError("invalid focus receipt")
-    elif operation == "delete" and status == HTTPStatus.OK:
-        from rp_ylx.recording.deletion import valid_delete_request
-
-        if (
-            not valid_delete_request(request)
-            or not isinstance(body, dict)
-            or set(body) != {"schema", "deleted_session_ids", "failed_sessions"}
-            or body["schema"] != "ylx.session-delete-result.v1"
-            or not isinstance(body["deleted_session_ids"], list)
-            or not all(isinstance(sid, str) for sid in body["deleted_session_ids"])
-            or not isinstance(body["failed_sessions"], list)
-        ):
-            raise ValueError("invalid deletion receipt")
-        sessions = list(body["deleted_session_ids"])
-        for failure in body["failed_sessions"]:
-            if (
-                not isinstance(failure, dict)
-                or set(failure) != {"session_id", "error"}
-                or not isinstance(failure["session_id"], str)
-                or not isinstance(failure["error"], str)
-                or not failure["error"]
-            ):
-                raise ValueError("invalid deletion failure")
-            sessions.append(failure["session_id"])
-        expected = {entry["session_id"] for entry in request["sessions"]}
-        if len(sessions) != len(set(sessions)) or set(sessions) != expected:
-            raise ValueError("deletion receipt differs from request")
-    else:
-        raise ValueError("invalid command operation or status")
-    return payload, CaptureCommandResult(status, copy.deepcopy(body), replayed=False)
-
-
-def _read_recovery_metadata(root_fd: int, parts: tuple[str, ...], limit: int) -> tuple[dict, bytes]:
-    """Read only bounded regular metadata beneath an already opened session."""
-    with ExitStack() as cleanup:
-        current = root_fd
-        for component in parts[:-1]:
-            current = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=current,
-            )
-            cleanup.callback(os.close, current)
-            if os.fstat(current).st_dev != os.fstat(root_fd).st_dev:
-                raise ValueError("recovery metadata directory is on a different device")
-        descriptor = os.open(
-            parts[-1],
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-            dir_fd=current,
-        )
-        cleanup.callback(os.close, descriptor)
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_dev != os.fstat(root_fd).st_dev
-            or before.st_size > limit
-        ):
-            raise ValueError("unsafe or oversized recovery metadata")
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            payload = stream.read(limit + 1)
-        after = os.fstat(descriptor)
-        if (
-            len(payload) != before.st_size
-            or len(payload) > limit
-            or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-        ):
-            raise ValueError("recovery metadata changed during read")
-        value = json.loads(payload)
-        if not isinstance(value, dict):
-            raise ValueError("invalid recovery metadata object")
-        return value, payload
-
-
-VOLUME_MARKER = ".ylx-volume.json"
-SESSIONS_DIRECTORY = "recordings"
-LEGACY_SESSIONS_DIRECTORY = "sessions"
-LIVE_IMU_STALE_SECONDS = 2.0
-# The frozen receipt GET contract exposes InternalError for failed operations;
-# conflict statuses remain on the command endpoints, not this resource query.
-SAFE_SWAP_FAILURES = {
-    "safe_swap_unverified": (
-        HTTPStatus.INTERNAL_SERVER_ERROR,
-        "待交接录像的信息已变化或无法读取，请重试",
-    ),
-    "safe_swap_publish_failed": (
-        HTTPStatus.INTERNAL_SERVER_ERROR,
-        "安全换盘回执未能持久发布，请重试",
-    ),
-    "safe_swap_blocked": (
-        HTTPStatus.INTERNAL_SERVER_ERROR,
-        "仍有读取句柄未释放，请稍后重试",
-    ),
-    "safe_swap_resume_failed": (
-        HTTPStatus.INTERNAL_SERVER_ERROR,
-        "存储交接复核失败，请检查设备日志后重试",
-    ),
-}
 CALIBRATION_CAPTURE_DISABLED_REASONS = {
     "capture_source_unsupported",
     "storage_unavailable",
     "hardware_unavailable",
     "maintenance_or_capture_busy",
 }
-SESSION_CATALOG_REVISION_DOMAIN = b"ylx.session-list.v3.catalog-revision\x00"
-SESSION_CURSOR_DOMAIN = b"ylx.session-list.v3.cursor\x00"
-SESSION_CURSOR_SCHEMA = "ylx.session-list.cursor.v1"
-SESSION_DIAGNOSTIC_SUMMARIES = {
-    "manifest_unreadable": "会话清单无法安全读取",
-    "unsupported_schema": "会话清单 schema 不受当前 Device API 支持",
-    "manifest_invalid": "会话清单或 artifact 描述不符合 Device Session 合同",
-    "manifest_not_sealed": "会话尚未形成可下载的 sealed 清单",
-}
-GATEWAY_VERIFICATION_DIAGNOSTICS = {
-    "digest_mismatch": (
-        "artifact_digest_mismatch",
-        "artifact 内容 SHA-256 与清单声明不一致",
-    ),
-    "artifact_invalid": (
-        "artifact_invalid",
-        "artifact 类型、大小或稳定身份与清单声明不一致",
-    ),
-    "manifest_invalid": (
-        "manifest_invalid",
-        "manifest 内容不符合 Device Session 合同",
-    ),
-}
 
-
-@dataclass(frozen=True, slots=True)
-class _VerifiedSessionSnapshot:
-    manifest_sha256: str
-    manifest_id: str
-    volume_id: str
-    sealed_at: str
-    manifest_identity: tuple[int, int, int, int, int, int, int]
-    artifact_identities: tuple[tuple[str, tuple[int, int, int, int, int, int, int]], ...]
-
-
-def _canonical_json_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _locked_file_identity(representation: object) -> tuple[int, int, int, int, int, int, int]:
-    descriptor = getattr(representation, "_descriptor", None)
-    if type(descriptor) is not int:
-        raise DeviceRecordingError("artifact_invalid", "安全读取句柄缺少文件描述符")
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise DeviceRecordingError("artifact_invalid", "会话对象不是独占普通文件")
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_nlink,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
-def _stable_quarantine_id(candidate_identity: str, code: str) -> str:
-    digest = bytearray(
-        hashlib.sha256(
-            b"ylx.session-list.v3.quarantine-id\x00"
-            + candidate_identity.encode("utf-8", errors="surrogatepass")
-            + b"\x00"
-            + code.encode("ascii")
-        ).digest()[:16]
-    )
-    digest[6] = (digest[6] & 0x0F) | 0x40
-    digest[8] = (digest[8] & 0x3F) | 0x80
-    return str(uuid.UUID(bytes=bytes(digest)))
-
-
-def _session_catalog_revision(
-    items: list[dict[str, object]],
-    diagnostics: list[dict[str, object]],
-) -> str:
-    # Preserve the exact canonical v1 JSON byte stream and existing cursors,
-    # without materializing/encoding the entire catalog in one GIL-held call.
-    # A small batch amortizes JSON encoder overhead while bounding that call
-    # to 64 summaries rather than all sessions in a large recording volume.
-    digest = hashlib.sha256(SESSION_CATALOG_REVISION_DOMAIN)
-    digest.update(b'{"entries":[')
-    batch: list[dict[str, object]] = []
-    separator = b""
-
-    def consume_batch() -> None:
-        nonlocal separator
-        digest.update(separator)
-        digest.update(_canonical_json_bytes(batch)[1:-1])
-        separator = b","
-        batch.clear()
-
-    for kind, values in (("session", items), ("diagnostic", diagnostics)):
-        for value in values:
-            batch.append({"kind": kind, "value": value})
-            if len(batch) == 64:
-                consume_batch()
-    if batch:
-        consume_batch()
-    digest.update(b'],"schema":"ylx.session-catalog-revision-input.v1"}')
-    return f"sha256:{digest.hexdigest()}"
-
-
-def _encode_session_cursor(
-    *,
-    catalog_revision: str,
-    take_id: str | None,
-    offset: int,
-) -> str:
-    payload = _canonical_json_bytes(
-        {
-            "schema": SESSION_CURSOR_SCHEMA,
-            "catalog_revision": catalog_revision,
-            "take_id": take_id,
-            "offset": offset,
-        }
-    )
-    signature = hashlib.sha256(SESSION_CURSOR_DOMAIN + payload).digest()
-    return base64.urlsafe_b64encode(payload + signature).rstrip(b"=").decode("ascii")
-
-
-def _decode_session_cursor(cursor: str) -> Mapping[str, object]:
-    if len(cursor) > 2048:
-        raise ProviderError("invalid_cursor", "会话游标无效", status=HTTPStatus.BAD_REQUEST)
-    try:
-        encoded = cursor.encode("ascii")
-        padding = b"=" * ((4 - len(encoded) % 4) % 4)
-        decoded = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
-        if len(decoded) <= 32:
-            raise ValueError("cursor payload is empty")
-        payload, signature = decoded[:-32], decoded[-32:]
-        expected = hashlib.sha256(SESSION_CURSOR_DOMAIN + payload).digest()
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError("cursor signature mismatch")
-        value = json.loads(payload)
-        if _canonical_json_bytes(value) != payload:
-            raise ValueError("cursor payload is not canonical")
-    except (
-        UnicodeEncodeError,
-        UnicodeDecodeError,
-        binascii.Error,
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ) as error:
-        raise ProviderError(
-            "invalid_cursor",
-            "会话游标无效",
-            status=HTTPStatus.BAD_REQUEST,
-        ) from error
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != {"schema", "catalog_revision", "take_id", "offset"}
-        or value.get("schema") != SESSION_CURSOR_SCHEMA
-        or not isinstance(value.get("catalog_revision"), str)
-        or (value.get("take_id") is not None and not isinstance(value.get("take_id"), str))
-        or type(value.get("offset")) is not int
-        or int(value["offset"]) <= 0
-    ):
-        raise ProviderError("invalid_cursor", "会话游标无效", status=HTTPStatus.BAD_REQUEST)
-    return value
-
-
-class CaptureSources(Protocol):
-    @property
-    def supports_calibration_capture(self) -> bool: ...
-
-    @property
-    def open_handle_count(self) -> int: ...
-
-    def start(
-        self,
-        *,
-        mode: str,
-        generation_id: str,
-        submit_frame: Callable[[FrameObservation], bool],
-        submit_imu: Callable[[ImuObservation], bool],
-        on_failure: Callable[[str, str], None],
-        native_recorder: object | None = None,
-    ) -> None: ...
-
-    def stop(self) -> None: ...
-
-    def camera_connection_status(self) -> dict[str, object]: ...
-
-    def camera_focus_status(self) -> dict[str, object] | None: ...
-
-    def set_camera_focus(
-        self,
-        *,
-        value: int | None = None,
-        auto_enabled: bool | None = None,
-    ) -> dict[str, object]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class VolumeAdmission:
-    mountpoint: Path
-    sessions_root: Path
-    catalog_roots: tuple[Path, ...]
-    volume_id: str
-    generation_id: str
-    device: int
-    mount_identity: str
-    total_bytes: int
-    available_bytes: int
-    available_inodes: int
-
-
-@dataclass(frozen=True, slots=True)
-class CoordinatorConfig:
-    mountpoint: Path
-    state_root: Path
-    session: DeviceSessionConfig
-    minimum_available_bytes: int = 2 * 1024 * 1024 * 1024
-    minimum_available_inodes: int = 1024
-    queue_capacity: int = 128
-    enqueue_timeout: float = 0.05
-    checkpoint_interval: float = 1.0
-
-    def __post_init__(self) -> None:
-        if (
-            not self.mountpoint.is_absolute()
-            or not self.state_root.is_absolute()
-            or self.minimum_available_bytes < 0
-            or self.minimum_available_inodes < 0
-            or self.queue_capacity <= 0
-            or self.enqueue_timeout < 0
-            or self.checkpoint_interval < 0
-        ):
-            raise ValueError("录制协调器配置无效")
-
-
-@dataclass(frozen=True, slots=True)
-class _LatestImuReceipt:
-    session_id: str | None
-    sample: ImuSample
-    sample_key: tuple[int, int, int, int, int]
-    received_at_monotonic: float
-
-
-def initialize_capture_volume(mountpoint: str | Path, *, volume_id: str | None = None) -> str:
-    """显式初始化录制卷；不会覆盖已有标记或创建挂载点。"""
-
-    root = Path(mountpoint).resolve()
-    if not root.is_dir():
-        raise DeviceRecordingError("storage_unavailable", "录制卷挂载点不存在")
-    selected = volume_id or str(uuid.uuid4())
-    try:
-        parsed = uuid.UUID(selected)
-    except ValueError as error:
-        raise ValueError("volume_id 必须是 UUIDv4") from error
-    if parsed.version != 4 or str(parsed) != selected:
-        raise ValueError("volume_id 必须是规范 UUIDv4")
-    marker = root / VOLUME_MARKER
-    if marker.exists():
-        raise DeviceRecordingError("volume_already_initialized", "录制卷已经包含身份标记")
-    write_json_atomic(
-        marker,
-        {
-            "schema": "ylx.capture-volume.v1",
-            "volume_id": selected,
-            "initialized_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        },
-    )
-    return selected
-
-
-def _read_volume_id(mountpoint: Path) -> str:
-    marker = mountpoint / VOLUME_MARKER
-    try:
-        raw = marker.read_bytes()
-        if len(raw) > 4096:
-            raise ValueError("卷标记过大")
-        value = json.loads(raw)
-        if not isinstance(value, dict) or set(value) != {
-            "schema",
-            "volume_id",
-            "initialized_at",
-        }:
-            raise ValueError("卷标记字段无效")
-        selected = value["volume_id"]
-        parsed = uuid.UUID(selected)
-        if (
-            value["schema"] != "ylx.capture-volume.v1"
-            or parsed.version != 4
-            or str(parsed) != selected
-            or not isinstance(value["initialized_at"], str)
-        ):
-            raise ValueError("卷标记值无效")
-        return selected
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-        raise DeviceRecordingError("volume_not_admitted", "录制卷缺少有效身份标记") from error
-
-
-def _stat_capacity(mountpoint: Path) -> tuple[int, int, int]:
-    try:
-        stat = os.statvfs(mountpoint)
-    except OSError as error:
-        raise DeviceRecordingError("storage_unavailable", "无法读取录制卷容量") from error
-    return (
-        stat.f_frsize * stat.f_blocks,
-        stat.f_frsize * stat.f_bavail,
-        # exFAT has no fixed inode table and reports f_files=f_favail=0.
-        # Use free allocation units as a conservative creation budget there;
-        # preserve the real exhausted-inode signal on ext4.
-        stat.f_bavail if stat.f_files == 0 else stat.f_favail,
-    )
-
-
-def _mount_writable(mountpoint: Path) -> bool:
-    try:
-        flags = os.statvfs(mountpoint).f_flag
-    except OSError:
-        return False
-    read_only = bool(flags & getattr(os, "ST_RDONLY", 1))
-    return not read_only and os.access(mountpoint, os.W_OK)
-
-
-def _default_mount_identity(mountpoint: Path) -> str:
-    try:
-        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        lines = []
-    encoded_mountpoint = str(mountpoint).replace(" ", "\\040").replace("\t", "\\011")
-    for line in lines:
-        fields = line.split()
-        if len(fields) >= 6 and fields[4] == encoded_mountpoint:
-            return f"mount:{fields[0]}:{fields[2]}"
-    current = mountpoint.stat()
-    return f"path:{current.st_dev}:{current.st_ino}"
-
-
-class _TrackedRepresentation:
-    def __init__(
-        self,
-        representation: LockedBytes,
-        release: Callable[[], None],
-        on_close: Callable[[str, int], None] | None = None,
-    ) -> None:
-        self._representation = representation
-        self._release = release
-        self._closed = False
-        self._on_close = on_close
-        self._bytes_read = 0
-        self._full_read = False
-        self._failed = False
-        self.etag = representation.etag
-        self.size = representation.size
-        self.content_type = representation.content_type
-        descriptor = getattr(representation, "descriptor", None)
-        if descriptor is not None:
-            self.descriptor = descriptor
-
-    def __enter__(self) -> _TrackedRepresentation:
-        if self._closed:
-            raise RuntimeError("会话表示已关闭")
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
-
-    def __del__(self) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._representation.close()
-        finally:
-            try:
-                if self._on_close is not None:
-                    status = (
-                        "failed"
-                        if self._failed
-                        else "served"
-                        if self._full_read
-                        else "partial"
-                        if self._bytes_read
-                        else "metadata_only"
-                    )
-                    self._on_close(status, self._bytes_read)
-            finally:
-                self._release()
-
-    def read(self, offset: int = 0, length: int | None = None) -> bytes:
-        try:
-            value = self._representation.read(offset, length)
-            self._bytes_read += len(value)
-            self._full_read |= offset == 0 and len(value) == self.size
-            return value
-        except BaseException:
-            self._failed = True
-            raise
-
-    def iter_chunks(
-        self,
-        offset: int = 0,
-        length: int | None = None,
-        *,
-        chunk_size: int = 1024 * 1024,
-    ) -> Iterator[bytes]:
-        total = 0
-        try:
-            for chunk in self._representation.iter_chunks(offset, length, chunk_size=chunk_size):
-                total += len(chunk)
-                self._bytes_read += len(chunk)
-                yield chunk
-            self._full_read |= offset == 0 and total == self.size
-        except GeneratorExit:
-            raise
-        except BaseException:
-            self._failed = True
-            raise
-
-    def send_to(self, output_descriptor: int, offset: int = 0, length: int | None = None) -> int:
-        try:
-            count = self._representation.send_to(output_descriptor, offset, length)
-            self._bytes_read += count
-            self._full_read |= offset == 0 and count == self.size
-            return count
-        except BaseException:
-            self._failed = True
-            raise
-
-
-class _MultiRootSessionStore:
-    """Read sealed sessions from the current recordings root and legacy roots."""
-
-    def __init__(
-        self,
-        roots: tuple[Path, ...],
-        *,
-        verified_manifests: Mapping[str, str],
-        recording_paths: Mapping[Path, Mapping[str, Path]] | None = None,
-    ) -> None:
-        self._stores = []
-        with ExitStack() as cleanup:
-            for root in roots:
-                store = DirectorySessionStore(
-                    root,
-                    verified_manifests=verified_manifests,
-                    recording_paths=None if recording_paths is None else recording_paths.get(root),
-                )
-                cleanup.callback(store.close)
-                self._stores.append(store)
-            cleanup.pop_all()
-
-    def close(self) -> None:
-        stores, self._stores = self._stores, []
-        with ExitStack() as cleanup:
-            for store in stores:
-                cleanup.callback(store.close)
-
-    def open_manifest(self, session_id: str, api_version: str) -> LockedManifest:
-        not_found: ArtifactAccessError | None = None
-        for store in self._stores:
-            try:
-                return store.open_manifest(session_id, api_version)
-            except ArtifactAccessError as error:
-                if error.code != "not_found":
-                    raise
-                not_found = error
-        if not_found is not None:
-            raise not_found
-        raise ArtifactAccessError("not_found", "会话不存在")
-
-    def manifest_identity(
-        self, session_id: str, *, expected_sha256: str | None = None
-    ) -> tuple[int, int, int, int, int, int, int]:
-        for store in self._stores:
-            try:
-                return store.manifest_identity(session_id, expected_sha256=expected_sha256)
-            except ArtifactAccessError as error:
-                if error.code != "not_found":
-                    raise
-        raise ArtifactAccessError("not_found", "会话不存在")
-
-    def open_artifact(self, session_id: str, artifact_id: str, api_version: str) -> LockedArtifact:
-        for store in self._stores:
-            try:
-                return store.open_artifact(session_id, artifact_id, api_version)
-            except ArtifactAccessError as error:
-                if error.code != "not_found":
-                    raise
-        raise ArtifactAccessError("not_found", "录像文件不存在")
-
-    def open_verified_artifact(
-        self, session_id: str, artifact_id: str, api_version: str
-    ) -> LockedArtifact:
-        last_retryable: ArtifactAccessError | None = None
-        for store in self._stores:
-            try:
-                return store.open_verified_artifact(session_id, artifact_id, api_version)
-            except ArtifactAccessError as error:
-                if error.code == "not_found" or (
-                    error.code == "not_verified" and error.reason == "stale"
-                ):
-                    last_retryable = error
-                    continue
-                raise
-        if last_retryable is not None:
-            raise last_retryable
-        raise ArtifactAccessError("not_found", "artifact 不存在")
-
-    def snapshot_verified_identities(
-        self,
-        session_id: str,
-        api_version: str,
-    ) -> tuple[
-        bytes,
-        tuple[int, int, int, int, int, int, int],
-        tuple[tuple[str, tuple[int, int, int, int, int, int, int]], ...],
-    ]:
-        last_retryable: ArtifactAccessError | None = None
-        for store in self._stores:
-            try:
-                return store.snapshot_verified_identities(session_id, api_version)
-            except ArtifactAccessError as error:
-                if error.code == "not_found" or (
-                    error.code == "not_verified" and error.reason == "stale"
-                ):
-                    last_retryable = error
-                    continue
-                raise
-        if last_retryable is not None:
-            raise last_retryable
-        raise ArtifactAccessError("not_found", "会话不存在")
+# Preserve compatibility aliases for existing tests and imports.
+_stat_capacity = stat_capacity
+_canonical_json_bytes = canonical_json_bytes
+_encode_session_cursor = encode_session_cursor
+_session_catalog_revision = session_catalog_revision
+_read_recovery_metadata = read_recovery_metadata
 
 
 class CaptureCoordinator:
@@ -785,113 +125,610 @@ class CaptureCoordinator:
         before_write: Callable[[str, bytes], None] | None = None,
     ) -> None:
         self._config = config
-        self._mount_checker = mount_checker or (lambda path: path.is_mount())
-        self._mount_identity = mount_identity or _default_mount_identity
         self._runtime = runtime or collect_linux_runtime
         self._preview = preview or LatestPreviewBuffer(stream_fps=25, thumbnails=True)
         self._sources = sources
         self._metrics = metrics
         self._before_write = before_write
-        self._lock = threading.RLock()
-        self._stop_condition = threading.Condition(self._lock)
-        self._close_lock = threading.Lock()
-        self._state_persist_lock = threading.Lock()
-        self._state_write_sequence = 0
-        self._state_persisted_sequence = 0
-        self._storage_lock = threading.Lock()
-        self._catalog_lock = threading.RLock()
-        self._catalog_verification_lock = threading.Lock()
-        self._catalog_verification_cancel = threading.Event()
-        self._catalog_verification_epoch = 0
-        self._catalog_verification_session: str | None = None
-        self._closing = False
-        self._storage_checked_at = 0.0
-        self._storage_cache: StorageStatus | None = None
-        self._active: DeviceSessionRecorder | None = None
-        self._active_plan: SessionPlan | None = None
-        self._capture_timer: tuple[SessionPlan, float, int] | None = None
-        self._network_operation_lease: int | None = None
-        self._retained: dict[str, dict[str, object]] = {}
-        self._recovery_session: dict[str, str] | None = None
-        self._verified: dict[str, str] = {}
-        self._session_snapshots: dict[str, _VerifiedSessionSnapshot] = {}
-        self._session_summaries: dict[str, dict[str, object]] = {}
-        self._session_diagnostics: dict[str, dict[str, object]] = {}
-        self._latest_imu: _LatestImuReceipt | None = None
-        self._focus_revision = 0
-        self._open_representations = 0
-        self._released = False
-        self._media_lost = False
-        self._pending_safe_swap: dict[str, object] | None = None
-        self._pending_safe_swap_failure: dict[str, object] | None = None
-        self._safe_swap_resource: dict[str, object] | None = None
-        self._safe_swap_to_persist: dict[str, object] | None = None
-        self._stop_inflight: tuple[str, str, str] | None = None
-        self._pending_stop_state_commit: tuple[str, str, str] | None = None
-        self._stop_acceptance_inflight: tuple[str, str, str] | None = None
-        self._safe_swap_failure_clear_pending = False
-        self._async_stop_worker: threading.Thread | None = None
-        self._async_stop_reason: str | None = None
-        self._failure_inflight: DeviceSessionRecorder | None = None
-        self._failure_projection: dict[str, object] | None = None
-        self._failure_pending_commit: DeviceSessionRecorder | None = None
-        self._cached_active_state: Mapping[str, object] | None = None
-        self._pending_source_failure: DeviceRecordingError | None = None
-        self._commands: dict[tuple[str, str, str], tuple[bytes, CaptureCommandResult]] = {}
-        self._invalid_commands: dict[tuple[str, str, str], object] = {}
-        self._persisted_commands: dict[
-            tuple[str, str, str], tuple[bytes, CaptureCommandResult]
-        ] = {}
-        self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
-        self._state_path = self._config.state_root / "capture-coordinator.json"
-        self._state_db = StateDatabase(self._config.state_root / "state.sqlite3")
-        self._state_db.import_json("capture", self._state_path)
-        self._state_db.interrupt_transfers()
-        self._voice_settings = self._state_db.get("voice_feedback")
-        if self._voice_settings is None:
-            self._voice_settings = {"volume": 100}
-        self._timer_settings = self._state_db.get("capture_timer")
-        if self._timer_settings is None:
-            self._timer_settings = dict(DEFAULT_TIMER)
-        self._focus_restore_invalid = False
-        self._focus_to_persist: dict[str, object] | None = None
-        self._persisted_focus: dict[str, object] | None = None
+        self._admission_lock = threading.Lock()
+
+        self._lifecycle = CaptureLifecycle()
+        self._volume = VolumeManager(
+            config,
+            mount_checker=mount_checker,
+            mount_identity=mount_identity,
+            stat_capacity_fn=lambda path: _stat_capacity(path),
+            system_capacity_fn=lambda path: system_capacity(path),
+            backing_capacity_fn=lambda path: backing_capacity(path),
+            monotonic_fn=lambda: time.monotonic(),
+        )
+        self._state = CoordinatorStateStore(
+            config.state_root,
+            notify_fn=lambda *args, **kwargs: notify_voice(*args, **kwargs),
+        )
+        self._catalog = CatalogService(
+            config.state_root,
+            commit=config.session.commit,
+            inspect_fn=lambda *args, **kwargs: inspect_device_session_directory(*args, **kwargs),
+            validate_fn=lambda *args, **kwargs: validate_device_session_directory(*args, **kwargs),
+            validate_summary_fn=lambda value: validate_session_summary(value),
+            store_cls=_MultiRootSessionStore,
+        )
+        self._leases = CaptureLeaseManager(self._network_operation_lock_path)
+        self._network_proxy = NetworkControllerProxy(
+            request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs),
+            collect_network_status_fn=lambda: collect_network_status(),
+        )
+        self._clock_proxy = ClockSyncProxy(
+            request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs)
+        )
+        self._camera_proxy = CameraFocusProxy()
+        self._imu_tracker = LiveImuTracker(monotonic_fn=lambda: time.monotonic())
+
+        persisted = self._state._initial_persisted
         try:
-            self._pending_focus = self._state_db.get("camera_focus")
-        except (ValueError, TypeError, RecursionError, PersistenceError) as error:
-            # Preserve corrupt optional settings for explicit correction. An
-            # actual database I/O error still propagates instead of being ignored.
-            self._pending_focus = None
-            self._focus_restore_invalid = True
-            operational_logger("recording").event(
-                "camera_focus_restore_rejected",
-                level="warning",
-                exception_type=type(error).__name__,
-            )
-        self._failure_retry = None
-        self._recovery_retry_at = 0.0
-        self._recording_paths: dict[Path, dict[str, Path]] = {}
-        self._catalog_db = SessionCatalog(self._config.state_root / "catalog.sqlite3")
-        persisted = self._read_local_state()
-        self._authority_epoch = str(persisted.get("authority_epoch") or uuid.uuid4())
-        self._revision = int(persisted.get("source_revision", 0))
-        binding = persisted.get("volume_binding")
-        self._last_volume_binding = copy.deepcopy(binding) if isinstance(binding, Mapping) else None
-        self._admission: VolumeAdmission | None = None
-        self._recovery_deferred = False
-        try:
-            self._admission = self._admit(persisted)
+            self._volume._admission = self._admit(persisted)
         except DeviceRecordingError:
-            self._admission = None
+            self._volume._admission = None
         self._restore_local_state(persisted)
-        if self._admission is not None:
+        if self._volume._admission is not None:
             self._recover_sessions()
-            # Saved recordings are discovered from metadata; startup and reads
-            # never require a full-media integrity scan.
+        self._lifecycle.sync_phase(pending_safe_swap=self._state._pending_safe_swap)
         self._persist_local_state()
         if self._sources is not None:
             with suppress(CameraError, ProviderError):
                 self._require_camera_connected()
+
+    # -- Compatibility properties preserving test-inspectable attributes --
+
+    @property
+    def phase(self) -> CapturePhase:
+        return self._lifecycle._phase
+
+    @property
+    def _lock(self) -> threading.RLock:
+        override = self.__dict__.get("_lock_override")
+        if override is not None:
+            return override
+        return self._lifecycle._lock
+
+    @_lock.setter
+    def _lock(self, value: threading.RLock) -> None:
+        self.__dict__["_lock_override"] = value
+
+    @_lock.deleter
+    def _lock(self) -> None:
+        self.__dict__.pop("_lock_override", None)
+
+    def _get_lock(self) -> threading.RLock:
+        override = self.__dict__.get("_lock_override")
+        if override is not None:
+            return override
+        if "_lifecycle" in self.__dict__:
+            return self._lifecycle._lock
+        lock = self.__dict__.get("_lock")
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__["_lock_override"] = lock
+        return lock
+
+    @property
+    def _stop_condition(self) -> threading.Condition:
+        return self._lifecycle._stop_condition
+
+    @property
+    def _close_lock(self) -> threading.Lock:
+        return self._lifecycle._close_lock
+
+    @property
+    def _state_persist_lock(self) -> threading.Lock:
+        override = self.__dict__.get("_state_persist_lock_override")
+        return override if override is not None else self._state._state_persist_lock
+
+    @_state_persist_lock.setter
+    def _state_persist_lock(self, value: threading.Lock) -> None:
+        self.__dict__["_state_persist_lock_override"] = value
+
+    @_state_persist_lock.deleter
+    def _state_persist_lock(self) -> None:
+        self.__dict__.pop("_state_persist_lock_override", None)
+
+    @property
+    def _state_db(self):
+        return self._state._state_db
+
+    @property
+    def _storage_lock(self) -> threading.Lock:
+        return self._volume._storage_lock
+
+    @property
+    def _storage_checked_at(self) -> float:
+        return self._volume._storage_checked_at
+
+    @_storage_checked_at.setter
+    def _storage_checked_at(self, value: float) -> None:
+        self._volume._storage_checked_at = value
+
+    @property
+    def _storage_cache(self) -> StorageStatus | None:
+        return self._volume._storage_cache
+
+    @_storage_cache.setter
+    def _storage_cache(self, value: StorageStatus | None) -> None:
+        self._volume._storage_cache = value
+
+    @property
+    def _admission(self) -> VolumeAdmission | None:
+        return self._volume._admission
+
+    @_admission.setter
+    def _admission(self, value: VolumeAdmission | None) -> None:
+        self._volume._admission = value
+
+    @property
+    def _media_lost(self) -> bool:
+        return self._volume._media_lost
+
+    @_media_lost.setter
+    def _media_lost(self, value: bool) -> None:
+        self._volume._media_lost = value
+
+    @property
+    def _catalog_lock(self):
+        return self._catalog._catalog_lock
+
+    @_catalog_lock.setter
+    def _catalog_lock(self, value) -> None:
+        self._catalog._catalog_lock = value
+
+    @property
+    def _catalog_db(self):
+        return self._catalog._catalog_db
+
+    @property
+    def _catalog_verification_lock(self) -> threading.Lock:
+        if "_catalog" in self.__dict__:
+            return self._catalog._catalog_verification_lock
+        return self.__dict__["_catalog_verification_lock_override"]
+
+    @_catalog_verification_lock.setter
+    def _catalog_verification_lock(self, value: threading.Lock) -> None:
+        if "_catalog" in self.__dict__:
+            self._catalog._catalog_verification_lock = value
+        else:
+            self.__dict__["_catalog_verification_lock_override"] = value
+
+    @_catalog_verification_lock.deleter
+    def _catalog_verification_lock(self) -> None:
+        self.__dict__.pop("_catalog_verification_lock_override", None)
+
+    @property
+    def _catalog_verification_cancel(self) -> threading.Event:
+        if "_catalog" in self.__dict__:
+            return self._catalog._catalog_verification_cancel
+        return self.__dict__["_compat_catalog_verification_cancel"]
+
+    @_catalog_verification_cancel.setter
+    def _catalog_verification_cancel(self, value: threading.Event) -> None:
+        if "_catalog" in self.__dict__:
+            self._catalog._catalog_verification_cancel = value
+        else:
+            self.__dict__["_compat_catalog_verification_cancel"] = value
+
+    @property
+    def _catalog_verification_epoch(self) -> int:
+        if "_catalog" in self.__dict__:
+            return self._catalog._catalog_verification_epoch
+        return self.__dict__.get("_compat_catalog_verification_epoch", 0)
+
+    @_catalog_verification_epoch.setter
+    def _catalog_verification_epoch(self, value: int) -> None:
+        if "_catalog" in self.__dict__:
+            self._catalog._catalog_verification_epoch = value
+        else:
+            self.__dict__["_compat_catalog_verification_epoch"] = value
+
+    @property
+    def _catalog_verification_session(self) -> str | None:
+        return self._catalog._catalog_verification_session
+
+    @_catalog_verification_session.setter
+    def _catalog_verification_session(self, value: str | None) -> None:
+        self._catalog._catalog_verification_session = value
+
+    @property
+    def _recording_paths(self) -> dict[Path, dict[str, Path]]:
+        return self._catalog._recording_paths
+
+    @_recording_paths.setter
+    def _recording_paths(self, value: dict[Path, dict[str, Path]]) -> None:
+        self._catalog._recording_paths = value
+
+    @property
+    def _verified(self) -> dict[str, str]:
+        return self._catalog._verified
+
+    @_verified.setter
+    def _verified(self, value: dict[str, str]) -> None:
+        self._catalog._verified = value
+
+    @property
+    def _session_snapshots(self) -> dict[str, _VerifiedSessionSnapshot]:
+        return self._catalog._session_snapshots
+
+    @_session_snapshots.setter
+    def _session_snapshots(self, value: dict[str, _VerifiedSessionSnapshot]) -> None:
+        self._catalog._session_snapshots = value
+
+    @property
+    def _session_summaries(self) -> dict[str, dict[str, object]]:
+        return self._catalog._session_summaries
+
+    @_session_summaries.setter
+    def _session_summaries(self, value: dict[str, dict[str, object]]) -> None:
+        self._catalog._session_summaries = value
+
+    @property
+    def _session_diagnostics(self) -> dict[str, dict[str, object]]:
+        return self._catalog._session_diagnostics
+
+    @_session_diagnostics.setter
+    def _session_diagnostics(self, value: dict[str, dict[str, object]]) -> None:
+        self._catalog._session_diagnostics = value
+
+    @property
+    def _active(self) -> DeviceSessionRecorder | None:
+        if "_lifecycle" in self.__dict__:
+            return self._lifecycle._active
+        return self.__dict__.get("_compat_active")
+
+    @_active.setter
+    def _active(self, value: DeviceSessionRecorder | None) -> None:
+        if "_lifecycle" in self.__dict__:
+            self._lifecycle._active = value
+        else:
+            self.__dict__["_compat_active"] = value
+
+    @property
+    def _active_plan(self) -> SessionPlan | None:
+        return self._lifecycle._active_plan
+
+    @_active_plan.setter
+    def _active_plan(self, value: SessionPlan | None) -> None:
+        self._lifecycle._active_plan = value
+
+    @property
+    def _capture_timer(self) -> tuple[SessionPlan, float, int] | None:
+        return self._lifecycle._capture_timer
+
+    @_capture_timer.setter
+    def _capture_timer(self, value: tuple[SessionPlan, float, int] | None) -> None:
+        self._lifecycle._capture_timer = value
+
+    @property
+    def _closing(self) -> bool:
+        return self._lifecycle._closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._lifecycle._closing = value
+
+    @property
+    def _released(self) -> bool:
+        return self._lifecycle._released
+
+    @_released.setter
+    def _released(self, value: bool) -> None:
+        self._lifecycle._released = value
+
+    @_released.deleter
+    def _released(self) -> None:
+        self._lifecycle._released = False
+
+    @property
+    def _open_representations(self) -> int:
+        return self._lifecycle._open_representations
+
+    @_open_representations.setter
+    def _open_representations(self, value: int) -> None:
+        self._lifecycle._open_representations = value
+
+    @property
+    def _stop_inflight(self):
+        return self._lifecycle._stop_inflight
+
+    @_stop_inflight.setter
+    def _stop_inflight(self, value) -> None:
+        self._lifecycle._stop_inflight = value
+
+    @property
+    def _pending_stop_state_commit(self):
+        return self._lifecycle._pending_stop_state_commit
+
+    @_pending_stop_state_commit.setter
+    def _pending_stop_state_commit(self, value) -> None:
+        self._lifecycle._pending_stop_state_commit = value
+
+    @property
+    def _stop_acceptance_inflight(self):
+        return self._lifecycle._stop_acceptance_inflight
+
+    @_stop_acceptance_inflight.setter
+    def _stop_acceptance_inflight(self, value) -> None:
+        self._lifecycle._stop_acceptance_inflight = value
+
+    @property
+    def _async_stop_worker(self):
+        return self._lifecycle._async_stop_worker
+
+    @_async_stop_worker.setter
+    def _async_stop_worker(self, value) -> None:
+        self._lifecycle._async_stop_worker = value
+
+    @property
+    def _async_stop_reason(self):
+        return self._lifecycle._async_stop_reason
+
+    @_async_stop_reason.setter
+    def _async_stop_reason(self, value) -> None:
+        self._lifecycle._async_stop_reason = value
+
+    @_async_stop_reason.deleter
+    def _async_stop_reason(self) -> None:
+        self._lifecycle._async_stop_reason = None
+
+    @property
+    def _failure_inflight(self):
+        return self._lifecycle._failure_inflight
+
+    @_failure_inflight.setter
+    def _failure_inflight(self, value) -> None:
+        self._lifecycle._failure_inflight = value
+
+    @property
+    def _failure_projection(self):
+        return self._lifecycle._failure_projection
+
+    @_failure_projection.setter
+    def _failure_projection(self, value) -> None:
+        self._lifecycle._failure_projection = value
+
+    @property
+    def _failure_pending_commit(self):
+        return self._lifecycle._failure_pending_commit
+
+    @_failure_pending_commit.setter
+    def _failure_pending_commit(self, value) -> None:
+        self._lifecycle._failure_pending_commit = value
+
+    @property
+    def _failure_retry(self):
+        return self._lifecycle._failure_retry
+
+    @_failure_retry.setter
+    def _failure_retry(self, value) -> None:
+        self._lifecycle._failure_retry = value
+
+    @property
+    def _cached_active_state(self):
+        return self._lifecycle._cached_active_state
+
+    @_cached_active_state.setter
+    def _cached_active_state(self, value) -> None:
+        self._lifecycle._cached_active_state = value
+
+    @property
+    def _pending_source_failure(self):
+        return self._lifecycle._pending_source_failure
+
+    @_pending_source_failure.setter
+    def _pending_source_failure(self, value) -> None:
+        self._lifecycle._pending_source_failure = value
+
+    @property
+    def _recovery_deferred(self) -> bool:
+        return self._lifecycle._recovery_deferred
+
+    @_recovery_deferred.setter
+    def _recovery_deferred(self, value: bool) -> None:
+        self._lifecycle._recovery_deferred = value
+
+    @property
+    def _recovery_retry_at(self) -> float:
+        return self._lifecycle._recovery_retry_at
+
+    @_recovery_retry_at.setter
+    def _recovery_retry_at(self, value: float) -> None:
+        self._lifecycle._recovery_retry_at = value
+
+    @property
+    def _focus_revision(self) -> int:
+        return self._lifecycle._focus_revision
+
+    @_focus_revision.setter
+    def _focus_revision(self, value: int) -> None:
+        self._lifecycle._focus_revision = value
+
+    @property
+    def _network_operation_lease(self) -> int | None:
+        if "_leases" in self.__dict__:
+            return self._leases.network_operation_lease
+        return self.__dict__.get("_compat_network_operation_lease")
+
+    @_network_operation_lease.setter
+    def _network_operation_lease(self, value: int | None) -> None:
+        if "_leases" in self.__dict__:
+            self._leases.network_operation_lease = value
+        else:
+            self.__dict__["_compat_network_operation_lease"] = value
+
+    @property
+    def _maintenance_lease(self):
+        if "_leases" in self.__dict__:
+            return self._leases.maintenance_lease
+        return self.__dict__.get("_compat_maintenance_lease")
+
+    @_maintenance_lease.setter
+    def _maintenance_lease(self, value) -> None:
+        if "_leases" in self.__dict__:
+            self._leases.maintenance_lease = value
+        else:
+            self.__dict__["_compat_maintenance_lease"] = value
+
+    @property
+    def _retained(self) -> dict[str, dict[str, object]]:
+        return self._state._retained
+
+    @_retained.setter
+    def _retained(self, value: dict[str, dict[str, object]]) -> None:
+        self._state._retained = value
+
+    @property
+    def _commands(self):
+        return self._state._commands
+
+    @_commands.setter
+    def _commands(self, value) -> None:
+        self._state._commands = value
+
+    @property
+    def _invalid_commands(self):
+        return self._state._invalid_commands
+
+    @_invalid_commands.setter
+    def _invalid_commands(self, value) -> None:
+        self._state._invalid_commands = value
+
+    @property
+    def _persisted_commands(self):
+        return self._state._persisted_commands
+
+    @_persisted_commands.setter
+    def _persisted_commands(self, value) -> None:
+        self._state._persisted_commands = value
+
+    @property
+    def _pending_safe_swap(self):
+        return self._state._pending_safe_swap
+
+    @_pending_safe_swap.setter
+    def _pending_safe_swap(self, value) -> None:
+        self._state._pending_safe_swap = value
+
+    @_pending_safe_swap.deleter
+    def _pending_safe_swap(self) -> None:
+        self._state._pending_safe_swap = None
+
+    @property
+    def _pending_safe_swap_failure(self):
+        return self._state._pending_safe_swap_failure
+
+    @_pending_safe_swap_failure.setter
+    def _pending_safe_swap_failure(self, value) -> None:
+        self._state._pending_safe_swap_failure = value
+
+    @property
+    def _safe_swap_resource(self):
+        return self._state._safe_swap_resource
+
+    @_safe_swap_resource.setter
+    def _safe_swap_resource(self, value) -> None:
+        self._state._safe_swap_resource = value
+
+    @property
+    def _safe_swap_to_persist(self):
+        return self._state._safe_swap_to_persist
+
+    @_safe_swap_to_persist.setter
+    def _safe_swap_to_persist(self, value) -> None:
+        self._state._safe_swap_to_persist = value
+
+    @property
+    def _safe_swap_failure_clear_pending(self) -> bool:
+        return self._state._safe_swap_failure_clear_pending
+
+    @_safe_swap_failure_clear_pending.setter
+    def _safe_swap_failure_clear_pending(self, value: bool) -> None:
+        self._state._safe_swap_failure_clear_pending = value
+
+    @property
+    def _authority_epoch(self) -> str:
+        return self._state._authority_epoch
+
+    @property
+    def _revision(self) -> int:
+        return self._state._revision
+
+    @_revision.setter
+    def _revision(self, value: int) -> None:
+        self._state._revision = value
+
+    @property
+    def _voice_settings(self):
+        if "_state" in self.__dict__:
+            return self._state._voice_settings
+        return self.__dict__.get("_compat_voice_settings", {"volume": 100})
+
+    @_voice_settings.setter
+    def _voice_settings(self, value) -> None:
+        if "_state" in self.__dict__:
+            self._state._voice_settings = value
+        else:
+            self.__dict__["_compat_voice_settings"] = value
+
+    @property
+    def _timer_settings(self):
+        if "_state" in self.__dict__:
+            return self._state._timer_settings
+        return self.__dict__.get(
+            "_compat_timer_settings", {"enabled": False, "duration_seconds": 600}
+        )
+
+    @_timer_settings.setter
+    def _timer_settings(self, value) -> None:
+        if "_state" in self.__dict__:
+            self._state._timer_settings = value
+        else:
+            self.__dict__["_compat_timer_settings"] = value
+
+    @property
+    def _pending_focus(self):
+        if "_state" in self.__dict__:
+            return self._state._pending_focus
+        return self.__dict__.get("_compat_pending_focus")
+
+    @_pending_focus.setter
+    def _pending_focus(self, value) -> None:
+        if "_state" in self.__dict__:
+            self._state._pending_focus = value
+        else:
+            self.__dict__["_compat_pending_focus"] = value
+
+    @property
+    def _focus_restore_invalid(self) -> bool:
+        if "_state" in self.__dict__:
+            return self._state._focus_restore_invalid
+        return bool(self.__dict__.get("_compat_focus_restore_invalid", False))
+
+    @_focus_restore_invalid.setter
+    def _focus_restore_invalid(self, value: bool) -> None:
+        if "_state" in self.__dict__:
+            self._state._focus_restore_invalid = value
+        else:
+            self.__dict__["_compat_focus_restore_invalid"] = value
+
+    @property
+    def _latest_imu(self):
+        return self._imu_tracker.latest_imu
+
+    @_latest_imu.setter
+    def _latest_imu(self, value) -> None:
+        self._imu_tracker.latest_imu = value
+
+    def _sync_phase(self) -> CapturePhase:
+        return self._lifecycle.sync_phase(pending_safe_swap=self._pending_safe_swap)
+
+    # -- Public volume/handle/source metadata --
 
     @property
     def volume_id(self) -> str:
@@ -905,8 +742,6 @@ class CaptureCoordinator:
     def open_handle_count(self) -> int:
         with self._lock:
             if self._failure_projection is not None:
-                # Recovery owns the volume even while individual handles close.
-                # Do not acquire the recorder lock while it waits for storage.
                 return 1 + self._open_representations
             recorder_handles = 0 if self._active is None else self._active.open_handle_count
             source_handles = 0 if self._sources is None else self._sources.open_handle_count
@@ -920,271 +755,44 @@ class CaptureCoordinator:
     def _sources_keep_preview(self) -> bool:
         return bool(getattr(self._sources, "keeps_preview_after_stop", False))
 
+    # -- State persistence & volume admission delegation --
+
     def _read_local_state(self) -> Mapping[str, object]:
-        return self._state_db.capture_state()
+        return self._state.read_local_state()
+
+    def _admit(self, persisted: Mapping[str, object]) -> VolumeAdmission:
+        return self._volume.admit(persisted)
 
     def _require_admission(self) -> VolumeAdmission:
-        admission = self._admission
+        admission = self._volume._admission
         if admission is not None:
             return admission
-        with self._lock:
-            if self._admission is not None:
-                return self._admission
+        with self._admission_lock:
+            admission = self._volume._admission
+            if admission is not None:
+                return admission
             persisted = self._read_local_state()
             admission = self._admit(persisted)
-            self._admission = admission
-            self._media_lost = False
-            self._restore_local_state(persisted)
+            with self._lock:
+                self._volume._admission = admission
+                self._volume._media_lost = False
+                self._restore_local_state(persisted)
+                self._next_revision()
+                self._sync_phase()
             self._recover_sessions()
-            self._next_revision()
             self._persist_local_state()
             return admission
 
-    def _admit(self, persisted: Mapping[str, object]) -> VolumeAdmission:
-        mountpoint = self._config.mountpoint.resolve()
-        if not self._mount_checker(mountpoint):
-            raise DeviceRecordingError("volume_not_mounted", "录制卷不是当前活动挂载点")
-        try:
-            mount_stat = mountpoint.stat()
-        except OSError as error:
-            raise DeviceRecordingError("storage_unavailable", "录制卷不可读取") from error
-        if os.environ.get("RP_YLX_DATA_VOLUME_MODE") == "exfat":
-            identity = os.environ.get("RP_YLX_DATA_VOLUME_UUID", "")
-            if not re.fullmatch(r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}", identity):
-                raise DeviceRecordingError("volume_not_admitted", "录制卷配置缺少有效身份")
-            try:
-                expected = Path("/dev/disk/by-uuid", identity).stat()
-            except OSError as error:
-                raise DeviceRecordingError("volume_not_mounted", "指定的录制卷不在线") from error
-            if not stat.S_ISBLK(expected.st_mode) or expected.st_rdev != mount_stat.st_dev:
-                raise DeviceRecordingError("volume_not_admitted", "挂载的录制卷与设备配置不匹配")
-        volume_id = _read_volume_id(mountpoint)
-        mount_identity = self._mount_identity(mountpoint)
-        total_bytes, available_bytes, available_inodes = _stat_capacity(mountpoint)
-        # Admission proves volume identity and topology. Recording reserves must
-        # not prevent reading or deleting existing sessions after a full-disk boot.
-        if not _mount_writable(mountpoint):
-            raise DeviceRecordingError("volume_read_only", "录制卷不可写")
-        previous_binding = persisted.get("volume_binding")
-        generation_id = str(uuid.uuid4())
-        if isinstance(previous_binding, Mapping):
-            previous_generation = previous_binding.get("generation_id")
-            if (
-                previous_binding.get("volume_id") == volume_id
-                and previous_binding.get("device") == mount_stat.st_dev
-                and previous_binding.get("mount_identity") == mount_identity
-                and isinstance(previous_generation, str)
-            ):
-                with suppress(ValueError):
-                    parsed = uuid.UUID(previous_generation)
-                    if parsed.version == 4 and str(parsed) == previous_generation:
-                        generation_id = previous_generation
-        sessions_root = mountpoint / SESSIONS_DIRECTORY
-        sessions_root_existed = sessions_root.exists()
-        try:
-            sessions_root.mkdir(mode=0o750, exist_ok=True)
-        except OSError as error:
-            raise DeviceRecordingError("storage_unavailable", "无法访问会话目录") from error
-        if sessions_root.is_symlink():
-            raise DeviceRecordingError("unsafe_sessions_root", "会话目录不能是符号链接")
-        if sessions_root.stat().st_dev != mount_stat.st_dev:
-            raise DeviceRecordingError("cross_device_sessions", "会话目录不在录制卷文件系统内")
-        catalog_roots = [sessions_root]
-        legacy_sessions_root = mountpoint / LEGACY_SESSIONS_DIRECTORY
-        if legacy_sessions_root != sessions_root and legacy_sessions_root.exists():
-            if legacy_sessions_root.is_symlink() or not legacy_sessions_root.is_dir():
-                raise DeviceRecordingError("unsafe_sessions_root", "旧会话目录不能是符号链接或文件")
-            if legacy_sessions_root.stat().st_dev != mount_stat.st_dev:
-                raise DeviceRecordingError(
-                    "cross_device_sessions",
-                    "旧会话目录不在录制卷文件系统内",
-                )
-            catalog_roots.append(legacy_sessions_root)
-        if not sessions_root_existed:
-            fsync_directory(mountpoint)
-        return VolumeAdmission(
-            mountpoint,
-            sessions_root,
-            tuple(catalog_roots),
-            volume_id,
-            generation_id,
-            mount_stat.st_dev,
-            mount_identity,
-            total_bytes,
-            available_bytes,
-            available_inodes,
-        )
-
     def _restore_local_state(self, persisted: Mapping[str, object]) -> None:
-        admission = self._admission
-        self._recovery_session = None
-        identity = persisted.get("active_session")
-        if isinstance(identity, dict) and set(identity) == {
-            "session_id",
-            "volume_id",
-            "generation_id",
-        }:
-            try:
-                for key, version in (("session_id", 7), ("volume_id", 4), ("generation_id", 4)):
-                    parsed = uuid.UUID(identity[key])
-                    if parsed.version != version or str(parsed) != identity[key]:
-                        raise ValueError("invalid active session identity")
-            except (ValueError, TypeError, AttributeError):
-                pass
-            else:
-                self._recovery_session = dict(identity)
-        retained = persisted.get("retained")
-        if isinstance(retained, Mapping):
-            self._retained = {}
-            rejected = 0
-            for key, value in retained.items():
-                state = value.get("recording_state") if isinstance(value, dict) else None
-                if not isinstance(key, str) or not isinstance(state, Mapping):
-                    rejected += 1
-                    continue
-                try:
-                    validate_retained_unsuccessful_outcome(
-                        {
-                            "schema": "ylx.retained-unsuccessful-session-resource.v2",
-                            "authority_epoch": state.get("authority_epoch"),
-                            "source_revision": state.get("state_revision"),
-                            "outcome": value,
-                        },
-                        session_id=key,
-                    )
-                except (ValueError, KeyError, TypeError, RecursionError):
-                    rejected += 1
-                    continue
-                self._retained[key] = copy.deepcopy(value)
-            if rejected:
-                operational_logger("recording").event(
-                    "retained_outcomes_rejected", level="warning", count=rejected
-                )
-        safe_swap = persisted.get("safe_swap_resource")
-        if safe_swap is not None:
-            try:
-                if (
-                    not isinstance(safe_swap, dict)
-                    or set(safe_swap) != {"schema", "receipt"}
-                    or safe_swap["schema"] != "ylx.safe-swap-receipt-resource.v3"
-                    or not isinstance(safe_swap["receipt"], dict)
-                ):
-                    raise ValueError("invalid persisted safe-swap resource")
-                validate_safe_swap_v3_receipt(safe_swap["receipt"])
-            except (ValueError, KeyError, TypeError, RecursionError):
-                operational_logger("recording").event(
-                    "safe_swap_state_rejected", level="warning", field="safe_swap_resource"
-                )
-                safe_swap = None
-        if isinstance(safe_swap, dict):
-            receipt = safe_swap.get("receipt")
-            if (
-                admission is not None
-                and isinstance(receipt, Mapping)
-                and receipt.get("volume_id") == admission.volume_id
-                and receipt.get("generation_id") == admission.generation_id
-            ):
-                self._safe_swap_resource = copy.deepcopy(safe_swap)
-                self._released = True
-        pending = persisted.get("pending_safe_swap")
-        if pending is not None:
-            try:
-                if not isinstance(pending, dict) or set(pending) != {
-                    "session_id",
-                    "volume_id",
-                    "generation_id",
-                    "manifest_id",
-                    "manifest_sha256",
-                    "sealed_at",
-                }:
-                    raise ValueError("invalid persisted safe-swap intent")
-                # Reuse the frozen receipt field rules for the six intent fields.
-                # Publication rechecks the saved manifest and released handles.
-                validate_safe_swap_v3_receipt(
-                    {
-                        **pending,
-                        "schema": "ylx.safe-swap-receipt.v3",
-                        "released_at": pending["sealed_at"],
-                        "release_state": "device-released",
-                        "open_handle_count": 0,
-                    }
-                )
-            except (ValueError, KeyError, TypeError, RecursionError):
-                operational_logger("recording").event(
-                    "safe_swap_state_rejected", level="warning", field="pending_safe_swap"
-                )
-                pending = None
-        if (
-            admission is not None
-            and isinstance(pending, dict)
-            and pending.get("volume_id") == admission.volume_id
-            and pending.get("generation_id") == admission.generation_id
-        ):
-            self._pending_safe_swap = copy.deepcopy(pending)
-            failure = persisted.get("pending_safe_swap_failure")
-            if (
-                isinstance(failure, Mapping)
-                and set(failure) == {"session_id", "manifest_sha256", "code"}
-                and isinstance(failure.get("code"), str)
-                and failure["code"] in SAFE_SWAP_FAILURES
-                and failure["session_id"] == pending.get("session_id")
-                and failure["manifest_sha256"] == pending.get("manifest_sha256")
-            ):
-                self._pending_safe_swap_failure = copy.deepcopy(dict(failure))
-        invalid = persisted.get("invalid_commands", [])
-        if not isinstance(invalid, list):
-            raise PersistenceError("invalid quarantined command identities")
-        for entry in invalid:
-            if not isinstance(entry, dict) or not isinstance(entry.get("scope"), list):
-                raise PersistenceError("invalid quarantined command identity")
-            scope = tuple(entry["scope"])
-            if len(scope) != 3 or not all(isinstance(part, str) and part for part in scope):
-                raise PersistenceError("invalid quarantined command identity")
-            self._invalid_commands[scope] = copy.deepcopy(entry.get("receipt"))
-        commands = persisted.get("commands")
-        if "commands" in persisted and not isinstance(commands, list):
-            raise PersistenceError("invalid legacy command receipt collection")
-        if isinstance(commands, list):
-            for item in commands[-1024:]:
-                if not isinstance(item, Mapping):
-                    raise PersistenceError("unidentifiable legacy command receipt")
-                scope = tuple(
-                    item.get(key)
-                    for key in (
-                        "principal_id",
-                        "operation",
-                        "idempotency_key",
-                    )
-                )
-                if not all(isinstance(part, str) and part for part in scope):
-                    raise PersistenceError("unidentifiable legacy command receipt")
-                try:
-                    receipt = _validated_command_receipt(item)
-                except (ValueError, KeyError, TypeError, RecursionError, OverflowError):
-                    self._invalid_commands[scope] = json.dumps(item, ensure_ascii=True)
-                    self._commands.pop(scope, None)
-                else:
-                    if scope not in self._invalid_commands:
-                        self._commands[scope] = receipt
-        if self._invalid_commands:
-            operational_logger("recording").event(
-                "command_receipts_rejected", level="warning", count=len(self._invalid_commands)
-            )
+        def mark_released() -> None:
+            self._released = True
 
-        # Older firmware persisted deletion receipts without retiring retained
-        # failures. Only successful deletions are evidence to remove an outcome;
-        # absent media alone must not erase a legitimate interrupted recording.
-        for (_, operation, _), (_, result) in self._commands.items():
-            body = result.body
-            if (
-                operation == "delete"
-                and result.status == HTTPStatus.OK
-                and isinstance(body, Mapping)
-                and body.get("schema") == "ylx.session-delete-result.v1"
-            ):
-                deleted = body.get("deleted_session_ids")
-                if isinstance(deleted, list) and all(isinstance(sid, str) for sid in deleted):
-                    self._forget_deleted_outcomes(deleted)
+        self._state.restore_local_state(
+            persisted,
+            self._volume._admission,
+            on_released=mark_released,
+            on_forget_deleted=self._forget_deleted_outcomes,
+        )
 
     def _forget_deleted_outcomes(self, session_ids: list[str]) -> None:
         removed = self._retained.keys() & set(session_ids)
@@ -1194,108 +802,50 @@ class CaptureCoordinator:
         for session_id in removed:
             del self._retained[session_id]
         if visible is not None and visible["recording_state"]["session_id"] in removed:
-            # Publish the disappearance to capture-status/event consumers. An
-            # older deleted failure must not hide a different current outcome.
             self._next_revision()
 
     def _persist_local_state(self) -> None:
-        # Snapshot under the command lock, then write independently. Delayed
-        # older callbacks must never overwrite a newer durable command/state.
-        with self._lock:
+        def snapshot_builder():
             sequence, value, commands = self._local_state_write()
-            focus = self._focus_to_persist
-            pending_stop = self._pending_stop_state_commit
-        with self._state_persist_lock:
-            if sequence <= self._state_persisted_sequence:
-                return
-            # Cached receipt tuples are private and never mutated after insertion.
-            # Identity distinguishes a reused key even if its canonical body is
-            # unchanged. A failed write must not mark its receipt durable.
-            new_commands = [
-                {
-                    "principal_id": scope[0],
-                    "operation": scope[1],
-                    "idempotency_key": scope[2],
-                    "canonical_body": receipt[0].decode("utf-8"),
-                    "status": int(receipt[1].status),
-                    "body": receipt[1].body,
-                }
-                for scope, receipt in commands.items()
-                if self._persisted_commands.get(scope) is not receipt
-            ]
-            removed = self._persisted_commands.keys() - commands.keys()
-            if focus is not None and focus is not self._persisted_focus:
-                self._state_db.put_capture_state(value, new_commands, removed, camera_focus=focus)
-            else:
-                self._state_db.put_capture_state(value, new_commands, removed)
-            self._persisted_focus = focus
-            self._persisted_commands = commands
-            self._state_persisted_sequence = sequence
+            return (
+                sequence,
+                value,
+                commands,
+                self._state._focus_to_persist,
+                self._pending_stop_state_commit,
+            )
+
+        def on_committed(
+            pending_stop: tuple[str, str, str] | None, value: dict[str, object]
+        ) -> None:
             if (
                 pending_stop is not None
                 and self._pending_stop_state_commit == pending_stop
                 and value["active_session"] is None
             ):
-                # This exact completed-state snapshot is durable. The stop
-                # owner still fences new mutations until its finally block.
                 self._pending_stop_state_commit = None
-            # The same successful transaction has preserved any inline evidence
-            # in capture_commands. Quarantine identities never change during a
-            # coordinator lifetime; replace the mapping without reacquiring the
-            # command lock while holding the persistence lock.
-            self._invalid_commands = dict.fromkeys(self._invalid_commands)
+                if (
+                    self._active is None
+                    and self._stop_inflight is None
+                    and self._async_stop_worker is None
+                ):
+                    self._release_network_operation_lease()
+                self._sync_phase()
+                self._stop_condition.notify_all()
+
+        self._state.persist_local_state(
+            self._lock,
+            snapshot_builder,
+            on_committed,
+            lock_override=self._state_persist_lock,
+        )
 
     def _local_state_write(self):
-        admission = self._admission
-        if admission is not None:
-            self._last_volume_binding = {
-                "volume_id": admission.volume_id,
-                "generation_id": admission.generation_id,
-                "device": admission.device,
-                "mount_identity": admission.mount_identity,
-            }
-        value = {
-            "schema": "ylx.capture-coordinator-state.v1",
-            "invalid_commands": [
-                {
-                    "scope": list(scope),
-                    **({"receipt": copy.deepcopy(receipt)} if receipt is not None else {}),
-                }
-                for scope, receipt in self._invalid_commands.items()
-            ],
-            "authority_epoch": self._authority_epoch,
-            "source_revision": self._revision,
-            "volume_binding": copy.deepcopy(self._last_volume_binding),
-            # Persisted by the existing recording-start checkpoint, before
-            # sources start. It locates a published prefix if final state commit
-            # never happens; no scan of every completed recording is required.
-            "active_session": (
-                {
-                    "session_id": self._active_plan.session_id,
-                    "volume_id": self._active_plan.volume_id,
-                    "generation_id": self._active_plan.generation_id,
-                }
-                if self._active is not None and self._active_plan is not None
-                else self._recovery_session
-            ),
-            "retained": self._retained,
-            "pending_safe_swap": self._pending_safe_swap,
-            "pending_safe_swap_failure": self._pending_safe_swap_failure,
-            "safe_swap_resource": self._safe_swap_resource,
-        }
-        if self._safe_swap_failure_clear_pending:
-            value["pending_safe_swap_failure"] = None
-        if self._safe_swap_to_persist is not None:
-            # The handoff owner stages a durable snapshot without exposing an
-            # uncommitted success through status or the safe-swap endpoint.
-            value["safe_swap_resource"] = self._safe_swap_to_persist
-            value["pending_safe_swap"] = None
-            value["pending_safe_swap_failure"] = None
-        self._state_write_sequence += 1
-        return (
-            self._state_write_sequence,
-            copy.deepcopy(value),
-            dict(self._commands),
+        return self._state.build_local_state_write(
+            admission=self._volume._admission,
+            active=self._active,
+            active_plan=self._active_plan,
+            failure_pending_commit=self._failure_pending_commit,
         )
 
     def _recording_state_changed(self, plan: SessionPlan, state: Mapping[str, object]) -> None:
@@ -1308,9 +858,6 @@ class CaptureCoordinator:
         except (OSError, sqlite3.Error, PersistenceError) as error:
             if not recovering:
                 raise
-            # Keep the normal checkpoint ordering when storage works. Its
-            # recording.json is already durable; defer only this failed DB
-            # write to the final recovery commit, whose failure retains ownership.
             operational_logger("recording").event(
                 "failure_checkpoint_commit_deferred",
                 level="warning",
@@ -1320,26 +867,11 @@ class CaptureCoordinator:
 
     def _next_revision(self) -> int:
         with self._lock:
-            self._revision += 1
-            return self._revision
+            self._state._revision += 1
+            return self._state._revision
 
     def _probe_storage_capacity(self, admission: VolumeAdmission) -> tuple[StorageStatus, int]:
-        """Read one admitted volume without changing coordinator or cache state."""
-        mountpoint = admission.mountpoint
-        try:
-            if (
-                not self._mount_checker(mountpoint)
-                or mountpoint.stat().st_dev != admission.device
-                or self._mount_identity(mountpoint) != admission.mount_identity
-                or _read_volume_id(mountpoint) != admission.volume_id
-            ):
-                raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-            _, available_bytes, inodes = _stat_capacity(mountpoint)
-            if not _mount_writable(mountpoint):
-                raise DeviceRecordingError("media_lost", "录制介质变为不可写")
-            return StorageStatus(available_bytes, True), inodes
-        except OSError as error:
-            raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
+        return self._volume.probe_storage_capacity(admission)
 
     def _check_generation(
         self,
@@ -1348,542 +880,73 @@ class CaptureCoordinator:
         force: bool = False,
     ) -> StorageStatus:
         admission = self._require_admission()
-        if generation_id is not None and generation_id != admission.generation_id:
-            raise DeviceRecordingError("stale_generation", "录制命令来自过期挂载代次")
-        if self._released:
-            raise DeviceRecordingError("volume_released", "录制卷已经进入安全移除状态")
-        if self._media_lost:
-            raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-        mountpoint = admission.mountpoint
-        try:
-            if not self._mount_checker(mountpoint) or mountpoint.stat().st_dev != admission.device:
-                self._media_lost = True
-                raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-        except DeviceRecordingError:
-            raise
-        except OSError as error:
-            raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
-        now = time.monotonic()
-        with self._storage_lock:
-            if (
-                not force
-                and self._storage_cache is not None
-                and now - self._storage_checked_at < 0.25
-            ):
-                return self._storage_cache
-        try:
-            status, _ = self._probe_storage_capacity(admission)
-            with self._storage_lock:
-                self._storage_cache = status
-                self._storage_checked_at = now
-            return status
-        except DeviceRecordingError as error:
-            if error.code == "media_lost":
-                self._media_lost = True
-            raise
-        except OSError as error:
-            raise DeviceRecordingError("media_lost", "录制介质不可访问") from error
+        return self._volume.check_generation(
+            admission,
+            generation_id,
+            released=self._released,
+            force=force,
+        )
 
     def _require_capture_reserve(
         self,
         admission: VolumeAdmission,
         capacity: tuple[int, int, int] | None = None,
     ) -> None:
-        self._require_system_reserve()
-        _, available_bytes, available_inodes = (
-            _stat_capacity(admission.mountpoint) if capacity is None else capacity
-        )
-        require_backing_reserve(
-            admission.mountpoint,
-            self._config.minimum_available_bytes,
-            self._config.minimum_available_inodes,
-        )
-        if available_bytes < self._config.minimum_available_bytes:
-            raise DeviceRecordingError("insufficient_space", "录制卷可用空间不足")
-        if available_inodes < self._config.minimum_available_inodes:
-            raise DeviceRecordingError("insufficient_inodes", "录制卷可用 inode 不足")
+        self._volume.require_capture_reserve(admission, capacity)
 
     def _require_system_reserve(self) -> None:
-        try:
-            available, inodes = system_capacity(self._config.state_root)
-        except OSError as error:
-            raise DeviceRecordingError("storage_unavailable", "无法读取系统状态盘容量") from error
-        if available < SYSTEM_RESERVE_BYTES:
-            raise DeviceRecordingError(
-                "insufficient_space", "系统状态盘可用空间不足，至少需要 256 MiB"
-            )
-        if inodes < SYSTEM_RESERVE_INODES:
-            raise DeviceRecordingError("insufficient_inodes", "系统状态盘可用 inode 不足")
+        self._volume.require_system_reserve()
 
     def capture_readiness(self) -> dict[str, object]:
-        budgets = {"recording": None, "system": None, "backing": None}
-        code, message = "ready", "可以开始新录制"
-        try:
-            available, _ = system_capacity(self._config.state_root)
-            budgets["system"] = {
-                "available_bytes": max(0, available),
-                "required_bytes": SYSTEM_RESERVE_BYTES,
-            }
-            admission = self._require_admission()
-            status = self._check_generation(force=True)
-            budgets["recording"] = {
-                "available_bytes": max(0, status.remaining_bytes or 0),
-                "required_bytes": self._config.minimum_available_bytes,
-            }
-            backing = backing_capacity(admission.mountpoint)
-            if backing is not None:
-                budgets["backing"] = {
-                    "available_bytes": max(0, backing[0]),
-                    "required_bytes": self._config.minimum_available_bytes,
-                }
-            self._require_capture_reserve(admission)
-            if not status.writable:
-                raise DeviceRecordingError("storage_unavailable", "录像盘不可写")
-        except (DeviceRecordingError, OSError) as error:
-            code = getattr(error, "code", "storage_unavailable")
-            message = getattr(error, "message", "无法读取存储状态")
+        camera_connected = self._camera_connection_status()["state"] == "connected"
+        recovery_pending = self._lifecycle.is_recovery_pending()
+        capture_busy = self._lifecycle.is_capture_busy()
         with self._lock:
-            if (
-                self._failure_retry is not None
-                or self._failure_inflight is not None
-                or self._failure_pending_commit is not None
-                or self._pending_stop_state_commit is not None
-            ):
-                code, message = (
-                    "recovery_pending",
-                    "正在保存上次录制并释放资源，完成后自动恢复；请勿断电",
-                )
-            elif (
-                self._active is not None
-                or self._stop_inflight is not None
-                or self._stop_acceptance_inflight is not None
-                or self._async_stop_worker is not None
-            ):
-                code, message = "capture_busy", "录制或保存正在进行"
-            elif self._closing:
-                code, message = "capture_busy", "录制服务正在关闭"
-            elif code == "ready" and self._camera_connection_status()["state"] != "connected":
-                code, message = "hardware_unavailable", "相机未连接"
-        return {
-            "schema": "ylx.capture-readiness.v1",
-            "allowed": code == "ready",
-            "code": code,
-            "message": message,
-            "storage": budgets,
-        }
+            closing_state = self._closing
+        return self._volume.capture_readiness(
+            require_admission=self._require_admission,
+            check_generation=self._check_generation,
+            recovery_pending=recovery_pending,
+            capture_busy=capture_busy,
+            closing=closing_state,
+            camera_connected=camera_connected,
+        )
 
     def reconcile_capture_recovery(self) -> None:
         """Retry only quiescent owners; never detach a live writer or replay a start."""
-        with self._stop_condition:
-            if (
-                self._closing
-                or self._failure_inflight is not None
-                or self._stop_inflight is not None
-                or self._async_stop_worker is not None
-                or self._stop_acceptance_inflight is not None
-                or time.monotonic() < self._recovery_retry_at
-            ):
-                return
-            self._recovery_retry_at = time.monotonic() + 2.0
-            retry = self._failure_retry
-            pending = self._pending_stop_state_commit
-            if retry is not None:
-                recorder, plan, error = retry
-                if self._active is not recorder or self._active_plan is not plan:
-                    self._failure_retry = None
-                    return
-                self._failure_inflight = recorder
-            elif self._active is None and pending is not None:
-                self._stop_inflight = pending
-            else:
-                return
-        try:
-            if retry is not None:
-                if self._failure_pending_commit is recorder:
-                    self._commit_active_failure(recorder)
-                else:
-                    self._finish_active_failure(recorder, plan, error)
-            else:
-                self._persist_local_state()
-                with self._lock:
-                    if self._pending_stop_state_commit == pending:
-                        self._pending_stop_state_commit = None
-                    self._release_network_operation_lease()
-        finally:
-            with self._stop_condition:
-                if retry is not None and self._failure_inflight is recorder:
-                    self._failure_inflight = None
-                    if self._active is not recorder:
-                        self._failure_projection = None
-                elif retry is None and self._stop_inflight == pending:
-                    self._stop_inflight = None
-                self._stop_condition.notify_all()
+        failure_recovery.reconcile_capture_recovery(self)
+
+    # -- Crash recovery --
 
     def _can_recover_sessions(self, admission: VolumeAdmission) -> bool:
-        try:
-            self._require_capture_reserve(admission)
-        except DeviceRecordingError as error:
-            self._recovery_deferred = True
-            operational_logger("recording").event(
-                "session_recovery_deferred", level="warning", reason=error.code
-            )
-            return False
-        return True
+        return recovery_orchestrator.can_recover_sessions(self, admission)
 
     def _recover_sessions(self) -> None:
-        admission = self._require_admission()
-        # Recovery writes manifests and checkpoints. Preserve unfinished data
-        # under pressure; retry under the capture lock before the next recording.
-        if not self._can_recover_sessions(admission):
-            return
-        self._recovery_deferred = False
-        for sessions_root in admission.catalog_roots:
-            for partial in sorted(sessions_root.glob("*.partial")):
-                session_id = partial.name.removesuffix(".partial")
-                try:
-                    parsed = uuid.UUID(session_id)
-                except ValueError:
-                    continue
-                if parsed.version != 7 or str(parsed) != session_id:
-                    continue
-                try:
-                    descriptor = os.open(
-                        partial, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-                    )
-                except OSError:
-                    continue
-                with ExitStack() as cleanup:
-                    cleanup.callback(os.close, descriptor)
-                    if os.fstat(descriptor).st_dev != admission.device:
-                        continue
-                    if not self._can_recover_sessions(admission):
-                        return
-                    self._recover_partial_directory(partial, session_id, descriptor)
-        # Publication may have finished just before a crash, before the local
-        # retained state was saved. Reconcile here without taking the catalog
-        # lock: catalog reads must never acquire the capture-state lock.
-        restored = self._restore_published_failure(admission)
-        for session_id in tuple(self._retained):
-            if session_id == restored:
-                continue
-            for sessions_root in admission.catalog_roots:
-                try:
-                    recovered, _ = inspect_device_session_directory(
-                        resolve_recording(sessions_root, session_id)
-                    )
-                except (OSError, DeviceRecordingError):
-                    continue
-                if any(log.get("role") == RECOVERY_ROLE for log in recovered["logs"]):
-                    self._record_saved_prefix(session_id, recovered)
+        recovery_orchestrator.recover_sessions(self)
 
     @staticmethod
     def _partial_directory_current(partial: Path, descriptor: int) -> bool:
-        try:
-            entry = partial.stat(follow_symlinks=False)
-            opened = os.fstat(descriptor)
-        except OSError:
-            return False
-        return stat.S_ISDIR(entry.st_mode) and (entry.st_dev, entry.st_ino) == (
-            opened.st_dev,
-            opened.st_ino,
-        )
+        return recovery_orchestrator.partial_directory_current(partial, descriptor)
 
     def _recover_partial_directory(self, partial: Path, session_id: str, descriptor: int) -> None:
-        # RDK runs Linux. Pin metadata mutations to this descriptor rather than
-        # re-resolving a directory name that may have been replaced meanwhile.
-        anchored = Path("/proc/self/fd") / str(descriptor)
-        manifest = anchored / "manifest.json"
-        if manifest.is_file():
-            final = partial.parent / session_id
-            published = False
-            try:
-                inspect_device_session_directory(partial, expected_session_id=session_id)
-                if not self._partial_directory_current(partial, descriptor):
-                    return
-                if final.exists():
-                    raise DeviceRecordingError("session_exists", "恢复目标会话已经存在")
-                for control in ("capture.json", "recording.json"):
-                    try:
-                        os.stat(control, dir_fd=descriptor, follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    with suppress(FileExistsError):
-                        os.mkdir("recovery", dir_fd=descriptor)
-                    recovery_fd = os.open(
-                        "recovery",
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        dir_fd=descriptor,
-                    )
-                    try:
-                        os.replace(control, control, src_dir_fd=descriptor, dst_dir_fd=recovery_fd)
-                        os.fsync(recovery_fd)
-                    finally:
-                        os.close(recovery_fd)
-                os.fsync(descriptor)
-                if not self._partial_directory_current(partial, descriptor):
-                    return
-                os.rename(partial, final)
-                published = True
-                fsync_directory(final.parent)
-                if not self._partial_directory_current(final, descriptor):
-                    return
-                _, payload = _read_recovery_metadata(
-                    descriptor, ("manifest.json",), MAX_MANIFEST_BYTES
-                )
-                self._verified[session_id] = hashlib.sha256(payload).hexdigest()
-                self._publish_recording_directory(final, json.loads(payload))
-                return
-            except (OSError, ValueError, RecursionError, DeviceRecordingError):
-                if published or self._partial_directory_current(final, descriptor):
-                    # Renaming already made the session visible. Leave its
-                    # evidence intact; catalog verification can retry later.
-                    operational_logger("recording").event(
-                        "recovery_publication_check_deferred",
-                        level="warning",
-                        transaction_id=session_id,
-                    )
-                    return
-                with suppress(OSError):
-                    os.unlink("manifest.json", dir_fd=descriptor)
-        self._settle_partial(anchored, session_id, descriptor=descriptor)
-        if self._partial_directory_current(partial, descriptor):
-            self._recover_completed_prefix(partial, session_id)
+        recovery_orchestrator.recover_partial_directory(self, partial, session_id, descriptor)
 
     def _restore_published_failure(self, admission: VolumeAdmission) -> str | None:
-        identity = self._recovery_session
-        if identity is None or identity["volume_id"] != admission.volume_id:
-            return None
-        session_id = identity["session_id"]
-        if session_id in self._retained:
-            self._recovery_session = None
-            return None
-        retryable_read = False
-        for sessions_root in admission.catalog_roots:
-            session_opened = False
-            try:
-                with ExitStack() as cleanup:
-                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-                    root_fd = os.open(sessions_root, flags)
-                    cleanup.callback(os.close, root_fd)
-                    relative = resolve_recording(sessions_root, session_id).relative_to(
-                        sessions_root
-                    )
-                    session_fd = open_relative_directory(root_fd, relative)
-                    cleanup.callback(os.close, session_fd)
-                    session_opened = True
-                    if os.fstat(session_fd).st_dev != admission.device:
-                        raise ValueError("recovery session is on a different device")
-                    state, _ = _read_recovery_metadata(
-                        session_fd, ("recovery", "recording.json"), MAX_RECOVERY_METADATA_BYTES
-                    )
-                    receipt, receipt_bytes = _read_recovery_metadata(
-                        session_fd, ("recovery", "interruption.json"), 1024 * 1024
-                    )
-                    manifest, _ = _read_recovery_metadata(
-                        session_fd, ("manifest.json",), MAX_MANIFEST_BYTES
-                    )
-                outcome = {"generation_id": admission.generation_id, "recording_state": state}
-                validate_retained_unsuccessful_outcome(
-                    {
-                        "schema": "ylx.retained-unsuccessful-session-resource.v2",
-                        "authority_epoch": state.get("authority_epoch"),
-                        "source_revision": state.get("state_revision"),
-                        "outcome": outcome,
-                    },
-                    session_id=session_id,
-                )
-                if (
-                    state["authority_epoch"] != self._authority_epoch
-                    or state["storage"]["volume_id"] != admission.volume_id
-                    or state["device"]["device_id"] != self._config.session.device_id
-                    or manifest.get("schema")
-                    not in {
-                        "ylx.device-session.v2",
-                        "ylx.device-session.v3",
-                        "ylx.device-session.v4",
-                    }
-                    or manifest.get("sealed") is not True
-                    or manifest.get("session_id") != session_id
-                    or manifest.get("volume_id") != admission.volume_id
-                    or receipt.get("schema") != "openaria.recording-recovery.v1"
-                    or receipt.get("session_id") != session_id
-                    or receipt.get("outcome") != "interrupted"
-                ):
-                    raise ValueError("published recovery identity mismatch")
-                duration = manifest["time"]["duration_seconds"]
-                saved = receipt["saved_video_seconds"]
-                if (
-                    type(duration) not in (int, float)
-                    or not math.isfinite(duration)
-                    or type(saved) not in (int, float)
-                    or not math.isfinite(saved)
-                    or not 0 < saved <= duration
-                ):
-                    raise ValueError("invalid recovery duration")
-                digest = hashlib.sha256(receipt_bytes).hexdigest()
-                expected_log = {
-                    "artifact_id": digest,
-                    "sha256": digest,
-                    "bytes": len(receipt_bytes),
-                    "path": "recovery/interruption.json",
-                    "role": RECOVERY_ROLE,
-                    "media_type": "application/json",
-                }
-                if expected_log not in manifest["logs"]:
-                    raise ValueError("recovery receipt is not bound to the published manifest")
-            except FileNotFoundError:
-                # A damaged manifest or temporarily replaced readable directory
-                # can hide the UUID. Keep the pending recovery identity for a
-                # later repaired-volume retry; absence of recovery files inside
-                # an opened normal recording still settles the identity.
-                if not session_opened:
-                    retryable_read = True
-                continue
-            except (
-                OSError,
-                ValueError,
-                KeyError,
-                TypeError,
-                OverflowError,
-                RecursionError,
-                InvalidSourceEvent,
-            ):
-                retryable_read = True
-                continue
-            # Restore historical outcome only, never grant payload verification.
-            # Listing/export keeps its independent content-admission checks.
-            self._retained[session_id] = outcome
-            self._revision = max(self._revision, state["state_revision"])
-            self._record_saved_prefix(session_id, manifest)
-            self._recovery_session = None
-            return session_id
-        if not retryable_read:
-            self._recovery_session = None
-        return None
+        return recovery_orchestrator.restore_published_failure(self, admission)
 
     def _publish_recording_directory(self, path: Path, manifest: Mapping[str, object]) -> Path:
-        try:
-            published = publish_readable(path, manifest)
-            self._recording_paths.setdefault(path.parent, {})[str(manifest["session_id"])] = (
-                published.relative_to(path.parent)
-            )
-            return published
-        except (OSError, ValueError, AttributeError):
-            operational_logger("recording").event(
-                "readable_directory_deferred",
-                level="warning",
-                transaction_id=str(manifest.get("session_id")),
-            )
-            return resolve_recording(path.parent, str(manifest["session_id"]))
+        return self._catalog.publish_recording_directory(path, manifest)
 
     def _recover_completed_prefix(self, partial: Path, session_id: str) -> None:
-        try:
-            recovered = recover_device_session(partial)
-        except (
-            OSError,
-            ValueError,
-            KeyError,
-            TypeError,
-            DeviceRecordingError,
-            ArtifactAccessError,
-        ):
-            return
-        if recovered is not None:
-            self._publish_recording_directory(recovered.path, recovered.manifest)
-            self._verified[session_id] = recovered.manifest_sha256
-            self._record_saved_prefix(session_id, recovered.manifest)
+        recovery_orchestrator.recover_completed_prefix(self, partial, session_id)
 
     def _record_saved_prefix(self, session_id: str, manifest: Mapping[str, object]) -> None:
-        retained = self._retained.get(session_id)
-        if retained is None:
-            return
-        state = copy.deepcopy(retained["recording_state"])
-        if any(item.get("code") == "recording_prefix_saved" for item in state["diagnostics"]):
-            return
-        duration = manifest["time"]["duration_seconds"]
-        state["diagnostics"].append(
-            {
-                "code": "recording_prefix_saved",
-                "severity": "info",
-                "message": f"录制已中断，已保存前 {duration:.1f} 秒，可导出",
-                "at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "recoverable": False,
-            }
-        )
-        state["authority_epoch"] = self._authority_epoch
-        state["state_revision"] = self._next_revision()
-        state["updated_at"] = state["diagnostics"][-1]["at"]
-        retained["recording_state"] = state
+        recovery_orchestrator.record_saved_prefix(self, session_id, manifest)
 
     def _settle_partial(self, partial: Path, session_id: str, *, descriptor: int) -> None:
-        admission = self._require_admission()
-        with suppress(OSError):
-            (partial / "manifest.json").unlink(missing_ok=True)
-        try:
-            current, _ = _read_recovery_metadata(
-                descriptor, ("recording.json",), MAX_RECOVERY_METADATA_BYTES
-            )
-            validate_recording_state(current)
-            if current["session_id"] != session_id:
-                raise ValueError("partial recording state identity mismatch")
-            # A historical take may have moved to another admitted volume or
-            # device. Compare with its own capture plan, not this daemon's ID.
-            try:
-                capture, _ = _read_recovery_metadata(
-                    descriptor, ("capture.json",), MAX_RECOVERY_METADATA_BYTES
-                )
-            except FileNotFoundError:
-                capture = None
-            if capture is not None and (
-                capture["session_id"] != session_id
-                or capture["plan"]["session_id"] != session_id
-                or current["storage"]["volume_id"] != capture["plan"]["volume_id"]
-                or current["device"]["device_id"] != capture["config"]["device_id"]
-            ):
-                raise ValueError("partial recording state differs from capture plan")
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError, KeyError, TypeError, RecursionError) as error:
-            operational_logger("recording").event(
-                "recovery_state_rejected",
-                level="warning",
-                transaction_id=session_id,
-                exception_type=type(error).__name__,
-            )
-            return
-        if (
-            current.get("authority_epoch") == self._authority_epoch
-            and type(current.get("state_revision")) is int
-        ):
-            self._revision = max(self._revision, int(current["state_revision"]))
-        if current.get("state") in {"recoverable", "failed", "abandoned"}:
-            self._retained[session_id] = {
-                "generation_id": admission.generation_id,
-                "recording_state": current,
-            }
-            return
-        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        settled = copy.deepcopy(current)
-        settled["state"] = "recoverable"
-        settled["authority_epoch"] = self._authority_epoch
-        settled["state_revision"] = self._next_revision()
-        settled["updated_at"] = now
-        settled["diagnostics"] = [
-            {
-                "code": "process_interrupted",
-                "severity": "error",
-                "message": "daemon 重启时发现未完成封存的会话",
-                "at": now,
-                "recoverable": True,
-            }
-        ]
-        with suppress(OSError):
-            (partial / "manifest.json").unlink(missing_ok=True)
-            write_json_atomic(partial / "recording.json", settled)
-        self._retained[session_id] = {
-            "generation_id": admission.generation_id,
-            "recording_state": settled,
-        }
+        recovery_orchestrator.settle_partial(self, partial, session_id, descriptor=descriptor)
+
+    # -- Catalog & verification compatibility bridges --
 
     def _verify_exact_session_payload(
         self,
@@ -1896,115 +959,51 @@ class CaptureCoordinator:
         verified_artifacts=None,
         progress: Callable[[int, int], None] | None = None,
     ) -> tuple[_VerifiedSessionSnapshot, DeviceRecordingError | None]:
-        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-        admission = self._require_admission()
-        store = _MultiRootSessionStore(
-            admission.catalog_roots,
-            verified_manifests={session_id: manifest_sha256},
-            recording_paths=self._recording_paths,
+        return self._catalog.verify_exact_session_payload(
+            self._require_admission(),
+            session_path,
+            session_id,
+            manifest,
+            manifest_payload,
+            interrupt_check=interrupt_check,
+            verified_artifacts=verified_artifacts,
+            progress=progress,
         )
-        try:
-            try:
-                descriptors = list(iter_device_session_v1_artifacts(manifest))
-            except ArtifactAccessError as error:
-                raise DeviceRecordingError("manifest_invalid", error.message) from error
-            seen_artifact_ids: set[str] = set()
-            for descriptor in descriptors:
-                artifact_id = descriptor.get("artifact_id")
-                if not isinstance(artifact_id, str) or artifact_id in seen_artifact_ids:
-                    raise DeviceRecordingError(
-                        "manifest_invalid",
-                        "manifest artifact 描述符无效",
-                    )
-                seen_artifact_ids.add(artifact_id)
-
-            def snapshot() -> _VerifiedSessionSnapshot:
-                try:
-                    current_payload, manifest_identity, artifact_identities = (
-                        store.snapshot_verified_identities(session_id, "v4")
-                    )
-                    if current_payload != manifest_payload:
-                        raise DeviceRecordingError(
-                            "verification_changed",
-                            "manifest 在独立校验期间发生变化",
-                        )
-                except ArtifactAccessError as error:
-                    raise DeviceRecordingError(
-                        "verification_changed",
-                        "会话在独立校验期间发生变化",
-                    ) from error
-                return _VerifiedSessionSnapshot(
-                    manifest_sha256=manifest_sha256,
-                    manifest_id=manifest["manifest_id"],
-                    volume_id=manifest["volume_id"],
-                    sealed_at=manifest["sealed_at"],
-                    manifest_identity=manifest_identity,
-                    artifact_identities=artifact_identities,
-                )
-
-            before = snapshot()
-            verification_error: DeviceRecordingError | None = None
-            try:
-                validated_manifest = validate_device_session_directory(
-                    session_path,
-                    expected_session_id=session_id,
-                    interrupt_check=interrupt_check,
-                    **({"verified_artifacts": verified_artifacts} if verified_artifacts else {}),
-                    **({"progress": progress} if progress is not None else {}),
-                )
-            except DeviceRecordingError as error:
-                if error.code != "digest_mismatch":
-                    raise
-                verification_error = error
-                validated_manifest = manifest
-            if validated_manifest != manifest:
-                raise DeviceRecordingError(
-                    "verification_changed",
-                    "manifest 在独立校验期间发生变化",
-                )
-            after = snapshot()
-            if before != after:
-                raise DeviceRecordingError(
-                    "verification_changed",
-                    "会话在独立校验期间发生变化",
-                )
-            return after, verification_error
-        finally:
-            store.close()
 
     def _invalidate_session_verification(self, session_id: str) -> None:
-        self._verified.pop(session_id, None)
-        self._session_snapshots.pop(session_id, None)
-        summary = self._session_summaries.get(session_id)
-        if summary is not None:
-            summary["verification"] = None
+        self._catalog.invalidate_session_verification(session_id)
 
     def _session_manifest_is_current(
         self,
         session_id: str,
         snapshot: _VerifiedSessionSnapshot,
     ) -> bool:
-        admission = self._require_admission()
-        store = _MultiRootSessionStore(
-            admission.catalog_roots,
-            verified_manifests={session_id: snapshot.manifest_sha256},
-            recording_paths=self._recording_paths,
+        return self._catalog.session_manifest_is_current(
+            self._require_admission(), session_id, snapshot
         )
-        try:
-            # Coarse timestamps can collide across same-size writes. Recheck
-            # manifest bytes without decoding JSON or hashing video payloads.
+
+    def _is_verification_busy(self) -> bool:
+        with self._lock:
             return (
-                store.manifest_identity(session_id, expected_sha256=snapshot.manifest_sha256)
-                == snapshot.manifest_identity
+                self._active is not None
+                or self._lifecycle._starting
+                or self._lifecycle._deleting
+                or self._closing
             )
-        except (ArtifactAccessError, DeviceRecordingError, OSError):
-            return False
-        finally:
-            store.close()
+
+    def _is_verification_releasing(self, allow_pending_safe_swap: bool) -> bool:
+        with self._lock:
+            return self._released or (
+                not allow_pending_safe_swap
+                and (self._pending_safe_swap is not None or self._async_stop_reason == "safe_swap")
+            )
+
+    def _retained_session_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._retained)
 
     def _check_catalog_verification_idle(self) -> None:
-        if self._active is not None or self._closing or self._catalog_verification_cancel.is_set():
-            raise DeviceRecordingError("verification_changed", "历史内容校验已暂停，等待设备空闲")
+        self._catalog.check_catalog_verification_idle(is_busy=self._is_verification_busy)
 
     def _verify_catalog_session(
         self,
@@ -2013,158 +1012,24 @@ class CaptureCoordinator:
         cancelled: Callable[[], bool] | None = None,
         allow_pending_safe_swap: bool = False,
     ) -> None:
-        # Serialize expensive reads independently of both catalog and control.
-        # Existing export clients may wait for another recording's scan. Keep that
-        # wait cancellable without consuming a control lock or duplicating I/O.
-        registered = False
-        with self._lock:
-            epoch = self._catalog_verification_epoch
-
-        def check() -> None:
-            self._check_catalog_verification_idle()
-            if epoch != self._catalog_verification_epoch:
-                raise DeviceRecordingError("verification_changed", "排队的录像校验已取消")
-            if cancelled is not None and cancelled():
-                raise DeviceRecordingError("verification_changed", "下载请求已取消")
-
-        while not self._catalog_verification_lock.acquire(timeout=0.05):
-            try:
-                check()
-            except DeviceRecordingError as error:
-                raise ProviderError(
-                    "verification_cancelled",
-                    "录像校验已中止，请稍后重试",
-                    status=503,
-                    retryable=True,
-                ) from error
-        try:
-            with self._lock:
-                if epoch != self._catalog_verification_epoch:
-                    raise DeviceRecordingError("verification_changed", "排队的录像校验已取消")
-                if self._active is not None or self._closing:
-                    raise ProviderError(
-                        "verification_busy", "采集资源繁忙，请稍后重试", status=503, retryable=True
-                    )
-                if self._released or (
-                    not allow_pending_safe_swap
-                    and (
-                        self._pending_safe_swap is not None
-                        or self._async_stop_reason == "safe_swap"
-                    )
-                ):
-                    raise ProviderError(
-                        "volume_releasing", "录制卷正在安全释放", status=423, retryable=True
-                    )
-                self._catalog_verification_cancel.clear()
-                self._catalog_verification_session = session_id
-                registered = True
-            check()
-            with self._catalog_lock:
-                snapshot = self._session_snapshots.get(session_id)
-            if snapshot is not None and self._session_payload_is_current(session_id, snapshot):
-                check()
-                return
-            with self._catalog_lock:
-                self._invalidate_session_verification(session_id)
-            admission = self._require_admission()
-            for root in admission.catalog_roots:
-                directory = resolve_recording(root, session_id)
-                if not directory.is_dir():
-                    continue
-                try:
-                    signature = self._catalog_db.signature(directory)
-                    manifest, payload = inspect_device_session_directory(directory)
-                    recovered = any(log.get("role") == RECOVERY_ROLE for log in manifest["logs"])
-                    if session_id in self._retained and not recovered:
-                        raise DeviceRecordingError(
-                            "manifest_invalid", "会话发布失败，未进入可下载 catalog"
-                        )
-                    check()
-                    snapshot, error = self._verify_exact_session_payload(
-                        directory,
-                        session_id,
-                        manifest,
-                        payload,
-                        interrupt_check=check,
-                    )
-                    check()
-                    # Publish only the exact identity verified above. File changes
-                    # during the unlocked scan must never create a usable receipt.
-                    with self._catalog_lock:
-                        check()
-                        if not self._session_payload_is_current(session_id, snapshot):
-                            raise DeviceRecordingError(
-                                "verification_changed", "会话在校验结果发布前发生变化"
-                            )
-                        summary = self._session_summary(
-                            session_id,
-                            manifest,
-                            payload,
-                            verification_error=error,
-                            verification_current=True,
-                        )
-                        self._catalog_db.remember(
-                            admission.volume_id,
-                            directory,
-                            self._config.session.commit,
-                            summary,
-                            manifest,
-                            expected_signature=signature,
-                        )
-                        self._session_summaries[session_id] = summary
-                        self._session_diagnostics.pop(session_id, None)
-                        self._session_snapshots[session_id] = snapshot
-                        if error is None:
-                            self._verified[session_id] = snapshot.manifest_sha256
-                    return
-                except (OSError, DeviceRecordingError, KeyError, TypeError, ValueError) as error:
-                    if (
-                        isinstance(error, DeviceRecordingError)
-                        and error.code == "verification_changed"
-                    ):
-                        raise
-                    with self._catalog_lock:
-                        self._invalidate_session_verification(session_id)
-                        self._session_summaries.pop(session_id, None)
-                        self._session_diagnostics[session_id] = self._session_diagnostic(
-                            session_id, error
-                        )
-                    return
-        except DeviceRecordingError as error:
-            if error.code != "verification_changed":
-                raise
-            raise ProviderError(
-                "verification_cancelled", "录像校验已中止，请稍后重试", status=503, retryable=True
-            ) from error
-        finally:
-            if registered:
-                with self._stop_condition:
-                    self._catalog_verification_session = None
-                    self._stop_condition.notify_all()
-            self._catalog_verification_lock.release()
+        self._catalog.verify_catalog_session(
+            session_id,
+            stop_condition=self._stop_condition,
+            is_busy=self._is_verification_busy,
+            is_releasing=self._is_verification_releasing,
+            require_admission=self._require_admission,
+            retained_ids=self._retained_session_ids,
+            verify_payload_fn=self._verify_exact_session_payload,
+            cancelled=cancelled,
+            allow_pending_safe_swap=allow_pending_safe_swap,
+        )
 
     def _session_payload_is_current(
         self, session_id: str, snapshot: _VerifiedSessionSnapshot
     ) -> bool:
-        admission = self._require_admission()
-        store = _MultiRootSessionStore(
-            admission.catalog_roots,
-            verified_manifests={session_id: snapshot.manifest_sha256},
-            recording_paths=self._recording_paths,
+        return self._catalog.session_payload_is_current(
+            self._require_admission(), session_id, snapshot
         )
-        try:
-            payload, manifest_identity, artifact_identities = store.snapshot_verified_identities(
-                session_id, "v4"
-            )
-            return (
-                hashlib.sha256(payload).hexdigest() == snapshot.manifest_sha256
-                and manifest_identity == snapshot.manifest_identity
-                and artifact_identities == snapshot.artifact_identities
-            )
-        except (ArtifactAccessError, DeviceRecordingError, OSError):
-            return False
-        finally:
-            store.close()
 
     def _catalog_sessions(
         self,
@@ -2173,196 +1038,18 @@ class CaptureCoordinator:
         cancelled: Callable[[], bool] | None = None,
     ) -> None:
         admission = self._require_admission()
-        # Check exact manifest identities to invalidate replaced catalog entries;
-        # defer artifact inspection until that artifact is actually downloaded.
-        if verify_session is not None and (
-            verify_session in {"", ".", ".."}
-            or "\x00" in verify_session
-            or Path(verify_session).name != verify_session
-        ):
-            return
-        if verify_session is not None:
-            self._verify_catalog_session(verify_session, cancelled=cancelled)
-            return
-        with self._catalog_lock, self._catalog_db.scan():
-            discovered: set[str] = set()
-            for sessions_root in admission.catalog_roots:
-                for directory, session_id in iter_recordings(sessions_root):
-                    self._recording_paths.setdefault(sessions_root, {})[session_id] = (
-                        directory.relative_to(sessions_root)
-                    )
-                    if session_id in discovered:
-                        continue
-                    discovered.add(session_id)
-                    summary = self._session_summaries.get(session_id)
-                    snapshot = self._session_snapshots.get(session_id)
-                    if summary is not None and snapshot is not None:
-                        if self._session_manifest_is_current(session_id, snapshot):
-                            continue
-                        self._invalidate_session_verification(session_id)
-                        try:
-                            manifest, payload = inspect_device_session_directory(directory)
-                            self._session_summaries[session_id] = self._session_summary(
-                                session_id,
-                                manifest,
-                                payload,
-                                verification_current=False,
-                            )
-                            self._session_diagnostics.pop(session_id, None)
-                        except (
-                            OSError,
-                            DeviceRecordingError,
-                            KeyError,
-                            TypeError,
-                            ValueError,
-                        ) as error:
-                            self._session_summaries.pop(session_id, None)
-                            self._session_diagnostics[session_id] = self._session_diagnostic(
-                                session_id,
-                                error,
-                            )
-                        continue
-
-                    try:
-                        signature = self._catalog_db.signature(directory)
-                        cached = self._catalog_db.cached(
-                            admission.volume_id,
-                            session_id,
-                            signature,
-                            self._config.session.commit,
-                            directory=directory,
-                            validate_summary=validate_session_summary,
-                            cache_validation=True,
-                            required_artifact_role=(
-                                RECOVERY_ROLE
-                                if session_id in self._retained and session_id not in self._verified
-                                else None
-                            ),
-                        )
-                    except OSError:
-                        cached = None
-                    if cached is not None:
-                        if summary is None or snapshot is None:
-                            self._session_summaries[session_id] = cached
-                        self._session_diagnostics.pop(session_id, None)
-                        continue
-                    # A changed manifest must not keep a stale metadata-only summary.
-                    self._session_summaries.pop(session_id, None)
-                    summary = None
-
-                    # A summary without a snapshot is already metadata-only.
-                    # Only an explicit artifact request can promote it to verified.
-                    if summary is not None:
-                        continue
-                    try:
-                        inspected_signature = self._catalog_db.signature(directory)
-                        manifest, payload = inspect_device_session_directory(directory)
-                        recovered = any(
-                            log.get("role") == RECOVERY_ROLE for log in manifest["logs"]
-                        )
-                        if (
-                            session_id in self._retained
-                            and session_id not in self._verified
-                            and not recovered
-                        ):
-                            self._session_diagnostics[session_id] = self._session_diagnostic(
-                                session_id, "会话发布失败，未进入可下载 catalog"
-                            )
-                            continue
-                        self._session_summaries[session_id] = self._session_summary(
-                            session_id,
-                            manifest,
-                            payload,
-                            verification_current=False,
-                        )
-                        self._catalog_db.remember(
-                            admission.volume_id,
-                            directory,
-                            self._config.session.commit,
-                            self._session_summaries[session_id],
-                            manifest,
-                            expected_signature=inspected_signature,
-                        )
-                        self._session_diagnostics.pop(session_id, None)
-                        self._invalidate_session_verification(session_id)
-                    except (
-                        OSError,
-                        DeviceRecordingError,
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
-                        self._session_summaries.pop(session_id, None)
-                        self._verified.pop(session_id, None)
-                        self._session_snapshots.pop(session_id, None)
-                        diagnostic = self._session_diagnostic(session_id, error)
-                        current_diagnostic = self._session_diagnostics.get(session_id)
-                        if (
-                            current_diagnostic is not None
-                            and current_diagnostic.get("code") == diagnostic["code"]
-                        ):
-                            diagnostic = current_diagnostic
-                        self._session_diagnostics[session_id] = diagnostic
-
-            self._catalog_db.discard_missing(admission.volume_id, discovered)
-            for session_id in set(self._session_summaries) - discovered:
-                self._session_summaries.pop(session_id, None)
-                self._verified.pop(session_id, None)
-                self._session_snapshots.pop(session_id, None)
-            for session_id in set(self._session_diagnostics) - discovered:
-                self._session_diagnostics.pop(session_id, None)
+        self._catalog.catalog_sessions(
+            admission,
+            retained_ids=self._retained_session_ids(),
+            check_manifest_current=self._session_manifest_is_current,
+            verify_session_fn=self._verify_catalog_session,
+            verify_session=verify_session,
+            cancelled=cancelled,
+        )
 
     @staticmethod
     def _session_diagnostic(candidate_identity: str, error: object) -> dict[str, object]:
-        code = "manifest_invalid"
-        if isinstance(error, OSError):
-            code = "manifest_unreadable"
-        elif isinstance(error, DeviceRecordingError):
-            text = f"{error.code} {error.message}".lower()
-            cause = error.__cause__
-            schema_error = getattr(cause, "__cause__", None)
-            schema_path = tuple(getattr(schema_error, "absolute_path", ()))
-            if any(
-                marker in text
-                for marker in (
-                    "no such file",
-                    "not found",
-                    "expecting value",
-                    "expecting property",
-                    "utf-8",
-                    "无法安全打开",
-                    "无法读取",
-                    "超过允许大小",
-                )
-            ):
-                code = "manifest_unreadable"
-            elif any(
-                marker in text
-                for marker in (
-                    "unsupported schema",
-                    "unknown schema",
-                    "schema unsupported",
-                    "schema unknown",
-                    "不支持的 schema",
-                    "不是支持的 device-session",
-                    "未知 schema",
-                )
-            ):
-                code = "unsupported_schema"
-            elif schema_path == ("sealed",) or (
-                "sealed" in text
-                and any(
-                    marker in text
-                    for marker in ("false", "unsealed", "未封存", "尚未", "必须为 true")
-                )
-            ):
-                code = "manifest_not_sealed"
-        return {
-            "quarantine_id": _stable_quarantine_id(candidate_identity, code),
-            "code": code,
-            "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "message": SESSION_DIAGNOSTIC_SUMMARIES[code],
-        }
+        return CatalogService.session_diagnostic(candidate_identity, error)
 
     def _session_summary(
         self,
@@ -2373,73 +1060,19 @@ class CaptureCoordinator:
         verification_error: DeviceRecordingError | None = None,
         verification_current: bool = True,
     ) -> dict[str, object]:
-        take = manifest["take"]
-        timing = manifest["time"]
-        device = manifest["device"]
-        integrity = manifest["integrity"]
-        if not all(isinstance(value, Mapping) for value in (take, timing, device, integrity)):
-            raise DeviceRecordingError("manifest_invalid", "会话清单结构无效")
-        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-        validator_name = "openaria-conductor-device-session-v2-integrity"
-        validator_version = "1"
-        validator_build_sha256 = hashlib.sha256(
-            (f"{validator_name}\x00{validator_version}\x00{self._config.session.commit}").encode()
-        ).hexdigest()
-        diagnostics: list[dict[str, str]] = []
-        if any(log.get("role") == RECOVERY_ROLE for log in manifest.get("logs", [])):
-            diagnostics.append(
-                {
-                    "code": "recording_interrupted",
-                    "summary": "录制已中断，完整前段已保存，可正常导出",
-                }
-            )
-        if verification_error is not None:
-            code, summary = GATEWAY_VERIFICATION_DIAGNOSTICS.get(
-                verification_error.code,
-                (
-                    "verification_failed",
-                    "gateway 无法确认 artifact 内容与 sealed 清单一致",
-                ),
-            )
-            diagnostics.append({"code": code, "summary": summary})
-        verification: dict[str, object] | None = None
-        if verification_current:
-            verification = {
-                "actor": "gateway",
-                "validator": {
-                    "name": validator_name,
-                    "version": validator_version,
-                    "build_sha256": validator_build_sha256,
-                },
-                "manifest_sha256": manifest_sha256,
-                "verified_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "verdict": "usable" if verification_error is None else "unusable",
-                "diagnostics": diagnostics,
-            }
-        return {
-            "session_id": manifest["session_id"],
-            "producer_outcome": "sealed",
-            "take_id": take["take_id"],
-            "take_sequence": take["sequence"],
-            "continuation_of": take["continuation_of"],
-            "display_name": manifest["display_name"],
-            "device": {
-                "device_id": device["device_id"],
-                "device_label": device["device_label"],
-            },
-            "started_at": timing["started_at"],
-            "ended_at": timing["ended_at"],
-            "duration_seconds": timing["duration_seconds"],
-            "total_bytes": manifest_artifact_bytes_total(manifest, code="manifest_invalid"),
-            "verification": verification,
-        }
+        return self._catalog.session_summary(
+            session_id,
+            manifest,
+            manifest_payload,
+            verification_error=verification_error,
+            verification_current=verification_current,
+        )
+
+    # -- Snapshots, runtime, IMU, camera --
 
     def _recording_snapshot(
         self,
     ) -> tuple[int, str, dict[str, object] | None, dict[str, object] | None]:
-        if self._admission is None:
-            with suppress(DeviceRecordingError):
-                self._require_admission()
         if self._active is not None:
             recording_state = (
                 copy.deepcopy(self._failure_projection)
@@ -2449,12 +1082,8 @@ class CaptureCoordinator:
             if recording_state is None:
                 return self._revision, "blocked", None, None
             if self._failure_projection is None:
-                # Recording state is persisted only at lifecycle checkpoints.
-                # Project the latest background capacity observation just like
-                # live frame progress; a status request must not perform disk I/O.
                 if recording_state["state"] == "recording":
-                    with self._storage_lock:
-                        storage = self._storage_cache
+                    storage = self._volume.cached_storage()
                     if storage is not None:
                         recording_state = {
                             **recording_state,
@@ -2465,8 +1094,6 @@ class CaptureCoordinator:
                                 "writable": storage.writable,
                             },
                         }
-                # Native progress advances between durable state callbacks.
-                # Preserve the last observed live progress for lock-free recovery.
                 self._cached_active_state = copy.deepcopy(recording_state)
             state = str(recording_state["state"])
             return (
@@ -2491,72 +1118,13 @@ class CaptureCoordinator:
         return self._revision, "idle", None, retained
 
     def capture_recording_progress(self) -> tuple[str, int, Mapping[str, object] | None]:
+        if self._admission is None:
+            with suppress(DeviceRecordingError):
+                self._require_admission()
         with self._lock:
             revision, _, active, _ = self._recording_snapshot()
             state = None if active is None else active["recording_state"]
             return self._authority_epoch, revision, state
-
-    @staticmethod
-    def _raw_imu_vector(vector: RawVector3) -> Mapping[str, object]:
-        return {"x": vector.x, "y": vector.y, "z": vector.z}
-
-    def _live_imu_from_sample(
-        self, session_id: str | None, sample: ImuSample
-    ) -> Mapping[str, object]:
-        return {
-            "session_id": session_id,
-            "clock": {
-                "time_base": "host_monotonic",
-                "timestamp_ns": sample.host_monotonic_ns,
-            },
-            "raw": {
-                "units": "raw_int16",
-                "accelerometer": self._raw_imu_vector(sample.accelerometer),
-                "gyroscope": self._raw_imu_vector(sample.gyroscope),
-            },
-            "sync": {"quality": sample.sync_quality},
-        }
-
-    @staticmethod
-    def _imu_sample_key(sample: ImuSample) -> tuple[int, int, int, int, int]:
-        return (
-            sample.sequence,
-            sample.packet_sequence,
-            sample.sample_index,
-            sample.device_timestamp_raw,
-            sample.host_monotonic_ns,
-        )
-
-    @staticmethod
-    def _fresh_live_imu(
-        receipt: _LatestImuReceipt | None,
-        session_id: str | None,
-        observed_at_monotonic: float,
-    ) -> tuple[str | None, ImuSample] | None:
-        if receipt is None or receipt.session_id != session_id:
-            return None
-        if observed_at_monotonic - receipt.received_at_monotonic > LIVE_IMU_STALE_SECONDS:
-            return None
-        return receipt.session_id, receipt.sample
-
-    def _store_latest_imu_locked(
-        self,
-        session_id: str | None,
-        sample: ImuSample,
-        *,
-        observed_at_monotonic: float,
-    ) -> _LatestImuReceipt:
-        key = self._imu_sample_key(sample)
-        cached = self._latest_imu
-        if (
-            cached is not None
-            and cached.session_id == session_id
-            and (cached.sample_key == key or cached.received_at_monotonic > observed_at_monotonic)
-        ):
-            return cached
-        receipt = _LatestImuReceipt(session_id, sample, key, observed_at_monotonic)
-        self._latest_imu = receipt
-        return receipt
 
     def _refresh_latest_imu(self) -> None:
         with self._lock:
@@ -2568,14 +1136,19 @@ class CaptureCoordinator:
             return
         try:
             observation = latest()
-        except BaseException:
+        except Exception as error:
+            operational_logger("recording").event(
+                "latest_imu_poll_failed",
+                level="warning",
+                exception_type=type(error).__name__,
+            )
             return
         if observation is None or not observation.samples:
             return
         sample = observation.samples[-1]
         with self._lock:
             if self._active_plan is plan:
-                self._store_latest_imu_locked(
+                self._imu_tracker.store_latest_imu_locked(
                     None if plan is None or self._active is None else plan.session_id,
                     sample,
                     observed_at_monotonic=observed_at,
@@ -2584,115 +1157,41 @@ class CaptureCoordinator:
     def _live_imu_snapshot_locked(self) -> Mapping[str, object] | None:
         plan = self._active_plan
         session_id = None if self._active is None or plan is None else plan.session_id
-        latest = self._fresh_live_imu(self._latest_imu, session_id, time.monotonic())
-        return None if latest is None else self._live_imu_from_sample(latest[0], latest[1])
+        return self._imu_tracker.snapshot_locked(session_id)
 
     def _camera_focus_status(self, *, raise_errors: bool = False) -> dict[str, object] | None:
-        sources = self._sources
-        if sources is None:
-            return None
-        try:
-            return sources.camera_focus_status()
-        except CameraError:
-            if raise_errors:
-                raise
-            return None
-        except Exception as exc:
-            if raise_errors:
-                raise CameraError("camera_focus_unavailable", str(exc), retryable=True) from exc
-            return None
+        return CameraFocusProxy.camera_focus_status(self._sources, raise_errors=raise_errors)
 
     def _camera_connection_status(self) -> dict[str, object]:
-        status_reader = getattr(getattr(self, "_sources", None), "camera_connection_status", None)
-        if not callable(status_reader):
-            return {"schema": "ylx.camera-connection.v1", "state": "connected"}
-        status = status_reader()
-        if (
-            not isinstance(status, Mapping)
-            or set(status) != {"schema", "state"}
-            or status.get("schema") != "ylx.camera-connection.v1"
-            or status.get("state") not in {"connected", "disconnected"}
-        ):
-            raise RuntimeError("camera connection status 无效")
-        return dict(status)
+        return CameraFocusProxy.camera_connection_status(getattr(self, "_sources", None))
 
     @staticmethod
     def _camera_not_connected() -> ProviderError:
-        return ProviderError(
-            "camera_not_connected",
-            "相机未接入",
-            status=HTTPStatus.SERVICE_UNAVAILABLE,
-            retryable=True,
-        )
+        return CameraFocusProxy.camera_not_connected()
 
     def _require_camera_connected(self, *, restore_focus: bool = True) -> None:
-        if self._camera_connection_status()["state"] != "connected":
-            raise self._camera_not_connected()
-        if not restore_focus:
+        def get_pending() -> tuple[dict[str, object] | None, bool]:
+            return self._pending_focus, self._focus_restore_invalid
+
+        def set_pending(pending: dict[str, object] | None, invalid: bool) -> None:
+            self._pending_focus = pending
+            self._focus_restore_invalid = invalid
+
+        sources = getattr(self, "_sources", None)
+        if "_camera_proxy" in self.__dict__:
+            self._camera_proxy.require_camera_connected(
+                sources,
+                restore_focus=restore_focus,
+                get_pending_focus=get_pending,
+                set_pending_focus=set_pending,
+            )
             return
-        pending = self._pending_focus
-        if pending is not None and (
-            not isinstance(pending, dict)
-            or not set(pending) <= {"value", "auto_enabled"}
-            or (pending.get("value") is not None and type(pending["value"]) is not int)
-            or (
-                pending.get("auto_enabled") is not None
-                and type(pending["auto_enabled"]) is not bool
-            )
-            or all(pending.get(key) is None for key in ("value", "auto_enabled"))
-        ):
-            if not self._focus_restore_invalid:
-                operational_logger("recording").event(
-                    "camera_focus_restore_rejected",
-                    level="warning",
-                    error_code="invalid_camera_focus",
-                )
-            self._focus_restore_invalid = True
-        if getattr(self, "_focus_restore_invalid", False):
-            raise ProviderError(
-                "camera_focus_restore_failed",
-                "已保存的焦距设置损坏，请重新设置焦距",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=False,
-            )
-        if pending is not None and self._sources is not None:
-            try:
-                result = self._sources.set_camera_focus(**pending)
-                if not valid_camera_focus_status(result):
-                    raise CameraError(
-                        "camera_focus_unavailable", "焦距恢复响应无效", retryable=True
-                    )
-            except CameraError as error:
-                if error.code == "camera_focus_unsupported":
-                    # A fixed-focus camera has no setting to restore. Keep the
-                    # stored preference for a future capable camera.
-                    self._pending_focus = None
-                    operational_logger("recording").event(
-                        "camera_focus_restore_skipped", level="warning", error_code=error.code
-                    )
-                    return
-                operational_logger("recording").event(
-                    "camera_focus_restore_failed", level="warning", error_code=error.code
-                )
-                raise ProviderError(
-                    "camera_focus_restore_failed",
-                    "已保存的焦距设置未能恢复，请重试或重新设置焦距",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    retryable=error.retryable,
-                ) from error
-            except Exception as error:
-                operational_logger("recording").event(
-                    "camera_focus_restore_failed",
-                    level="warning",
-                    exception_type=type(error).__name__,
-                )
-                raise ProviderError(
-                    "camera_focus_restore_failed",
-                    "已保存的焦距设置暂时无法恢复",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    retryable=True,
-                ) from error
-            self._pending_focus = None
+        CameraFocusProxy().require_camera_connected(
+            sources,
+            restore_focus=restore_focus,
+            get_pending_focus=get_pending,
+            set_pending_focus=set_pending,
+        )
 
     def _calibration_source_supported(self) -> bool:
         if self._sources is None:
@@ -2746,39 +1245,45 @@ class CaptureCoordinator:
             runtime["live_imu"] = self._live_imu_snapshot_locked()
         return runtime
 
+    def _build_capture_status_locked(self, runtime: Mapping[str, object]) -> Mapping[str, object]:
+        source_revision, state, active, retained = self._recording_snapshot()
+        rt = dict(runtime)
+        rt["live_imu"] = self._live_imu_snapshot_locked()
+        if (
+            (
+                active is None
+                or self._failure_projection is not None
+                or (self._active is not None and self._active.state == "sealed")
+            )
+            and rt["live_imu"] is not None
+            and rt["live_imu"]["session_id"] is not None
+        ):
+            rt["live_imu"] = None
+        return {
+            "schema": "ylx.capture-status.v2",
+            "authority_epoch": self._authority_epoch,
+            "source_revision": source_revision,
+            "snapshot": {
+                "schema": "ylx.capture-snapshot-event.v2",
+                "device_state": state,
+                "active_recording": active,
+                "retained_unsuccessful": retained,
+                "runtime": rt,
+            },
+        }
+
     def capture_status(self) -> Mapping[str, object]:
+        if self._admission is None:
+            with suppress(DeviceRecordingError):
+                self._require_admission()
         while True:
             with self._lock:
                 focus_revision = self._focus_revision
-            runtime = dict(self._runtime_snapshot())
+            runtime = self._runtime_snapshot()
             with self._lock:
-                source_revision, state, active, retained = self._recording_snapshot()
-                # Checkpoints advance capture revisions without changing hardware controls.
                 if focus_revision != self._focus_revision:
                     continue
-                runtime["live_imu"] = self._live_imu_snapshot_locked()
-                if (
-                    (
-                        active is None
-                        or self._failure_projection is not None
-                        or (self._active is not None and self._active.state == "sealed")
-                    )
-                    and runtime["live_imu"] is not None
-                    and runtime["live_imu"]["session_id"] is not None
-                ):
-                    runtime["live_imu"] = None
-                return {
-                    "schema": "ylx.capture-status.v2",
-                    "authority_epoch": self._authority_epoch,
-                    "source_revision": source_revision,
-                    "snapshot": {
-                        "schema": "ylx.capture-snapshot-event.v2",
-                        "device_state": state,
-                        "active_recording": active,
-                        "retained_unsuccessful": retained,
-                        "runtime": runtime,
-                    },
-                }
+                return self._build_capture_status_locked(runtime)
 
     def capture_snapshot_event(self) -> Mapping[str, object]:
         status = self.capture_status()
@@ -2808,8 +1313,6 @@ class CaptureCoordinator:
             capacity = _stat_capacity(admission.mountpoint)
             total_bytes, available_bytes, _ = capacity
             writable = status.writable
-            # Report actual storage capacity even when it cannot admit a new
-            # capture. A low reserve does not mean that the volume disappeared.
             with suppress(DeviceRecordingError):
                 self._require_capture_reserve(admission, capacity)
                 capture_ready = writable and not self._released
@@ -2865,6 +1368,8 @@ class CaptureCoordinator:
         assert isinstance(projected, Mapping)
         return projected
 
+    # -- Hardware & network proxies --
+
     def camera_focus_status(self) -> dict[str, object] | None:
         self._require_camera_connected(restore_focus=False)
         try:
@@ -2882,239 +1387,66 @@ class CaptureCoordinator:
     def _network_operation_lock_path() -> Path:
         return network_operation_lock_path()
 
-    def _acquire_network_operation_lease(self) -> None:
-        if self._network_operation_lease is not None:
-            raise ProviderError(
-                "network_state_unavailable",
-                "录制网络互斥租约状态无效",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=True,
-            )
-        from rp_ylx.update import MaintenanceBusyError, maintenance_lock
+    def _get_leases(self) -> CaptureLeaseManager:
+        if "_leases" in self.__dict__:
+            return self._leases
+        leases = self.__dict__.get("_compat_leases")
+        if leases is None:
+            leases = CaptureLeaseManager(self._network_operation_lock_path)
+            leases.network_operation_lease = self.__dict__.get("_compat_network_operation_lease")
+            leases.maintenance_lease = self.__dict__.get("_compat_maintenance_lease")
+            self.__dict__["_compat_leases"] = leases
+        return leases
 
-        maintenance = maintenance_lock(shared=True)
-        try:
-            maintenance.__enter__()
-        except (OSError, ValueError) as error:
-            raise ProviderError(
-                "maintenance_active",
-                "设备正在维护，暂时不能开始录制",
-                status=HTTPStatus.CONFLICT,
-                retryable=isinstance(error, MaintenanceBusyError),
-            ) from error
-        descriptor = -1
-        try:
-            descriptor = os.open(
-                self._network_operation_lock_path(),
-                os.O_RDONLY
-                | os.O_CREAT
-                | os.O_NONBLOCK
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o660,
-            )
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise OSError(errno.EINVAL, "network operation lock is not a regular file")
-            if metadata.st_uid == os.geteuid():
-                os.fchmod(descriptor, 0o660)
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException as error:
-            try:
-                self._close_capture_leases(maintenance, descriptor if descriptor >= 0 else None)
-            except BaseException as cleanup_error:
-                if isinstance(error, Exception) and not isinstance(cleanup_error, Exception):
-                    raise cleanup_error from error
-                error.add_note(f"capture lease cleanup failed ({type(cleanup_error).__name__})")
-            if not isinstance(error, OSError):
-                raise
-            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+    def _sync_compat_leases(self, leases: CaptureLeaseManager) -> None:
+        if "_leases" not in self.__dict__:
+            self.__dict__["_compat_network_operation_lease"] = leases.network_operation_lease
+            self.__dict__["_compat_maintenance_lease"] = leases.maintenance_lease
+
+    def _acquire_network_operation_lease(self) -> None:
+        with self._get_lock():
+            if "_lifecycle" in self.__dict__ and self._lifecycle._network_ipc_inflight > 0:
                 raise ProviderError(
                     "network_mutation_active",
                     "网络事务执行期间不能开始录制",
                     status=HTTPStatus.CONFLICT,
                     retryable=True,
-                ) from error
-            raise ProviderError(
-                "network_state_unavailable",
-                "无法取得录制网络互斥租约",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=True,
-            ) from error
-        self._network_operation_lease = descriptor
-        self._maintenance_lease = maintenance
+                )
+        leases = self._get_leases()
+        try:
+            leases.acquire()
+        finally:
+            self._sync_compat_leases(leases)
 
     def _release_network_operation_lease(self) -> None:
-        maintenance = getattr(self, "_maintenance_lease", None)
-        self._maintenance_lease = None
-        descriptor = self._network_operation_lease
-        self._network_operation_lease = None
-        self._close_capture_leases(maintenance, descriptor)
+        leases = self._get_leases()
+        try:
+            leases.release()
+        finally:
+            self._sync_compat_leases(leases)
 
     @staticmethod
     def _close_capture_leases(maintenance, descriptor: int | None) -> None:
-        # These leases are independently owned. Failure/cancellation while
-        # releasing one must not strand the other or prevent later capture.
-        try:
-            if maintenance is not None:
-                maintenance.__exit__(None, None, None)
-        finally:
-            if descriptor is not None:
-                try:
-                    with suppress(OSError):
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
-                finally:
-                    with suppress(OSError):
-                        os.close(descriptor)
+        CaptureLeaseManager.close_capture_leases(maintenance, descriptor)
 
     def network_status(self) -> Mapping[str, object]:
-        try:
-            legacy_status = collect_network_status()
-            # Network polling needs only host telemetry. Sampling camera controls
-            # here sends work to the capture thread on every SSE poll.
-            runtime = self._runtime()
-            status = project_network_status_v1(runtime, legacy_status=legacy_status)
-        except NetworkError as error:
-            raise ProviderError(
-                "network_status_unavailable",
-                "网络状态暂时不可用",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from error
-
+        runtime = self._runtime()
         with self._lock:
             capture_active = self._active is not None
-        if capture_active:
-            status = copy.deepcopy(status)
-            capability = status.get("mutation_capability")
-            if isinstance(capability, dict):
-                capability["enabled"] = False
-                capability["disabled_reason"] = "capture_active"
-        return status
+        return self._network_proxy.network_status(runtime, capture_active=capture_active)
 
     @staticmethod
     def _network_controller_available() -> bool:
-        try:
-            response = request_network_control("health")
-        except NetworkControlClientError:
-            return False
-        capabilities = response.get("capabilities")
-        return (
-            response.get("ok") is True
-            and response.get("operation") == "health"
-            and isinstance(capabilities, Mapping)
-            and capabilities.get("mutation_enabled") is True
-        )
+        return NetworkControllerProxy(
+            request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs)
+        ).controller_available()
 
     @staticmethod
     def _network_mutation_unavailable(
         reason: str = "controller_unavailable",
         message: str = "网络写入控制器暂时不可用",
     ) -> ProviderError:
-        return ProviderError(
-            "network_mutation_unavailable",
-            message,
-            status=HTTPStatus.SERVICE_UNAVAILABLE,
-            retryable=True,
-            details={"reason": reason},
-        )
-
-    @staticmethod
-    def _network_provider_error(
-        response: Mapping[str, object],
-        *,
-        operation: str,
-        body: Mapping[str, object] | None = None,
-    ) -> ProviderError:
-        error = response.get("error")
-        controller_code = error.get("code") if isinstance(error, Mapping) else None
-        code = str(controller_code or "network_controller_unavailable")
-        mutation_operations = {"apply", "retry", "forget"}
-        if code == "idempotency_conflict" and operation in mutation_operations:
-            return ProviderError(
-                "idempotency_conflict",
-                "幂等键已经用于不同的网络请求",
-                status=HTTPStatus.CONFLICT,
-                details={
-                    "idempotency_scope": "network-mutation",
-                    "original_transaction_id": None,
-                },
-            )
-        if code == "transaction_not_found" and operation == "retry":
-            transaction_id = body.get("transaction_id") if isinstance(body, Mapping) else None
-            try:
-                parsed_transaction_id = uuid.UUID(str(transaction_id))
-            except (AttributeError, TypeError, ValueError):
-                parsed_transaction_id = None
-            if (
-                parsed_transaction_id is not None
-                and parsed_transaction_id.version == 7
-                and str(parsed_transaction_id) == transaction_id
-            ):
-                return ProviderError(
-                    "network_transaction_not_found",
-                    "指定的网络事务不存在",
-                    status=HTTPStatus.NOT_FOUND,
-                    details={"transaction_id": transaction_id},
-                )
-        if code in {"controller_busy", "recovery_required"}:
-            return CaptureCoordinator._network_mutation_unavailable(
-                "recovery_required",
-                "另一个网络事务仍在执行或等待恢复",
-            )
-        invalid_details: tuple[str, str] | None = None
-        if code == "transaction_not_retryable":
-            invalid_details = ("transaction_id", "active_state")
-        elif code == "credential_ref_invalid":
-            invalid_details = (
-                "desired.wifi_client.credential_ref",
-                "credential_ref_not_allowed",
-            )
-        elif code == "credential_ref_expired":
-            invalid_details = (
-                "desired.wifi_client.credential_ref",
-                "credential_ref_expired",
-            )
-        elif code == "inline_secret_rejected":
-            invalid_details = ("desired", "unsafe_secret_field")
-        elif code == "network_config_invalid":
-            invalid_details = ("desired.mode", "unsupported_mode")
-        elif code == "candidate_invalid":
-            desired = body.get("desired") if isinstance(body, Mapping) else None
-            mode = desired.get("mode") if isinstance(desired, Mapping) else None
-            invalid_details = (
-                ("desired.ethernet.static_ipv4", "invalid_static_ipv4")
-                if mode == "ethernet-static"
-                else ("desired.wifi_client", "security_mismatch")
-                if mode == "wifi-client"
-                else ("desired.mode", "unsupported_mode")
-            )
-        elif code == "credential_invalid" and operation != "credentials":
-            invalid_details = ("desired.wifi_client", "security_mismatch")
-        if invalid_details is not None and operation in {"apply", "retry"}:
-            return ProviderError(
-                "invalid_network_desired_state",
-                "网络目标状态或凭据引用无效",
-                status=HTTPStatus.UNPROCESSABLE_ENTITY,
-                details={"field": invalid_details[0], "reason": invalid_details[1]},
-            )
-        if code == "credential_invalid" and operation == "credentials":
-            return ProviderError(
-                "invalid_request",
-                "网络凭据不符合要求",
-                status=HTTPStatus.BAD_REQUEST,
-            )
-        unavailable_reasons = {
-            "network_controller_not_enabled": "not_enabled",
-            "network_manager_unavailable": "network_manager_unavailable",
-            "rescue_ap_unavailable": "rescue_ap_not_validated",
-            "rescue_ap_not_validated": "rescue_ap_not_validated",
-            "concurrency_unsupported": "unsupported_concurrency",
-            "capture_active": "capture_active",
-        }
-        return CaptureCoordinator._network_mutation_unavailable(
-            unavailable_reasons.get(code, "controller_unavailable")
-        )
+        return NetworkControllerProxy.network_mutation_unavailable(reason, message)
 
     def clock_status(self, principal_id: str) -> Mapping[str, object]:
         return self._clock_control("clock_status", principal_id, {})
@@ -3123,134 +1455,98 @@ class CaptureCoordinator:
         return self._clock_control("clock_inspect", principal_id, {})
 
     def sync_clock(self, principal_id: str, body: Mapping[str, object]) -> Mapping[str, object]:
-        # Share the start/stop lock: never step wall time halfway through a capture
-        # or between allocating its session ID and writing the initial metadata.
-        with self._lock:
-            if self._active is not None:
-                raise ProviderError(
-                    "capture_active",
-                    "录制结束后再校准设备日期",
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                )
+        lock = self._get_lock()
+        has_lifecycle = "_lifecycle" in self.__dict__
+        with lock:
+            if getattr(self, "_active", None) is not None or (
+                has_lifecycle and self._lifecycle._phase is not CapturePhase.IDLE
+            ):
+                if has_lifecycle and self._lifecycle._phase in {
+                    CapturePhase.SAFE_SWAP_PENDING,
+                    CapturePhase.RELEASED,
+                }:
+                    pass
+                else:
+                    raise ProviderError(
+                        "capture_active",
+                        "录制结束后再校准设备日期",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    )
+            if has_lifecycle:
+                self._lifecycle._clock_sync_inflight += 1
+        try:
+            # Run clock IPC outside self._lock so concurrent status/catalog readers never block.
             before = self.clock_status(principal_id)
             result = self._clock_control("clock_sync", principal_id, body)
             if before["source"] == "unsynchronized" and result["source"] == "client":
                 self._notify_voice("clock_ready")
             return result
+        finally:
+            if has_lifecycle:
+                with lock:
+                    self._lifecycle._clock_sync_inflight -= 1
+                    self._stop_condition.notify_all()
 
-    @staticmethod
     def _clock_control(
-        operation: str, principal_id: str, body: Mapping[str, object]
+        self, operation: str, principal_id: str, body: Mapping[str, object]
     ) -> Mapping[str, object]:
-        try:
-            response = request_network_control(
-                operation,
-                principal_id=principal_id,
-                body=body,
-                timeout_seconds=3.0,
+        proxy = self.__dict__.get("_clock_proxy")
+        if proxy is None:
+            proxy = ClockSyncProxy(
+                request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs)
             )
-        except NetworkControlClientError as exc:
-            raise ProviderError(
-                "clock_sync_unavailable",
-                "设备校时服务暂时不可用",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from exc
-        if response.get("ok") is not True:
-            error = response.get("error", {})
-            code = str(error.get("code", "clock_sync_unavailable"))
-            status = (
-                HTTPStatus.CONFLICT
-                if code
-                in {
-                    "clock_challenge_expired",
-                    "clock_changed",
-                    "clock_ntp_active",
-                    "capture_active",
-                }
-                else HTTPStatus.SERVICE_UNAVAILABLE
-            )
-            raise ProviderError(
-                code,
-                str(error.get("message", "设备日期尚未校准，请重试")),
-                status=status,
-                retryable=True,
-            )
-        return response["body"]
+        return proxy.clock_control(operation, principal_id, body)
+
+    def _get_network_proxy(self) -> NetworkControllerProxy:
+        if "_network_proxy" in self.__dict__:
+            return self._network_proxy
+        return NetworkControllerProxy(
+            request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs)
+        )
 
     def scan_networks(self) -> Mapping[str, object]:
-        try:
-            response = request_network_control(
-                "scan",
-                timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
-            )
-        except NetworkControlClientError as exc:
-            raise ProviderError(
-                "network_scan_unavailable",
-                "无线网络扫描暂时不可用",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from exc
-        if response.get("ok") is not True or response.get("status") != HTTPStatus.OK:
-            raise ProviderError(
-                "network_scan_unavailable",
-                "无线网络扫描暂时不可用",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=response.get("retryable") is True,
-            )
-        body = response.get("body")
-        if not isinstance(body, Mapping):
-            raise self._network_mutation_unavailable()
-        return body
+        return self._get_network_proxy().scan_networks()
 
     def create_network_credential(self, command: NetworkCredentialCommand) -> Mapping[str, object]:
-        try:
-            response = request_network_control(
-                "create_credential",
-                principal_id=command.principal_id,
-                body={
-                    "schema": "ylx.network-credential-request.v1",
-                    "passphrase": command.passphrase,
-                },
-                timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
-            )
-        except NetworkControlClientError as exc:
-            raise self._network_mutation_unavailable() from exc
-        if response.get("ok") is not True:
-            raise self._network_provider_error(response, operation="credentials")
-        body = response.get("body")
-        if response.get("status") != HTTPStatus.CREATED or not isinstance(body, Mapping):
-            raise self._network_mutation_unavailable()
-        return body
+        return self._get_network_proxy().create_network_credential(command)
 
     def _network_command(self, operation: str, command: NetworkCommand) -> NetworkCommandResult:
-        with getattr(self, "_lock", nullcontext()):
-            if getattr(self, "_active", None) is not None:
+        lock = self._get_lock()
+        has_lifecycle = "_lifecycle" in self.__dict__
+        proxy = self._get_network_proxy()
+        with lock:
+            busy = (
+                getattr(self, "_active", None) is not None
+                or getattr(self, "_closing", False)
+                or (
+                    has_lifecycle
+                    and self._lifecycle._phase
+                    in {
+                        CapturePhase.STARTING,
+                        CapturePhase.RECORDING,
+                        CapturePhase.STOPPING,
+                        CapturePhase.RECOVERING_FAILURE,
+                        CapturePhase.COMMITTING_STATE,
+                        CapturePhase.CLOSING,
+                    }
+                )
+            )
+            if busy:
                 raise self._network_mutation_unavailable(
                     "capture_active",
                     "录制期间不能变更设备网络",
                 )
-            try:
-                response = request_network_control(
-                    operation,
-                    principal_id=command.principal_id,
-                    idempotency_key=command.idempotency_key,
-                    body=command.body,
-                    timeout_seconds=CONTROL_RESPONSE_TIMEOUT_SECONDS,
-                )
-            except NetworkControlClientError as exc:
-                raise self._network_mutation_unavailable() from exc
-        if response.get("ok") is not True:
-            raise self._network_provider_error(response, operation=operation, body=command.body)
-        status = response.get("status")
-        if type(status) is not int:
-            raise self._network_mutation_unavailable()
-        return NetworkCommandResult(
-            status,
-            response.get("body"),
-            replayed=response.get("replayed") is True,
-        )
+            if has_lifecycle:
+                self._lifecycle._network_ipc_inflight += 1
+        try:
+            # R-07: Run up to 20s network controller IPC outside coordinator._lock.
+            return proxy.network_command(operation, command)
+        finally:
+            if has_lifecycle:
+                with lock:
+                    self._lifecycle._network_ipc_inflight -= 1
+                    self._stop_condition.notify_all()
 
     def apply_network_desired_state(self, command: NetworkCommand) -> NetworkCommandResult:
         return self._network_command("apply", command)
@@ -3262,168 +1558,133 @@ class CaptureCoordinator:
         return self._network_command("forget", command)
 
     def set_camera_focus(self, command: CaptureCommand) -> CaptureCommandResult:
-        with self._lock:
-            return self._idempotent(
-                "set_camera_focus",
-                command,
-                lambda: CaptureCommandResult(200, self._set_camera_focus(command.body)),
-            )
-
-    def _set_camera_focus(self, body: Mapping[str, object]) -> dict[str, object]:
-        self._require_camera_connected(restore_focus=False)
-        value = body.get("value")
-        auto_enabled = body.get("auto_enabled")
-        if value is None and auto_enabled is None:
-            raise ProviderError(
-                "invalid_camera_focus",
-                "焦距请求必须包含 value 或 auto_enabled",
-                status=HTTPStatus.BAD_REQUEST,
-            )
-        if value is not None and type(value) is not int:
-            raise ProviderError(
-                "invalid_camera_focus",
-                "焦距 value 必须是整数",
-                status=HTTPStatus.BAD_REQUEST,
-            )
-        if auto_enabled is not None and type(auto_enabled) is not bool:
-            raise ProviderError(
-                "invalid_camera_focus",
-                "auto_enabled 必须是布尔值",
-                status=HTTPStatus.BAD_REQUEST,
-            )
-        self._focus_revision += 1
+        scope = (command.principal_id, "set_camera_focus", command.idempotency_key)
+        value, auto_enabled = CameraFocusProxy.validate_focus_body(command.body)
+        need_persist = False
+        replay_result: CaptureCommandResult | None = None
+        acquired_inflight = False
+        with self._stop_condition:
+            while True:
+                self._lifecycle.wait_while_starting_locked()
+                need_persist, replay_result = self._state.check_command_idempotency(
+                    scope, command.canonical_body
+                )
+                stop_pending = (
+                    self._stop_inflight is not None
+                    or self._pending_stop_state_commit is not None
+                    or self._stop_acceptance_inflight is not None
+                )
+                if replay_result is not None:
+                    if stop_pending and need_persist:
+                        raise ProviderError(
+                            "capture_busy",
+                            "录制正在收尾",
+                            status=HTTPStatus.CONFLICT,
+                            retryable=True,
+                        )
+                    break
+                if stop_pending:
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                inflight = self._lifecycle._focus_inflight
+                if inflight is not None:
+                    if inflight[0] == scope and inflight[1] != command.canonical_body:
+                        raise ProviderError(
+                            "idempotency_conflict",
+                            "幂等键已经用于不同请求",
+                            status=HTTPStatus.CONFLICT,
+                        )
+                    self._stop_condition.wait()
+                    continue
+                if (
+                    self._lifecycle._deleting
+                    or self._failure_inflight is not None
+                    or self._failure_projection is not None
+                    or self._async_stop_worker is not None
+                    or self._closing
+                ):
+                    raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
+                if self._sources is None:
+                    raise self._camera_not_connected()
+                self._lifecycle._focus_inflight = (scope, command.canonical_body)
+                acquired_inflight = True
+                break
+        if replay_result is not None:
+            if need_persist:
+                self._persist_local_state()
+            return replay_result
         try:
-            result = self._sources.set_camera_focus(  # type: ignore[union-attr]
-                value=value,
-                auto_enabled=auto_enabled,
-            )
-        except CameraError as error:
-            if error.code in {"invalid_camera_focus", "invalid_focus_value"}:
-                status = HTTPStatus.BAD_REQUEST
-            elif error.code == "camera_focus_unsupported":
-                status = HTTPStatus.NOT_FOUND
-            elif error.code == "camera_focus_auto_unsupported":
-                status = HTTPStatus.UNPROCESSABLE_ENTITY
-            elif error.retryable:
-                status = HTTPStatus.SERVICE_UNAVAILABLE
-            else:
-                status = HTTPStatus.CONFLICT
-            raise ProviderError(
-                error.code,
-                error.message,
-                status=status,
-                retryable=error.retryable,
-            ) from error
-        except Exception as exc:
-            raise ProviderError(
-                "camera_focus_unavailable",
-                str(exc),
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from exc
-        if not valid_camera_focus_status(result):
-            raise ProviderError(
-                "camera_focus_unavailable",
-                "相机返回的焦距状态无效",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            )
-        # The hardware write cannot be rolled back transactionally. Keep its
-        # validated result private so receipt retries only retry the SQLite
-        # commit; the preference and success receipt must become durable together.
-        self._focus_to_persist = {
-            "value": result["value"],
-            "auto_enabled": result["auto_enabled"],
-        }
-        self._pending_focus = None
-        self._focus_restore_invalid = False
-        self._next_revision()
-        return result
+            # R-07: Run V4L2 camera connection & focus write outside lifecycle._lock.
+            self._require_camera_connected(restore_focus=False)
+            with self._lock:
+                sources = self._sources
+            if sources is None:
+                raise self._camera_not_connected()
+            try:
+                focus_result = self._camera_proxy.apply_camera_focus(
+                    sources,
+                    value=value,
+                    auto_enabled=auto_enabled,
+                )
+            finally:
+                with self._lock:
+                    self._focus_revision += 1
+            cmd_result = CaptureCommandResult(200, focus_result)
+            with self._lock:
+                self._state._focus_to_persist = {
+                    "value": focus_result["value"],
+                    "auto_enabled": focus_result["auto_enabled"],
+                }
+                self._pending_focus = None
+                self._focus_restore_invalid = False
+                self._next_revision()
+                self._cache_command(scope, command, cmd_result)
+            self._persist_local_state()
+            return cmd_result
+        finally:
+            if acquired_inflight:
+                with self._stop_condition:
+                    self._lifecycle._focus_inflight = None
+                    self._stop_condition.notify_all()
+
+    # -- Idempotency, voice, and capture timer --
 
     def _require_valid_command_receipt(self, scope: tuple[str, str, str]) -> None:
-        if scope in self._invalid_commands:
-            raise ProviderError(
-                "command_receipt_invalid",
-                "该请求的持久化回执损坏，无法安全重放；请先核对实际操作结果",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=False,
-            )
-
-    def _idempotent(
-        self,
-        operation: str,
-        command: CaptureCommand,
-        execute: Callable[[], CaptureCommandResult],
-    ) -> CaptureCommandResult:
-        scope = (command.principal_id, operation, command.idempotency_key)
-        self._require_valid_command_receipt(scope)
-        previous = self._commands.get(scope)
-        if (
-            self._stop_inflight is not None
-            or self._pending_stop_state_commit is not None
-            or self._stop_acceptance_inflight is not None
-        ) and (previous is None or self._persisted_commands.get(scope) is not previous):
-            raise ProviderError(
-                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
-            )
-        if previous is not None:
-            previous_body, result = previous
-            if previous_body != command.canonical_body:
-                raise ProviderError(
-                    "idempotency_conflict",
-                    "幂等键已经用于不同请求",
-                    status=HTTPStatus.CONFLICT,
-                )
-            if self._persisted_commands.get(scope) is not previous:
-                self._persist_local_state()
-            return CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
-        if (
-            self._failure_inflight is not None
-            or self._failure_projection is not None
-            or self._async_stop_worker is not None
-            or self._closing
-        ):
-            raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
-        result = execute()
-        self._commands[scope] = (command.canonical_body, copy.deepcopy(result))
-        while len(self._commands) > 1024:
-            self._commands.pop(next(iter(self._commands)))
-        self._persist_local_state()
-        return result
+        self._state.require_valid_command_receipt(scope)
 
     def _notify_voice(self, event: str, identity: str = "") -> None:
+        if "_state" in self.__dict__:
+            self._state.notify_voice(event, identity)
+            return
         volume = self._voice_settings.get("volume")
         notify_voice(event, identity, volume=volume if valid_volume(volume) else 0)
 
     def voice_status(self) -> dict[str, object]:
         with self._lock:
-            volume = self._voice_settings.get("volume")
-            if not valid_volume(volume):
-                raise ProviderError(
-                    "invalid_voice_settings", "提示音设置损坏，请重新保存", status=409
-                )
-            return {
-                "schema": "ylx.voice.v1",
-                "enabled": os.environ.get("OPENARIA_VOICE_ENABLED") == "1",
-                "volume": volume,
-            }
+            return self._state.voice_status()
 
     def set_voice_volume(self, volume: int) -> dict[str, object]:
         if not valid_volume(volume):
             raise ProviderError("invalid_request", "音量须为0至100的整数", status=400)
-        with self._lock:
-            if (
-                self._active is not None
-                or self._closing
-                or self._stop_inflight is not None
-                or self._async_stop_worker is not None
-                or self._failure_inflight is not None
-            ):
-                raise ProviderError("capture_busy", "请在录制结束后调整提示音量", status=409)
-            value = {"volume": volume}
-            self._state_db.put("voice_feedback", value, history=True)
-            self._voice_settings = value
-            return self.voice_status()
+        with self._stop_condition:
+            while self._lifecycle._settings_updating:
+                self._stop_condition.wait()
+            self._lifecycle.require_idle_for_settings(
+                "请在录制结束后调整提示音量",
+                pending_safe_swap=self._pending_safe_swap,
+            )
+            self._lifecycle._settings_updating = True
+        value = {"volume": volume}
+        try:
+            self._state._state_db.put("voice_feedback", value, history=True)
+            with self._stop_condition:
+                self._state._voice_settings = value
+                return self._state.voice_status()
+        finally:
+            with self._stop_condition:
+                self._lifecycle._settings_updating = False
+                self._stop_condition.notify_all()
 
     def capture_timer_status(self) -> dict[str, object]:
         with self._lock:
@@ -3444,6 +1705,9 @@ class CaptureCoordinator:
             }
 
     def _require_timer_settings(self) -> None:
+        if "_state" in self.__dict__:
+            self._state.require_timer_settings()
+            return
         if not valid_timer_settings(self._timer_settings):
             raise ProviderError(
                 "invalid_timer_settings",
@@ -3454,21 +1718,24 @@ class CaptureCoordinator:
     def set_capture_timer(self, settings: Mapping[str, object]) -> dict[str, object]:
         if not valid_timer_settings(settings):
             raise ProviderError("invalid_request", "时长须为1至86400秒的整数", status=400)
-        with self._lock:
-            if (
-                self._active is not None
-                or self._closing
-                or self._stop_inflight is not None
-                or self._async_stop_worker is not None
-                or self._failure_inflight is not None
-            ):
-                raise ProviderError("capture_busy", "请在录制结束后设置定时", status=409)
-            # Publish only after the SQLite transaction succeeds. No timer setting
-            # is copied into legacy capture state or the immutable media manifest.
-            value = dict(settings)
-            self._state_db.put("capture_timer", value, history=True)
-            self._timer_settings = value
-            return self.capture_timer_status()
+        with self._stop_condition:
+            while self._lifecycle._settings_updating:
+                self._stop_condition.wait()
+            self._lifecycle.require_idle_for_settings(
+                "请在录制结束后设置定时",
+                pending_safe_swap=self._pending_safe_swap,
+            )
+            self._lifecycle._settings_updating = True
+        value = dict(settings)
+        try:
+            self._state._state_db.put("capture_timer", value, history=True)
+            with self._stop_condition:
+                self._state._timer_settings = value
+                return self.capture_timer_status()
+        finally:
+            with self._stop_condition:
+                self._lifecycle._settings_updating = False
+                self._stop_condition.notify_all()
 
     def enforce_capture_timer(self) -> None:
         with self._lock:
@@ -3483,16 +1750,88 @@ class CaptureCoordinator:
                 return
             session_id = timer[0].session_id
         body = {"reason": "timer"}
-        # The stop path rechecks session identity under its own lock, including
-        # after waiting for a concurrent manual stop. Never stop a newer take.
         self.stop_capture(
             CaptureCommand("capture-timer", session_id, body, _canonical_json_bytes(body)),
             expected_session_id=session_id,
         )
 
+    # -- Start / Stop / Failure / Safe-Swap Lifecycle --
+
     def start_capture(self, command: CaptureCommand) -> CaptureCommandResult:
-        with self._lock:
-            return self._idempotent("start", command, lambda: self._start_capture(command.body))
+        scope = (command.principal_id, "start", command.idempotency_key)
+        replay_to_persist: CaptureCommandResult | None = None
+        with self._stop_condition:
+            self._lifecycle.wait_while_starting_locked()
+            need_persist, replay_result = self._state.check_command_idempotency(
+                scope, command.canonical_body
+            )
+            stop_pending = (
+                self._stop_inflight is not None
+                or self._pending_stop_state_commit is not None
+                or self._stop_acceptance_inflight is not None
+            )
+            if replay_result is not None:
+                if stop_pending and need_persist:
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                if need_persist:
+                    replay_to_persist = replay_result
+                else:
+                    return replay_result
+            else:
+                if stop_pending:
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                if (
+                    self._lifecycle._deleting
+                    or self._failure_inflight is not None
+                    or self._failure_projection is not None
+                    or self._failure_pending_commit is not None
+                    or self._failure_retry is not None
+                    or self._async_stop_worker is not None
+                    or self._closing
+                ):
+                    raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
+                if self._active is not None:
+                    raise ProviderError("capture_busy", "已有活动录制", status=HTTPStatus.CONFLICT)
+                if self._lifecycle._network_ipc_inflight > 0:
+                    raise ProviderError(
+                        "network_mutation_active",
+                        "网络事务执行期间不能开始录制",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    )
+                if self._lifecycle._clock_sync_inflight > 0:
+                    raise ProviderError(
+                        "capture_busy",
+                        "设备正在校时，请稍后重试",
+                        status=HTTPStatus.CONFLICT,
+                        retryable=True,
+                    )
+                self._lifecycle._starting = True
+                self._sync_phase()
+        if replay_to_persist is not None:
+            self._persist_local_state()
+            return replay_to_persist
+        try:
+            result = self._start_capture(command.body)
+            with self._stop_condition:
+                self._cache_command(scope, command, result)
+                self._lifecycle._starting = False
+                self._sync_phase()
+                self._stop_condition.notify_all()
+            self._persist_local_state()
+            return result
+        finally:
+            with self._stop_condition:
+                if self._lifecycle._starting:
+                    self._lifecycle._starting = False
+                    if self._active is None:
+                        self._release_network_operation_lease()
+                    self._sync_phase()
+                    self._stop_condition.notify_all()
 
     def _start_capture(self, body: Mapping[str, object]) -> CaptureCommandResult:
         try:
@@ -3512,8 +1851,9 @@ class CaptureCoordinator:
         if body.get("mode") == "calibration" and not self._calibration_source_supported():
             raise self._calibration_unavailable("capture_source_unsupported")
         self._require_camera_connected()
-        self._catalog_verification_epoch += 1
-        self._catalog_verification_cancel.set()
+        with self._lock:
+            self._catalog_verification_epoch += 1
+            self._catalog_verification_cancel.set()
         self._acquire_network_operation_lease()
         try:
             return self._start_capture_with_network_lease(body)
@@ -3523,37 +1863,9 @@ class CaptureCoordinator:
             raise
 
     def _start_capture_with_network_lease(self, body: Mapping[str, object]) -> CaptureCommandResult:
-        try:
-            network_response = request_network_control("status")
-        except NetworkControlClientError as error:
-            raise ProviderError(
-                "network_state_unavailable",
-                "无法确认网络事务为空闲状态",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=True,
-            ) from error
-        network_body = network_response.get("body")
-        transaction = network_body.get("transaction") if isinstance(network_body, Mapping) else None
-        if not (
-            network_response.get("ok") is True
-            and network_response.get("operation") == "status"
-            and network_response.get("status") == HTTPStatus.OK
-            and isinstance(transaction, Mapping)
-            and "current" in transaction
-        ):
-            raise ProviderError(
-                "network_state_unavailable",
-                "无法确认网络事务为空闲状态",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=True,
-            )
-        if transaction.get("current") is not None:
-            raise ProviderError(
-                "network_mutation_active",
-                "网络事务执行期间不能开始录制",
-                status=HTTPStatus.CONFLICT,
-                retryable=True,
-            )
+        NetworkControllerProxy(
+            request_control_fn=lambda *args, **kwargs: request_network_control(*args, **kwargs)
+        ).require_network_idle()
         clock = self.clock_inspect("capture-start")
         if (
             not valid_clock_response(clock)
@@ -3656,18 +1968,22 @@ class CaptureCoordinator:
             before_write=self._before_write,
             native_data_plane=bool(getattr(self._sources, "requires_native_transaction", False)),
         )
-        self._active = recorder
-        self._active_plan = plan
-        self._cached_active_state = None
-        self._pending_source_failure = None
-        self._latest_imu = None
-        self._safe_swap_resource = None
-        self._pending_safe_swap = None
-        self._pending_safe_swap_failure = None
+        with self._lock:
+            self._active_plan = plan
+            self._cached_active_state = None
+            self._pending_source_failure = None
+            self._latest_imu = None
+            self._safe_swap_resource = None
+            self._pending_safe_swap = None
+            self._pending_safe_swap_failure = None
         if not self._sources_keep_preview():
             self._preview.clear()
         try:
+            # R-07: Start recorder and hardware sources outside lifecycle._lock.
             recorder.start()
+            with self._lock:
+                self._active = recorder
+            self._persist_local_state()
             if self._sources is not None:
                 self._sources.start(
                     mode=plan.capture_mode,
@@ -3692,6 +2008,7 @@ class CaptureCoordinator:
                     native_recorder=recorder,
                 )
         except BaseException as error:
+            # R-07: Run recorder.fail() outside lifecycle._lock so writer.join() cannot deadlock.
             if recorder.state in {"recording", "finalizing"}:
                 recorder.fail(
                     "source_start_failed",
@@ -3699,29 +2016,30 @@ class CaptureCoordinator:
                     recoverable=False,
                 )
             state = recorder.current_recording_state
-            if state is not None:
-                self._retained[plan.session_id] = {
-                    "generation_id": plan.generation_id,
-                    "recording_state": state,
-                }
-            self._active = None
-            self._active_plan = None
-            self._capture_timer = None
-            self._latest_imu = None
+            with self._lock:
+                if state is not None:
+                    self._retained[plan.session_id] = {
+                        "generation_id": plan.generation_id,
+                        "recording_state": state,
+                    }
+                self._active = None
+                self._active_plan = None
+                self._capture_timer = None
+                self._latest_imu = None
+                self._sync_phase()
             self._preview.clear()
             self._persist_local_state()
             code = getattr(error, "code", "source_start_failed")
             message = getattr(error, "message", str(error))
             raise ProviderError(str(code), str(message), status=HTTPStatus.CONFLICT) from error
-        if self._timer_settings["enabled"]:
-            duration = self._timer_settings["duration_seconds"]
-            self._capture_timer = (plan, time.monotonic() + duration, duration)
-        else:
-            self._capture_timer = None
+        with self._lock:
+            if self._timer_settings["enabled"]:
+                duration = self._timer_settings["duration_seconds"]
+                self._capture_timer = (plan, time.monotonic() + duration, duration)
+            else:
+                self._capture_timer = None
+            self._sync_phase()
         self._notify_voice("started", plan.session_id)
-        # _idempotent persists this state together with the accepted start receipt.
-        # Writing here can fail after sources have started but before that receipt
-        # is remembered, so a same-key retry would incorrectly report capture_busy.
         return CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
 
     def _source_failure(
@@ -3733,109 +2051,68 @@ class CaptureCoordinator:
         expected_plan: SessionPlan | None = None,
         defer_recovery: bool = False,
     ) -> None:
-        with self._lock:
-            if (
-                self._active is None
-                or self._active_plan is None
-                or self._active_plan.generation_id != generation_id
-                or (expected_plan is not None and self._active_plan is not expected_plan)
-            ):
-                return
-            plan = self._active_plan
-        self._retain_active_failure(
-            DeviceRecordingError(code, message), plan, defer_recovery=defer_recovery
+        failure_recovery.source_failure(
+            self,
+            generation_id,
+            code,
+            message,
+            expected_plan=expected_plan,
+            defer_recovery=defer_recovery,
         )
 
     def enforce_storage_reserve(self) -> None:
         """Stop normally before exhausting the finalization reserve; never from a source thread."""
         with self._lock:
             if (
-                self._active_plan is None
+                self._active is None
+                or self._active_plan is None
+                or self._lifecycle._starting
+                or self._closing
+                or self._stop_inflight is not None
+                or self._failure_projection is not None
+            ):
+                return
+            admission = self._volume._admission
+        if admission is None:
+            admission = self._require_admission()
+        with self._lock:
+            if (
+                self._active is None
+                or self._active_plan is None
+                or self._lifecycle._starting
                 or self._closing
                 or self._stop_inflight is not None
                 or self._failure_projection is not None
             ):
                 return
             plan = self._active_plan
-            admission = self._require_admission()
+            admission = self._volume._admission or admission
             if self._released:
                 raise DeviceRecordingError("volume_released", "录制卷已经进入安全移除状态")
             if self._media_lost:
                 raise DeviceRecordingError("media_lost", "录制介质已移除或被替换")
-        # Filesystem and loop-host reads may stall on slow or failing media.
-        # Keep status and stop responsive, then fence every result by the exact
-        # recording plan and admission before publishing it or stopping capture.
         try:
-            storage, inodes = self._probe_storage_capacity(admission)
+            storage, observed_at, violation = self._volume.check_reserve_violation(admission, plan)
         except DeviceRecordingError as error:
             with self._lock:
-                if self._active_plan is not plan or self._admission is not admission:
+                if self._active_plan is not plan or self._volume._admission is not admission:
                     return
                 if error.code == "media_lost":
                     self._media_lost = True
             raise
-        observed_at = time.monotonic()
-        available = storage.remaining_bytes
-        backing_error = None
-        system_error = None
-        try:
-            self._require_system_reserve()
-        except DeviceRecordingError as error:
-            system_error = error.code
-        try:
-            backing = backing_capacity(admission.mountpoint)
-        except DeviceRecordingError as error:
-            # An unreadable host budget must not leave the recorder writing
-            # indefinitely while the monitor only logs/retries the error.
-            backing, backing_error = (0, 0), error.code
         with self._lock:
             if (
                 self._active_plan is not plan
-                or self._admission is not admission
+                or self._volume._admission is not admission
                 or self._closing
                 or self._stop_inflight is not None
                 or self._failure_inflight is not None
             ):
                 return
-            with self._storage_lock:
-                if observed_at >= self._storage_checked_at:
-                    self._storage_cache = storage
-                    self._storage_checked_at = observed_at
+            self._volume.update_storage_cache(storage, observed_at)
             session_id = plan.session_id
-            if (
-                backing_error is None
-                and system_error is None
-                and available >= self._config.minimum_available_bytes
-                and inodes >= self._config.minimum_available_inodes
-                and (
-                    backing is None
-                    or (
-                        backing[0] >= self._config.minimum_available_bytes
-                        and backing[1] >= self._config.minimum_available_inodes
-                    )
-                )
-            ):
-                return
-            if system_error is not None:
-                reserve_reason, error_code = "system_reserve_low", system_error
-            elif backing_error is not None:
-                reserve_reason, error_code = "backing_capacity_unavailable", backing_error
-            elif available < self._config.minimum_available_bytes:
-                reserve_reason, error_code = "volume_bytes_low", "insufficient_space"
-            elif inodes < self._config.minimum_available_inodes:
-                reserve_reason, error_code = "volume_inodes_low", "insufficient_inodes"
-            elif backing is not None and backing[0] < self._config.minimum_available_bytes:
-                reserve_reason, error_code = "backing_bytes_low", "insufficient_space"
-            else:
-                reserve_reason, error_code = "backing_inodes_low", "insufficient_inodes"
-        operational_logger("recording").event(
-            "storage_reserve_stop",
-            transaction_id=session_id,
-            # Keep the cause in the existing closed operational-log contract.
-            # Arbitrary byte/inode context keys are otherwise silently redacted.
-            reason=reserve_reason,
-            error_code=error_code,
-        )
+        if violation is None:
+            return
         body = {"reason": "storage_reserve"}
         self.stop_capture(
             CaptureCommand("storage-monitor", session_id, body, _canonical_json_bytes(body)),
@@ -3843,243 +2120,16 @@ class CaptureCoordinator:
         )
 
     def request_stop_capture(self, command: CaptureCommand) -> CaptureCommandResult:
-        """Durably accept a stop without holding an HTTP request through sealing.
-
-        One worker owns the original recorder and plan. Accepted receipts remain
-        stable; status/SSE and the typed safe-swap receipt describe completion.
-        Internal callers can still use stop_capture to wait for finalization.
-        """
-        replay = self._retry_completed_stop_receipt(command)
-        if replay is not None:
-            return replay
-        with self._stop_condition:
-            prepared = self._prepare_stop_request(command)
-        return prepared() if callable(prepared) else prepared
+        """Durably accept a stop without holding an HTTP request through sealing."""
+        return stop_workflow.request_stop_capture(self, command)
 
     def _prepare_stop_request(
         self,
         command: CaptureCommand,
-    ) -> CaptureCommandResult | Callable[[], CaptureCommandResult]:
-        scope = (command.principal_id, "stop", command.idempotency_key)
-        reason = command.body.get("reason")
-        retry_receipt: CaptureCommandResult | None = None
-        if self._closing:
-            raise ProviderError(
-                "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
-            )
-        self._require_valid_command_receipt(scope)
-        previous = self._commands.get(scope)
-        if self._stop_acceptance_inflight is not None:
-            if previous is not None and previous[0] != command.canonical_body:
-                raise ProviderError("idempotency_conflict", "幂等键已经用于不同请求", status=409)
-            if previous is not None and self._persisted_commands.get(scope) is previous:
-                result = previous[1]
-                return CaptureCommandResult(
-                    result.status,
-                    copy.deepcopy(result.body),
-                    replayed=True,
-                )
-            raise ProviderError(
-                "capture_busy",
-                "停止请求正在持久接收，请重试",
-                status=409,
-                retryable=True,
-            )
-        if previous is not None:
-            previous_body, result = previous
-            if previous_body != command.canonical_body:
-                raise ProviderError(
-                    "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
-                )
-            if self._persisted_commands.get(scope) is not previous:
-                if self._stop_inflight is not None or (
-                    self._active is None
-                    and (reason != "safe_swap" or self._pending_safe_swap is None)
-                ):
-                    raise ProviderError(
-                        "capture_busy",
-                        "停止回执正在提交，请重试",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                    )
-                return self._prepare_stop_receipt_commit(command, scope, result, retry=True)
-            if (
-                reason == "safe_swap"
-                and self._async_stop_worker is None
-                and self._pending_safe_swap is not None
-                and isinstance(result.body, Mapping)
-                and isinstance(
-                    accepted_active := result.body.get("snapshot", {}).get("active_recording"),
-                    Mapping,
-                )
-                and accepted_active.get("recording_state", {}).get("session_id")
-                == self._pending_safe_swap["session_id"]
-            ):
-                return self._request_pending_safe_swap(command, scope, replay=result)
-            if (
-                self._failure_pending_commit is self._active
-                and self._active_plan is not None
-                and self._async_stop_worker is None
-                and self._stop_inflight is None
-                and self._failure_inflight is None
-                and result.status == HTTPStatus.ACCEPTED
-                and isinstance(result.body, Mapping)
-                and isinstance(
-                    retry_active := result.body.get("snapshot", {}).get("active_recording"),
-                    Mapping,
-                )
-                and retry_active.get("recording_state", {}).get("session_id")
-                == self._active_plan.session_id
-            ):
-                # The receipt accepted this exact take's stop, but its
-                # background commit failed. Re-arm only that unfinished work.
-                retry_receipt = result
-            else:
-                return CaptureCommandResult(
-                    result.status, copy.deepcopy(result.body), replayed=True
-                )
-        if self._stop_inflight is not None and self._active is None:
-            raise ProviderError(
-                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
-            )
-        if self._async_stop_worker is not None:
-            if reason != self._async_stop_reason:
-                raise ProviderError(
-                    "stop_intent_conflict",
-                    "已有不同目的的停止请求正在收尾",
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                )
-            result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
-            return self._prepare_stop_receipt_commit(command, scope, result)
-        if self._stop_inflight is not None or self._failure_inflight is not None:
-            raise ProviderError(
-                "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
-            )
-        if self._active is None:
-            if reason == "safe_swap" and self._pending_safe_swap is not None:
-                return self._request_pending_safe_swap(command, scope)
-            if self._admission is None:
-                try:
-                    self._require_admission()
-                except DeviceRecordingError as error:
-                    raise ProviderError(
-                        error.code,
-                        error.message,
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                    ) from error
-            return self._prepare_stop_receipt_commit(
-                command,
-                scope,
-                CaptureCommandResult(HTTPStatus.NO_CONTENT, None),
-            )
-        if reason == "safe_swap" and self._open_representations:
-            raise ProviderError(
-                "safe_swap_blocked",
-                "仍有读取句柄未释放",
-                status=HTTPStatus.CONFLICT,
-                retryable=True,
-                details={"open_handle_count": self._open_representations},
-            )
-        recorder, plan = self._active, self._active_plan
-        assert plan is not None
-        result = (
-            CaptureCommandResult(
-                retry_receipt.status, copy.deepcopy(retry_receipt.body), replayed=True
-            )
-            if retry_receipt is not None
-            else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
-        )
-        old_commands = dict(self._commands)
-        ready = threading.Event()
-
-        def finish() -> None:
-            # The database commit occurs without the status lock. The event
-            # prevents the worker from touching sources before acceptance.
-            ready.wait()
-            with self._stop_condition:
-                if self._async_stop_worker is not threading.current_thread():
-                    return
-            try:
-                self._finish_stop_capture(command, scope, recorder, plan, remember_result=False)
-            except BaseException as error:
-                operational_logger("recording").event(
-                    "stop_finalization_failed",
-                    level="error",
-                    transaction_id=plan.session_id,
-                    exception_type=type(error).__name__,
-                    code=getattr(error, "code", "stop_finalization_failed"),
-                )
-                # Expected recording failures already retained their precise
-                # diagnostics. Unexpected IO/worker errors must also become
-                # visible through capture status, not disappear in a thread.
-                with self._stop_condition:
-                    still_owned = self._active is recorder and self._active_plan is plan
-                    pending = self._pending_safe_swap
-                if still_owned:
-                    self._retain_active_failure(
-                        DeviceRecordingError("stop_finalization_failed", str(error)),
-                        plan,
-                        from_stop=True,
-                    )
-                elif (
-                    reason == "safe_swap"
-                    and pending is not None
-                    and pending["session_id"] == plan.session_id
-                ):
-                    self._record_safe_swap_failure(pending, error)
-            finally:
-                with self._stop_condition:
-                    if self._async_stop_worker is threading.current_thread():
-                        self._async_stop_worker = None
-                        self._async_stop_reason = None
-                    self._stop_condition.notify_all()
-
-        try:
-            worker = threading.Thread(target=finish, name="rp-ylx-stop-finalization", daemon=False)
-            self._stop_inflight = scope
-            self._async_stop_worker = worker
-            self._async_stop_reason = str(reason)
-            worker.start()
-        except BaseException as error:
-            self._stop_inflight = None
-            self._async_stop_worker = None
-            self._async_stop_reason = None
-            self._stop_condition.notify_all()
-            ready.set()
-            if not isinstance(error, (RuntimeError, MemoryError)):
-                raise
-            raise ProviderError(
-                "stop_worker_unavailable",
-                "无法启动录制收尾任务",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from error
-
-        def rollback() -> None:
-            self._commands = old_commands
-            self._stop_inflight = None
-            self._async_stop_worker = None
-            self._async_stop_reason = None
-
-        try:
-            if retry_receipt is None:
-                self._cache_command(scope, command, result)
-            self._stop_acceptance_inflight = scope
-        except BaseException:
-            ready.set()
-            rollback()
-            self._stop_condition.notify_all()
-            raise
-        return lambda: self._finish_stop_acceptance(
-            scope,
-            result,
-            rollback,
-            persist=retry_receipt is None,
-            ready=ready,
-            worker=worker,
-        )
+        *,
+        runtime: Mapping[str, object] | None = None,
+    ) -> CaptureCommandResult | Callable[[], CaptureCommandResult] | object:
+        return stop_workflow.prepare_stop_request(self, command, runtime=runtime)
 
     def _prepare_stop_receipt_commit(
         self,
@@ -4089,26 +2139,7 @@ class CaptureCoordinator:
         *,
         retry: bool = False,
     ) -> Callable[[], CaptureCommandResult]:
-        old_commands = dict(self._commands)
-
-        def rollback() -> None:
-            self._commands = old_commands
-
-        try:
-            if not retry:
-                self._cache_command(scope, command, result)
-            self._stop_acceptance_inflight = scope
-        except BaseException:
-            rollback()
-            raise
-
-        def commit() -> CaptureCommandResult:
-            committed = self._finish_stop_acceptance(scope, result, rollback)
-            # A nondurable earlier receipt may belong to a retryable handoff or
-            # failed recorder. Re-enter routing only after that receipt commits.
-            return self.request_stop_capture(command) if retry else committed
-
-        return commit
+        return stop_workflow.prepare_stop_receipt_commit(self, command, scope, result, retry=retry)
 
     def _finish_stop_acceptance(
         self,
@@ -4121,52 +2152,16 @@ class CaptureCoordinator:
         worker: threading.Thread | None = None,
         accepted: Callable[[], None] | None = None,
     ) -> CaptureCommandResult:
-        try:
-            if persist:
-                self._persist_local_state()
-            with self._stop_condition:
-                if accepted is not None:
-                    accepted()
-                self._stop_acceptance_inflight = None
-                self._stop_condition.notify_all()
-        except BaseException as error:
-            try:
-                with self._stop_condition:
-                    try:
-                        rollback()
-                    except BaseException as cleanup_error:
-                        error.add_note(
-                            "Stop acceptance cleanup failed: " + type(cleanup_error).__name__,
-                        )
-                    source_failure = self._pending_source_failure
-                    failed_plan = self._active_plan
-                # A callback may have deferred its failure to the gated owner.
-                # Keep acceptance ownership until recovery claims that failure,
-                # so close/new mutations cannot cross an unowned transition.
-                if source_failure is not None and failed_plan is not None:
-                    try:
-                        self._retain_active_failure(
-                            source_failure,
-                            failed_plan,
-                            defer_recovery=True,
-                        )
-                    except BaseException as recovery_error:
-                        error.add_note(
-                            "Deferred source recovery failed: " + type(recovery_error).__name__,
-                        )
-            finally:
-                with self._stop_condition:
-                    self._stop_acceptance_inflight = None
-                    self._stop_condition.notify_all()
-                if ready is not None:
-                    ready.set()
-            if worker is not None:
-                worker.join()
-            raise
-        finally:
-            if ready is not None:
-                ready.set()
-        return result
+        return stop_workflow.finish_stop_acceptance(
+            self,
+            scope,
+            result,
+            rollback,
+            persist=persist,
+            ready=ready,
+            worker=worker,
+            accepted=accepted,
+        )
 
     def _request_pending_safe_swap(
         self,
@@ -4174,252 +2169,29 @@ class CaptureCoordinator:
         scope: tuple[str, str, str],
         *,
         replay: CaptureCommandResult | None = None,
+        runtime: Mapping[str, object] | None = None,
     ) -> Callable[[], CaptureCommandResult]:
         """Prepare a gated handoff worker; commit its acceptance outside the lock."""
-        pending = self._pending_safe_swap
-        assert pending is not None and self._async_stop_worker is None
-        result = (
-            CaptureCommandResult(replay.status, copy.deepcopy(replay.body), replayed=True)
-            if replay is not None
-            else CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
-        )
-        old_commands = dict(self._commands)
-        previous_failure = self._pending_safe_swap_failure
-        ready = threading.Event()
-        self._acquire_network_operation_lease()
-
-        def finish() -> None:
-            ready.wait()
-            with self._stop_condition:
-                if self._async_stop_worker is not threading.current_thread():
-                    return
-            try:
-                self._publish_safe_swap()
-            except BaseException as error:
-                operational_logger("recording").event(
-                    "safe_swap_resume_failed",
-                    level="error",
-                    transaction_id=str(pending["session_id"]),
-                    exception_type=type(error).__name__,
-                    code=getattr(error, "code", "safe_swap_resume_failed"),
-                )
-                self._record_safe_swap_failure(pending, error)
-            finally:
-                with self._stop_condition:
-                    if self._async_stop_worker is threading.current_thread():
-                        self._async_stop_worker = None
-                        self._async_stop_reason = None
-                        self._stop_inflight = None
-                        self._release_network_operation_lease()
-                    self._stop_condition.notify_all()
-
-        try:
-            worker = threading.Thread(target=finish, name="rp-ylx-safe-swap-resume", daemon=False)
-            self._async_stop_worker = worker
-            self._async_stop_reason = "safe_swap"
-            self._stop_inflight = scope
-            worker.start()
-        except BaseException as error:
-            ready.set()
-            self._async_stop_worker = None
-            self._async_stop_reason = None
-            self._stop_inflight = None
-            self._release_network_operation_lease()
-            self._stop_condition.notify_all()
-            if not isinstance(error, (RuntimeError, MemoryError)):
-                raise
-            raise ProviderError(
-                "stop_worker_unavailable",
-                "无法启动存储交接复核任务",
-                status=HTTPStatus.SERVICE_UNAVAILABLE,
-                retryable=True,
-            ) from error
-
-        def rollback() -> None:
-            self._commands = old_commands
-            self._safe_swap_failure_clear_pending = False
-            self._async_stop_worker = None
-            self._async_stop_reason = None
-            self._stop_inflight = None
-            self._release_network_operation_lease()
-
-        def accepted() -> None:
-            self._pending_safe_swap_failure = None
-            self._safe_swap_failure_clear_pending = False
-
-        try:
-            if replay is None:
-                self._cache_command(scope, command, result)
-            self._safe_swap_failure_clear_pending = previous_failure is not None
-            self._stop_acceptance_inflight = scope
-        except BaseException:
-            ready.set()
-            rollback()
-            self._stop_condition.notify_all()
-            raise
-        return lambda: self._finish_stop_acceptance(
-            scope,
-            result,
-            rollback,
-            persist=replay is None or previous_failure is not None,
-            ready=ready,
-            worker=worker,
-            accepted=accepted,
+        return stop_workflow.request_pending_safe_swap(
+            self, command, scope, replay=replay, runtime=runtime
         )
 
     def _record_safe_swap_failure(
         self, pending: Mapping[str, object], error: BaseException
     ) -> None:
-        code = getattr(error, "code", "safe_swap_resume_failed")
-        if not isinstance(code, str) or code not in SAFE_SWAP_FAILURES:
-            code = "safe_swap_resume_failed"
-        with self._lock:
-            if self._pending_safe_swap is not pending:
-                return
-            self._pending_safe_swap_failure = {
-                "session_id": pending["session_id"],
-                "manifest_sha256": pending["manifest_sha256"],
-                "code": code,
-            }
-            self._next_revision()
-        try:
-            self._persist_local_state()
-        except BaseException as persist_error:
-            # A storage failure must not hide the original failure in this
-            # process, nor strand the worker/lease while trying to report it.
-            operational_logger("recording").event(
-                "safe_swap_failure_persist_failed",
-                level="error",
-                transaction_id=str(pending["session_id"]),
-                exception_type=type(persist_error).__name__,
-            )
+        stop_workflow.record_safe_swap_failure(self, pending, error)
 
     def stop_capture(
         self, command: CaptureCommand, *, expected_session_id: str | None = None
     ) -> CaptureCommandResult:
-        if expected_session_id is None:
-            replay = self._retry_completed_stop_receipt(command, wait=True)
-            if replay is not None:
-                return replay
-        scope = (command.principal_id, "stop", command.idempotency_key)
-        reason = command.body.get("reason")
-        pending_replay: CaptureCommandResult | None = None
-        resume_safe_swap = False
-        with self._stop_condition:
-            requested_plan = self._active_plan
-            while True:
-                if expected_session_id is not None and (
-                    self._active_plan is None or self._active_plan.session_id != expected_session_id
-                ):
-                    return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                self._require_valid_command_receipt(scope)
-                previous = self._commands.get(scope)
-                if previous is not None:
-                    previous_body, result = previous
-                    if previous_body != command.canonical_body:
-                        raise ProviderError(
-                            "idempotency_conflict",
-                            "幂等键已经用于不同请求",
-                            status=HTTPStatus.CONFLICT,
-                        )
-                    if self._persisted_commands.get(scope) is not previous:
-                        if (
-                            self._stop_inflight is not None
-                            or self._failure_inflight is not None
-                            or self._async_stop_worker is not None
-                            or self._stop_acceptance_inflight is not None
-                        ):
-                            self._stop_condition.wait()
-                            continue
-                        pending_replay = CaptureCommandResult(
-                            result.status, copy.deepcopy(result.body), replayed=True
-                        )
-                        self._stop_inflight = scope
-                        break
-                    return CaptureCommandResult(
-                        result.status, copy.deepcopy(result.body), replayed=True
-                    )
-                if self._active_plan is not None and self._active_plan is not requested_plan:
-                    # A waiter belongs to the take present when it arrived.
-                    # A new take may acquire the lock before this waiter wakes.
-                    # Replayed receipts above still retain their original body.
-                    if reason == "safe_swap":
-                        raise ProviderError(
-                            "capture_state_changed",
-                            "等待停止期间已开始新的录制，不能安全移除当前存储卷",
-                            status=HTTPStatus.CONFLICT,
-                        )
-                    result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                    self._remember_command(scope, command, result)
-                    return result
-                if (
-                    self._stop_inflight is None
-                    and self._failure_inflight is None
-                    and self._async_stop_worker is None
-                    and self._stop_acceptance_inflight is None
-                ):
-                    break
-                self._stop_condition.wait()
-            if pending_replay is None:
-                if self._admission is None:
-                    try:
-                        self._require_admission()
-                    except DeviceRecordingError as error:
-                        raise ProviderError(
-                            error.code,
-                            error.message,
-                            status=HTTPStatus.CONFLICT,
-                            retryable=True,
-                        ) from error
-                if self._active is None:
-                    if reason == "safe_swap" and self._pending_safe_swap is not None:
-                        self._acquire_network_operation_lease()
-                        self._stop_inflight = scope
-                        resume_safe_swap = True
-                    else:
-                        result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                        self._remember_command(scope, command, result)
-                        return result
-                else:
-                    recorder = self._active
-                    plan = self._active_plan
-                    assert plan is not None
-                    self._stop_inflight = scope
-
-        if pending_replay is not None:
-            return self._commit_stop_replay(scope, pending_replay)
-        if resume_safe_swap:
-            try:
-                result = self._publish_safe_swap_command()
-                with self._lock:
-                    self._cache_command(scope, command, result)
-                self._persist_local_state()
-                return result
-            finally:
-                with self._stop_condition:
-                    if self._stop_inflight == scope:
-                        self._stop_inflight = None
-                        self._release_network_operation_lease()
-                    self._stop_condition.notify_all()
-        return self._finish_stop_capture(command, scope, recorder, plan)
+        return stop_workflow.stop_capture(self, command, expected_session_id=expected_session_id)
 
     def _commit_stop_replay(
         self,
         scope: tuple[str, str, str],
         result: CaptureCommandResult,
     ) -> CaptureCommandResult:
-        pending = self._pending_stop_state_commit
-        try:
-            self._persist_local_state()
-            with self._lock:
-                if self._pending_stop_state_commit == pending:
-                    self._pending_stop_state_commit = None
-            return result
-        finally:
-            with self._stop_condition:
-                if self._stop_inflight == scope:
-                    self._stop_inflight = None
-                self._stop_condition.notify_all()
+        return stop_workflow.commit_stop_replay(self, scope, result)
 
     def _retry_completed_stop_receipt(
         self,
@@ -4427,66 +2199,7 @@ class CaptureCoordinator:
         *,
         wait: bool = False,
     ) -> CaptureCommandResult | None:
-        scope = (command.principal_id, "stop", command.idempotency_key)
-        with self._stop_condition:
-            while True:
-                self._require_valid_command_receipt(scope)
-                previous = self._commands.get(scope)
-                pending = self._pending_stop_state_commit
-                if pending is None and (
-                    previous is None or self._persisted_commands.get(scope) is previous
-                ):
-                    return None
-                result = None if previous is None else previous[1]
-                completed_normal_stop = command.body.get("reason") != "safe_swap" and (
-                    pending is not None
-                    or (
-                        result is not None
-                        and isinstance(result.body, Mapping)
-                        and result.body.get("snapshot", {}).get("device_state") == "idle"
-                    )
-                )
-                completed_safe_swap = (
-                    command.body.get("reason") == "safe_swap"
-                    and result is not None
-                    and result.status == HTTPStatus.NO_CONTENT
-                    and self._pending_safe_swap is None
-                    and self._safe_swap_resource is not None
-                    and self._released
-                )
-                if not (self._active is None and (completed_normal_stop or completed_safe_swap)):
-                    return None
-                if previous is not None and previous[0] != command.canonical_body:
-                    raise ProviderError(
-                        "idempotency_conflict", "幂等键已经用于不同请求", status=HTTPStatus.CONFLICT
-                    )
-                if self._closing:
-                    raise ProviderError(
-                        "capture_busy", "服务正在关闭", status=HTTPStatus.CONFLICT, retryable=True
-                    )
-                if (
-                    self._stop_inflight is not None
-                    or self._failure_inflight is not None
-                    or self._async_stop_worker is not None
-                    or self._stop_acceptance_inflight is not None
-                ):
-                    if wait:
-                        self._stop_condition.wait()
-                        continue
-                    raise ProviderError(
-                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
-                    )
-                replay = (
-                    CaptureCommandResult(result.status, copy.deepcopy(result.body), replayed=True)
-                    if result is not None
-                    else CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                )
-                self._stop_inflight = scope
-                break
-        committed = self._commit_stop_replay(scope, replay)
-        # A different key first completes the old transaction, then follows the
-        # usual idle-stop path to persist its own independent receipt.
-        return committed if previous is not None else None
+        return stop_workflow.retry_completed_stop_receipt(self, command, wait=wait)
 
     def _finish_stop_capture(
         self,
@@ -4497,173 +2210,13 @@ class CaptureCoordinator:
         *,
         remember_result: bool = True,
     ) -> CaptureCommandResult:
-        reason = command.body.get("reason")
-        stop_started = time.monotonic()
-        try:
-            if self._sources is not None:
-                try:
-                    self._sources.stop()
-                except BaseException as error:
-                    failure = DeviceRecordingError(
-                        "source_stop_failed",
-                        f"采集来源未能释放：{error}",
-                    )
-                    self._retain_active_failure(failure, plan, from_stop=True)
-                    raise ProviderError(
-                        "source_stop_failed",
-                        f"采集来源未能释放：{error}",
-                        status=HTTPStatus.CONFLICT,
-                    ) from error
-            if not self._sources_keep_preview():
-                self._preview.clear()
-            operational_logger("recording").event(
-                "stop_stage",
-                stage="sources_stop",
-                transaction_id=plan.session_id,
-                duration_ms=(time.monotonic() - stop_started) * 1000,
-            )
-
-            with self._lock:
-                retry_failure_commit = self._failure_pending_commit is recorder
-            if retry_failure_commit:
-                # Recovery already completed. Retry its durable publication,
-                # never call stop() on the failed recorder or recover it twice.
-                self._commit_active_failure(recorder)
-                result = CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-                if remember_result:
-                    with self._lock:
-                        self._remember_command(scope, command, result)
-                return result
-
-            try:
-                with self._lock:
-                    pending_failure = self._pending_source_failure
-                if pending_failure is not None:
-                    raise pending_failure
-                sealed = recorder.stop(
-                    before_publish=lambda: self._check_generation(
-                        plan.generation_id,
-                        force=True,
-                    )
-                )
-            except DeviceRecordingError as error:
-                self._retain_active_failure(error, plan, from_stop=True)
-                raise ProviderError(
-                    error.code, error.message, status=HTTPStatus.CONFLICT
-                ) from error
-
-            with self._lock:
-                if self._pending_source_failure is not None:
-                    raise self._pending_source_failure
-                if self._active is not recorder:
-                    raise ProviderError(
-                        "capture_state_changed",
-                        "录制停止期间状态已变化",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                    )
-            published_path = self._publish_recording_directory(sealed.path, sealed.manifest)
-            # This rebuildable metadata can wait for an unrelated list scan or
-            # SQLite writer. Keep the stop owner and leases, but leave status
-            # readers free to observe the sealed recorder while it is pending.
-            with self._catalog_lock:
-                self._session_summaries[plan.session_id] = self._session_summary(
-                    plan.session_id,
-                    sealed.manifest,
-                    sealed.manifest_bytes,
-                    verification_current=False,
-                )
-                try:
-                    self._catalog_db.remember(
-                        plan.volume_id,
-                        published_path,
-                        self._config.session.commit,
-                        self._session_summaries[plan.session_id],
-                        sealed.manifest,
-                    )
-                except (OSError, sqlite3.Error, PersistenceError):
-                    # The sealed files are already durable. Discovery can rebuild this cache.
-                    operational_logger("recording").event(
-                        "catalog_publish_deferred",
-                        level="warning",
-                        transaction_id=plan.session_id,
-                    )
-                self._invalidate_session_verification(plan.session_id)
-                self._session_diagnostics.pop(plan.session_id, None)
-
-            with self._lock:
-                if self._pending_source_failure is not None:
-                    raise self._pending_source_failure
-                if self._active is not recorder:
-                    raise ProviderError(
-                        "capture_state_changed",
-                        "录制停止期间状态已变化",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                    )
-                self._active = None
-                self._active_plan = None
-                self._capture_timer = None
-                self._latest_imu = None
-                self._next_revision()
-                if reason == "safe_swap":
-                    self._pending_safe_swap = {
-                        "session_id": plan.session_id,
-                        "volume_id": plan.volume_id,
-                        "generation_id": plan.generation_id,
-                        "manifest_id": sealed.manifest["manifest_id"],
-                        "manifest_sha256": sealed.manifest_sha256,
-                        "sealed_at": sealed.manifest["sealed_at"],
-                    }
-                else:
-                    result = CaptureCommandResult(HTTPStatus.ACCEPTED, self.capture_status())
-                    if remember_result:
-                        self._cache_command(scope, command, result)
-                    self._pending_stop_state_commit = scope
-            if reason == "safe_swap":
-                # Retain the owner and leases while the handoff intent, release
-                # proof and command receipt commit outside the status lock.
-                self._persist_local_state()
-                result = self._publish_safe_swap_command()
-                if remember_result:
-                    with self._lock:
-                        self._cache_command(scope, command, result)
-                    self._persist_local_state()
-                return result
-            # Keep _stop_inflight and the leases until the state and synchronous
-            # completion receipt are durable together. SQLite may wait without
-            # preventing status readers from observing the sealed recording.
-            self._persist_local_state()
-            with self._lock:
-                if self._pending_stop_state_commit == scope:
-                    self._pending_stop_state_commit = None
-                self._release_network_operation_lease()
-                self._notify_voice("saved", plan.session_id)
-                return result
-        except DeviceRecordingError as error:
-            self._retain_active_failure(error, plan, from_stop=True)
-            raise ProviderError(error.code, error.message, status=HTTPStatus.CONFLICT) from error
-        finally:
-            with self._stop_condition:
-                if self._stop_inflight == scope:
-                    self._stop_inflight = None
-                    self._pending_source_failure = None
-                if self._active is None:
-                    self._release_network_operation_lease()
-                self._stop_condition.notify_all()
+        return stop_workflow.finish_stop_capture(
+            self, command, scope, recorder, plan, remember_result=remember_result
+        )
 
     def _publish_safe_swap_command(self) -> CaptureCommandResult:
         self._publish_safe_swap()
         return CaptureCommandResult(HTTPStatus.NO_CONTENT, None)
-
-    def _remember_command(
-        self,
-        scope: tuple[str, str, str],
-        command: CaptureCommand,
-        result: CaptureCommandResult,
-    ) -> None:
-        self._cache_command(scope, command, result)
-        self._persist_local_state()
 
     def _cache_command(
         self,
@@ -4671,9 +2224,7 @@ class CaptureCoordinator:
         command: CaptureCommand,
         result: CaptureCommandResult,
     ) -> None:
-        self._commands[scope] = (command.canonical_body, copy.deepcopy(result))
-        while len(self._commands) > 1024:
-            self._commands.pop(next(iter(self._commands)))
+        self._state.cache_command(scope, command, result)
 
     def _retain_active_failure(
         self,
@@ -4683,137 +2234,17 @@ class CaptureCoordinator:
         from_stop: bool = False,
         defer_recovery: bool = False,
     ) -> None:
-        with self._stop_condition:
-            recorder = self._active
-            if recorder is None or plan is None or self._active_plan is not plan:
-                return
-            if self._failure_inflight is not None or self._failure_pending_commit is recorder:
-                return
-            if self._stop_inflight is not None and not from_stop:
-                # stop() may join this callback's source thread. Its owner will
-                # handle the failure; never wait for that owner from here.
-                self._pending_source_failure = self._pending_source_failure or error
-                return
-            self._notify_voice("save_failed" if from_stop else "recording_failed", plan.session_id)
-            error = self._pending_source_failure or error
-            self._pending_source_failure = None
-            projection = copy.deepcopy(self._cached_active_state)
-            now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            if projection is None:
-                # The protocol reserves storage.media_lost for terminal states.
-                projection = dict(self._local_failure_state(plan, error, media_lost=False))
-                projection["diagnostics"][0]["recoverable"] = error.code == "media_lost"
-            else:
-                # Recovery can take minutes. Publish the cause before any IO,
-                # while keeping progress, earlier diagnostics and the volume lease.
-                projection.setdefault("diagnostics", []).append(
-                    {
-                        "code": error.code,
-                        "severity": "error",
-                        "message": error.message,
-                        "at": now,
-                        "recoverable": error.code == "media_lost",
-                    }
-                )
-            projection["state"] = "finalizing"
-            projection["state_revision"] = self._next_revision()
-            projection["updated_at"] = now
-            self._failure_projection = projection
-            self._failure_inflight = recorder
-            self._failure_retry = (recorder, plan, error)
-
-        def finish() -> None:
-            try:
-                self._finish_active_failure(recorder, plan, error)
-            finally:
-                with self._stop_condition:
-                    self._failure_inflight = None
-                    if self._active is not recorder:
-                        self._failure_projection = None
-                    self._stop_condition.notify_all()
-
-        if defer_recovery:
-            # The native consumer also feeds preview. Claim the exact recorder
-            # synchronously, but never recover gigabytes on its callback stack.
-            # stop/close and volume operations still wait on _failure_inflight.
-            def background_finish() -> None:
-                try:
-                    finish()
-                except Exception as failure:
-                    operational_logger("recording").event(
-                        "recovery_failed",
-                        level="error",
-                        transaction_id=plan.session_id,
-                        exception_type=type(failure).__name__,
-                    )
-
-            try:
-                worker = threading.Thread(
-                    target=background_finish, name="rp-ylx-failure-recovery", daemon=False
-                )
-                worker.start()
-            except (RuntimeError, MemoryError):
-                # Resource exhaustion must not abandon the reserved recorder.
-                finish()
-            return
-        finish()
+        failure_recovery.retain_active_failure(
+            self, error, plan, from_stop=from_stop, defer_recovery=defer_recovery
+        )
 
     def _finish_active_failure(
         self, recorder: DeviceSessionRecorder, plan: SessionPlan, error: DeviceRecordingError
     ) -> None:
-        if not self._sources_keep_preview():
-            self._preview.clear()
-        media_lost = error.code == "media_lost"
-        recorder.fail(
-            error.code,
-            error.message,
-            recoverable=media_lost,
-            media_lost=media_lost,
-        )
-        state = recorder.current_recording_state
-        recovered = recorder.recovered_session
-        if (
-            not media_lost
-            and recovered is None
-            and not recorder.recovery_attempted
-            and recorder.partial_path.is_dir()
-        ):
-            # fail() can return early for an already failed writer. Recover it
-            # once, but do not rescan an unchanged long take after a failed try.
-            recovered = recorder.recover_completed_segments()
-        if not media_lost and recovered is not None:
-            published = self._publish_recording_directory(recovered.path, recovered.manifest)
-            recorder.recovered_session = replace(recovered, path=published)
-        with self._lock:
-            if state is None or state.get("state") not in {"recoverable", "failed", "abandoned"}:
-                state = self._local_failure_state(plan, error, media_lost=media_lost)
-            self._retained[plan.session_id] = {
-                "generation_id": plan.generation_id,
-                "recording_state": copy.deepcopy(state),
-            }
-            if not media_lost and recovered is not None:
-                self._verified[plan.session_id] = recovered.manifest_sha256
-                self._record_saved_prefix(plan.session_id, recovered.manifest)
-            self._failure_pending_commit = recorder
-        self._commit_active_failure(recorder)
+        failure_recovery.finish_active_failure(self, recorder, plan, error)
 
     def _commit_active_failure(self, recorder: DeviceSessionRecorder) -> None:
-        # A failed write retains projection and ownership for the background
-        # retry (or an explicit stop retry), without repeating media recovery.
-        self._persist_local_state()
-        with self._lock:
-            assert self._active is recorder and self._failure_pending_commit is recorder
-            self._failure_pending_commit = None
-            self._failure_retry = None
-            if self._failure_inflight is None:
-                self._failure_projection = None
-            self._active = None
-            self._active_plan = None
-            self._capture_timer = None
-            self._cached_active_state = None
-            self._latest_imu = None
-            if self._stop_inflight is None:
-                self._release_network_operation_lease()
+        failure_recovery.commit_active_failure(self, recorder)
 
     def _local_failure_state(
         self,
@@ -4822,41 +2253,17 @@ class CaptureCoordinator:
         *,
         media_lost: bool,
     ) -> Mapping[str, object]:
-        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        return {
-            "schema": "ylx.recording-state.v1",
-            "state": "recoverable" if media_lost else "failed",
-            "authority_epoch": self._authority_epoch,
-            "state_revision": self._next_revision(),
-            "updated_at": now,
-            "session_id": plan.session_id,
-            "take_id": plan.take_id,
-            "display_name": plan.display_name,
-            "device": {
-                "device_id": self._config.session.device_id,
-                "device_label": self._config.session.device_label,
-            },
-            "storage": {
-                "volume_id": plan.volume_id,
-                "status": "media_lost" if media_lost else "mounted",
-                "writable": False,
-                "remaining_bytes": None,
-            },
-            "progress": {
-                "elapsed_seconds": 0.0,
-                "captured_frames": 0,
-                "bytes_written": 0,
-            },
-            "diagnostics": [
-                {
-                    "code": error.code,
-                    "severity": "error",
-                    "message": error.message,
-                    "at": now,
-                    "recoverable": media_lost,
-                }
-            ],
-        }
+        return CaptureLifecycle.local_failure_state(
+            plan,
+            error,
+            authority_epoch=self._authority_epoch,
+            next_revision=self._next_revision,
+            device_id=self._config.session.device_id,
+            device_label=self._config.session.device_label,
+            media_lost=media_lost,
+        )
+
+    # -- Frame / IMU ingestion & media loss --
 
     def submit_frame(
         self,
@@ -4879,26 +2286,31 @@ class CaptureCoordinator:
     ) -> bool:
         failure: DeviceRecordingError | None = None
         active_plan: SessionPlan | None = None
-        with self._lock:
-            if self._active is None:
-                raise DeviceRecordingError("invalid_state", "当前没有活动录制")
-            if self._failure_projection is not None:
-                raise DeviceRecordingError("invalid_state", "录制正在收尾")
-            try:
-                self._check_generation(generation_id or self._active_plan.generation_id)
-                accepted = self._active.submit_frame(observation)
-                preview_jpeg = observation.frame.left or observation.frame.raw_side_by_side
-                if preview_jpeg is not None:
-                    with suppress(ValueError):
-                        self._preview.publish(preview_jpeg)
-                return accepted
-            except DeviceRecordingError as error:
-                if error.code == "stale_generation" or not retain_failure:
-                    raise
-                failure = error
-                active_plan = self._active_plan
+        while True:
+            with self._lock:
+                if self._active is None:
+                    raise DeviceRecordingError("invalid_state", "当前没有活动录制")
+                if self._failure_projection is not None:
+                    raise DeviceRecordingError("invalid_state", "录制正在收尾")
+                admission_ready = self._volume._admission is not None
+                if admission_ready:
+                    try:
+                        self._check_generation(generation_id or self._active_plan.generation_id)
+                        accepted = self._active.submit_frame(observation)
+                        preview_jpeg = observation.frame.left or observation.frame.raw_side_by_side
+                        if preview_jpeg is not None:
+                            with suppress(ValueError):
+                                self._preview.publish(preview_jpeg)
+                        return accepted
+                    except DeviceRecordingError as error:
+                        if error.code == "stale_generation" or not retain_failure:
+                            raise
+                        failure = error
+                        active_plan = self._active_plan
+                    break
+            self._require_admission()
         if self._sources is not None:
-            with suppress(BaseException):
+            with suppress(Exception):
                 self._sources.stop()
         if failure is not None:
             self._retain_active_failure(failure, active_plan)
@@ -4926,28 +2338,33 @@ class CaptureCoordinator:
     ) -> bool:
         failure: DeviceRecordingError | None = None
         active_plan: SessionPlan | None = None
-        with self._lock:
-            if self._active is None:
-                raise DeviceRecordingError("invalid_state", "当前没有活动录制")
-            if self._failure_projection is not None:
-                raise DeviceRecordingError("invalid_state", "录制正在收尾")
-            try:
-                self._check_generation(generation_id or self._active_plan.generation_id)
-                accepted = self._active.submit_imu(observation)
-                if accepted:
-                    self._store_latest_imu_locked(
-                        self._active_plan.session_id,
-                        observation.samples[-1],
-                        observed_at_monotonic=time.monotonic(),
-                    )
-                return accepted
-            except DeviceRecordingError as error:
-                if error.code == "stale_generation" or not retain_failure:
-                    raise
-                failure = error
-                active_plan = self._active_plan
+        while True:
+            with self._lock:
+                if self._active is None:
+                    raise DeviceRecordingError("invalid_state", "当前没有活动录制")
+                if self._failure_projection is not None:
+                    raise DeviceRecordingError("invalid_state", "录制正在收尾")
+                admission_ready = self._volume._admission is not None
+                if admission_ready:
+                    try:
+                        self._check_generation(generation_id or self._active_plan.generation_id)
+                        accepted = self._active.submit_imu(observation)
+                        if accepted:
+                            self._imu_tracker.store_latest_imu_locked(
+                                self._active_plan.session_id,
+                                observation.samples[-1],
+                                observed_at_monotonic=time.monotonic(),
+                            )
+                        return accepted
+                    except DeviceRecordingError as error:
+                        if error.code == "stale_generation" or not retain_failure:
+                            raise
+                        failure = error
+                        active_plan = self._active_plan
+                    break
+            self._require_admission()
         if self._sources is not None:
-            with suppress(BaseException):
+            with suppress(Exception):
                 self._sources.stop()
         if failure is not None:
             self._retain_active_failure(failure, active_plan)
@@ -4955,8 +2372,8 @@ class CaptureCoordinator:
         raise failure
 
     def report_media_loss(self, *, generation_id: str) -> None:
+        admission = self._require_admission()
         with self._lock:
-            admission = self._require_admission()
             if generation_id != admission.generation_id:
                 raise DeviceRecordingError("stale_generation", "介质事件来自过期挂载代次")
             if self._active is None:
@@ -4964,78 +2381,18 @@ class CaptureCoordinator:
             self._media_lost = True
             active_plan = self._active_plan
         if self._sources is not None:
-            with suppress(BaseException):
+            with suppress(Exception):
                 self._sources.stop()
         error = DeviceRecordingError("media_lost", "录制介质在安全交接前被移除")
         self._retain_active_failure(error, active_plan)
 
+    # -- Safe swap & artifact downloads --
+
     def _publish_safe_swap(self) -> None:
-        with self._lock:
-            pending = self._pending_safe_swap
-            if pending is None:
-                raise ProviderError("safe_swap_not_pending", "没有待发布的安全换盘", status=409)
-            if self.open_handle_count != 0:
-                raise ProviderError(
-                    "safe_swap_blocked",
-                    "仍有核心录制或读取句柄未释放",
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                    details={"open_handle_count": self.open_handle_count},
-                )
-        # All callers retain the stop owner, which fences new recordings and
-        # mutation. Pending handoff intent also fences new representation handles.
-        self._check_pending_safe_swap(pending)
-        with self._lock:
-            if self._pending_safe_swap is not pending:
-                raise ProviderError("capture_state_changed", "待交接录制已变化", status=409)
-            receipt = {
-                "schema": "ylx.safe-swap-receipt.v3",
-                **pending,
-                "released_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "release_state": "device-released",
-                "open_handle_count": 0,
-            }
-            validate_safe_swap_v3_receipt(receipt)
-            resource = {"schema": "ylx.safe-swap-receipt-resource.v3", "receipt": receipt}
-            self._safe_swap_to_persist = resource
-            self._next_revision()
-        try:
-            self._persist_local_state()
-        except BaseException as error:
-            with self._lock:
-                self._safe_swap_to_persist = None
-            if not isinstance(error, (OSError, sqlite3.Error, PersistenceError)):
-                raise
-            raise ProviderError(
-                "safe_swap_publish_failed",
-                "安全换盘回执未能持久发布",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                retryable=True,
-            ) from error
-        with self._lock:
-            self._released = True
-            self._safe_swap_resource = resource
-            self._pending_safe_swap = None
-            self._pending_safe_swap_failure = None
-            self._safe_swap_to_persist = None
-            self._next_revision()
+        stop_workflow.publish_safe_swap(self)
 
     def _check_pending_safe_swap(self, pending: Mapping[str, object]) -> None:
-        # Safe removal means writes are durable and handles released. It does
-        # not require rereading the recording. Bind the handoff to its manifest.
-        session_id = str(pending["session_id"])
-        with (
-            closing(self._open_store()) as store,
-            store.open_manifest(session_id, "v4") as representation,
-        ):
-            payload = representation.read()
-        manifest = json.loads(payload)
-        if hashlib.sha256(payload).hexdigest() != pending["manifest_sha256"] or any(
-            manifest[key] != pending[key] for key in ("manifest_id", "volume_id", "sealed_at")
-        ):
-            raise ProviderError(
-                "safe_swap_unverified", "待交接录像已变化，请重试", status=409, retryable=True
-            )
+        stop_workflow.check_pending_safe_swap(self, pending)
 
     def current_safe_swap_receipt(self) -> object | None:
         with self._lock:
@@ -5067,6 +2424,7 @@ class CaptureCoordinator:
                 self._released
                 or self._pending_safe_swap is not None
                 or self._async_stop_reason == "safe_swap"
+                or self._lifecycle._deleting
             ):
                 raise ProviderError(
                     "volume_releasing",
@@ -5074,16 +2432,22 @@ class CaptureCoordinator:
                     status=HTTPStatus.LOCKED,
                     retryable=True,
                 )
-            try:
-                self._check_generation()
-            except DeviceRecordingError as error:
-                raise ProviderError(
-                    error.code,
-                    error.message,
-                    status=HTTPStatus.CONFLICT,
-                    retryable=True,
-                ) from error
             self._open_representations += 1
+        try:
+            self._check_generation()
+        except DeviceRecordingError as error:
+            with self._lock:
+                self._open_representations -= 1
+            raise ProviderError(
+                error.code,
+                error.message,
+                status=HTTPStatus.CONFLICT,
+                retryable=True,
+            ) from error
+        except BaseException:
+            with self._lock:
+                self._open_representations -= 1
+            raise
         released = False
 
         def release() -> None:
@@ -5096,12 +2460,7 @@ class CaptureCoordinator:
         return release
 
     def _open_store(self) -> _MultiRootSessionStore:
-        admission = self._require_admission()
-        return _MultiRootSessionStore(
-            admission.catalog_roots,
-            verified_manifests=self._verified,
-            recording_paths=self._recording_paths,
-        )
+        return self._catalog.open_store(self._require_admission())
 
     def open_manifest(self, session_id: str, api_version: str) -> object:
         with ExitStack() as cleanup:
@@ -5125,8 +2484,6 @@ class CaptureCoordinator:
         *,
         cancelled: Callable[[], bool] | None = None,
     ) -> object:
-        # Playback and download read only the requested file/range. A saved
-        # recording needs no full-content scan, including the first read after boot.
         with ExitStack() as cleanup:
             if cancelled is not None and cancelled():
                 raise ProviderError(
@@ -5153,44 +2510,85 @@ class CaptureCoordinator:
             return tracked
 
     def _load_manifest(self, session_id: str) -> Mapping[str, object]:
-        admission = self._require_admission()
-        for sessions_root in admission.catalog_roots:
-            path = resolve_recording(sessions_root, session_id)
-            try:
-                manifest, _ = inspect_device_session_directory(path)
-                return manifest
-            except (OSError, DeviceRecordingError):
-                continue
-        raise ArtifactAccessError("not_found", "会话不存在")
+        return self._catalog.load_manifest(self._require_admission(), session_id)
 
     def delete_sessions(self, command: CaptureCommand) -> CaptureCommandResult:
-        from rp_ylx.recording.deletion import delete_recordings, valid_delete_request
-
         if not valid_delete_request(command.body):
             raise ProviderError("invalid_request", "删除请求无效", status=HTTPStatus.BAD_REQUEST)
 
-        def execute() -> CaptureCommandResult:
-            if self._active is not None or self._stop_inflight is not None:
-                raise ProviderError(
-                    "capture_busy", "录制进行中，不能删除", status=HTTPStatus.CONFLICT
-                )
-            if self._released or self._pending_safe_swap is not None:
-                raise ProviderError(
-                    "volume_releasing", "录制卷已释放或正在释放", status=HTTPStatus.LOCKED
-                )
-            if self._open_representations:
-                raise ProviderError(
-                    "download_busy", "下载进行中，不能删除", status=HTTPStatus.CONFLICT
-                )
-            if self._catalog_verification_session is not None:
-                self._catalog_verification_epoch += 1
-                self._catalog_verification_cancel.set()
-                raise ProviderError(
-                    "verification_cancelling",
-                    "正在停止录像校验，请稍后重试删除",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    retryable=True,
-                )
+        scope = (command.principal_id, "delete", command.idempotency_key)
+        replay_to_persist: CaptureCommandResult | None = None
+        catalog_acquired = False
+        with self._stop_condition:
+            self._lifecycle.wait_while_starting_locked()
+            need_persist, replay_result = self._state.check_command_idempotency(
+                scope, command.canonical_body
+            )
+            stop_pending = (
+                self._stop_inflight is not None
+                or self._pending_stop_state_commit is not None
+                or self._stop_acceptance_inflight is not None
+            )
+            if replay_result is not None:
+                if stop_pending and need_persist:
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                if need_persist:
+                    replay_to_persist = replay_result
+                else:
+                    return replay_result
+            else:
+                if stop_pending:
+                    raise ProviderError(
+                        "capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT, retryable=True
+                    )
+                if (
+                    self._lifecycle._deleting
+                    or self._failure_inflight is not None
+                    or self._failure_projection is not None
+                    or self._async_stop_worker is not None
+                    or self._closing
+                ):
+                    raise ProviderError("capture_busy", "录制正在收尾", status=HTTPStatus.CONFLICT)
+                if self._active is not None or self._stop_inflight is not None:
+                    raise ProviderError(
+                        "capture_busy", "录制进行中，不能删除", status=HTTPStatus.CONFLICT
+                    )
+                if self._released or self._pending_safe_swap is not None:
+                    raise ProviderError(
+                        "volume_releasing", "录制卷已释放或正在释放", status=HTTPStatus.LOCKED
+                    )
+                if self._open_representations:
+                    raise ProviderError(
+                        "download_busy", "下载进行中，不能删除", status=HTTPStatus.CONFLICT
+                    )
+                if self._catalog_verification_session is not None:
+                    self._catalog_verification_epoch += 1
+                    self._catalog_verification_cancel.set()
+                    raise ProviderError(
+                        "verification_cancelling",
+                        "正在停止录像校验，请稍后重试删除",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                if not self._catalog_lock.acquire(blocking=False):
+                    raise ProviderError(
+                        "catalog_busy",
+                        "录像目录正在更新，请稍后重试删除",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        retryable=True,
+                    )
+                catalog_acquired = True
+                self._lifecycle._deleting = True
+                self._sync_phase()
+        if replay_to_persist is not None:
+            self._persist_local_state()
+            return replay_to_persist
+
+        # R-07: Run generation check, delete_recordings (rmtree+fsync), and catalog cleanup
+        # outside self._lock.
+        try:
             try:
                 self._check_generation(force=True)
             except DeviceRecordingError as error:
@@ -5201,37 +2599,40 @@ class CaptureCoordinator:
             expected = {
                 item["session_id"]: item["manifest_sha256"] for item in command.body["sessions"]
             }
-            # Never wait for catalog work while owning the capture/clock lock.
-            if not self._catalog_lock.acquire(blocking=False):
-                raise ProviderError(
-                    "catalog_busy",
-                    "录像目录正在更新，请稍后重试删除",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    retryable=True,
-                )
+            deleted_ids: list[str] = []
             try:
-                try:
-                    result = delete_recordings(admission.catalog_roots, expected)
-                finally:
-                    for session_id in expected:
-                        self._session_summaries.pop(session_id, None)
-                        self._session_snapshots.pop(session_id, None)
-                        self._verified.pop(session_id, None)
-                        self._session_diagnostics.pop(session_id, None)
-                    self._storage_checked_at = 0.0
+                result = delete_recordings(admission.catalog_roots, expected)
+                deleted_ids = list(result["deleted_session_ids"])
+            except CoreProviderError as error:
+                if isinstance(error, ProviderError):
+                    raise
+                raise ProviderError(
+                    error.code,
+                    error.message,
+                    status=error.status,
+                    retryable=error.retryable,
+                    details=error.details,
+                ) from error
             finally:
+                self._catalog.prune_after_deletion(admission.volume_id, set(expected), deleted_ids)
+                self._volume.invalidate_storage_cache()
+            cmd_result = CaptureCommandResult(HTTPStatus.OK, result)
+            with self._lock:
+                self._forget_deleted_outcomes(result["deleted_session_ids"])
+                self._cache_command(scope, command, cmd_result)
+            self._persist_local_state()
+            return cmd_result
+        finally:
+            if catalog_acquired:
                 self._catalog_lock.release()
-            self._forget_deleted_outcomes(result["deleted_session_ids"])
-            return CaptureCommandResult(HTTPStatus.OK, result)
-
-        with self._lock:
-            return self._idempotent("delete", command, execute)
+            with self._stop_condition:
+                self._lifecycle._deleting = False
+                self._sync_phase()
+                self._stop_condition.notify_all()
 
     def retained_unsuccessful_outcome(self, session_id: str) -> object | None:
         with self._lock:
             if self._active_plan is not None and self._active_plan.session_id == session_id:
-                # The failure owner publishes the outcome only after recovery
-                # and its durable coordinator state have both completed.
                 return None
             outcome = self._retained.get(session_id)
             if outcome is None:
@@ -5262,120 +2663,27 @@ class CaptureCoordinator:
                 retryable=True,
             ) from error
         self._require_admission()
-        # Listing is deliberately metadata-only. Full artifact hashing is
-        # deferred until a caller requests a concrete artifact, so a large
-        # recording volume does not block the initial web UI render.
         self._catalog_sessions()
-        with self._catalog_lock:
-            # Keep the catalog stable while selecting the page. Only response
-            # entries need isolated copies; unselected nested data never escapes.
-            all_items = list(self._session_summaries.values())
-            diagnostics = list(self._session_diagnostics.values())
-            all_items.sort(
-                key=lambda item: (str(item["started_at"]), str(item["session_id"])),
-                reverse=True,
-            )
-
-            if api_version != "v4":
-                items = [
-                    item for item in all_items if take_id is None or item["take_id"] == take_id
-                ]
-                combined: list[tuple[str, dict[str, object]]] = [
-                    (str(item["session_id"]), item) for item in items
-                ]
-                start = 0
-                if cursor is not None:
-                    positions = [index for index, (key, _) in enumerate(combined) if key == cursor]
-                    if not positions:
-                        raise ProviderError(
-                            "invalid_cursor",
-                            "会话游标无效",
-                            status=HTTPStatus.BAD_REQUEST,
-                        )
-                    start = positions[0] + 1
-                selected_items = [
-                    copy.deepcopy(item) for _, item in combined[start : start + limit]
-                ]
-                for item in selected_items:
-                    verification = item.get("verification")
-                    if isinstance(verification, dict):
-                        raw_diagnostics = verification.get("diagnostics")
-                        if isinstance(raw_diagnostics, list):
-                            verification["diagnostics"] = [
-                                diagnostic["summary"]
-                                for diagnostic in raw_diagnostics
-                                if isinstance(diagnostic, Mapping)
-                                and isinstance(diagnostic.get("summary"), str)
-                            ]
-                remaining = limit - len(selected_items)
-                selected_diagnostics = copy.deepcopy(diagnostics[:remaining])
-                consumed = start + len(selected_items)
-                next_cursor = None
-                if consumed < len(combined) and selected_items:
-                    next_cursor = str(selected_items[-1]["session_id"])
-                return {
-                    "schema": "ylx.session-list.v2",
-                    "items": selected_items,
-                    "diagnostics": selected_diagnostics,
-                    "next_cursor": next_cursor,
-                }
-
-            diagnostics.sort(key=lambda item: str(item["quarantine_id"]))
-            catalog_revision = _session_catalog_revision(all_items, diagnostics)
-            items = [item for item in all_items if take_id is None or item["take_id"] == take_id]
-            ordered: list[tuple[str, dict[str, object]]] = [
-                *(("item", item) for item in items),
-                *(("diagnostic", diagnostic) for diagnostic in diagnostics),
-            ]
-            start = 0
-            if cursor is not None:
-                decoded = _decode_session_cursor(cursor)
-                if decoded["take_id"] != take_id:
-                    raise ProviderError(
-                        "invalid_cursor",
-                        "会话游标与当前筛选条件不匹配",
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-                if decoded["catalog_revision"] != catalog_revision:
-                    raise ProviderError(
-                        "catalog_changed",
-                        "会话目录已变化，请从第一页重新加载",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                        details={"catalog_revision": catalog_revision},
-                    )
-                start = int(decoded["offset"])
-                if start >= len(ordered):
-                    raise ProviderError(
-                        "invalid_cursor",
-                        "会话游标位置无效",
-                        status=HTTPStatus.BAD_REQUEST,
-                    )
-
-            selected = ordered[start : start + limit]
-            selected_items = [copy.deepcopy(value) for kind, value in selected if kind == "item"]
-            selected_diagnostics = [
-                copy.deepcopy(value) for kind, value in selected if kind == "diagnostic"
-            ]
-            consumed = start + len(selected)
-            next_cursor = (
-                _encode_session_cursor(
-                    catalog_revision=catalog_revision,
-                    take_id=take_id,
-                    offset=consumed,
-                )
-                if consumed < len(ordered)
-                else None
-            )
-            return {
-                "schema": "ylx.session-list.v3",
-                "catalog_revision": catalog_revision,
-                "items": selected_items,
-                "diagnostics": selected_diagnostics,
-                "next_cursor": next_cursor,
-            }
+        return self._catalog.list_sessions_page(
+            cursor=cursor,
+            limit=limit,
+            take_id=take_id,
+            api_version=api_version,
+        )
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:
+        with self._lock:
+            if (
+                self._pending_safe_swap is not None
+                or self._released
+                or self._async_stop_reason == "safe_swap"
+            ):
+                raise ProviderError(
+                    "volume_releasing",
+                    "录制卷正在安全释放",
+                    status=HTTPStatus.LOCKED,
+                    retryable=True,
+                )
         self._require_camera_connected(restore_focus=False)
         start_preview = getattr(self._sources, "start_preview", None)
         try:
@@ -5407,63 +2715,67 @@ class CaptureCoordinator:
             ) from error
 
     def close(self) -> None:
-        # Serialize close callers without holding the lock used by recorder
-        # checkpoint revision callbacks while joining the recorder's threads.
         with self._close_lock:
             self._close_capture()
 
     def _close_capture(self) -> None:
-        with self._stop_condition:
-            self._closing = True
+        def cancel_verification() -> None:
             self._catalog_verification_epoch += 1
             self._catalog_verification_cancel.set()
-        if self._sources is not None:
-            close_sources = getattr(self._sources, "close", None)
-            if callable(close_sources):
-                with suppress(BaseException):
-                    close_sources()
-            else:
-                with suppress(BaseException):
-                    self._sources.stop()
-        self._preview.clear()
-        with self._stop_condition:
-            while (
-                self._failure_inflight is not None
-                or self._stop_inflight is not None
-                or self._async_stop_worker is not None
-                or self._stop_acceptance_inflight is not None
-                or self._catalog_verification_session is not None
-            ):
-                self._stop_condition.wait()
-            active = self._active
-            if active is not None:
-                self._stop_inflight = ("internal", "close", "shutdown")
-        try:
-            if active is not None:
-                active.abort()
-            with self._stop_condition:
-                if active is not None:
-                    state = active.current_recording_state
-                    if state is not None and self._active_plan is not None:
-                        self._retained[self._active_plan.session_id] = {
-                            "generation_id": self._active_plan.generation_id,
-                            "recording_state": state,
-                        }
-                    self._active = None
-                    self._active_plan = None
-                    self._capture_timer = None
-                    self._latest_imu = None
-                    self._failure_pending_commit = None
-                    self._failure_projection = None
-                self._persist_local_state()
-        finally:
-            with self._stop_condition:
-                self._stop_inflight = None
-                self._release_network_operation_lease()
-                self._stop_condition.notify_all()
+
+        def publish_recovered(recovered: SealedDeviceSession) -> Path:
+            return self._publish_recording_directory(recovered.path, recovered.manifest)
+
+        def record_verified(session_id: str, sha256: str) -> None:
+            with self._catalog_lock:
+                self._verified[session_id] = sha256
+
+        def retain_outcome(session_id: str, outcome: Mapping[str, object]) -> None:
+            self._retained[session_id] = dict(outcome)
+
+        self._lifecycle.close_capture(
+            sources=self._sources,
+            clear_preview=self._preview.clear,
+            cancel_verification=cancel_verification,
+            is_verifying=lambda: self._catalog_verification_session is not None,
+            publish_recovered=publish_recovered,
+            record_saved_prefix=self._record_saved_prefix,
+            record_verified=record_verified,
+            retain_outcome=retain_outcome,
+            persist_state=self._persist_local_state,
+            leases=self._leases,
+            pending_safe_swap=lambda: self._pending_safe_swap,
+        )
+        self._latest_imu = None
 
     def __enter__(self) -> CaptureCoordinator:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+__all__ = [
+    "CALIBRATION_CAPTURE_DISABLED_REASONS",
+    "CaptureCoordinator",
+    "CapturePhase",
+    "CaptureSources",
+    "CoordinatorConfig",
+    "LEGACY_SESSIONS_DIRECTORY",
+    "LIVE_IMU_STALE_SECONDS",
+    "SAFE_SWAP_FAILURES",
+    "SESSION_CATALOG_REVISION_DOMAIN",
+    "SESSIONS_DIRECTORY",
+    "VOLUME_MARKER",
+    "VolumeAdmission",
+    "_MultiRootSessionStore",
+    "_TrackedRepresentation",
+    "_VerifiedSessionSnapshot",
+    "_canonical_json_bytes",
+    "_encode_session_cursor",
+    "_read_recovery_metadata",
+    "_session_catalog_revision",
+    "_stat_capacity",
+    "initialize_capture_volume",
+    "validate_capture_status",
+]

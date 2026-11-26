@@ -16,32 +16,45 @@ import stat
 import uuid
 import wave
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from rp_ylx.api.events import validate_recording_state
-from rp_ylx.audio_clock import audio_clock_report, audio_sample_time_ns, raw_audio_clock_model
+from rp_ylx.audio_clock import (
+    audio_clock_report,
+    audio_sample_time_offset_ns,
+    raw_audio_clock_model,
+)
+from rp_ylx.operational_logging import operational_logger
 from rp_ylx.recording.audio_journal import SCHEMA as AUDIO_JOURNAL_SCHEMA
 from rp_ylx.recording.audio_journal import AudioJournalReader
-from rp_ylx.recording.device_session import (
-    DeviceRecordingError,
-    DeviceSessionConfig,
-    DeviceSessionRecorder,
-    SealedDeviceSession,
-    SessionPlan,
-    StorageStatus,
-    _finalize_artifact,
+from rp_ylx.recording.encoding import RecordingEncoding
+from rp_ylx.recording.fs_safety import (
+    copy_regular_atomic,
+    file_identity,
     fsync_directory,
-    inspect_device_session_directory,
-    json_bytes,
+    is_exfat_or_msdos_path,
     write_json_atomic,
 )
-from rp_ylx.recording.encoding import RecordingEncoding
+from rp_ylx.recording.manifest_builder import (
+    DeviceRecordingError,
+    DeviceSessionConfig,
+    SealedDeviceSession,
+    SessionPlan,
+    build_device_session_manifest,
+    finalize_artifact,
+    inspect_device_session_directory,
+    json_bytes,
+)
 from rp_ylx.recording.recovery_index import RecoveryIndex
 from rp_ylx.recording.verified import VerifiedArtifact
 from rp_ylx.recording.verified import identity as verified_identity
+
+_finalize_artifact = finalize_artifact
+_copy_regular_atomic = copy_regular_atomic
+
 
 RECOVERY_ROLE = "log.recording-recovery"
 MAX_RECOVERY_METADATA_BYTES = 8 * 1024 * 1024
@@ -98,13 +111,25 @@ def _artifact(
     verified: dict[str, VerifiedArtifact] | None = None,
 ) -> dict:
     path = _regular(root, relative)
-    before = None if verified is None else verified_identity(path.stat(follow_symlinks=False))
+    exfat = is_exfat_or_msdos_path(path)
+    before = None
+    if verified is not None:
+        before = (
+            file_identity(path.stat(follow_symlinks=False), include_inode=False)
+            if exfat
+            else verified_identity(path.stat(follow_symlinks=False))
+        )
     finalized = _finalize_artifact(path, None, code="recovery_invalid")
     if verified is not None:
         assert before is not None
-        if verified_identity(path.stat(follow_symlinks=False)) != before:
+        after = (
+            file_identity(path.stat(follow_symlinks=False), include_inode=False)
+            if exfat
+            else verified_identity(path.stat(follow_symlinks=False))
+        )
+        if after != before:
             raise ValueError("recovery artifact changed during independent readback")
-        verified[relative] = VerifiedArtifact(before, finalized.sha256)
+        verified[relative] = VerifiedArtifact(before, finalized.sha256, include_inode=not exfat)
     return {
         "artifact_id": finalized.sha256,
         "sha256": finalized.sha256,
@@ -117,7 +142,11 @@ def _artifact(
 
 @contextmanager
 def _temporary_output(path: Path):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        0o640,
+    )
     try:
         stream = os.fdopen(descriptor, "wb")
     except BaseException:
@@ -157,7 +186,8 @@ def _write_records(
     finally:
         # Long IMU indexes can be gigabytes. Failed retries must not accumulate
         # private copies, and only a complete durable index replaces the prior one.
-        temporary.unlink(missing_ok=True)
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -272,7 +302,8 @@ def _frames(
             committed_count, first, last_committed, boundaries, relative, encoding
         )
     finally:
-        temporary.unlink(missing_ok=True)
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
 
 
 def _audio(
@@ -313,10 +344,10 @@ def _audio(
             anchors, rate, anchors[-1][0], clock["period_frames"], clock["buffer_frames"]
         )
         low, high = 0, min(clock["sample_count"], anchors[-1][0])
-        boundary = origin + video_end * 1e9
+        boundary_offset_ns = video_end * 1e9
         while low < high:
             middle = (low + high + 1) // 2
-            if audio_sample_time_ns(model["points"], middle) <= boundary:
+            if audio_sample_time_offset_ns(model["points"], middle, origin) <= boundary_offset_ns:
                 low = middle
             else:
                 high = middle - 1
@@ -324,8 +355,8 @@ def _audio(
     else:
         first, last = anchors[0], anchors[-1]
         slope = (last[1] - first[1]) / (last[0] - first[0])
-        start = first[1] - first[0] * slope
-        target = min(clock["sample_count"], math.floor((origin + video_end * 1e9 - start) / slope))
+        start_offset = (first[1] - origin) - first[0] * slope
+        target = min(clock["sample_count"], math.floor((video_end * 1e9 - start_offset) / slope))
         if abs(1e9 / slope / rate - 1) > 0.01:
             return None
     if target <= 0:
@@ -351,23 +382,36 @@ def _audio(
                 break
             selected = min(count, target - samples)
             if selected != count:
+                recovery_dir = root / "recovery"
+                if recovery_dir.is_symlink():
+                    raise ValueError("unsafe recovery directory")
+                recovery_dir.mkdir(exist_ok=True, mode=0o750)
                 relative = "recovery/audio-tail.wav"
-                temporary = root / "recovery/audio-tail.tmp"
-                if temporary.is_symlink() or (root / relative).is_symlink():
+                if (root / relative).is_symlink():
                     raise ValueError("unsafe recovery audio path")
-                with wave.open(str(temporary), "wb") as output:
-                    output.setparams(stream.getparams())
-                    remaining = selected
-                    while remaining:
-                        take = min(remaining, rate)
-                        payload = stream.readframes(take)
-                        if len(payload) != take * channels * 2:
-                            raise ValueError("truncated recovered audio")
-                        output.writeframesraw(payload)
-                        remaining -= take
-                with temporary.open("rb") as output:
-                    os.fsync(output.fileno())
-                os.replace(temporary, root / relative)
+                temporary = recovery_dir / f".audio-tail.{uuid.uuid4().hex}.tmp"
+                replaced = False
+                try:
+                    with _temporary_output(temporary) as out_stream:
+                        with wave.open(out_stream, "wb") as output:
+                            output.setparams(stream.getparams())
+                            remaining = selected
+                            while remaining:
+                                take = min(remaining, rate)
+                                payload = stream.readframes(take)
+                                if len(payload) != take * channels * 2:
+                                    raise ValueError("truncated recovered audio")
+                                output.writeframesraw(payload)
+                                remaining -= take
+                        out_stream.flush()
+                        os.fsync(out_stream.fileno())
+                    os.replace(temporary, root / relative)
+                    replaced = True
+                    fsync_directory(recovery_dir)
+                finally:
+                    if not replaced:
+                        with suppress(OSError):
+                            temporary.unlink(missing_ok=True)
             records.append(
                 {
                     "index": len(records),
@@ -397,16 +441,19 @@ def _audio(
         model = raw_audio_clock_model(
             selected_anchors, rate, samples, clock["period_frames"], clock["buffer_frames"]
         )
-        start, end = model["start_ns"], model["end_ns"]
+        start_offset_ns = audio_sample_time_offset_ns(model["points"], 0, origin)
+        end_offset_ns = audio_sample_time_offset_ns(model["points"], samples, origin)
         observed_stop = model["points"][-1][1]
         residual = model["max_residual_ns"]
     else:
         first, last = selected_anchors[0], selected_anchors[-1]
         slope = (last[1] - first[1]) / (last[0] - first[0])
-        start = first[1] - first[0] * slope
-        end = start + samples * slope
+        start_offset_ns = (first[1] - origin) - first[0] * slope
+        end_offset_ns = start_offset_ns + samples * slope
         observed_stop = last[1]
         residual = max(abs((t - first[1]) - (n - first[0]) * slope) for n, t in selected_anchors)
+    sample_start_ns = origin + round(start_offset_ns)
+    sample_end_ns = origin + round(end_offset_ns)
     proof = {
         "schema": "openaria.audio-clock.v2" if raw_clock else "openaria.audio-clock.v1",
         "clock": "host_monotonic",
@@ -419,9 +466,9 @@ def _audio(
         "thread_started_monotonic_ns": clock["thread_started_monotonic_ns"],
         # This is the observed end of the recovered capture window. The full
         # checkpoint keeps the original, longer capture window for diagnosis.
-        "thread_stopped_monotonic_ns": max(observed_stop, math.ceil(end)),
-        "sample_start_monotonic_ns": round(start),
-        "sample_end_monotonic_ns": round(end),
+        "thread_stopped_monotonic_ns": max(observed_stop, origin + math.ceil(end_offset_ns)),
+        "sample_start_monotonic_ns": sample_start_ns,
+        "sample_end_monotonic_ns": sample_end_ns,
         "session_start_monotonic_ns": origin,
         "max_residual_ns": math.ceil(residual),
         "queue_capacity_frames": clock["queue_capacity_frames"],
@@ -443,8 +490,8 @@ def _audio(
         "sync": {
             "time_base": "host_monotonic",
             "video_time_reference": "session_time_seconds",
-            "start_time_seconds": (round(start) - origin) / 1e9,
-            "end_time_seconds": (round(end) - origin) / 1e9,
+            "start_time_seconds": (sample_start_ns - origin) / 1e9,
+            "end_time_seconds": (sample_end_ns - origin) / 1e9,
         },
         "segments": records,
         "capture_clock": proof,
@@ -576,47 +623,35 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         if audio is None
         else (audio["capture_clock"]["thread_stopped_monotonic_ns"] - origin) / 1e9,
     )
-    # Restore the producer's metadata and reuse the normal manifest builder.
-    recorder = DeviceSessionRecorder(
-        partial.parent,
-        replace(config, audio_enabled=False),
-        plan,
-        authority_epoch=str(uuid.uuid4()),
-        allocate_revision=lambda: 1,
-        storage_status=lambda: StorageStatus(None, True),
-    )
-    recorder._started_at = datetime.fromisoformat(capture["started_at"].replace("Z", "+00:00"))
-    recorder._started_monotonic_ns = origin
-    recorder._frames_written = frames.count
-    recorder._imu_written = imu_count
-    recorder._segment_records = segments
-    for record in segments:
-        for ordinal in (record["start_ordinal"], record["end_ordinal"]):
-            recorder._boundary_record_sequence[ordinal] = ordinal
-            recorder._boundary_elapsed[ordinal] = (
-                video_end
-                if ordinal == frames.count
-                else (frames.boundary_monotonic_ns[ordinal] - origin) / 1e9
-            )
+    started_at = datetime.fromisoformat(capture["started_at"].replace("Z", "+00:00"))
     now = datetime.now(UTC)
-    manifest = recorder._manifest(
-        recorder._started_at + timedelta(seconds=duration), now, now, duration
-    )
     media_type = "application/zstd" if compress_indexes else "application/x-ndjson"
-    manifest["frames"]["artifact"] = _artifact(
-        partial, frames.path, "frames.index", media_type, verified=verified
-    )
-    manifest["imu"]["artifact"] = _artifact(
-        partial, imu_relative, "imu.samples", media_type, verified=verified
-    )
+    frames_artifact = _artifact(partial, frames.path, "frames.index", media_type, verified=verified)
+    imu_artifact = _artifact(partial, imu_relative, "imu.samples", media_type, verified=verified)
     if compress_indexes:
-        manifest["schema"] = "ylx.device-session.v4"
-        manifest["frames"]["artifact"]["storage_encoding"] = frames.storage_encoding
-        manifest["imu"]["artifact"]["storage_encoding"] = imu_encoding
-    if audio is not None:
-        manifest["audio"] = audio
-    elif config.audio_enabled:
-        manifest["audio"] = {
+        frames_artifact["storage_encoding"] = frames.storage_encoding
+        imu_artifact["storage_encoding"] = imu_encoding
+    video_segments = [
+        {
+            "index": int(record["index"]),
+            "start_frame": int(record["start_ordinal"]),
+            "end_frame": int(record["end_ordinal"]),
+            "start_time_seconds": (
+                frames.boundary_monotonic_ns[int(record["start_ordinal"])] - origin
+            )
+            / 1e9,
+            "end_time_seconds": (
+                video_end
+                if int(record["end_ordinal"]) == frames.count
+                else (frames.boundary_monotonic_ns[int(record["end_ordinal"])] - origin) / 1e9
+            ),
+            "artifacts": record["artifacts"],
+        }
+        for record in segments
+    ]
+    resolved_audio = audio
+    if resolved_audio is None and config.audio_enabled:
+        resolved_audio = {
             "state": "not_recorded",
             "requested_mode": "enabled",
             "resolved_mode": "disabled",
@@ -650,7 +685,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         "original_artifacts_preserved": True,
     }
     write_json_atomic(recovery / "interruption.json", receipt)
-    manifest["logs"] = [
+    logs = [
         _artifact(
             partial,
             "recovery/interruption.json",
@@ -660,7 +695,7 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
         )
     ]
     if clock is not None:
-        manifest["logs"].append(
+        logs.append(
             _artifact(
                 partial,
                 "clock-calibration.json",
@@ -669,22 +704,73 @@ def recover_device_session(partial: Path) -> SealedDeviceSession | None:
                 verified=verified,
             )
         )
+    manifest = build_device_session_manifest(
+        config=config,
+        plan=plan,
+        started_at=started_at,
+        ended_at=started_at + timedelta(seconds=duration),
+        verified_at=now,
+        sealed_at=now,
+        duration=duration,
+        frames_written=frames.count,
+        imu_written=imu_count,
+        video_segments=video_segments,
+        frames_artifact=frames_artifact,
+        imu_artifact=imu_artifact,
+        audio=resolved_audio,
+        logs=logs,
+        drop_events=(),
+        schema="ylx.device-session.v4" if compress_indexes else None,
+    )
     write_json_atomic(partial / "manifest.json", manifest, pretty=False)
-    inspect_device_session_directory(partial, expected_session_id=plan.session_id)
+    _, payload = inspect_device_session_directory(partial, expected_session_id=plan.session_id)
     # Recovery owns these files until publication. Detect concurrent replacement
     # or writes from metadata without rereading the recovered media.
     for relative, artifact in verified.items():
-        if verified_identity((partial / relative).stat(follow_symlinks=False)) != artifact.identity:
+        current_stat = (partial / relative).stat(follow_symlinks=False)
+        current_id = (
+            verified_identity(current_stat)
+            if artifact.include_inode
+            else file_identity(current_stat, include_inode=False)
+        )
+        if current_id != artifact.identity:
             raise DeviceRecordingError("artifact_invalid", "恢复文件在保存前发生变化")
-    # Archive controls after the recovered recording has been published durably.
-    # If power fails here, startup can finish the ordinary publish transaction.
+    # Stage control archives in recovery/ before rename (so crash-before-rename
+    # already has recovery/recording.json), but keep the top-level controls in
+    # partial until os.rename(partial, final) succeeds so failed renames stay
+    # recoverable.
+    archived_controls: list[str] = []
     for name in ("capture.json", "recording.json"):
-        path = partial / name
-        if path.exists():
-            os.replace(path, recovery / name)
+        if copy_regular_atomic(partial / name, recovery / name):
+            archived_controls.append(name)
+    for subdir_name in ("video", "audio"):
+        subdir = partial / subdir_name
+        if subdir.is_dir():
+            fsync_directory(subdir)
     fsync_directory(recovery)
     fsync_directory(partial)
     os.rename(partial, final)
     fsync_directory(final.parent)
-    payload = (final / "manifest.json").read_bytes()
-    return SealedDeviceSession(final, manifest, payload, hashlib.sha256(payload).hexdigest())
+    unlinked = False
+    for name in archived_controls:
+        try:
+            (final / name).unlink(missing_ok=True)
+            unlinked = True
+        except OSError as error:
+            operational_logger("recording").event(
+                "recovery_control_unlink_failed",
+                level="warning",
+                transaction_id=plan.session_id,
+                file=name,
+                error=str(error),
+            )
+    if unlinked:
+        with suppress(OSError):
+            fsync_directory(final)
+    return SealedDeviceSession(
+        final,
+        manifest,
+        payload,
+        hashlib.sha256(payload).hexdigest(),
+        verified_artifacts=verified,
+    )
