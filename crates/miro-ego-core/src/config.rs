@@ -419,7 +419,7 @@ impl DeviceConfig {
         if !is_valid_device_label(&self.device.device_label) {
             return Err(CoreError::invalid_config(
                 "invalid_config",
-                "device.device_label must match MiroEgo-XXXXXXXX or MEGO-XXXXXXXX (uppercase hex)",
+                "device.device_label must match Miro-Ego-XXXXXXXX (8 uppercase hex chars)",
             ));
         }
         let Some(fp_hex) = self.device.hardware_fingerprint.strip_prefix("sha256:") else {
@@ -577,19 +577,15 @@ impl Settings {
     }
 }
 
+/// Enforce canonical device label format `^Miro-Ego-[0-9A-F]{8}$` matching OpenAPI v1 contracts.
 pub fn is_valid_device_label(label: &str) -> bool {
-    let suffix = label
-        .strip_prefix("MiroEgo-")
-        .or_else(|| label.strip_prefix("MEGO-"));
-    match suffix {
-        Some(hex) => {
-            hex.len() == 8
-                && hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
-        }
-        None => false,
-    }
+    let Some(hex) = label.strip_prefix("Miro-Ego-") else {
+        return false;
+    };
+    hex.len() == 8
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
 }
 
 /// Load and strictly validate `DeviceConfig` from a bounded JSON file (<= 64 KiB).
@@ -655,7 +651,7 @@ mod tests {
             state_root: PathBuf::from("/var/lib/miro-ego"),
             device: DeviceIdentity {
                 device_id: new_uuid_v4(),
-                device_label: "MiroEgo-1234ABCD".to_owned(),
+                device_label: "Miro-Ego-1234ABCD".to_owned(),
                 hardware_fingerprint: format!("sha256:{}", "a".repeat(64)),
             },
             security: SecurityConfig::Lab {
@@ -692,10 +688,15 @@ mod tests {
         let loaded_settings = load_settings(&settings_path).unwrap();
         assert_eq!(loaded_settings, settings);
 
-        // Reject invalid label
-        let mut bad = cfg.clone();
-        bad.device.device_label = "BAD-1234".to_owned();
-        assert!(bad.validate().is_err());
+        // Reject invalid labels (missing hyphen, wrong prefix, lowercase hex)
+        for bad_label in ["BAD-1234", "MiroEgo-1234ABCD", "Miro-Ego-1234abcd"] {
+            let mut bad = cfg.clone();
+            bad.device.device_label = bad_label.to_owned();
+            assert!(
+                bad.validate().is_err(),
+                "expected rejection for {bad_label}"
+            );
+        }
 
         // Reject oversized config (> 64 KiB)
         let huge_path = dir.join("huge.json");

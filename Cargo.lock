@@ -533,6 +533,7 @@ dependencies = [
  "miro-ego-hw",
  "miro-ego-network",
  "miro-ego-storage",
+ "serde_json",
 ]
 
 [[package]]

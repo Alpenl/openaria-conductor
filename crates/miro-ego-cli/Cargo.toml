@@ -17,3 +17,4 @@ miro-ego-deploy.workspace = true
 miro-ego-hw.workspace = true
 miro-ego-network.workspace = true
 miro-ego-storage.workspace = true
+serde_json.workspace = true
