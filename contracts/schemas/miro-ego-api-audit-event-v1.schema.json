@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:miro-ego:schema:api-audit-event:v1",
+  "title": "Miro-Ego API Authorization Audit Event v1",
+  "description": "Secret-free per-request authorization audit record emitted to the bounded audit sink under /data/.miro-ego/audit/ or in-memory ring fallback.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "recorded_at",
+    "request_id",
+    "principal_id",
+    "operation_id",
+    "resource_id",
+    "outcome"
+  ],
+  "properties": {
+    "schema": {
+      "const": "miro-ego.api-audit-event.v1"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "principal_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128
+    },
+    "operation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "poll_count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Allowed lab status polls represented by this aggregated audit sample."
+    },
+    "resource_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 512
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}
