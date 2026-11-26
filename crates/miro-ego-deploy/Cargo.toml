@@ -6,8 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
 miro-ego-core.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle = "2"
 thiserror.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"

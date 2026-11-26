@@ -171,6 +171,64 @@ pub struct NetworkDeviceInfo {
     pub state: String,
 }
 
+/// Interface class currently owning the default route (`NetworkObservedState.default_route`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedDefaultRoute {
+    WifiClient,
+    Wired,
+    #[default]
+    None,
+}
+
+/// Live interface observation matching OpenAPI `NetworkInterfaceStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedInterfaceStatus {
+    pub state: String,
+    pub interface: Option<String>,
+    pub addresses: Vec<String>,
+    pub peer_or_ssid: Option<String>,
+}
+
+impl Default for ObservedInterfaceStatus {
+    fn default() -> Self {
+        Self {
+            state: "unavailable".to_owned(),
+            interface: None,
+            addresses: Vec::new(),
+            peer_or_ssid: None,
+        }
+    }
+}
+
+/// Live network state snapshot matching OpenAPI `NetworkObservedState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedNetworkState {
+    pub ap: ObservedInterfaceStatus,
+    pub wifi_client: ObservedInterfaceStatus,
+    pub wired: ObservedInterfaceStatus,
+    pub default_route: ObservedDefaultRoute,
+    pub mdns: crate::mdns::MdnsStatus,
+    pub devices: Vec<NetworkDeviceInfo>,
+}
+
+impl Default for ObservedNetworkState {
+    fn default() -> Self {
+        Self {
+            ap: ObservedInterfaceStatus::default(),
+            wifi_client: ObservedInterfaceStatus::default(),
+            wired: ObservedInterfaceStatus::default(),
+            default_route: ObservedDefaultRoute::None,
+            mdns: crate::mdns::MdnsStatus::for_host(
+                "miro-ego",
+                crate::mdns::DEFAULT_MDNS_PORT,
+                crate::mdns::MdnsScheme::Http,
+            ),
+            devices: Vec::new(),
+        }
+    }
+}
+
 /// Observed link, IPv4, route, and signal snapshot for an interface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceLinkSnapshot {
@@ -380,13 +438,112 @@ pub fn is_usable_ipv4(addr: Ipv4Addr) -> bool {
 /// Escape leading whitespace and backslashes for NetworkManager keyfiles.
 fn keyfile_escape(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\");
-    let leading_spaces = escaped.bytes().take_while(|&b| b == b' ').count();
-    let mut out = String::with_capacity(escaped.len() + leading_spaces);
-    for _ in 0..leading_spaces {
-        out.push_str("\\s");
+    let mut out = String::with_capacity(escaped.len() + 4);
+    let mut chars = escaped.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            ' ' => {
+                out.push_str("\\s");
+                chars.next();
+            }
+            '\t' => {
+                out.push_str("\\t");
+                chars.next();
+            }
+            _ => break,
+        }
     }
-    out.push_str(&escaped[leading_spaces..]);
+    out.extend(chars);
     out
+}
+
+/// Unescape a `GKeyFile` string value (stripping only unescaped leading horizontal whitespace
+/// after `=` while preserving valid trailing spaces).
+fn keyfile_unescape(raw_after_eq: &str) -> String {
+    let trimmed_start = raw_after_eq
+        .trim_end_matches('\r')
+        .trim_start_matches([' ', '\t']);
+    let mut out = String::with_capacity(trimmed_start.len());
+    let mut chars = trimmed_start.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('s') => out.push(' '),
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Return `true` when `value` would be parsed by NetworkManager's `read_array_of_uint8`
+/// (`g_key_file_get_integer_list` with all elements in `0..=255`), which would otherwise
+/// misinterpret numeric/semicolon SSIDs such as `"101"` or `"10;20"` as raw byte indices.
+fn is_nm_uint8_list_ambiguous(value: &str) -> bool {
+    let body = value.strip_suffix(';').unwrap_or(value);
+    if body.is_empty() {
+        return false;
+    }
+    let mut count = 0usize;
+    for part in body.split(';') {
+        let token = part.trim();
+        if token.is_empty() {
+            return false;
+        }
+        let Ok(num) = token.parse::<i64>() else {
+            return false;
+        };
+        if !(0..=255).contains(&num) {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0
+}
+
+/// Encode an SSID for `[wifi] ssid=` in `.nmconnection`, protecting integer-shaped SSIDs
+/// from NetworkManager's `uint8` array ambiguity while keeping normal ASCII SSIDs readable.
+fn format_nm_ssid_value(ssid: &str) -> String {
+    if is_nm_uint8_list_ambiguous(ssid) {
+        let mut encoded: Vec<String> = ssid.bytes().map(|b| b.to_string()).collect();
+        encoded.push(String::new());
+        encoded.join(";")
+    } else {
+        keyfile_escape(ssid)
+    }
+}
+
+/// Parse `[wifi] ssid=` from `.nmconnection`, handling both `uint8;` byte lists and
+/// `GKeyFile`-escaped UTF-8 strings (preserving valid trailing spaces).
+fn parse_nm_ssid_value(raw_after_eq: &str) -> Option<String> {
+    let trimmed = raw_after_eq
+        .trim_end_matches('\r')
+        .trim_start_matches([' ', '\t']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(';') && is_nm_uint8_list_ambiguous(trimmed) {
+        let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
+        let mut bytes = Vec::new();
+        for part in body.split(';') {
+            let b: u8 = part.trim().parse().ok()?;
+            bytes.push(b);
+        }
+        if let Ok(decoded) = String::from_utf8(bytes) {
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    let unescaped = keyfile_unescape(raw_after_eq);
+    (!unescaped.is_empty()).then_some(unescaped)
 }
 
 /// Generate a deterministic RFC 4122-shaped UUID from a profile name without external dependencies.
@@ -448,7 +605,7 @@ pub fn render_nmconnection(
             lines.extend([
                 "[wifi]".to_owned(),
                 "mode=ap".to_owned(),
-                format!("ssid={}", keyfile_escape(ssid)),
+                format!("ssid={}", format_nm_ssid_value(ssid)),
                 String::new(),
                 "[wifi-security]".to_owned(),
                 "key-mgmt=wpa-psk".to_owned(),
@@ -468,7 +625,7 @@ pub fn render_nmconnection(
             lines.extend([
                 "[wifi]".to_owned(),
                 "mode=infrastructure".to_owned(),
-                format!("ssid={}", keyfile_escape(ssid)),
+                format!("ssid={}", format_nm_ssid_value(ssid)),
                 String::new(),
             ]);
             if *security != WifiSecurity::Open {
@@ -552,7 +709,8 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
     let mut has_timestamp_or_perms = false;
 
     for raw_line in content.lines() {
-        let line = raw_line.trim();
+        let no_cr = raw_line.trim_end_matches('\r');
+        let line = no_cr.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
@@ -560,18 +718,27 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
             section = line[1..line.len() - 1].to_owned();
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
+        if let Some((k, v)) = no_cr.split_once('=') {
             let key = k.trim();
-            let val = v.trim();
+            let val_trimmed = v.trim();
             match (section.as_str(), key) {
-                ("connection", "autoconnect") => autoconnect_false = val == "false",
+                ("connection", "autoconnect") => autoconnect_false = val_trimmed == "false",
                 ("connection", "timestamp") | ("connection", "permissions") => {
                     has_timestamp_or_perms = true;
                 }
-                ("wifi", "ssid") if !val.is_empty() => existing_ssid = Some(val.to_owned()),
-                ("wifi-security", "psk") if !val.is_empty() => existing_psk = Some(val.to_owned()),
-                ("wifi-security", "key-mgmt") => key_mgmt = Some(val.to_owned()),
-                ("ipv4", "address1") => ipv4_addr = Some(val.to_owned()),
+                ("wifi", "ssid") => {
+                    if let Some(parsed_ssid) = parse_nm_ssid_value(v) {
+                        existing_ssid = Some(parsed_ssid);
+                    }
+                }
+                ("wifi-security", "psk") => {
+                    let parsed_psk = keyfile_unescape(v);
+                    if !parsed_psk.is_empty() {
+                        existing_psk = Some(parsed_psk);
+                    }
+                }
+                ("wifi-security", "key-mgmt") => key_mgmt = Some(val_trimmed.to_owned()),
+                ("ipv4", "address1") => ipv4_addr = Some(val_trimmed.to_owned()),
                 _ => {}
             }
         }
@@ -579,7 +746,7 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
 
     let customized_outside_psk = has_timestamp_or_perms
         || key_mgmt.as_deref().unwrap_or("wpa-psk") != "wpa-psk"
-        || existing_ssid.as_deref() != Some(keyfile_escape(expected_ssid).as_str())
+        || existing_ssid.as_deref() != Some(expected_ssid)
         || ipv4_addr.as_deref() != Some(DEFAULT_HOTSPOT_IPV4_CIDR);
 
     ExistingHotspotProfile {
@@ -1022,14 +1189,14 @@ impl NmcliBackend {
         Ok(items)
     }
 
-    /// List NetworkManager devices (`DEVICE,TYPE,STATE`).
+    /// List NetworkManager devices (`DEVICE,TYPE,STATE`) using `--escape yes`.
     pub fn list_devices(&self) -> NetworkResult<Vec<NetworkDeviceInfo>> {
         let out = self.runner.run(
             "nmcli",
             &[
                 "--terse",
                 "--escape",
-                "no",
+                "yes",
                 "--fields",
                 "DEVICE,TYPE,STATE",
                 "device",
@@ -1044,20 +1211,37 @@ impl NmcliBackend {
         }
         let mut devices = Vec::new();
         for line in out.stdout.lines() {
-            let mut parts = line.splitn(3, ':');
-            if let (Some(iface), Some(dtype), Some(state)) =
-                (parts.next(), parts.next(), parts.next())
-            {
-                if !iface.is_empty() {
-                    devices.push(NetworkDeviceInfo {
-                        interface: iface.to_owned(),
-                        device_type: dtype.to_owned(),
-                        state: state.to_owned(),
-                    });
-                }
+            let Some(fields) = split_nmcli_terse_escaped(line) else {
+                continue;
+            };
+            if fields.len() == 3 && !fields[0].is_empty() {
+                devices.push(NetworkDeviceInfo {
+                    interface: sanitize_device_token(&fields[0]),
+                    device_type: sanitize_device_token(&fields[1]),
+                    state: sanitize_device_state_token(&fields[2]),
+                });
             }
         }
+        devices.truncate(64);
         Ok(devices)
+    }
+
+    /// Disconnect a NetworkManager-managed interface (e.g. when leaving managed Ethernet mode).
+    pub fn disconnect_device(&self, interface: &str) -> NetworkResult<()> {
+        let out = self.runner.run(
+            "nmcli",
+            &["device", "disconnect", interface],
+            Duration::from_secs(10),
+        )?;
+        if out.exit_code != 0 {
+            return Err(NetworkError::Backend {
+                message: format!(
+                    "device_disconnect_failed: {interface}: {}",
+                    out.stderr.trim()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Write a `.nmconnection` profile atomically (`0600`) and reload NetworkManager.
@@ -1416,20 +1600,202 @@ impl NmcliBackend {
         let text = fs::read_to_string(self.profile_path(profile_name)).ok()?;
         let mut in_wifi = false;
         for raw in text.lines() {
-            let line = raw.trim();
+            let no_cr = raw.trim_end_matches('\r');
+            let line = no_cr.trim();
             if line.starts_with('[') && line.ends_with(']') {
                 in_wifi = line == "[wifi]";
                 continue;
             }
             if in_wifi {
-                if let Some(val) = line.strip_prefix("ssid=") {
-                    if !val.is_empty() {
-                        return Some(val.to_owned());
+                if let Some((k, v)) = no_cr.split_once('=') {
+                    if k.trim() == "ssid" {
+                        if let Some(ssid) = parse_nm_ssid_value(v) {
+                            return Some(ssid);
+                        }
                     }
                 }
             }
         }
         None
+    }
+
+    /// Build a live `ObservedNetworkState` snapshot matching OpenAPI `NetworkObservedState`.
+    pub fn observed_network_state(
+        &self,
+        rescue_ssid: Option<&str>,
+        mdns_hostname: &str,
+        mdns_port: u16,
+        mdns_scheme: crate::mdns::MdnsScheme,
+    ) -> ObservedNetworkState {
+        let wlan_snap = self.inspect_device(&self.wifi_interface).ok();
+        let eth_snap = self.inspect_device(&self.ethernet_interface).ok();
+        let devices = self.list_devices().unwrap_or_default();
+
+        let (ap, wifi_client, wifi_default_metric) = match &wlan_snap {
+            None => (
+                ObservedInterfaceStatus {
+                    state: "unavailable".to_owned(),
+                    interface: None,
+                    addresses: Vec::new(),
+                    peer_or_ssid: rescue_ssid.map(str::to_owned),
+                },
+                ObservedInterfaceStatus {
+                    state: "unavailable".to_owned(),
+                    interface: None,
+                    addresses: Vec::new(),
+                    peer_or_ssid: None,
+                },
+                None,
+            ),
+            Some(snap) if snap.connected => {
+                let is_ap = snap
+                    .connection
+                    .as_deref()
+                    .is_some_and(|c| c.contains("hotspot"))
+                    || snap
+                        .ipv4_addresses
+                        .iter()
+                        .any(|a| a == DEFAULT_HOTSPOT_IPV4_CIDR);
+                let ips = strip_cidr_prefixes(&usable_ipv4_cidrs(&snap.ipv4_addresses));
+                let resolved_ssid = snap.ssid.clone().or_else(|| {
+                    snap.connection
+                        .as_deref()
+                        .and_then(|profile| self.read_profile_ssid(profile))
+                });
+                if is_ap {
+                    let ap_ssid = resolved_ssid.or_else(|| rescue_ssid.map(str::to_owned));
+                    let ap_status = if ips.is_empty() {
+                        ObservedInterfaceStatus {
+                            state: "starting".to_owned(),
+                            interface: Some(self.wifi_interface.clone()),
+                            addresses: Vec::new(),
+                            peer_or_ssid: ap_ssid,
+                        }
+                    } else {
+                        ObservedInterfaceStatus {
+                            state: "active".to_owned(),
+                            interface: Some(self.wifi_interface.clone()),
+                            addresses: ips,
+                            peer_or_ssid: ap_ssid,
+                        }
+                    };
+                    let sta_status = ObservedInterfaceStatus {
+                        state: "disconnected".to_owned(),
+                        interface: Some(self.wifi_interface.clone()),
+                        addresses: Vec::new(),
+                        peer_or_ssid: None,
+                    };
+                    (ap_status, sta_status, None)
+                } else {
+                    let ap_status = ObservedInterfaceStatus {
+                        state: "disabled".to_owned(),
+                        interface: Some(self.wifi_interface.clone()),
+                        addresses: Vec::new(),
+                        peer_or_ssid: rescue_ssid.map(str::to_owned),
+                    };
+                    let metric = has_default_route(&snap.routes)
+                        .then(|| default_route_metric(&snap.routes).unwrap_or(600));
+                    let sta_status = if ips.is_empty() {
+                        ObservedInterfaceStatus {
+                            state: "connecting".to_owned(),
+                            interface: Some(self.wifi_interface.clone()),
+                            addresses: Vec::new(),
+                            peer_or_ssid: resolved_ssid,
+                        }
+                    } else {
+                        ObservedInterfaceStatus {
+                            state: "connected".to_owned(),
+                            interface: Some(self.wifi_interface.clone()),
+                            addresses: ips,
+                            peer_or_ssid: resolved_ssid,
+                        }
+                    };
+                    (ap_status, sta_status, metric)
+                }
+            }
+            Some(_) => (
+                ObservedInterfaceStatus {
+                    state: "disabled".to_owned(),
+                    interface: Some(self.wifi_interface.clone()),
+                    addresses: Vec::new(),
+                    peer_or_ssid: rescue_ssid.map(str::to_owned),
+                },
+                ObservedInterfaceStatus {
+                    state: "disconnected".to_owned(),
+                    interface: Some(self.wifi_interface.clone()),
+                    addresses: Vec::new(),
+                    peer_or_ssid: None,
+                },
+                None,
+            ),
+        };
+
+        let (wired, eth_default_metric) = match &eth_snap {
+            None => (
+                ObservedInterfaceStatus {
+                    state: "unavailable".to_owned(),
+                    interface: None,
+                    addresses: Vec::new(),
+                    peer_or_ssid: None,
+                },
+                None,
+            ),
+            Some(snap) if snap.connected => {
+                let ips = strip_cidr_prefixes(&usable_ipv4_cidrs(&snap.ipv4_addresses));
+                let metric = has_default_route(&snap.routes)
+                    .then(|| default_route_metric(&snap.routes).unwrap_or(100));
+                let status = if ips.is_empty() {
+                    ObservedInterfaceStatus {
+                        state: "connecting".to_owned(),
+                        interface: Some(self.ethernet_interface.clone()),
+                        addresses: Vec::new(),
+                        peer_or_ssid: None,
+                    }
+                } else {
+                    ObservedInterfaceStatus {
+                        state: "connected".to_owned(),
+                        interface: Some(self.ethernet_interface.clone()),
+                        addresses: ips,
+                        peer_or_ssid: None,
+                    }
+                };
+                (status, metric)
+            }
+            Some(_) => (
+                ObservedInterfaceStatus {
+                    state: "disconnected".to_owned(),
+                    interface: Some(self.ethernet_interface.clone()),
+                    addresses: Vec::new(),
+                    peer_or_ssid: None,
+                },
+                None,
+            ),
+        };
+
+        let default_route = match (wifi_default_metric, eth_default_metric) {
+            (Some(wm), Some(em)) => {
+                if wm < em {
+                    ObservedDefaultRoute::WifiClient
+                } else {
+                    ObservedDefaultRoute::Wired
+                }
+            }
+            (Some(_), None) => ObservedDefaultRoute::WifiClient,
+            (None, Some(_)) => ObservedDefaultRoute::Wired,
+            (None, None) => ObservedDefaultRoute::None,
+        };
+
+        let clean_host = sanitize_mdns_hostname(mdns_hostname);
+        let mdns = crate::mdns::MdnsStatus::for_host(&clean_host, mdns_port, mdns_scheme);
+
+        ObservedNetworkState {
+            ap,
+            wifi_client,
+            wired,
+            default_route,
+            mdns,
+            devices,
+        }
     }
 
     /// Verify that `expected_profile` is active on the expected interface with valid IPv4 & routes.
@@ -1515,6 +1881,118 @@ impl NmcliBackend {
         }
         removed.sort();
         Ok(removed)
+    }
+
+    /// Prune superseded managed `miro-ego-*.nmconnection` profiles while always preserving
+    /// `miro-ego-hotspot-rescue-*` and any profile stem listed in `keep_profiles`.
+    pub fn prune_managed_profiles(
+        &self,
+        keep_profiles: &HashSet<String>,
+    ) -> NetworkResult<Vec<String>> {
+        let mut removed = Vec::new();
+        if !self.profile_dir.is_dir() {
+            return Ok(removed);
+        }
+        let entries = fs::read_dir(&self.profile_dir).map_err(|err| NetworkError::Backend {
+            message: format!("failed to scan profile dir: {err}"),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| NetworkError::Backend {
+                message: format!("failed to read profile dir entry: {err}"),
+            })?;
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = file_name.strip_suffix(".nmconnection") else {
+                continue;
+            };
+            if !stem.starts_with("miro-ego-")
+                || stem.starts_with("miro-ego-hotspot-rescue-")
+                || keep_profiles.contains(stem)
+            {
+                continue;
+            }
+            fs::remove_file(entry.path()).map_err(|err| NetworkError::Backend {
+                message: format!("failed to prune superseded profile {file_name}: {err}"),
+            })?;
+            removed.push(file_name);
+        }
+        if !removed.is_empty() {
+            let _ = fsync_directory(&self.profile_dir);
+            self.reload_connections()?;
+        }
+        removed.sort();
+        Ok(removed)
+    }
+}
+
+fn strip_cidr_prefixes(cidrs: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(cidrs.len());
+    for cidr in cidrs {
+        let ip = cidr.split('/').next().unwrap_or(cidr).to_owned();
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+fn default_route_metric(routes: &[String]) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for route in routes {
+        if !has_default_route(std::slice::from_ref(route)) {
+            continue;
+        }
+        for part in route.split(',') {
+            let trimmed = part.trim();
+            if let Some(rest) = trimmed.strip_prefix("mt") {
+                if let Some(val) = rest.trim_start().strip_prefix('=') {
+                    if let Ok(m) = val.trim().parse::<u32>() {
+                        best = Some(best.map_or(m, |cur| cur.min(m)));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn sanitize_device_token(raw: &str) -> String {
+    let mut out: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if out.is_empty() {
+        out.push_str("unknown");
+    }
+    out
+}
+
+fn sanitize_device_state_token(raw: &str) -> String {
+    let head = raw.split_whitespace().next().unwrap_or("unknown");
+    sanitize_device_token(head)
+}
+
+fn sanitize_mdns_hostname(raw: &str) -> String {
+    let stem = raw
+        .trim()
+        .strip_suffix(".local")
+        .unwrap_or_else(|| raw.trim());
+    let cleaned: String = stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .take(120)
+        .collect();
+    if cleaned.is_empty() {
+        "miro-ego".to_owned()
+    } else {
+        cleaned
     }
 }
 
@@ -1671,5 +2149,87 @@ mod tests {
         assert!(!has_default_route(&[
             "dst = 192.168.10.0/24, nh = 0.0.0.0, mt = 100".to_owned()
         ]));
+    }
+
+    #[test]
+    fn unescapes_keyfile_ssids_preserves_trailing_spaces_and_encodes_integer_ssids() {
+        let dir = temp_dir("keyfile-ssid");
+        let runner = Arc::new(CountingScanRunner {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            stdout: String::new(),
+        });
+        let backend = NmcliBackend::new(runner, &dir, "wlan0", "eth0");
+
+        // Leading/trailing spaces + backslashes round-trip without stripping trailing space.
+        backend
+            .write_profile(
+                "miro-ego-wifi-client-spaced",
+                &ProfileSpec::WifiClient {
+                    ssid: "  Lab\\Cafe  ".to_owned(),
+                    security: WifiSecurity::Open,
+                    psk: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            backend.read_profile_ssid("miro-ego-wifi-client-spaced"),
+            Some("  Lab\\Cafe  ".to_owned())
+        );
+
+        // Numeric / semicolon-shaped SSIDs ("101", "10;20") encode safely as NM uint8 lists
+        // and round-trip losslessly.
+        for numeric_ssid in ["101", "0", "255", "10;20"] {
+            let prof = format!("miro-ego-wifi-client-{}", numeric_ssid.replace(';', "_"));
+            backend
+                .write_profile(
+                    &prof,
+                    &ProfileSpec::WifiClient {
+                        ssid: numeric_ssid.to_owned(),
+                        security: WifiSecurity::Open,
+                        psk: None,
+                    },
+                )
+                .unwrap();
+            let raw = fs::read_to_string(backend.profile_path(&prof)).unwrap();
+            assert!(!raw.contains(&format!("ssid={numeric_ssid}\n")));
+            assert_eq!(
+                backend.read_profile_ssid(&prof),
+                Some(numeric_ssid.to_owned())
+            );
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn list_devices_uses_escaped_terse_parsing_for_colon_interfaces() {
+        struct DeviceListRunner;
+        impl CommandRunner for DeviceListRunner {
+            fn run(
+                &self,
+                _program: &str,
+                args: &[&str],
+                _timeout: Duration,
+            ) -> NetworkResult<CommandOutput> {
+                assert!(args.windows(2).any(|w| w == ["--escape", "yes"]));
+                Ok(CommandOutput {
+                    exit_code: 0,
+                    stdout: "wlan0:wifi:connected (externally)\neth0\\:0:ethernet:disconnected\n"
+                        .to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let dir = temp_dir("dev-list");
+        let backend = NmcliBackend::new(Arc::new(DeviceListRunner), &dir, "wlan0", "eth0");
+        let devs = backend.list_devices().unwrap();
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].interface, "wlan0");
+        assert_eq!(devs[0].state, "connected");
+        assert_eq!(devs[1].interface, "eth0:0");
+        assert_eq!(devs[1].device_type, "ethernet");
+        assert_eq!(devs[1].state, "disconnected");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

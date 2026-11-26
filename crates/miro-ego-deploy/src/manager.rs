@@ -6,28 +6,38 @@
 //! health checks, automatic rollback on activation failure, and crash transaction recovery.
 
 use crate::bundle::{
-    DefaultOfflinePackageHook, OfflinePackageHook, VerifiedBundle, validate_commit_sha,
-    verify_bundle_dir,
+    DefaultOfflinePackageHook, OfflinePackageHook, VerifiedBundle, copy_and_verify_safe,
+    validate_commit_sha, verify_bundle_dir,
 };
 use crate::{
     DeployError, DeployResult, FIRMWARE_STATUS_SCHEMA, FirmwareManager, ReleaseInfo, UpdateStage,
 };
+use miro_ego_core::config::{ListenConfig, SecurityConfig, load_device_config};
 use miro_ego_core::ids::new_uuid_v4;
 use miro_ego_core::locks::{LockMode, acquire_flock, acquire_maintenance_lock};
 use miro_ego_core::paths::{
     SYSTEM_CONFIG_DIR, SYSTEM_INSTALL_ROOT, SYSTEM_RUN_DIR, SYSTEM_STATE_DIR,
 };
-use miro_ego_core::sys::fs::{fsync_directory, read_bounded_json, write_bytes_atomic};
+use miro_ego_core::sys::fs::{
+    fsync_directory, read_bounded_bytes, read_bounded_json, write_bytes_atomic,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{Cursor, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 pub const RELEASE_METADATA_SCHEMA: &str = "miro-ego.installed-release.v1";
 pub const INSTALL_TRANSACTION_SCHEMA: &str = "miro-ego.install-transaction.v1";
@@ -203,6 +213,24 @@ pub const DEPLOYMENT_ASSETS: &[AssetSpec] = &[
         mode: 0o644,
         preserve_if_exists: false,
     },
+    AssetSpec {
+        source_name: "90-miro-ego-leds.rules",
+        dest_relative: "etc/udev/rules.d/90-miro-ego-leds.rules",
+        mode: 0o644,
+        preserve_if_exists: false,
+    },
+    AssetSpec {
+        source_name: "miro-ego-deploy.socket",
+        dest_relative: "usr/lib/systemd/system/miro-ego-deploy.socket",
+        mode: 0o644,
+        preserve_if_exists: false,
+    },
+    AssetSpec {
+        source_name: "miro-ego-deploy.service",
+        dest_relative: "usr/lib/systemd/system/miro-ego-deploy.service",
+        mode: 0o644,
+        preserve_if_exists: false,
+    },
 ];
 
 const CORE_UNITS: &[&str] = &[
@@ -210,37 +238,136 @@ const CORE_UNITS: &[&str] = &[
     "miro-ego-network.socket",
     "miro-ego.service",
 ];
+const DEPLOY_SOCKET_UNIT: &str = "miro-ego-deploy.socket";
 const RECOVER_UNIT: &str = "miro-ego-recover.service";
 const NETWORK_SERVICE_UNIT: &str = "miro-ego-network.service";
 const BUTTON_UNIT: &str = "miro-ego-button.service";
 const WATCHDOG_SERVICE_UNIT: &str = "miro-ego-wifi-watchdog.service";
 const WATCHDOG_TIMER_UNIT: &str = "miro-ego-wifi-watchdog.timer";
+pub const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Trait-abstracted `systemctl` / system unit controller for hermetic testing.
+/// Trait-abstracted `systemctl` / system bootstrap controller for hermetic testing.
 pub trait SystemctlRunner: Send + Sync {
     fn run_systemctl(&self, args: &[&str]) -> DeployResult<()>;
     fn unit_load_state(&self, unit: &str) -> DeployResult<String>;
+
+    /// Execute an auxiliary bootstrap utility (`systemd-sysusers`, `systemd-tmpfiles`,
+    /// `udevadm`, `/usr/local/sbin/miro-ego-device-login`). Default is a no-op for mocks.
+    fn run_bootstrap_command(&self, program: &str, args: &[&str]) -> DeployResult<()> {
+        let _ = (program, args);
+        Ok(())
+    }
 }
 
-/// Real OS `systemctl` runner with bounded timeout.
+/// Real OS `systemctl` & bootstrap runner with bounded 60s execution timeout.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealSystemctlRunner;
 
-impl SystemctlRunner for RealSystemctlRunner {
+/// Configurable-timeout OS `systemctl` & bootstrap runner.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedSystemctlRunner {
+    timeout: Duration,
+}
+
+impl RealSystemctlRunner {
+    pub fn with_timeout(timeout: Duration) -> BoundedSystemctlRunner {
+        BoundedSystemctlRunner { timeout }
+    }
+}
+
+fn kill_bounded_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        if pid > 0 {
+            // SAFETY: `child` was placed in its own process group (`process_group(0)`),
+            // so `-pid` targets only the spawned command and its descendants.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_command_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> DeployResult<(i32, String, String)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|err| DeployError::Failed {
+        message: format!("failed to invoke {program} {}: {err}", args.join(" ")),
+    })?;
+
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = out_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(ref mut p) = err_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_bounded_process_group(&mut child);
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(DeployError::Failed {
+                        message: format!(
+                            "{program} {} timed out after {}s",
+                            args.join(" "),
+                            timeout.as_secs()
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                kill_bounded_process_group(&mut child);
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(DeployError::Failed {
+                    message: format!("failed waiting on {program} {}: {err}", args.join(" ")),
+                });
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_handle.join().unwrap_or_default()).into_owned();
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
+}
+
+impl SystemctlRunner for BoundedSystemctlRunner {
     fn run_systemctl(&self, args: &[&str]) -> DeployResult<()> {
-        let status = Command::new("systemctl")
-            .args(args)
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|err| DeployError::Failed {
-                message: format!("failed to invoke systemctl {}: {err}", args.join(" ")),
-            })?;
-        if !status.success() {
+        let (code, _stdout, stderr) = run_command_bounded("systemctl", args, self.timeout)?;
+        if code != 0 {
             return Err(DeployError::Failed {
                 message: format!(
-                    "systemctl {} exited with status {:?}",
+                    "systemctl {} exited with status {code}: {}",
                     args.join(" "),
-                    status.code()
+                    stderr.trim()
                 ),
             });
         }
@@ -248,20 +375,46 @@ impl SystemctlRunner for RealSystemctlRunner {
     }
 
     fn unit_load_state(&self, unit: &str) -> DeployResult<String> {
-        let output = Command::new("systemctl")
-            .args(["show", "--property=LoadState", "--value", unit])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|err| DeployError::Failed {
-                message: format!("failed to query systemd unit state for {unit}: {err}"),
-            })?;
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !output.status.success() || state.is_empty() || state.contains('\n') {
+        let (code, stdout, _stderr) = run_command_bounded(
+            "systemctl",
+            &["show", "--property=LoadState", "--value", unit],
+            self.timeout,
+        )?;
+        let state = stdout.trim().to_owned();
+        if code != 0 || state.is_empty() || state.contains('\n') {
             return Err(DeployError::Failed {
                 message: format!("invalid systemd unit LoadState for {unit}"),
             });
         }
         Ok(state)
+    }
+
+    fn run_bootstrap_command(&self, program: &str, args: &[&str]) -> DeployResult<()> {
+        let (code, _stdout, stderr) = run_command_bounded(program, args, self.timeout)?;
+        if code != 0 {
+            return Err(DeployError::Failed {
+                message: format!(
+                    "{program} {} exited with status {code}: {}",
+                    args.join(" "),
+                    stderr.trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl SystemctlRunner for RealSystemctlRunner {
+    fn run_systemctl(&self, args: &[&str]) -> DeployResult<()> {
+        Self::with_timeout(DEFAULT_SYSTEM_COMMAND_TIMEOUT).run_systemctl(args)
+    }
+
+    fn unit_load_state(&self, unit: &str) -> DeployResult<String> {
+        Self::with_timeout(DEFAULT_SYSTEM_COMMAND_TIMEOUT).unit_load_state(unit)
+    }
+
+    fn run_bootstrap_command(&self, program: &str, args: &[&str]) -> DeployResult<()> {
+        Self::with_timeout(DEFAULT_SYSTEM_COMMAND_TIMEOUT).run_bootstrap_command(program, args)
     }
 }
 
@@ -270,12 +423,111 @@ pub trait HealthChecker: Send + Sync {
     fn check_health(&self) -> DeployResult<()>;
 }
 
-/// Loopback HTTP health checker querying `GET /api/v1/device` until healthy or timed out.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    pinned_ders: Vec<CertificateDer<'static>>,
+    supported: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let matched = self.pinned_ders.iter().any(|pinned| {
+            pinned.as_ref().len() == end_entity.as_ref().len()
+                && bool::from(pinned.as_ref().ct_eq(end_entity.as_ref()))
+        });
+        if matched {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate does not match pinned device certificate".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+fn build_pinned_tls_client_config(cert_pem: &[u8]) -> DeployResult<Arc<ClientConfig>> {
+    let mut reader = Cursor::new(cert_pem);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| DeployError::Failed {
+            message: format!("failed parsing pinned TLS certificate PEM: {err}"),
+        })?;
+    if certs.is_empty() {
+        return Err(DeployError::Failed {
+            message: "pinned TLS certificate PEM contains no CERTIFICATE blocks".to_owned(),
+        });
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let supported = provider.signature_verification_algorithms;
+    let verifier = Arc::new(PinnedCertVerifier {
+        pinned_ders: certs,
+        supported,
+    });
+    let cfg = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| DeployError::Failed {
+            message: format!("failed configuring TLS protocol versions: {err}"),
+        })?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+fn loopback_addr_from_listen(listen: &ListenConfig) -> Option<SocketAddr> {
+    let ip: IpAddr = listen.host.parse().ok()?;
+    let target_ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        concrete => concrete,
+    };
+    Some(SocketAddr::new(target_ip, listen.port))
+}
+
+fn format_authority_host(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+/// Loopback HTTP/HTTPS health checker querying `GET /api/v1/device` until healthy or timed out.
 #[derive(Debug, Clone)]
 pub struct LocalHttpHealthChecker {
     addr: SocketAddr,
     timeout: Duration,
     poll_interval: Duration,
+    tls_config: Option<Arc<ClientConfig>>,
+    bearer_token: Option<String>,
 }
 
 impl LocalHttpHealthChecker {
@@ -284,24 +536,120 @@ impl LocalHttpHealthChecker {
             addr,
             timeout,
             poll_interval: Duration::from_millis(250),
+            tls_config: None,
+            bearer_token: None,
+        }
+    }
+
+    /// Configure pinned-certificate TLS (`https`) and optional `Authorization: Bearer` token.
+    pub fn with_tls_and_bearer(
+        mut self,
+        cert_pem: &[u8],
+        bearer_token: Option<String>,
+    ) -> DeployResult<Self> {
+        self.tls_config = Some(build_pinned_tls_client_config(cert_pem)?);
+        self.bearer_token = bearer_token;
+        Ok(self)
+    }
+
+    /// Construct a health checker from `/etc/miro-ego/device.json` (handling custom `listen.port`
+    /// and `security.profile == "customer"` HTTPS + Bearer token), falling back to plain HTTP on
+    /// `fallback_addr` when `config_path` does not exist yet.
+    pub fn from_device_config_path(
+        config_path: &Path,
+        fallback_addr: SocketAddr,
+        timeout: Duration,
+    ) -> DeployResult<Self> {
+        match fs::symlink_metadata(config_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::new(fallback_addr, timeout));
+            }
+            Err(err) => {
+                return Err(DeployError::Failed {
+                    message: format!("cannot inspect device config {}: {err}", config_path.display()),
+                });
+            }
+            Ok(_) => {}
+        }
+
+        let cfg = load_device_config(config_path).map_err(|err| DeployError::Failed {
+            message: format!("failed loading device config {}: {err}", config_path.display()),
+        })?;
+        let addr = loopback_addr_from_listen(&cfg.listen).unwrap_or(fallback_addr);
+        let checker = Self::new(addr, timeout);
+        match cfg.security {
+            SecurityConfig::Lab { .. } => Ok(checker),
+            SecurityConfig::Customer {
+                bearer_token_file,
+                tls_certificate_file,
+                ..
+            } => {
+                let raw_tok =
+                    read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| DeployError::Failed {
+                        message: format!(
+                            "failed reading customer bearer token {}: {err}",
+                            bearer_token_file.display()
+                        ),
+                    })?;
+                let token = String::from_utf8(raw_tok)
+                    .map_err(|_| DeployError::Failed {
+                        message: "customer bearer token is not valid UTF-8".to_owned(),
+                    })?
+                    .trim()
+                    .to_owned();
+                if token.is_empty() {
+                    return Err(DeployError::Failed {
+                        message: "customer bearer token file is empty".to_owned(),
+                    });
+                }
+                let cert_pem = read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
+                    DeployError::Failed {
+                        message: format!(
+                            "failed reading customer TLS certificate {}: {err}",
+                            tls_certificate_file.display()
+                        ),
+                    }
+                })?;
+                checker.with_tls_and_bearer(&cert_pem, Some(token))
+            }
         }
     }
 
     fn probe_once(&self) -> Result<(), String> {
-        let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2))
+        let tcp = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2))
             .map_err(|e| e.to_string())?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        let req = format!(
-            "GET /api/v1/device HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.addr
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_secs(2)));
+
+        let authority = format_authority_host(&self.addr);
+        let mut req = format!(
+            "GET /api/v1/device HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n"
         );
-        stream
-            .write_all(req.as_bytes())
-            .and_then(|()| stream.flush())
-            .map_err(|e| e.to_string())?;
+        if let Some(tok) = &self.bearer_token {
+            req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+        }
+        req.push_str("\r\n");
+
         let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = if let Some(tls_cfg) = &self.tls_config {
+            let server_name = ServerName::try_from("localhost").map_err(|e| e.to_string())?;
+            let conn =
+                ClientConnection::new(Arc::clone(tls_cfg), server_name).map_err(|e| e.to_string())?;
+            let mut tls_stream = StreamOwned::new(conn, tcp);
+            tls_stream
+                .write_all(req.as_bytes())
+                .and_then(|()| tls_stream.flush())
+                .map_err(|e| e.to_string())?;
+            tls_stream.read(&mut buf).map_err(|e| e.to_string())?
+        } else {
+            let mut plain = tcp;
+            plain
+                .write_all(req.as_bytes())
+                .and_then(|()| plain.flush())
+                .map_err(|e| e.to_string())?;
+            plain.read(&mut buf).map_err(|e| e.to_string())?
+        };
+
         let line = String::from_utf8_lossy(&buf[..n]);
         if line.starts_with("HTTP/1.1 200") || line.starts_with("HTTP/1.0 200") {
             Ok(())
@@ -363,6 +711,8 @@ pub struct InstallTransaction {
     pub transaction_id: String,
     pub action: TransactionAction,
     pub old_current: Option<String>,
+    #[serde(default)]
+    pub old_previous: Option<String>,
     pub new_current: String,
     pub state: TransactionState,
 }
@@ -385,6 +735,8 @@ pub struct DeploymentStatus {
     pub current: Option<String>,
     pub current_version: Option<String>,
     pub previous: Option<String>,
+    #[serde(default)]
+    pub previous_version: Option<String>,
     pub transaction_pending: bool,
     pub activation_failure: Option<ActivationFailureRecord>,
     pub recovery_delegated: bool,
@@ -474,11 +826,19 @@ impl ReleaseManager {
         &self.paths
     }
 
+    pub fn offline_hook(&self) -> &dyn OfflinePackageHook {
+        self.offline_hook.as_ref()
+    }
+
     /// Inspect current A/B installation status without taking mutating locks.
     pub fn status(&self) -> DeployResult<DeploymentStatus> {
         let current = self.read_link_commit("current")?;
         let previous = self.read_link_commit("previous")?;
         let current_version = match &current {
+            Some(commit) => self.read_release_metadata(commit).ok().map(|m| m.version),
+            None => None,
+        };
+        let previous_version = match &previous {
             Some(commit) => self.read_release_metadata(commit).ok().map(|m| m.version),
             None => None,
         };
@@ -490,6 +850,7 @@ impl ReleaseManager {
             current,
             current_version,
             previous,
+            previous_version,
             transaction_pending,
             activation_failure,
             recovery_delegated: false,
@@ -506,58 +867,71 @@ impl ReleaseManager {
         let verified = verify_bundle_dir(bundle_path)?;
         self.offline_hook.pre_install_verify(&verified)?;
 
-        let release_dir = self.stage_release(&verified)?;
         let old_current = self.read_link_commit("current")?;
+        let old_previous = self.read_link_commit("previous")?;
         let new_commit = verified.commit().to_owned();
         let release_changed = old_current.as_deref() != Some(new_commit.as_str());
+        let replacing_live_commit =
+            old_current.as_deref() == Some(new_commit.as_str()) && self.paths.releases_dir().join(&new_commit).exists();
 
-        let quiesced = old_current.is_some() && (activate || release_changed);
+        // Quiesce running services BEFORE mutating/replacing any live release directory or unit!
+        let quiesced =
+            old_current.is_some() && (activate || release_changed || replacing_live_commit);
         if quiesced {
             self.quiesce_services()?;
         }
 
-        let mut tx_started = false;
-        let switch_res = (|| -> DeployResult<()> {
-            if release_changed {
-                let tx = InstallTransaction {
-                    schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
-                    transaction_id: new_uuid_v4(),
-                    action: TransactionAction::Install,
-                    old_current: old_current.clone(),
-                    new_current: new_commit.clone(),
-                    state: TransactionState::Prepared,
-                };
-                self.write_transaction(&tx)?;
-                tx_started = true;
+        let release_dir = self.stage_release(&verified)?;
+        let tx = InstallTransaction {
+            schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
+            transaction_id: new_uuid_v4(),
+            action: TransactionAction::Install,
+            old_current: old_current.clone(),
+            old_previous: old_previous.clone(),
+            new_current: new_commit.clone(),
+            state: TransactionState::Prepared,
+        };
+        self.write_transaction(&tx)?;
 
-                self.install_assets_from_release(&release_dir)?;
-                self.systemctl.run_systemctl(&["daemon-reload"])?;
-                self.settle_transaction(&tx)?;
-            } else {
-                self.install_assets_from_release(&release_dir)?;
-                self.systemctl.run_systemctl(&["daemon-reload"])?;
+        let switch_res = (|| -> DeployResult<()> {
+            self.install_assets_from_release(&release_dir)?;
+            self.systemctl.run_systemctl(&["daemon-reload"])?;
+            self.bootstrap_system()?;
+            if release_changed {
+                self.switch_current_for_transaction(&tx)?;
             }
             Ok(())
         })();
 
         if let Err(err) = switch_res {
-            // Roll back partial switch before returning error.
             if let Some(old) = &old_current {
                 let old_dir = self.paths.releases_dir().join(old);
                 let _ = self.install_assets_from_release(&old_dir);
             }
-            if tx_started {
-                let _ = self.revert_switch(old_current.as_deref(), &new_commit);
-            }
+            let _ = self.revert_to_previous_links(old_current.as_deref(), old_previous.as_deref());
             if quiesced {
                 let _ = self.systemctl.run_systemctl(&["daemon-reload"]);
+                let _ = self.bootstrap_system();
                 let _ = self.start_services(false);
             }
             return Err(err);
         }
 
+        let committed_previous = if release_changed {
+            old_current.as_deref()
+        } else {
+            old_previous.as_deref()
+        };
+
         if activate {
-            self.activate_or_rollback(old_current.as_deref(), &new_commit)?;
+            self.activate_or_rollback(
+                old_current.as_deref(),
+                old_previous.as_deref(),
+                committed_previous,
+                &new_commit,
+            )?;
+        } else {
+            self.finalize_verified_switch(&new_commit, committed_previous)?;
         }
 
         self.status()
@@ -587,6 +961,7 @@ impl ReleaseManager {
             transaction_id: new_uuid_v4(),
             action: TransactionAction::Rollback,
             old_current: Some(current.clone()),
+            old_previous: Some(previous.clone()),
             new_current: previous.clone(),
             state: TransactionState::Prepared,
         };
@@ -596,21 +971,31 @@ impl ReleaseManager {
         let switch_res = (|| -> DeployResult<()> {
             self.install_assets_from_release(&prev_dir)?;
             self.systemctl.run_systemctl(&["daemon-reload"])?;
-            self.settle_transaction(&tx)?;
+            self.bootstrap_system()?;
+            self.switch_current_for_transaction(&tx)?;
             Ok(())
         })();
 
         if let Err(err) = switch_res {
             let cur_dir = self.paths.releases_dir().join(&current);
             let _ = self.install_assets_from_release(&cur_dir);
-            let _ = self.revert_switch(Some(&current), &previous);
+            let _ = self.revert_to_previous_links(Some(&current), Some(&previous));
             let _ = self.systemctl.run_systemctl(&["daemon-reload"]);
+            let _ = self.bootstrap_system();
             let _ = self.start_services(false);
             return Err(err);
         }
 
+        let committed_previous = (current != previous).then_some(current.as_str());
         if activate {
-            self.activate_or_rollback(Some(&current), &previous)?;
+            self.activate_or_rollback(
+                Some(&current),
+                Some(&previous),
+                committed_previous,
+                &previous,
+            )?;
+        } else {
+            self.finalize_verified_switch(&previous, committed_previous)?;
         }
 
         self.status()
@@ -681,6 +1066,7 @@ impl ReleaseManager {
             }
         }
         let _ = fs::remove_file(self.paths.run_dir.join("network-control.sock"));
+        let _ = fs::remove_file(self.paths.run_dir.join("deploy-control.sock"));
         self.systemctl.run_systemctl(&["daemon-reload"])?;
 
         Ok(UninstallReport {
@@ -694,34 +1080,67 @@ impl ReleaseManager {
     fn recover_locked(&self) -> DeployResult<DeploymentStatus> {
         let mut assets_restored = false;
         if let Some(tx) = self.read_transaction()? {
-            let target_dir = self.paths.releases_dir().join(&tx.new_current);
-            let target_valid = self.release_is_complete(&tx.new_current);
-
-            if target_valid {
-                self.install_assets_from_release(&target_dir)?;
-                assets_restored = true;
-                self.settle_transaction(&tx)?;
-            } else if let Some(old) = &tx.old_current {
-                let old_dir = self.paths.releases_dir().join(old);
-                if self.release_is_complete(old) {
-                    self.install_assets_from_release(&old_dir)?;
-                    assets_restored = true;
+            match tx.action {
+                TransactionAction::Install => {
+                    // An uncommitted `Install` transaction on disk (`Prepared` or `Switched`)
+                    // never completed post-activation health verification: always revert safely
+                    // back to `old_current` + `old_previous`!
+                    if let Some(old) = &tx.old_current {
+                        let old_dir = self.paths.releases_dir().join(old);
+                        if self.release_is_complete(old) {
+                            self.install_assets_from_release(&old_dir)?;
+                            assets_restored = true;
+                            self.revert_to_previous_links(
+                                Some(old.as_str()),
+                                tx.old_previous.as_deref(),
+                            )?;
+                        } else {
+                            self.revert_to_previous_links(None, tx.old_previous.as_deref())?;
+                        }
+                    } else {
+                        self.revert_to_previous_links(None, tx.old_previous.as_deref())?;
+                    }
                 }
-                self.revert_switch(Some(old), &tx.new_current)?;
-            } else {
-                self.revert_switch(None, &tx.new_current)?;
+                TransactionAction::Rollback => {
+                    let target_dir = self.paths.releases_dir().join(&tx.new_current);
+                    if self.release_is_complete(&tx.new_current) {
+                        self.install_assets_from_release(&target_dir)?;
+                        assets_restored = true;
+                        let next_prev = tx
+                            .old_current
+                            .as_deref()
+                            .filter(|&o| o != tx.new_current.as_str());
+                        self.switch_current_for_transaction(&tx)?;
+                        self.finalize_verified_switch(&tx.new_current, next_prev)?;
+                    } else if let Some(old) = &tx.old_current {
+                        let old_dir = self.paths.releases_dir().join(old);
+                        if self.release_is_complete(old) {
+                            self.install_assets_from_release(&old_dir)?;
+                            assets_restored = true;
+                        }
+                        self.revert_to_previous_links(
+                            Some(old.as_str()),
+                            tx.old_previous.as_deref(),
+                        )?;
+                    } else {
+                        self.revert_to_previous_links(None, tx.old_previous.as_deref())?;
+                    }
+                }
             }
         }
 
         if assets_restored {
             let _ = self.systemctl.run_systemctl(&["daemon-reload"]);
+            let _ = self.bootstrap_system();
         }
 
-        // Remove any orphaned staging directories left by crashed installs.
+        // Remove any orphaned staging or backup directories left by crashed installs.
         if let Ok(entries) = fs::read_dir(self.paths.releases_dir()) {
             for entry in entries.filter_map(Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && name.contains(".staging-") {
+                if name.starts_with('.')
+                    && (name.contains(".staging-") || name.contains(".backup-"))
+                {
                     let path = entry.path();
                     if fs::symlink_metadata(&path)
                         .map(|m| m.file_type().is_dir())
@@ -739,10 +1158,13 @@ impl ReleaseManager {
     fn activate_or_rollback(
         &self,
         old_current: Option<&str>,
+        old_previous: Option<&str>,
+        committed_previous: Option<&str>,
         new_current: &str,
     ) -> DeployResult<()> {
         match self.start_services(true) {
             Ok(()) => {
+                self.finalize_verified_switch(new_current, committed_previous)?;
                 let _ = fs::remove_file(self.paths.activation_failure_file());
                 Ok(())
             }
@@ -763,15 +1185,16 @@ impl ReleaseManager {
 
                 let rollback_result: DeployResult<()> = if let Some(old) = old_current {
                     if release_changed {
-                        self.restore_previous_release(old, new_current)
+                        self.restore_previous_release(old, old_previous)
                     } else {
-                        self.deactivate_units()
+                        let deact = self.deactivate_units();
+                        let rev = self.revert_to_previous_links(Some(old), old_previous);
+                        deact.and(rev)
                     }
                 } else {
                     let deact = self.deactivate_units();
-                    let sw1 = self.switch_symlink("current", None);
-                    let sw2 = self.switch_symlink("previous", Some(new_current));
-                    deact.and(sw1).and(sw2)
+                    let rev = self.revert_to_previous_links(None, old_previous);
+                    deact.and(rev)
                 };
 
                 if let Err(rb_err) = rollback_result {
@@ -799,22 +1222,14 @@ impl ReleaseManager {
     fn restore_previous_release(
         &self,
         old_current: &str,
-        failed_release: &str,
+        old_previous: Option<&str>,
     ) -> DeployResult<()> {
         self.quiesce_services()?;
-        let tx = InstallTransaction {
-            schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
-            transaction_id: new_uuid_v4(),
-            action: TransactionAction::Rollback,
-            old_current: Some(failed_release.to_owned()),
-            new_current: old_current.to_owned(),
-            state: TransactionState::Prepared,
-        };
-        self.write_transaction(&tx)?;
         let old_dir = self.paths.releases_dir().join(old_current);
         self.install_assets_from_release(&old_dir)?;
-        self.settle_transaction(&tx)?;
+        self.revert_to_previous_links(Some(old_current), old_previous)?;
         self.systemctl.run_systemctl(&["daemon-reload"])?;
+        self.bootstrap_system()?;
         self.start_services(false)?;
         Ok(())
     }
@@ -839,24 +1254,26 @@ impl ReleaseManager {
 
         let stage_result = (|| -> DeployResult<()> {
             for entry in verified.all_entries() {
-                let src = verified.root.join(&entry.path);
+                let rel = Path::new(&entry.path);
                 let dst = stage_dir.join(&entry.path);
                 if let Some(parent) = dst.parent() {
                     ensure_dir_tree_mode(parent, &stage_dir, 0o755)?;
                 }
-                let payload = fs::read(&src).map_err(|err| DeployError::Failed {
-                    message: format!("failed reading verified bundle entry {}: {err}", entry.path),
-                })?;
-                let mode = if entry.executable || entry.path.starts_with("bin/") {
+                let is_binary = entry.path.starts_with("bin/");
+                let mode = if entry.executable || is_binary {
                     0o755
                 } else {
                     0o644
                 };
-                write_bytes_atomic(&dst, &payload, mode, true).map_err(|err| {
-                    DeployError::Failed {
-                        message: format!("failed staging {}: {err}", entry.path),
-                    }
-                })?;
+                let _ = copy_and_verify_safe(
+                    Some(&verified.root),
+                    rel,
+                    &dst,
+                    mode,
+                    Some(entry.bytes),
+                    &entry.sha256,
+                    is_binary,
+                )?;
             }
 
             let meta = InstalledReleaseMetadata {
@@ -975,24 +1392,30 @@ impl ReleaseManager {
             == Some("customer")
     }
 
-    fn settle_transaction(&self, tx: &InstallTransaction) -> DeployResult<()> {
+    fn switch_current_for_transaction(&self, tx: &InstallTransaction) -> DeployResult<()> {
         let _ = self.read_release_metadata(&tx.new_current)?;
         if tx.state == TransactionState::Prepared {
             self.switch_symlink("current", Some(&tx.new_current))?;
             let mut switched = tx.clone();
             switched.state = TransactionState::Switched;
             self.write_transaction(&switched)?;
+        } else {
+            self.switch_symlink("current", Some(&tx.new_current))?;
         }
+        Ok(())
+    }
 
-        let previous_target = tx
-            .old_current
-            .as_deref()
-            .filter(|&old| old != tx.new_current.as_str());
-        self.switch_symlink("previous", previous_target)?;
+    fn finalize_verified_switch(
+        &self,
+        new_current: &str,
+        previous_target: Option<&str>,
+    ) -> DeployResult<()> {
+        let normalized_prev = previous_target.filter(|&prev| prev != new_current);
+        self.switch_symlink("previous", normalized_prev)?;
 
         let mut keep = HashSet::new();
-        keep.insert(tx.new_current.clone());
-        if let Some(prev) = previous_target {
+        keep.insert(new_current.to_owned());
+        if let Some(prev) = normalized_prev {
             keep.insert(prev.to_owned());
         }
         self.prune_releases(&keep)?;
@@ -1002,9 +1425,17 @@ impl ReleaseManager {
         Ok(())
     }
 
-    fn revert_switch(&self, old_current: Option<&str>, new_current: &str) -> DeployResult<()> {
+    fn revert_to_previous_links(
+        &self,
+        old_current: Option<&str>,
+        old_previous: Option<&str>,
+    ) -> DeployResult<()> {
         self.switch_symlink("current", old_current)?;
-        self.switch_symlink("previous", Some(new_current))?;
+        let normalized_prev = match (old_current, old_previous) {
+            (Some(cur), Some(prev)) if cur == prev => None,
+            (_, prev) => prev,
+        };
+        self.switch_symlink("previous", normalized_prev)?;
         let _ = fs::remove_file(self.paths.transaction_file());
         let _ = fsync_directory(&self.paths.state_root);
         Ok(())
@@ -1034,20 +1465,100 @@ impl ReleaseManager {
         Ok(())
     }
 
-    fn quiesce_services(&self) -> DeployResult<()> {
-        let recover_state = self.systemctl.unit_load_state(RECOVER_UNIT)?;
-        let mut cmds: Vec<&[&str]> = vec![
-            &["disable", "--now", WATCHDOG_TIMER_UNIT],
-            &["stop", WATCHDOG_SERVICE_UNIT],
-            &["stop", "miro-ego.service"],
-            &["stop", "miro-ego-network.socket"],
-            &["stop", NETWORK_SERVICE_UNIT],
-        ];
-        if recover_state != "not-found" {
-            cmds.push(&["stop", RECOVER_UNIT]);
+    fn bootstrap_system(&self) -> DeployResult<()> {
+        let sysusers_conf = self
+            .paths
+            .system_root
+            .join("usr/lib/sysusers.d/miro-ego.conf");
+        if sysusers_conf.is_file() {
+            let arg = sysusers_conf.to_string_lossy().into_owned();
+            self.systemctl
+                .run_bootstrap_command("systemd-sysusers", &[&arg])?;
         }
-        for cmd in cmds {
-            self.systemctl.run_systemctl(cmd)?;
+
+        let tmpfiles_conf = self
+            .paths
+            .system_root
+            .join("usr/lib/tmpfiles.d/miro-ego.conf");
+        if tmpfiles_conf.is_file() {
+            let arg = tmpfiles_conf.to_string_lossy().into_owned();
+            self.systemctl
+                .run_bootstrap_command("systemd-tmpfiles", &["--create", &arg])?;
+        }
+
+        self.ensure_service_ownership_if_root()?;
+
+        let udev_rules = self
+            .paths
+            .system_root
+            .join("etc/udev/rules.d/90-miro-ego-leds.rules");
+        if udev_rules.is_file() {
+            self.systemctl
+                .run_bootstrap_command("udevadm", &["control", "--reload-rules"])?;
+            let _ = self
+                .systemctl
+                .run_bootstrap_command("udevadm", &["trigger", "--subsystem-match=leds"]);
+        }
+
+        let device_login = self
+            .paths
+            .system_root
+            .join("usr/local/sbin/miro-ego-device-login");
+        if device_login.is_file() {
+            let prog = device_login.to_string_lossy().into_owned();
+            self.systemctl.run_bootstrap_command(&prog, &[])?;
+        }
+        Ok(())
+    }
+
+    fn ensure_service_ownership_if_root(&self) -> DeployResult<()> {
+        create_dir_with_mode(&self.paths.config_root, 0o750)?;
+        create_dir_with_mode(&self.paths.state_root, 0o750)?;
+        create_dir_with_mode(&self.paths.run_dir, 0o755)?;
+
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(());
+        }
+        let (Some(uid), Some(gid)) = lookup_miro_ego_uid_gid() else {
+            return Ok(());
+        };
+        chown_path(&self.paths.config_root, 0, gid);
+        for name in [
+            "device.json",
+            "settings.json",
+            "button.json",
+            "network.json",
+            "bearer.token",
+        ] {
+            let p = self.paths.config_root.join(name);
+            if fs::symlink_metadata(&p).is_ok() {
+                chown_path(&p, 0, gid);
+            }
+        }
+        chown_path(&self.paths.state_root, uid, gid);
+        chown_path(&self.paths.run_dir, uid, gid);
+        Ok(())
+    }
+
+    fn unit_exists(&self, unit: &str) -> DeployResult<bool> {
+        Ok(self.systemctl.unit_load_state(unit)? != "not-found")
+    }
+
+    fn quiesce_services(&self) -> DeployResult<()> {
+        if self.unit_exists(WATCHDOG_TIMER_UNIT)? {
+            self.systemctl
+                .run_systemctl(&["disable", "--now", WATCHDOG_TIMER_UNIT])?;
+        }
+        for unit in [
+            WATCHDOG_SERVICE_UNIT,
+            "miro-ego.service",
+            "miro-ego-network.socket",
+            NETWORK_SERVICE_UNIT,
+            RECOVER_UNIT,
+        ] {
+            if self.unit_exists(unit)? {
+                self.systemctl.run_systemctl(&["stop", unit])?;
+            }
         }
         Ok(())
     }
@@ -1055,36 +1566,53 @@ impl ReleaseManager {
     fn start_services(&self, check_health: bool) -> DeployResult<()> {
         self.systemctl
             .run_systemctl(&["try-restart", "systemd-journald.service"])?;
-        self.systemctl
-            .run_systemctl(&["enable", "--now", "logrotate.timer"])?;
+        if self.unit_exists("logrotate.timer")? {
+            self.systemctl
+                .run_systemctl(&["enable", "--now", "logrotate.timer"])?;
+        }
+        if self.unit_exists(DEPLOY_SOCKET_UNIT)? {
+            self.systemctl
+                .run_systemctl(&["enable", "--now", DEPLOY_SOCKET_UNIT])?;
+        }
         for unit in CORE_UNITS {
             self.systemctl.run_systemctl(&["enable", "--now", unit])?;
         }
         if check_health {
             self.health.check_health()?;
         }
-        let button_enabled = self.button_config_enabled();
-        let button_action = if button_enabled { "enable" } else { "disable" };
-        self.systemctl
-            .run_systemctl(&[button_action, "--now", BUTTON_UNIT])?;
-        self.systemctl
-            .run_systemctl(&["enable", "--now", WATCHDOG_TIMER_UNIT])?;
+        if self.unit_exists(BUTTON_UNIT)? {
+            let button_enabled = self.button_config_enabled();
+            let button_action = if button_enabled { "enable" } else { "disable" };
+            self.systemctl
+                .run_systemctl(&[button_action, "--now", BUTTON_UNIT])?;
+        }
+        if self.unit_exists(WATCHDOG_TIMER_UNIT)? {
+            self.systemctl
+                .run_systemctl(&["enable", "--now", WATCHDOG_TIMER_UNIT])?;
+        }
         Ok(())
     }
 
     fn deactivate_units(&self) -> DeployResult<()> {
-        let cmds: &[&[&str]] = &[
-            &["disable", "--now", WATCHDOG_TIMER_UNIT],
-            &["stop", WATCHDOG_SERVICE_UNIT],
-            &["disable", "--now", BUTTON_UNIT],
-            &["disable", "--now", "miro-ego.service"],
-            &["disable", "--now", "miro-ego-network.socket"],
-            &["stop", NETWORK_SERVICE_UNIT],
-            &["stop", RECOVER_UNIT],
-            &["disable", "--now", "miro-ego-data-volume.service"],
-        ];
-        for cmd in cmds {
-            self.systemctl.run_systemctl(cmd)?;
+        for unit in [
+            WATCHDOG_TIMER_UNIT,
+            BUTTON_UNIT,
+            "miro-ego.service",
+            "miro-ego-network.socket",
+            DEPLOY_SOCKET_UNIT,
+        ] {
+            if self.unit_exists(unit)? {
+                self.systemctl.run_systemctl(&["disable", "--now", unit])?;
+            }
+        }
+        for unit in [WATCHDOG_SERVICE_UNIT, NETWORK_SERVICE_UNIT, RECOVER_UNIT] {
+            if self.unit_exists(unit)? {
+                self.systemctl.run_systemctl(&["stop", unit])?;
+            }
+        }
+        if self.unit_exists("miro-ego-data-volume.service")? {
+            self.systemctl
+                .run_systemctl(&["disable", "--now", "miro-ego-data-volume.service"])?;
         }
         Ok(())
     }
@@ -1104,7 +1632,7 @@ impl ReleaseManager {
         create_dir_with_mode(&self.paths.releases_dir(), 0o755)?;
         create_dir_with_mode(&self.paths.config_root, 0o750)?;
         create_dir_with_mode(&self.paths.state_root, 0o750)?;
-        create_dir_with_mode(&self.paths.run_dir, 0o750)?;
+        create_dir_with_mode(&self.paths.run_dir, 0o755)?;
         Ok(())
     }
 
@@ -1220,6 +1748,9 @@ impl ReleaseManager {
         validate_commit_sha(&tx.new_current)?;
         if let Some(old) = &tx.old_current {
             validate_commit_sha(old)?;
+        }
+        if let Some(old_prev) = &tx.old_previous {
+            validate_commit_sha(old_prev)?;
         }
         Ok(Some(tx))
     }
@@ -1342,6 +1873,35 @@ fn map_lock_err(err: miro_ego_core::CoreError) -> DeployError {
     match err {
         miro_ego_core::CoreError::LockBusy { message } => DeployError::Blocked { message },
         other => DeployError::Core(other),
+    }
+}
+
+fn lookup_miro_ego_uid_gid() -> (Option<u32>, Option<u32>) {
+    let Ok(name_c) = CString::new("miro-ego") else {
+        return (None, None);
+    };
+    unsafe {
+        let pwd = libc::getpwnam(name_c.as_ptr());
+        let uid = if pwd.is_null() {
+            None
+        } else {
+            Some((*pwd).pw_uid)
+        };
+        let grp = libc::getgrnam(name_c.as_ptr());
+        let gid = if grp.is_null() {
+            None
+        } else {
+            Some((*grp).gr_gid)
+        };
+        (uid, gid)
+    }
+}
+
+fn chown_path(path: &Path, uid: u32, gid: u32) {
+    if let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) {
+        unsafe {
+            let _ = libc::chown(path_c.as_ptr(), uid, gid);
+        }
     }
 }
 
@@ -1535,11 +2095,12 @@ mod tests {
         let err = mgr.install(&b2, true).unwrap_err();
         assert!(err.to_string().contains("automatically rolled back"));
 
-        // Current MUST be back on v1, previous points to failed v2, v1's unit file restored,
-        // daemon-reload ran, activation failure recorded, and user button.json preserved!
+        // Current MUST be back on v1, previous MUST remain None (never point to failed v2!),
+        // v1's unit file restored, daemon-reload ran, activation failure recorded, and user button.json preserved!
         let after = mgr.status().unwrap();
         assert_eq!(after.current.as_deref(), Some(commit_v1.as_str()));
-        assert_eq!(after.previous.as_deref(), Some(commit_v2.as_str()));
+        assert_eq!(after.previous, None);
+        assert_eq!(after.previous_version, None);
         assert!(!after.transaction_pending);
         assert!(after.activation_failure.is_some());
         assert!(fs::read_to_string(&unit_path).unwrap().contains("v1"));
@@ -1563,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_transaction_recovery_settles_prepared_and_reverts_broken_targets() {
+    fn crash_transaction_recovery_reverts_unverified_installs_and_settles_rollbacks() {
         let (root, paths) = temp_env("crash-recover");
         let sysctl = MockSystemctl::new();
         let health = Arc::new(ToggleHealth {
@@ -1571,10 +2132,18 @@ mod tests {
         });
         let mgr = ReleaseManager::new(paths.clone(), sysctl.clone(), health);
 
+        let commit_v0 = "0".repeat(40);
         let commit_v1 = "a".repeat(40);
         let commit_v2 = "b".repeat(40);
+        let b0 = root.join("bundles/v0");
         let b1 = root.join("bundles/v1");
         let b2 = root.join("bundles/v2");
+        build_valid_bundle(
+            &b0,
+            "0.2.9",
+            &commit_v0,
+            &[("miro-ego.service", b"[Unit]\nDescription=v0\n", false)],
+        );
         build_valid_bundle(
             &b1,
             "0.3.0",
@@ -1588,11 +2157,17 @@ mod tests {
             &[("miro-ego.service", b"[Unit]\nDescription=v2\n", false)],
         );
 
-        // Install v1 normally, then stage v2 and simulate crash right after writing `prepared` transaction!
+        // Install v0 then v1 normally so current=v1, previous=v0, then stage v2 and simulate crash
+        // during an unverified `Install` (`Prepared` or `Switched` before health check passed)!
+        mgr.install(&b0, false).unwrap();
         mgr.install(&b1, false).unwrap();
+        assert_eq!(
+            mgr.status().unwrap().previous_version.as_deref(),
+            Some("0.2.9")
+        );
+
         let v2_verified = verify_bundle_dir(&b2).unwrap();
         mgr.stage_release(&v2_verified).unwrap();
-        // Also leave a stale staging directory to verify cleanup.
         fs::create_dir_all(paths.releases_dir().join(".deadbeef.staging-orphan")).unwrap();
 
         let crashed_tx = InstallTransaction {
@@ -1600,17 +2175,20 @@ mod tests {
             transaction_id: new_uuid_v4(),
             action: TransactionAction::Install,
             old_current: Some(commit_v1.clone()),
+            old_previous: Some(commit_v0.clone()),
             new_current: commit_v2.clone(),
-            state: TransactionState::Prepared,
+            state: TransactionState::Switched,
         };
+        mgr.switch_symlink("current", Some(&commit_v2)).unwrap();
         mgr.write_transaction(&crashed_tx).unwrap();
         assert!(mgr.status().unwrap().transaction_pending);
 
-        // Boot recovery settles the valid prepared target to v2!
+        // Boot recovery MUST revert unverified Install back to old_current (v1) + old_previous (v0)!
         let recovered = mgr.recover(false).unwrap();
         assert!(!recovered.transaction_pending);
-        assert_eq!(recovered.current.as_deref(), Some(commit_v2.as_str()));
-        assert_eq!(recovered.previous.as_deref(), Some(commit_v1.as_str()));
+        assert_eq!(recovered.current.as_deref(), Some(commit_v1.as_str()));
+        assert_eq!(recovered.previous.as_deref(), Some(commit_v0.as_str()));
+        assert_eq!(recovered.previous_version.as_deref(), Some("0.2.9"));
         assert!(
             !paths
                 .releases_dir()
@@ -1620,29 +2198,26 @@ mod tests {
         assert!(
             fs::read_to_string(root.join("usr/lib/systemd/system/miro-ego.service"))
                 .unwrap()
-                .contains("v2")
+                .contains("v1")
         );
 
-        // Now simulate crash where target release v3 is missing/corrupt -> recovery reverts to v2!
-        let commit_v3 = "c".repeat(40);
-        let bad_tx = InstallTransaction {
+        // Interrupted Rollback (v1 -> v0) settles cleanly to known-good v0!
+        let rollback_tx = InstallTransaction {
             schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
             transaction_id: new_uuid_v4(),
-            action: TransactionAction::Install,
-            old_current: Some(commit_v2.clone()),
-            new_current: commit_v3.clone(),
+            action: TransactionAction::Rollback,
+            old_current: Some(commit_v1.clone()),
+            old_previous: Some(commit_v0.clone()),
+            new_current: commit_v0.clone(),
             state: TransactionState::Prepared,
         };
-        mgr.write_transaction(&bad_tx).unwrap();
+        mgr.write_transaction(&rollback_tx).unwrap();
+        let settled_rb = mgr.recover(false).unwrap();
+        assert!(!settled_rb.transaction_pending);
+        assert_eq!(settled_rb.current.as_deref(), Some(commit_v0.as_str()));
+        assert_eq!(settled_rb.previous.as_deref(), Some(commit_v1.as_str()));
 
-        let reverted = mgr.recover(false).unwrap();
-        assert!(!reverted.transaction_pending);
-        assert_eq!(reverted.current.as_deref(), Some(commit_v2.as_str()));
-
-        // Explicit rollback from v2 -> v1 via FirmwareManager trait!
-        // First ensure v1 is still present (previous was overwritten by commit_v3 during revert,
-        // so point previous back to v1 and invoke FirmwareManager::rollback).
-        mgr.switch_symlink("previous", Some(&commit_v1)).unwrap();
+        // Explicit rollback from v0 -> v1 via FirmwareManager trait!
         let rolled = FirmwareManager::rollback(&mgr).unwrap();
         assert_eq!(rolled.commit_sha, commit_v1);
         assert_eq!(rolled.stage, UpdateStage::RolledBack);
@@ -1719,6 +2294,223 @@ mod tests {
             Err(DeployError::Blocked { .. })
         ));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stages_voice_assets_runs_bootstrap_and_probes_customer_tls_health() {
+        use miro_ego_core::config::{
+            AudioConfig, CameraConfig, DEVICE_CONFIG_SCHEMA, DeviceConfig, DeviceIdentity,
+            EncodingPreset, ListenConfig, RecordingEncoding, SecurityConfig, StorageConfig,
+        };
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::{ServerConfig, ServerConnection};
+        use std::net::TcpListener;
+
+        let (root, paths) = temp_env("tls-bootstrap");
+        fs::create_dir_all(&paths.config_root).unwrap();
+
+        // Generate self-signed cert via rcgen without 127.0.0.1 SAN (proving pinned DER cert
+        // verification succeeds despite hostname mismatch, while wrong cert is rejected!).
+        let certified = rcgen::generate_simple_self_signed(vec!["miro-ego-device.local".into()])
+            .expect("rcgen self-signed");
+        let cert_pem = certified.cert.pem();
+        let key_pem = certified.key_pair.serialize_pem();
+
+        let other_cert =
+            rcgen::generate_simple_self_signed(vec!["attacker.local".into()]).unwrap();
+        let wrong_cert_pem = other_cert.cert.pem();
+
+        let cert_file = paths.config_root.join("tls-cert.pem");
+        let key_file = paths.config_root.join("tls-key.pem");
+        let tok_file = paths.config_root.join("bearer.token");
+        fs::write(&cert_file, cert_pem.as_bytes()).unwrap();
+        fs::write(&key_file, key_pem.as_bytes()).unwrap();
+        fs::write(&tok_file, b"secret-customer-token-99\n").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+
+        let dev_cfg = DeviceConfig {
+            schema: DEVICE_CONFIG_SCHEMA.to_owned(),
+            listen: ListenConfig {
+                host: "0.0.0.0".to_owned(),
+                port: bound_port,
+            },
+            camera: CameraConfig {
+                device: PathBuf::from("/dev/video0"),
+                width: 3840,
+                height: 1080,
+                fps: 60,
+                frame_decimation: 2,
+                exposure_time_absolute: None,
+            },
+            storage: StorageConfig {
+                mountpoint: PathBuf::from("/data"),
+                minimum_available_bytes: 1024,
+                minimum_available_inodes: 64,
+            },
+            state_root: paths.state_root.clone(),
+            device: DeviceIdentity {
+                device_id: new_uuid_v4(),
+                device_label: "Miro-Ego-ABCD1234".to_owned(),
+                hardware_fingerprint: format!("sha256:{}", "f".repeat(64)),
+            },
+            security: SecurityConfig::Customer {
+                isolated_network: true,
+                bearer_token_file: tok_file,
+                tls_certificate_file: cert_file,
+                tls_private_key_file: key_file,
+                principal_id: "customer-admin".to_owned(),
+            },
+            audio: AudioConfig::default(),
+            recording: RecordingEncoding::from_preset(EncodingPreset::Efficient),
+            segment_seconds: 5.0,
+        };
+        let cfg_path = paths.config_root.join("device.json");
+        fs::write(&cfg_path, serde_json::to_vec_pretty(&dev_cfg).unwrap()).unwrap();
+
+        // Spawn a minimal rustls HTTPS server requiring `Authorization: Bearer secret-customer-token-99`.
+        let cert_der = certified.cert.der().clone();
+        let key_der = PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        let srv_cfg = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap(),
+        );
+        listener.set_nonblocking(true).unwrap();
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_srv_loop = Arc::clone(&stop_srv);
+        let srv_handle = std::thread::spawn(move || {
+            while !stop_srv_loop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((tcp, _)) => {
+                        let _ = tcp.set_nonblocking(false);
+                        let _ = tcp.set_read_timeout(Some(Duration::from_millis(500)));
+                        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+                        let conn = ServerConnection::new(Arc::clone(&srv_cfg)).unwrap();
+                        let mut tls = StreamOwned::new(conn, tcp);
+                        let mut buf = [0u8; 2048];
+                        if let Ok(n) = tls.read(&mut buf) {
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            if req.contains("Authorization: Bearer secret-customer-token-99\r\n") {
+                                let _ = tls.write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                                );
+                            } else {
+                                let _ = tls.write_all(
+                                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                            }
+                            let _ = tls.flush();
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Wrong pinned cert MUST fail verification!
+        let bad_checker = LocalHttpHealthChecker::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),
+            Duration::from_millis(300),
+        )
+        .with_tls_and_bearer(
+            wrong_cert_pem.as_bytes(),
+            Some("secret-customer-token-99".to_owned()),
+        )
+        .unwrap();
+        assert!(bad_checker.check_health().is_err());
+
+        // `from_device_config_path` loads Customer cert + Bearer token + custom port and succeeds!
+        let good_checker = Arc::new(
+            LocalHttpHealthChecker::from_device_config_path(
+                &cfg_path,
+                "127.0.0.1:8080".parse().unwrap(),
+                Duration::from_secs(3),
+            )
+            .unwrap(),
+        );
+
+        struct RecordingBootstrapSystemctl {
+            bootstrap_calls: Mutex<Vec<(String, Vec<String>)>>,
+        }
+        impl SystemctlRunner for RecordingBootstrapSystemctl {
+            fn run_systemctl(&self, _args: &[&str]) -> DeployResult<()> {
+                Ok(())
+            }
+            fn unit_load_state(&self, unit: &str) -> DeployResult<String> {
+                if unit == RECOVER_UNIT {
+                    Ok("not-found".to_owned())
+                } else {
+                    Ok("loaded".to_owned())
+                }
+            }
+            fn run_bootstrap_command(&self, program: &str, args: &[&str]) -> DeployResult<()> {
+                self.bootstrap_calls.lock().unwrap().push((
+                    program.to_owned(),
+                    args.iter().map(|s| (*s).to_owned()).collect(),
+                ));
+                Ok(())
+            }
+        }
+
+        let sysctl = Arc::new(RecordingBootstrapSystemctl {
+            bootstrap_calls: Mutex::new(Vec::new()),
+        });
+        let mgr = ReleaseManager::new(paths.clone(), sysctl.clone(), good_checker);
+        let commit = "9".repeat(40);
+        let bundle_dir = root.join("bundles/v-voice");
+        build_valid_bundle(
+            &bundle_dir,
+            "0.3.2",
+            &commit,
+            &[
+                ("miro-ego.sysusers", b"u miro-ego - \"Miro-Ego\"\n", false),
+                ("miro-ego.tmpfiles", b"d /run/miro-ego 0750 root miro-ego -\n", false),
+                ("90-miro-ego-leds.rules", b"SUBSYSTEM==\"leds\"\n", false),
+                ("miro-ego-device-login", b"#!/bin/sh\nexit 0\n", true),
+                ("miro-ego-deploy.socket", b"[Socket]\nListenStream=/run/miro-ego/deploy-control.sock\n", false),
+                ("miro-ego-deploy.service", b"[Service]\nExecStart=/opt/miro-ego/current/bin/miro-ego\n", false),
+                ("share/voice/recording_started.wav", b"RIFF$\x00\x00\x00WAVE", false),
+            ],
+        );
+
+        let st = mgr.install(&bundle_dir, true).unwrap();
+        assert_eq!(st.current.as_deref(), Some(commit.as_str()));
+        assert!(
+            paths
+                .releases_dir()
+                .join(&commit)
+                .join("share/voice/recording_started.wav")
+                .is_file()
+        );
+        assert!(root.join("etc/udev/rules.d/90-miro-ego-leds.rules").is_file());
+        assert!(
+            root.join("usr/lib/systemd/system/miro-ego-deploy.socket")
+                .is_file()
+        );
+        assert!(
+            root.join("usr/lib/systemd/system/miro-ego-deploy.service")
+                .is_file()
+        );
+
+        let calls = sysctl.bootstrap_calls.lock().unwrap();
+        assert!(calls.iter().any(|(p, _)| p == "systemd-sysusers"));
+        assert!(calls.iter().any(|(p, _)| p == "systemd-tmpfiles"));
+        assert!(calls.iter().any(|(p, _)| p == "udevadm"));
+        assert!(calls.iter().any(|(p, _)| p.ends_with("miro-ego-device-login")));
+
+        stop_srv.store(true, Ordering::Release);
+        srv_handle.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

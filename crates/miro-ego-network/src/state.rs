@@ -523,6 +523,97 @@ impl NetworkStateStore {
         Ok(self.lock_state()?.receipts.len())
     }
 
+    pub fn has_active_transaction(&self) -> NetworkResult<bool> {
+        Ok(self.lock_state()?.transaction.current.is_some())
+    }
+
+    /// Look up the authoritative status for a specific `transaction_id` across active,
+    /// latest, and retained receipt windows.
+    pub fn find_transaction_status(
+        &self,
+        transaction_id: &str,
+    ) -> NetworkResult<Option<TransactionStatus>> {
+        let state = self.lock_state()?;
+        if let Some(cur) = &state.transaction.current {
+            if cur.transaction_id == transaction_id {
+                return Ok(Some(cur.status));
+            }
+        }
+        if let Some(latest) = &state.transaction.latest {
+            if latest.transaction_id == transaction_id {
+                return Ok(Some(latest.status));
+            }
+        }
+        if let Some(entry) = state
+            .receipts
+            .iter()
+            .find(|r| r.receipt.transaction.transaction_id == transaction_id)
+        {
+            return Ok(Some(entry.receipt.transaction.status));
+        }
+        Ok(None)
+    }
+
+    /// Settle any non-terminal `transaction.current` left behind by a crashed/restarted
+    /// controller into terminal `Rescued` (when rescue AP is verified active) or `Failed`.
+    pub fn recover_interrupted_transaction(
+        &self,
+        rescued: bool,
+        updated_at: String,
+    ) -> NetworkResult<Option<NetworkTransaction>> {
+        let mut state = self.lock_state()?;
+        if state.transaction.current.is_none() {
+            return Ok(None);
+        }
+
+        let mut next = state.clone();
+        let Some(mut interrupted) = next.transaction.current.take() else {
+            return Ok(None);
+        };
+
+        next.source_revision = next.source_revision.saturating_add(1);
+        let (status, stage, recovery_action) = if rescued {
+            (
+                TransactionStatus::Rescued,
+                TransactionStage::Rescued,
+                RecoveryAction::ReconnectRescueAp,
+            )
+        } else {
+            (
+                TransactionStatus::Failed,
+                TransactionStage::Failed,
+                RecoveryAction::ServiceRequired,
+            )
+        };
+        interrupted.source_revision = next.source_revision;
+        interrupted.status = status;
+        interrupted.stage = stage;
+        interrupted.updated_at = updated_at;
+        interrupted.deadline = None;
+        interrupted.recovery_action = recovery_action;
+        interrupted.rescue.ap_validated = rescued;
+        interrupted.error = Some(TransactionError {
+            code: "network_manager_unavailable".to_owned(),
+            message: "network transaction was interrupted by controller restart".to_owned(),
+            retryable: true,
+        });
+
+        let tx_id = interrupted.transaction_id.clone();
+        for stored in &mut next.receipts {
+            if stored.receipt.transaction.transaction_id == tx_id {
+                stored.receipt.transaction = interrupted.clone();
+            }
+        }
+        next.verified = false;
+        next.transaction.latest = Some(interrupted.clone());
+        prune_receipts(&mut next, MAX_RETAINED_RECEIPTS);
+        next.validate()?;
+        persist_state_atomic(&self.path, &next)?;
+        *state = next;
+
+        Ok(Some(interrupted))
+    }
+
     pub fn set_rescue_info(&self, profile: String, ssid: String) -> NetworkResult<()> {
         let mut state = self.lock_state()?;
         if state.rescue_profile.as_deref() == Some(profile.as_str())
@@ -709,6 +800,11 @@ impl NetworkStateStore {
         }
         if let Some(candidate_slot) = update.retained_candidate {
             next.retained_candidate = candidate_slot;
+        }
+        for stored in &mut next.receipts {
+            if stored.receipt.transaction.transaction_id == transaction_id {
+                stored.receipt.transaction = updated_tx.clone();
+            }
         }
         if update.status.is_terminal() {
             next.transaction.latest = Some(updated_tx.clone());

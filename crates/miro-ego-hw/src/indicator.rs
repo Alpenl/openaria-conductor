@@ -250,12 +250,19 @@ impl IndicatorController for SysfsLedController {
                 delay_on_ms,
                 delay_off_ms,
             } => {
-                // Kernel timer trigger requires nonzero brightness even on inverted LEDs.
+                // Kernel timer trigger drives `max_brightness` during `delay_on` and `0` during
+                // `delay_off`. On active-low (`inverted`) LEDs, `max_brightness` is physically OFF
+                // and `0` is physically ON, so swap on/off durations to preserve physical duty cycle.
+                let (actual_on_ms, actual_off_ms) = if guard.inverted {
+                    (delay_off_ms, delay_on_ms)
+                } else {
+                    (delay_on_ms, delay_off_ms)
+                };
                 self.io
                     .write_attr("brightness", &guard.max_brightness.to_string())?;
                 self.io.write_attr("trigger", "timer")?;
-                self.io.write_attr("delay_on", &delay_on_ms.to_string())?;
-                self.io.write_attr("delay_off", &delay_off_ms.to_string())?;
+                self.io.write_attr("delay_on", &actual_on_ms.to_string())?;
+                self.io.write_attr("delay_off", &actual_off_ms.to_string())?;
             }
         }
 
@@ -380,6 +387,18 @@ mod tests {
             led.set_state(state).unwrap();
             assert_eq!(led.cached_state().unwrap(), Some(state));
         }
+
+        // Inverted asymmetric blink (`Ready`: 150ms physical ON / 1850ms physical OFF) swaps
+        // kernel timer delays (`delay_on=1850`, `delay_off=150`).
+        led.set_state(IndicatorState::Ready).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("delay_on")).unwrap().trim(),
+            "1850"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("delay_off")).unwrap().trim(),
+            "150"
+        );
 
         // Inverted steady Idle illuminates brightness=1; Recording sets brightness=0.
         led.set_state(IndicatorState::Idle).unwrap();
