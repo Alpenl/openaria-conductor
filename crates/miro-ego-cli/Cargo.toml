@@ -1,0 +1,20 @@
+[package]
+name = "miro-ego-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "miro-ego"
+path = "src/main.rs"
+
+[dependencies]
+miro-ego-api.workspace = true
+miro-ego-capture.workspace = true
+miro-ego-core.workspace = true
+miro-ego-deploy.workspace = true
+miro-ego-hw.workspace = true
+miro-ego-network.workspace = true
+miro-ego-storage.workspace = true
+serde_json.workspace = true
