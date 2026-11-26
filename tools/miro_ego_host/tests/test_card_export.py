@@ -1,0 +1,354 @@
+"""Unit tests for the MIRO-EGO exFAT SD-card exporter (recordings, SHA-256, logs, sudo)."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from miro_ego_host import disks
+from miro_ego_host.card_export import export as tool
+from miro_ego_host.tests.fixtures import (
+    build_exfat_image,
+    build_session_manifest,
+    wrap_mbr_disk,
+)
+
+
+def _sample_session_files(*, seed: int = 0) -> tuple[dict[str, bytes], bytes]:
+    left = bytes((i + seed) % 256 for i in range(256)) * 41  # > 2 exFAT clusters (10496 B)
+    right = bytes((255 - i + seed) % 256 for i in range(256)) * 37  # 9472 B
+    wav = b"RIFF" + b"\x00" * 40 + (b"\x01\x02\x03\x04" * 2000)  # 8044 B
+    frames = b'{"frame":0,"host_monotonic_ns":1000}\n{"frame":1,"host_monotonic_ns":34333}\n'
+    imu = b'{"seq":0,"ax":1,"ay":2,"az":3}\n'
+    session_log = b'{"event":"capture_started"}\n'
+    files = {
+        "video/left_00000.mp4": left,
+        "video/right_00000.mp4": right,
+        "audio/audio_00000.wav": wav,
+        "frames.ndjson": frames,
+        "imu.ndjson": imu,
+        "logs/capture.ndjson": session_log,
+    }
+    manifest = build_session_manifest(
+        files,
+        session_id=f"0198c9a8-7a3c-7000-8000-{seed:012d}",
+        extra_log_paths=("logs/capture.ndjson",),
+    )
+    manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+    return files, manifest_bytes
+
+
+def _session_tree(files: dict[str, bytes], manifest_bytes: bytes) -> dict[str, object]:
+    return {
+        "manifest.json": manifest_bytes,
+        "frames.ndjson": files["frames.ndjson"],
+        "imu.ndjson": files["imu.ndjson"],
+        "video": {
+            "left_00000.mp4": files["video/left_00000.mp4"],
+            "right_00000.mp4": files["video/right_00000.mp4"],
+        },
+        "audio": {
+            "audio_00000.wav": files["audio/audio_00000.wav"],
+        },
+        "logs": {
+            "capture.ndjson": files["logs/capture.ndjson"],
+        },
+    }
+
+
+class CardExportExfatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+        self.files1, self.manifest1 = _sample_session_files(seed=1)
+        self.files2, self.manifest2 = _sample_session_files(seed=2)
+        self.watchdog_log = b"2026-11-26T14:00:00Z wlan0 recovered\n" * 40
+        self.app_log = b"INFO miro-ego serve ready\n"
+
+        tree = {
+            "recordings": {
+                "2026-11-26": {
+                    "14-30-05": _session_tree(self.files1, self.manifest1),
+                    "14-30-05_02": _session_tree(self.files2, self.manifest2),
+                },
+                # Legacy top-level UUID folder must be ignored!
+                "0198c9a8-7a3c-7000-8000-000000000099": {
+                    "manifest.json": b'{"legacy":true}',
+                },
+            },
+            # Legacy top-level /sessions folder must be ignored!
+            "sessions": {
+                "2026-11-26": {
+                    "10-00-00": {"manifest.json": b'{"legacy":true}'},
+                },
+            },
+            "logs": {
+                "miro-ego.log": self.app_log,
+                "wifi-watchdog": {
+                    "diagnostic-20261126T140000Z.log": self.watchdog_log,
+                },
+            },
+            "updates": {},
+            ".miro-ego": {
+                "volume.json": b'{"schema":"miro-ego.volume.v1","label":"MIRO-EGO"}\n',
+            },
+        }
+        exfat_bytes = build_exfat_image(
+            tree,
+            label="MIRO-EGO",
+            dirty=False,
+            no_fat_chain_paths={"recordings/2026-11-26/14-30-05/audio/audio_00000.wav"},
+        )
+        # Wrap inside a 3-partition MBR disk image (dummy p1/p2 + real exFAT p3).
+        disk_bytes = wrap_mbr_disk(
+            {
+                1: (0x0C, 64, b"FAT32-DUMMY" + bytes(4096)),
+                2: (0x83, 128, b"EXT4-DUMMY" + bytes(4096)),
+                3: (0x07, 256, exfat_bytes),
+            }
+        )
+        self.card = self.root / "miro-ego-card.img"
+        self.card.write_bytes(disk_bytes)
+
+    def test_mbr_exfat_exports_verified_recordings_and_logs_without_legacy_baggage(self) -> None:
+        before_sha = disks.sha256_file(self.card)
+        dest = self.root / "out"
+        dest.mkdir()
+
+        with tool.volumes(self.card) as found:
+            self.assertEqual(len(found), 1)
+            label, _fs, unclean, volume_label = found[0]
+            self.assertEqual(label, "partition-3")
+            self.assertFalse(unclean)
+            self.assertEqual(volume_label, "MIRO-EGO")
+
+            records = tool.recordings(found)
+            self.assertEqual(
+                [r["id"] for r in records],
+                [
+                    "partition-3/recordings/2026-11-26/14-30-05",
+                    "partition-3/recordings/2026-11-26/14-30-05_02",
+                ],
+            )
+            self.assertTrue(all(r["sealed"] for r in records))
+
+            logs = tool.diagnostic_logs(found)
+            self.assertEqual([item["id"] for item in logs], ["partition-3/logs"])
+
+            output = tool.export_selected(records, dest, log_sources=logs)
+
+        self.assertTrue(output.name.startswith("Miro-Ego-export-"))
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertEqual(report["schema"], "miro-ego.card-export-report.v1")
+        self.assertEqual(report["status"], "complete")
+        self.assertFalse(report["source_dirty"])
+        # 2 recordings * 6 artifacts each = 12 verified manifest artifacts.
+        self.assertEqual(report["verified_artifacts"], 12)
+        # 2 recordings * 7 files + 2 diagnostic log files = 16 exported files.
+        self.assertEqual(len(report["files"]), 16)
+        for entry in report["files"]:
+            exported = output / entry["path"]
+            self.assertEqual(disks.sha256_file(exported), entry["sha256"])
+            self.assertEqual(exported.stat().st_size, entry["bytes"])
+
+        # Verify exact bytes of multi-cluster FAT-chained MP4, NoFatChain WAV, and diagnostic logs.
+        rec1 = output / "partition-3/recordings/2026-11-26/14-30-05"
+        self.assertEqual(
+            (rec1 / "video/left_00000.mp4").read_bytes(), self.files1["video/left_00000.mp4"]
+        )
+        self.assertEqual(
+            (rec1 / "audio/audio_00000.wav").read_bytes(), self.files1["audio/audio_00000.wav"]
+        )
+        self.assertEqual(
+            (
+                output / "partition-3/logs/wifi-watchdog/diagnostic-20261126T140000Z.log"
+            ).read_bytes(),
+            self.watchdog_log,
+        )
+        self.assertEqual((output / "partition-3/logs/miro-ego.log").read_bytes(), self.app_log)
+
+        # Source card image must remain bit-for-bit unmodified.
+        self.assertEqual(disks.sha256_file(self.card), before_sha)
+
+    def test_logs_only_cli_export(self) -> None:
+        dest = self.root / "logs-out"
+        dest.mkdir()
+        tool.main(["--source", str(self.card), "--destination", str(dest), "--logs-only"])
+        export_dirs = list(dest.glob("Miro-Ego-export-*"))
+        self.assertEqual(len(export_dirs), 1)
+        report = json.loads((export_dirs[0] / "export-report.json").read_bytes())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["recordings"], [])
+        self.assertEqual(report["logs"], ["partition-3/logs"])
+        self.assertEqual(len(report["files"]), 2)
+
+    def test_tampered_artifact_fails_manifest_sha256_verification(self) -> None:
+        files, manifest_bytes = _sample_session_files(seed=7)
+        # Corrupt one byte in left video after manifest was computed.
+        tampered = dict(files)
+        tampered["video/left_00000.mp4"] = b"\xff" + files["video/left_00000.mp4"][1:]
+        exfat_img = self.root / "tampered.exfat"
+        exfat_img.write_bytes(
+            build_exfat_image(
+                {
+                    "recordings": {
+                        "2026-11-26": {"15-00-00": _session_tree(tampered, manifest_bytes)}
+                    }
+                }
+            )
+        )
+        dest = self.root / "tampered-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            with self.assertRaisesRegex(RuntimeError, "Manifest SHA-256 mismatch"):
+                tool.export_selected(records, dest)
+        reports = list(dest.glob("Miro-Ego-export-*/export-report.json"))
+        self.assertEqual(len(reports), 1)
+        parsed = json.loads(reports[0].read_bytes())
+        self.assertEqual(parsed["status"], "incomplete")
+        self.assertIn("Manifest SHA-256 mismatch", parsed["error"])
+
+    def test_missing_manifest_artifact_and_bad_schema_rejected(self) -> None:
+        files, manifest_bytes = _sample_session_files(seed=8)
+        tree = _session_tree(files, manifest_bytes)
+        del tree["imu.ndjson"]  # type: ignore[arg-type]
+        exfat_img = self.root / "missing.exfat"
+        exfat_img.write_bytes(build_exfat_image({"recordings": {"2026-11-26": {"15-10-00": tree}}}))
+        dest = self.root / "missing-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            with self.assertRaisesRegex(RuntimeError, "missing manifest artifact"):
+                tool.export_selected(records, dest)
+
+        # Bad manifest schema rejected.
+        bad_manifest = json.dumps(build_session_manifest(files, schema="legacy.session.v0")).encode(
+            "utf-8"
+        )
+        bad_img = self.root / "bad-schema.exfat"
+        bad_img.write_bytes(
+            build_exfat_image(
+                {"recordings": {"2026-11-26": {"15-20-00": _session_tree(files, bad_manifest)}}}
+            )
+        )
+        with tool.volumes(bad_img) as found:
+            records = tool.recordings(found)
+            self.assertFalse(records[0]["sealed"])
+            self.assertIsNotNone(records[0]["manifest_error"])
+            with self.assertRaisesRegex(RuntimeError, "Invalid session manifest"):
+                tool.export_selected(records, dest)
+
+    def test_dirty_exfat_volume_refused_by_default_and_valid_data_length_zero_padded(self) -> None:
+        files, _ = _sample_session_files(seed=9)
+        padded_bytes = b"ABCD" + b"\x00" * 4092  # 4096 bytes, valid_length=4
+        files["imu.ndjson"] = padded_bytes
+        manifest_bytes = json.dumps(
+            build_session_manifest(files, extra_log_paths=("logs/capture.ndjson",))
+        ).encode("utf-8")
+        dirty_img = self.root / "dirty.exfat"
+        dirty_img.write_bytes(
+            build_exfat_image(
+                {"recordings": {"2026-11-26": {"16-00-00": _session_tree(files, manifest_bytes)}}},
+                dirty=True,
+                valid_length_overrides={"recordings/2026-11-26/16-00-00/imu.ndjson": 4},
+            )
+        )
+        dest = self.root / "dirty-out"
+        dest.mkdir()
+        with tool.volumes(dirty_img) as found:
+            records = tool.recordings(found)
+            self.assertTrue(records[0]["dirty"])
+            with self.assertRaisesRegex(RuntimeError, "cleanly"):
+                tool.export_selected(records, dest)
+            output = tool.export_selected(records, dest, allow_dirty=True)
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertTrue(report["source_dirty"])
+        self.assertEqual(
+            (output / "exfat/recordings/2026-11-26/16-00-00/imu.ndjson").read_bytes(),
+            padded_bytes,
+        )
+
+    def test_mounted_directory_export_and_destination_guard(self) -> None:
+        mounted = self.root / "MIRO-EGO"
+        files, manifest_bytes = _sample_session_files(seed=11)
+        rec_dir = mounted / "recordings/2026-11-26/17-00-00"
+        (rec_dir / "video").mkdir(parents=True)
+        (rec_dir / "audio").mkdir(parents=True)
+        (rec_dir / "logs").mkdir(parents=True)
+        (rec_dir / "manifest.json").write_bytes(manifest_bytes)
+        for rel, data in files.items():
+            (rec_dir / rel).write_bytes(data)
+        (mounted / "logs").mkdir(parents=True)
+        (mounted / "logs/service.log").write_bytes(b"ok\n")
+
+        # Exporting into the mounted source tree must be rejected.
+        with self.assertRaisesRegex(RuntimeError, "source card"):
+            tool.destination_check(mounted, mounted / "logs")
+
+        dest = self.root / "mounted-out"
+        dest.mkdir()
+        with tool.volumes(mounted) as found:
+            output = tool.export_selected(
+                tool.recordings(found), dest, log_sources=tool.diagnostic_logs(found)
+            )
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["verified_artifacts"], 6)
+
+    @unittest.skipUnless(os.name == "posix", "sudo UID/GID ownership restoration is POSIX-only")
+    def test_sudo_ownership_restoration_chowns_dirs_files_and_report(self) -> None:
+        dest = self.root / "sudo-out"
+        dest.mkdir()
+        chowned: list[tuple[Path, int, int]] = []
+
+        def fake_chown(path: Path, uid: int, gid: int) -> None:
+            chowned.append((Path(path), uid, gid))
+
+        with (
+            patch.object(os, "geteuid", return_value=0),
+            patch.dict(os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1000"}),
+            patch.object(os, "chown", side_effect=fake_chown),
+            tool.volumes(self.card) as found,
+        ):
+            output = tool.export_selected(tool.recordings(found)[:1], dest)
+
+        chowned_paths = {p for p, uid, gid in chowned if (uid, gid) == (1000, 1000)}
+        self.assertIn(output, chowned_paths)
+        self.assertIn(output / "export-report.json", chowned_paths)
+        self.assertIn(
+            output / "partition-3/recordings/2026-11-26/14-30-05/manifest.json", chowned_paths
+        )
+
+    def test_portable_names_and_linux_destination_check(self) -> None:
+        for bad in ("..", "../escape", "a/b", "a\\b", "CON", "a:b", "x.", "NUL.mp4"):
+            with self.assertRaises(RuntimeError):
+                tool.safe_name(bad)
+        for bad_rel in ("/abs.mp4", "../up.mp4", "manifest.json", "video/a.tmp", "video\\a.mp4"):
+            with self.assertRaises(RuntimeError):
+                tool.safe_artifact_relpath(bad_rel)
+        self.assertEqual(tool.safe_name("left_00000.mp4"), "left_00000.mp4")
+
+        with (
+            patch.object(disks.platform, "system", return_value="Linux"),
+            patch.object(disks, "run", return_value=b"/dev/sdb3\n"),
+            self.assertRaisesRegex(RuntimeError, "source card"),
+        ):
+            tool.destination_check("/dev/sdb", self.root)
+
+        # Prefix-collision device /dev/sdba3 must NOT falsely block /dev/sdb!
+        with (
+            patch.object(disks.platform, "system", return_value="Linux"),
+            patch.object(disks, "run", return_value=b"/dev/sdba3\n"),
+        ):
+            self.assertEqual(tool.destination_check("/dev/sdb", self.root), self.root.resolve())
+
+
+if __name__ == "__main__":
+    unittest.main()

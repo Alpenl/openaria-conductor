@@ -1,0 +1,5 @@
+paramiko>=3.5,<5
+cryptography>=44,<48
+pyfatfs==1.1.0
+# PyFilesystem still imports pkg_resources; keep its provider available.
+setuptools==80.9.0
