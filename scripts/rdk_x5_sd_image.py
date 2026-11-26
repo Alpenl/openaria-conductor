@@ -1,7 +1,10 @@
-"""Build an offline RDK X5 SD image with a dedicated Open Aria /data partition.
+"""Build a legacy/experimental ext4 /data RDK X5 SD test image.
 
 The tool intentionally writes only regular image files. It never mutates a block
 device, mounted filesystem, or the running rootfs on an RDK X5.
+
+Note: For production factory provisioning with the supported exFAT partition 3
+layout (`OPENARIA` / `RECORDINGS`), use `scripts/factory_recovery/` instead.
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -35,10 +36,19 @@ def allowed(name):
     )
 
 
+def _is_rdk_x5_model(raw: bytes) -> bool:
+    try:
+        from rp_ylx.core.board import is_rdk_x5_model
+    except ImportError:
+        text = raw.decode("utf-8", errors="replace")
+        return " ".join(text.replace("\x00", "").split()).casefold() == "d-robotics rdk x5 v1.0"
+    return is_rdk_x5_model(raw)
+
+
 def hardware():
-    model = Path("/proc/device-tree/model").read_bytes().rstrip(b"\0").decode()
+    model = Path("/proc/device-tree/model").read_bytes()
     serial = Path("/proc/device-tree/serial-number").read_bytes().rstrip(b"\0")
-    if model != "D-Robotics RDK X5 V1.0" or not serial or set(serial) == {48}:
+    if not _is_rdk_x5_model(model) or not serial or set(serial) == {48}:
         raise RuntimeError("Unsupported or unidentified board")
     return hashlib.sha256(serial).hexdigest()
 
@@ -164,20 +174,42 @@ def write_files(files):
         path = Path("/", name)
         if any(p.is_symlink() for p in (path, *path.parents)):
             raise RuntimeError("Unsafe configuration destination")
+    import uuid
+
     for name, raw in files.items():
         path = Path("/", name)
+        missing_dirs = []
+        cursor = path.parent
+        while not cursor.exists():
+            missing_dirs.append(cursor)
+            if cursor.parent == cursor:
+                break
+            cursor = cursor.parent
         path.parent.mkdir(parents=True, exist_ok=True)
-        import uuid
+        dir_mode = 0o750 if name.startswith("var/lib/rp-ylx-network") else 0o755
+        for created_dir in reversed(missing_dirs):
+            created_dir.chmod(dir_mode)
 
         temporary = path.with_name(path.name + ".openaria-restore-" + uuid.uuid4().hex)
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as out:
-            out.write(raw)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(temporary, path)
-        if name in {"etc/machine-id", "etc/hostname", "etc/hosts"} or name.endswith(".conf"):
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                out.write(raw)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, path)
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        if name in {
+            "etc/machine-id",
+            "etc/hostname",
+            "etc/hosts",
+            "etc/rp-ylx/recording-button.json",
+        } or name.endswith(".conf"):
             path.chmod(0o644)
+        else:
+            path.chmod(0o600)
         fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(fd)

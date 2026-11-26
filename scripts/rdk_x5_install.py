@@ -21,6 +21,8 @@ def _sha256(path: Path) -> str:
 
 
 def _prepare_runtime(root: Path) -> Path:
+    if root.is_symlink() or (root / "bundle.json").is_symlink():
+        raise RuntimeError("bundle path is unsafe")
     try:
         bundle = json.loads((root / "bundle.json").read_bytes())
         descriptor = bundle["runtime"]
@@ -92,9 +94,24 @@ def _prepare_runtime(root: Path) -> Path:
                     installed_runtime.exists() and not installed_runtime.is_dir()
                 ):
                     raise RuntimeError("package-owned runtime destination is unsafe")
+                stale_runtime: Path | None = None
                 if installed_runtime.exists():
-                    shutil.rmtree(installed_runtime)
-                os.replace(stage / "runtime", installed_runtime)
+                    stale_runtime = root / f".runtime-stale-{os.getpid()}"
+                    if stale_runtime.exists():
+                        shutil.rmtree(stale_runtime)
+                    os.replace(installed_runtime, stale_runtime)
+                try:
+                    os.replace(stage / "runtime", installed_runtime)
+                except BaseException:
+                    if (
+                        stale_runtime is not None
+                        and stale_runtime.exists()
+                        and not installed_runtime.exists()
+                    ):
+                        os.replace(stale_runtime, installed_runtime)
+                    raise
+                if stale_runtime is not None and stale_runtime.exists():
+                    shutil.rmtree(stale_runtime)
     except (OSError, tarfile.TarError) as error:
         raise RuntimeError(f"cannot extract package-owned runtime: {error}") from error
     executable = root / "runtime/bin/python3"
@@ -103,10 +120,14 @@ def _prepare_runtime(root: Path) -> Path:
 
 def main() -> int:
     root = Path(__file__).resolve().parent
-    runtime = root / "runtime/bin/python3"
+    runtime_dir = root / "runtime"
+    runtime = runtime_dir / "bin/python3"
     try:
         using_managed_runtime = (
-            runtime.is_file() and Path(sys.executable).resolve() == runtime.resolve()
+            not runtime_dir.is_symlink()
+            and not runtime.is_symlink()
+            and runtime.is_file()
+            and Path(sys.executable).resolve() == runtime.resolve()
         )
     except OSError:
         using_managed_runtime = False

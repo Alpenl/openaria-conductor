@@ -211,16 +211,38 @@ def _hash_colon_fields(line: str, indexes: set[int]) -> str:
     return ":".join(fields)
 
 
-def redact_value(value: Any, *, key: str | None = None) -> Any:
+def sanitize_argv(argv: list[str]) -> list[str]:
+    """Redact secret flag values such as --bearer-token before storing argv."""
+    sanitized: list[str] = []
+    redact_next = False
+    secret_flags = ("--bearer-token", "--token")
+    for item in argv:
+        if redact_next:
+            sanitized.append("[REDACTED]")
+            redact_next = False
+            continue
+        if item in secret_flags:
+            sanitized.append(item)
+            redact_next = True
+            continue
+        matched = next((flag for flag in secret_flags if item.startswith(flag + "=")), None)
+        if matched is not None:
+            sanitized.append(f"{matched}=[REDACTED]")
+            continue
+        sanitized.append(item)
+    return sanitized
+
+
+def redact_value(value: Any, *, key: str | None = None, secret_values: tuple[str, ...] = ()) -> Any:
     if isinstance(value, dict):
         return {
-            str(item_key): redact_value(item_value, key=str(item_key))
+            str(item_key): redact_value(item_value, key=str(item_key), secret_values=secret_values)
             for item_key, item_value in value.items()
         }
     if isinstance(value, list):
-        return [redact_value(item) for item in value]
+        return [redact_value(item, secret_values=secret_values) for item in value]
     if isinstance(value, tuple):
-        return [redact_value(item) for item in value]
+        return [redact_value(item, secret_values=secret_values) for item in value]
     if not isinstance(value, str):
         return value
 
@@ -229,7 +251,11 @@ def redact_value(value: Any, *, key: str | None = None) -> Any:
         return "[REDACTED]"
     if identifier_key_is_private(key_lower) and value:
         return _stable_hash(value)
-    return redact_text(value)
+    redacted = redact_text(value)
+    for secret in secret_values:
+        if secret and secret in redacted:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
 def identifier_key_is_private(key_lower: str) -> bool:
@@ -582,17 +608,18 @@ def parse_ip_json(result: CommandResult) -> Any:
 
 
 def filesystem_inventory() -> dict[str, Any]:
-    network_dir = Path("/var/lib/rp-ylx/network")
+    network_dir = Path("/var/lib/rp-ylx-network")
     system_connections = Path("/etc/NetworkManager/system-connections")
     paths = [
         network_dir / "rescue.json",
-        network_dir / "last-known-good.json",
-        network_dir / "lkg.json",
+        network_dir / "lkg-wlan0.json",
+        network_dir / "lkg-eth0.json",
+        network_dir / "controller.sqlite3",
         Path("/run/rp-ylx/network-control.sock"),
         Path("/etc/systemd/system/rp-ylx-network-control.service"),
         Path("/etc/systemd/system/rp-ylx-network-control.socket"),
-        Path("/lib/systemd/system/rp-ylx-network-control.service"),
-        Path("/lib/systemd/system/rp-ylx-network-control.socket"),
+        Path("/usr/lib/systemd/system/rp-ylx-network-control.service"),
+        Path("/usr/lib/systemd/system/rp-ylx-network-control.socket"),
         Path("/opt/rp-ylx/current/bin/rp-ylx"),
     ]
     return {
@@ -644,9 +671,11 @@ def collect_preflight(
     expected_commit: str | None,
     bearer_token: str | None,
     runner: ReadOnlyRunner | None = None,
+    argv: list[str] | None = None,
 ) -> dict[str, Any]:
     runner = runner or ReadOnlyRunner()
     started_at = _utc_now()
+    raw_argv = list(sys.argv if argv is None else argv)
 
     http = collect_http(base_url, bearer_token=bearer_token)
     command_sections = collect_commands(runner)
@@ -662,7 +691,7 @@ def collect_preflight(
         "script": {
             "path": str(Path(__file__).resolve()),
             "sha256": _script_sha256(),
-            "argv": sys.argv,
+            "argv": sanitize_argv(raw_argv),
         },
         "target": {
             "hostname": socket.gethostname(),
@@ -727,7 +756,8 @@ def collect_preflight(
             },
         },
     }
-    return redact_value(report)
+    secret_values = (bearer_token,) if bearer_token else ()
+    return redact_value(report, secret_values=secret_values)
 
 
 def collect_http(base_url: str, *, bearer_token: str | None) -> dict[str, dict[str, Any]]:
@@ -921,15 +951,14 @@ def sys_class_net_inventory(root: Path = Path("/sys/class/net")) -> dict[str, An
         return {"available": False, "error": f"{type(exc).__name__}: {exc}", "interfaces": {}}
     inventory: dict[str, Any] = {}
     for interface in interfaces:
+        address = read_text_file(interface / "address")
         inventory[interface.name] = {
             "operstate": read_text_file(interface / "operstate"),
             "carrier": read_text_file(interface / "carrier"),
             "address": {
-                **read_text_file(interface / "address"),
-                "content": _stable_hash(
-                    (read_text_file(interface / "address").get("content") or "").strip()
-                )
-                if read_text_file(interface / "address").get("available")
+                **address,
+                "content": _stable_hash((address.get("content") or "").strip())
+                if address.get("available")
                 else None,
             },
         }
@@ -983,8 +1012,8 @@ def summarize_readiness(
     if not isinstance(network_payload, dict):
         warnings.append("network_payload_unparseable")
     else:
-        capabilities = network_payload.get("capabilities")
-        if isinstance(capabilities, dict) and capabilities.get("same_phy_ap_sta") != "unverified":
+        concurrency = network_payload.get("concurrency_capability")
+        if isinstance(concurrency, dict) and concurrency.get("same_phy_ap_sta") != "unverified":
             warnings.append("unexpected_same_phy_ap_sta_contract_value")
 
     if iw_summary["driver_advertises_same_phy_ap_sta"] != "driver_advertised":
@@ -1040,6 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
         base_url=args.base_url,
         expected_commit=args.expected_commit,
         bearer_token=args.bearer_token,
+        argv=sys.argv if argv is None else [sys.argv[0], *argv],
     )
     write_json(output, report)
     print(output)

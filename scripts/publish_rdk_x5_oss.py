@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -20,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from rp_ylx.deployment import load_bundle  # noqa: E402
+from rp_ylx.deployment import Bundle, DeploymentError, load_bundle  # noqa: E402
 from rp_ylx.update import (  # noqa: E402
     PLATFORM,
     RELEASE_SCHEMA,
@@ -33,6 +35,103 @@ from rp_ylx.update import (  # noqa: E402
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+OPENARIA_RELEASE_SIGNING_KEY_ENV = "OPENARIA_RELEASE_SIGNING_KEY"
+
+
+def _load_signing_key_bytes(signing_key: Path | str) -> bytes:
+    if isinstance(signing_key, Path):
+        if signing_key.is_symlink() or not signing_key.is_file():
+            raise ValueError("发布签名私钥文件缺失或无效")
+        raw = signing_key.read_bytes()
+    else:
+        text = signing_key.strip()
+        if not text:
+            raise ValueError("发布签名私钥为空")
+        if "-----BEGIN" in text:
+            return text.encode("ascii")
+        candidate = Path(text)
+        if candidate.exists():
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError("发布签名私钥文件缺失或无效")
+            raw = candidate.read_bytes()
+        else:
+            raw = text.encode("ascii")
+    if len(raw) > 16 * 1024:
+        raise ValueError("发布签名私钥过大")
+    return raw
+
+
+def _sign_ed25519_bytes(raw_key: bytes, message: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    except ImportError:
+        Ed25519PrivateKey = None
+        load_pem_private_key = None
+
+    if load_pem_private_key is not None and Ed25519PrivateKey is not None:
+        if b"-----BEGIN" in raw_key:
+            key = load_pem_private_key(raw_key, password=None)
+            if not isinstance(key, Ed25519PrivateKey):
+                raise ValueError("发布签名私钥不是 Ed25519")
+            return key.sign(message)
+        if len(raw_key) == 32:
+            return Ed25519PrivateKey.from_private_bytes(raw_key).sign(message)
+        try:
+            decoded = base64.b64decode(raw_key.strip(), validate=True)
+        except ValueError as error:
+            raise ValueError("发布签名私钥格式无效") from error
+        if len(decoded) != 32:
+            raise ValueError("Ed25519 私钥长度无效")
+        return Ed25519PrivateKey.from_private_bytes(decoded).sign(message)
+
+    if b"-----BEGIN" not in raw_key:
+        raise ValueError("未安装 cryptography，仅支持 PEM 格式 Ed25519 私钥")
+    with tempfile.TemporaryDirectory(prefix=".sign-") as temp:
+        root = Path(temp)
+        key_file = root / "priv.pem"
+        msg_file = root / "msg.bin"
+        sig_file = root / "sig.bin"
+        key_file.write_bytes(raw_key)
+        key_file.chmod(0o600)
+        msg_file.write_bytes(message)
+        result = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-sign",
+                "-inkey",
+                str(key_file),
+                "-rawin",
+                "-in",
+                str(msg_file),
+                "-out",
+                str(sig_file),
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError("OpenSSL Ed25519 签名失败")
+        sig = sig_file.read_bytes()
+        if len(sig) != 64:
+            raise ValueError("OpenSSL Ed25519 签名长度无效")
+        return sig
+
+
+def sign_manifest(manifest: dict, signing_key: Path | str) -> str:
+    """Return base64 Ed25519 signature over canonical manifest JSON (excluding signature)."""
+    canonical = json.dumps(
+        {k: v for k, v in manifest.items() if k != "signature"},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    raw_key = _load_signing_key_bytes(signing_key)
+    signature = _sign_ed25519_bytes(raw_key, canonical)
+    return base64.b64encode(signature).decode("ascii")
 
 
 def check_channel_promotion(prepared: dict, config: dict) -> None:
@@ -79,9 +178,16 @@ python3 "$work/update.py" "$@"
 
 
 def prepare(
-    bundle_dir: Path, output: Path, config: dict, *, release_notes: str | None = None
+    bundle_dir: Path,
+    output: Path,
+    config: dict,
+    *,
+    release_notes: str | None = None,
+    signing_key: Path | str | None = None,
+    bundle: Bundle | None = None,
 ) -> dict:
-    bundle = load_bundle(bundle_dir)
+    if bundle is None:
+        bundle = load_bundle(bundle_dir)
     manifest = {
         "schema": RELEASE_SCHEMA,
         "platform": PLATFORM,
@@ -131,8 +237,17 @@ def prepare(
         "bytes": updater.stat().st_size,
         "sha256": updater_hash,
     }
-    (output / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (output / "install.sh").write_text(bootstrap_script(base, updater_key, updater_hash))
+    resolved_key = (
+        signing_key
+        if signing_key is not None
+        else os.environ.get(OPENARIA_RELEASE_SIGNING_KEY_ENV, "").strip() or None
+    )
+    if resolved_key is not None:
+        manifest["signature"] = sign_manifest(manifest, resolved_key)
+    (output / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (output / "install.sh").write_text(
+        bootstrap_script(base, updater_key, updater_hash), encoding="utf-8"
+    )
     return {"manifest": manifest, "bundle_key": bundle_key, "updater_key": updater_key}
 
 
@@ -159,15 +274,17 @@ def publish(output: Path, prepared: dict, config: dict, bucket) -> None:
     base = config["public_base_url"].rstrip("/")
 
     def upload(local: Path, key: str, content_type: str, immutable: bool):
+        local_sha256 = sha256(local)
+        local_bytes = local.stat().st_size
         headers = {
             "Content-Type": content_type,
             "x-oss-object-acl": "public-read",
             "Cache-Control": "public, max-age=31536000, immutable" if immutable else "no-cache",
-            "x-oss-meta-sha256": sha256(local),
+            "x-oss-meta-sha256": local_sha256,
         }
         if immutable:
             headers["x-oss-forbid-overwrite"] = "true"
-        print(f"上传 {key} ({local.stat().st_size} bytes)", file=sys.stderr, flush=True)
+        print(f"上传 {key} ({local_bytes} bytes)", file=sys.stderr, flush=True)
         for attempt in range(3):
             try:
                 bucket.put_object_from_file(prefix + "/" + key, str(local), headers=headers)
@@ -194,10 +311,8 @@ def publish(output: Path, prepared: dict, config: dict, bucket) -> None:
         # Anonymous full GET proves that public access works and verifies exact bytes.
         with tempfile.TemporaryDirectory() as temp:
             downloaded = Path(temp) / "object"
-            download(base + "/" + key, downloaded, local.stat().st_size)
-            if downloaded.stat().st_size != local.stat().st_size or sha256(downloaded) != sha256(
-                local
-            ):
+            download(base + "/" + key, downloaded, local_bytes)
+            if downloaded.stat().st_size != local_bytes or sha256(downloaded) != local_sha256:
                 raise ValueError("OSS 匿名下载内容不匹配，停止发布")
 
     upload(output / "bundle.tar.gz", prepared["bundle_key"], "application/gzip", True)
@@ -210,6 +325,25 @@ def publish(output: Path, prepared: dict, config: dict, bucket) -> None:
     upload(output / "latest.json", "latest.json", "application/json", False)
 
 
+def _redact_local_error(message: str, config: dict | None) -> str:
+    redacted = message
+    for env_name in (
+        "OSS_ACCESS_KEY_ID",
+        "OSS_ACCESS_KEY_SECRET",
+        "OSS_SESSION_TOKEN",
+        OPENARIA_RELEASE_SIGNING_KEY_ENV,
+    ):
+        secret = os.environ.get(env_name, "").strip()
+        if len(secret) >= 4:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    if isinstance(config, dict):
+        for key in ("endpoint", "bucket"):
+            value = config.get(key)
+            if isinstance(value, str) and len(value) >= 4:
+                redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="准备并发布 RDK X5 离线固件到阿里云 OSS")
     parser.add_argument("--bundle-dir", type=Path, required=True)
@@ -220,7 +354,22 @@ def main() -> int:
     parser.add_argument(
         "--aliyun-profile", help="读取本机 ~/.aliyun/config.json；默认使用 OSS 环境凭据"
     )
+    parser.add_argument(
+        "--signing-key",
+        "--signing-key-file",
+        dest="signing_key",
+        help=(
+            "Ed25519 私钥路径（PEM 或 32 字节原始/Base64 密钥）；"
+            "默认读取 OPENARIA_RELEASE_SIGNING_KEY"
+        ),
+    )
+    parser.add_argument(
+        "--allow-unsigned-dev",
+        action="store_true",
+        help="允许开发/测试阶段在无 Ed25519 签名私钥时执行 --publish",
+    )
     args = parser.parse_args()
+    config: dict | None = None
     try:
         config = json.loads(args.config.read_bytes())
         https_url(config["endpoint"])
@@ -228,24 +377,49 @@ def main() -> int:
         if not re.fullmatch(r"[a-z0-9][a-z0-9/\-]*", config["prefix"]):
             raise ValueError("OSS prefix 无效")
         notes = None
+        bundle = load_bundle(args.bundle_dir)
+        resolved_signing_key = (
+            args.signing_key
+            if args.signing_key is not None
+            else os.environ.get(OPENARIA_RELEASE_SIGNING_KEY_ENV, "").strip() or None
+        )
         if args.publish:
-            from release_version import release_tag
+            try:
+                from release_version import release_tag
+            except ImportError:
+                from scripts.release_version import release_tag
 
+            if resolved_signing_key is None and not args.allow_unsigned_dev:
+                raise ValueError(
+                    "正式发布需要提供 Ed25519 签名私钥（OPENARIA_RELEASE_SIGNING_KEY 或 "
+                    "--signing-key-file），或显式指定 --allow-unsigned-dev"
+                )
             if not args.tag:
                 raise ValueError("发布需要 --tag v0.2.x")
             version, notes = release_tag(args.tag)
-            if load_bundle(args.bundle_dir).version != version:
+            if bundle.version != version:
                 raise ValueError("bundle 版本与附注标签不一致")
             commit = subprocess.check_output(
                 ["git", "rev-parse", f"refs/tags/{args.tag}^{{commit}}"], cwd=ROOT, text=True
             ).strip()
-            if load_bundle(args.bundle_dir).commit != commit:
+            if bundle.commit != commit:
                 raise ValueError("bundle commit 与附注标签不一致")
-        prepared = prepare(args.bundle_dir, args.output, config, release_notes=notes)
+        prepared = prepare(
+            args.bundle_dir,
+            args.output,
+            config,
+            release_notes=notes,
+            signing_key=resolved_signing_key,
+            bundle=bundle,
+        )
         if args.publish:
             check_channel_promotion(prepared, config)
             publish(args.output, prepared, config, oss_bucket(config, args.aliyun_profile))
         print(json.dumps({"published": args.publish, **prepared}, ensure_ascii=False))
+    except (ValueError, DeploymentError) as error:
+        detail = _redact_local_error(str(error), config)
+        print(f"发布失败：{type(error).__name__}: {detail}", file=sys.stderr)
+        return 2
     except Exception as error:
         # SDK exception bodies can include signed request details. Do not print them.
         print(

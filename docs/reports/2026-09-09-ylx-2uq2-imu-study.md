@@ -303,7 +303,7 @@ saved_residual = max_window(|host_midpoint − prediction|)
 
 调整标签阈值可以改善诊断解释，但不会缩短 USB 调用，不会识别 ADC 采样时刻，也不会改善实际视频/IMU 同步。后续应将“传输读取不确定度”“计数器拟合稳定性”“物理同步标定误差”分开报告。
 
-![30 分钟 IMU 时序分析](assets/2026-09-09-imu-study/imu-timing.png)
+![30 分钟 IMU 时序分析](assets/2026-09-09-imu-study/imu-timing.svg)
 
 图中第三幅仅每 40 个点绘制一个点以便观察，表格统计使用全部数据。第四幅的负偏移是两个主机时间标记之差，不是物理同步测量。
 
@@ -440,7 +440,7 @@ Kalibr 支持相机与 IMU 的空间/时间联合标定，并强调输入 IMU �
 
 ### 11.5 验收目标的使用方式
 
-已有 [OpenAria Score IMU 物理验收手册](../../../openaria-score/docs/IMU_PHYSICAL_ACCEPTANCE_RUNBOOK.md) 给出项目门槛，例如六面重力残差 P95 ≤0.15 m/s²、已知角速度比例误差 ≤5%、至少 20 次共同事件、读取耗时 P95 ≤10 ms，并要求真实回绕和样本相位证据。它们是项目验收约定，**不是厂商保证指标**。
+已有 OpenAria Score IMU 物理验收手册（`openaria-score/docs/IMU_PHYSICAL_ACCEPTANCE_RUNBOOK.md`）给出项目门槛，例如六面重力残差 P95 ≤0.15 m/s²、已知角速度比例误差 ≤5%、至少 20 次共同事件、读取耗时 P95 ≤10 ms，并要求真实回绕和样本相位证据。它们是项目验收约定，**不是厂商保证指标**。
 
 本次数据虽然满足部分传输/拟合统计量，也没有完成其物理验收要求；不能据此填写 `CAP-PHY-03/04=PASS`。真实回绕按当前增长率需约 78 小时，应单独安排，不能把合成回绕或十分钟短测充当完成。
 
@@ -483,7 +483,7 @@ VIO 能否取得可用效果不能只由“有约 119 行/s”判定。许多场
 完整离线研究目录：`/data2/openaria-imu-study-20260909/`。
 
 - [统计结果 JSON](assets/2026-09-09-imu-study/analysis.json)：文中两个会话的完整指标、来源文件 SHA-256、厂商示例解码。
-- [时序图 PNG](assets/2026-09-09-imu-study/imu-timing.png) / [SVG](assets/2026-09-09-imu-study/imu-timing.svg)。
+- [时序图 SVG](assets/2026-09-09-imu-study/imu-timing.svg)。
 - 离线分析脚本：`/data2/openaria-imu-study-20260909/analyze_existing.py`；绘图脚本：同目录 `plot_results.py`。它们位于研究证据目录，不属于产品业务代码。
 - 精确源码副本：同目录 `source-9503e44/`；来源和只读设备观察：`provenance.json`。
 - 本次只读 USB 描述符：同目录 `device-xu-descriptors.json`，确认 IMU GUID 对应 unit 3。

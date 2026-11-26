@@ -8,6 +8,8 @@ import os
 import re
 import stat
 import subprocess
+import uuid
+from contextlib import suppress
 from pathlib import Path
 
 if __package__:
@@ -89,17 +91,33 @@ def prepare(layout, boot, state_root, atomic_json):
     # links when the recording service starts immediately after installation.
     run("udevadm", "trigger", "--action=change", str(data))
     run("udevadm", "settle", "--timeout=30")
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    temporary = CONFIG.with_suffix(".tmp")
-    with temporary.open("w") as dst:
-        dst.write("RP_YLX_DATA_VOLUME_MODE=exfat\n")
-        dst.write("RP_YLX_DATA_VOLUME_PARTUUID=" + layout["partuuid"] + "\n")
-        dst.write("RP_YLX_DATA_VOLUME_UUID=" + identity + "\n")
-        dst.flush()
-        os.fsync(dst.fileno())
-    os.replace(temporary, CONFIG)
-    descriptor = os.open(CONFIG.parent, os.O_RDONLY)
+    CONFIG.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    temporary = CONFIG.with_name(f".{CONFIG.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(temporary, flags, 0o644)
+    replaced = False
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream as dst:
+            os.fchmod(dst.fileno(), 0o644)
+            dst.write("RP_YLX_DATA_VOLUME_MODE=exfat\n")
+            dst.write("RP_YLX_DATA_VOLUME_PARTUUID=" + layout["partuuid"] + "\n")
+            dst.write("RP_YLX_DATA_VOLUME_UUID=" + identity + "\n")
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(temporary, CONFIG)
+        replaced = True
+        descriptor = os.open(CONFIG.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        if not replaced:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise

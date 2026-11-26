@@ -9,9 +9,24 @@ import platform
 import plistlib
 import re
 import subprocess
+import sys
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+try:
+    if __package__:
+        from .. import _host_disks
+    else:
+        for _candidate in (
+            Path(__file__).resolve().parent,
+            Path(__file__).resolve().parents[1],
+        ):
+            if (_candidate / "_host_disks.py").is_file() and str(_candidate) not in sys.path:
+                sys.path.insert(0, str(_candidate))
+        import _host_disks
+except ImportError:
+    _host_disks = None
 
 BLOCK = 4 * 1024 * 1024
 
@@ -24,62 +39,123 @@ def powershell(script):
     return run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
 
 
-@dataclass(frozen=True)
-class Disk:
-    path: str
-    size: int
-    identity: str
-    model: str
+if _host_disks is not None:
+    Disk = _host_disks.Disk
+    _linux_source_on_disk = _host_disks.linux_source_on_disk
+    _linux_disks_impl = _host_disks.linux_disks
+    _windows_disks_impl = _host_disks.windows_disks
+    _macos_disks_impl = _host_disks.macos_disks
+else:
 
+    @dataclass(frozen=True)
+    class Disk:
+        path: str
+        size: int
+        identity: str
+        model: str
 
-def linux_disks(data):
-    result = []
-    for d in data["blockdevices"]:
-        # Fail closed for internal storage, RAID, unknown transports and partitions.
-        if (
-            d.get("type") != "disk"
-            or int(d.get("size", 0)) == 0
-            or not (d.get("rm") or d.get("tran") == "usb")
-        ):
-            continue
-        nodes = [d]
-        safe = True
-        while nodes:
-            n = nodes.pop()
-            nodes.extend(n.get("children", []))
-            mounts = n.get("mountpoints") or []
-            if any(m in ("/", "/boot", "/boot/efi", "[SWAP]") for m in mounts):
-                safe = False
-            if n.get("type") not in ("disk", "part"):
-                safe = False
-        if safe and not d.get("ro") and re.fullmatch(r"/dev/(sd[a-z]+|mmcblk[0-9]+)", d["path"]):
+    def _linux_source_on_disk(source: str, disk_path: str) -> bool:
+        backing = source.strip().split("[", 1)[0]
+        return re.fullmatch(rf"{re.escape(disk_path)}(p?\d+)?", backing) is not None
+
+    def _linux_disks_impl(data):
+        result = []
+        for d in data.get("blockdevices", []):
+            if (
+                d.get("type") != "disk"
+                or int(d.get("size") or 0) == 0
+                or not (d.get("rm") or d.get("tran") == "usb")
+                or d.get("ro")
+            ):
+                continue
+            nodes = [d]
+            safe = True
+            while nodes:
+                n = nodes.pop()
+                nodes.extend(n.get("children", []))
+                mounts = n.get("mountpoints") or []
+                if any(m in ("/", "/boot", "/boot/efi", "[SWAP]") for m in mounts):
+                    safe = False
+                if n.get("type") not in ("disk", "part"):
+                    safe = False
+            path = d.get("path", "")
+            if not safe or not re.fullmatch(r"/dev/(sd[a-z]+|mmcblk[0-9]+)", path):
+                continue
             result.append(
                 Disk(
-                    d["path"],
+                    path,
                     int(d["size"]),
                     str(d.get("serial") or d.get("wwn") or ""),
                     str(d.get("model") or "SD card"),
                 )
             )
-    return result
+        return result
+
+    def _windows_disks_impl(data):
+        if isinstance(data, dict):
+            data = [data]
+        result = []
+        for d in data or []:
+            size = int(d.get("Size") or 0)
+            if size <= 0:
+                continue
+            if not (
+                d.get("BusType") in ("USB", "SD")
+                and d.get("IsBoot") is False
+                and d.get("IsSystem") is False
+                and d.get("IsReadOnly") is False
+            ):
+                continue
+            result.append(
+                Disk(
+                    r"\\.\PhysicalDrive" + str(int(d["Number"])),
+                    size,
+                    str(d.get("UniqueId") or d.get("SerialNumber") or ""),
+                    str(d.get("FriendlyName") or "SD card"),
+                )
+            )
+        return result
+
+    def _macos_disks_impl(run_fn):
+        devices = plistlib.loads(run_fn("diskutil", "list", "-plist", "external", "physical"))
+        protected = set()
+        root_info = plistlib.loads(run_fn("diskutil", "info", "-plist", "/"))
+        protected.update({root_info.get("ParentWholeDisk"), root_info.get("DeviceIdentifier")})
+        apfs = plistlib.loads(run_fn("diskutil", "apfs", "list", "-plist"))
+        for container in apfs.get("Containers", []):
+            for store in container.get("PhysicalStores", []):
+                info = plistlib.loads(
+                    run_fn("diskutil", "info", "-plist", store["DeviceIdentifier"])
+                )
+                protected.add(info.get("ParentWholeDisk"))
+        result = []
+        for name in devices.get("WholeDisks", []):
+            if name in protected or not re.fullmatch(r"disk[0-9]+", name):
+                continue
+            d = plistlib.loads(run_fn("diskutil", "info", "-plist", "/dev/" + name))
+            if (
+                d.get("Whole") is True
+                and d.get("Internal") is False
+                and d.get("Writable") is True
+                and d.get("VirtualOrPhysical") != "Virtual"
+            ):
+                result.append(
+                    Disk(
+                        "/dev/" + name,
+                        int(d["TotalSize"]),
+                        str(d.get("DeviceTreePath") or ""),
+                        str(d.get("MediaName") or name),
+                    )
+                )
+        return result
+
+
+def linux_disks(data):
+    return _linux_disks_impl(data)
 
 
 def windows_disks(data):
-    if isinstance(data, dict):
-        data = [data]
-    return [
-        Disk(
-            r"\\.\PhysicalDrive" + str(int(d["Number"])),
-            int(d["Size"]),
-            str(d.get("UniqueId") or d.get("SerialNumber") or ""),
-            str(d.get("FriendlyName") or "SD card"),
-        )
-        for d in (data or [])
-        if d.get("BusType") in ("USB", "SD")
-        and d.get("IsBoot") is False
-        and d.get("IsSystem") is False
-        and d.get("IsReadOnly") is False
-    ]
+    return _windows_disks_impl(data)
 
 
 def discover():
@@ -108,37 +184,7 @@ def discover():
             )
         )
     if system == "Darwin":
-        devices = plistlib.loads(run("diskutil", "list", "-plist", "external", "physical"))
-        result = []
-        root_info = plistlib.loads(run("diskutil", "info", "-plist", "/"))
-        protected = {root_info.get("ParentWholeDisk"), root_info.get("DeviceIdentifier")}
-        # Reject all APFS physical stores, including external macOS boot containers.
-        apfs = plistlib.loads(run("diskutil", "apfs", "list", "-plist"))
-        for container in apfs.get("Containers", []):
-            for store in container.get("PhysicalStores", []):
-                info = plistlib.loads(run("diskutil", "info", "-plist", store["DeviceIdentifier"]))
-                protected.add(info.get("ParentWholeDisk"))
-        for name in devices["WholeDisks"]:
-            if name in protected:
-                continue
-            if not re.fullmatch(r"disk[0-9]+", name):
-                continue
-            d = plistlib.loads(run("diskutil", "info", "-plist", "/dev/" + name))
-            if (
-                d.get("Whole") is True
-                and d.get("Internal") is False
-                and d.get("Writable") is True
-                and d.get("VirtualOrPhysical") != "Virtual"
-            ):
-                result.append(
-                    Disk(
-                        "/dev/" + name,
-                        int(d["TotalSize"]),
-                        str(d.get("DeviceTreePath") or ""),
-                        str(d.get("MediaName") or name),
-                    )
-                )
-        return result
+        return _macos_disks_impl(run)
     raise RuntimeError("Only Windows, Linux and macOS are supported")
 
 
@@ -279,7 +325,7 @@ def check_source(disk, image):
     system = platform.system()
     if system == "Linux":
         source = run("findmnt", "-n", "-o", "SOURCE", "--target", str(image)).decode().strip()
-        if source.startswith(disk.path):
+        if _linux_source_on_disk(source, disk.path):
             raise RuntimeError("Image is stored on target disk")
     elif system == "Darwin":
         source = run("df", "-P", str(image)).decode().splitlines()[-1].split()[0]

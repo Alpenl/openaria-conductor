@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import os
 import struct
+import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -17,6 +19,7 @@ GIB = 1024**3
 PACKAGE = "exfatprogs_1.1.3-1ubuntu0.1_arm64.deb"
 PACKAGE_URL = "https://ports.ubuntu.com/pool/universe/e/exfatprogs/" + PACKAGE
 PACKAGE_SHA256 = "5a9d0deec1f2b418de4a726ec1b8a9d19cb23880fe5fedc33b41d4e500b72f4e"
+MAX_PACKAGE_BYTES = 16 * 1024**2
 
 
 def partitions(mbr):
@@ -72,16 +75,44 @@ def check_fit(image, card_bytes):
         raise RuntimeError("Partition layout exceeds target card capacity")
 
 
-def prepare_tools(directory):
+def _download_package(urls: list[str]) -> bytes:
+    errors: list[str] = []
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=60) as src:
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = src.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_PACKAGE_BYTES:
+                        raise RuntimeError("Offline exFAT package exceeds size limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except (urllib.error.URLError, OSError, RuntimeError) as exc:
+            errors.append(f"{url}: {exc}")
+            print(f"Warning: failed to download {PACKAGE} from {url}: {exc}", file=sys.stderr)
+    raise RuntimeError(
+        f"Failed to download {PACKAGE}; override via OPENARIA_EXFATPROGS_URL or place the "
+        f"verified .deb in tools directory ({'; '.join(errors)})"
+    )
+
+
+def prepare_tools(directory, *, package_url: str | None = None):
     """Host-side download only; first boot never requires a network connection."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / PACKAGE
     if not output.exists():
+        configured = package_url or os.environ.get("OPENARIA_EXFATPROGS_URL", "").strip()
+        fallback = os.environ.get("OPENARIA_EXFATPROGS_FALLBACK_URL", "").strip()
+        candidates = [url for url in (configured, PACKAGE_URL, fallback) if url]
+        urls = list(dict.fromkeys(candidates))
         temporary = output.with_suffix(".partial")
         try:
-            with urllib.request.urlopen(PACKAGE_URL, timeout=60) as src:
-                raw = src.read(1024**2)
+            raw = _download_package(urls)
             if hashlib.sha256(raw).hexdigest() != PACKAGE_SHA256:
                 raise RuntimeError("Offline exFAT package digest mismatch")
             with temporary.open("xb") as dst:

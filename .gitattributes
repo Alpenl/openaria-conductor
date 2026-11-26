@@ -1,2 +1,8 @@
-scripts/factory_recovery/start.cmd text eol=crlf
-scripts/card_export/start.cmd text eol=crlf
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.wav binary
+*.png binary
+*.jpg binary
+*.tar.gz binary
+*.whl binary

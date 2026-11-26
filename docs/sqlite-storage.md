@@ -91,8 +91,11 @@ oa database backup --database /var/lib/rp-ylx/state.sqlite3 --output /secure/new
 使用的 `.sqlite3` 主文件。跨数据库的整机一致快照应先停止写入服务。备份不等于素材备份，
 素材交付仍需独立校验文件 SHA-256。设备端不能仅凭一次下载请求认定客户端已经完成备份。
 
-恢复前正常停止录制，停止 `rp-ylx-recording-button.service`、`rp-ylx.service`、
-`rp-ylx-network-control.service` 和 `rp-ylx-recover.service`。恢复入口检查这些服务均已停止。
+恢复前正常停止录制，停止 `rp-ylx.service`、`rp-ylx-network-control.service`、
+`rp-ylx-network-control.socket`、`rp-ylx-recording-button.service`、`rp-ylx-recover.service`、
+`openaria-update.service`、`rp-ylx-wifi-watchdog.service` 和 `rp-ylx-wifi-watchdog.timer`，
+并确保没有其他进程持有 `/run/rp-ylx/maintenance.lock` 维护锁。恢复入口检查上述 8 个
+systemd unit 均已停止且维护锁空闲。
 
 ```bash
 oa database restore --database /var/lib/rp-ylx/state.sqlite3 --input /secure/new-state.sqlite3

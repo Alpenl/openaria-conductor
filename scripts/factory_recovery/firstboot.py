@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import uuid
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 
 if __package__:
@@ -38,18 +40,39 @@ StandardError=append:/var/lib/openaria-factory/firstboot/install.log
 PHASES = ("restoring", "configured", "installed", "complete")
 
 
-def atomic_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("w") as out:
-        json.dump(value, out)
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(temporary, path)
-    fd = os.open(path.parent, os.O_RDONLY)
+def _atomic_write_text(path: Path, text: str, *, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(temporary, flags, mode)
+    replaced = False
     try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        replaced = True
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        if not replaced:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        raise
+
+
+def atomic_json(path, value, *, mode=0o600):
+    _atomic_write_text(Path(path), json.dumps(value), mode=mode)
 
 
 def extract_bundle(archive, destination):
@@ -104,7 +127,7 @@ def register():
     if complete():
         return
     unit = Path("/etc/systemd/system/openaria-firstboot.service")
-    unit.write_text(UNIT)
+    _atomic_write_text(unit, UNIT, mode=0o644)
     run("systemctl", "daemon-reload")
     # Never wait for the boot/resize jobs from inside the vendor's boot hook.
     run("systemctl", "start", "--no-block", "openaria-firstboot.service")
@@ -185,6 +208,8 @@ def execute():
         restore_volume(profile)
         advance("complete")
         (BOOT / "profile.bin").unlink(missing_ok=True)
+        (BOOT / "bundle.tar").unlink(missing_ok=True)
+        shutil.rmtree(ROOT / "bundle", ignore_errors=True)
         os.sync()
         run("systemctl", "reboot", "--no-block")
 

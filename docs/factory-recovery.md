@@ -69,7 +69,7 @@ python recover.py auto-flash --disk <整盘> --image <官方.img> --sha256 <官�
 
 电脑合成前取得官方Ubuntu Jammy ARM64 `exfatprogs` 包并校验固定SHA-256，包随CONFIG分区写入；
 首次开机离线安装。工具包中的 `tools/` 可预置此包，因此现场刷卡不必联网。
-依赖来源：[Ubuntu exfatprogs](https://packages.ubuntu.com/jammy-updates/arm64/exfatprogs/download)。
+依赖来源：[Ubuntu exfatprogs](https://packages.ubuntu.com/jammy-updates/arm64/exfatprogs/download)。如官方源访问受限，可通过环境变量 `OPENARIA_EXFATPROGS_URL` 覆盖主下载地址，并通过 `OPENARIA_EXFATPROGS_FALLBACK_URL` 指定备用镜像地址（下载后仍强制校验固定 SHA-256）。
 
 挂载使用文件系统UUID和分区身份校验，权限通过exFAT挂载参数分配给录制用户。
 每次挂载前限时执行 `fsck.exfat -p`；检查或挂载失败不阻止系统/Web启动，但禁止录制、禁止回退写系统盘。

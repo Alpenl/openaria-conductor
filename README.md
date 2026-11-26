@@ -4,7 +4,8 @@ Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 �
 同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。代码仍保留
 历史 package、CLI、systemd unit 和数据标识作为兼容别名，以兼容现有安装与已录制会话。
 
-当前交付版本为 **0.2.1**。后续仅递增 `0.2.x`；未经用户明确授权不改变版本系列。
+当前版本为 **0.2.16**（属于 `0.2.x` 系列；自 `0.2.1` 起仅递增补丁号，未经用户明确授权不改变版本系列）。
+最新变更见 [0.2.16 发布说明](docs/releases/0.2.16.md)。
 网页顶部版本入口可检查更新、手动升级和回退，设备通过阿里云 OSS 获取完整应用包。
 发版采用附注标签，详细步骤见 [安装与发布手册](docs/one-click-install.md)。
 
@@ -85,9 +86,20 @@ uv run openaria probe
 uv run openaria hardware-smoke --help
 uv run openaria serve-mock
 uv run openaria serve-hardware-preview --device /dev/video0
+uv run openaria serve --help
+uv run openaria settings --help
+uv run openaria database --help
+uv run openaria validate --help
+uv run openaria timestamps --help
+uv run openaria volume --help
+uv run openaria network --help
+uv run openaria network-control --help
+uv run openaria benchmark --help
 uv run python scripts/check.py
 uv build
 ```
+
+> 注：`experiments/` 目录为已归档的历史基准测试与消融实验记录，不参与当前生产运行代码路径。
 
 已完成的 Python/Rust 固定 trace 消融结果、原始报告和校验摘要见
 [`experiments/fixed-trace-20260905-132783d`](experiments/fixed-trace-20260905-132783d/README.md)。
@@ -101,23 +113,27 @@ uv build
 - 救援热点公共密码：`12345678`。
 - 救援热点固定管理地址：`10.42.0.1`，Web 入口为 `http://10.42.0.1:8080/`。
 - SSH 管理账号：`OpenAria`。
-- SSH 管理密码：`12345678`。
+- SSH 管理密码：`123456`。
 
 `status` 在没有相机和 IMU 的电脑上也能正常运行，并明确报告硬件尚未探测。
 日常使用步骤见 [设备使用指南](docs/user-guide.md)。
-录制写盘、背压和失败目录语义见 [有界录制管道](docs/recording-pipeline.md)。
-RDK X5 的固定硬件事实、短录制步骤和证据边界见 [RDK X5 基线](docs/rdk-x5-baseline.md)。
+录制格式、背压策略与分段恢复语义见 [录制格式与时钟](docs/recording-v4.md) 及
+[分段恢复报告](docs/reports/2026-09-15-recording-recovery.md)。
+RDK X5 的安装部署、固件更新与网页 API 见 [安装与发布手册](docs/one-click-install.md) 及
+[网页固件更新 API](docs/firmware-api.md)。
 RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援](docs/networking.md)。
 实体按钮的 40PIN 接线、电平检测和录制控制配置见
 [RDK X5 实体录制按钮](docs/rdk-x5-recording-button.md)。
 结构化 journald 事件、隐私边界和 API 审计记录见
 [运行日志](docs/operational-logging.md)。
-测量驱动的 Rust 数据面范围、性能闸门和当前证据边界见
-[RDK X5 Rust 性能重写基线](docs/rust-performance-rewrite.md)。
+Rust 数据面基准、结构消融与当前代码审计基线见
+[固定 trace 消融报告](experiments/fixed-trace-20260905-132783d/README.md) 及
+[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md)。
 
 ## 当前状态
 
-Rewrite MVP 已建立最小可运行基线。后续差量功能按 GitHub Issue 逐项实现与验收。
+当前处于 **0.2.16** 生产交付阶段（参见 [0.2.16 发布说明](docs/releases/0.2.16.md)），并正在按
+[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md) 推进稳定性加固、架构解耦与 CI 检查完善。
 
 公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。
 

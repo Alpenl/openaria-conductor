@@ -1,6 +1,6 @@
 # OpenAria 读卡器录像导出工具（验收候选）
 
-无需改卡的分区、无需安装ext4驱动、不需要设备联网。只读解析系统分区及其中的data-volume.img，
+无需改卡的分区、无需安装ext4驱动、不需要设备联网。只读解析系统分区及其中的data-volume.img，或直接只读解析exFAT录像分区（支持传统UUID目录和0.2.15+ `YYYY-MM-DD/HH-MM-SS` 日期分组目录），
 把选中的录像目录复制到电脑，逐文件回读SHA-256校验并输出export-report.json。不复制整个80GB镜像。
 
 ## 使用

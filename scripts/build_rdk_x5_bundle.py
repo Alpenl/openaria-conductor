@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from rp_ylx.deployment import (
@@ -13,10 +14,26 @@ from rp_ylx.deployment import (
     write_bundle_sha256sums,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 RUNTIME_NAME = re.compile(
     r"^cpython-(3\.11\.\d+)\+\d+-aarch64-unknown-linux-gnu-"
     r"install_only(?:_stripped)?\.tar\.gz$"
 )
+
+
+def _uv_export_target_flags() -> list[str]:
+    help_text = subprocess.run(
+        ["uv", "export", "--help"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    if "--python-platform" in help_text and "--python-version" in help_text:
+        return ["--python-platform", "aarch64-unknown-linux-gnu", "--python-version", "3.11"]
+    return ["--python", "3.11"]
 
 
 def main() -> None:
@@ -40,30 +57,54 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         parser.error("output 必须为空，避免旧依赖混入候选 bundle")
-    command = [
-        "uvx",
-        "--python",
-        "3.11",
-        "--from",
-        "pip",
-        "pip",
-        "download",
-        "--dest",
-        str(output),
-        "--only-binary=:all:",
-        "--platform",
-        "manylinux_2_28_aarch64",
-        "--platform",
-        "manylinux2014_aarch64",
-        "--python-version",
-        "311",
-        "--implementation",
-        "cp",
-        "--abi",
-        "cp311",
-        str(application_wheel),
-    ]
-    subprocess.run(command, check=True, timeout=600)
+    shutil.copy2(application_wheel, output / application_wheel.name)
+    with tempfile.TemporaryDirectory() as temporary:
+        requirements = Path(temporary) / "requirements.txt"
+        exported = subprocess.run(
+            [
+                "uv",
+                "export",
+                "--frozen",
+                "--no-dev",
+                "--no-emit-project",
+                *_uv_export_target_flags(),
+                "--format",
+                "requirements.txt",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        requirements.write_text(exported.stdout, encoding="utf-8")
+        command = [
+            "uvx",
+            "--python",
+            "3.11",
+            "--from",
+            "pip",
+            "pip",
+            "download",
+            "--dest",
+            str(output),
+            "--only-binary=:all:",
+            "--platform",
+            "manylinux_2_28_aarch64",
+            "--platform",
+            "manylinux2014_aarch64",
+            "--python-version",
+            "311",
+            "--implementation",
+            "cp",
+            "--abi",
+            "cp311",
+            "--require-hashes",
+            "--no-deps",
+            "-r",
+            str(requirements),
+        ]
+        subprocess.run(command, check=True, timeout=600)
     installer_source = Path(__file__).with_name("rdk_x5_install.py")
     shutil.copy2(installer_source, output / installer_source.name)
     runtime = args.runtime.resolve()

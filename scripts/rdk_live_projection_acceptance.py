@@ -8,7 +8,7 @@ guard, and then reconciles the last live projection with the sealed manifest
 and validator output.
 
 The default run is deliberately narrow: it refuses an already-active device,
-uses /data/recordings, admits only the current /data loopback mount, and never
+uses /data/recordings, admits only a loopback or exFAT /data mount, and never
 performs reboot, network, power, partition, or service mutation.
 """
 
@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -32,6 +33,7 @@ from typing import Any
 UTC = timezone.utc  # noqa: UP017 - RDK Ubuntu 22.04 system Python is 3.10.
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_API_VERSION = "v4"
 DEFAULT_RECORDING_ROOT = Path("/data/recordings")
 DEFAULT_ACCEPTANCE_DIR = Path("/data/acceptance")
 DEFAULT_RP_YLX_BIN = Path("/opt/rp-ylx/current/bin/rp-ylx")
@@ -124,6 +126,21 @@ def _utc_stamp() -> str:
 
 def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
+
+
+def _api_path(api_version: str, suffix: str) -> str:
+    return f"/api/{api_version}{suffix}"
+
+
+def _resolve_recording_dir(recording_root: Path, session_id: str) -> Path:
+    try:
+        from rp_ylx.recording_layout import resolve_recording
+    except ImportError:
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        if src_root.is_dir() and str(src_root) not in sys.path:
+            sys.path.insert(0, str(src_root))
+        from rp_ylx.recording_layout import resolve_recording
+    return resolve_recording(recording_root, session_id)
 
 
 def _parse_json_body(body: bytes) -> Any:
@@ -275,9 +292,12 @@ def _require_safe_default_storage(args: argparse.Namespace, mount: dict[str, Any
     if args.allow_non_loopback_data:
         return
     source = mount.get("source")
-    if not isinstance(source, str) or not Path(source).name.startswith("loop"):
+    fstype = mount.get("fstype")
+    is_loopback = isinstance(source, str) and Path(source).name.startswith("loop")
+    is_exfat = isinstance(source, str) and bool(source) and fstype == "exfat"
+    if not (is_loopback or is_exfat):
         raise RuntimeError(
-            f"refusing non-loopback /data source {source!r}; pass --allow-non-loopback-data"
+            f"refusing /data source {source!r} (fstype={fstype!r}); pass --allow-non-loopback-data"
         )
 
 
@@ -303,20 +323,20 @@ def _parse_sse_block(lines: list[str]) -> dict[str, Any] | None:
     }
 
 
-def _read_sse_event(response: Any, stop: threading.Event) -> dict[str, Any] | None:
+def _read_sse_event(response: Any, stop: threading.Event) -> tuple[dict[str, Any] | None, bool]:
     lines: list[str] = []
     while not stop.is_set():
         try:
             raw = response.readline()
         except TimeoutError:
-            return None
+            return None, False
         if not raw:
-            return None
+            return (_parse_sse_block(lines) if lines else None), True
         line = raw.decode("utf-8", "replace").rstrip("\r\n")
         if not line:
-            return _parse_sse_block(lines)
+            return _parse_sse_block(lines), False
         lines.append(line)
-    return None
+    return None, False
 
 
 def _sse_monitor(
@@ -327,6 +347,7 @@ def _sse_monitor(
     reconnect_after_s: float,
     timeout: float = SSE_READ_TIMEOUT_SECONDS,
     journal: _EvidenceJournal | None = None,
+    api_version: str = DEFAULT_API_VERSION,
 ) -> None:
     def emit(item: dict[str, Any]) -> None:
         output.append(item)
@@ -341,7 +362,7 @@ def _sse_monitor(
         if last_event_id is not None:
             headers["Last-Event-ID"] = last_event_id
         request = urllib.request.Request(
-            _url(base_url, "/api/v3/capture/events"),
+            _url(base_url, _api_path(api_version, "/capture/events")),
             headers=headers,
             method="GET",
         )
@@ -356,7 +377,7 @@ def _sse_monitor(
                     }
                 )
                 while not stop.is_set():
-                    event = _read_sse_event(response, stop)
+                    event, eof = _read_sse_event(response, stop)
                     if event is not None:
                         event["kind"] = "event"
                         event["observed_at"] = _utc_now()
@@ -377,6 +398,8 @@ def _sse_monitor(
                             }
                         )
                         reconnect_done = True
+                        break
+                    if eof:
                         break
                     if event is None:
                         continue
@@ -467,6 +490,8 @@ def _artifact_range_probe(
     base_url: str,
     session_id: str,
     manifest: dict[str, Any],
+    *,
+    api_version: str = DEFAULT_API_VERSION,
 ) -> dict[str, Any]:
     artifact = next(
         (
@@ -481,9 +506,10 @@ def _artifact_range_probe(
     if artifact is None:
         return {"available": False, "error": "manifest has no nonempty artifact"}
     artifact_id = str(artifact["artifact_id"])
-    path = (
-        f"/api/v3/sessions/{urllib.parse.quote(session_id, safe='')}"
-        f"/artifacts/{urllib.parse.quote(artifact_id, safe='')}"
+    path = _api_path(
+        api_version,
+        f"/sessions/{urllib.parse.quote(session_id, safe='')}"
+        f"/artifacts/{urllib.parse.quote(artifact_id, safe='')}",
     )
     result = _request(
         base_url,
@@ -948,16 +974,17 @@ def _collect(
     journal: _EvidenceJournal | None,
 ) -> dict[str, Any]:
     started_at = _utc_now()
+    api_version = getattr(args, "api_version", None) or "v3"
     service_before = _service_status(args.service_name)
     mount = _data_mount_info(Path("/data"))
     _require_safe_default_storage(args, mount)
 
-    device = _request(args.base_url, "GET", "/api/v3/device")
+    device = _request(args.base_url, "GET", _api_path(api_version, "/device"))
     _require_status(device, {200}, "device")
     build = device.payload.get("build") if isinstance(device.payload, dict) else None
     device_commit = build.get("commit") if isinstance(build, dict) else None
 
-    pre_status = _request(args.base_url, "GET", "/api/v3/capture/status")
+    pre_status = _request(args.base_url, "GET", _api_path(api_version, "/capture/status"))
     _require_status(pre_status, {200}, "capture status")
     if _active_recording(pre_status.payload) is not None:
         raise RuntimeError("device has an active recording; refusing to interrupt it")
@@ -975,6 +1002,7 @@ def _collect(
         kwargs={
             "reconnect_after_s": args.sse_reconnect_after,
             "journal": journal,
+            "api_version": api_version,
         },
         name="rp-ylx-live-projection-sse",
         daemon=True,
@@ -984,7 +1012,7 @@ def _collect(
         start = _request(
             args.base_url,
             "POST",
-            "/api/v3/capture/start",
+            _api_path(api_version, "/capture/start"),
             payload={
                 "schema": "ylx.capture-start.v2",
                 "mode": "production",
@@ -996,7 +1024,9 @@ def _collect(
         _require_status(start, {200, 202}, "capture start")
         active = _active_recording(start.payload)
         if active is None:
-            active_status = _request(args.base_url, "GET", "/api/v3/capture/status")
+            active_status = _request(
+                args.base_url, "GET", _api_path(api_version, "/capture/status")
+            )
             _require_status(active_status, {200}, "capture status after start")
             active = _active_recording(active_status.payload)
         if active is None:
@@ -1006,37 +1036,45 @@ def _collect(
         sse_thread.start()
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
-            sample = _request(args.base_url, "GET", "/api/v3/capture/status", timeout=5)
+            sample = _request(
+                args.base_url, "GET", _api_path(api_version, "/capture/status"), timeout=5
+            )
             status_sample = _status_sample(sample)
             status_samples.append(status_sample)
             if journal is not None:
                 journal.append("status_sample", status_sample)
             time.sleep(args.sample_interval)
 
-        stop_observation = _stop_and_wait(
-            args.base_url,
-            timeout_seconds=args.stop_timeout,
-            idempotency_key=f"live-projection-stop-{int(time.time())}",
-        )
+        stop_kwargs: dict[str, Any] = {
+            "timeout_seconds": args.stop_timeout,
+            "idempotency_key": f"live-projection-stop-{int(time.time())}",
+        }
+        if api_version != "v3":
+            stop_kwargs["api_version"] = api_version
+        stop_observation = _stop_and_wait(args.base_url, **stop_kwargs)
         stop_confirmed_idle = True
     finally:
         sse_stop.set()
         if sse_thread.is_alive():
             sse_thread.join(timeout=3.0)
         if session_id is not None and not stop_confirmed_idle:
-            cleanup_stop_observation = _stop_and_wait(
-                args.base_url,
-                timeout_seconds=args.stop_timeout,
-                idempotency_key=f"live-projection-cleanup-{int(time.time())}",
-            )
+            cleanup_kwargs: dict[str, Any] = {
+                "timeout_seconds": args.stop_timeout,
+                "idempotency_key": f"live-projection-cleanup-{int(time.time())}",
+            }
+            if api_version != "v3":
+                cleanup_kwargs["api_version"] = api_version
+            cleanup_stop_observation = _stop_and_wait(args.base_url, **cleanup_kwargs)
 
     assert session_id is not None
-    session_dir = args.recording_root / session_id
+    session_dir = _resolve_recording_dir(args.recording_root, session_id)
     manifest_path = session_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest_summary = _manifest_summary(manifest)
     validation = _run_validate(args.rp_ylx_bin, session_dir)
-    range_probe = _artifact_range_probe(args.base_url, session_id, manifest)
+    range_probe = _artifact_range_probe(
+        args.base_url, session_id, manifest, api_version=api_version
+    )
     service_after = _service_status(args.service_name)
     reconciliation = _counter_reconciliation(
         status_samples,
@@ -1130,6 +1168,7 @@ def _stop_and_wait(
     *,
     timeout_seconds: float,
     idempotency_key: str,
+    api_version: str = "v3",
 ) -> dict[str, Any]:
     started = time.monotonic()
     response: HttpResult | None = None
@@ -1138,7 +1177,7 @@ def _stop_and_wait(
         response = _request(
             base_url,
             "POST",
-            "/api/v3/capture/stop",
+            _api_path(api_version, "/capture/stop"),
             payload={"schema": "ylx.capture-stop.v2", "reason": "user"},
             headers={"Idempotency-Key": idempotency_key},
             timeout=timeout_seconds,
@@ -1147,7 +1186,10 @@ def _stop_and_wait(
     except (TimeoutError, urllib.error.URLError) as exc:
         request_error = exc
 
-    _wait_for_idle(base_url, timeout_seconds=timeout_seconds)
+    if api_version == "v3":
+        _wait_for_idle(base_url, timeout_seconds=timeout_seconds)
+    else:
+        _wait_for_idle(base_url, timeout_seconds=timeout_seconds, api_version=api_version)
     return {
         "request_http_status": response.status if response is not None else None,
         "request_latency_s": response.latency_s if response is not None else None,
@@ -1158,11 +1200,11 @@ def _stop_and_wait(
     }
 
 
-def _wait_for_idle(base_url: str, *, timeout_seconds: float) -> None:
+def _wait_for_idle(base_url: str, *, timeout_seconds: float, api_version: str = "v3") -> None:
     deadline = time.monotonic() + timeout_seconds
     last_payload: Any = None
     while time.monotonic() < deadline:
-        result = _request(base_url, "GET", "/api/v3/capture/status")
+        result = _request(base_url, "GET", _api_path(api_version, "/capture/status"))
         if result.status == 200 and isinstance(result.payload, dict):
             last_payload = result.payload
             if _active_recording(result.payload) is None:
@@ -1174,6 +1216,7 @@ def _wait_for_idle(base_url: str, *, timeout_seconds: float) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-version", choices=("v3", "v4"), default=DEFAULT_API_VERSION)
     parser.add_argument("--duration", type=float, default=20.0)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--sse-reconnect-after", type=float, default=5.0)

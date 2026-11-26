@@ -114,7 +114,7 @@ EXPECTED_EXTENSION_UNITS = (
     },
 )
 
-VERSION_RE = re.compile(r"^rp-ylx\s+(\S+)\s+\(([0-9a-f]{40})\)\s*$")
+VERSION_RE = re.compile(r"^(?:Open Aria|rp-ylx)\s+(\S+)\s+\(([0-9a-f]{40})\)\s*$")
 VIDEO_NODE_RE = re.compile(r"^/dev/video[0-9]+$")
 MEDIA_NODE_RE = re.compile(r"^/dev/media[0-9]+$")
 MEDIA_ENTITY_RE = re.compile(r"^- entity\s+(\d+):\s*(.*?)\s+\(")

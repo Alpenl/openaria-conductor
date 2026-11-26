@@ -25,6 +25,7 @@ on:
       - "build_backend.py"
       - "native/**"
       - "pyproject.toml"
+      - "uv.lock"
       - "scripts/build_rdk_x5_bundle.py"
       - "scripts/rdk_x5_install.py"
       - "scripts/publish_rdk_x5_oss.py"
@@ -33,7 +34,7 @@ on:
       - "src/**"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.publish_oss) && 'rdk-x5-public-release' || format('rdk-x5-build-{0}', github.ref) }}
@@ -76,16 +77,20 @@ jobs:
               stream.write(f"RDK_WHEEL=dist-aarch64/rp_ylx-{version}-cp311-abi3-manylinux_2_28_aarch64.whl\n")
           PY
 
-      - name: 正式发布前执行完整无硬件检查
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
+      - name: 安装 Rust toolchain 与 shellcheck
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target aarch64-unknown-linux-gnu
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: 执行完整无硬件检查
         run: |
           uv sync --frozen --extra dev
-          uv run python scripts/check.py
-
-      - name: 安装 Rust aarch64 target
-        run: |
-          rustup toolchain install stable --profile minimal --target aarch64-unknown-linux-gnu
-          rustup default stable
+          cargo fmt --manifest-path native/Cargo.toml --check
+          mapfile -t deploy_scripts < <(grep -l '^#!' src/rp_ylx/deploy/rp-ylx-*)
+          shellcheck "${deploy_scripts[@]}"
+          CI=true uv run python scripts/check.py
 
       - name: 暴露 zig linker
         run: |
@@ -103,7 +108,8 @@ jobs:
 
       - name: 构建 aarch64 manylinux wheel
         run: |
-          uv run --python 3.11 --no-project --with 'build>=1,<2' python -m build \
+          uv run --python 3.11 --no-project --with 'build==1.6.1' --with 'maturin==1.16.0' python -m build \
+            --no-isolation \
             --wheel \
             --outdir dist-aarch64 \
             -Cbuild-args="--target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 --zig"
@@ -148,7 +154,7 @@ jobs:
             --runtime "dist-runtime/$RDK_RUNTIME_NAME" \
             --output dist-rdk-x5 \
             --version "$RDK_VERSION" \
-            --build-info "rp-ylx ${RDK_VERSION} (${RDK_COMMIT})"
+            --build-info "Open Aria ${RDK_VERSION} (${RDK_COMMIT})"
 
       - name: 校验 bundle manifest
         run: |
@@ -168,11 +174,39 @@ jobs:
           path: dist-rdk-x5/
           if-no-files-found: error
 
+  publish:
+    name: 发布 RDK X5 bundle 与 GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.0.1
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: rp-ylx-rdk-x5-${{ github.sha }}
+          path: dist-rdk-x5
+
+      - name: 校验并提取发布说明
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            echo "正式发布必须在附注标签 v0.2.x 上运行，不能发布分支" >&2
+            exit 1
+          fi
+          uv run python scripts/release_version.py --tag "$GITHUB_REF_NAME" --notes-file release-notes.txt
+
       - name: 发布到阿里云 OSS 国内下载源
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
         env:
           OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OPENARIA_RELEASE_SIGNING_KEY: ${{ secrets.OPENARIA_RELEASE_SIGNING_KEY }}
         run: |
           uv run scripts/publish_rdk_x5_oss.py \
             --bundle-dir dist-rdk-x5 \
@@ -180,7 +214,6 @@ jobs:
             --publish --tag "$GITHUB_REF_NAME"
 
       - name: 创建对应 GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

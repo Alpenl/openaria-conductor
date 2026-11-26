@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -13,14 +14,41 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = re.compile(r"0\.2\.[1-9][0-9]*\Z")
 
 
+def _package_fallback_version(init_path: Path) -> str:
+    tree = ast.parse(init_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        for statement in node.body:
+            if (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == "__version__"
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            ):
+                return statement.value.value
+    raise ValueError("src/rp_ylx/__init__.py 缺少 __version__ 回退定义")
+
+
 def project_version(root: Path = ROOT) -> str:
-    value = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    value = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "version"
+    ]
     if not VERSION.fullmatch(value):
         raise ValueError("版本仅允许 0.2.x（x >= 1）；改变系列须用户明确授权")
-    native = tomllib.loads((root / "native/Cargo.toml").read_text())["package"]["version"]
-    web = json.loads((root / "src/rp_ylx/web/assets.json").read_text())["version"]
+    native = tomllib.loads((root / "native/Cargo.toml").read_text(encoding="utf-8"))["package"][
+        "version"
+    ]
+    web = json.loads((root / "src/rp_ylx/web/assets.json").read_text(encoding="utf-8"))["version"]
     if native != value or web != value:
         raise ValueError("Conductor、Rust 与嵌入 Echo Web 必须使用相同版本")
+    init_path = root / "src/rp_ylx/__init__.py"
+    if root == ROOT and not init_path.is_file():
+        raise ValueError("缺少 src/rp_ylx/__init__.py")
+    if init_path.is_file() and _package_fallback_version(init_path) != value:
+        raise ValueError("Conductor、Rust、__init__.py 回退版本与嵌入 Echo Web 必须使用相同版本")
     return value
 
 
@@ -53,7 +81,7 @@ def main():
     if args.tag:
         version, notes = release_tag(args.tag)
         if args.notes_file:
-            args.notes_file.write_text(notes + "\n")
+            args.notes_file.write_text(notes + "\n", encoding="utf-8")
     print(version)
 
 

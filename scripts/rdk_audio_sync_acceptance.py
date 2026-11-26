@@ -9,7 +9,7 @@ timeline.
 
 Run on the RDK as root when the recording files are service-owned, for example:
 
-    sudo /opt/rp-ylx/current/bin/python3 scripts/rdk_audio_sync_acceptance.py
+    sudo /opt/rp-ylx/current/runtime/bin/python3 scripts/rdk_audio_sync_acceptance.py
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +29,7 @@ from typing import Any
 UTC = timezone.utc  # noqa: UP017 - RDK Ubuntu 22.04 system Python is 3.10.
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_API_VERSION = "v4"
 DEFAULT_RECORDING_ROOT = Path("/data/recordings")
 DEFAULT_ACCEPTANCE_DIR = Path("/data/acceptance")
 DEFAULT_RP_YLX_BIN = Path("/opt/rp-ylx/current/bin/rp-ylx")
@@ -51,6 +53,21 @@ def _utc_stamp() -> str:
 
 def _url(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
+
+
+def _api_path(api_version: str, suffix: str) -> str:
+    return f"/api/{api_version}{suffix}"
+
+
+def _resolve_recording_dir(recording_root: Path, session_id: str) -> Path:
+    try:
+        from rp_ylx.recording_layout import resolve_recording
+    except ImportError:
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        if src_root.is_dir() and str(src_root) not in sys.path:
+            sys.path.insert(0, str(src_root))
+        from rp_ylx.recording_layout import resolve_recording
+    return resolve_recording(recording_root, session_id)
 
 
 def _request(
@@ -289,12 +306,13 @@ def _checks(
 
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     started_at = _utc_now()
-    device = _request(args.base_url, "GET", "/api/v3/device")
+    api_version = getattr(args, "api_version", None) or DEFAULT_API_VERSION
+    device = _request(args.base_url, "GET", _api_path(api_version, "/device"))
     _require_status(device, {200}, "device")
     build = device.payload.get("build") if isinstance(device.payload, dict) else None
     device_commit = build.get("commit") if isinstance(build, dict) else None
 
-    initial_status = _request(args.base_url, "GET", "/api/v3/capture/status")
+    initial_status = _request(args.base_url, "GET", _api_path(api_version, "/capture/status"))
     _require_status(initial_status, {200}, "capture status")
     if _active_recording(initial_status.payload) is not None:
         raise RuntimeError("device has an active recording; refusing to interrupt it")
@@ -307,7 +325,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         start_result = _request(
             args.base_url,
             "POST",
-            "/api/v3/capture/start",
+            _api_path(api_version, "/capture/start"),
             payload={
                 "schema": "ylx.capture-start.v2",
                 "mode": "production",
@@ -320,7 +338,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         active = _active_recording(start_result.payload)
         if active is None:
             time.sleep(1.0)
-            active_status = _request(args.base_url, "GET", "/api/v3/capture/status")
+            active_status = _request(
+                args.base_url, "GET", _api_path(api_version, "/capture/status")
+            )
             _require_status(active_status, {200}, "capture status after start")
             active = _active_recording(active_status.payload)
         if active is None:
@@ -329,7 +349,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
-            sample_result = _request(args.base_url, "GET", "/api/v3/capture/status")
+            sample_result = _request(
+                args.base_url, "GET", _api_path(api_version, "/capture/status")
+            )
             if sample_result.status == 200 and isinstance(sample_result.payload, dict):
                 snapshot = sample_result.payload.get("snapshot")
                 runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else None
@@ -355,24 +377,24 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         stop_result = _request(
             args.base_url,
             "POST",
-            "/api/v3/capture/stop",
+            _api_path(api_version, "/capture/stop"),
             payload={"schema": "ylx.capture-stop.v2", "reason": "user"},
             headers={"Idempotency-Key": f"audio-sync-stop-{int(time.time())}"},
         )
         _require_status(stop_result, {200, 202, 204}, "capture stop")
-        _wait_for_idle(args.base_url, timeout_seconds=args.stop_timeout)
+        _wait_for_idle(args.base_url, timeout_seconds=args.stop_timeout, api_version=api_version)
     finally:
         if session_id is not None and not stop_attempted:
             _request(
                 args.base_url,
                 "POST",
-                "/api/v3/capture/stop",
+                _api_path(api_version, "/capture/stop"),
                 payload={"schema": "ylx.capture-stop.v2", "reason": "acceptance_abort"},
                 headers={"Idempotency-Key": f"audio-sync-abort-{int(time.time())}"},
             )
 
     assert session_id is not None
-    session_dir = args.recording_root / session_id
+    session_dir = _resolve_recording_dir(args.recording_root, session_id)
     manifest_path = session_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     audio = manifest.get("audio")
@@ -384,7 +406,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     validation = _run_validate(args.rp_ylx_bin, session_dir)
     range_result = _range_request(
         args.base_url,
-        f"/api/v3/sessions/{session_id}/artifacts/{first_audio_artifact['artifact_id']}",
+        _api_path(
+            api_version, f"/sessions/{session_id}/artifacts/{first_audio_artifact['artifact_id']}"
+        ),
         "bytes=0-43",
     )
     sample_rate = _audio_sample_rate(audio)
@@ -457,11 +481,13 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def _wait_for_idle(base_url: str, *, timeout_seconds: float) -> None:
+def _wait_for_idle(
+    base_url: str, *, timeout_seconds: float, api_version: str = DEFAULT_API_VERSION
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_payload: Any = None
     while time.monotonic() < deadline:
-        result = _request(base_url, "GET", "/api/v3/capture/status")
+        result = _request(base_url, "GET", _api_path(api_version, "/capture/status"))
         if result.status == 200 and isinstance(result.payload, dict):
             last_payload = result.payload
             if _active_recording(result.payload) is None:
@@ -473,6 +499,7 @@ def _wait_for_idle(base_url: str, *, timeout_seconds: float) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-version", choices=("v3", "v4"), default=DEFAULT_API_VERSION)
     parser.add_argument("--duration", type=float, default=12.0)
     parser.add_argument("--sample-interval", type=float, default=2.0)
     parser.add_argument("--stop-timeout", type=float, default=60.0)

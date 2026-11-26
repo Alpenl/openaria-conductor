@@ -132,7 +132,11 @@ def backup(args):
     client, login = connection(args.host, args.user)
     try:
         raw = remote(
-            client, login, args.user, Path(__file__).with_name("device.py").read_text(), ("backup",)
+            client,
+            login,
+            args.user,
+            Path(__file__).with_name("device.py").read_text(encoding="utf-8"),
+            ("backup",),
         )
         device.validate(json.loads(raw))
         encrypted = encrypt(raw, password)
@@ -145,7 +149,7 @@ def backup(args):
 
 
 INSTALL = r"""
-import hashlib, json, os, pathlib, subprocess, sys, tarfile
+import errno, hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile
 root = pathlib.Path(sys.argv[1])
 if root.is_symlink() or not root.name.startswith('openaria-factory-'):
     raise RuntimeError('invalid staging directory')
@@ -154,15 +158,34 @@ root.chmod(0o700)
 persistent = pathlib.Path('/var/lib/openaria-factory')
 persistent.mkdir(mode=0o700, exist_ok=True)
 if persistent.is_symlink(): raise RuntimeError('invalid persistent directory')
-root = pathlib.Path(root.rename(persistent / root.name))
+target = persistent / root.name
+try:
+    root = pathlib.Path(root.rename(target))
+except OSError as exc:
+    if exc.errno != errno.EXDEV:
+        raise
+    shutil.copytree(root, target, symlinks=False)
+    os.chown(target, 0, 0)
+    target.chmod(0o700)
+    for item in target.rglob('*'):
+        os.chown(item, 0, 0)
+        item.chmod(0o700 if item.is_dir() else 0o600)
+        if item.is_file():
+            with item.open('rb') as f:
+                os.fsync(f.fileno())
+    dir_fd = os.open(target, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    shutil.rmtree(root)
+    root = target
 archive = root / 'bundle.tar'
+h = hashlib.sha256()
 with archive.open('rb') as f:
-    digest = None
-if digest is None:
-    h = hashlib.sha256()
-    with archive.open('rb') as f:
-        for b in iter(lambda:f.read(1024*1024), b''): h.update(b)
-    digest = h.hexdigest()
+    for b in iter(lambda: f.read(1024 * 1024), b''):
+        h.update(b)
+digest = h.hexdigest()
 if digest != sys.argv[2]: raise RuntimeError('bundle digest mismatch')
 bundle = root / 'bundle'
 bundle.mkdir(mode=0o700)
@@ -226,7 +249,7 @@ def restore(args):
             client,
             login,
             args.user,
-            Path(__file__).with_name("device.py").read_text(),
+            Path(__file__).with_name("device.py").read_text(encoding="utf-8"),
             ("restore",),
             raw,
         )
@@ -247,10 +270,29 @@ def restore(args):
             time.sleep(5)
         else:
             raise RuntimeError("Install still pending; do not reflash or clear logs")
-        check = """import subprocess
-subprocess.run(['systemctl','is-active','--quiet','rp-ylx'],check=True)
-subprocess.run(['systemctl','daemon-reload'],check=True)
-subprocess.run(['alsactl','restore'],check=True)
+        volume = int(profile.get("voice", {"volume": 100})["volume"])
+        has_alsa_state = "var/lib/alsa/asound.state" in profile["files"]
+        check = f"""import subprocess
+subprocess.run(['systemctl', 'is-active', '--quiet', 'rp-ylx'], check=True)
+subprocess.run(['systemctl', 'daemon-reload'], check=True)
+subprocess.run(['systemctl', 'stop', 'rp-ylx.service'], check=True)
+code = (
+    "from rp_ylx.persistence import StateDatabase;from pathlib import Path;"
+    "db=StateDatabase(Path('/var/lib/rp-ylx/state.sqlite3'));"
+    "db.put('voice_feedback',{{'volume':{volume}}},history=True)"
+)
+subprocess.run(
+    [
+        'runuser', '-u', 'rp-ylx', '--',
+        '/usr/bin/env', 'PYTHONPATH=/opt/rp-ylx/current/site-packages',
+        '/opt/rp-ylx/current/runtime/bin/python3', '-c', code,
+    ],
+    check=True,
+)
+if {has_alsa_state!r}:
+    subprocess.run(['alsactl', 'restore'], check=True)
+subprocess.run(['systemctl', 'start', 'rp-ylx.service'], check=True)
+subprocess.run(['systemctl', 'is-active', '--quiet', 'rp-ylx.service'], check=True)
 print('installed')
 """
         remote(client, login, args.user, check)
@@ -274,6 +316,7 @@ def parser():
     sub.add_parser("disks", help="list eligible external whole disks")
     c = sub.add_parser("prepare-image", help="download and verify official system image")
     c.add_argument("--directory", type=Path, default=Path(__file__).parent / "images")
+    c.add_argument("--archive-sha256", help="optional pinned SHA-256 for the .img.xz archive")
     for action in ("compose", "auto-flash"):
         c = sub.add_parser(action, help="prepare offline first-boot recovery image")
         c.add_argument("--image", required=True, type=Path)
@@ -422,7 +465,7 @@ def main():
 
         print(json.dumps([asdict(d) for d in disks.discover()], ensure_ascii=False, indent=2))
     elif args.action == "prepare-image":
-        prepare_image.prepare(args.directory)
+        prepare_image.prepare(args.directory, expected_sha256=args.archive_sha256)
     elif args.action == "backup":
         backup(args)
     elif args.action == "restore":
