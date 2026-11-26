@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
+import http.client
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from rp_ylx.recording_button import CaptureClient
+from typing import Any, Protocol
 
 LOG = logging.getLogger("rp-ylx.recording-indicator")
+_MAX_CONSECUTIVE_LED_ERRORS = 5
+
+__all__ = ["CaptureSnapshotClient", "StatusLed", "indicator_pattern", "run_indicator"]
+
+
+class CaptureSnapshotClient(Protocol):
+    """Minimal capture client contract required by the status LED worker."""
+
+    def capture_snapshot(self) -> dict[str, Any]: ...
 
 
 def indicator_pattern(snapshot: dict) -> str:
     state = snapshot.get("device_state")
     if state == "recording":
         return "recording"
-    if state == "finalizing":
+    if state in {"finalizing", "verifying", "encoding"}:
         return "saving"
     if state == "idle" and snapshot.get("retained_unsuccessful") is None:
         return "idle"
@@ -31,7 +38,11 @@ class StatusLed:
         self.maximum = int((path / "max_brightness").read_text())
         self.previous_brightness = int((path / "brightness").read_text())
         triggers = (path / "trigger").read_text().split()
-        active = [value[1:-1] for value in triggers if value.startswith("[")]
+        active = [
+            value[1:-1]
+            for value in triggers
+            if value.startswith("[") and value.endswith("]") and len(value) > 2
+        ]
         supported = {value.strip("[]") for value in triggers}
         if len(active) != 1 or self.maximum < 1 or "timer" not in supported:
             raise ValueError("status LED requires a valid brightness and timer trigger")
@@ -52,8 +63,9 @@ class StatusLed:
             raise ValueError("unknown recording indicator pattern")
         if pattern == self.pattern:
             return
-        self.owned = True
+        self.pattern = None
         self._write("trigger", "none")
+        self.owned = True
         if pattern in {"saving", "error"}:
             # The kernel timer needs a nonzero brightness even on an inverted LED.
             # Both blink patterns have equal on/off times, so polarity preserves cadence.
@@ -76,12 +88,13 @@ class StatusLed:
         self._write("trigger", self.previous_trigger)
         for name, value in self.previous_delays.items():
             self._write(name, value)
+        self.pattern = None
         self.owned = False
 
 
 def run_indicator(
     led_path: Path,
-    client: CaptureClient,
+    client: CaptureSnapshotClient,
     stopped: threading.Event,
     *,
     inverted: bool = False,
@@ -89,6 +102,7 @@ def run_indicator(
     """Poll independently so slow HTTP requests never block physical button sampling."""
     led = None
     unavailable = False
+    consecutive_led_errors = 0
     try:
         led = StatusLed(led_path, inverted=inverted)
         while not stopped.is_set():
@@ -97,14 +111,22 @@ def run_indicator(
                 if unavailable:
                     LOG.info("recording indicator: capture status available again")
                 unavailable = False
-            except (OSError, ValueError, RuntimeError) as error:
+            except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
                 if not unavailable:
                     LOG.warning("recording indicator: capture status unavailable: %s", error)
                 unavailable = True
                 pattern = "error"
             if stopped.is_set():
                 break
-            led.show(pattern)
+            try:
+                led.show(pattern)
+                consecutive_led_errors = 0
+            except OSError as error:
+                consecutive_led_errors += 1
+                if consecutive_led_errors >= _MAX_CONSECUTIVE_LED_ERRORS:
+                    raise
+                if consecutive_led_errors == 1:
+                    LOG.warning("recording indicator transient LED write failure: %s", error)
             stopped.wait(0.5)
     except (OSError, ValueError) as error:
         # A missing or unavailable LED must not disable the physical recording button.

@@ -2,34 +2,37 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
-import sqlite3
-import stat
 import subprocess
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from rp_ylx.core.fs import O_CLOEXEC, O_NOFOLLOW, chown_to_parent
+from rp_ylx.core.locks import acquire_flock
 from rp_ylx.persistence import (
-    APPLICATION_ID,
     SCHEMA_VERSION,
     PersistenceError,
     StateDatabase,
-    _require_regular_database_file,
-    _sync_parent,
-    validate_state_schema,
+    readonly_connection,
+    sync_parent,
 )
 from rp_ylx.recording.catalog import SessionCatalog
+
+__all__ = ["inspect", "manage", "require_offline", "restore"]
 
 
 def require_offline() -> None:
     units = [
         "rp-ylx.service",
         "rp-ylx-network-control.service",
+        "rp-ylx-network-control.socket",
         "rp-ylx-recording-button.service",
         "rp-ylx-recover.service",
+        "openaria-update.service",
+        "rp-ylx-wifi-watchdog.service",
+        "rp-ylx-wifi-watchdog.timer",
     ]
     result = subprocess.run(
         ["systemctl", "show", "--property=ActiveState", "--value", *units],
@@ -41,20 +44,13 @@ def require_offline() -> None:
     states = result.stdout.split()
     if len(states) != len(units) or any(s not in {"inactive", "failed"} for s in states):
         raise PersistenceError(
-            "stop capture, network-control, recording-button and recover services first"
+            "stop capture, network-control, recording-button, update, "
+            "watchdog and recover services first"
         )
 
 
 def inspect(path: Path) -> dict:
-    _require_regular_database_file(path)
-    db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)
-    try:
-        if (
-            db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-            or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-        ):
-            raise PersistenceError("unsupported database identity or schema")
-        validate_state_schema(db)
+    with readonly_connection(path) as db:
         checks = [row[0] for row in db.execute("PRAGMA integrity_check")]
         if checks != ["ok"]:
             raise PersistenceError("database integrity check failed")
@@ -66,8 +62,25 @@ def inspect(path: Path) -> dict:
                 for r in db.execute("SELECT name,revision FROM documents ORDER BY name")
             ],
         }
-    finally:
-        db.close()
+
+
+@contextmanager
+def _maintenance_restore_lease() -> Iterator[None]:
+    lock_path = Path(os.environ.get("OPENARIA_MAINTENANCE_LOCK", "/run/rp-ylx/maintenance.lock"))
+    if (
+        os.geteuid() != 0
+        and "OPENARIA_MAINTENANCE_LOCK" not in os.environ
+        and not lock_path.exists()
+    ):
+        yield
+        return
+    try:
+        with acquire_flock(lock_path, nonblocking=True):
+            yield
+    except BlockingIOError as error:
+        raise PersistenceError(
+            "maintenance lock is busy; retry after active operation finishes"
+        ) from error
 
 
 @contextmanager
@@ -75,23 +88,19 @@ def _restore_lock(destination: Path) -> Iterator[None]:
     # Keep this inode after release. Unlinking a lock file permits waiters and
     # new callers to lock different inodes for the same destination.
     lock = destination.with_suffix(destination.suffix + ".restore.lock")
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise PersistenceError("database restore lock must be a regular file")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise PersistenceError("database restore is busy; retry after it finishes") from None
-        yield
-    finally:
-        os.close(fd)
+        with acquire_flock(lock, mode=0o600, group_name=None, nonblocking=True):
+            yield
+    except BlockingIOError:
+        raise PersistenceError("database restore is busy; retry after it finishes") from None
+    except ValueError as error:
+        raise PersistenceError("database restore lock must be a regular file") from error
 
 
 def restore(source: Path, destination: Path) -> dict:
     # SQLite locks protect transactions, not renames of database and journal
     # files. Serialize maintenance through final inspection and cleanup.
-    with _restore_lock(destination):
+    with _restore_lock(destination), _maintenance_restore_lease():
         return _restore_locked(source, destination)
 
 
@@ -124,15 +133,16 @@ def _restore_prepared(prepared: Path, destination: Path, required: str | None, t
     # Preserve even corrupt databases and their journals for diagnosis.
     # Never remove the authority marker: interruption must fail closed.
     marker = destination.with_suffix(destination.suffix + ".initialized")
-    if not marker.exists():
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if not os.path.lexists(marker):
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         with os.fdopen(fd, "w") as stream:
             stream.write(str(SCHEMA_VERSION))
             stream.flush()
             os.fsync(stream.fileno())
+        chown_to_parent(marker)
     # Make the authority marker durable before any old file moves. A
     # missing database after interruption must not bootstrap empty state.
-    _sync_parent(marker)
+    sync_parent(marker)
     # A hot rollback journal belongs to the old database just like WAL/SHM.
     # Leaving it at the live name can replay old pages into the restored copy.
     for suffix in ("", "-wal", "-shm", "-journal"):
@@ -143,11 +153,11 @@ def _restore_prepared(prepared: Path, destination: Path, required: str | None, t
             archived.append(str(saved))
     # Old database and journals must be durably named before publication.
     # On failure, retain their archived names and the authority marker.
-    _sync_parent(destination)
+    sync_parent(destination)
     prepared.replace(destination)
     # The private snapshot's contents were synced before admission; its new name
     # needs its own barrier. A failure preserves both new and archived data.
-    _sync_parent(destination)
+    sync_parent(destination)
     StateDatabase(destination)
     return {"restored": str(destination), "preserved": archived, **inspect(destination)}
 
@@ -175,7 +185,8 @@ def manage(path: Path, action: str, *, source: Path | None, destination: Path | 
             result["rebuild"] = "session manifests will be indexed on the next list request"
             return result
         finally:
-            temporary.unlink(missing_ok=True)
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(str(temporary) + suffix).unlink(missing_ok=True)
             temporary.with_suffix(".sqlite3.initialized").unlink(missing_ok=True)
             temporary.with_suffix(".sqlite3.init.lock").unlink(missing_ok=True)
     raise ValueError("unknown database operation")

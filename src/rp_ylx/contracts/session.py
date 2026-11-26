@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from rp_ylx.contracts.frame_stream import FrameStreamError, iter_frames
+from rp_ylx.core.ids import parse_rfc3339, valid_sha256
 
 SESSION_FORMAT = "ylx.recording-session.v0"
 STATE_FORMAT = "ylx.recording-session-state.v0"
@@ -35,8 +35,6 @@ ROLE_MEDIA_TYPES = {
     "imu.samples": "application/x-ndjson",
     "diagnostics.events": "application/x-ndjson",
 }
-
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SessionValidationError(ValueError):
@@ -112,7 +110,7 @@ def _timestamp(value: object, location: str) -> datetime:
     if not isinstance(value, str) or not value.endswith(("Z", "+00:00")):
         _fail("invalid_value", location, "必须是带 UTC 时区的 RFC 3339 时间")
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parse_rfc3339(value)
     except ValueError:
         _fail("invalid_value", location, "不是有效 RFC 3339 时间")
 
@@ -437,7 +435,7 @@ def validate_session(directory: str | Path, *, allow_partial: bool = False) -> d
         )
         if resolved.stat().st_size != expected_bytes:
             _fail("size_mismatch", relative, "文件大小与清单不一致")
-        if not isinstance(artifact["sha256"], str) or not _SHA256.fullmatch(artifact["sha256"]):
+        if not valid_sha256(artifact["sha256"]):
             _fail("invalid_value", f"manifest.artifacts[{index}].sha256", "SHA-256 格式无效")
         if _digest(resolved) != artifact["sha256"]:
             _fail("digest_mismatch", relative, "文件摘要与清单不一致")

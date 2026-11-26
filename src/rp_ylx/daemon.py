@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
+import math
 import os
 import signal
 import ssl
 import stat
 import threading
 import time
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +20,37 @@ from rp_ylx import __commit__, __version__
 from rp_ylx.api import AuditEvent, Principal, SecurityPolicy, create_gateway_server
 from rp_ylx.api.events import EventReplayBuffer
 from rp_ylx.api.preview import LatestPreviewBuffer
-from rp_ylx.api.security import valid_customer_bearer_token
 from rp_ylx.camera import (
     CameraController,
     CameraMode,
 )
 from rp_ylx.cli_helpers import stable_id_for_device
+from rp_ylx.config import PRODUCTION_CONFIG_SCHEMA as PRODUCTION_CONFIG_SCHEMA
+from rp_ylx.config import (
+    ProductionConfig,
+    ProductionConfigError,
+    production_config_from_value,
+    read_bearer_token,
+)
+from rp_ylx.core.board import RDK_X5_MODEL
+from rp_ylx.core.fs import O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, read_bounded_json
+from rp_ylx.core.time import utc_now_iso
+
+__all__ = [
+    "CUSTOMER_OPERATIONS",
+    "CaptureEventPump",
+    "CaptureRecoveryMonitor",
+    "CaptureTimerMonitor",
+    "LAB_OPERATIONS",
+    "PRODUCTION_CONFIG_SCHEMA",
+    "ProductionConfig",
+    "ProductionConfigError",
+    "ProductionService",
+    "StorageReserveMonitor",
+    "build_production_service",
+    "load_production_config",
+    "run_production_service",
+]
 from rp_ylx.imu import ImuCollector
 from rp_ylx.mdns import MdnsPublisher
 from rp_ylx.native import NativeModuleError, native_capabilities
@@ -40,9 +63,7 @@ from rp_ylx.recording import (
     DeviceSessionConfig,
     NativeContinuousCaptureSources,
 )
-from rp_ylx.recording.encoding import RecordingEncoding
 
-PRODUCTION_CONFIG_SCHEMA = "ylx.production-config.v1"
 LAB_OPERATIONS = frozenset(
     {
         "getDevice",
@@ -52,6 +73,7 @@ LAB_OPERATIONS = frozenset(
         "getCaptureTimer",
         "setCaptureTimer",
         "getDeviceClock",
+        "inspectDeviceClock",
         "firmwareStatus",
         "firmwareUpdate",
         "getCaptureStatus",
@@ -80,141 +102,14 @@ LAB_OPERATIONS = frozenset(
 )
 CUSTOMER_OPERATIONS = LAB_OPERATIONS
 _OPERATIONAL_LOG = operational_logger("production-service")
-
-
-class ProductionConfigError(ValueError):
-    def __init__(self, message: str, *, code: str = "invalid_production_config") -> None:
-        self.code = code
-        self.message = message
-        super().__init__(f"{code}: {message}")
-
-
-@dataclass(frozen=True, slots=True)
-class ProductionConfig:
-    host: str
-    port: int
-    camera_device: Path
-    mountpoint: Path
-    state_root: Path
-    device_id: str
-    device_label: str
-    hardware_fingerprint: str
-    isolated_network: bool
-    security_profile: str = "lab"
-    bearer_token_file: Path | None = None
-    tls_certificate_file: Path | None = None
-    tls_private_key_file: Path | None = None
-    principal_id: str = "device-owner"
-    data_plane: str = "rust"
-    width: int = 3840
-    height: int = 1080
-    fps: int = 60
-    # 0.5 records 30fps split-eye H.264: dual 1080p60 leaves the VPU no headroom.
-    frame_decimation: int = 2
-    video_layout: str = "split-eyes"
-    video_bitrate_kbps: int = 8192
-    recording_encoding: RecordingEncoding | None = None
-    exposure_time_absolute: int | str | None = "auto"
-    segment_seconds: float = 5.0
-    audio_enabled: bool = True
-    audio_device: str = "hw:CARD=D2UQ2,DEV=0"
-    audio_sample_rate_hz: int = 48_000
-    audio_channels: int = 2
-    audio_sample_format: str = "S16_LE"
-    minimum_available_bytes: int = 2 * 1024 * 1024 * 1024
-    minimum_available_inodes: int = 1024
-
-    def __post_init__(self) -> None:
-        if self.exposure_time_absolute not in (None, "auto") and (
-            type(self.exposure_time_absolute) is not int
-            or not 1 <= self.exposure_time_absolute <= 100
-        ):
-            raise ProductionConfigError(
-                "camera.exposure_time_absolute 必须为 auto、null 或 1..100 整数"
-            )
-        try:
-            address = ipaddress.ip_address(self.host)
-            device_id = uuid.UUID(self.device_id)
-        except ValueError as error:
-            raise ProductionConfigError("生产服务地址或设备 UUID 无效") from error
-        if (
-            not self.isolated_network
-            or address.is_multicast
-            or address.is_unspecified
-            and self.host not in {"0.0.0.0", "::"}
-            or not 1 <= self.port <= 65535
-            or not self.camera_device.is_absolute()
-            or not self.mountpoint.is_absolute()
-            or not self.state_root.is_absolute()
-            or device_id.version != 4
-            or str(device_id) != self.device_id
-            or len(self.device_label) != 12
-            or not self.device_label.startswith("YLX-")
-            or any(character not in "0123456789ABCDEF" for character in self.device_label[4:])
-            or len(self.hardware_fingerprint) != 71
-            or not self.hardware_fingerprint.startswith("sha256:")
-            or any(
-                character not in "0123456789abcdef" for character in self.hardware_fingerprint[7:]
-            )
-            or self.security_profile not in {"customer", "lab"}
-            or (
-                self.security_profile == "lab"
-                and any(
-                    path is not None
-                    for path in (
-                        self.bearer_token_file,
-                        self.tls_certificate_file,
-                        self.tls_private_key_file,
-                    )
-                )
-            )
-            or (
-                self.security_profile == "customer"
-                and (
-                    self.bearer_token_file is None
-                    or not self.bearer_token_file.is_absolute()
-                    or self.tls_certificate_file is None
-                    or not self.tls_certificate_file.is_absolute()
-                    or self.tls_private_key_file is None
-                    or not self.tls_private_key_file.is_absolute()
-                    or not 1 <= len(self.principal_id) <= 128
-                    or any(not 0x21 <= ord(character) <= 0x7E for character in self.principal_id)
-                )
-            )
-            or self.width <= 0
-            or self.width % 2
-            or self.height <= 0
-            or self.fps <= 0
-            or self.frame_decimation <= 0
-            or self.video_layout != "split-eyes"
-            or self.video_bitrate_kbps <= 0
-            or self.segment_seconds <= 0
-            or type(self.audio_enabled) is not bool
-            or (self.audio_enabled and not self.audio_device)
-            or self.audio_sample_rate_hz <= 0
-            or self.audio_channels <= 0
-            or self.audio_sample_format != "S16_LE"
-            or self.minimum_available_bytes < 0
-            or self.minimum_available_inodes < 0
-            or self.data_plane != "rust"
-        ):
-            raise ProductionConfigError("生产服务配置无效")
-
-
-def _integer(value: object, name: str) -> int:
-    if type(value) is not int:
-        raise ProductionConfigError(f"{name} 必须是整数")
-    return value
+_MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024
 
 
 def load_production_config(path: str | Path) -> ProductionConfig:
     source = Path(path)
     try:
-        raw = source.read_bytes()
-        if len(raw) > 64 * 1024:
-            raise ProductionConfigError("生产配置文件过大")
-        value = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as error:
+        value = read_bounded_json(source, max_bytes=64 * 1024)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as error:
         raise ProductionConfigError(f"无法读取生产配置：{error}") from error
     from rp_ylx.settings import effective
 
@@ -223,163 +118,11 @@ def load_production_config(path: str | Path) -> ProductionConfig:
     return production_config_from_value(effective(value))
 
 
-def production_config_from_value(value: object) -> ProductionConfig:
-    required = {
-        "schema",
-        "listen",
-        "camera",
-        "storage",
-        "state_root",
-        "device",
-        "security",
-    }
-    optional = {"audio", "recording"}
-    if not isinstance(value, dict):
-        raise ProductionConfigError("生产配置顶层字段无效")
-    top_level = set(value)
-    if not required <= top_level or top_level - required - optional:
-        raise ProductionConfigError("生产配置顶层字段无效")
-    listen = value["listen"]
-    camera = value["camera"]
-    storage = value["storage"]
-    device = value["device"]
-    security = value["security"]
-    audio = value.get("audio")
-    try:
-        encoding = RecordingEncoding.from_mapping(value.get("recording", {}))
-    except (TypeError, ValueError) as error:
-        raise ProductionConfigError(str(error)) from error
-    security_profile = security.get("profile") if isinstance(security, dict) else None
-    security_valid = (
-        isinstance(security, dict)
-        and type(security.get("isolated_network")) is bool
-        and (
-            security_profile == "lab"
-            and set(security) == {"profile", "isolated_network"}
-            or security_profile == "customer"
-            and set(security)
-            == {
-                "profile",
-                "isolated_network",
-                "bearer_token_file",
-                "tls_certificate_file",
-                "tls_private_key_file",
-                "principal_id",
-            }
-            and isinstance(security.get("bearer_token_file"), str)
-            and isinstance(security.get("tls_certificate_file"), str)
-            and isinstance(security.get("tls_private_key_file"), str)
-            and isinstance(security.get("principal_id"), str)
-        )
-    )
-    if (
-        value["schema"] != PRODUCTION_CONFIG_SCHEMA
-        or not all(isinstance(item, dict) for item in (listen, camera, storage, device, security))
-        or (audio is not None and not isinstance(audio, dict))
-        or set(listen) != {"host", "port"}
-        or (set(camera) - {"exposure_time_absolute"})
-        not in (
-            {"device", "width", "height", "fps"},
-            {"device", "width", "height", "fps", "data_plane"},
-        )
-        or (
-            audio is not None
-            and set(audio) != {"enabled", "device", "sample_rate_hz", "channels", "sample_format"}
-        )
-        or (audio is not None and type(audio.get("enabled")) is not bool)
-        or set(storage) != {"mountpoint", "minimum_available_bytes", "minimum_available_inodes"}
-        or set(device) != {"device_id", "device_label", "hardware_fingerprint"}
-        or not security_valid
-    ):
-        raise ProductionConfigError("生产配置结构无效")
-    try:
-        return ProductionConfig(
-            host=str(listen["host"]),
-            port=_integer(listen["port"], "listen.port"),
-            camera_device=Path(str(camera["device"])),
-            mountpoint=Path(str(storage["mountpoint"])),
-            state_root=Path(str(value["state_root"])),
-            device_id=str(device["device_id"]),
-            device_label=str(device["device_label"]),
-            hardware_fingerprint=str(device["hardware_fingerprint"]),
-            isolated_network=security["isolated_network"],
-            security_profile=str(security_profile),
-            bearer_token_file=(
-                None if security_profile == "lab" else Path(str(security["bearer_token_file"]))
-            ),
-            tls_certificate_file=(
-                None if security_profile == "lab" else Path(str(security["tls_certificate_file"]))
-            ),
-            tls_private_key_file=(
-                None if security_profile == "lab" else Path(str(security["tls_private_key_file"]))
-            ),
-            principal_id=(
-                "device-owner" if security_profile == "lab" else str(security["principal_id"])
-            ),
-            data_plane=str(camera.get("data_plane", "rust")),
-            width=_integer(camera["width"], "camera.width"),
-            height=_integer(camera["height"], "camera.height"),
-            fps=_integer(camera["fps"], "camera.fps"),
-            recording_encoding=encoding,
-            exposure_time_absolute=camera.get("exposure_time_absolute", "auto"),
-            video_bitrate_kbps=encoding.bitrate_kbps,
-            audio_enabled=True if audio is None else audio["enabled"],
-            audio_device="hw:CARD=D2UQ2,DEV=0" if audio is None else str(audio["device"]),
-            audio_sample_rate_hz=(
-                48_000
-                if audio is None
-                else _integer(audio["sample_rate_hz"], "audio.sample_rate_hz")
-            ),
-            audio_channels=2 if audio is None else _integer(audio["channels"], "audio.channels"),
-            audio_sample_format="S16_LE" if audio is None else str(audio["sample_format"]),
-            minimum_available_bytes=_integer(
-                storage["minimum_available_bytes"], "storage.minimum_available_bytes"
-            ),
-            minimum_available_inodes=_integer(
-                storage["minimum_available_inodes"], "storage.minimum_available_inodes"
-            ),
-        )
-    except KeyError as error:
-        raise ProductionConfigError(f"生产配置缺少字段：{error}") from error
-
-
-def _read_bearer_token(path: Path) -> str:
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ProductionConfigError("Bearer token 文件必须是普通文件且不能是符号链接")
-            if metadata.st_mode & 0o027:
-                raise ProductionConfigError("Bearer token 文件权限必须禁止组写入和其他用户访问")
-            raw = os.read(descriptor, 4097)
-        finally:
-            os.close(descriptor)
-    except ProductionConfigError:
-        raise
-    except OSError as error:
-        raise ProductionConfigError("无法读取 Bearer token 文件") from error
-    if len(raw) > 4096:
-        raise ProductionConfigError("Bearer token 文件过大")
-    try:
-        token = raw.rstrip(b"\r\n").decode("ascii")
-    except UnicodeDecodeError as error:
-        raise ProductionConfigError("Bearer token 必须是 ASCII") from error
-    if not valid_customer_bearer_token(token) or raw.rstrip(b"\r\n") != raw.removesuffix(
-        b"\n"
-    ).removesuffix(b"\r"):
-        raise ProductionConfigError("Bearer token 格式无效")
-    return token
-
-
 def _security_policy(config: ProductionConfig) -> SecurityPolicy:
     if config.security_profile == "lab":
         return SecurityPolicy.lab(allowed_operations=LAB_OPERATIONS)
     assert config.bearer_token_file is not None
-    token = _read_bearer_token(config.bearer_token_file)
+    token = read_bearer_token(config.bearer_token_file)
     principal = Principal(
         config.principal_id,
         permissions={operation: None for operation in CUSTOMER_OPERATIONS},
@@ -391,7 +134,7 @@ def _validate_tls_file(path: Path, *, private: bool) -> None:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
         )
         try:
             metadata = os.fstat(descriptor)
@@ -419,18 +162,39 @@ def _enable_customer_tls(server: Any, config: ProductionConfig) -> None:
             certfile=str(config.tls_certificate_file),
             keyfile=str(config.tls_private_key_file),
         )
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        # Defer TLS handshake to worker threads so a stalled TCP client never
+        # blocks the single accept loop.
+        server.socket = context.wrap_socket(
+            server.socket, server_side=True, do_handshake_on_connect=False
+        )
     except (OSError, ssl.SSLError) as error:
         raise ProductionConfigError("无法启用 Customer TLS") from error
 
 
-def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
+def _audit_sink(
+    path: Path, *, max_bytes: int = _MAX_AUDIT_LOG_BYTES
+) -> Callable[[AuditEvent], None]:
     lock = threading.Lock()
+    rotated_path = path.with_name(path.name + ".1")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+
+    def _validate_regular_single_link(info: os.stat_result) -> None:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError("API audit target must be an exclusively linked regular file")
+
+    def _rotate_audit_file() -> None:
+        try:
+            rotated_info = rotated_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            _validate_regular_single_link(rotated_info)
+        os.replace(path, rotated_path)
 
     def write(event: AuditEvent) -> None:
         value = {
             "schema": "ylx.api-audit-event.v1",
-            "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "recorded_at": utc_now_iso(),
             "request_id": event.request_id,
             "principal_id": event.principal_id,
             "operation_id": event.operation_id,
@@ -438,34 +202,40 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
             "outcome": event.outcome,
         }
         payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        flags |= os.O_NONBLOCK
         with lock:
-            # Reject special files before open can block or affect a device.
-            # The descriptor check below also covers replacement after lstat.
-            try:
-                existing = path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
-                    raise OSError("API audit target must be an exclusively linked regular file")
-            descriptor = os.open(path, flags, 0o600)
-            try:
-                metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise OSError("API audit target must be an exclusively linked regular file")
-                if metadata.st_mode & 0o777 != 0o600:
-                    os.fchmod(descriptor, 0o600)
-                remaining = memoryview(payload)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise OSError("API audit record was not fully written")
-                    remaining = remaining[written:]
-            finally:
-                os.close(descriptor)
+            for attempt in range(2):
+                # Reject special files before open can block or affect a device.
+                # The descriptor check below also covers replacement after lstat.
+                try:
+                    existing = path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    _validate_regular_single_link(existing)
+                    if existing.st_size > 0 and existing.st_size + len(payload) > max_bytes:
+                        _rotate_audit_file()
+                descriptor = os.open(path, flags, 0o600)
+                try:
+                    metadata = os.fstat(descriptor)
+                    _validate_regular_single_link(metadata)
+                    if metadata.st_mode & 0o777 != 0o600:
+                        os.fchmod(descriptor, 0o600)
+                    if (
+                        attempt == 0
+                        and metadata.st_size > 0
+                        and metadata.st_size + len(payload) > max_bytes
+                    ):
+                        _rotate_audit_file()
+                        continue
+                    remaining = memoryview(payload)
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written <= 0:
+                            raise OSError("API audit record was not fully written")
+                        remaining = remaining[written:]
+                    return
+                finally:
+                    os.close(descriptor)
 
     return write
 
@@ -483,12 +253,12 @@ class ProductionService:
     def close(self) -> None:
         error = _close_service_components(
             (
+                ("server", self.server, "server_close"),
                 ("recovery_monitor", self.recovery_monitor, "close"),
                 ("capture_timer_monitor", self.capture_timer_monitor, "close"),
                 ("storage_monitor", self.storage_monitor, "close"),
-                ("server", self.server, "server_close"),
-                ("mdns_publisher", self.mdns_publisher, "close"),
                 ("event_pump", self.event_pump, "close"),
+                ("mdns_publisher", self.mdns_publisher, "close"),
                 ("coordinator", self.coordinator, "close"),
             )
         )
@@ -589,61 +359,61 @@ def _start_background_worker(
 class StorageReserveMonitor:
     """A separate thread keeps a slow finalization off the SSE/status event pump."""
 
+    _thread_name = "storage-reserve"
+    _interval = 1.0
+    _failure_event = "storage_reserve_monitor_failed"
+
     def __init__(self, coordinator: CaptureCoordinator) -> None:
         self.coordinator = coordinator
         self.stop = threading.Event()
         self.thread = _start_background_worker(
-            self._run, self.stop, name="storage-reserve", daemon=True
+            self._run, self.stop, name=self._thread_name, daemon=True
         )
+
+    def _step(self) -> None:
+        self.coordinator.enforce_storage_reserve()
 
     def _run(self) -> None:
         next_report_at: float | None = None
-        while not self.stop.wait(1.0):
+        while not self.stop.wait(self._interval):
             try:
-                self.coordinator.enforce_storage_reserve()
+                self._step()
             except Exception as error:
                 next_report_at = _report_worker_failure(
-                    "recording", "storage_reserve_monitor_failed", error, next_report_at
+                    "recording", self._failure_event, error, next_report_at
                 )
 
     def close(self) -> None:
         self.stop.set()
-        self.thread.join()
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            _OPERATIONAL_LOG.event(
+                "background_worker_close_timeout",
+                level="warning",
+                stage=self._thread_name,
+            )
 
 
 class CaptureRecoveryMonitor(StorageReserveMonitor):
     """Failure publication retries must not wait behind the storage monitor."""
 
-    def _run(self) -> None:
-        next_report_at = None
-        while not self.stop.wait(2.0):
-            try:
-                self.coordinator.reconcile_capture_recovery()
-            except Exception as error:
-                next_report_at = _report_worker_failure(
-                    "recording", "capture_recovery_retry_failed", error, next_report_at
-                )
+    _thread_name = "capture-recovery"
+    _interval = 2.0
+    _failure_event = "capture_recovery_retry_failed"
+
+    def _step(self) -> None:
+        self.coordinator.reconcile_capture_recovery()
 
 
 class CaptureTimerMonitor(StorageReserveMonitor):
     """Independent of storage probes, browsers and SSE; checks at 100 ms intervals."""
 
-    def __init__(self, coordinator: CaptureCoordinator) -> None:
-        self.coordinator = coordinator
-        self.stop = threading.Event()
-        self.thread = _start_background_worker(
-            self._run, self.stop, name="capture-timer", daemon=True
-        )
+    _thread_name = "capture-timer"
+    _interval = 0.1
+    _failure_event = "capture_timer_monitor_failed"
 
-    def _run(self) -> None:
-        next_report_at: float | None = None
-        while not self.stop.wait(0.1):
-            try:
-                self.coordinator.enforce_capture_timer()
-            except Exception as error:
-                next_report_at = _report_worker_failure(
-                    "recording", "capture_timer_monitor_failed", error, next_report_at
-                )
+    def _step(self) -> None:
+        self.coordinator.enforce_capture_timer()
 
 
 class CaptureEventPump:
@@ -657,7 +427,14 @@ class CaptureEventPump:
         interval: float = 1.0,
         progress_interval: float = 0.2,
     ) -> None:
-        if interval <= 0 or progress_interval <= 0:
+        if (
+            type(interval) not in {int, float}
+            or not math.isfinite(interval)
+            or interval <= 0
+            or type(progress_interval) not in {int, float}
+            or not math.isfinite(progress_interval)
+            or progress_interval <= 0
+        ):
             raise ValueError("事件泵 interval 必须大于零")
         self._coordinator = coordinator
         self._event_buffer = event_buffer
@@ -749,7 +526,7 @@ class CaptureEventPump:
         if state is None:
             return None
         phase = state.get("state")
-        if phase not in {"recording", "finalizing", "verifying"}:
+        if phase not in {"recording", "finalizing", "verifying", "encoding"}:
             return None
         session_id = state.get("session_id")
         if not isinstance(session_id, str):
@@ -759,7 +536,7 @@ class CaptureEventPump:
             return None
         elapsed = progress.get("elapsed_seconds")
         frames = progress.get("captured_frames")
-        if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
+        if type(elapsed) not in {int, float} or not math.isfinite(elapsed):
             return None
         if type(frames) is not int or frames < 0:
             return None
@@ -767,7 +544,7 @@ class CaptureEventPump:
             "authority_epoch": source[0],
             "source_revision": source[1],
             "type": "progress",
-            "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "occurred_at": utc_now_iso(),
             "session_id": session_id,
             "data": {
                 "schema": "ylx.capture-progress-event.v2",
@@ -784,6 +561,130 @@ class CaptureEventPump:
         self._thread.join(timeout=self._interval + 1.0)
         if self._thread.is_alive():
             raise RuntimeError("事件泵线程未能在关闭期限内退出")
+
+
+def _validate_native_data_plane(config: ProductionConfig) -> None:
+    try:
+        capabilities = native_capabilities()
+    except NativeModuleError as exc:
+        raise ProductionConfigError(exc.message, code=exc.code) from exc
+    if not capabilities.module_available:
+        raise ProductionConfigError(
+            "正式服务缺少 Rust 原生模块",
+            code="native_module_unavailable",
+        )
+    required = [
+        (
+            "capture_engine",
+            "native_capture_engine_unavailable",
+            "正式采集缺少 Rust CaptureEngine 深层资源 owner",
+        ),
+        (
+            "session_store",
+            "native_session_store_unavailable",
+            "正式录制缺少 Rust SessionStore 事务 owner",
+        ),
+        (
+            "preview_buffer",
+            "native_preview_buffer_unavailable",
+            "正式预览缺少 Rust latest-only 缓冲能力",
+        ),
+        (
+            "performance_metrics",
+            "native_metrics_unavailable",
+            "正式采集缺少 Rust 性能指标累计能力",
+        ),
+    ]
+    if config.audio_enabled:
+        required.append(
+            (
+                "native_audio",
+                "native_audio_unavailable",
+                "正式采集缺少 Rust/ALSA 原生音频能力",
+            )
+        )
+    for feature, code, message in required:
+        if feature not in capabilities.features:
+            raise ProductionConfigError(message, code=code)
+
+
+def _build_capture_sources(
+    config: ProductionConfig,
+    *,
+    using_native_data_plane: bool,
+    preview: LatestPreviewBuffer,
+    metrics: PerformanceMetrics,
+    camera_backend_factory: Callable[[], object] | None,
+    imu_source_factory: Callable[[Path], object] | None,
+) -> Any:
+    mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
+    if using_native_data_plane:
+        return NativeContinuousCaptureSources(
+            str(config.camera_device),
+            mode,
+            preview=preview,
+            frame_decimation=config.frame_decimation,
+            metrics=metrics,
+            exposure_time_absolute=config.exposure_time_absolute,
+        )
+    assert camera_backend_factory is not None
+    assert imu_source_factory is not None
+
+    def imu_factory() -> ImuCollector:
+        return ImuCollector(imu_source_factory(config.camera_device))
+
+    selector = CameraController(camera_backend_factory())
+    stable_id = stable_id_for_device(selector, config.camera_device)
+    return ContinuousCaptureSources(
+        lambda: CameraController(camera_backend_factory()),
+        imu_factory,
+        mode,
+        publish_preview=preview.publish,
+        stable_id=stable_id,
+        warmup_frames=max(1, config.fps),
+        frame_decimation=config.frame_decimation,
+    )
+
+
+def _start_preview_best_effort(sources: Any, camera_device: Path) -> None:
+    try:
+        sources.start_preview()
+    except Exception as error:
+        code = getattr(error, "code", "camera_preview_unavailable")
+        if not camera_device.exists():
+            code = "camera_not_connected"
+        _OPERATIONAL_LOG.event(
+            "camera_preview_degraded",
+            level="warning",
+            error_code=code if isinstance(code, str) else "camera_preview_unavailable",
+            exception_type=type(error).__name__,
+            retryable=True,
+        )
+
+
+def _build_session_config(config: ProductionConfig) -> DeviceSessionConfig:
+    return DeviceSessionConfig(
+        device_id=config.device_id,
+        device_label=config.device_label,
+        hardware_fingerprint=config.hardware_fingerprint,
+        platform=f"{RDK_X5_MODEL} + YLX 2UQ2",
+        software_version=__version__,
+        commit=__commit__,
+        width=config.width,
+        height=config.height,
+        sensor_fps=float(config.fps),
+        frame_decimation=config.frame_decimation,
+        video_layout=config.video_layout,
+        video_bitrate_kbps=config.video_bitrate_kbps,
+        recording_encoding=config.recording_encoding,
+        lossless_storage=True,
+        segment_seconds=config.segment_seconds,
+        audio_enabled=config.audio_enabled,
+        audio_device=config.audio_device,
+        audio_sample_rate_hz=config.audio_sample_rate_hz,
+        audio_channels=config.audio_channels,
+        audio_sample_format=config.audio_sample_format,
+    )
 
 
 def build_production_service(
@@ -803,78 +704,17 @@ def build_production_service(
             code="incomplete_test_capture_adapter",
         )
     if using_native_data_plane:
-        try:
-            capabilities = native_capabilities()
-        except NativeModuleError as exc:
-            raise ProductionConfigError(exc.message, code=exc.code) from exc
-        if not capabilities.module_available:
-            raise ProductionConfigError(
-                "正式服务缺少 Rust 原生模块",
-                code="native_module_unavailable",
-            )
-        required = [
-            (
-                "capture_engine",
-                "native_capture_engine_unavailable",
-                "正式采集缺少 Rust CaptureEngine 深层资源 owner",
-            ),
-            (
-                "session_store",
-                "native_session_store_unavailable",
-                "正式录制缺少 Rust SessionStore 事务 owner",
-            ),
-            (
-                "preview_buffer",
-                "native_preview_buffer_unavailable",
-                "正式预览缺少 Rust latest-only 缓冲能力",
-            ),
-            (
-                "performance_metrics",
-                "native_metrics_unavailable",
-                "正式采集缺少 Rust 性能指标累计能力",
-            ),
-        ]
-        if config.audio_enabled:
-            required.append(
-                (
-                    "native_audio",
-                    "native_audio_unavailable",
-                    "正式采集缺少 Rust/ALSA 原生音频能力",
-                )
-            )
-        for feature, code, message in required:
-            if feature not in capabilities.features:
-                raise ProductionConfigError(message, code=code)
-    mode = CameraMode(config.width, config.height, float(config.fps), "mjpg")
+        _validate_native_data_plane(config)
     preview = LatestPreviewBuffer(stream_fps=25, thumbnails=using_native_data_plane)
     metrics = PerformanceMetrics()
-    if using_native_data_plane:
-        sources = NativeContinuousCaptureSources(
-            str(config.camera_device),
-            mode,
-            preview=preview,
-            frame_decimation=config.frame_decimation,
-            metrics=metrics,
-            exposure_time_absolute=config.exposure_time_absolute,
-        )
-    else:
-        assert camera_backend_factory is not None
-        assert imu_source_factory is not None
-
-        def imu_factory() -> ImuCollector:
-            return ImuCollector(imu_source_factory(config.camera_device))
-
-        selector = CameraController(camera_backend_factory())
-        stable_id = stable_id_for_device(selector, config.camera_device)
-        sources = ContinuousCaptureSources(
-            lambda: CameraController(camera_backend_factory()),
-            imu_factory,
-            mode,
-            publish_preview=preview.publish,
-            stable_id=stable_id,
-            warmup_frames=max(1, config.fps),
-            frame_decimation=config.frame_decimation,
-        )
+    sources = _build_capture_sources(
+        config,
+        using_native_data_plane=using_native_data_plane,
+        preview=preview,
+        metrics=metrics,
+        camera_backend_factory=camera_backend_factory,
+        imu_source_factory=imu_source_factory,
+    )
     coordinator = None
     server = None
     event_pump = None
@@ -883,42 +723,9 @@ def build_production_service(
     capture_timer_monitor = None
     recovery_monitor = None
     try:
-        try:
-            sources.start_preview()
-        except BaseException as error:
-            code = getattr(error, "code", "camera_preview_unavailable")
-            if not config.camera_device.exists():
-                code = "camera_not_connected"
-            _OPERATIONAL_LOG.event(
-                "camera_preview_degraded",
-                level="warning",
-                error_code=code if isinstance(code, str) else "camera_preview_unavailable",
-                exception_type=type(error).__name__,
-                retryable=True,
-            )
+        _start_preview_best_effort(sources, config.camera_device)
         config.state_root.mkdir(parents=True, exist_ok=True, mode=0o750)
-        session_config = DeviceSessionConfig(
-            device_id=config.device_id,
-            device_label=config.device_label,
-            hardware_fingerprint=config.hardware_fingerprint,
-            platform="D-Robotics RDK X5 V1.0 + YLX 2UQ2",
-            software_version=__version__,
-            commit=__commit__,
-            width=config.width,
-            height=config.height,
-            sensor_fps=float(config.fps),
-            frame_decimation=config.frame_decimation,
-            video_layout=config.video_layout,
-            video_bitrate_kbps=config.video_bitrate_kbps,
-            recording_encoding=config.recording_encoding,
-            lossless_storage=True,
-            segment_seconds=config.segment_seconds,
-            audio_enabled=config.audio_enabled,
-            audio_device=config.audio_device,
-            audio_sample_rate_hz=config.audio_sample_rate_hz,
-            audio_channels=config.audio_channels,
-            audio_sample_format=config.audio_sample_format,
-        )
+        session_config = _build_session_config(config)
         coordinator = CaptureCoordinator(
             CoordinatorConfig(
                 config.mountpoint,
@@ -935,6 +742,7 @@ def build_production_service(
         )
         security = _security_policy(config)
         event_buffer = EventReplayBuffer()
+        external_scheme = "https" if config.security_profile == "customer" else "http"
         server = create_gateway_server(
             config.host,
             config.port,
@@ -942,15 +750,12 @@ def build_production_service(
             security=security,
             audit_sink=_audit_sink(config.state_root / "api-audit.ndjson"),
             event_buffer=event_buffer,
-            external_scheme="https" if config.security_profile == "customer" else "http",
+            external_scheme=external_scheme,
         )
         _enable_customer_tls(server, config)
         event_pump = CaptureEventPump(coordinator, event_buffer)
         publisher_factory = mdns_publisher_factory or MdnsPublisher
-        mdns_publisher = publisher_factory(
-            config.port,
-            scheme="https" if config.security_profile == "customer" else "http",
-        )
+        mdns_publisher = publisher_factory(config.port, scheme=external_scheme)
         mdns_publisher.start()
         storage_monitor = StorageReserveMonitor(coordinator)
         capture_timer_monitor = CaptureTimerMonitor(coordinator)
@@ -967,12 +772,12 @@ def build_production_service(
     except BaseException:
         _close_service_components(
             (
+                ("server", server, "server_close"),
                 ("recovery_monitor", recovery_monitor, "close"),
                 ("capture_timer_monitor", capture_timer_monitor, "close"),
                 ("storage_monitor", storage_monitor, "close"),
-                ("mdns_publisher", mdns_publisher, "close"),
                 ("event_pump", event_pump, "close"),
-                ("server", server, "server_close"),
+                ("mdns_publisher", mdns_publisher, "close"),
                 ("coordinator", coordinator, "close"),
                 ("sources", sources if coordinator is None else None, "close"),
             )
@@ -983,30 +788,19 @@ def build_production_service(
 def run_production_service(config_path: str | Path) -> None:
     started_ns = time.monotonic_ns()
     _OPERATIONAL_LOG.event("production_service_starting")
-    try:
-        from rp_ylx.settings import initialize
-
-        initialize(Path(config_path))
-        config = load_production_config(config_path)
-        service = build_production_service(config)
-    except BaseException as error:
-        with suppress(BaseException):
-            code = getattr(error, "code", "service_start_failed")
-            _OPERATIONAL_LOG.event(
-                "production_service_start_failed",
-                level="error",
-                error_code=code if isinstance(code, str) else "service_start_failed",
-                exception_type=type(error).__name__,
-                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-            )
-        raise
+    service: ProductionService | None = None
     previous: dict[int, Any] = {}
+    stop_requested = threading.Event()
     stop_signal: str | None = None
     primary_error: BaseException | None = None
+    ready = False
 
     def stop(signum: int, frame: object) -> None:
         nonlocal stop_signal
         del frame
+        if stop_requested.is_set():
+            return
+        stop_requested.set()
         stop_signal = signal.Signals(signum).name
         raise KeyboardInterrupt
 
@@ -1025,37 +819,57 @@ def run_production_service(config_path: str | Path) -> None:
             )
 
     try:
-        _OPERATIONAL_LOG.event(
-            "production_service_ready",
-            security_profile=config.security_profile,
-            data_plane=config.data_plane,
-            port=config.port,
-            duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
-        )
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous[signum] = signal.signal(signum, stop)
         with suppress(KeyboardInterrupt):
+            from rp_ylx.settings import initialize
+
+            initialize(Path(config_path))
+            config = load_production_config(config_path)
+            service = build_production_service(config)
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.signal(signum, stop)
+            _OPERATIONAL_LOG.event(
+                "production_service_ready",
+                security_profile=config.security_profile,
+                data_plane=config.data_plane,
+                port=config.port,
+                duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+            )
+            ready = True
             service.server.serve_forever()
     except BaseException as error:
         primary_error = error
+        if not ready:
+            with suppress(BaseException):
+                code = getattr(error, "code", "service_start_failed")
+                _OPERATIONAL_LOG.event(
+                    "production_service_start_failed",
+                    level="error",
+                    error_code=code if isinstance(code, str) else "service_start_failed",
+                    exception_type=type(error).__name__,
+                    duration_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
+                )
     finally:
-        try:
-            context: dict[str, object] = {"outcome": "shutdown_requested"}
-            if stop_signal is not None:
-                context["signal"] = stop_signal
-            _OPERATIONAL_LOG.event("production_service_stopping", **context)
-        except BaseException as error:
-            cleanup_failed("stopping_log", error)
-        try:
-            service.close()
-        except BaseException as error:
-            cleanup_failed("service_close", error)
+        # Disarm stop handler before closing components so a second signal
+        # cannot raise KeyboardInterrupt inside coordinator.close().
+        stop_requested.set()
+        if service is not None:
+            try:
+                context: dict[str, object] = {"outcome": "shutdown_requested"}
+                if stop_signal is not None:
+                    context["signal"] = stop_signal
+                _OPERATIONAL_LOG.event("production_service_stopping", **context)
+            except BaseException as error:
+                cleanup_failed("stopping_log", error)
+            try:
+                service.close()
+            except BaseException as error:
+                cleanup_failed("service_close", error)
         for signum, handler in previous.items():
             try:
                 signal.signal(signum, handler)
             except BaseException as error:
                 cleanup_failed(f"restore_{signal.Signals(signum).name}", error)
-        if primary_error is None:
+        if primary_error is None and (ready or stop_requested.is_set()):
             _OPERATIONAL_LOG.event("production_service_stopped", outcome="closed")
     if primary_error is not None:
         raise primary_error

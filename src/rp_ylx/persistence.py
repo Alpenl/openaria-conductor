@@ -8,7 +8,6 @@ verification proof is reconstructed from this database.
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import sqlite3
@@ -17,14 +16,39 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, closing, contextmanager, suppress
-from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from typing import Any
 
+from rp_ylx.core.fs import (
+    EXFAT_UNSUPPORTED_ERRNOS,
+    O_CLOEXEC,
+    O_NOFOLLOW,
+    O_NONBLOCK,
+    chown_to_parent,
+    fsync_directory,
+    read_bounded_bytes,
+    read_bounded_json,
+)
+from rp_ylx.core.locks import acquire_flock
+from rp_ylx.core.time import utc_now_iso
+
+__all__ = [
+    "APPLICATION_ID",
+    "BACKUP_TIMEOUT_SECONDS",
+    "PersistenceError",
+    "SCHEMA_VERSION",
+    "StateDatabase",
+    "readonly_connection",
+    "require_regular_database_file",
+    "sync_parent",
+    "validate_state_schema",
+]
+
 SCHEMA_VERSION = 1
 APPLICATION_ID = 0x594C5801
 BACKUP_TIMEOUT_SECONDS = 30
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
 
 _STATE_TABLES = {
     "documents": "name TEXT PRIMARY KEY, body TEXT NOT NULL, "
@@ -70,7 +94,20 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _require_regular_database_file(path: Path) -> None:
+def _migrate_schema(db: sqlite3.Connection, current_version: int) -> int:
+    """Run registered forward-only schema migrations up to SCHEMA_VERSION."""
+    version = current_version
+    while version < SCHEMA_VERSION:
+        step = _MIGRATIONS.get(version)
+        if step is None:
+            raise PersistenceError(f"unsupported database schema: {current_version}")
+        step(db)
+        version += 1
+        db.execute(f"PRAGMA user_version={version}")
+    return version
+
+
+def require_regular_database_file(path: Path) -> None:
     # Inspect metadata only: opening and closing another descriptor for this
     # inode could release SQLite's process-wide POSIX locks. This rejects
     # existing special files and final-component links, not hostile concurrent
@@ -79,12 +116,11 @@ def _require_regular_database_file(path: Path) -> None:
         raise PersistenceError("database must be a regular file")
 
 
-def _sync_parent(path: Path) -> None:
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+def sync_parent(path: Path) -> None:
+    fsync_directory(path.parent)
+
+
+_sync_parent = sync_parent
 
 
 def _preserve_import_source(source: Path, raw: bytes) -> None:
@@ -92,7 +128,11 @@ def _preserve_import_source(source: Path, raw: bytes) -> None:
     backup = source.with_suffix(source.suffix + ".pre-sqlite")
     if not os.path.lexists(backup):
         temporary = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
         try:
             with os.fdopen(fd, "wb") as stream:
                 if stream.write(raw) != len(raw):
@@ -107,7 +147,7 @@ def _preserve_import_source(source: Path, raw: bytes) -> None:
             # Independently verify a competing winning copy below.
         finally:
             temporary.unlink(missing_ok=True)
-    fd = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(backup, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != len(raw):
@@ -129,16 +169,23 @@ def _preserve_import_source(source: Path, raw: bytes) -> None:
 
 
 @contextmanager
-def _readonly_database_connection(path: Path) -> Iterator[sqlite3.Connection]:
-    _require_regular_database_file(path)
-    db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
+def readonly_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a validated read-only SQLite authority connection without creating WAL/SHM."""
+    require_regular_database_file(path)
     try:
-        if (
-            db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-            or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-        ):
-            raise PersistenceError("unsupported backup source identity or schema")
-        validate_state_schema(db)
+        db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as error:
+        raise PersistenceError(f"cannot open state database {path}: {error}") from error
+    try:
+        try:
+            if (
+                db.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
+                or db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+            ):
+                raise PersistenceError("unsupported backup source identity or schema")
+            validate_state_schema(db)
+        except sqlite3.Error as error:
+            raise PersistenceError(f"cannot read state database {path}: {error}") from error
         yield db
     finally:
         db.close()
@@ -152,40 +199,42 @@ def _remove_private_snapshot(path: Path) -> None:
 class StateDatabase:
     """Versioned local state with explicit, one-time JSON imports."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, pool_connections: bool = False) -> None:
+        del pool_connections
+        self._closed = False
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = path.with_suffix(path.suffix + ".init.lock")
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise PersistenceError("database initialization lock must be a regular file")
-            if os.geteuid() == 0:
-                parent = path.parent.stat()
-                os.fchown(fd, parent.st_uid, parent.st_gid)
-            deadline = time.monotonic() + 5
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with acquire_flock(lock, mode=0o600, group_name=None, nonblocking=True):
+                    chown_to_parent(lock, path.parent)
+                    self._initialize(path)
                     break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise PersistenceError("database initialization is busy") from None
-                    time.sleep(0.01)
-            self._initialize(path)
-        finally:
-            os.close(fd)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PersistenceError("database initialization is busy") from None
+                time.sleep(0.01)
+            except ValueError as error:
+                raise PersistenceError(
+                    "database initialization lock must be a regular file"
+                ) from error
 
     def _initialize(self, path: Path) -> None:
         self.path = Path(path)
         self.marker = self.path.with_suffix(self.path.suffix + ".initialized")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not self.path.exists() and self.marker.exists():
+        if not os.path.lexists(self.path) and os.path.lexists(self.marker):
             raise PersistenceError(f"missing authoritative database: {self.path}")
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fd = os.open(
+                self.path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600,
+            )
             os.close(fd)
             metadata = self.path.lstat()
         if not stat.S_ISREG(metadata.st_mode):
@@ -193,23 +242,25 @@ class StateDatabase:
         # Do not open/close an unrelated descriptor on an existing SQLite file:
         # closing it could release another connection's process-wide POSIX locks.
         self.path.chmod(0o600)
-        if os.geteuid() == 0:
-            parent = self.path.parent.stat()
-            os.chown(self.path, parent.st_uid, parent.st_gid, follow_symlinks=False)
+        chown_to_parent(self.path)
         try:
             with self.connection() as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
                 application = db.execute("PRAGMA application_id").fetchone()[0]
                 objects = db.execute("SELECT name FROM sqlite_master").fetchall()
-                if self.marker.exists() and version == 0:
+                if os.path.lexists(self.marker) and version == 0:
                     raise PersistenceError("initialized database has lost its schema")
                 if application != APPLICATION_ID and (application or version or objects):
                     raise PersistenceError("not an OpenAria state database")
-                if version not in (0, SCHEMA_VERSION):
+                if (
+                    version < 0
+                    or version > SCHEMA_VERSION
+                    or (version not in (0, SCHEMA_VERSION) and version not in _MIGRATIONS)
+                ):
                     raise PersistenceError(f"unsupported database schema: {version}")
                 if version == SCHEMA_VERSION:
                     validate_state_schema(db)
-                elif objects:
+                elif version == 0 and objects:
                     # Schema creation and its version commit together. Existing
                     # tables with version zero cannot be an interrupted creation.
                     raise PersistenceError("unversioned state database contains existing schema")
@@ -223,32 +274,51 @@ class StateDatabase:
                             db.execute(f"CREATE TABLE {name} ({columns})")
                         db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                         db.execute(f"PRAGMA application_id={APPLICATION_ID}")
-            if not self.marker.exists():
+                    elif 0 < version < SCHEMA_VERSION:
+                        db.execute("BEGIN IMMEDIATE")
+                        _migrate_schema(db, version)
+                        validate_state_schema(db)
+            if not os.path.lexists(self.marker):
                 try:
-                    fd = os.open(self.marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    fd = os.open(
+                        self.marker,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0o600,
+                    )
                 except FileExistsError:
                     pass  # Another initializer committed the same schema.
                 else:
                     with os.fdopen(fd, "w") as stream:
-                        if os.geteuid() == 0:
-                            parent = self.path.parent.stat()
-                            os.fchown(stream.fileno(), parent.st_uid, parent.st_gid)
                         stream.write(str(SCHEMA_VERSION))
                         stream.flush()
                         os.fsync(stream.fileno())
+                    chown_to_parent(self.marker, self.path.parent)
                 _sync_parent(self.marker)
         except (sqlite3.Error, OSError) as error:
             raise PersistenceError(f"cannot open state database {self.path}: {error}") from error
 
+    def close(self) -> None:
+        """Mark this database handle closed so future checkouts fail explicitly."""
+        self._closed = True
+
+    def __enter__(self) -> StateDatabase:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        # Recheck on every open; the path may have changed since initialization.
-        _require_regular_database_file(self.path)
+        if self._closed:
+            raise PersistenceError("state database is closed")
+        # Recheck on every checkout; the path may have been restored or replaced.
+        require_regular_database_file(self.path)
         # mode=rw prevents a removed authority from being silently recreated.
         db = sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA foreign_keys=ON")
         try:
-            db.execute("PRAGMA synchronous=FULL")
-            db.execute("PRAGMA foreign_keys=ON")
             yield db
         finally:
             db.close()
@@ -262,7 +332,7 @@ class StateDatabase:
             if db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
                 raise PersistenceError(f"missing authoritative document: {name}")
             body = _json(value)
-            now = datetime.now(UTC).isoformat()
+            now = utc_now_iso()
             db.execute("INSERT INTO documents VALUES (?,?,1,?)", (name, body, now))
             db.execute("INSERT INTO imports VALUES (?,?)", (name, source))
             db.execute(
@@ -281,7 +351,7 @@ class StateDatabase:
             if body == old[0]:
                 return
             revision = old[1] + 1
-            now = datetime.now(UTC).isoformat()
+            now = utc_now_iso()
             db.execute(
                 "UPDATE documents SET body=?,revision=?,updated_at=? WHERE name=?",
                 (body, revision, now, name),
@@ -307,55 +377,60 @@ class StateDatabase:
         # A deferred read transaction does not reserve the SQLite writer.
         with self.connection() as db:
             db.execute("BEGIN")
-            row = db.execute("SELECT body FROM documents WHERE name='capture'").fetchone()
-            if row is None:
-                raise PersistenceError("missing authoritative document: capture")
-            value = json.loads(row[0])
-            if not isinstance(value, dict):
-                raise PersistenceError("invalid state document: capture")
-            if "commands" not in value:
-                value["commands"] = []
-                invalid = value.get("invalid_commands", [])
-                if not isinstance(invalid, list):
-                    raise PersistenceError("invalid quarantined command identities")
-                for principal, operation, key, raw in db.execute(
-                    "SELECT principal,operation,idempotency_key,body "
-                    "FROM capture_commands ORDER BY rowid"
-                ):
-                    scope = [principal, operation, key]
-                    if not all(isinstance(part, str) and part for part in scope):
-                        raise PersistenceError("invalid command table identity")
-                    try:
-                        if not isinstance(raw, str):
-                            raise ValueError("command row body is not text")
-                        item = json.loads(raw)
-                        if (
-                            not isinstance(item, dict)
-                            or [
-                                item.get("principal_id"),
-                                item.get("operation"),
-                                item.get("idempotency_key"),
-                            ]
-                            != scope
-                        ):
-                            raise ValueError("command body differs from table identity")
-                    except (ValueError, TypeError, RecursionError):
-                        # Preserve the original row and use its SQL primary key,
-                        # never a potentially forged identity inside the body.
-                        evidence = raw if isinstance(raw, str) else repr(raw)
-                        invalid.append({"scope": scope, "receipt": evidence})
-                    else:
-                        value["commands"].append(item)
-                if invalid:
-                    value["invalid_commands"] = invalid
-            return value
+            try:
+                row = db.execute("SELECT body FROM documents WHERE name='capture'").fetchone()
+                if row is None:
+                    raise PersistenceError("missing authoritative document: capture")
+                value = json.loads(row[0])
+                if not isinstance(value, dict):
+                    raise PersistenceError("invalid state document: capture")
+                if "commands" not in value:
+                    value["commands"] = []
+                    invalid = value.get("invalid_commands", [])
+                    if not isinstance(invalid, list):
+                        raise PersistenceError("invalid quarantined command identities")
+                    for principal, operation, key, raw in db.execute(
+                        "SELECT principal,operation,idempotency_key,body "
+                        "FROM capture_commands ORDER BY rowid"
+                    ):
+                        scope = [principal, operation, key]
+                        if not all(isinstance(part, str) and part for part in scope):
+                            raise PersistenceError("invalid command table identity")
+                        try:
+                            if not isinstance(raw, str):
+                                raise ValueError("command row body is not text")
+                            item = json.loads(raw)
+                            if (
+                                not isinstance(item, dict)
+                                or [
+                                    item.get("principal_id"),
+                                    item.get("operation"),
+                                    item.get("idempotency_key"),
+                                ]
+                                != scope
+                            ):
+                                raise ValueError("command body differs from table identity")
+                        except (ValueError, TypeError, RecursionError):
+                            # Preserve the original row and use its SQL primary key,
+                            # never a potentially forged identity inside the body.
+                            evidence = raw if isinstance(raw, str) else repr(raw)
+                            invalid.append({"scope": scope, "receipt": evidence})
+                        else:
+                            value["commands"].append(item)
+                    if invalid:
+                        value["invalid_commands"] = invalid
+                return value
+            finally:
+                with suppress(sqlite3.Error):
+                    if db.in_transaction:
+                        db.rollback()
 
     def begin_transfer(self, volume: str, session: str, artifact: str) -> str:
         identity = str(uuid.uuid4())
         with self.connection() as db, db:
             db.execute(
                 "INSERT INTO transfers VALUES (?,?,?,?,?,NULL,'open',0)",
-                (identity, volume, session, artifact, datetime.now(UTC).isoformat()),
+                (identity, volume, session, artifact, utc_now_iso()),
             )
         return identity
 
@@ -363,7 +438,7 @@ class StateDatabase:
         with self.connection() as db, db:
             db.execute(
                 "UPDATE transfers SET finished_at=?,status=?,bytes_read=? WHERE id=?",
-                (datetime.now(UTC).isoformat(), status, bytes_read, identity),
+                (utc_now_iso(), status, bytes_read, identity),
             )
             db.execute(
                 "DELETE FROM transfers WHERE status!='open' AND rowid NOT IN "
@@ -374,7 +449,7 @@ class StateDatabase:
         with self.connection() as db, db:
             db.execute(
                 "UPDATE transfers SET status='interrupted',finished_at=? WHERE status='open'",
-                (datetime.now(UTC).isoformat(),),
+                (utc_now_iso(),),
             )
 
     def put_capture_state(
@@ -418,7 +493,7 @@ class StateDatabase:
         ):
             raise PersistenceError("cannot replace a quarantined command receipt")
         body = _json(value)
-        now = datetime.now(UTC).isoformat()
+        now = utc_now_iso()
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT body,revision FROM documents WHERE name='capture'").fetchone()
@@ -474,7 +549,7 @@ class StateDatabase:
 
     def put(self, name: str, value: Mapping[str, Any], *, history: bool = False) -> None:
         body = _json(value)
-        now = datetime.now(UTC).isoformat()
+        now = utc_now_iso()
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
             self._put_document(db, name, body, now, history=history)
@@ -496,9 +571,9 @@ class StateDatabase:
             if db.execute("SELECT 1 FROM imports WHERE name=?", (name,)).fetchone():
                 raise PersistenceError(f"missing authoritative document: {name}")
             raw = None
-            if source.exists():
-                raw = source.read_bytes()
-                value = json.loads(raw)
+            if os.path.lexists(source):
+                value = read_bounded_json(source)
+                raw = read_bounded_bytes(source)
             else:
                 value = default_factory()
             if not isinstance(value, Mapping):
@@ -511,7 +586,7 @@ class StateDatabase:
                 _preserve_import_source(source, raw)
             db.execute(
                 "INSERT INTO documents VALUES (?,?,1,?)",
-                (name, body, datetime.now(UTC).isoformat()),
+                (name, body, utc_now_iso()),
             )
             db.execute("INSERT INTO imports VALUES (?,?)", (name, str(source)))
             return value
@@ -523,15 +598,13 @@ class StateDatabase:
     @staticmethod
     def backup_readonly(source_path: Path, destination: Path) -> None:
         """Copy existing authority without initializing or changing source permissions."""
-        StateDatabase._backup(destination, lambda: _readonly_database_connection(source_path))
+        StateDatabase._backup(destination, lambda: readonly_connection(source_path))
 
     @staticmethod
     @contextmanager
     def readonly_snapshot(source_path: Path, destination: Path) -> Iterator[None]:
         """Own a private recovery snapshot from exclusive creation through cleanup."""
-        with StateDatabase._snapshot(
-            destination, lambda: _readonly_database_connection(source_path)
-        ):
+        with StateDatabase._snapshot(destination, lambda: readonly_connection(source_path)):
             yield
 
     @staticmethod
@@ -548,7 +621,11 @@ class StateDatabase:
                 raise FileExistsError(
                     errno.EEXIST, "private snapshot journal already exists", journal
                 )
-        fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        fd = os.open(
+            destination,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
         os.close(fd)
         try:
             with connection() as source:
@@ -592,6 +669,39 @@ class StateDatabase:
             _remove_private_snapshot(destination)
 
     @staticmethod
+    def _copy_exclusive_backup(source: Path, destination: Path) -> None:
+        src_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            dst_fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            completed = False
+            try:
+                while True:
+                    chunk = os.read(src_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(dst_fd, view)
+                        if written <= 0:
+                            raise OSError("short write during exclusive backup copy")
+                        view = view[written:]
+                os.fsync(dst_fd)
+                completed = True
+            finally:
+                try:
+                    os.close(dst_fd)
+                finally:
+                    if not completed:
+                        with suppress(OSError):
+                            destination.unlink(missing_ok=True)
+        finally:
+            os.close(src_fd)
+
+    @staticmethod
     def _backup(
         destination: Path,
         connection: Callable[[], AbstractContextManager[sqlite3.Connection]],
@@ -602,7 +712,12 @@ class StateDatabase:
         with StateDatabase._snapshot(temporary, connection):
             # A competing final name must never be overwritten or cleaned up.
             # Only the private snapshot belongs to this call.
-            os.link(temporary, destination, follow_symlinks=False)
+            try:
+                os.link(temporary, destination, follow_symlinks=False)
+            except OSError as error:
+                if error.errno not in EXFAT_UNSUPPORTED_ERRNOS:
+                    raise
+                StateDatabase._copy_exclusive_backup(temporary, destination)
         # If this barrier fails, retain the complete published backup and report
         # failure. Private recovery snapshots instead stay inside their context.
         _sync_parent(destination)

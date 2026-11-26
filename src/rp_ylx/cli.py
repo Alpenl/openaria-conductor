@@ -13,6 +13,8 @@ from rp_ylx import PRODUCT_NAME, __commit__, __version__
 from rp_ylx.api import CameraPreviewPump, MockDevice, create_server
 from rp_ylx.camera import CameraController, CameraError, CameraMode, V4L2DiscoveryBackend
 from rp_ylx.cli_helpers import stable_id_for_device
+from rp_ylx.config import ProductionConfigError
+from rp_ylx.core.fs import write_json_atomic
 from rp_ylx.hardware import HardwareSmokeError, collect_hardware_facts, record_hardware_smoke
 from rp_ylx.native import NativeModuleError, native_capabilities
 from rp_ylx.network import (
@@ -26,6 +28,20 @@ from rp_ylx.operational_logging import configure_operational_logging, operationa
 from rp_ylx.validation import PublicValidationError, validate_public_session
 
 _OPERATIONAL_LOG = operational_logger("cli")
+
+__all__ = ["build_parser", "main"]
+
+
+def _print_json_error(code: str, message: str, *, exit_code: int = 2) -> int:
+    print(
+        json.dumps(
+            {"ok": False, "error": {"code": code, "message": message}},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+    return exit_code
 
 
 def _print_network_error(exc: NetworkError) -> int:
@@ -159,378 +175,356 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cmd_status(_args: argparse.Namespace) -> int:
+    try:
+        native = native_capabilities().as_dict()
+    except NativeModuleError as exc:
+        native = {
+            "adapter": "python",
+            "module_available": False,
+            "module_version": None,
+            "abi": None,
+            "features": [],
+            "error": {"code": exc.code, "message": exc.message},
+        }
+    print(
+        json.dumps(
+            {
+                "service": "openaria",
+                "version": __version__,
+                "commit": __commit__,
+                "hardware": "not-probed",
+                "recording": "idle",
+                "native": native,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_probe(args: argparse.Namespace) -> int:
+    try:
+        facts = collect_hardware_facts(storage_path=Path(args.storage))
+        if args.output:
+            write_json_atomic(Path(args.output), facts, sort_keys=True, indent=2)
+        else:
+            print(json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True))
+    except (OSError, TypeError, ValueError) as exc:
+        code = str(getattr(exc, "code", "probe_failed"))
+        message = str(getattr(exc, "message", exc))
+        return _print_json_error(code, message)
+    return 0
+
+
+def _cmd_timestamps(args: argparse.Namespace) -> int:
+    from rp_ylx.session_timestamps import SessionTimestampError, build_session_timestamp_report
+
+    try:
+        report = build_session_timestamp_report(
+            args.directory,
+            output=None if args.output is None else Path(args.output),
+        )
+    except (OSError, SessionTimestampError, ValueError) as exc:
+        code = str(getattr(exc, "code", "session_timestamps_failed"))
+        message = str(getattr(exc, "message", exc))
+        return _print_json_error(code, message)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_database(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from rp_ylx.database_admin import manage
+
+    try:
+        value = manage(args.database, args.action, source=args.input, destination=args.output)
+        print(json.dumps(value, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+        print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _cmd_settings(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from rp_ylx.settings import manage
+
+    try:
+        value = manage(args.config, args.action, source=args.input, destination=args.output)
+        print(json.dumps(value, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+        print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    from rp_ylx.performance.benchmark import BenchmarkConfig, BenchmarkError, run_benchmark
+
+    try:
+        report = run_benchmark(
+            BenchmarkConfig(
+                kind=args.kind,
+                duration_seconds=args.duration,
+                round=args.round,
+                wheel_sha256=args.wheel_sha256,
+                device=Path(args.device),
+                trace=None if args.trace is None else Path(args.trace),
+                recording_root=(None if args.recording_root is None else Path(args.recording_root)),
+                adapter=args.adapter,
+            )
+        )
+        write_json_atomic(Path(args.output), report, sort_keys=True, indent=2)
+    except (BenchmarkError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        code = str(getattr(exc, "code", "benchmark_failed"))
+        message = str(getattr(exc, "message", exc))
+        return _print_json_error(code, message)
+    print(json.dumps({"ok": True, "output": args.output}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_hardware_smoke(args: argparse.Namespace) -> int:
+    if args.frames <= 0 or args.imu_packets <= 0:
+        return _print_json_error("invalid_argument", "frames 和 imu-packets 必须大于零")
+    try:
+        facts = collect_hardware_facts(storage_path=Path(args.output).parent)
+        result = record_hardware_smoke(
+            output=Path(args.output),
+            device=Path(args.device),
+            mode=CameraMode(3840, 1080, 60.0, "mjpg"),
+            covered_eye=args.covered_eye,
+            frames=args.frames,
+            imu_packets=args.imu_packets,
+            software_version=f"{__version__}+{__commit__}",
+            evidence_kind="hardware",
+            hardware_facts=facts,
+        )
+    except (HardwareSmokeError, ValueError) as exc:
+        code = exc.code if isinstance(exc, HardwareSmokeError) else "invalid_argument"
+        message = exc.message if isinstance(exc, HardwareSmokeError) else str(exc)
+        return _print_json_error(code, message)
+    print(json.dumps({"ok": True, **result}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_serve_mock(args: argparse.Namespace) -> int:
+    device = MockDevice()
+    if args.fault:
+        device.set_fault(args.fault, "命令行配置的模拟故障")
+    server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
+    print(f"{PRODUCT_NAME} mock API: http://{args.host}:{server.server_port}/api/v0")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+def _cmd_serve_hardware_preview(args: argparse.Namespace) -> int:
+    server = None
+    pump = None
+    try:
+        mode = CameraMode(args.width, args.height, float(args.fps), "mjpg")
+        device = MockDevice()
+        controller = CameraController(V4L2DiscoveryBackend())
+        stable_id = stable_id_for_device(controller, Path(args.device))
+        pump = CameraPreviewPump(device, controller, mode, stable_id=stable_id)
+        pump.start()
+        server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
+        print(
+            f"{PRODUCT_NAME} hardware preview API: http://{args.host}:{server.server_port}/api/v0"
+        )
+        with suppress(KeyboardInterrupt):
+            server.serve_forever()
+    except (CameraError, OSError, RuntimeError, ValueError) as exc:
+        print(f"hardware preview failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if pump is not None:
+            try:
+                pump.stop()
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"hardware preview shutdown failed: {exc}", file=sys.stderr)
+        if server is not None:
+            server.server_close()
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from rp_ylx.daemon import run_production_service
+    from rp_ylx.recording import DeviceRecordingError
+
+    configure_operational_logging()
+    try:
+        run_production_service(args.config)
+    except (
+        CameraError,
+        DeviceRecordingError,
+        json.JSONDecodeError,
+        OSError,
+        ProductionConfigError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        code = str(getattr(exc, "code", "service_start_failed"))
+        message = str(getattr(exc, "message", exc))
+        return _print_json_error(code, message)
+    return 0
+
+
+def _cmd_volume(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.volume_command == "init":
+        from rp_ylx.recording import DeviceRecordingError, initialize_capture_volume
+
+        try:
+            volume_id = initialize_capture_volume(args.mountpoint)
+        except (DeviceRecordingError, OSError, ValueError) as exc:
+            code = str(getattr(exc, "code", "volume_init_failed"))
+            message = str(getattr(exc, "message", exc))
+            return _print_json_error(code, message)
+        print(json.dumps({"ok": True, "volume_id": volume_id}, sort_keys=True))
+        return 0
+    parser.print_help()
+    return 0
+
+
+def _cmd_network(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    actions = {
+        "status": network_status,
+        "apply": lambda: apply_network(args.request_id, args.config, stdin=sys.stdin),
+        "rescue": rescue_network,
+        "reconcile": reconcile_network,
+    }
+    action = actions.get(args.network_command)
+    if action is None:
+        parser.print_help()
+        return 0
+    try:
+        result = action()
+    except NetworkError as exc:
+        return _print_network_error(exc)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _cmd_network_control(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.network_control_command == "serve" and args.stdio:
+        from rp_ylx.network_control import serve_stdio
+
+        configure_operational_logging()
+        try:
+            return serve_stdio()
+        except (NetworkError, OSError, RuntimeError, ValueError) as exc:
+            code = getattr(exc, "code", "network_control_process_failed")
+            _OPERATIONAL_LOG.event(
+                "network_control_process_failed",
+                level="error",
+                error_code=(code if isinstance(code, str) else "network_control_process_failed"),
+                exception_type=type(exc).__name__,
+                exit_code=2,
+            )
+            return 2
+    if args.network_control_command in {"desired-mode", "watchdog-mode"}:
+        from rp_ylx.network_control import NetworkControlClientError, request_control
+
+        try:
+            response = request_control("status")
+        except NetworkControlClientError as exc:
+            print(exc.code, file=sys.stderr)
+            return 1
+        body = response.get("body")
+        desired = body.get("desired") if isinstance(body, dict) else None
+        mode = desired.get("mode") if isinstance(desired, dict) else None
+        if response.get("ok") is not True or mode not in {
+            "hotspot",
+            "wifi-client",
+            "ethernet-dhcp",
+            "ethernet-static",
+        }:
+            print("network_controller_status_invalid", file=sys.stderr)
+            return 1
+        if args.network_control_command == "watchdog-mode" and mode == "wifi-client":
+            transaction = body.get("transaction")
+            if not isinstance(transaction, dict) or set(transaction) != {
+                "current",
+                "latest",
+            }:
+                print("network_controller_status_invalid", file=sys.stderr)
+                return 1
+            latest = transaction.get("latest")
+            if transaction.get("current") is not None or (
+                isinstance(latest, dict) and latest.get("status") in {"rescued", "failed"}
+            ):
+                mode = "defer"
+        print(mode)
+        return 0
+    parser.print_help()
+    return 0
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    try:
+        manifest = validate_public_session(args.directory)
+    except PublicValidationError as exc:
+        print(
+            json.dumps(
+                {
+                    "valid": False,
+                    "error": {
+                        "code": exc.code,
+                        "location": exc.location,
+                        "message": exc.message,
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        json.dumps(
+            {"valid": True, "session_id": manifest["session_id"]},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version:
         print(f"{PRODUCT_NAME} {__version__} ({__commit__})")
         return 0
-    if args.command == "status":
-        try:
-            native = native_capabilities().as_dict()
-        except NativeModuleError as exc:
-            native = {
-                "adapter": "python",
-                "module_available": False,
-                "module_version": None,
-                "abi": None,
-                "features": [],
-                "error": {"code": exc.code, "message": exc.message},
-            }
-        print(
-            json.dumps(
-                {
-                    "service": "openaria",
-                    "version": __version__,
-                    "commit": __commit__,
-                    "hardware": "not-probed",
-                    "recording": "idle",
-                    "native": native,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return 0
-    if args.command == "probe":
-        facts = collect_hardware_facts(storage_path=Path(args.storage))
-        rendered = json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        if args.output:
-            Path(args.output).write_text(rendered, encoding="utf-8")
-        else:
-            print(rendered, end="")
-        return 0
-    if args.command == "timestamps":
-        from rp_ylx.session_timestamps import SessionTimestampError, build_session_timestamp_report
-
-        try:
-            report = build_session_timestamp_report(
-                args.directory,
-                output=None if args.output is None else Path(args.output),
-            )
-        except (OSError, SessionTimestampError, ValueError) as exc:
-            code = str(getattr(exc, "code", "session_timestamps_failed"))
-            message = str(getattr(exc, "message", exc))
-            print(
-                json.dumps(
-                    {"ok": False, "error": {"code": code, "message": message}},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-    if args.command == "database":
-        import sqlite3
-
-        from rp_ylx.database_admin import manage
-
-        try:
-            value = manage(args.database, args.action, source=args.input, destination=args.output)
-            print(json.dumps(value, ensure_ascii=False))
-            return 0
-        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
-            print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
-            return 1
-    if args.command == "settings":
-        from rp_ylx.settings import manage
-
-        try:
-            value = manage(args.config, args.action, source=args.input, destination=args.output)
-            print(json.dumps(value, ensure_ascii=False))
-            return 0
-        except (OSError, ValueError, RuntimeError) as error:
-            print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
-            return 1
-    if args.command == "benchmark":
-        from rp_ylx.performance.benchmark import BenchmarkConfig, BenchmarkError, run_benchmark
-
-        try:
-            report = run_benchmark(
-                BenchmarkConfig(
-                    kind=args.kind,
-                    duration_seconds=args.duration,
-                    round=args.round,
-                    wheel_sha256=args.wheel_sha256,
-                    device=Path(args.device),
-                    trace=None if args.trace is None else Path(args.trace),
-                    recording_root=(
-                        None if args.recording_root is None else Path(args.recording_root)
-                    ),
-                    adapter=args.adapter,
-                )
-            )
-            Path(args.output).write_text(
-                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-        except (BenchmarkError, OSError, RuntimeError, ValueError) as exc:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": {
-                            "code": str(getattr(exc, "code", "benchmark_failed")),
-                            "message": str(getattr(exc, "message", exc)),
-                        },
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        print(json.dumps({"ok": True, "output": args.output}, ensure_ascii=False, sort_keys=True))
-        return 0
-    if args.command == "hardware-smoke":
-        if args.frames <= 0 or args.imu_packets <= 0:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": {
-                            "code": "invalid_argument",
-                            "message": "frames 和 imu-packets 必须大于零",
-                        },
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            facts = collect_hardware_facts(storage_path=Path(args.output).parent)
-            result = record_hardware_smoke(
-                output=Path(args.output),
-                device=Path(args.device),
-                mode=CameraMode(3840, 1080, 60.0, "mjpg"),
-                covered_eye=args.covered_eye,
-                frames=args.frames,
-                imu_packets=args.imu_packets,
-                software_version=f"{__version__}+{__commit__}",
-                evidence_kind="hardware",
-                hardware_facts=facts,
-            )
-        except (HardwareSmokeError, ValueError) as exc:
-            code = exc.code if isinstance(exc, HardwareSmokeError) else "invalid_argument"
-            message = exc.message if isinstance(exc, HardwareSmokeError) else str(exc)
-            print(
-                json.dumps(
-                    {"ok": False, "error": {"code": code, "message": message}},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        print(json.dumps({"ok": True, **result}, ensure_ascii=False, sort_keys=True))
-        return 0
-    if args.command == "serve-mock":
-        device = MockDevice()
-        if args.fault:
-            device.set_fault(args.fault, "命令行配置的模拟故障")
-        server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
-        print(f"{PRODUCT_NAME} mock API: http://{args.host}:{server.server_port}/api/v0")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.server_close()
-        return 0
-    if args.command == "serve-hardware-preview":
-        server = None
-        pump = None
-        try:
-            mode = CameraMode(args.width, args.height, float(args.fps), "mjpg")
-            device = MockDevice()
-            controller = CameraController(V4L2DiscoveryBackend())
-            stable_id = stable_id_for_device(controller, Path(args.device))
-            pump = CameraPreviewPump(device, controller, mode, stable_id=stable_id)
-            pump.start()
-            server = create_server(args.host, args.port, device, allowed_origins=args.allow_origin)
-            print(
-                f"{PRODUCT_NAME} hardware preview API: "
-                f"http://{args.host}:{server.server_port}/api/v0"
-            )
-            with suppress(KeyboardInterrupt):
-                server.serve_forever()
-        except (CameraError, OSError, RuntimeError, ValueError) as exc:
-            print(f"hardware preview failed: {exc}", file=sys.stderr)
-            return 2
-        finally:
-            if pump is not None:
-                try:
-                    pump.stop()
-                except (OSError, RuntimeError, ValueError) as exc:
-                    print(f"hardware preview shutdown failed: {exc}", file=sys.stderr)
-            if server is not None:
-                server.server_close()
-        return 0
-    if args.command == "serve":
-        from rp_ylx.daemon import ProductionConfigError, run_production_service
-        from rp_ylx.recording import DeviceRecordingError
-
-        configure_operational_logging()
-        try:
-            run_production_service(args.config)
-        except (
-            CameraError,
-            DeviceRecordingError,
-            OSError,
-            ProductionConfigError,
-            RuntimeError,
-        ) as exc:
-            code = str(getattr(exc, "code", "service_start_failed"))
-            message = str(getattr(exc, "message", exc))
-            print(
-                json.dumps(
-                    {"ok": False, "error": {"code": code, "message": message}},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        return 0
+    handlers = {
+        "status": _cmd_status,
+        "probe": _cmd_probe,
+        "timestamps": _cmd_timestamps,
+        "database": _cmd_database,
+        "settings": _cmd_settings,
+        "benchmark": _cmd_benchmark,
+        "hardware-smoke": _cmd_hardware_smoke,
+        "serve-mock": _cmd_serve_mock,
+        "serve-hardware-preview": _cmd_serve_hardware_preview,
+        "serve": _cmd_serve,
+        "validate": _cmd_validate,
+    }
+    handler = handlers.get(args.command)
+    if handler is not None:
+        return handler(args)
     if args.command == "volume":
-        if args.volume_command == "init":
-            from rp_ylx.recording import DeviceRecordingError, initialize_capture_volume
-
-            try:
-                volume_id = initialize_capture_volume(args.mountpoint)
-            except (DeviceRecordingError, OSError, ValueError) as exc:
-                code = str(getattr(exc, "code", "volume_init_failed"))
-                message = str(getattr(exc, "message", exc))
-                print(
-                    json.dumps(
-                        {"ok": False, "error": {"code": code, "message": message}},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                )
-                return 2
-            print(json.dumps({"ok": True, "volume_id": volume_id}, sort_keys=True))
-            return 0
-        parser.print_help()
-        return 0
+        return _cmd_volume(args, parser)
     if args.command == "network":
-        if args.network_command == "status":
-            try:
-                result = network_status()
-            except NetworkError as exc:
-                return _print_network_error(exc)
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            return 0
-        if args.network_command == "apply":
-            try:
-                result = apply_network(args.request_id, args.config, stdin=sys.stdin)
-            except NetworkError as exc:
-                return _print_network_error(exc)
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            return 0
-        if args.network_command == "rescue":
-            try:
-                result = rescue_network()
-            except NetworkError as exc:
-                return _print_network_error(exc)
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            return 0
-        if args.network_command == "reconcile":
-            try:
-                result = reconcile_network()
-            except NetworkError as exc:
-                return _print_network_error(exc)
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            return 0
-        parser.print_help()
-        return 0
+        return _cmd_network(args, parser)
     if args.command == "network-control":
-        if args.network_control_command == "serve" and args.stdio:
-            from rp_ylx.network_control import serve_stdio
-
-            configure_operational_logging()
-            try:
-                return serve_stdio()
-            except (NetworkError, OSError, RuntimeError, ValueError) as exc:
-                code = getattr(exc, "code", "network_control_process_failed")
-                _OPERATIONAL_LOG.event(
-                    "network_control_process_failed",
-                    level="error",
-                    error_code=(
-                        code if isinstance(code, str) else "network_control_process_failed"
-                    ),
-                    exception_type=type(exc).__name__,
-                    exit_code=2,
-                )
-                return 2
-        if args.network_control_command in {"desired-mode", "watchdog-mode"}:
-            from rp_ylx.network_control import NetworkControlClientError, request_control
-
-            try:
-                response = request_control("status")
-            except NetworkControlClientError as exc:
-                print(exc.code, file=sys.stderr)
-                return 1
-            body = response.get("body")
-            desired = body.get("desired") if isinstance(body, dict) else None
-            mode = desired.get("mode") if isinstance(desired, dict) else None
-            if response.get("ok") is not True or mode not in {
-                "hotspot",
-                "wifi-client",
-                "ethernet-dhcp",
-                "ethernet-static",
-            }:
-                print("network_controller_status_invalid", file=sys.stderr)
-                return 1
-            if args.network_control_command == "watchdog-mode" and mode == "wifi-client":
-                transaction = body.get("transaction")
-                if not isinstance(transaction, dict) or set(transaction) != {
-                    "current",
-                    "latest",
-                }:
-                    print("network_controller_status_invalid", file=sys.stderr)
-                    return 1
-                latest = transaction.get("latest")
-                if transaction.get("current") is not None or (
-                    isinstance(latest, dict) and latest.get("status") in {"rescued", "failed"}
-                ):
-                    mode = "defer"
-            print(mode)
-            return 0
-        parser.print_help()
-        return 0
-    if args.command == "validate":
-        try:
-            manifest = validate_public_session(args.directory)
-        except PublicValidationError as exc:
-            print(
-                json.dumps(
-                    {
-                        "valid": False,
-                        "error": {
-                            "code": exc.code,
-                            "location": exc.location,
-                            "message": exc.message,
-                        },
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
-            return 2
-        print(
-            json.dumps(
-                {"valid": True, "session_id": manifest["session_id"]},
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
-        return 0
+        return _cmd_network_control(args, parser)
     parser.print_help()
     return 0

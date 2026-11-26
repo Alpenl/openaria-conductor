@@ -326,6 +326,7 @@ def _timed_samples(
     rate: float | None,
     *,
     raw: bool = False,
+    origin: int = 0,
 ) -> Iterator[tuple[dict[str, Any], float]]:
     spool.seek(0)
     packet = -1
@@ -359,7 +360,12 @@ def _timed_samples(
                 or seen >= count
             ):
                 raise SessionTimestampError("session_timestamps_invalid", "IMU packet 在读取间改变")
-            when = float(host) if raw or rate is None else host - (count - 1 - seen) * period
+            relative_host = host - origin
+            when = (
+                float(relative_host)
+                if raw or rate is None
+                else relative_host - (count - 1 - seen) * period
+            )
             if not raw and rate is not None and previous_time is not None and when <= previous_time:
                 raise _UseHostTimes
             yield sample, when
@@ -426,6 +432,8 @@ def _frame_interval_summary(
 def _alignment_rows(
     frames: list[dict[str, int]],
     samples: Iterator[tuple[dict[str, Any], float]],
+    *,
+    origin: int = 0,
 ) -> Iterator[dict[str, Any]]:
     before = None
     after = next(samples, None)
@@ -433,16 +441,17 @@ def _alignment_rows(
         raise SessionTimestampError("session_timestamps_empty", "会话没有可对齐的 IMU 样本")
     for frame in frames:
         frame_time = frame["host_monotonic_ns"]
-        while after is not None and after[1] < frame_time:
+        frame_offset = frame_time - origin
+        while after is not None and after[1] < frame_offset:
             before, after = after, next(samples, None)
         if before is None:
             chosen = after
-        elif after is None or abs(before[1] - frame_time) <= abs(after[1] - frame_time):
+        elif after is None or abs(before[1] - frame_offset) <= abs(after[1] - frame_offset):
             chosen = before
         else:
             chosen = after
         assert chosen is not None
-        imu, imu_time = chosen
+        imu, imu_offset = chosen
         yield {
             "frame_index": frame["frame_index"],
             "source_sequence": frame["source_sequence"],
@@ -450,8 +459,8 @@ def _alignment_rows(
             "right_eye_host_monotonic_ns": frame_time,
             "nearest_imu_sample_number": imu["sample_number"],
             "nearest_imu_host_monotonic_ns": imu["host_monotonic_ns"],
-            "nearest_imu_estimated_monotonic_ns": int(round(imu_time)),
-            "nearest_imu_delta_ms": (imu_time - frame_time) / 1_000_000.0,
+            "nearest_imu_estimated_monotonic_ns": origin + int(round(imu_offset)),
+            "nearest_imu_delta_ms": (imu_offset - frame_offset) / 1_000_000.0,
             "imu_device_timestamp_raw": imu["device_timestamp_raw"],
             "imu_device_ticks": imu["device_ticks"],
             "imu_packet_sequence": imu["packet_sequence"],
@@ -544,11 +553,16 @@ def build_session_timestamp_report(
                 stream.truncate()
                 writer = csv.DictWriter(_CheckedCsvOutput(stream), fieldnames=TIMESTAMP_CSV_FIELDS)
                 writer.writeheader()
+            origin = (
+                0 if frames[-1]["host_monotonic_ns"] < (1 << 50) else frames[0]["host_monotonic_ns"]
+            )
             try:
                 with closing(
-                    _timed_samples(root, manifest, spool, imu["record_rate_hz"], raw=raw)
+                    _timed_samples(
+                        root, manifest, spool, imu["record_rate_hz"], raw=raw, origin=origin
+                    )
                 ) as samples:
-                    for row in _alignment_rows(frames, samples):
+                    for row in _alignment_rows(frames, samples, origin=origin):
                         deltas.append(abs(row["nearest_imu_delta_ms"]))
                         if writer is not None:
                             writer.writerow(row)

@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-RDK_X5_MODEL = "D-Robotics RDK X5 V1.0"
+from rp_ylx.core.board import RDK_X5_MODEL, is_rdk_x5_model
+
 RDK_X5_BOARD_ID = "rdk_x5_v1.0"
 YLX_2UQ2_USB_ID = ("1bcf", "0b15")
 YLX_2UQ2_CAMERA_ID = "ylx_2uq2"
 
-
-def is_rdk_x5_model(model: str | None) -> bool:
-    if model is None:
-        return False
-    return " ".join(model.split()).casefold() == RDK_X5_MODEL.casefold()
+__all__ = [
+    "RDK_X5_BOARD_ID",
+    "RDK_X5_MODEL",
+    "YLX_2UQ2_CAMERA_ID",
+    "YLX_2UQ2_USB_ID",
+    "is_rdk_x5_model",
+    "is_supported_target",
+    "is_ylx_2uq2_usb",
+]
 
 
 def is_ylx_2uq2_usb(device: Mapping[str, object]) -> bool:

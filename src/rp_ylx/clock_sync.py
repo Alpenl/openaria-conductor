@@ -198,7 +198,7 @@ class ClockSynchronizer:
         self._reference_source = source
         self._revision = uuid.uuid4().hex
 
-    def _source(self) -> str:
+    def _source_with_ntp(self, ntp: bool) -> str:
         if self._client_reference is not None:
             mono, wall = self._client_reference
             if (
@@ -207,13 +207,16 @@ class ClockSynchronizer:
             ):
                 self._client_reference = None
                 self._revision = uuid.uuid4().hex
-        if ntp_synchronized():
+        if ntp:
             if self._client_reference is None or self._reference_source != "ntp":
                 self._remember("ntp")
             return "ntp"
         if self._client_reference is not None:
             return self._reference_source
         return "unsynchronized"
+
+    def _source(self) -> str:
+        return self._source_with_ntp(ntp_synchronized())
 
     @staticmethod
     def _response(source: str, *, challenge: str | None = None, applied: bool = False) -> dict:
@@ -253,8 +256,10 @@ class ClockSynchronizer:
         return result
 
     def status(self, principal_id: str, *, extended: bool = False) -> dict:
+        # Query timedatectl outside self._lock so slow subprocesses never block readers.
+        ntp = ntp_synchronized()
         with self._lock:
-            return self._status(principal_id, self._source(), extended=extended)
+            return self._status(principal_id, self._source_with_ntp(ntp), extended=extended)
 
     def sync(self, principal_id: str, body: Mapping[str, object]) -> dict:
         if not valid_clock_request(body):
@@ -269,12 +274,17 @@ class ClockSynchronizer:
             _, issued, original_wall, revision, extended = reference
             if body["schema"] == "ylx.clock-sync-request.v2" and not extended:
                 raise ClockSyncError("clock_challenge_expired", "请重新取得设备时间")
-            source = self._source()
+            if not 0 <= received - issued < CHALLENGE_TTL_MS * 1_000_000:
+                raise ClockSyncError("clock_challenge_expired", "校时请求已过期，请重试")
+        # Run timedatectl outside self._lock, then recheck expiry and clock state atomically.
+        ntp = ntp_synchronized()
+        with self._lock:
+            source = self._source_with_ntp(ntp)
             # Another client or NTP may have initialized the clock since GET.
             replace = body.get("replace") is True
             if source != "unsynchronized" and not replace:
                 return self._status(principal_id, source, extended=extended)
-            if replace and ntp_synchronized():
+            if replace and ntp:
                 raise ClockSyncError("clock_ntp_active", "设备正在使用网络校时，不能用手机覆盖")
             if replace and revision != self._revision:
                 raise ClockSyncError("clock_changed", "设备时间已改变，请重新确认")

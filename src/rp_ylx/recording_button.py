@@ -217,26 +217,14 @@ class CaptureClient:
 
 
 def create_capture_client(config_path: Path, timeout_seconds: float) -> CaptureClient:
-    from rp_ylx.daemon import _read_bearer_token, load_production_config
+    from rp_ylx.core.device_client import load_bootstrap_endpoint
 
-    config = load_production_config(config_path)
-    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(config.host, config.host)
-    authority = f"[{host}]" if ":" in host else host
-    context = None
-    token = None
-    scheme = "http"
-    if config.security_profile == "customer":
-        assert config.bearer_token_file is not None and config.tls_certificate_file is not None
-        scheme = "https"
-        token = _read_bearer_token(config.bearer_token_file)
-        context = ssl.create_default_context(cafile=str(config.tls_certificate_file))
-        # Trust only the installed device certificate; it need not name the loopback address.
-        context.check_hostname = False
+    endpoint = load_bootstrap_endpoint(config_path, check_hostname=False)
     return CaptureClient(
-        f"{scheme}://{authority}:{config.port}",
-        token=token,
-        timeout_seconds=timeout_seconds,
-        tls_context=context,
+        endpoint.url,
+        token=endpoint.bearer_token,
+        timeout_seconds=min(float(timeout_seconds), 6.0),
+        tls_context=endpoint.ssl_context,
     )
 
 
@@ -322,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.monitor
         else create_capture_client(
             args.device_config,
-            config.request_timeout_ms / 1000,
+            min(config.request_timeout_ms / 1000, 6.0),
         )
     )
     stopped = threading.Event()

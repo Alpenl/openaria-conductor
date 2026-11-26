@@ -10,13 +10,29 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from collections.abc import Mapping
+from fractions import Fraction
+
+
+def audio_sample_time_exact(points: list[tuple[int, int]], sample: int) -> Fraction:
+    """Map a sample through observed clock points using exact rational arithmetic."""
+    index = min(max(bisect_right(points, (sample, math.inf)), 1), len(points) - 1)
+    first, last = points[index - 1 : index + 1]
+    return Fraction(first[1]) + Fraction(
+        (sample - first[0]) * (last[1] - first[1]),
+        last[0] - first[0],
+    )
+
+
+def audio_sample_time_offset_ns(points: list[tuple[int, int]], sample: int, origin: int) -> float:
+    """Map a sample to nanoseconds relative to origin without large-timestamp float64 loss."""
+    index = min(max(bisect_right(points, (sample, math.inf)), 1), len(points) - 1)
+    first, last = points[index - 1 : index + 1]
+    return (first[1] - origin) + (sample - first[0]) * (last[1] - first[1]) / (last[0] - first[0])
 
 
 def audio_sample_time_ns(points: list[tuple[int, int]], sample: int) -> float:
     """Map a sample through observed clock points, extrapolating only endpoints."""
-    index = min(max(bisect_right(points, (sample, math.inf)), 1), len(points) - 1)
-    first, last = points[index - 1 : index + 1]
-    return first[1] + (sample - first[0]) * (last[1] - first[1]) / (last[0] - first[0])
+    return float(audio_sample_time_exact(points, sample))
 
 
 def raw_audio_clock_model(anchors: list, rate: int, count: int, period: int, buffer: int) -> dict:
@@ -230,22 +246,25 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
     if any(b[0] <= a[0] or b[1] <= a[1] for a, b in zip(anchors, anchors[1:], strict=False)):
         raise ValueError("nonmonotonic audio clock")
     first, last = anchors[0], anchors[-1]
-    ns_per_sample = (last[1] - first[1]) / (last[0] - first[0])
-    actual_rate = 1e9 / ns_per_sample
-    residual = max(abs((t - first[1]) - (n - first[0]) * ns_per_sample) for n, t in anchors)
-    predicted_start = first[1] - first[0] * ns_per_sample
-    predicted_end = predicted_start + count * ns_per_sample
+    span_ns = last[1] - first[1]
+    span_samples = last[0] - first[0]
+    slope = span_ns / span_samples
+    actual_rate = 1e9 / slope
+    residual = max(abs((row[1] - first[1]) - (row[0] - first[0]) * slope) for row in anchors)
+    origin = clock["session_start_monotonic_ns"]
     if raw_model is not None:
         actual_rate = raw_model["actual_rate"]
         residual = raw_model["max_residual_ns"]
-        predicted_start = raw_model["start_ns"]
-        predicted_end = raw_model["end_ns"]
-    origin = clock["session_start_monotonic_ns"]
+        predicted_start_exact = audio_sample_time_exact(raw_model["points"], 0)
+        predicted_end_exact = audio_sample_time_exact(raw_model["points"], count)
+    else:
+        predicted_start_exact = Fraction(first[1]) - Fraction(first[0] * span_ns, span_samples)
+        predicted_end_exact = predicted_start_exact + Fraction(count * span_ns, span_samples)
     if (
         abs(actual_rate / rate - 1) > 0.01
         or abs(residual - clock["max_residual_ns"]) > 2
-        or abs(predicted_start - clock["sample_start_monotonic_ns"]) > 2
-        or abs(predicted_end - clock["sample_end_monotonic_ns"]) > 2
+        or abs(predicted_start_exact - clock["sample_start_monotonic_ns"]) > 2
+        or abs(predicted_end_exact - clock["sample_end_monotonic_ns"]) > 2
         or abs(start * 1e9 - (clock["sample_start_monotonic_ns"] - origin)) > 2
         or abs(end * 1e9 - (clock["sample_end_monotonic_ns"] - origin)) > 2
     ):
@@ -254,8 +273,8 @@ def audio_clock_report(audio: Mapping, session_duration: float) -> dict:
     thread_stop = clock["thread_stopped_monotonic_ns"]
     if (
         not origin <= thread_start < thread_stop
-        or predicted_start < thread_start - 20_000_000
-        or predicted_end > thread_stop + 20_000_000
+        or predicted_start_exact < thread_start - 20_000_000
+        or predicted_end_exact > thread_stop + 20_000_000
         or thread_stop - origin > session_duration * 1e9 + 1_000
     ):
         raise ValueError("audio sample clock outside capture lifetime")

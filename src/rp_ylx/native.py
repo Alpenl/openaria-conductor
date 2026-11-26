@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from types import ModuleType
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from rp_ylx.camera_focus import valid_camera_focus_status
 
@@ -437,6 +437,35 @@ def set_native_camera_focus(
     if status is None:
         raise NativeModuleError("camera_focus_unsupported", "相机没有可读取的焦距控制")
     return status
+
+
+def configure_native_exposure(
+    device: str,
+    absolute: int | Literal["auto"],
+) -> dict[str, int]:
+    """Configure V4L2 exposure controls and verify readback via the Rust control path."""
+
+    if absolute != "auto" and (type(absolute) is not int or not 1 <= absolute <= 100):
+        raise ValueError("camera.exposure_time_absolute must be auto, null or an integer in 1..100")
+    module = _require_native_feature(
+        "v4l2_focus_control",
+        "native_exposure_unavailable",
+        "原生相机控制模块",
+        "原生模块缺少 V4L2 曝光控制能力",
+    )
+    fn = getattr(module, "v4l2_configure_exposure", None)
+    if fn is None:
+        raise NativeModuleError(
+            "native_exposure_unavailable",
+            "原生模块缺少 v4l2_configure_exposure 接口",
+        )
+    try:
+        result = fn(device, None if absolute == "auto" else absolute, absolute == "auto")
+    except Exception as exc:
+        raise _parse_native_error(exc, "native_exposure_set_failed") from exc
+    if not isinstance(result, dict):
+        raise NativeModuleError("invalid_native_exposure_status", "原生曝光返回值无效")
+    return {str(key): int(val) for key, val in result.items()}
 
 
 def create_native_capture_engine(

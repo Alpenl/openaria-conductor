@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import re
 import socket
 import struct
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from contextlib import suppress
 from pathlib import Path
+
+from rp_ylx.core.time import utc_now_iso
 
 _SIOCGIFADDR = 0x8915
 _SIOCGIFNETMASK = 0x891B
+_RTM_NEWADDR = 20
+_RTM_GETADDR = 22
+_NLMSG_DONE = 3
+_NLM_F_REQUEST = 0x01
+_NLM_F_DUMP = 0x300
+_IFA_ADDRESS = 1
+_IFA_LOCAL = 2
 _HOTSPOT_ADDRESS = "10.42.0.1/24"
 # Primary Linux interface names fit IFNAMSIZ (16 including NUL). The API
 # additionally restricts their alphabet; do not emit unrepresentable names or
@@ -21,18 +31,96 @@ _RTF_UP = 0x0001
 _RTF_REJECT = 0x0200
 
 
+def _netlink_ipv4_addresses(interface: str) -> list[str]:
+    if not hasattr(socket, "AF_NETLINK") or not hasattr(socket, "NETLINK_ROUTE"):
+        return []
+    try:
+        target_index = socket.if_nametoindex(interface)
+    except OSError:
+        return []
+    discovered: list[str] = []
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as netlink:
+            netlink.settimeout(1.0)
+            request = struct.pack(
+                "=IHHIIBBBBi",
+                24,
+                _RTM_GETADDR,
+                _NLM_F_REQUEST | _NLM_F_DUMP,
+                1,
+                0,
+                socket.AF_INET,
+                0,
+                0,
+                0,
+                0,
+            )
+            netlink.sendall(request)
+            while True:
+                data = netlink.recv(65536)
+                if not data:
+                    break
+                offset = 0
+                done = False
+                while offset + 16 <= len(data):
+                    nl_len, nl_type, _flags, _seq, _pid = struct.unpack_from("=IHHII", data, offset)
+                    if nl_len < 16 or offset + nl_len > len(data):
+                        done = True
+                        break
+                    if nl_type == _NLMSG_DONE:
+                        done = True
+                        break
+                    if nl_type == _RTM_NEWADDR and nl_len >= 24:
+                        fam, prefixlen, _iflags, _scope, ifindex = struct.unpack_from(
+                            "=BBBBI", data, offset + 16
+                        )
+                        if fam == socket.AF_INET and ifindex == target_index:
+                            local_ip: str | None = None
+                            peer_ip: str | None = None
+                            attr_pos = offset + 24
+                            attr_end = offset + nl_len
+                            while attr_pos + 4 <= attr_end:
+                                rta_len, rta_type = struct.unpack_from("=HH", data, attr_pos)
+                                if rta_len < 4 or attr_pos + rta_len > attr_end:
+                                    break
+                                if rta_type == _IFA_LOCAL and rta_len >= 8:
+                                    local_ip = socket.inet_ntoa(data[attr_pos + 4 : attr_pos + 8])
+                                elif rta_type == _IFA_ADDRESS and rta_len >= 8:
+                                    peer_ip = socket.inet_ntoa(data[attr_pos + 4 : attr_pos + 8])
+                                attr_pos += (rta_len + 3) & ~3
+                            chosen = local_ip or peer_ip
+                            if chosen is not None:
+                                addr_obj = ipaddress.IPv4Address(chosen)
+                                cidr = f"{chosen}/{prefixlen}"
+                                if not addr_obj.is_loopback and cidr not in discovered:
+                                    discovered.append(cidr)
+                    offset += (nl_len + 3) & ~3
+                if done:
+                    break
+    except OSError:
+        return []
+    return discovered
+
+
 def _ipv4_addresses(interface: str) -> list[str]:
     if _INTERFACE_NAME.fullmatch(interface) is None:
         return []
     request = struct.pack("256s", interface.encode("ascii"))
+    addresses: list[str] = []
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
             address = socket.inet_ntoa(fcntl.ioctl(control.fileno(), _SIOCGIFADDR, request)[20:24])
             mask = socket.inet_ntoa(fcntl.ioctl(control.fileno(), _SIOCGIFNETMASK, request)[20:24])
+        if not ipaddress.IPv4Address(address).is_loopback:
+            prefix = sum(int(octet).bit_count() for octet in socket.inet_aton(mask))
+            addresses.append(f"{address}/{prefix}")
     except (OSError, UnicodeEncodeError):
-        return []
-    prefix = sum(int(octet).bit_count() for octet in socket.inet_aton(mask))
-    return [f"{address}/{prefix}"]
+        pass
+    with suppress(OSError):
+        for candidate in _netlink_ipv4_addresses(interface):
+            if candidate not in addresses:
+                addresses.append(candidate)
+    return addresses
 
 
 def _default_interface(route_path: Path) -> str | None:
@@ -64,7 +152,8 @@ def _default_interface(route_path: Path) -> str | None:
     return min(candidates)[1] if candidates else None
 
 
-def _temperature(thermal_paths: Sequence[Path]) -> float:
+def read_temperature(thermal_paths: Sequence[Path]) -> float | None:
+    """Return the hottest valid SoC thermal reading in Celsius, or None if unreadable."""
     readings: list[float] = []
     for path in thermal_paths:
         try:
@@ -76,7 +165,13 @@ def _temperature(thermal_paths: Sequence[Path]) -> float:
         value /= 1000
         if -40 <= value <= 125:
             readings.append(value)
-    return max(readings, default=0.0)
+    return max(readings) if readings else None
+
+
+def _temperature(thermal_paths: Sequence[Path]) -> float:
+    reading = read_temperature(thermal_paths)
+    # OpenAPI v2/v3/v4 and api/events.py currently require numeric [-40, 125].
+    return 0.0 if reading is None else reading
 
 
 def _interface_status(
@@ -222,7 +317,7 @@ def collect_linux_runtime(
             connection_method = "offline"
 
     return {
-        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "observed_at": utc_now_iso(),
         "connection_method": connection_method,
         "temperature_celsius": _temperature(thermal_paths),
         "network": {

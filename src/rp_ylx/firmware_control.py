@@ -31,9 +31,26 @@ LIMIT = 64 * 1024
 MAX_CONTROL_DEPTH = 64
 ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 TTL = 1200
-SEMVER = re.compile(r"^0\.2\.([1-9][0-9]*|0)$")
+SUPPORTED_SERIES = (0, 2)
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 KEY = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+
+def parse_semver(value: object) -> tuple[int, int, int] | None:
+    """Parse canonical MAJOR.MINOR.PATCH SemVer without leading zeros or suffixes."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(".")
+    if len(parts) != 3:
+        return None
+    parsed: list[int] = []
+    for part in parts:
+        if not part or not part.isascii() or not part.isdigit():
+            return None
+        if len(part) > 1 and part.startswith("0"):
+            return None
+        parsed.append(int(part))
+    return parsed[0], parsed[1], parsed[2]
 
 
 class FirmwareError(RuntimeError):
@@ -87,9 +104,10 @@ def installed_release(name: str, root: Path = INSTALL) -> dict | None:
 
 def newer(available: str, current: str) -> bool:
     def parts(value):
-        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        parsed = parse_semver(value)
+        if parsed is None:
             raise FirmwareError("version_invalid", "版本号无效", 503)
-        return tuple(map(int, value.split(".")))
+        return parsed
 
     return parts(available) > parts(current)
 
@@ -343,7 +361,12 @@ class FirmwareSupervisor:
                 with tempfile.TemporaryDirectory() as directory:
                     manifest = update.fetch_manifest(update.DEFAULT_MANIFEST, Path(directory))
                 metadata = update.manifest_display_metadata(manifest)
-                if not SEMVER.fullmatch(metadata["version"]) or manifest["version"] == "0.2.0":
+                parsed_version = parse_semver(metadata["version"])
+                if (
+                    parsed_version is None
+                    or parsed_version[:2] != SUPPORTED_SERIES
+                    or parsed_version[2] == 0
+                ):
                     with self.lock:
                         self.cache = None
                         self._cache_checked_at = None
@@ -359,10 +382,12 @@ class FirmwareSupervisor:
                     self._cache_checked_at = time.monotonic()
                     self.warning = None
             except OSError:
-                self.warning = "无法连接 OSS 发布源，请检查设备互联网连接后重试"
+                with self.lock:
+                    self.warning = "无法连接 OSS 发布源，请检查设备互联网连接后重试"
                 return self.status()
             except (ValueError, KeyError, TypeError, RecursionError):
-                self.warning = "OSS 发布清单校验失败，请联系维护者检查发布内容后重试"
+                with self.lock:
+                    self.warning = "OSS 发布清单校验失败，请联系维护者检查发布内容后重试"
                 return self.status()
             return self.status()
 
@@ -438,6 +463,16 @@ class FirmwareSupervisor:
                     raise FirmwareError(
                         "state_schema_incompatible",
                         "上一版本不支持 SQLite，必须离线恢复配套状态后才能回退",
+                    )
+                if (
+                    updater_module().exfat_storage_required()
+                    and not updater_module().release_supports_exfat(
+                        self.install / "releases" / commit / "site-packages/rp_ylx"
+                    )
+                ):
+                    raise FirmwareError(
+                        "storage_schema_incompatible",
+                        "上一版本不支持 exFAT 独立录像分区，禁止回退",
                     )
             try:
                 updater_module().require_idle()
@@ -908,8 +943,9 @@ def main():
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = Path(SOCKET)
     path.unlink(missing_ok=True)
-    with ControlServer(SOCKET, ControlHandler) as server:
-        os.chmod(SOCKET, 0o660)
+    with ControlServer(SOCKET, ControlHandler, bind_and_activate=False) as server:
+        # Assign supervisor before binding/exposing the socket so early clients
+        # never observe an uninitialized server.
         server.supervisor = FirmwareSupervisor(
             on_success=lambda: subprocess.run(
                 ["systemctl", "--no-block", "try-restart", "openaria-update.service"],
@@ -917,7 +953,26 @@ def main():
                 timeout=10,
             )
         )
-        server.serve_forever()
+        server.server_bind()
+        os.chmod(SOCKET, 0o660)
+        server.server_activate()
+        shutdown_requested = threading.Event()
+        previous: dict[int, object] = {}
+
+        def request_shutdown(_signum, _frame):
+            if not shutdown_requested.is_set():
+                shutdown_requested.set()
+                threading.Thread(
+                    target=server.shutdown, name="firmware-shutdown", daemon=True
+                ).start()
+
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.signal(signum, request_shutdown)
+            server.serve_forever()
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

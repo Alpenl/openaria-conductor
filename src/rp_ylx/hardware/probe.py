@@ -7,10 +7,11 @@ import os
 import platform
 import shutil
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from rp_ylx.core.board import normalize_board_model
+from rp_ylx.core.time import utc_now_iso
 from rp_ylx.hardware.target import (
     RDK_X5_BOARD_ID,
     YLX_2UQ2_CAMERA_ID,
@@ -19,6 +20,8 @@ from rp_ylx.hardware.target import (
 )
 
 PROBE_FORMAT = "ylx.hardware-probe.v0"
+
+__all__ = ["PROBE_FORMAT", "collect_hardware_facts"]
 
 
 def _text(path: Path) -> str | None:
@@ -212,12 +215,13 @@ def collect_hardware_facts(
     storage_path: Path = Path("/"),
     v4l2_ctl: str | None = None,
 ) -> dict[str, Any]:
-    model = _text(proc_root / "device-tree" / "model")
+    raw_model = _text(proc_root / "device-tree" / "model")
+    model = None if raw_model is None else normalize_board_model(raw_model) or None
     executable = shutil.which("v4l2-ctl") if v4l2_ctl is None else v4l2_ctl
     usb_devices = _usb_devices(sys_root)
     return {
         "format": PROBE_FORMAT,
-        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "observed_at": utc_now_iso(),
         "platform": {
             "machine": platform.machine(),
             "kernel": platform.release(),

@@ -211,6 +211,37 @@ def _manifest_dropped_frames(manifest: dict[str, object]) -> int:
     return dropped
 
 
+def _recorder_generation_id(recorder: object) -> str:
+    generation_id = getattr(recorder, "generation_id", None)
+    if isinstance(generation_id, str) and generation_id:
+        return generation_id
+    plan = getattr(recorder, "plan", None)
+    if plan is None:
+        plan = getattr(recorder, "_plan", None)
+    plan_generation_id = getattr(plan, "generation_id", None)
+    if isinstance(plan_generation_id, str) and plan_generation_id:
+        return plan_generation_id
+    raise BenchmarkError("recorder_missing_generation_id", "recorder did not expose generation_id")
+
+
+def _preview_sequence(preview: LatestPreviewBuffer) -> int:
+    snapshot_fn = getattr(preview, "snapshot", None)
+    if callable(snapshot_fn):
+        return int(snapshot_fn().sequence)
+    native_owner = preview.native_owner
+    if native_owner is not None:
+        try:
+            sequence, _ = native_owner.jpeg()
+        except RuntimeError as exc:
+            raw = str(exc)
+            code, separator, message = raw.partition(": ")
+            if separator and code == "preview_unavailable":
+                raise PreviewFrameUnavailable(message) from exc
+            raise
+        return int(sequence)
+    return int(preview._snapshot().sequence)
+
+
 def _run_native_continuous_hardware(
     config: BenchmarkConfig, metrics: PerformanceMetrics
 ) -> tuple[int, int, int]:
@@ -239,7 +270,7 @@ def _run_native_continuous_hardware(
         recorder.start()
         sources.start(
             mode="production",
-            generation_id=recorder._plan.generation_id,
+            generation_id=_recorder_generation_id(recorder),
             submit_frame=recorder.submit_frame,
             submit_imu=recorder.submit_imu,
             on_failure=on_failure,
@@ -295,10 +326,10 @@ def _run_native_preview_hardware(
         deadline = time.monotonic() + config.duration_seconds
         while time.monotonic() < deadline:
             with suppress(PreviewFrameUnavailable):
-                snapshot = preview._snapshot()
-                if snapshot.sequence != last_sequence:
+                sequence = _preview_sequence(preview)
+                if sequence != last_sequence:
                     frames += 1
-                    last_sequence = snapshot.sequence
+                    last_sequence = sequence
             time.sleep(1 / 60)
     finally:
         sources.close()
