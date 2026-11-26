@@ -503,13 +503,14 @@ static void segment_close(miro_ego_pipeline_t *pipeline, eye_t *eye)
 
 static int segment_finalize(miro_ego_pipeline_t *pipeline, segment_t *segment)
 {
-    if (hb_mm_mx_stop(&segment->muxer) != 0) {
-        fail(pipeline, "segment_seal_failed: stop %s", segment->relative);
+    if (segment->end_frame == segment->start_frame) {
+        /* A segment with zero frames has no media; release muxer best-effort and unlink. */
+        (void)hb_mm_mx_stop(&segment->muxer);
+        unlink(segment->absolute);
         return 0;
     }
-    if (segment->end_frame == segment->start_frame) {
-        /* A segment opened exactly at the final frame boundary has no media. */
-        unlink(segment->absolute);
+    if (hb_mm_mx_stop(&segment->muxer) != 0) {
+        fail(pipeline, "segment_seal_failed: stop %s", segment->relative);
         return 0;
     }
     char reason[128] = {0};
@@ -680,9 +681,15 @@ static void *mux_writer_thread(void *argument)
 {
     eye_t *eye = (eye_t *)argument;
     miro_ego_pipeline_t *pipeline = eye->pipeline;
-    int writable = segment_open(pipeline, eye, 0, 0) == 0;
+    int writable = 1;
     miro_ego_packet_t *packet;
     while ((packet = miro_ego_packet_queue_pop(&eye->packets)) != NULL) {
+        if (writable && eye->current == NULL) {
+            int seg_index = pipeline->segment_frames > 0
+                                ? (int)(eye->ordinal / (unsigned long long)pipeline->segment_frames)
+                                : 0;
+            writable = segment_open(pipeline, eye, seg_index, eye->ordinal) == 0;
+        }
         if (writable) {
             mx_stream_t stream;
             memset(&stream, 0, sizeof(stream));
@@ -705,9 +712,6 @@ static void *mux_writer_thread(void *argument)
                 if (pipeline->segment_frames > 0 &&
                     eye->ordinal % (unsigned long long)pipeline->segment_frames == 0) {
                     segment_close(pipeline, eye);
-                    writable = segment_open(pipeline, eye,
-                        (int)(eye->ordinal / (unsigned long long)pipeline->segment_frames),
-                        eye->ordinal) == 0;
                 }
             }
         }
@@ -716,7 +720,9 @@ static void *mux_writer_thread(void *argument)
     /* A failed write can have partially changed the tail MP4. Preserve that
      * file for diagnosis, but never emit it as a completed segment. */
     if (writable) {
-        segment_close(pipeline, eye);
+        if (eye->current != NULL) {
+            segment_close(pipeline, eye);
+        }
     } else if (eye->current != NULL) {
         hb_mm_mx_stop(&eye->current->muxer);
         free(eye->current);

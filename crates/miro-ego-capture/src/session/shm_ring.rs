@@ -387,6 +387,12 @@ impl ShmRingProducer {
         flags: u32,
         payload: &[u8],
     ) -> Result<PushStatus, ShmRingError> {
+        if payload.is_empty() {
+            return Err(ShmRingError::new(
+                "invalid_argument",
+                "frame payload must not be empty",
+            ));
+        }
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             ShmRingError::new("frame_too_large", "frame payload exceeds u32 length")
         })?;
@@ -463,22 +469,53 @@ impl ShmRingProducer {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<u64, ShmRingError> {
+        self.push_wait_with_check(frame_seq, monotonic_ns, flags, payload, timeout, || {
+            Ok::<(), ShmRingError>(())
+        })
+    }
+
+    /// Push a frame, polling `done_fd` in bounded slices while periodically running `check`
+    /// so child encoder crashes / unexpected EOF abort immediately instead of stalling for `timeout`.
+    pub fn push_wait_with_check<E, F>(
+        &mut self,
+        frame_seq: u64,
+        monotonic_ns: u64,
+        flags: u32,
+        payload: &[u8],
+        timeout: Duration,
+        mut check: F,
+    ) -> Result<u64, E>
+    where
+        E: From<ShmRingError>,
+        F: FnMut() -> Result<(), E>,
+    {
+        const POLL_SLICE: Duration = Duration::from_millis(100);
         let deadline = Instant::now() + timeout;
         loop {
+            check()?;
             match self.try_push(frame_seq, monotonic_ns, flags, payload)? {
                 PushStatus::Pushed { write_idx, .. } => return Ok(write_idx),
                 PushStatus::Full => {
+                    check()?;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(ShmRingError::new(
                             "shm_backpressure_timeout",
                             "timed out waiting for encoder to free a SHM slot",
-                        ));
+                        )
+                        .into());
                     }
-                    let _ = wait_and_drain_eventfd(self.done_fd.as_raw_fd(), remaining)?;
+                    let _ = wait_and_drain_eventfd(
+                        self.done_fd.as_raw_fd(),
+                        remaining.min(POLL_SLICE),
+                    )?;
                 }
             }
         }
+    }
+
+    pub(crate) fn clone_done_wakeup_fd(&self) -> Result<OwnedFd, ShmRingError> {
+        dup_owned(self.done_fd.as_raw_fd())
     }
 
     /// Mark EOF in `header.flags` (`SHM_FLAG_EOF`) and wake the consumer via `kick_fd`.
@@ -587,10 +624,10 @@ impl ShmRingConsumer {
         let slot_index = (read_idx & mask) as u32;
         // SAFETY: `read_idx != write_idx` with Acquire fence guarantees producer finished writing.
         let desc = unsafe { std::ptr::read(self.region.slot_ptr(slot_index)) };
-        if desc.payload_len > self.layout.slot_capacity {
+        if desc.payload_len == 0 || desc.payload_len > self.layout.slot_capacity {
             return Err(ShmRingError::new(
                 "shm_corrupt",
-                "slot payload_len exceeds slot_capacity",
+                "slot payload_len is zero or exceeds slot_capacity",
             ));
         }
         let data_offset = usize::try_from(desc.data_offset)
@@ -731,19 +768,50 @@ fn signal_eventfd(fd: RawFd) -> Result<(), ShmRingError> {
     }
 }
 
+pub(crate) fn wake_eventfd_best_effort(fd: RawFd) {
+    let _ = signal_eventfd(fd);
+}
+
 fn wait_and_drain_eventfd(fd: RawFd, timeout: Duration) -> Result<bool, ShmRingError> {
-    let timeout_ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+    if fd < 0 {
+        return Err(ShmRingError::io(
+            "eventfd_poll_failed",
+            "poll eventfd",
+            io::Error::from_raw_os_error(libc::EBADF),
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    let nonblocking = timeout.is_zero();
     let mut pollfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
     loop {
+        let timeout_ms = if nonblocking {
+            0
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            remaining.as_millis().max(1).min(i32::MAX as u128) as i32
+        };
+        pollfd.revents = 0;
         // SAFETY: `pollfd` points to a valid `libc::pollfd` of length 1.
         let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
         if rc > 0 {
-            drain_eventfd(fd)?;
-            return Ok(true);
+            if (pollfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
+                return Err(ShmRingError::new(
+                    "eventfd_poll_failed",
+                    format!("poll eventfd returned error revents={:#x}", pollfd.revents),
+                ));
+            }
+            if (pollfd.revents & libc::POLLIN) != 0 {
+                drain_eventfd(fd)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         if rc == 0 {
             return Ok(false);
@@ -971,5 +1039,65 @@ mod tests {
                 .code,
             "shm_invalid"
         );
+    }
+
+    #[test]
+    fn rejects_empty_payloads_and_handles_submillisecond_and_invalid_eventfd_polls() {
+        let mut producer = ShmRingProducer::create(ShmRingConfig {
+            slot_count: 4,
+            slot_capacity: 64,
+        })
+        .unwrap();
+        let (shm, kick, done) = producer.clone_consumer_fds().unwrap();
+        let mut consumer = ShmRingConsumer::attach(shm, kick, done).unwrap();
+
+        assert_eq!(
+            producer.try_push(0, 100, 0, b"").unwrap_err().code,
+            "invalid_argument"
+        );
+        assert_eq!(
+            producer
+                .push_wait(0, 100, 0, b"", Duration::from_millis(5))
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+
+        // Positive sub-millisecond wait clamps to >= 1ms without busy-spinning and times out cleanly.
+        assert!(!super::wait_and_drain_eventfd(
+            producer.done_fd.as_raw_fd(),
+            Duration::from_micros(250),
+        )
+        .unwrap());
+        // Negative fd is rejected immediately, and a closed non-negative fd triggers POLLNVAL.
+        assert_eq!(
+            super::wait_and_drain_eventfd(-1, Duration::from_millis(1))
+                .unwrap_err()
+                .code,
+            "eventfd_poll_failed"
+        );
+        let closed_fd = dup_cloexec(producer.done_fd.as_raw_fd()).unwrap();
+        unsafe {
+            libc::close(closed_fd);
+        }
+        assert_eq!(
+            super::wait_and_drain_eventfd(closed_fd, Duration::from_millis(1))
+                .unwrap_err()
+                .code,
+            "eventfd_poll_failed"
+        );
+
+        // Zero-length forged slot descriptor is rejected as shm_corrupt.
+        unsafe {
+            let slot = consumer.region.slot_ptr(0);
+            (*slot).data_offset = consumer.layout.data_region_offset as u64;
+            (*slot).payload_len = 0;
+        }
+        producer
+            .region
+            .header()
+            .write_idx
+            .store(1, Ordering::Release);
+        assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
     }
 }

@@ -622,6 +622,11 @@ mod tests {
         helper
     }
 
+    fn test_encoder_args() -> &'static [String] {
+        static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        ARGS.get_or_init(|| vec!["--intra-period".to_owned(), "3".to_owned()])
+    }
+
     fn plan<'a>(
         root: &'a Path,
         helper: &'a Path,
@@ -636,7 +641,7 @@ mod tests {
             height: 1080,
             fps: 30,
             bitrate_kbps: 8192,
-            encoder_arguments: &[],
+            encoder_arguments: test_encoder_args(),
             encoder_transport: super::EncoderTransport::StdinPipe,
             segment_frames: 3,
             recording_start_monotonic_ns,

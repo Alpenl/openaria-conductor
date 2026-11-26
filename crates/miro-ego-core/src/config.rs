@@ -15,6 +15,9 @@ pub const SETTINGS_SCHEMA: &str = "miro-ego.settings.v1";
 pub const RECORDING_ENCODING_SCHEMA: &str = "miro-ego.recording-encoding.v1";
 pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_CONFIG_JSON_DEPTH: usize = 32;
+pub const MAX_CAMERA_DIMENSION: u32 = 16_384;
+pub const MAX_ENCODED_FPS: u32 = 60;
+pub const MAX_SEGMENT_FRAMES: u64 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -398,13 +401,29 @@ impl DeviceConfig {
         }
         if self.camera.width == 0
             || self.camera.width % 4 != 0
+            || self.camera.width > MAX_CAMERA_DIMENSION
             || self.camera.height == 0
+            || self.camera.height % 2 != 0
+            || self.camera.height > MAX_CAMERA_DIMENSION
             || self.camera.fps == 0
             || self.camera.frame_decimation == 0
         {
             return Err(CoreError::invalid_config(
                 "invalid_config",
-                "camera dimensions, fps, and frame_decimation must be valid positive values",
+                "camera width (multiple of 4, <= 16384), height (even, <= 16384), fps, and frame_decimation must be valid",
+            ));
+        }
+        if self.camera.fps % self.camera.frame_decimation != 0 {
+            return Err(CoreError::invalid_config(
+                "invalid_config",
+                "camera.fps must be an exact multiple of camera.frame_decimation",
+            ));
+        }
+        let encoded_fps = self.camera.fps / self.camera.frame_decimation;
+        if !(1..=MAX_ENCODED_FPS).contains(&encoded_fps) {
+            return Err(CoreError::invalid_config(
+                "invalid_config",
+                "effective encoded fps (camera.fps / camera.frame_decimation) must be in 1..=60",
             ));
         }
         if let Some(exposure) = &self.camera.exposure_time_absolute {
@@ -486,8 +505,45 @@ impl DeviceConfig {
             ));
         }
         self.recording.validate()?;
+        validate_segment_frame_bounds(
+            encoded_fps,
+            self.segment_seconds,
+            self.recording.gop_frames,
+            "invalid_config",
+        )?;
         Ok(())
     }
+}
+
+fn validate_segment_frame_bounds(
+    encoded_fps: u32,
+    segment_seconds: f64,
+    gop_frames: u32,
+    code: &'static str,
+) -> CoreResult<()> {
+    let raw_frames = (f64::from(encoded_fps) * segment_seconds).round();
+    if !raw_frames.is_finite()
+        || raw_frames < 1.0
+        || raw_frames > (MAX_SEGMENT_FRAMES as f64)
+    {
+        return Err(CoreError::invalid_config(
+            code,
+            format!("segment frame count must be in 1..={MAX_SEGMENT_FRAMES}"),
+        ));
+    }
+    let gop = u64::from(gop_frames.max(1));
+    let base = (raw_frames as u64).max(gop);
+    let aligned = base
+        .div_ceil(gop)
+        .checked_mul(gop)
+        .ok_or_else(|| CoreError::invalid_config(code, "segment frame alignment overflow"))?;
+    if aligned > MAX_SEGMENT_FRAMES {
+        return Err(CoreError::invalid_config(
+            code,
+            format!("GOP-aligned segment frame count exceeds {MAX_SEGMENT_FRAMES}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Validated mutable device settings stored in `/etc/miro-ego/settings.json`.
@@ -546,12 +602,16 @@ impl Settings {
         }
         if self.camera.width == 0
             || self.camera.width % 4 != 0
+            || self.camera.width > MAX_CAMERA_DIMENSION
             || self.camera.height == 0
+            || self.camera.height % 2 != 0
+            || self.camera.height > MAX_CAMERA_DIMENSION
             || self.camera.fps == 0
+            || self.camera.fps > MAX_ENCODED_FPS
         {
             return Err(CoreError::invalid_config(
                 "invalid_settings",
-                "settings.camera dimensions and fps must be valid positive values",
+                "settings.camera width (multiple of 4, <= 16384), height (even, <= 16384), and fps (1..=60) must be valid",
             ));
         }
         if let Some(exposure) = &self.camera.exposure_time_absolute {
@@ -574,6 +634,35 @@ impl Settings {
         }
         self.recording.validate()?;
         Ok(())
+    }
+
+    /// Validate mutable `Settings` against the device's configured `frame_decimation`
+    /// and `segment_seconds` so persisted settings remain compatible with `miro-ego-encoder`.
+    pub fn validate_for_device(
+        &self,
+        frame_decimation: u32,
+        segment_seconds: f64,
+    ) -> CoreResult<()> {
+        self.validate()?;
+        if frame_decimation == 0 || self.camera.fps % frame_decimation != 0 {
+            return Err(CoreError::invalid_config(
+                "invalid_settings",
+                "settings.camera.fps must be an exact multiple of frame_decimation",
+            ));
+        }
+        let encoded_fps = self.camera.fps / frame_decimation;
+        if !(1..=MAX_ENCODED_FPS).contains(&encoded_fps) {
+            return Err(CoreError::invalid_config(
+                "invalid_settings",
+                "effective encoded fps must be in 1..=60",
+            ));
+        }
+        validate_segment_frame_bounds(
+            encoded_fps,
+            segment_seconds,
+            self.recording.gop_frames,
+            "invalid_settings",
+        )
     }
 }
 
@@ -704,5 +793,53 @@ mod tests {
         assert!(load_device_config(&huge_path).is_err());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enforces_c_encoder_dimension_fps_decimation_and_segment_invariants() {
+        let cfg = sample_config();
+
+        // Odd height rejected in DeviceConfig and Settings
+        let mut odd_h = cfg.clone();
+        odd_h.camera.height = 1081;
+        assert!(odd_h.validate().is_err());
+        let mut odd_settings = Settings::from_device_config(&cfg);
+        odd_settings.camera.height = 1081;
+        assert!(odd_settings.validate().is_err());
+
+        // Dimensions > 16384 rejected
+        let mut huge_w = cfg.clone();
+        huge_w.camera.width = 16_388;
+        assert!(huge_w.validate().is_err());
+        let mut huge_h = cfg.clone();
+        huge_h.camera.height = 16_386;
+        assert!(huge_h.validate().is_err());
+
+        // Non-divisible fps % frame_decimation rejected
+        let mut bad_dec = cfg.clone();
+        bad_dec.camera.fps = 60;
+        bad_dec.camera.frame_decimation = 7;
+        assert!(bad_dec.validate().is_err());
+        let ok_settings = Settings::from_device_config(&cfg);
+        assert!(ok_settings.validate_for_device(2, 5.0).is_ok());
+        assert!(ok_settings.validate_for_device(7, 5.0).is_err());
+
+        // Effective encoded fps > 60 or == 0 rejected
+        let mut high_fps = cfg.clone();
+        high_fps.camera.fps = 180;
+        high_fps.camera.frame_decimation = 2;
+        assert!(high_fps.validate().is_err());
+        let mut zero_eff_fps = cfg.clone();
+        zero_eff_fps.camera.fps = 30;
+        zero_eff_fps.camera.frame_decimation = 60;
+        assert!(zero_eff_fps.validate().is_err());
+        let mut high_settings = Settings::from_device_config(&cfg);
+        high_settings.camera.fps = 90;
+        assert!(high_settings.validate().is_err());
+
+        // segment_seconds exceeding 1,000,000 frames rejected
+        let mut huge_seg = cfg.clone();
+        huge_seg.segment_seconds = 40_000.0; // 30 fps * 40,000s = 1,200,000 > 1,000,000
+        assert!(huge_seg.validate().is_err());
     }
 }

@@ -10,6 +10,7 @@
 //!   `receipts/`, and `telemetry/`.
 
 use crate::sys::fs::set_exfat_hidden;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,43 @@ pub const HIDDEN_META_DIR_NAME: &str = ".miro-ego";
 
 pub const MAINTENANCE_LOCK_NAME: &str = "maintenance.lock";
 pub const NETWORK_OPERATION_LOCK_NAME: &str = "network-operation.lock";
+pub const MAINTENANCE_LOCK_ENV: &str = "MIRO_EGO_MAINTENANCE_LOCK";
+pub const NETWORK_OPERATION_LOCK_ENV: &str = "MIRO_EGO_NETWORK_OPERATION_LOCK_PATH";
+
+pub(crate) fn resolve_lock_path_with_env(
+    run_dir: &Path,
+    default_name: &str,
+    env_override: Option<&OsStr>,
+) -> PathBuf {
+    if run_dir == Path::new(SYSTEM_RUN_DIR) {
+        if let Some(override_path) = env_override.filter(|value| !value.is_empty()) {
+            return PathBuf::from(override_path);
+        }
+    }
+    run_dir.join(default_name)
+}
+
+/// Resolve the maintenance lock file path for `run_dir`, honoring
+/// `MIRO_EGO_MAINTENANCE_LOCK` when `run_dir` is the canonical `/run/miro-ego`.
+pub fn resolve_maintenance_lock_path(run_dir: impl AsRef<Path>) -> PathBuf {
+    let env_val = std::env::var_os(MAINTENANCE_LOCK_ENV);
+    resolve_lock_path_with_env(
+        run_dir.as_ref(),
+        MAINTENANCE_LOCK_NAME,
+        env_val.as_deref(),
+    )
+}
+
+/// Resolve the network-operation lock file path for `run_dir`, honoring
+/// `MIRO_EGO_NETWORK_OPERATION_LOCK_PATH` when `run_dir` is the canonical `/run/miro-ego`.
+pub fn resolve_network_operation_lock_path(run_dir: impl AsRef<Path>) -> PathBuf {
+    let env_val = std::env::var_os(NETWORK_OPERATION_LOCK_ENV);
+    resolve_lock_path_with_env(
+        run_dir.as_ref(),
+        NETWORK_OPERATION_LOCK_NAME,
+        env_val.as_deref(),
+    )
+}
 
 /// Canonical system-disk paths (parameterizable for hermetic testing).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,11 +106,11 @@ impl SystemPaths {
     }
 
     pub fn maintenance_lock_file(&self) -> PathBuf {
-        self.run_dir.join(MAINTENANCE_LOCK_NAME)
+        resolve_maintenance_lock_path(&self.run_dir)
     }
 
     pub fn network_operation_lock_file(&self) -> PathBuf {
-        self.run_dir.join(NETWORK_OPERATION_LOCK_NAME)
+        resolve_network_operation_lock_path(&self.run_dir)
     }
 }
 

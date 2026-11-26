@@ -525,6 +525,8 @@ int hb_mm_mx_stop(media_muxer_context_t *context)
             if (write_minimal_moov(mx) != 0) {
                 ret = -1;
             }
+        } else if (g_cfg.fail_empty_mux_stop) {
+            ret = -1;
         }
         close(mx->fd);
         mx->fd = -1;

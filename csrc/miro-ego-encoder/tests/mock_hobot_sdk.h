@@ -11,6 +11,7 @@ typedef struct {
     int force_decoder_capacity;
     int force_bad_decode_result;
     int emit_stdout_noise;
+    int fail_empty_mux_stop;
 } mock_hobot_config_t;
 
 void mock_hobot_reset(const mock_hobot_config_t *cfg);

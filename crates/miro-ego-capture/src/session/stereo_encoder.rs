@@ -1,11 +1,13 @@
 use crate::session::session_io;
-use crate::session::shm_ring::{ShmRingConfig, ShmRingError, ShmRingProducer};
+use crate::session::shm_ring::{
+    ShmRingConfig, ShmRingError, ShmRingProducer, wake_eventfd_best_effort,
+};
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::clock::monotonic_ns;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -16,10 +18,17 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SHM_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(50);
 const SPAWN_ETXTBSY_MAX_ATTEMPTS: usize = 8;
 const SPAWN_ETXTBSY_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 8 * 1024;
+const MAX_ENCODER_DIMENSION: u64 = 16_384;
+const MAX_ENCODER_FPS: u64 = 60;
+const MAX_ENCODER_BITRATE_KBPS: u64 = 100_000;
+const MAX_ENCODER_SEGMENT_FRAMES: u64 = 1_000_000;
+const MAX_ENCODER_INTRA_PERIOD: u64 = 300;
+const MAX_ENCODER_VBV_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncoderEventError {
@@ -57,6 +66,7 @@ pub struct SegmentEvent {
 pub enum EncoderEvent {
     Ready,
     Segment(SegmentEvent),
+    Stats(BTreeMap<String, i64>),
     Done(BTreeMap<String, i64>),
     Error { code: String, message: String },
 }
@@ -117,10 +127,13 @@ enum ActiveTransport {
 struct ProcessState {
     ready: bool,
     closed: bool,
+    saw_done: bool,
+    stderr_closed: bool,
     failure: Option<EncoderProcessError>,
     segments: Vec<SegmentEvent>,
     stats: BTreeMap<String, i64>,
     stderr_ring: VecDeque<u8>,
+    wake_done_fd: Option<OwnedFd>,
 }
 
 impl ProcessState {
@@ -128,10 +141,13 @@ impl ProcessState {
         Self {
             ready: false,
             closed: false,
+            saw_done: false,
+            stderr_closed: false,
             failure: None,
             segments: Vec::new(),
             stats: BTreeMap::new(),
             stderr_ring: VecDeque::new(),
+            wake_done_fd: None,
         }
     }
 
@@ -160,6 +176,35 @@ impl ProcessState {
         let text = String::from_utf8_lossy(&bytes).trim().to_owned();
         if text.is_empty() { None } else { Some(text) }
     }
+
+    fn wake_producer(&self) {
+        if let Some(fd) = self.wake_done_fd.as_ref() {
+            wake_eventfd_best_effort(fd.as_raw_fd());
+        }
+    }
+
+    fn unexpected_eof_error(&self) -> EncoderProcessError {
+        let base = if self.ready {
+            "encoder stdout closed before done event"
+        } else {
+            "encoder exited before ready"
+        };
+        let message = match self.stderr_snippet() {
+            Some(stderr) => format!("{base}; stderr={stderr}"),
+            None => base.to_owned(),
+        };
+        EncoderProcessError::new("encoder_unexpected_eof", message)
+    }
+
+    fn effective_failure(&self) -> Option<EncoderProcessError> {
+        if let Some(failure) = &self.failure {
+            return Some(failure.clone());
+        }
+        if self.closed && !self.saw_done {
+            return Some(self.unexpected_eof_error());
+        }
+        None
+    }
 }
 
 struct SharedProcess {
@@ -167,9 +212,24 @@ struct SharedProcess {
     changed: Condvar,
 }
 
+impl SharedProcess {
+    fn raise_if_failed(&self) -> Result<(), EncoderProcessError> {
+        let state = self.state.lock().map_err(|_| {
+            EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        if let Some(error) = state.effective_failure() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 pub struct EncoderProcess {
     executable: PathBuf,
     args: Vec<String>,
+    fps: u64,
+    segment_frames: u64,
+    intra_period: Option<u64>,
     transport_mode: EncoderTransport,
     shared: Arc<SharedProcess>,
     child: Option<Child>,
@@ -201,10 +261,16 @@ impl EncoderProcess {
     ) -> Result<Self, EncoderProcessError> {
         if config.width == 0
             || config.width % 4 != 0
+            || config.width > MAX_ENCODER_DIMENSION
             || config.height == 0
+            || config.height % 2 != 0
+            || config.height > MAX_ENCODER_DIMENSION
             || config.fps == 0
+            || config.fps > MAX_ENCODER_FPS
             || config.bitrate_kbps == 0
+            || config.bitrate_kbps > MAX_ENCODER_BITRATE_KBPS
             || config.segment_frames == 0
+            || config.segment_frames > MAX_ENCODER_SEGMENT_FRAMES
         {
             return Err(EncoderProcessError::new(
                 "invalid_argument",
@@ -232,6 +298,9 @@ impl EncoderProcess {
                 "--segment-frames".to_owned(),
                 config.segment_frames.to_string(),
             ],
+            fps: config.fps,
+            segment_frames: config.segment_frames,
+            intra_period: None,
             transport_mode,
             shared: Arc::new(SharedProcess {
                 state: Mutex::new(ProcessState::new()),
@@ -245,6 +314,41 @@ impl EncoderProcess {
         })
     }
 
+    pub fn with_transport_and_intra_period(
+        config: EncoderConfig<'_>,
+        intra_period: u64,
+        transport_mode: EncoderTransport,
+    ) -> Result<Self, EncoderProcessError> {
+        if intra_period > MAX_ENCODER_INTRA_PERIOD {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "intra_period must be in 0..=300",
+            ));
+        }
+        let mut proc = Self::with_transport(config, transport_mode)?;
+        proc.intra_period = Some(intra_period);
+        proc.validate_segment_gop()?;
+        proc.args.push("--intra-period".to_owned());
+        proc.args.push(intra_period.to_string());
+        Ok(proc)
+    }
+
+    fn validate_segment_gop(&self) -> Result<(), EncoderProcessError> {
+        let effective_gop = self.intra_period.filter(|&p| p > 0).unwrap_or(self.fps);
+        if self.segment_frames > 0
+            && (effective_gop == 0 || self.segment_frames % effective_gop != 0)
+        {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                format!(
+                    "segment_frames ({}) must be a multiple of effective intra_period ({effective_gop})",
+                    self.segment_frames
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn transport_mode(&self) -> EncoderTransport {
         self.transport_mode
     }
@@ -256,6 +360,7 @@ impl EncoderProcess {
                 "encoder child can only be started once",
             ));
         }
+        self.validate_segment_gop()?;
         {
             let mut state = self.shared.state.lock().map_err(|_| {
                 EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
@@ -267,9 +372,10 @@ impl EncoderProcess {
         command.args(&self.args);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let shm_producer = match self.transport_mode {
+        let (shm_producer, wake_done_fd) = match self.transport_mode {
             EncoderTransport::ShmRing(shm_config) => {
                 let producer = ShmRingProducer::create(shm_config)?;
+                let wake_fd = producer.clone_done_wakeup_fd()?;
                 let shm_fd = producer.shm_raw_fd();
                 let kick_fd = producer.kick_raw_fd();
                 let done_fd = producer.done_raw_fd();
@@ -295,11 +401,11 @@ impl EncoderProcess {
                         Ok(())
                     });
                 }
-                Some(producer)
+                (Some(producer), Some(wake_fd))
             }
             EncoderTransport::StdinPipe => {
                 command.stdin(Stdio::piped());
-                None
+                (None, None)
             }
         };
 
@@ -313,6 +419,16 @@ impl EncoderProcess {
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
         self.child = Some(child);
+
+        {
+            let mut state = self.shared.state.lock().map_err(|_| {
+                EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
+            })?;
+            state.wake_done_fd = wake_done_fd;
+            if stderr.is_none() {
+                state.stderr_closed = true;
+            }
+        }
 
         self.active_transport = match shm_producer {
             Some(producer) => Some(ActiveTransport::ShmRing(producer)),
@@ -381,26 +497,103 @@ impl EncoderProcess {
                 "invalid encoder settings",
             ));
         }
+        let mut next_intra_period = self.intra_period;
+        let mut saw_intra_period = false;
         for pair in args.chunks_exact(2) {
-            if !matches!(
-                pair[0].as_str(),
-                "--codec"
-                    | "--rc-mode"
-                    | "--bitrate-kbps"
-                    | "--min-qp"
-                    | "--max-qp"
-                    | "--intra-qp"
-                    | "--initial-qp"
-                    | "--intra-period"
-                    | "--vbv-ms"
-            ) || pair[1].starts_with('-')
-            {
+            let flag = pair[0].as_str();
+            let value = pair[1].as_str();
+            if value.starts_with('-') {
                 return Err(EncoderProcessError::new(
                     "invalid_argument",
                     "unsupported encoder setting",
                 ));
             }
+            match flag {
+                "--codec" => {
+                    if !matches!(value, "h264" | "hevc") {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "unsupported codec value",
+                        ));
+                    }
+                }
+                "--rc-mode" => {
+                    if !matches!(value, "cbr" | "vbr" | "fixqp" | "avbr") {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "unsupported rc-mode value",
+                        ));
+                    }
+                }
+                "--bitrate-kbps" => {
+                    let kbps = value.parse::<u64>().map_err(|_| {
+                        EncoderProcessError::new("invalid_argument", "invalid bitrate-kbps")
+                    })?;
+                    if !(1..=MAX_ENCODER_BITRATE_KBPS).contains(&kbps) {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "bitrate-kbps out of range",
+                        ));
+                    }
+                }
+                "--min-qp" | "--max-qp" | "--intra-qp" | "--initial-qp" => {
+                    let qp = value.parse::<u8>().map_err(|_| {
+                        EncoderProcessError::new("invalid_argument", "invalid qp setting")
+                    })?;
+                    if qp > 51 {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "qp setting must be in 0..=51",
+                        ));
+                    }
+                }
+                "--intra-period" => {
+                    let period = value.parse::<u64>().map_err(|_| {
+                        EncoderProcessError::new("invalid_argument", "invalid intra-period")
+                    })?;
+                    if period > MAX_ENCODER_INTRA_PERIOD {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "intra-period must be in 0..=300",
+                        ));
+                    }
+                    next_intra_period = Some(period);
+                    saw_intra_period = true;
+                }
+                "--vbv-ms" => {
+                    let vbv = value.parse::<u64>().map_err(|_| {
+                        EncoderProcessError::new("invalid_argument", "invalid vbv-ms")
+                    })?;
+                    if !(1..=MAX_ENCODER_VBV_MS).contains(&vbv) {
+                        return Err(EncoderProcessError::new(
+                            "invalid_argument",
+                            "vbv-ms must be in 1..=3000",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(EncoderProcessError::new(
+                        "invalid_argument",
+                        "unsupported encoder setting",
+                    ));
+                }
+            }
         }
+        if saw_intra_period {
+            let effective_gop = next_intra_period.filter(|&p| p > 0).unwrap_or(self.fps);
+            if self.segment_frames > 0
+                && (effective_gop == 0 || self.segment_frames % effective_gop != 0)
+            {
+                return Err(EncoderProcessError::new(
+                    "invalid_argument",
+                    format!(
+                        "segment_frames ({}) must be a multiple of effective intra_period ({effective_gop})",
+                        self.segment_frames
+                    ),
+                ));
+            }
+        }
+        self.intra_period = next_intra_period;
         self.args.extend_from_slice(args);
         Ok(())
     }
@@ -416,17 +609,31 @@ impl EncoderProcess {
         host_monotonic_ns: u64,
         jpeg: &[u8],
     ) -> Result<u64, EncoderProcessError> {
+        if jpeg.is_empty() {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "encoder frame payload must not be empty",
+            ));
+        }
         self.raise_if_failed()?;
+        let shared = &self.shared;
         let transport = self.active_transport.as_mut().ok_or_else(|| {
             EncoderProcessError::new("invalid_state", "encoder process not started")
         })?;
         let written = match transport {
             ActiveTransport::ShmRing(ring) => {
-                match ring.push_wait(frame_seq, host_monotonic_ns, 0, jpeg, SHM_SUBMIT_TIMEOUT) {
+                match ring.push_wait_with_check(
+                    frame_seq,
+                    host_monotonic_ns,
+                    0,
+                    jpeg,
+                    SHM_SUBMIT_TIMEOUT,
+                    || shared.raise_if_failed(),
+                ) {
                     Ok(_) => u64::try_from(jpeg.len()).unwrap_or(u64::MAX),
                     Err(error) => {
-                        self.raise_if_failed()?;
-                        return Err(error.into());
+                        shared.raise_if_failed()?;
+                        return Err(error);
                     }
                 }
             }
@@ -435,7 +642,7 @@ impl EncoderProcess {
                     Ok(written) => written,
                     Err(error) => {
                         // Prefer the helper's causal error over the subsequent EPIPE.
-                        self.raise_if_failed()?;
+                        shared.raise_if_failed()?;
                         return Err(error.into());
                     }
                 }
@@ -521,6 +728,9 @@ impl EncoderProcess {
             }
         }
         let _ = self.active_transport.take();
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.wake_done_fd = None;
+        }
         if child_reaped {
             let _ = self.join_readers();
         } else {
@@ -555,7 +765,7 @@ impl EncoderProcess {
     }
 
     pub fn failure(&self) -> Option<EncoderProcessError> {
-        self.shared.state.lock().ok()?.failure.clone()
+        self.shared.state.lock().ok()?.effective_failure()
     }
 
     pub fn submitted_frames(&self) -> u64 {
@@ -621,13 +831,7 @@ impl EncoderProcess {
     }
 
     fn raise_if_failed(&self) -> Result<(), EncoderProcessError> {
-        let state = self.shared.state.lock().map_err(|_| {
-            EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
-        })?;
-        if let Some(error) = state.failure.clone() {
-            return Err(error);
-        }
-        Ok(())
+        self.shared.raise_if_failed()
     }
 
     fn join_readers(&mut self) -> Result<(), EncoderProcessError> {
@@ -641,6 +845,9 @@ impl EncoderProcess {
                     "encoder event thread panicked",
                 ));
             }
+        }
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.wake_done_fd = None;
         }
         Ok(())
     }
@@ -715,7 +922,28 @@ fn read_events(stdout: std::process::ChildStdout, shared: Arc<SharedProcess>) {
         }
     }
     if let Ok(mut state) = shared.state.lock() {
+        if state.ready && !state.saw_done && state.failure.is_none() {
+            let deadline = Instant::now() + STDERR_DRAIN_GRACE;
+            while !state.stderr_closed {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Ok((next_state, wait_res)) = shared.changed.wait_timeout(state, remaining)
+                else {
+                    return;
+                };
+                state = next_state;
+                if wait_res.timed_out() {
+                    break;
+                }
+            }
+            if state.failure.is_none() {
+                state.failure = Some(state.unexpected_eof_error());
+            }
+        }
         state.closed = true;
+        state.wake_producer();
         shared.changed.notify_all();
     }
 }
@@ -734,6 +962,10 @@ fn read_stderr(mut stderr: std::process::ChildStderr, shared: Arc<SharedProcess>
             Err(_) => break,
         }
     }
+    if let Ok(mut state) = shared.state.lock() {
+        state.stderr_closed = true;
+        shared.changed.notify_all();
+    }
 }
 
 fn handle_event(shared: &SharedProcess, line: &[u8]) -> Result<(), EncoderProcessError> {
@@ -750,13 +982,18 @@ fn handle_event(shared: &SharedProcess, line: &[u8]) -> Result<(), EncoderProces
         EncoderEvent::Segment(segment) => {
             state.segments.push(segment);
         }
+        EncoderEvent::Stats(stats) => {
+            state.stats = stats;
+        }
         EncoderEvent::Done(stats) => {
             state.stats = stats;
+            state.saw_done = true;
         }
         EncoderEvent::Error { code, message } => {
             if state.failure.is_none() {
                 state.failure = Some(EncoderProcessError::new(code, message));
             }
+            state.wake_producer();
         }
     }
     shared.changed.notify_all();
@@ -768,6 +1005,7 @@ fn set_failure(shared: &SharedProcess, error: EncoderProcessError) {
         if state.failure.is_none() {
             state.failure = Some(error);
         }
+        state.wake_producer();
         shared.changed.notify_all();
     }
 }
@@ -830,7 +1068,20 @@ pub fn parse_event(line: &[u8]) -> Result<Option<EncoderEvent>, EncoderEventErro
     match kind {
         "ready" => Ok(Some(EncoderEvent::Ready)),
         "segment" => Ok(Some(EncoderEvent::Segment(parse_segment(object)?))),
-        "done" | "stats" => {
+        "stats" => {
+            let stats = object
+                .iter()
+                .filter_map(|(key, value)| {
+                    if key == "event" {
+                        None
+                    } else {
+                        value.as_i64().map(|number| (key.clone(), number))
+                    }
+                })
+                .collect();
+            Ok(Some(EncoderEvent::Stats(stats)))
+        }
+        "done" => {
             let stats = object
                 .iter()
                 .filter_map(|(key, value)| {
@@ -1074,6 +1325,13 @@ mod tests {
             }))
         );
         assert_eq!(
+            parse_event(br#"{"event":"stats","frames":3,"ignored":"x"}"#).unwrap(),
+            Some(EncoderEvent::Stats(BTreeMap::from([(
+                "frames".to_owned(),
+                3
+            )])))
+        );
+        assert_eq!(
             parse_event(br#"{"event":"done","frames":7,"ignored":"x"}"#).unwrap(),
             Some(EncoderEvent::Done(BTreeMap::from([(
                 "frames".to_owned(),
@@ -1274,5 +1532,150 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
         assert_eq!(exhausted_attempts, 3);
+    }
+
+    #[test]
+    fn validates_dimensions_fps_segment_bounds_gop_alignment_and_empty_frames() {
+        let valid = || EncoderConfig {
+            out_dir: std::path::Path::new("/unused"),
+            executable: std::path::Path::new("/unused/helper"),
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 12_000,
+            segment_frames: 150,
+            path_prefix: "video/",
+        };
+
+        // Odd height rejected
+        let mut odd_h = valid();
+        odd_h.height = 1081;
+        assert!(EncoderProcess::new(odd_h).is_err());
+
+        // Dimensions > 16384 rejected
+        let mut big_w = valid();
+        big_w.width = 16_388;
+        assert!(EncoderProcess::new(big_w).is_err());
+
+        // FPS > 60 rejected
+        let mut big_fps = valid();
+        big_fps.fps = 90;
+        assert!(EncoderProcess::new(big_fps).is_err());
+
+        // segment_frames > 1_000_000 rejected
+        let mut big_seg = valid();
+        big_seg.segment_frames = 1_000_001;
+        assert!(EncoderProcess::new(big_seg).is_err());
+
+        // segment_frames % intra_period != 0 rejected on configure() and start()
+        let mut enc = EncoderProcess::new(valid()).unwrap();
+        assert_eq!(
+            enc.configure(&["--intra-period".to_owned(), "60".to_owned()])
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+        let mut misaligned_default = valid();
+        misaligned_default.segment_frames = 100; // 100 % 30 != 0
+        let mut misaligned_enc = EncoderProcess::new(misaligned_default).unwrap();
+        assert_eq!(
+            misaligned_enc.start().unwrap_err().code,
+            "invalid_argument"
+        );
+
+        // 0-byte frame rejected up front
+        let mut zero_check = EncoderProcess::new(valid()).unwrap();
+        assert_eq!(
+            zero_check.submit_frame(0, 100, b"").unwrap_err().code,
+            "invalid_argument"
+        );
+    }
+
+    #[test]
+    fn shm_encoder_crash_after_ready_fails_fast_with_stderr_and_never_stalls_10s() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "miro-ego-encoder-crash-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let gate = root.join("crash.gate");
+        let helper = root.join("crash-helper.sh");
+        // Emit ready + stats (not done!), wait until test fills the 4 SHM slots, write stderr,
+        // and exit non-zero without emitting error or done.
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '{{\"event\":\"ready\"}}\\n'\nprintf '{{\"event\":\"stats\",\"frames\":0}}\\n'\nwhile [ ! -e \"{}\" ]; do sleep 0.01; done\nprintf 'fatal simulated VPU SIGSEGV\\n' >&2\nexit 139\n",
+                gate.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&helper, perms).unwrap();
+
+        let mut encoder = EncoderProcess::with_transport(
+            EncoderConfig {
+                out_dir: &root,
+                executable: &helper,
+                width: 3840,
+                height: 1080,
+                fps: 30,
+                bitrate_kbps: 8192,
+                segment_frames: 30,
+                path_prefix: "video/",
+            },
+            EncoderTransport::ShmRing(ShmRingConfig {
+                slot_count: 4,
+                slot_capacity: 4096,
+            }),
+        )
+        .unwrap();
+        encoder.start().unwrap();
+
+        // Fill all 4 SHM slots while helper is alive.
+        for seq in 0..4_u64 {
+            encoder
+                .submit_frame(seq, (seq + 1) * 1_000_000, &[0xAB; 64])
+                .unwrap();
+        }
+        assert_eq!(encoder.submitted_frames(), 4);
+
+        // Trigger helper crash after a short delay while submit_frame(4) is blocked on full ring!
+        let gate_clone = gate.clone();
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            std::fs::write(gate_clone, b"crash").unwrap();
+        });
+
+        let started = Instant::now();
+        let err = encoder
+            .submit_frame(4, 5_000_000, &[0xCD; 64])
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        trigger.join().unwrap();
+
+        assert_eq!(err.code, "encoder_unexpected_eof");
+        assert!(
+            err.message.contains("fatal simulated VPU SIGSEGV"),
+            "expected stderr tail in error message, got: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "submit_frame stalled for {elapsed:?} instead of waking immediately on crash"
+        );
+        assert_eq!(encoder.submitted_frames(), 4);
+        assert_eq!(encoder.failure().unwrap().code, "encoder_unexpected_eof");
+
+        encoder.abort();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

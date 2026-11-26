@@ -471,6 +471,86 @@ static void test_cli_stdin_fallback(void)
     cleanup_dir(dir);
 }
 
+static void test_pipeline_exact_boundary_and_zero_frame_lazy_open(void)
+{
+    /* 1. Exact multiple of segment_frames (6 frames, segment_frames = 3) with
+     *    fail_empty_mux_stop = 1 must succeed cleanly with 2 segments and no orphan left_00002.mp4. */
+    char dir[] = "/tmp/miro_ego_lazy_exact_XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+
+    mock_hobot_config_t mock = {
+        .sbs_width = 64,
+        .height = 32,
+        .intra_period = 3,
+        .force_missing_idr = 0,
+        .force_decoder_capacity = 0,
+        .force_bad_decode_result = 0,
+        .emit_stdout_noise = 0,
+        .fail_empty_mux_stop = 1,
+    };
+    mock_hobot_reset(&mock);
+
+    miro_ego_pipeline_config_t cfg = {
+        .sbs_width = 64,
+        .height = 32,
+        .fps = 30,
+        .bitrate_kbps = 4096,
+        .hevc = 0,
+        .rate_control = 0,
+        .intra_period = 3,
+        .min_qp = 18,
+        .max_qp = 40,
+        .intra_qp = 22,
+        .initial_qp = 24,
+        .vbv_ms = 2000,
+        .segment_frames = 3,
+        .out_dir = dir,
+        .path_prefix = "video/",
+    };
+
+    seg_collector_t col = {0};
+    miro_ego_pipeline_t *pipeline = NULL;
+    char err[256] = {0};
+    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+
+    uint8_t fake_jpeg[64];
+    memset(fake_jpeg, 0xd8, sizeof(fake_jpeg));
+    for (int i = 0; i < 6; i += 1) {
+        fake_jpeg[0] = (uint8_t)i;
+        assert(miro_ego_pipeline_submit(pipeline, fake_jpeg, sizeof(fake_jpeg), 500) == 0);
+    }
+    assert(miro_ego_pipeline_finish(pipeline) == 0);
+    assert(!miro_ego_pipeline_failed(pipeline));
+    miro_ego_pipeline_close(pipeline);
+
+    assert(col.count == 2);
+    char orphan_l[512], orphan_r[512];
+    snprintf(orphan_l, sizeof(orphan_l), "%s/left_00002.mp4", dir);
+    snprintf(orphan_r, sizeof(orphan_r), "%s/right_00002.mp4", dir);
+    assert(access(orphan_l, F_OK) != 0);
+    assert(access(orphan_r, F_OK) != 0);
+    cleanup_dir(dir);
+
+    /* 2. Zero-frame session with fail_empty_mux_stop = 1 must finish cleanly
+     *    without creating left_00000.mp4 / right_00000.mp4. */
+    char zero_dir[] = "/tmp/miro_ego_lazy_zero_XXXXXX";
+    assert(mkdtemp(zero_dir) != NULL);
+    mock_hobot_reset(&mock);
+    cfg.out_dir = zero_dir;
+    memset(&col, 0, sizeof(col));
+    pipeline = NULL;
+    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+    assert(miro_ego_pipeline_finish(pipeline) == 0);
+    assert(!miro_ego_pipeline_failed(pipeline));
+    miro_ego_pipeline_close(pipeline);
+    assert(col.count == 0);
+    snprintf(orphan_l, sizeof(orphan_l), "%s/left_00000.mp4", zero_dir);
+    snprintf(orphan_r, sizeof(orphan_r), "%s/right_00000.mp4", zero_dir);
+    assert(access(orphan_l, F_OK) != 0);
+    assert(access(orphan_r, F_OK) != 0);
+    cleanup_dir(zero_dir);
+}
+
 int main(void)
 {
     test_pipeline_multi_segment(0, NULL);
@@ -484,6 +564,7 @@ int main(void)
     assert(g_custom_split_calls == 16); /* 8 frames * 2 eyes */
     assert(g_custom_destroy_calls == 1);
 
+    test_pipeline_exact_boundary_and_zero_frame_lazy_open();
     test_pipeline_failure_modes();
     test_cli_shm_end_to_end();
     test_cli_stdin_fallback();

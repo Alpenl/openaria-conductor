@@ -1,7 +1,11 @@
 //! Safe POSIX advisory `flock` guards for Miro-Ego maintenance and network locks.
 
 use crate::error::{CoreError, CoreResult};
-use crate::paths::{MAINTENANCE_LOCK_NAME, NETWORK_OPERATION_LOCK_NAME};
+pub use crate::paths::{
+    MAINTENANCE_LOCK_ENV, MAINTENANCE_LOCK_NAME, NETWORK_OPERATION_LOCK_ENV,
+    NETWORK_OPERATION_LOCK_NAME, resolve_maintenance_lock_path,
+    resolve_network_operation_lock_path,
+};
 use crate::sys::fs::fstat;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -130,27 +134,30 @@ pub fn acquire_flock(
     }
 }
 
-/// Acquire `/run/miro-ego/maintenance.lock` (or under a custom `run_dir` for tests).
+/// Acquire `/run/miro-ego/maintenance.lock` (honoring `MIRO_EGO_MAINTENANCE_LOCK` when
+/// `run_dir` is `/run/miro-ego`, or using `run_dir/maintenance.lock` for custom test dirs).
 pub fn acquire_maintenance_lock(
     run_dir: impl AsRef<Path>,
     mode: LockMode,
     nonblocking: bool,
 ) -> CoreResult<FlockGuard> {
     acquire_flock(
-        run_dir.as_ref().join(MAINTENANCE_LOCK_NAME),
+        resolve_maintenance_lock_path(run_dir),
         mode,
         nonblocking,
     )
 }
 
-/// Acquire `/run/miro-ego/network-operation.lock` (or under a custom `run_dir` for tests).
+/// Acquire `/run/miro-ego/network-operation.lock` (honoring
+/// `MIRO_EGO_NETWORK_OPERATION_LOCK_PATH` when `run_dir` is `/run/miro-ego`, or using
+/// `run_dir/network-operation.lock` for custom test dirs).
 pub fn acquire_network_operation_lock(
     run_dir: impl AsRef<Path>,
     mode: LockMode,
     nonblocking: bool,
 ) -> CoreResult<FlockGuard> {
     acquire_flock(
-        run_dir.as_ref().join(NETWORK_OPERATION_LOCK_NAME),
+        resolve_network_operation_lock_path(run_dir),
         mode,
         nonblocking,
     )
@@ -213,6 +220,111 @@ mod tests {
 
         let err = acquire_maintenance_lock(&dir, LockMode::Exclusive, true).unwrap_err();
         assert_eq!(err.code(), "lock_open_failed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn honors_lock_env_overrides_for_canonical_run_dir_while_keeping_custom_dirs_isolated() {
+        use crate::paths::{SYSTEM_RUN_DIR, SystemPaths, resolve_lock_path_with_env};
+        use std::ffi::OsStr;
+        use std::process::Command;
+
+        if let Some(mode) = std::env::var_os("MIRO_EGO_TEST_LOCK_SUBPROCESS") {
+            let maint_expected = PathBuf::from(std::env::var_os(MAINTENANCE_LOCK_ENV).unwrap());
+            let net_expected =
+                PathBuf::from(std::env::var_os(NETWORK_OPERATION_LOCK_ENV).unwrap());
+            let custom_dir =
+                PathBuf::from(std::env::var_os("MIRO_EGO_TEST_CUSTOM_RUN_DIR").unwrap());
+
+            let sys = SystemPaths::canonical();
+            assert_eq!(sys.maintenance_lock_file(), maint_expected);
+            assert_eq!(sys.network_operation_lock_file(), net_expected);
+
+            if mode == "contended" {
+                assert_eq!(
+                    acquire_maintenance_lock(SYSTEM_RUN_DIR, LockMode::Exclusive, true)
+                        .unwrap_err()
+                        .code(),
+                    "lock_busy"
+                );
+                assert_eq!(
+                    acquire_network_operation_lock(SYSTEM_RUN_DIR, LockMode::Exclusive, true)
+                        .unwrap_err()
+                        .code(),
+                    "lock_busy"
+                );
+            } else {
+                let m = acquire_maintenance_lock(SYSTEM_RUN_DIR, LockMode::Exclusive, true)
+                    .expect("canonical run_dir must honor MIRO_EGO_MAINTENANCE_LOCK");
+                assert_eq!(m.path(), maint_expected.as_path());
+                let n = acquire_network_operation_lock(SYSTEM_RUN_DIR, LockMode::Exclusive, true)
+                    .expect("canonical run_dir must honor MIRO_EGO_NETWORK_OPERATION_LOCK_PATH");
+                assert_eq!(n.path(), net_expected.as_path());
+            }
+
+            // Custom test run_dir stays isolated even while env vars are set.
+            let isolated = acquire_maintenance_lock(&custom_dir, LockMode::Exclusive, true).unwrap();
+            assert_eq!(
+                isolated.path(),
+                custom_dir.join(MAINTENANCE_LOCK_NAME).as_path()
+            );
+            return;
+        }
+
+        let dir = temp_run_dir("env-override");
+        let maint_override = dir.join("custom-maint.lock");
+        let net_override = dir.join("custom-net.lock");
+
+        // Pure resolver check for empty vs populated overrides and custom run_dir isolation.
+        assert_eq!(
+            resolve_lock_path_with_env(
+                Path::new(SYSTEM_RUN_DIR),
+                MAINTENANCE_LOCK_NAME,
+                Some(OsStr::new("")),
+            ),
+            PathBuf::from("/run/miro-ego/maintenance.lock")
+        );
+        assert_eq!(
+            resolve_lock_path_with_env(
+                &dir,
+                MAINTENANCE_LOCK_NAME,
+                Some(maint_override.as_os_str()),
+            ),
+            dir.join(MAINTENANCE_LOCK_NAME)
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        let test_name =
+            "locks::tests::honors_lock_env_overrides_for_canonical_run_dir_while_keeping_custom_dirs_isolated";
+
+        // 1. Hold locks in parent and verify child sees lock_busy via env-resolved paths.
+        let maint_guard = acquire_flock(&maint_override, LockMode::Exclusive, true).unwrap();
+        let net_guard = acquire_flock(&net_override, LockMode::Exclusive, true).unwrap();
+
+        let contended_status = Command::new(&exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("MIRO_EGO_TEST_LOCK_SUBPROCESS", "contended")
+            .env(MAINTENANCE_LOCK_ENV, &maint_override)
+            .env(NETWORK_OPERATION_LOCK_ENV, &net_override)
+            .env("MIRO_EGO_TEST_CUSTOM_RUN_DIR", &dir)
+            .status()
+            .unwrap();
+        assert!(contended_status.success());
+
+        drop(net_guard);
+        drop(maint_guard);
+
+        // 2. Release locks and verify child acquires both env-overridden locks cleanly.
+        let uncontended_status = Command::new(&exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env("MIRO_EGO_TEST_LOCK_SUBPROCESS", "uncontended")
+            .env(MAINTENANCE_LOCK_ENV, &maint_override)
+            .env(NETWORK_OPERATION_LOCK_ENV, &net_override)
+            .env("MIRO_EGO_TEST_CUSTOM_RUN_DIR", &dir)
+            .status()
+            .unwrap();
+        assert!(uncontended_status.success());
+
         fs::remove_dir_all(dir).unwrap();
     }
 }

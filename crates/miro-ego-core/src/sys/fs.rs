@@ -168,6 +168,30 @@ pub fn is_exfat_or_msdos(fd: libc::c_int) -> io::Result<bool> {
     }
 }
 
+/// Check whether `fd` resides strictly on a native Linux exFAT filesystem
+/// (`EXFAT_SUPER_MAGIC = 0x2011BAB0`), rejecting FAT12/16/32 (`MSDOS_SUPER_MAGIC`)
+/// and generic FUSE mounts.
+pub fn is_exfat_only(fd: RawFd) -> io::Result<bool> {
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    loop {
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `buf` points to writable `libc::statfs` storage.
+        if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } == 0 {
+            // SAFETY: kernel initialized `buf` on 0 return.
+            let buf = unsafe { buf.assume_init() };
+            #[allow(clippy::unnecessary_cast)]
+            let f_type = buf.f_type as i64;
+            return Ok(f_type == EXFAT_SUPER_MAGIC);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 pub fn renameat2_noreplace(old_path: &CStr, new_path: &CStr) -> io::Result<()> {
     loop {
         // SAFETY: `old_path` and `new_path` are NUL-terminated C strings.
@@ -557,9 +581,6 @@ pub fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> 
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL byte"))?;
 
     let dir = open_directory_safe(parent)?;
-    let expected = fstatat_nofollow(dir.as_raw_fd(), &name_c)?;
-    validate_bounded_regular_stat(&expected, max_bytes)?;
-
     let mut file = openat_retry(
         dir.as_raw_fd(),
         &name_c,
@@ -567,12 +588,6 @@ pub fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> 
     )?;
     let opened = fstat(file.as_raw_fd())?;
     validate_bounded_regular_stat(&opened, max_bytes)?;
-    if opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file changed before read",
-        ));
-    }
 
     let limit = max_bytes
         .checked_add(1)
@@ -599,6 +614,7 @@ pub fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> 
         || after.st_size != opened.st_size
         || after.st_mtime != opened.st_mtime
         || after.st_mtime_nsec != opened.st_mtime_nsec
+        || payload.len() as u64 != opened.st_size as u64
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -980,10 +996,21 @@ mod tests {
         // Reject excessive depth
         assert!(read_bounded_json_value(&target, 1024, 1).is_err());
 
-        // Reject symlink and hardlink
+        // Reject symlink, hardlink, and directory
         let sym_path = root.join("sym.json");
         symlink(&target, &sym_path).unwrap();
         assert!(read_bounded_bytes(&sym_path, 1024).is_err());
+
+        let sub_dir = root.join("nested_dir");
+        fs::create_dir(&sub_dir).unwrap();
+        assert!(read_bounded_bytes(&sub_dir, 1024).is_err());
+
+        let dir_fd = open_directory_safe(&sub_dir).unwrap();
+        assert!(!is_exfat_only(dir_fd.as_raw_fd()).unwrap());
+        assert_eq!(
+            is_exfat_only(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
 
         let hard_path = root.join("hard.json");
         fs::hard_link(&target, &hard_path).unwrap();

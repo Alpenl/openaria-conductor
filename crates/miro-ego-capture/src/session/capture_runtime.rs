@@ -242,8 +242,26 @@ impl Runtime {
                 "capture runtime worker mutex is poisoned",
             )
         })?;
-        if worker.is_some() {
-            return Ok(());
+        if let Some(existing) = worker.as_ref() {
+            let state_running = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| {
+                    RuntimeError::new(
+                        "capture_runtime_poisoned",
+                        "capture runtime state mutex is poisoned",
+                    )
+                })?
+                .running;
+            if state_running && !existing.is_finished() {
+                return Ok(());
+            }
+        }
+        if let Some(old_handle) = worker.take() {
+            self.stop.store(true, Ordering::Release);
+            let _ = self.stream.stop();
+            let _ = old_handle.join();
         }
         self.stream.start()?;
         self.stop.store(false, Ordering::Release);
@@ -260,6 +278,8 @@ impl Runtime {
             state.running = true;
             state.terminal_error = None;
             state.last_preview_error = None;
+            state.recording = None;
+            state.fanout.start_stopping();
         }
         let stream = Arc::clone(&self.stream);
         let preview = Arc::clone(&self.preview);
@@ -389,6 +409,7 @@ impl Runtime {
                             shared,
                             stop,
                             timeout: imu_timeout,
+                            stall_budget: IMU_RETRYABLE_STALL_BUDGET,
                             metrics,
                         });
                         let _ = done_tx.send(());
@@ -979,6 +1000,9 @@ fn finish_recording_frame(shared: &Shared) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+const IMU_RETRYABLE_STALL_BUDGET: Duration = Duration::from_millis(750);
+const IMU_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(2);
+
 struct ImuLoopContext {
     collector: Arc<Collector>,
     sink: Arc<Mutex<recording::RecordingSink>>,
@@ -987,6 +1011,7 @@ struct ImuLoopContext {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     timeout: Duration,
+    stall_budget: Duration,
     metrics: Option<Arc<Metrics>>,
 }
 
@@ -999,8 +1024,10 @@ fn run_imu_loop(ctx: ImuLoopContext) {
         shared,
         stop,
         timeout,
+        stall_budget,
         metrics,
     } = ctx;
+    let mut stall_deadline: Option<Instant> = None;
     loop {
         if stop.load(Ordering::Acquire) || !recording_present(&shared) {
             break;
@@ -1015,11 +1042,13 @@ fn run_imu_loop(ctx: ImuLoopContext) {
                 break;
             }
         }
+        let call_started = Instant::now();
         let read_started = start_stage(metrics.as_ref());
         let read_result = collector.read(timeout);
         finish_stage(metrics.as_ref(), "native_imu_read", read_started);
         match read_result {
             Ok(observation) => {
+                stall_deadline = None;
                 if stop.load(Ordering::Acquire) || !recording_present(&shared) {
                     break;
                 }
@@ -1047,9 +1076,25 @@ fn run_imu_loop(ctx: ImuLoopContext) {
                 }
             }
             Err(error) => {
-                if !stop.load(Ordering::Acquire) && recording_present(&shared) {
-                    report_recording_failure(&shared, error.into(), Some(Arc::clone(&on_failure)));
+                if stop.load(Ordering::Acquire) || !recording_present(&shared) {
+                    break;
                 }
+                if error.retryable && !stall_budget.is_zero() {
+                    let now = Instant::now();
+                    let deadline = *stall_deadline.get_or_insert_with(|| now + stall_budget);
+                    if now < deadline {
+                        let read_elapsed = call_started.elapsed();
+                        if read_elapsed < IMU_RETRY_MIN_BACKOFF {
+                            let sleep_for = (IMU_RETRY_MIN_BACKOFF - read_elapsed)
+                                .min(deadline.saturating_duration_since(Instant::now()));
+                            if !sleep_for.is_zero() {
+                                thread::sleep(sleep_for);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                report_recording_failure(&shared, error.into(), Some(Arc::clone(&on_failure)));
                 break;
             }
         }
@@ -1250,6 +1295,23 @@ mod tests {
 
     fn test_recording(root: &std::path::Path, sink_cb: Arc<TestFailureSink>) -> SplitSinkRecording {
         fs::create_dir_all(root.join("video")).unwrap();
+        let mut encoder = stereo_encoder::EncoderProcess::with_transport(
+            stereo_encoder::EncoderConfig {
+                out_dir: &root.join("video"),
+                executable: std::path::Path::new("/bin/cat"),
+                width: 3840,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 8192,
+                segment_frames: 3,
+                path_prefix: "video/",
+            },
+            stereo_encoder::EncoderTransport::StdinPipe,
+        )
+        .unwrap();
+        encoder
+            .configure(&["--intra-period".to_owned(), "3".to_owned()])
+            .unwrap();
         SplitSinkRecording {
             active_take: Arc::new(Mutex::new(
                 active_take::ActiveTakeWriter::new("session").unwrap(),
@@ -1257,22 +1319,7 @@ mod tests {
             sink: Arc::new(Mutex::new(
                 recording::RecordingSink::create(root, "session").unwrap(),
             )),
-            encoder: Arc::new(Mutex::new(
-                stereo_encoder::EncoderProcess::with_transport(
-                    stereo_encoder::EncoderConfig {
-                        out_dir: &root.join("video"),
-                        executable: std::path::Path::new("/bin/cat"),
-                        width: 3840,
-                        height: 1080,
-                        fps: 60,
-                        bitrate_kbps: 8192,
-                        segment_frames: 3,
-                        path_prefix: "video/",
-                    },
-                    stereo_encoder::EncoderTransport::StdinPipe,
-                )
-                .unwrap(),
-            )),
+            encoder: Arc::new(Mutex::new(encoder)),
             segment_planner: Arc::new(Mutex::new(
                 recording::RecordingSegmentPlanner::new(3).unwrap(),
             )),
@@ -1337,6 +1384,9 @@ mod tests {
                 stereo_encoder::EncoderTransport::StdinPipe,
             )
             .unwrap();
+            encoder
+                .configure(&["--intra-period".to_owned(), "3".to_owned()])
+                .unwrap();
             encoder.start().unwrap();
             target.encoder = Arc::new(Mutex::new(encoder));
             let active_take = Arc::clone(&target.active_take);
@@ -1454,6 +1504,9 @@ mod tests {
                 stereo_encoder::EncoderTransport::StdinPipe,
             )
             .unwrap();
+            encoder
+                .configure(&["--intra-period".to_owned(), "3".to_owned()])
+                .unwrap();
             encoder.start().unwrap();
             target.encoder = Arc::new(Mutex::new(encoder));
             target.recording_start_monotonic_ns = 1_000_000;
@@ -1757,6 +1810,9 @@ mod tests {
             stereo_encoder::EncoderTransport::StdinPipe,
         )
         .unwrap();
+        encoder
+            .configure(&["--intra-period".to_owned(), "3".to_owned()])
+            .unwrap();
         encoder.start().unwrap();
         target.encoder = Arc::new(Mutex::new(encoder));
         let runtime = Runtime::new(
@@ -1836,5 +1892,209 @@ mod tests {
             1
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_preview_reaps_exited_worker_after_terminal_error_and_recovers() {
+        let root = temp_root("preview-recovery");
+        let stream = Arc::new(Stream::test_fake(false, 4));
+        let runtime = Runtime::new(
+            Arc::clone(&stream),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(20),
+            None,
+        )
+        .unwrap();
+
+        runtime.start_preview().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.snapshot().unwrap().running {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for fake stream read timeout to trigger terminal_error"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let crashed_snap = runtime.snapshot().unwrap();
+        assert!(!crashed_snap.running);
+        assert_eq!(
+            crashed_snap.terminal_error.as_ref().unwrap().code,
+            "frame_timeout"
+        );
+        assert!(runtime.worker.lock().unwrap().is_some());
+
+        // Calling start_preview() must reap the dead worker, restart stream, and clear terminal_error.
+        runtime.start_preview().unwrap();
+        let recovered_snap = runtime.snapshot().unwrap();
+        assert!(recovered_snap.running);
+        assert!(recovered_snap.terminal_error.is_none());
+
+        // Recording can now start on the recovered runtime before the next read timeout fires.
+        let rec = test_recording(&root, Arc::new(TestFailureSink::default()));
+        let rec_snap = runtime
+            .start_recording(RecordingTarget {
+                active_take: Arc::clone(&rec.active_take),
+                sink: Arc::clone(&rec.sink),
+                encoder: Arc::clone(&rec.encoder),
+                segment_planner: Arc::clone(&rec.segment_planner),
+                recording_start_monotonic_ns: 1,
+                on_failure: Arc::clone(&rec.on_failure),
+                imu: None,
+                imu_timeout: Duration::from_millis(10),
+                audio: None,
+                capture_stopped_monotonic_ns: Arc::clone(&rec.capture_stopped_monotonic_ns),
+                recover_source_gaps: false,
+            })
+            .unwrap();
+        assert!(rec_snap.recording_active);
+        let _ = runtime.stop_recording(Duration::from_secs(1));
+        runtime.close(Duration::from_secs(1)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_imu_loop_tolerates_transient_retryable_errors_and_fails_on_fatal_or_exhausted_budget() {
+        // 1. Transient retryable error (disconnected on non-UVC pipe fd) within stall budget
+        //    must NOT immediately fail the recording while stop arrives shortly after.
+        let root = temp_root("imu-retry-ok");
+        let callbacks = Arc::new(TestFailureSink::default());
+        let target = test_recording(&root, Arc::clone(&callbacks));
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(target));
+        }
+
+        let mut pipe_fds = [-1_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(pipe_fds[1]) };
+        let collector = Arc::new(Collector::test_with_fd(Some(pipe_fds[0])));
+        let sink = Arc::clone(
+            &runtime
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .recording
+                .as_ref()
+                .unwrap()
+                .sink,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_trigger = Arc::clone(&stop);
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            stop_trigger.store(true, Ordering::Release);
+        });
+        run_imu_loop(ImuLoopContext {
+            collector,
+            sink,
+            on_failure: Arc::clone(&callbacks) as Arc<dyn FailureSink>,
+            audio: None,
+            shared: Arc::clone(&runtime.shared),
+            stop,
+            timeout: Duration::from_millis(5),
+            stall_budget: Duration::from_millis(500),
+            metrics: None,
+        });
+        stopper.join().unwrap();
+        assert!(
+            callbacks.calls.lock().unwrap().is_empty(),
+            "transient retryable IMU errors within stall budget must not abort recording"
+        );
+        assert!(runtime.snapshot().unwrap().recording_present);
+        let _ = runtime.stop_recording(Duration::from_secs(1));
+        let _ = fs::remove_dir_all(root);
+
+        // 2. Continuous retryable errors exceeding stall_budget DO fail the take.
+        let root_exhaust = temp_root("imu-retry-exhaust");
+        let exhaust_cb = Arc::new(TestFailureSink::default());
+        let exhaust_target = test_recording(&root_exhaust, Arc::clone(&exhaust_cb));
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(exhaust_target));
+        }
+        let mut pipe_fds2 = [-1_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds2.as_mut_ptr()) }, 0);
+        unsafe { libc::close(pipe_fds2[1]) };
+        let collector2 = Arc::new(Collector::test_with_fd(Some(pipe_fds2[0])));
+        let sink2 = Arc::clone(
+            &runtime
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .recording
+                .as_ref()
+                .unwrap()
+                .sink,
+        );
+        run_imu_loop(ImuLoopContext {
+            collector: collector2,
+            sink: sink2,
+            on_failure: Arc::clone(&exhaust_cb) as Arc<dyn FailureSink>,
+            audio: None,
+            shared: Arc::clone(&runtime.shared),
+            stop: Arc::new(AtomicBool::new(false)),
+            timeout: Duration::from_millis(5),
+            stall_budget: Duration::from_millis(25),
+            metrics: None,
+        });
+        let exhaust_calls = exhaust_cb.calls.lock().unwrap().clone();
+        assert_eq!(exhaust_calls.len(), 1);
+        assert_eq!(exhaust_calls[0].0, "disconnected");
+        let _ = fs::remove_dir_all(root_exhaust);
+
+        // 3. Non-retryable error (fd == None -> invalid_state) fails immediately despite large budget.
+        let root_fatal = temp_root("imu-fatal");
+        let fatal_cb = Arc::new(TestFailureSink::default());
+        let fatal_target = test_recording(&root_fatal, Arc::clone(&fatal_cb));
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(fatal_target));
+        }
+        let collector3 = Arc::new(Collector::test_with_fd(None));
+        let sink3 = Arc::clone(
+            &runtime
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .recording
+                .as_ref()
+                .unwrap()
+                .sink,
+        );
+        let started = Instant::now();
+        run_imu_loop(ImuLoopContext {
+            collector: collector3,
+            sink: sink3,
+            on_failure: Arc::clone(&fatal_cb) as Arc<dyn FailureSink>,
+            audio: None,
+            shared: Arc::clone(&runtime.shared),
+            stop: Arc::new(AtomicBool::new(false)),
+            timeout: Duration::from_millis(5),
+            stall_budget: Duration::from_secs(5),
+            metrics: None,
+        });
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let fatal_calls = fatal_cb.calls.lock().unwrap().clone();
+        assert_eq!(fatal_calls.len(), 1);
+        assert_eq!(fatal_calls[0].0, "invalid_state");
+        let _ = fs::remove_dir_all(root_fatal);
     }
 }

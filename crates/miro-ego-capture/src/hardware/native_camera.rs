@@ -581,6 +581,12 @@ impl Stream {
             terminal_error: Arc::new(Mutex::new(None)),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fake(fail_start: bool, queue_capacity: usize) -> Self {
+        let capture = Capture::test_fake(fail_start).unwrap();
+        Self::from_parts(capture, None, 3840, 1080, queue_capacity).unwrap()
+    }
 }
 
 impl Drop for Stream {

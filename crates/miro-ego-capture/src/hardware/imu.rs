@@ -42,6 +42,8 @@ pub struct ImuError {
 }
 
 impl ImuError {
+    pub const XU_NOT_FOUND_CODE: &'static str = "xu_not_found";
+
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -60,6 +62,18 @@ impl ImuError {
 
     fn io(code: &'static str, context: &str, error: io::Error) -> Self {
         Self::new(code, format!("{context}: {error}"))
+    }
+
+    /// Returns `true` when UVC Extension Unit discovery found USB descriptors
+    /// for the video device, but the Miro-Ego IMU XU GUID was absent.
+    pub fn is_xu_not_found(&self) -> bool {
+        self.code == Self::XU_NOT_FOUND_CODE
+    }
+
+    /// Returns `true` when the camera lacks the Miro-Ego IMU XU or USB sysfs
+    /// descriptors (e.g. non-IMU UVC webcam or virtual/CSI V4L2 device).
+    pub fn is_xu_unavailable(&self) -> bool {
+        matches!(self.code, "xu_not_found" | "xu_discovery_unavailable")
     }
 }
 
@@ -246,6 +260,25 @@ impl Collector {
             .lock()
             .map(|latest| latest.clone())
             .map_err(|_| ImuError::new("native_imu_poisoned", "IMU mutex is poisoned"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_fd(fd: Option<RawFd>) -> Self {
+        Self {
+            io: Mutex::new(IoState {
+                fd,
+                unit: KNOWN_IMU_UNIT,
+                selector: KNOWN_IMU_SELECTOR,
+                stale_poll_interval: Duration::from_millis(1),
+                last_payload: None,
+                unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
+                synchronizer: TimeSynchronizer::default(),
+                packet_sequence: 0,
+                sample_sequence: 0,
+            }),
+            latest_observation: Mutex::new(None),
+            stop: AtomicBool::new(false),
+        }
     }
 }
 
@@ -956,6 +989,8 @@ mod tests {
         extension.extend_from_slice(&XU_GUID_BYTES);
         extension.extend_from_slice(&[0, 0, 0, 0]);
         let mut descriptors = vec![4, 4, 0, 0];
+        assert!(find_uvc_xu_unit(&descriptors).unwrap_err().is_xu_not_found());
+        assert!(find_uvc_xu_unit(&descriptors).unwrap_err().is_xu_unavailable());
         descriptors.extend_from_slice(&extension);
         assert_eq!(find_uvc_xu_unit(&descriptors).unwrap(), 7);
     }
