@@ -653,6 +653,7 @@ class DeviceProvider:
         self.live_imu: object | None = None
         self.manifest_representation: object | None = None
         self.list_error: ProviderError | None = None
+        self.last_include_recovery = False
         self.stop_status = 204
         self.device_schema_override: str | None = None
         self.device_extra: dict[str, object] = {}
@@ -782,10 +783,12 @@ class DeviceProvider:
         limit: int,
         take_id: str | None,
         api_version: str,
+        include_recovery: bool = False,
     ) -> dict[str, object]:
         self.last_list_query = (cursor, limit, take_id)
         if self.list_error is not None:
             raise self.list_error
+        self.last_include_recovery = include_recovery
         return deepcopy(SESSION_LIST_V4 if api_version == "v4" else SESSION_LIST)
 
     def open_manifest(self, session_id: str, api_version: str) -> MemoryRepresentation:

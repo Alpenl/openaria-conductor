@@ -16,10 +16,16 @@ import urllib.request
 from pathlib import Path
 
 GIB = 1024**3
+SYSTEM_GIB = 20
 PACKAGE = "exfatprogs_1.1.3-1ubuntu0.1_arm64.deb"
 PACKAGE_URL = "https://ports.ubuntu.com/pool/universe/e/exfatprogs/" + PACKAGE
 PACKAGE_SHA256 = "5a9d0deec1f2b418de4a726ec1b8a9d19cb23880fe5fedc33b41d4e500b72f4e"
 MAX_PACKAGE_BYTES = 16 * 1024**2
+
+
+LOGROTATE = "logrotate_3.19.0-1ubuntu1.1_arm64.deb"
+LOGROTATE_SHA256 = "bd11fab1ae9c442f188fa06abfbc400365babbe1778afa53dd922968d31da106"
+LOGROTATE_URL = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/logrotate/logrotate_3.19.0-1ubuntu1.1_arm64.deb"
 
 
 def partitions(mbr):
@@ -28,13 +34,13 @@ def partitions(mbr):
     return [(mbr[450 + i * 16], *struct.unpack_from("<II", mbr, 454 + i * 16)) for i in range(4)]
 
 
-def plan(mbr, card_bytes, system_gib=16):
+def plan(mbr, card_bytes, system_gib=SYSTEM_GIB):
     entries = partitions(mbr)
     if entries != [(0xC, 8192, 524288), (0x83, 532480, 19767296), (0, 0, 0), (0, 0, 0)]:
         raise RuntimeError("exFAT layout requires the pinned official RDK OS 3.5.0 image")
-    if type(system_gib) is not int or not 16 <= system_gib <= 64:
-        raise RuntimeError("System partition must be 16–64 GiB")
-    if type(card_bytes) is not int or not 20 * GIB <= card_bytes <= 512 * GIB:
+    if type(system_gib) is not int or system_gib != SYSTEM_GIB:
+        raise RuntimeError("System partition must be exactly 20 GiB")
+    if type(card_bytes) is not int or not 20 * GIB <= card_bytes <= 512 * GIB or card_bytes % 512:
         raise RuntimeError("exFAT layout requires the actual card size (20–512 GiB)")
     root_start = entries[1][1]
     root_sectors = system_gib * GIB // 512
@@ -75,7 +81,7 @@ def check_fit(image, card_bytes):
         raise RuntimeError("Partition layout exceeds target card capacity")
 
 
-def _download_package(urls: list[str]) -> bytes:
+def _download_package(urls: list[str], *, package_name: str = PACKAGE) -> bytes:
     errors: list[str] = []
     for url in urls:
         try:
@@ -88,33 +94,45 @@ def _download_package(urls: list[str]) -> bytes:
                         break
                     total += len(chunk)
                     if total > MAX_PACKAGE_BYTES:
-                        raise RuntimeError("Offline exFAT package exceeds size limit")
+                        raise RuntimeError("Offline package exceeds size limit")
                     chunks.append(chunk)
                 return b"".join(chunks)
         except (urllib.error.URLError, OSError, RuntimeError) as exc:
             errors.append(f"{url}: {exc}")
-            print(f"Warning: failed to download {PACKAGE} from {url}: {exc}", file=sys.stderr)
+            print(f"Warning: failed to download {package_name} from {url}: {exc}", file=sys.stderr)
+    hint = " override via OPENARIA_EXFATPROGS_URL or" if package_name == PACKAGE else ""
     raise RuntimeError(
-        f"Failed to download {PACKAGE}; override via OPENARIA_EXFATPROGS_URL or place the "
+        f"Failed to download {package_name};{hint} place the "
         f"verified .deb in tools directory ({'; '.join(errors)})"
     )
 
 
-def prepare_tools(directory, *, package_url: str | None = None):
+def prepare_tools(
+    directory,
+    name=PACKAGE,
+    url=PACKAGE_URL,
+    digest=PACKAGE_SHA256,
+    *,
+    package_url: str | None = None,
+):
     """Host-side download only; first boot never requires a network connection."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    output = directory / PACKAGE
+    output = directory / name
     if not output.exists():
-        configured = package_url or os.environ.get("OPENARIA_EXFATPROGS_URL", "").strip()
-        fallback = os.environ.get("OPENARIA_EXFATPROGS_FALLBACK_URL", "").strip()
-        candidates = [url for url in (configured, PACKAGE_URL, fallback) if url]
+        if name == PACKAGE:
+            configured = package_url or os.environ.get("OPENARIA_EXFATPROGS_URL", "").strip()
+            fallback = os.environ.get("OPENARIA_EXFATPROGS_FALLBACK_URL", "").strip()
+            candidates = [candidate for candidate in (configured, url, fallback) if candidate]
+        else:
+            configured = package_url or url
+            candidates = [candidate for candidate in (configured, url) if candidate]
         urls = list(dict.fromkeys(candidates))
         temporary = output.with_suffix(".partial")
         try:
-            raw = _download_package(urls)
-            if hashlib.sha256(raw).hexdigest() != PACKAGE_SHA256:
-                raise RuntimeError("Offline exFAT package digest mismatch")
+            raw = _download_package(urls, package_name=name)
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise RuntimeError("Offline package digest mismatch")
             with temporary.open("xb") as dst:
                 dst.write(raw)
                 dst.flush()
@@ -122,6 +140,6 @@ def prepare_tools(directory, *, package_url: str | None = None):
             os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
-    if hashlib.sha256(output.read_bytes()).hexdigest() != PACKAGE_SHA256:
-        raise RuntimeError("Offline exFAT package digest mismatch")
+    if hashlib.sha256(output.read_bytes()).hexdigest() != digest:
+        raise RuntimeError("Offline package digest mismatch")
     return output

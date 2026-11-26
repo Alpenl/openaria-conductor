@@ -129,6 +129,7 @@ class DeviceProvider(Protocol):
         limit: int,
         take_id: str | None,
         api_version: str,
+        include_recovery: bool = False,
     ) -> Mapping[str, object]: ...
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedRepresentation: ...

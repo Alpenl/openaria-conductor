@@ -51,6 +51,15 @@ CUSTOMER_TLS_CERTIFICATE_RELATIVE = Path("tls/device.crt")
 CUSTOMER_TLS_PRIVATE_KEY_RELATIVE = Path("tls/device.key")
 DEVICE_CONFIG_SNAPSHOT_DIRECTORY = ".release-configs"
 DEPLOYMENT_ASSETS: Mapping[str, tuple[str, int]] = {
+    "openaria-journal.conf": ("etc/systemd/journald.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-logrotate.conf": ("etc/logrotate.d/00-openaria-defaults", 0o644),
+    "openaria-logrotate-timer.conf": (
+        "etc/systemd/system/logrotate.timer.d/60-openaria-space.conf",
+        0o644,
+    ),
+    "openaria-core-limits.conf": ("etc/systemd/system.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-coredump.conf": ("etc/systemd/coredump.conf.d/60-openaria-space.conf", 0o644),
+    "openaria-apt-cache.conf": ("etc/apt/apt.conf.d/99openaria-cache", 0o644),
     "rp-ylx-idle-fstrim": ("usr/local/sbin/rp-ylx-idle-fstrim", 0o755),
     "openaria-idle-fstrim.conf": (
         "etc/systemd/system/fstrim.service.d/50-openaria-idle.conf",

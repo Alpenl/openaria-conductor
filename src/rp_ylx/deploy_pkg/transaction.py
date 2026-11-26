@@ -961,6 +961,18 @@ class ReleaseManager:
             bundle = load_bundle(bundle_path)
             release_dir = self._prepare_release(bundle)
             self._require_state_compatible_release(bundle.commit)
+            if self.executable_finder("logrotate") is None:
+                # Older boot media and updaters do not provision this dependency.
+                name = "logrotate_3.19.0-1ubuntu1.1_arm64.deb"
+                package = release_dir / "site-packages/rp_ylx/deploy" / name
+                if (
+                    package.is_symlink()
+                    or not package.is_file()
+                    or _sha256(package)
+                    != "bd11fab1ae9c442f188fa06abfbc400365babbe1778afa53dd922968d31da106"
+                ):
+                    raise DeploymentError("runtime_dependency_missing", "离线日志轮换工具校验失败")
+                self.runner(["dpkg", "-i", str(package)])
             current = self._link_target("current")
             old_current = current
             quiesced = old_current is not None and (activate or old_current != bundle.commit)

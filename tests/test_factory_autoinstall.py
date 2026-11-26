@@ -298,7 +298,9 @@ class AutoinstallTests(unittest.TestCase):
                 tar.addfile(member, io.BytesIO(wheel_bytes.getvalue()))
             package = root / partition_layout.PACKAGE
             package.write_bytes(b"verified-package-fixture")
-            with patch.object(partition_layout, "prepare_tools", return_value=package):
+            logrotate = root / partition_layout.LOGROTATE
+            logrotate.write_bytes(b"logrotate-package-fixture")
+            with patch.object(partition_layout, "prepare_tools", side_effect=[package, logrotate]):
                 receipt = provision.compose(
                     base,
                     original,
@@ -315,6 +317,9 @@ class AutoinstallTests(unittest.TestCase):
                 manifest = json.loads(fs.readbytes("/openaria/manifest.json"))
                 self.assertEqual(manifest["storage"], receipt["storage"])
                 self.assertEqual(fs.readbytes("/openaria/" + package.name), package.read_bytes())
+                self.assertEqual(
+                    fs.readbytes("/openaria/" + logrotate.name), logrotate.read_bytes()
+                )
                 self.assertTrue(fs.exists("/openaria/storage_firstboot.py"))
             with output.open("rb") as src:
                 self.assertEqual(partition_layout.partitions(src.read(512))[2][0], 7)

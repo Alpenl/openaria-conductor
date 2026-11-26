@@ -2652,6 +2652,7 @@ class CaptureCoordinator:
         limit: int,
         take_id: str | None,
         api_version: str = "v3",
+        include_recovery: bool = False,
     ) -> Mapping[str, object]:
         try:
             self._check_generation(force=True)
@@ -2662,13 +2663,15 @@ class CaptureCoordinator:
                 status=HTTPStatus.CONFLICT,
                 retryable=True,
             ) from error
-        self._require_admission()
+        admission = self._require_admission()
         self._catalog_sessions()
         return self._catalog.list_sessions_page(
             cursor=cursor,
             limit=limit,
             take_id=take_id,
             api_version=api_version,
+            include_recovery=include_recovery,
+            volume_id=admission.volume_id,
         )
 
     def latest_preview(self, *, fps: int | None, accept: str) -> PreviewResponse:

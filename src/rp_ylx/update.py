@@ -792,30 +792,154 @@ def fetch_bundle(manifest: dict, cache: Path) -> Path:
     return target
 
 
-def extract_bundle(archive: Path, target: Path) -> None:
+def require_free(path: Path, required: int, reserve: int = 512 * 1024**2) -> None:
+    if shutil.disk_usage(path).free < required + reserve:
+        raise ValueError(f"{path} 空间不足，需 {required} 字节并保留 {reserve} 字节")
+
+
+def prune_update_cache(cache: Path, keep: str | None, active_stage: Path) -> None:
+    # The caller holds the cache lock. Only our private cache is swept.
+    for path in cache.iterdir():
+        if path == active_stage or path.name == keep or path.is_symlink():
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}\.tar\.gz", path.name) and path.is_file():
+            path.unlink()
+        elif re.fullmatch(r"\.(stage|download)-[a-z0-9_]{8}", path.name) and path.is_dir():
+            shutil.rmtree(path)
+
+
+@contextmanager
+def recording_scratch():
+    # Pin the directory before checking the mount identity. A detach cannot
+    # redirect openat through /data into the underlying root filesystem.
+    fd = os.open("/data", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if not require_configured_exfat_volume(data_fd=fd):
+            raise ValueError("录像分区配置已变化")
+        if os.fstatvfs(fd).f_flag & os.ST_RDONLY:
+            raise ValueError("录像分区只读")
+        yield Path(f"/proc/self/fd/{fd}")
+    finally:
+        os.close(fd)
+
+
+def unpack_for_install(manifest: dict, cache: Path, bundle: Path) -> None:
+    descriptor = manifest["bundle"]
+    if require_configured_exfat_volume():
+        with recording_scratch() as medium:
+            reserve = 2 * 1024**3
+            if os.path.lexists(CONFIG):
+                config_data = _loads_strict_json(
+                    _read_bounded_regular_file(
+                        CONFIG,
+                        max_bytes=128 * 1024,
+                        error_message="设备配置文件无效",
+                        forbidden_mode=0o022,
+                    )
+                )
+                if not isinstance(config_data, dict):
+                    raise ValueError("设备配置文件无效")
+                storage = config_data.get("storage")
+                if isinstance(storage, dict):
+                    min_available = storage.get("minimum_available_bytes", 0)
+                    if isinstance(min_available, int) and not isinstance(min_available, bool):
+                        reserve = max(reserve, min_available)
+            require_free(medium, descriptor["bytes"], reserve)
+            with tempfile.TemporaryFile(dir=medium) as scratch:
+                archive = Path(f"/proc/self/fd/{scratch.fileno()}")
+                download(descriptor["url"], archive, descriptor["bytes"])
+                extract_bundle(archive, bundle, descriptor=descriptor)
+    else:
+        target = cache / (descriptor["sha256"] + ".tar.gz")
+        if (
+            not target.exists()
+            or target.stat().st_size != descriptor["bytes"]
+            or sha256(target) != descriptor["sha256"]
+        ):
+            require_free(cache, descriptor["bytes"])
+        archive = fetch_bundle(manifest, cache)
+        extract_bundle(archive, bundle)
+        archive.unlink()
+
+
+def require_install_space(bundle: Path) -> None:
+    # The launcher expands Python in the private staging directory, then the
+    # deployer expands it again in the new release beside current/previous.
+    metadata = _loads_strict_json(
+        _read_bounded_regular_file(
+            bundle / "bundle.json",
+            max_bytes=128 * 1024,
+            error_message="bundle.json 无效或过大",
+        )
+    )
+    if not isinstance(metadata, dict):
+        raise ValueError("bundle.json 格式无效")
+    with tarfile.open(bundle / metadata["runtime"]["file"], "r:gz") as stream:
+        runtime_bytes = sum(member.size for member in stream)
+    wheel_bytes = 0
+    for item in metadata["wheels"]:
+        with zipfile.ZipFile(bundle / item["file"]) as wheel:
+            wheel_bytes += sum(entry.file_size for entry in wheel.infolist())
+    release_fs = CURRENT.parent if CURRENT.parent.exists() else Path("/opt")
+    if bundle.stat().st_dev == release_fs.stat().st_dev:
+        require_free(bundle, 2 * runtime_bytes + wheel_bytes)
+    else:
+        require_free(bundle, runtime_bytes)
+        require_free(release_fs, runtime_bytes + wheel_bytes)
+
+
+def extract_bundle(archive: Path, target: Path, *, descriptor: dict | None = None) -> None:
     """Release archives are deliberately flat: only regular bundle files."""
-    with tarfile.open(archive, "r:gz") as stream:
-        seen = set()
-        total = 0
-        for member in stream:
-            name = member.name
-            total += member.size
-            if (
-                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+\-]*", name)
-                or not member.isfile()
-                or member.issparse()
-                or name in seen
-                or len(seen) >= 256
-                or total > MAX_UNPACKED
-            ):
-                raise ValueError("固件归档含非法路径、特殊文件或超过上限")
-            seen.add(name)
-            source = stream.extractfile(member)
-            if source is None:
-                raise ValueError("固件归档文件不可读")
-            with source, (target / name).open("xb") as out:
-                shutil.copyfileobj(source, out, length=1024 * 1024)
-            (target / name).chmod(0o644)
+    # For removable media, authenticate exactly the bytes supplied to the
+    # extractor. A separate pathname hash can race a change on the volume.
+    with archive.open("rb") as raw:
+        digest = hashlib.sha256()
+        count = 0
+
+        class Reader:
+            def read(self, size):
+                nonlocal count
+                block = raw.read(size)
+                if descriptor is not None:
+                    count += len(block)
+                    if count > descriptor["bytes"]:
+                        raise ValueError("固件超过发布清单大小")
+                    digest.update(block)
+                return block
+
+        reader = Reader()
+        with tarfile.open(fileobj=reader, mode="r|gz") as stream:
+            _extract_members(stream, target)
+        if descriptor is not None:
+            while reader.read(1024 * 1024):
+                pass
+            if count != descriptor["bytes"] or digest.hexdigest() != descriptor["sha256"]:
+                raise ValueError("录像盘暂存的固件校验失败")
+
+
+def _extract_members(stream, target: Path) -> None:
+    seen = set()
+    total = 0
+    for member in stream:
+        name = member.name
+        total += member.size
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+\-]*", name)
+            or not member.isfile()
+            or member.issparse()
+            or name in seen
+            or len(seen) >= 256
+            or total > MAX_UNPACKED
+        ):
+            raise ValueError("固件归档含非法路径、特殊文件或超过上限")
+        seen.add(name)
+        source = stream.extractfile(member)
+        if source is None:
+            raise ValueError("固件归档文件不可读")
+        require_free(target, member.size)
+        with source, (target / name).open("xb") as out:
+            shutil.copyfileobj(source, out, length=1024 * 1024)
+        (target / name).chmod(0o644)
 
 
 def verify_bundle(root: Path, manifest: dict) -> None:
@@ -992,7 +1116,7 @@ def data_volume_size(free_bytes: int) -> int:
     return size
 
 
-def require_configured_exfat_volume() -> bool:
+def require_configured_exfat_volume(*, data_fd: int | None = None) -> bool:
     values = _parse_data_volume_config()
     mode = values.get("RP_YLX_DATA_VOLUME_MODE", "loop")
     if mode != "exfat":
@@ -1035,6 +1159,8 @@ def require_configured_exfat_volume() -> bool:
         or Path(filesystems[0].get("source", "")).resolve() != device.resolve()
     ):
         raise ValueError("/data挂载的不是配置的录像分区")
+    if data_fd is not None and os.fstat(data_fd).st_dev != device.stat().st_rdev:
+        raise ValueError("录像分区挂载已变化")
     return True
 
 
@@ -1205,6 +1331,8 @@ def main(argv=None) -> int:
                 print(json.dumps({**result, "update_available": current != manifest["commit"]}))
                 return 0
             updater = fetch_updater(manifest, directory)
+            if args.cache_dir is None:
+                prune_update_cache(cache, manifest["bundle"]["sha256"] + ".tar.gz", directory)
             if current == manifest["commit"] and not (args.reinstall or args.download_only):
                 fw_path = CURRENT / "site-packages" / "rp_ylx" / "firmware_control.py"
                 install_update_command(
@@ -1213,17 +1341,19 @@ def main(argv=None) -> int:
                 )
                 print(json.dumps({**result, "changed": False}))
                 return 0
-            archive = fetch_bundle(manifest, cache)
             bundle = directory / "bundle"
             bundle.mkdir()
-            extract_bundle(archive, bundle)
-            verify_bundle(bundle, manifest)
-            prune_bundle_cache(cache, keep=2, preserve=archive)
             if args.download_only:
+                archive = fetch_bundle(manifest, cache)
+                extract_bundle(archive, bundle)
+                verify_bundle(bundle, manifest)
                 print(json.dumps({**result, "archive": str(archive), "verified": True}))
                 return 0
             require_idle()
+            unpack_for_install(manifest, cache, bundle)
+            verify_bundle(bundle, manifest)
             prepare_dependencies()
+            require_install_space(bundle)
             configure_data_volume()
             require_idle()
             if current is None:

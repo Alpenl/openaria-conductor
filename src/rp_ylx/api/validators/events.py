@@ -275,6 +275,7 @@ def validate_session_list(
     limit: int,
     take_id: str | None,
     api_version: str = "v3",
+    include_recovery: bool = False,
 ) -> None:
     """验证 provider 返回的闭合会话页。"""
     _validate_finite_json(resource)
@@ -314,7 +315,12 @@ def validate_session_list(
     ):
         raise InvalidSourceEvent("session list 基础字段无效")
     for item in items:
-        _validate_session_summary(item, take_id=take_id, api_version=api_version)
+        _validate_session_summary(
+            item,
+            take_id=take_id,
+            api_version=api_version,
+            include_recovery=include_recovery,
+        )
     if len({item["session_id"] for item in items}) != len(items):
         raise InvalidSourceEvent("session list 不得重复会话")
     order = [(_date_time_value(item["started_at"]), item["session_id"]) for item in items]
@@ -625,8 +631,9 @@ def _validate_session_summary(
     *,
     take_id: str | None,
     api_version: str,
+    include_recovery: bool = False,
 ) -> None:
-    if not isinstance(value, Mapping) or set(value) != {
+    expected = {
         "session_id",
         "producer_outcome",
         "take_id",
@@ -639,7 +646,15 @@ def _validate_session_summary(
         "duration_seconds",
         "total_bytes",
         "verification",
-    }:
+    }
+    if (
+        api_version == "v4"
+        and include_recovery
+        and isinstance(value, Mapping)
+        and value.get("recovered_prefix") is True
+    ):
+        expected.add("recovered_prefix")
+    if not isinstance(value, Mapping) or set(value) != expected:
         raise InvalidSourceEvent("session summary 必须是闭合对象")
     continuation = value["continuation_of"]
     display_name = value["display_name"]

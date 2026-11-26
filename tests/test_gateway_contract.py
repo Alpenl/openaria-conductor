@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "0b162d75d702b9641038b4df7686f3ff8561a577ac1d9628d6ecc3b2f3d58fd5",
-        "bytes": 152_136,
+        "sha256": "7cf35d883068327bd3f1f9e1d7a3673b99835b23854fbcad687bf9cc8b0e6028",
+        "bytes": 152_601,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -474,6 +474,7 @@ class _WireProvider:
         limit: int,
         take_id: str | None,
         api_version: str,
+        include_recovery: bool = False,
     ) -> dict[str, object]:
         del cursor, limit, take_id
         legacy = {

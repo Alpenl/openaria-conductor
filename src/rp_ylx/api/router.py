@@ -117,7 +117,7 @@ def _api_routes() -> tuple[RouteSpec, ...]:
                     "/sessions",
                     ("GET", "OPTIONS"),
                     {"GET": "listSessions"},
-                    {"GET": _GET_HEADERS},
+                    {"GET": ("Authorization", "Prefer") if version == "v4" else _GET_HEADERS},
                     lambda h, _m, v=version: sessions.list_sessions(h, v, h.query_params()),
                 ),
             )

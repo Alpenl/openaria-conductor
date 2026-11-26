@@ -330,6 +330,12 @@ class RecordingRecoveryTests(unittest.TestCase):
                     self.assertEqual(len(listed["items"]), 1)
                     session = listed["items"][0]
                     self.assertEqual(session["session_id"], recorder._plan.session_id)
+                    self.assertNotIn("recovered_prefix", session)
+                    opted_in = coordinator.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4", include_recovery=True
+                    )
+                    self.assertIs(opted_in["items"][0]["recovered_prefix"], True)
+                    self.assertIsNone(opted_in["items"][0]["verification"])
                     coordinator._catalog_sessions(verify_session=recorder._plan.session_id)
                     # Recovered data uses the ordinary artifact access contract.
                     representation = coordinator.open_manifest(recorder._plan.session_id, "v4")

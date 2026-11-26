@@ -74,11 +74,26 @@ class SessionCatalog(StateDatabase):
                 "relative_path TEXT NOT NULL, PRIMARY KEY(volume,session), "
                 "FOREIGN KEY(volume,session) REFERENCES sessions(volume,session) ON DELETE CASCADE)"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS recovered_sessions ON artifacts(volume,session) "
+                "WHERE role='log.recording-recovery'"
+            )
             for volume, session, root, relative_path in db.execute(
                 "SELECT volume, session, root, relative_path FROM session_paths"
             ):
                 self._paths[(volume, session)] = (root, relative_path)
                 self._reverse_paths[(volume, root, relative_path)] = session
+
+    def recovered_sessions(self, volume: str) -> set[str]:
+        with self.connection() as db:
+            return {
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT session FROM artifacts "
+                    "WHERE volume=? AND role='log.recording-recovery'",
+                    (volume,),
+                )
+            }
 
     def _set_path_locked(self, volume: str, session: str, entry: tuple[str, str]) -> None:
         previous = self._paths.get((volume, session))

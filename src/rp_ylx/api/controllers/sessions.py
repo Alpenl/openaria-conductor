@@ -53,18 +53,24 @@ def list_sessions(
     if take_id is not None and not valid_uuid7(take_id):
         handler._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "take_id 必须是 UUIDv7")
         return
+    preferences = ",".join(handler.headers.get_all("Prefer", failobj=[])).lower().split(",")
+    include_recovery = api_version == "v4" and any(
+        token.strip() == "include-recovery" for token in preferences
+    )
     try:
         result = handler.server.provider.list_sessions(
             cursor=cursor,
             limit=limit,
             take_id=take_id,
             api_version=api_version,
+            include_recovery=include_recovery,
         )
         validate_session_list(
             result,
             limit=limit,
             take_id=take_id,
             api_version=api_version,
+            include_recovery=include_recovery,
         )
     except InvalidSourceEvent:
         handler._invalid_source_state("daemon session list 无效")

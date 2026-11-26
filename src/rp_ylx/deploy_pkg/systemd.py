@@ -366,6 +366,9 @@ def start_release_services(
 ) -> None:
     # Independent of capture/network units: never stop this supervisor while
     # it is executing the transaction that restarts those services.
+    runner(["systemctl", "try-restart", "systemd-journald.service"])
+    runner(["systemctl", "enable", "--now", "logrotate.timer"])
+    runner(["systemctl", "restart", "logrotate.timer"])
     runner(["systemctl", "enable", "--now", "openaria-update.service"])
     for unit in CORE_SYSTEMD_UNITS:
         runner(["systemctl", "enable", "--now", unit])

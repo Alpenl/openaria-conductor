@@ -1246,9 +1246,17 @@ class CatalogService:
         limit: int,
         take_id: str | None,
         api_version: str = "v3",
+        include_recovery: bool = False,
+        volume_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._catalog_lock:
             all_items = list(self._session_summaries.values())
+            if api_version == "v4" and include_recovery and volume_id is not None:
+                recovered = self._catalog_db.recovered_sessions(volume_id)
+                all_items = [
+                    {**item, "recovered_prefix": True} if item["session_id"] in recovered else item
+                    for item in all_items
+                ]
             diagnostics = list(self._session_diagnostics.values())
             all_items.sort(
                 key=lambda item: (str(item["started_at"]), str(item["session_id"])),
