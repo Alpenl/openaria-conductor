@@ -160,6 +160,18 @@ pub trait GatewayBackend: Send + Sync + 'static {
     // --- Preview & SSE Hubs ---
     fn preview_mjpeg_hub(&self) -> Option<Arc<MjpegPreviewHub>>;
     fn preview_h264_hub(&self) -> Option<Arc<H264PreviewHub>>;
+    async fn open_preview_mjpeg(&self, _fps: Option<u32>) -> ApiResult<Arc<MjpegPreviewHub>> {
+        self.preview_mjpeg_hub()
+            .ok_or_else(|| ApiError::preview_unavailable("preview stream is unavailable"))
+    }
+    async fn open_preview_h264(
+        &self,
+        _fps: Option<u32>,
+        _bitrate_kbps: Option<u32>,
+    ) -> ApiResult<Arc<H264PreviewHub>> {
+        self.preview_h264_hub()
+            .ok_or_else(ApiError::preview_h264_unsupported)
+    }
     fn capture_event_buffer(&self) -> Arc<EventReplayBuffer>;
     fn network_event_buffer(&self) -> Arc<NetworkEventReplayBuffer>;
 
@@ -209,6 +221,7 @@ pub trait GatewayBackend: Send + Sync + 'static {
 pub struct MockSession {
     pub session_id: String,
     pub take_id: String,
+    pub primary_artifact_id: String,
     pub manifest: RawManifest,
     pub summary: Value,
     pub verified: bool,
@@ -253,7 +266,10 @@ struct MockState {
     source_revision: u64,
     network_revision: u64,
     device_state: String,
+    camera_connected: bool,
     active_session_id: Option<String>,
+    active_take_id: Option<String>,
+    active_display_name: Option<String>,
     active_generation_id: Option<String>,
     safe_swap_receipt: Option<Value>,
     timer_enabled: bool,
@@ -319,93 +335,23 @@ impl MockGatewayBackend {
         let session_id = new_uuid_v7();
         let take_id = new_uuid_v7();
         let failed_session_id = new_uuid_v7();
-        let artifact_payload =
-            Bytes::from_static(b"MIRO-EGO-SAMPLE-ARTIFACT-BYTES-0123456789abcdef");
-        let artifact_id = sha256_hex(&artifact_payload);
+        let failed_take_id = new_uuid_v7();
+        let fw_commit = "1".repeat(40);
 
-        let manifest_json = json!({
-            "schema": "miro-ego.device-session.v1",
-            "session_id": session_id,
-            "take": {
-                "take_id": take_id,
-                "sequence": 1,
-                "continuation_of": null
-            },
-            "display_name": "2026-11-26 Sample Session",
-            "device": {
-                "device_id": device_id,
-                "device_label": device_label
-            },
-            "time": {
-                "started_at": "2026-11-26T10:00:00Z",
-                "ended_at": "2026-11-26T10:00:10Z",
-                "duration_seconds": 10.0
-            },
-            "artifacts": [
-                {
-                    "artifact_id": artifact_id,
-                    "media_type": "video/mp4",
-                    "bytes": artifact_payload.len(),
-                    "sha256": artifact_id
-                }
-            ]
-        });
-        let manifest_bytes =
-            Bytes::from(serde_json::to_vec(&manifest_json).unwrap_or_else(|_| b"{}".to_vec()));
-        let manifest = RawManifest::from_bytes(manifest_bytes);
-
-        let summary = json!({
-            "session_id": session_id,
-            "producer_outcome": "sealed",
-            "take_id": take_id,
-            "take_sequence": 1,
-            "continuation_of": null,
-            "display_name": "2026-11-26 Sample Session",
-            "device": {
-                "device_id": device_id,
-                "device_label": device_label
-            },
-            "started_at": "2026-11-26T10:00:00Z",
-            "ended_at": "2026-11-26T10:00:10Z",
-            "duration_seconds": 10.0,
-            "total_bytes": artifact_payload.len(),
-            "verification": {
-                "actor": "gateway",
-                "validator": {
-                    "name": "miro-ego-gateway",
-                    "version": "0.3.0",
-                    "build_sha256": "b".repeat(64)
-                },
-                "manifest_sha256": manifest.sha256,
-                "verified_at": "2026-11-26T10:00:11Z",
-                "verdict": "usable",
-                "diagnostics": []
-            }
-        });
-
-        let mut artifacts = HashMap::new();
-        artifacts.insert(
-            artifact_id.clone(),
-            MockArtifact {
-                artifact_id: artifact_id.clone(),
-                media_type: "video/mp4".to_owned(),
-                backing: MockArtifactBacking::Memory(artifact_payload),
-            },
+        let sample_session = build_mock_session(
+            &session_id,
+            &take_id,
+            "2026-11-26 Sample Session",
+            &device_id,
+            &device_label,
+            &hardware_fingerprint,
+            &volume_id,
+            &fw_commit,
         );
+        let manifest_sha = sample_session.manifest.sha256.clone();
 
         let mut sessions = HashMap::new();
-        sessions.insert(
-            session_id.clone(),
-            MockSession {
-                session_id: session_id.clone(),
-                take_id,
-                manifest: manifest.clone(),
-                summary,
-                verified: true,
-                verification_reason: "usable".to_owned(),
-                artifacts,
-            },
-        );
+        sessions.insert(session_id.clone(), sample_session);
 
         let mut unsuccessful_outcomes = HashMap::new();
         let failed_gen_id = new_uuid_v4();
@@ -417,14 +363,18 @@ impl MockGatewayBackend {
                 "source_revision": 1,
                 "outcome": {
                     "generation_id": failed_gen_id,
-                    "recording_state": {
-                        "schema": "miro-ego.recording-state.v1",
-                        "authority_epoch": authority_epoch,
-                        "state_revision": 1,
-                        "session_id": failed_session_id,
-                        "state": "failed",
-                        "diagnostics": []
-                    }
+                    "recording_state": build_mock_recording_state(
+                        "failed",
+                        &authority_epoch,
+                        1,
+                        &failed_session_id,
+                        &failed_take_id,
+                        "2026-11-26 Failed Session",
+                        &device_id,
+                        &device_label,
+                        &volume_id,
+                        "2026-11-26T10:01:00Z",
+                    )
                 }
             }),
         );
@@ -437,7 +387,7 @@ impl MockGatewayBackend {
                 "volume_id": volume_id,
                 "generation_id": new_uuid_v4(),
                 "manifest_id": new_uuid_v7(),
-                "manifest_sha256": manifest.sha256,
+                "manifest_sha256": manifest_sha,
                 "sealed_at": "2026-11-26T10:00:10Z",
                 "released_at": "2026-11-26T10:00:12Z",
                 "release_state": "unmounted",
@@ -535,7 +485,10 @@ impl MockGatewayBackend {
                 source_revision: 1,
                 network_revision: 1,
                 device_state: "idle".to_owned(),
+                camera_connected: true,
                 active_session_id: None,
+                active_take_id: None,
+                active_display_name: None,
                 active_generation_id: None,
                 safe_swap_receipt: Some(safe_swap_receipt),
                 timer_enabled: false,
@@ -556,7 +509,7 @@ impl MockGatewayBackend {
                 network_credentials: HashMap::new(),
                 network_transactions,
                 latest_network_tx: Some(initial_tx),
-                firmware_current: ("0.3.0".to_owned(), "1".repeat(40)),
+                firmware_current: ("0.3.0".to_owned(), fw_commit),
                 firmware_previous: Some(("0.2.9".to_owned(), "2".repeat(40))),
                 firmware_available: Some(("0.3.1".to_owned(), "3".repeat(40))),
                 firmware_task: None,
@@ -594,18 +547,51 @@ impl MockGatewayBackend {
         }
     }
 
+    pub fn set_camera_connected(&self, connected: bool) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.camera_connected = connected;
+        }
+    }
+
     pub fn set_logs_dir(&self, path: PathBuf) {
         if let Ok(mut guard) = self.state.lock() {
             guard.logs_dir = Some(path);
         }
     }
 
+    pub fn insert_sample_session(
+        &self,
+        take_id: Option<String>,
+    ) -> ApiResult<(String, String, String)> {
+        let mut guard = self.lock_state()?;
+        let sid = new_uuid_v7();
+        let tid = take_id.unwrap_or_else(new_uuid_v7);
+        let sess = build_mock_session(
+            &sid,
+            &tid,
+            "2026-11-26 Additional Session",
+            &guard.device_id,
+            &guard.device_label,
+            &guard.hardware_fingerprint,
+            &guard.volume_id,
+            &guard.firmware_current.1,
+        );
+        let aid = sess.primary_artifact_id.clone();
+        let manifest_sha = sess.manifest.sha256.clone();
+        guard.sessions.insert(sid.clone(), sess);
+        guard.session_order.push(sid.clone());
+        Ok((sid, aid, manifest_sha))
+    }
+
     pub fn sample_session_and_artifact(&self) -> Option<(String, String, String)> {
         let guard = self.state.lock().ok()?;
         let sid = guard.session_order.first()?.clone();
         let sess = guard.sessions.get(&sid)?;
-        let aid = sess.artifacts.keys().next()?.clone();
-        Some((sid, aid, sess.manifest.sha256.clone()))
+        Some((
+            sid,
+            sess.primary_artifact_id.clone(),
+            sess.manifest.sha256.clone(),
+        ))
     }
 
     pub fn sample_unsuccessful_session_id(&self) -> Option<String> {
@@ -663,8 +649,303 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_mock_session(
+    session_id: &str,
+    take_id: &str,
+    display_name: &str,
+    device_id: &str,
+    device_label: &str,
+    hardware_fingerprint: &str,
+    volume_id: &str,
+    commit: &str,
+) -> MockSession {
+    let left_payload = Bytes::from(format!("MIRO-EGO-LEFT-VIDEO-MP4-{session_id}"));
+    let right_payload = Bytes::from(format!("MIRO-EGO-RIGHT-VIDEO-MP4-{session_id}"));
+    let imu_payload = Bytes::from_static(
+        b"{\"t_ns\":0,\"ax\":0,\"ay\":0,\"az\":16384,\"gx\":0,\"gy\":0,\"gz\":0}\n",
+    );
+    let frames_payload = Bytes::from_static(b"{\"frame\":0,\"t_ns\":0}\n");
+
+    let left_id = sha256_hex(&left_payload);
+    let right_id = sha256_hex(&right_payload);
+    let imu_id = sha256_hex(&imu_payload);
+    let frames_id = sha256_hex(&frames_payload);
+    let total_bytes =
+        left_payload.len() + right_payload.len() + imu_payload.len() + frames_payload.len();
+
+    let manifest_json = json!({
+        "schema": "miro-ego.device-session.v1",
+        "manifest_id": new_uuid_v7(),
+        "sealed": true,
+        "sealed_at": "2026-11-26T10:00:11Z",
+        "session_id": session_id,
+        "volume_id": volume_id,
+        "capture_mode": "production",
+        "display_name": display_name,
+        "device": {
+            "device_id": device_id,
+            "device_label": device_label,
+            "hardware_fingerprint": hardware_fingerprint,
+            "platform": "rdk-x5-ubuntu22.04-aarch64",
+            "software_version": "0.3.0",
+            "commit": commit
+        },
+        "time": {
+            "started_at": "2026-11-26T10:00:00Z",
+            "ended_at": "2026-11-26T10:00:10Z",
+            "timezone": "Etc/UTC",
+            "duration_seconds": 10.0,
+            "duration_clock": "host_monotonic"
+        },
+        "take": {
+            "take_id": take_id,
+            "sequence": 1,
+            "continuation_of": null
+        },
+        "camera": {
+            "width": 2560,
+            "height": 800,
+            "eye_width": 1280,
+            "sensor_fps": 30.0,
+            "frame_decimation": 1,
+            "nominal_fps": 30.0,
+            "effective_fps": 30.0,
+            "coordinate_frame": "opencv_optical"
+        },
+        "video": {
+            "layout": "split-eyes",
+            "codec": "h264",
+            "container": "mp4",
+            "segments": [
+                {
+                    "index": 0,
+                    "start_frame": 0,
+                    "end_frame": 300,
+                    "start_time_seconds": 0.0,
+                    "end_time_seconds": 10.0,
+                    "artifacts": {
+                        "left": {
+                            "artifact_id": left_id,
+                            "role": "video.left",
+                            "path": "video/seg_0000_left.mp4",
+                            "media_type": "video/mp4",
+                            "bytes": left_payload.len(),
+                            "sha256": left_id
+                        },
+                        "right": {
+                            "artifact_id": right_id,
+                            "role": "video.right",
+                            "path": "video/seg_0000_right.mp4",
+                            "media_type": "video/mp4",
+                            "bytes": right_payload.len(),
+                            "sha256": right_id
+                        }
+                    }
+                }
+            ],
+            "encoding": {
+                "schema": "miro-ego.recording-encoding.v1",
+                "codec": "h264",
+                "rate_control": "cbr",
+                "profile": "high",
+                "pixel_format": "yuv420p",
+                "bit_depth": 8,
+                "b_frames": 0,
+                "bitrate_kbps": 12000,
+                "min_qp": 18,
+                "max_qp": 38,
+                "intra_qp": 24,
+                "initial_qp": 26,
+                "gop_frames": 30,
+                "vbv_ms": 1000
+            }
+        },
+        "imu": {
+            "artifact": {
+                "artifact_id": imu_id,
+                "role": "imu.samples",
+                "path": "imu/samples.ndjson",
+                "media_type": "application/x-ndjson",
+                "bytes": imu_payload.len(),
+                "sha256": imu_id
+            },
+            "sample_count": 1,
+            "units": "raw_int16",
+            "coordinate_frame": "raw_device_axes"
+        },
+        "frames": {
+            "artifact": {
+                "artifact_id": frames_id,
+                "role": "frames.index",
+                "path": "frames/index.ndjson",
+                "media_type": "application/x-ndjson",
+                "bytes": frames_payload.len(),
+                "sha256": frames_id
+            },
+            "count": 300
+        },
+        "audio": {
+            "state": "not_recorded",
+            "requested_mode": "disabled",
+            "resolved_mode": "disabled",
+            "reason": "user_disabled"
+        },
+        "logs": [],
+        "integrity": {
+            "verified_at": "2026-11-26T10:00:11Z",
+            "dropped_frames": 0,
+            "drop_events": [],
+            "fatal_errors": []
+        }
+    });
+    let manifest_bytes =
+        Bytes::from(serde_json::to_vec(&manifest_json).unwrap_or_else(|_| b"{}".to_vec()));
+    let manifest = RawManifest::from_bytes(manifest_bytes);
+
+    let summary = json!({
+        "session_id": session_id,
+        "producer_outcome": "sealed",
+        "take_id": take_id,
+        "take_sequence": 1,
+        "continuation_of": null,
+        "display_name": display_name,
+        "device": {
+            "device_id": device_id,
+            "device_label": device_label
+        },
+        "started_at": "2026-11-26T10:00:00Z",
+        "ended_at": "2026-11-26T10:00:10Z",
+        "duration_seconds": 10.0,
+        "total_bytes": total_bytes,
+        "verification": {
+            "actor": "gateway",
+            "validator": {
+                "name": "miro-ego-gateway",
+                "version": "0.3.0",
+                "build_sha256": "b".repeat(64)
+            },
+            "manifest_sha256": manifest.sha256,
+            "verified_at": "2026-11-26T10:00:11Z",
+            "verdict": "usable",
+            "diagnostics": []
+        }
+    });
+
+    let mut artifacts = HashMap::new();
+    artifacts.insert(
+        left_id.clone(),
+        MockArtifact {
+            artifact_id: left_id.clone(),
+            media_type: "video/mp4".to_owned(),
+            backing: MockArtifactBacking::Memory(left_payload),
+        },
+    );
+    artifacts.insert(
+        right_id.clone(),
+        MockArtifact {
+            artifact_id: right_id,
+            media_type: "video/mp4".to_owned(),
+            backing: MockArtifactBacking::Memory(right_payload),
+        },
+    );
+    artifacts.insert(
+        imu_id.clone(),
+        MockArtifact {
+            artifact_id: imu_id,
+            media_type: "application/x-ndjson".to_owned(),
+            backing: MockArtifactBacking::Memory(imu_payload),
+        },
+    );
+    artifacts.insert(
+        frames_id.clone(),
+        MockArtifact {
+            artifact_id: frames_id,
+            media_type: "application/x-ndjson".to_owned(),
+            backing: MockArtifactBacking::Memory(frames_payload),
+        },
+    );
+
+    MockSession {
+        session_id: session_id.to_owned(),
+        take_id: take_id.to_owned(),
+        primary_artifact_id: left_id,
+        manifest,
+        summary,
+        verified: true,
+        verification_reason: "usable".to_owned(),
+        artifacts,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_mock_recording_state(
+    state_name: &str,
+    authority_epoch: &str,
+    state_revision: u64,
+    session_id: &str,
+    take_id: &str,
+    display_name: &str,
+    device_id: &str,
+    device_label: &str,
+    volume_id: &str,
+    updated_at: &str,
+) -> Value {
+    let mut progress = json!({
+        "elapsed_seconds": 1.0,
+        "captured_frames": 30,
+        "bytes_written": 4096
+    });
+    if state_name == "verifying"
+        && let Some(obj) = progress.as_object_mut()
+    {
+        obj.insert("verification".to_owned(), json!({ "completed": 0, "total": 4 }));
+    }
+
+    let diagnostics = match state_name {
+        "failed" => json!([{
+            "code": "encoder_fault",
+            "severity": "error",
+            "message": "hardware encoder fault terminated capture session",
+            "at": updated_at,
+            "recoverable": false
+        }]),
+        "recoverable" => json!([{
+            "code": "power_interrupted",
+            "severity": "warning",
+            "message": "capture interrupted with recoverable prefix",
+            "at": updated_at,
+            "recoverable": true
+        }]),
+        _ => json!([]),
+    };
+
+    json!({
+        "schema": "miro-ego.recording-state.v1",
+        "state": state_name,
+        "authority_epoch": authority_epoch,
+        "state_revision": state_revision,
+        "updated_at": updated_at,
+        "session_id": session_id,
+        "take_id": take_id,
+        "display_name": display_name,
+        "device": {
+            "device_id": device_id,
+            "device_label": device_label
+        },
+        "storage": {
+            "volume_id": volume_id,
+            "status": "mounted",
+            "writable": true,
+            "remaining_bytes": 96_000_000_000_u64
+        },
+        "progress": progress,
+        "diagnostics": diagnostics
+    })
+}
+
 fn mock_runtime_json(state: &MockState) -> Value {
-    let focus = if state.focus_supported {
+    let focus = if state.camera_connected && state.focus_supported {
         json!({
             "schema": "miro-ego.camera-focus.v1",
             "value": state.focus_value,
@@ -706,7 +987,7 @@ fn mock_runtime_json(state: &MockState) -> Value {
         "live_imu": null,
         "camera": {
             "schema": "miro-ego.camera-connection.v1",
-            "state": "connected"
+            "state": if state.camera_connected { "connected" } else { "disconnected" }
         },
         "camera_focus": focus
     })
@@ -718,20 +999,30 @@ fn mock_capture_snapshot_data(state: &MockState) -> Value {
         "recording" | "finalizing" | "encoding" | "verifying"
     ) {
         let sid = state.active_session_id.clone().unwrap_or_else(new_uuid_v7);
+        let tid = state.active_take_id.clone().unwrap_or_else(new_uuid_v7);
+        let disp = state
+            .active_display_name
+            .as_deref()
+            .unwrap_or("Active Capture Session");
         let gen_id = state
             .active_generation_id
             .clone()
             .unwrap_or_else(new_uuid_v4);
+        let now = rfc3339_now_utc();
         json!({
             "generation_id": gen_id,
-            "recording_state": {
-                "schema": "miro-ego.recording-state.v1",
-                "authority_epoch": state.authority_epoch,
-                "state_revision": state.source_revision,
-                "session_id": sid,
-                "state": state.device_state,
-                "diagnostics": []
-            }
+            "recording_state": build_mock_recording_state(
+                &state.device_state,
+                &state.authority_epoch,
+                state.source_revision,
+                &sid,
+                &tid,
+                disp,
+                &state.device_id,
+                &state.device_label,
+                &state.volume_id,
+                &now,
+            )
         })
     } else {
         Value::Null
@@ -844,6 +1135,16 @@ fn check_idempotency(
             let mut replayed = existing.outcome.clone();
             replayed.replayed = true;
             return Ok(Some(replayed));
+        }
+        if matches!(scope, "network_apply" | "network_retry" | "network_forget") {
+            let orig_tx_id = existing
+                .outcome
+                .body
+                .as_ref()
+                .and_then(|b| b.get("transaction"))
+                .and_then(|t| t.get("transaction_id"))
+                .and_then(Value::as_str);
+            return Err(ApiError::network_idempotency_conflict(orig_tx_id));
         }
         return Err(ApiError::conflict(
             "idempotency_conflict",
@@ -969,11 +1270,24 @@ impl GatewayBackend for MockGatewayBackend {
             if let Some(replayed) = check_idempotency(&state, "capture_start", &cmd)? {
                 return Ok(replayed);
             }
+            if !state.camera_connected {
+                return Err(ApiError::camera_not_connected(
+                    "configured camera is not connected",
+                ));
+            }
             if state.device_state == "idle" {
                 let sid = new_uuid_v7();
+                let tid = new_uuid_v7();
                 let gen_id = new_uuid_v4();
+                let display_name = cmd
+                    .body
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 state.device_state = "recording".to_owned();
                 state.active_session_id = Some(sid.clone());
+                state.active_take_id = Some(tid);
+                state.active_display_name = display_name;
                 state.active_generation_id = Some(gen_id.clone());
                 state.source_revision += 1;
                 let ev = json!({
@@ -1005,20 +1319,39 @@ impl GatewayBackend for MockGatewayBackend {
     }
 
     async fn stop_capture(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
-        let mut state = self.lock_state()?;
-        if let Some(replayed) = check_idempotency(&state, "capture_stop", &cmd)? {
-            return Ok(replayed);
-        }
-        let outcome = if state.device_state == "idle" {
-            CommandOutcome::no_content(false)
-        } else {
-            state.device_state = "idle".to_owned();
-            state.active_session_id = None;
-            state.active_generation_id = None;
-            state.source_revision += 1;
-            CommandOutcome::accepted(mock_capture_status_json(&state), false)
+        let (outcome, stop_event) = {
+            let mut state = self.lock_state()?;
+            if let Some(replayed) = check_idempotency(&state, "capture_stop", &cmd)? {
+                return Ok(replayed);
+            }
+            if state.device_state == "idle" {
+                let outcome = CommandOutcome::no_content(false);
+                store_idempotency(&mut state, "capture_stop", &cmd, &outcome);
+                (outcome, None)
+            } else {
+                state.device_state = "idle".to_owned();
+                state.active_session_id = None;
+                state.active_take_id = None;
+                state.active_display_name = None;
+                state.active_generation_id = None;
+                state.source_revision += 1;
+                let snap_data = mock_capture_snapshot_data(&state);
+                let ev = json!({
+                    "authority_epoch": state.authority_epoch,
+                    "source_revision": state.source_revision,
+                    "type": "snapshot",
+                    "occurred_at": rfc3339_now_utc(),
+                    "session_id": Value::Null,
+                    "data": snap_data
+                });
+                let outcome = CommandOutcome::accepted(mock_capture_status_json(&state), false);
+                store_idempotency(&mut state, "capture_stop", &cmd, &outcome);
+                (outcome, Some(ev))
+            }
         };
-        store_idempotency(&mut state, "capture_stop", &cmd, &outcome);
+        if let Some(ev) = stop_event {
+            let _ = self.capture_events.publish(ev);
+        }
         Ok(outcome)
     }
 
@@ -1056,6 +1389,11 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn camera_focus(&self) -> ApiResult<Option<Value>> {
         let state = self.lock_state()?;
+        if !state.camera_connected {
+            return Err(ApiError::camera_not_connected(
+                "configured camera is not connected",
+            ));
+        }
         if !state.focus_supported {
             return Ok(None);
         }
@@ -1073,6 +1411,11 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn set_camera_focus(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
         let mut state = self.lock_state()?;
+        if !state.camera_connected {
+            return Err(ApiError::camera_not_connected(
+                "configured camera is not connected",
+            ));
+        }
         if !state.focus_supported {
             return Err(ApiError::camera_focus_unsupported());
         }
@@ -1109,6 +1452,52 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn list_sessions(&self, query: ListSessionsQuery) -> ApiResult<Value> {
         let state = self.lock_state()?;
+        let all_summaries: Vec<&Value> = state
+            .session_order
+            .iter()
+            .filter_map(|sid| state.sessions.get(sid).map(|s| &s.summary))
+            .collect();
+        let catalog_input = serde_json::to_vec(&all_summaries).unwrap_or_default();
+        let catalog_revision = format!("sha256:{}", sha256_hex(&catalog_input));
+
+        let take_tok = query.take_id.as_deref().unwrap_or("-");
+        let rec_tok = if query.include_recovery { "1" } else { "0" };
+
+        let offset = match query.cursor.as_deref() {
+            None => 0usize,
+            Some(tok) => {
+                let parts: Vec<&str> = tok.splitn(4, '~').collect();
+                if parts.len() != 4 {
+                    return Err(
+                        ApiError::new(400, "invalid_cursor", "invalid pagination cursor")
+                            .with_retryable(false),
+                    );
+                }
+                let parsed_off = parts[3].parse::<usize>().map_err(|_| {
+                    ApiError::new(400, "invalid_cursor", "invalid pagination cursor offset")
+                        .with_retryable(false)
+                })?;
+                if parts[0] != catalog_revision {
+                    return Err(ApiError::conflict(
+                        "catalog_changed",
+                        "session catalog revision changed; restart listing without cursor",
+                    )
+                    .with_retryable(true)
+                    .with_error_code_header()
+                    .with_details(json!({ "catalog_revision": catalog_revision })));
+                }
+                if parts[1] != take_tok || parts[2] != rec_tok {
+                    return Err(ApiError::new(
+                        400,
+                        "invalid_cursor",
+                        "cursor filter does not match request filter",
+                    )
+                    .with_retryable(false));
+                }
+                parsed_off
+            }
+        };
+
         let mut items = Vec::new();
         for sid in &state.session_order {
             if let Some(sess) = state.sessions.get(sid) {
@@ -1126,33 +1515,14 @@ impl GatewayBackend for MockGatewayBackend {
                 items.push(item);
             }
         }
-        let catalog_input = serde_json::to_vec(&items).unwrap_or_default();
-        let catalog_revision = format!("sha256:{}", sha256_hex(&catalog_input));
-
-        let offset = match query.cursor.as_deref() {
-            None => 0usize,
-            Some(tok) => {
-                let Some((rev, off_str)) = tok.split_once(':') else {
-                    return Err(ApiError::bad_request("invalid pagination cursor"));
-                };
-                if rev != catalog_revision {
-                    return Err(ApiError::conflict(
-                        "catalog_changed",
-                        "session catalog revision changed; restart listing without cursor",
-                    )
-                    .with_retryable(true)
-                    .with_details(json!({ "catalog_revision": catalog_revision })));
-                }
-                off_str
-                    .parse::<usize>()
-                    .map_err(|_| ApiError::bad_request("invalid pagination cursor offset"))?
-            }
-        };
 
         let limit = query.limit.clamp(1, 200);
         let page: Vec<Value> = items.iter().skip(offset).take(limit).cloned().collect();
         let next_cursor = if offset + page.len() < items.len() {
-            Some(format!("{catalog_revision}:{}", offset + page.len()))
+            Some(format!(
+                "{catalog_revision}~{take_tok}~{rec_tok}~{}",
+                offset + page.len()
+            ))
         } else {
             None
         };
@@ -1196,26 +1566,25 @@ impl GatewayBackend for MockGatewayBackend {
         session_id: &str,
         artifact_id: &str,
     ) -> ApiResult<OpenRepresentation> {
-        let (verified, reason, artifact) = {
+        let artifact = {
             let state = self.lock_state()?;
             let session = state
                 .sessions
                 .get(session_id)
                 .ok_or_else(|| ApiError::not_found("session not found"))?;
-            let artifact = session
+            if !session.verified {
+                let reason = match session.verification_reason.as_str() {
+                    "absent" | "unusable" | "stale" => session.verification_reason.as_str(),
+                    _ => "absent",
+                };
+                return Err(ApiError::session_not_verified(reason));
+            }
+            session
                 .artifacts
                 .get(artifact_id)
                 .cloned()
-                .ok_or_else(|| ApiError::not_found("artifact not found"))?;
-            (
-                session.verified,
-                session.verification_reason.clone(),
-                artifact,
-            )
+                .ok_or_else(|| ApiError::not_found("artifact not found"))?
         };
-        if !verified {
-            return Err(ApiError::session_not_verified(&reason));
-        }
         let etag = format!("\"{}\"", artifact.artifact_id);
         match artifact.backing {
             MockArtifactBacking::Memory(bytes) => Ok(OpenRepresentation::from_memory(
@@ -1224,18 +1593,25 @@ impl GatewayBackend for MockGatewayBackend {
                 bytes,
             )),
             MockArtifactBacking::FilePath(path) => {
-                let file = miro_ego_core::sys::fs::open_readonly_safe(&path).map_err(|err| {
-                    ApiError::provider_failure(format!("open artifact file: {err}"))
-                })?;
-                let meta = file.metadata().map_err(|err| {
-                    ApiError::provider_failure(format!("stat artifact file: {err}"))
-                })?;
-                Ok(OpenRepresentation::from_file(
-                    artifact.media_type,
-                    etag,
-                    file,
-                    meta.len(),
-                ))
+                let media_type = artifact.media_type;
+                tokio::task::spawn_blocking(move || {
+                    let file = miro_ego_core::sys::fs::open_readonly_safe(&path).map_err(|err| {
+                        ApiError::provider_failure(format!("open artifact file: {err}"))
+                    })?;
+                    let meta = file.metadata().map_err(|err| {
+                        ApiError::provider_failure(format!("stat artifact file: {err}"))
+                    })?;
+                    Ok(OpenRepresentation::from_file(
+                        media_type,
+                        etag,
+                        file,
+                        meta.len(),
+                    ))
+                })
+                .await
+                .map_err(|err| {
+                    ApiError::internal("task_join_error", format!("open artifact task failed: {err}"))
+                })?
             }
         }
     }
@@ -1303,7 +1679,16 @@ impl GatewayBackend for MockGatewayBackend {
         let mut entries: Vec<(String, u64, String, String, Option<String>)> = Vec::new();
 
         if let Some(root) = logs_dir {
-            collect_disk_logs(&root, "", query.prefix.as_deref(), &mut entries)?;
+            let prefix = query.prefix.clone();
+            entries = tokio::task::spawn_blocking(move || {
+                let mut disk_entries = Vec::new();
+                collect_disk_logs(&root, "", prefix.as_deref(), &mut disk_entries)?;
+                Ok::<_, ApiError>(disk_entries)
+            })
+            .await
+            .map_err(|err| {
+                ApiError::internal("task_join_error", format!("list logs task failed: {err}"))
+            })??;
         } else {
             for entry in mem_logs.values() {
                 if let Some(prefix) = query.prefix.as_deref()
@@ -1360,7 +1745,15 @@ impl GatewayBackend for MockGatewayBackend {
             )
         };
         if let Some(root) = logs_dir {
-            return open_safe_log_file(&root, name);
+            let owned_name = name.to_owned();
+            return tokio::task::spawn_blocking(move || open_safe_log_file(&root, &owned_name))
+                .await
+                .map_err(|err| {
+                    ApiError::internal(
+                        "task_join_error",
+                        format!("open log file task failed: {err}"),
+                    )
+                })?;
         }
         let entry =
             mem_entry.ok_or_else(|| ApiError::not_found("diagnostic log file not found"))?;
@@ -1379,6 +1772,45 @@ impl GatewayBackend for MockGatewayBackend {
 
     fn preview_h264_hub(&self) -> Option<Arc<H264PreviewHub>> {
         self.h264_hub.as_ref().map(Arc::clone)
+    }
+
+    async fn open_preview_mjpeg(&self, _fps: Option<u32>) -> ApiResult<Arc<MjpegPreviewHub>> {
+        let state = self.lock_state()?;
+        if state.device_state == "blocked" {
+            return Err(ApiError::conflict(
+                "preview_state_conflict",
+                "preview is unavailable in the current device state",
+            ));
+        }
+        if !state.camera_connected {
+            return Err(ApiError::camera_not_connected(
+                "configured camera is not connected",
+            ));
+        }
+        Ok(Arc::clone(&self.mjpeg_hub))
+    }
+
+    async fn open_preview_h264(
+        &self,
+        _fps: Option<u32>,
+        _bitrate_kbps: Option<u32>,
+    ) -> ApiResult<Arc<H264PreviewHub>> {
+        let Some(hub) = self.h264_hub.as_ref().map(Arc::clone) else {
+            return Err(ApiError::preview_h264_unsupported());
+        };
+        let state = self.lock_state()?;
+        if state.device_state == "blocked" {
+            return Err(ApiError::conflict(
+                "preview_state_conflict",
+                "preview is unavailable in the current device state",
+            ));
+        }
+        if !state.camera_connected {
+            return Err(ApiError::camera_not_connected(
+                "configured camera is not connected",
+            ));
+        }
+        Ok(hub)
     }
 
     fn capture_event_buffer(&self) -> Arc<EventReplayBuffer> {
@@ -1703,12 +2135,7 @@ impl GatewayBackend for MockGatewayBackend {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ApiError::bad_request("missing transaction_id"))?;
             let Some(prev_tx) = state.network_transactions.get(tx_id).cloned() else {
-                return Err(ApiError::not_found("network transaction not found")
-                    .with_header(
-                        crate::error::HEADER_ERROR_CODE,
-                        "network_transaction_not_found",
-                    )
-                    .with_details(json!({ "transaction_id": tx_id })));
+                return Err(ApiError::network_transaction_not_found(tx_id));
             };
             state.network_revision += 1;
             let now = rfc3339_now_utc();

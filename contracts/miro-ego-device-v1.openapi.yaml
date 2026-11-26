@@ -849,10 +849,14 @@ paths:
                 event: state
                 data: {"schema":"miro-ego.capture-event.v1","sse_delivery_id":"1042","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":42,"type":"state","occurred_at":"2026-11-26T10:25:01Z","session_id":"01989f6a-2c00-7a1b-8c2d-3e4f50617283","data":{"schema":"miro-ego.capture-state-event.v1","state":"encoding","volume_id":"6ba7b810-9dad-41d1-80b4-00c04fd430c8","generation_id":"7d516b70-d8ab-47d1-b2dc-5b1250138789"}}
 
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/StreamCapacityExhausted"
         "500":
           $ref: "#/components/responses/InternalError"
   /capture/safe-swap:
@@ -949,6 +953,8 @@ paths:
               schema:
                 type: string
                 contentEncoding: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -961,18 +967,26 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: |
-            No preview frame is currently available. A physically absent configured
-            camera returns camera_not_connected with retryable=true; an attached camera
-            that has not produced a frame returns preview_unavailable.
+            No preview frame or stream slot is currently available. A physically absent
+            configured camera returns camera_not_connected with retryable=true; an attached
+            camera that has not produced a frame returns preview_unavailable; concurrent
+            MJPEG stream saturation returns preview_capacity_exhausted.
           headers:
             Miro-Ego-Error-Code:
               required: false
               schema:
-                enum: [camera_not_connected, preview_unavailable]
+                enum: [camera_not_connected, preview_unavailable, preview_capacity_exhausted]
+            Retry-After:
+              required: false
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /preview/h264:
     get:
       tags: [Capture]
@@ -1297,10 +1311,14 @@ paths:
                 event: transaction
                 data: {"schema":"miro-ego.network-event.v1","sse_delivery_id":"208","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":12,"occurred_at":"2026-11-26T11:40:04+08:00","type":"transaction","transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","data":{"schema":"miro-ego.network-transaction.v1","authority_epoch":"4fa85f64-5717-4562-b3fc-2c963f66afa6","source_revision":12,"transaction_id":"0198d2a0-41a0-7b7a-a751-0e86a39d4db1","operation":"apply","status":"committed","stage":"committed","desired":{"mode":"wifi-client","wifi_client":{"ssid":"studio-wifi","security":"wpa2-personal","credential_state":"stored"},"ethernet":null},"accepted_at":"2026-11-26T11:39:52+08:00","updated_at":"2026-11-26T11:40:04+08:00","deadline":null,"recovery_action":"reconnect_target_lan","rescue":{"ap_validated":true,"fallback_mode":"hotspot","failure_trigger_seconds":10},"error":null}}
 
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/StreamCapacityExhausted"
         "500":
           $ref: "#/components/responses/InternalError"
   /network/apply:
@@ -1548,6 +1566,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/DownloadCapacityExhausted"
         "500":
           $ref: "#/components/responses/InternalError"
   /sessions/{session_id}/unsuccessful-outcome:
@@ -1690,6 +1710,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/DownloadCapacityExhausted"
         "500":
           $ref: "#/components/responses/InternalError"
     head:
@@ -1726,6 +1748,8 @@ paths:
           $ref: "#/components/responses/CaptureBusyHead"
         "404":
           $ref: "#/components/responses/NotFoundHead"
+        "503":
+          $ref: "#/components/responses/DownloadCapacityExhaustedHead"
         "500":
           $ref: "#/components/responses/InternalErrorHead"
   /logs:
@@ -1882,7 +1906,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
-          $ref: "#/components/responses/StorageUnavailable"
+          description: Recording volume (/data) is temporarily unavailable or concurrent download capacity is exhausted
+          headers:
+            Miro-Ego-Error-Code:
+              required: true
+              schema:
+                type: string
+                enum: [storage_unavailable, download_capacity_exhausted]
+            Retry-After:
+              required: false
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           $ref: "#/components/responses/InternalError"
 components:
@@ -2276,6 +2315,53 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/StorageUnavailableError"
+    StreamCapacityExhausted:
+      description: Maximum concurrent SSE event streams reached; retry after the indicated backoff
+      headers:
+        Miro-Ego-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: stream_capacity_exhausted
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DownloadCapacityExhausted:
+      description: Maximum concurrent session/artifact downloads reached; retry after the indicated backoff
+      headers:
+        Miro-Ego-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: download_capacity_exhausted
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DownloadCapacityExhaustedHead:
+      description: Maximum concurrent session/artifact downloads reached; HEAD sends no response body
+      headers:
+        Miro-Ego-Error-Code:
+          required: true
+          schema:
+            type: string
+            const: download_capacity_exhausted
+        Retry-After:
+          required: true
+          schema:
+            type: integer
+            minimum: 1
     InternalError:
       description: Unexpected device error
       headers:

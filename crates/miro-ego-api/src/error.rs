@@ -182,14 +182,72 @@ impl ApiError {
             .with_header(HEADER_ERROR_CODE, "storage_unavailable")
     }
 
-    pub fn audit_unavailable() -> Self {
+    pub fn camera_not_connected(message: impl Into<String>) -> Self {
+        Self::new(503, "camera_not_connected", message)
+            .with_retryable(true)
+            .with_header(HEADER_ERROR_CODE, "camera_not_connected")
+    }
+
+    pub fn preview_unavailable(message: impl Into<String>) -> Self {
+        Self::new(503, "preview_unavailable", message)
+            .with_retryable(true)
+            .with_header(HEADER_ERROR_CODE, "preview_unavailable")
+    }
+
+    pub fn preview_capacity_exhausted() -> Self {
         Self::new(
             503,
+            "preview_capacity_exhausted",
+            "maximum concurrent preview streams reached",
+        )
+        .with_retryable(true)
+        .with_header("Retry-After", "1")
+        .with_header(HEADER_ERROR_CODE, "preview_capacity_exhausted")
+    }
+
+    pub fn stream_capacity_exhausted() -> Self {
+        Self::new(
+            503,
+            "stream_capacity_exhausted",
+            "maximum concurrent SSE connections reached",
+        )
+        .with_retryable(true)
+        .with_header("Retry-After", "1")
+        .with_header(HEADER_ERROR_CODE, "stream_capacity_exhausted")
+    }
+
+    pub fn network_transaction_not_found(transaction_id: &str) -> Self {
+        Self::new(
+            404,
+            "network_transaction_not_found",
+            "network transaction not found",
+        )
+        .with_retryable(false)
+        .with_header(HEADER_ERROR_CODE, "network_transaction_not_found")
+        .with_details(json!({ "transaction_id": transaction_id }))
+    }
+
+    pub fn network_idempotency_conflict(original_transaction_id: Option<&str>) -> Self {
+        Self::new(
+            409,
+            "idempotency_conflict",
+            "Idempotency-Key reused with different network mutation request",
+        )
+        .with_retryable(false)
+        .with_header(HEADER_ERROR_CODE, "idempotency_conflict")
+        .with_details(json!({
+            "idempotency_scope": "network-mutation",
+            "original_transaction_id": original_transaction_id,
+        }))
+    }
+
+    pub fn audit_unavailable() -> Self {
+        Self::new(
+            500,
             "audit_unavailable",
             "audit sink is temporarily unavailable; retry later",
         )
         .with_retryable(true)
-        .with_header("Retry-After", "1")
         .with_header(HEADER_ERROR_CODE, "audit_unavailable")
     }
 

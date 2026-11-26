@@ -990,7 +990,7 @@ async fn live_rustls_https_enforces_bearer_auth_csrf_permissions_host_rebinding_
         .expect("server must close stalled TLS handshake within timeout");
     assert!(matches!(read_res, Ok(0) | Err(_)));
 
-    // 9. Fail-closed audit sink -> 503 with Miro-Ego-Audit-Status: unavailable
+    // 9. Fail-closed audit sink -> 500 InternalError with Miro-Ego-Audit-Status: unavailable
     backend.set_fail_audit(true);
     let (st, hdrs, body) = https_request(
         srv.addr,
@@ -1001,7 +1001,7 @@ async fn live_rustls_https_enforces_bearer_auth_csrf_permissions_host_rebinding_
         None,
     )
     .await;
-    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         hdrs.get(HEADER_AUDIT_STATUS).and_then(|v| v.to_str().ok()),
         Some("unavailable")
@@ -1446,6 +1446,7 @@ async fn mjpeg_and_h264_preview_streaming_and_unsupported_fallback() {
         text_h264.contains("moof-mdat-fragment-1"),
         "got:\n{text_h264}"
     );
+    assert_eq!(h264_hub.last_stream_hints(), (Some(15), Some(2000)));
     drop(tcp_h264);
     srv.shutdown().await;
 
@@ -1769,14 +1770,18 @@ async fn customer_mode_rejects_unauthenticated_invalid_paths_with_401_and_mirror
 
     let unauth_invalid_paths = [
         (Method::GET, "/api/v1/sessions/not-a-uuid"),
+        (Method::GET, "/api/v1/sessions/%ff"),
         (
             Method::GET,
             "/api/v1/sessions/not-a-uuid/unsuccessful-outcome",
         ),
+        (Method::GET, "/api/v1/sessions/%ff/unsuccessful-outcome"),
         (Method::GET, "/api/v1/sessions/not-a-uuid/artifacts/bad"),
+        (Method::GET, "/api/v1/sessions/%ff/artifacts/bad"),
         (Method::HEAD, "/api/v1/sessions/not-a-uuid/artifacts/bad"),
         (Method::GET, "/api/v1/logs/../etc/passwd"),
         (Method::GET, "/api/v1/logs/%2e%2e/secret"),
+        (Method::GET, "/api/v1/logs/%ff"),
     ];
 
     for (method, path) in unauth_invalid_paths {
@@ -1806,50 +1811,870 @@ async fn customer_mode_rejects_unauthenticated_invalid_paths_with_401_and_mirror
         }
     }
 
-    // Confirm unauthorized audit events were recorded for all 6 unauthenticated probes
+    // Confirm unauthorized audit events were recorded for all 10 unauthenticated probes
     let unauth_audits = backend
         .audit_events()
         .into_iter()
         .filter(|ev| ev.outcome == "unauthorized")
         .count();
-    assert_eq!(unauth_audits, 6);
+    assert_eq!(unauth_audits, 10);
 
-    // Authenticated requests with invalid path params still return 404 (sessions) / 400 (logs)
-    // AND automatically mirror Miro-Ego-Error-Code!
+    // Authenticated requests with invalid or non-UTF8 (%ff) path params still return JSON
+    // miro-ego.api-error.v1 404 (sessions) / 400 (logs) and mirror Miro-Ego-Error-Code!
     let auth = [("Authorization", "Bearer admin-secret-token-9999")];
-    let (st_sess, hdrs_sess, _) = https_request(
-        srv.addr,
-        &connector,
-        Method::GET,
-        "/api/v1/sessions/not-a-uuid",
-        &auth,
-        None,
+    for sess_bad_path in ["/api/v1/sessions/not-a-uuid", "/api/v1/sessions/%ff"] {
+        let (st_sess, hdrs_sess, body_sess) = https_request(
+            srv.addr,
+            &connector,
+            Method::GET,
+            sess_bad_path,
+            &auth,
+            None,
+        )
+        .await;
+        assert_eq!(st_sess, StatusCode::NOT_FOUND, "path={sess_bad_path}");
+        assert_eq!(
+            hdrs_sess
+                .get(HEADER_ERROR_CODE)
+                .and_then(|v| v.to_str().ok()),
+            Some("not_found")
+        );
+        let problem: Value = serde_json::from_slice(&body_sess).unwrap();
+        assert_eq!(problem["schema"], "miro-ego.api-error.v1");
+    }
+
+    for log_bad_path in ["/api/v1/logs/../etc/passwd", "/api/v1/logs/%ff"] {
+        let (st_log, hdrs_log, body_log) =
+            https_request(srv.addr, &connector, Method::GET, log_bad_path, &auth, None).await;
+        assert_eq!(st_log, StatusCode::BAD_REQUEST, "path={log_bad_path}");
+        assert_eq!(
+            hdrs_log
+                .get(HEADER_ERROR_CODE)
+                .and_then(|v| v.to_str().ok()),
+            Some("invalid_request")
+        );
+        let problem: Value = serde_json::from_slice(&body_log).unwrap();
+        assert_eq!(problem["schema"], "miro-ego.api-error.v1");
+    }
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn customer_echoed_bearer_csrf_and_resource_scoped_session_deletion() {
+    let (tls_cfg, connector) = generate_test_tls();
+    let backend = Arc::new(MockGatewayBackend::new());
+    let (sid_a, _, sha_a) = backend.sample_session_and_artifact().unwrap();
+    let (sid_b, _, sha_b) = backend.insert_sample_session(None).unwrap();
+
+    let operator_a = Principal::all_v1_operations("operator-a").unwrap();
+    let mut scoped_perms = HashMap::new();
+    scoped_perms.insert(
+        "deleteSessions".to_owned(),
+        Some(HashSet::from([sid_a.clone()])),
+    );
+    scoped_perms.insert("setVoiceVolume".to_owned(), None);
+    let operator_b = Principal::new("operator-b", scoped_perms).unwrap();
+
+    let mut tokens = HashMap::new();
+    tokens.insert("bearer-tok-alpha-1111".to_owned(), operator_a);
+    tokens.insert("bearer-tok-bravo-2222".to_owned(), operator_b);
+
+    // Multi-token Customer policy with csrf_token = None enforces X-CSRF-Token == caller's bearer token!
+    let security = Arc::new(SecurityPolicy::customer(tokens, HashSet::new(), None).unwrap());
+    let srv = RunningServer::start_https(
+        Arc::clone(&backend),
+        security,
+        tls_cfg,
+        Duration::from_secs(5),
     )
     .await;
-    assert_eq!(st_sess, StatusCode::NOT_FOUND);
+    let origin = format!("https://localhost:{}", srv.addr.port());
+    let voice_body = Bytes::from(json!({"schema": "miro-ego.voice-set.v1", "volume": 55}).to_string());
+
+    // 1. Missing X-CSRF-Token -> 403 csrf_forbidden (NOT bypassed when csrf_token is None!)
+    let (st, _, body) = https_request(
+        srv.addr,
+        &connector,
+        Method::POST,
+        "/api/v1/voice",
+        &[
+            ("Authorization", "Bearer bearer-tok-alpha-1111"),
+            ("Origin", &origin),
+            ("Content-Type", "application/json"),
+        ],
+        Some(voice_body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
     assert_eq!(
-        hdrs_sess
-            .get(HEADER_ERROR_CODE)
-            .and_then(|v| v.to_str().ok()),
-        Some("not_found")
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+        "csrf_forbidden"
     );
 
-    let (st_log, hdrs_log, _) = https_request(
+    // 2. Cross-principal bearer token in X-CSRF-Token -> 403 csrf_forbidden
+    let (st, _, body) = https_request(
         srv.addr,
         &connector,
-        Method::GET,
-        "/api/v1/logs/../etc/passwd",
-        &auth,
-        None,
+        Method::POST,
+        "/api/v1/voice",
+        &[
+            ("Authorization", "Bearer bearer-tok-alpha-1111"),
+            ("Origin", &origin),
+            ("Content-Type", "application/json"),
+            ("X-CSRF-Token", "bearer-tok-bravo-2222"),
+        ],
+        Some(voice_body.clone()),
     )
     .await;
-    assert_eq!(st_log, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::FORBIDDEN);
     assert_eq!(
-        hdrs_log
-            .get(HEADER_ERROR_CODE)
-            .and_then(|v| v.to_str().ok()),
-        Some("invalid_request")
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+        "csrf_forbidden"
+    );
+
+    // 3. Each principal echoing its own bearer token in X-CSRF-Token succeeds (200 OK)
+    for tok in ["bearer-tok-alpha-1111", "bearer-tok-bravo-2222"] {
+        let (st, _, _) = https_request(
+            srv.addr,
+            &connector,
+            Method::POST,
+            "/api/v1/voice",
+            &[
+                ("Authorization", &format!("Bearer {tok}")),
+                ("Origin", &origin),
+                ("Content-Type", "application/json"),
+                ("X-CSRF-Token", tok),
+            ],
+            Some(voice_body.clone()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "echoed bearer CSRF failed for {tok}");
+    }
+
+    // 4. Resource-scoped operator-b attempting to delete unauthorized sid_b -> 403 forbidden
+    let (st_forbid, _, _) = https_request(
+        srv.addr,
+        &connector,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Authorization", "Bearer bearer-tok-bravo-2222"),
+            ("Origin", &origin),
+            ("Content-Type", "application/json"),
+            ("X-CSRF-Token", "bearer-tok-bravo-2222"),
+            ("Idempotency-Key", "scoped-del-forbid"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.session-delete-request.v1",
+                "sessions": [{"session_id": sid_b, "manifest_sha256": sha_b}]
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_forbid, StatusCode::FORBIDDEN);
+
+    // 5. Resource-scoped operator-b deleting permitted sid_a -> 200 OK
+    let (st_allow, _, body_allow) = https_request(
+        srv.addr,
+        &connector,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Authorization", "Bearer bearer-tok-bravo-2222"),
+            ("Origin", &origin),
+            ("Content-Type", "application/json"),
+            ("X-CSRF-Token", "bearer-tok-bravo-2222"),
+            ("Idempotency-Key", "scoped-del-allow"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.session-delete-request.v1",
+                "sessions": [{"session_id": sid_a, "manifest_sha256": sha_a}]
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_allow, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_allow).unwrap()["deleted_session_ids"][0],
+        sid_a
     );
 
     srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_artifact_download_blocks_session_deletion_until_stream_closes() {
+    let backend = Arc::new(MockGatewayBackend::new());
+    let (sid, _, manifest_sha) = backend.sample_session_and_artifact().unwrap();
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "miro-ego-api-open-dl-del-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&tmp_dir).unwrap();
+    let file_path = tmp_dir.join("large_segment.mp4");
+    let total_size = 8 * 1024 * 1024;
+    let payload = vec![0x5a_u8; total_size];
+    fs::write(&file_path, &payload).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let aid = hex_encode(&hasher.finalize());
+    backend
+        .add_file_artifact(&sid, aid.clone(), "video/mp4".to_owned(), file_path)
+        .unwrap();
+
+    let runtime = GatewayRuntimeConfig {
+        max_concurrent_downloads: 4,
+        download_chunk_bytes: 32 * 1024,
+        ..GatewayRuntimeConfig::default()
+    };
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        Arc::new(SecurityPolicy::lab_default()),
+        runtime,
+    )
+    .await;
+
+    // Open a streaming download with a small TCP receive buffer and pause reading body bytes
+    // so the server's download body stream stays active and holds its shared delete lease.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    let _ = sock.set_recv_buffer_size(4096);
+    let tcp = sock.connect(srv.addr).await.unwrap();
+    let (mut sender, conn) = client_http1::handshake(TokioIo::new(tcp)).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let dl_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/sessions/{sid}/artifacts/{aid}"))
+        .header("Host", format!("127.0.0.1:{}", srv.addr.port()))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let dl_resp = sender.send_request(dl_req).await.unwrap();
+    assert_eq!(dl_resp.status(), StatusCode::OK);
+
+    // Concurrent POST /api/v1/sessions/delete must be rejected with 409 open_downloads!
+    let del_body = Bytes::from(
+        json!({
+            "schema": "miro-ego.session-delete-request.v1",
+            "sessions": [{"session_id": sid, "manifest_sha256": manifest_sha}]
+        })
+        .to_string(),
+    );
+    let (st_conflict, hdrs_conflict, body_conflict) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "del-while-open-1"),
+        ],
+        Some(del_body.clone()),
+    )
+    .await;
+    assert_eq!(st_conflict, StatusCode::CONFLICT);
+    assert_eq!(
+        hdrs_conflict
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("open_downloads")
+    );
+    let conflict_json: Value = serde_json::from_slice(&body_conflict).unwrap();
+    assert_eq!(conflict_json["error"]["code"], "open_downloads");
+    assert_eq!(conflict_json["error"]["retryable"], true);
+
+    // Finish draining the download body so the server releases the delete lease.
+    let downloaded = dl_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(downloaded.len(), total_size);
+    drop(sender);
+    tokio::task::yield_now().await;
+
+    // Now POST /api/v1/sessions/delete succeeds!
+    let (st_ok, _, body_ok) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "del-after-close-1"),
+        ],
+        Some(del_body),
+    )
+    .await;
+    assert_eq!(st_ok, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_ok).unwrap()["deleted_session_ids"][0],
+        sid
+    );
+
+    srv.shutdown().await;
+    let _ = fs::remove_dir_all(tmp_dir);
+}
+
+#[tokio::test]
+async fn sse_async_snapshot_retry_prevents_swallowed_concurrent_event_and_bumps_cursor_collision() {
+    use miro_ego_api::{EventCursor, EventReplayBuffer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Fresh buffer (next_delivery_id == 1) with Last-Event-ID: 1 must bump resync ID to 2 (> 1).
+    let fresh_buf = EventReplayBuffer::new(16);
+    let epoch = new_uuid_v4();
+    let bumped = fresh_buf
+        .replay_or_snapshot_async(Some(EventCursor::Exact(1)), || {
+            let ep = epoch.clone();
+            async move {
+                Ok(json!({
+                    "authority_epoch": ep,
+                    "source_revision": 1,
+                    "type": "snapshot",
+                    "occurred_at": "2026-11-26T10:00:00Z",
+                    "session_id": null,
+                    "data": {"schema": "miro-ego.capture-snapshot-event.v1"}
+                }))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(bumped.len(), 1);
+    assert_eq!(
+        bumped[0].delivery_id, 2,
+        "resync snapshot must advance past Last-Event-ID=1"
+    );
+
+    // 2. Concurrent publish firing DURING async snapshot fetch must cause replay_or_snapshot_async
+    // to re-fetch fresh state rather than anchoring over the concurrent publish with a stale snapshot!
+    let race_buf = Arc::new(EventReplayBuffer::new(16));
+    let live_rev = Arc::new(AtomicUsize::new(10));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let buf_for_cb = Arc::clone(&race_buf);
+    let rev_for_cb = Arc::clone(&live_rev);
+    let calls_for_cb = Arc::clone(&calls);
+    let epoch2 = new_uuid_v4();
+
+    let events = race_buf
+        .replay_or_snapshot_async(None, || {
+            let b = Arc::clone(&buf_for_cb);
+            let r = Arc::clone(&rev_for_cb);
+            let c = Arc::clone(&calls_for_cb);
+            let ep = epoch2.clone();
+            async move {
+                let attempt = c.fetch_add(1, Ordering::SeqCst);
+                let observed_rev = r.load(Ordering::SeqCst);
+                if attempt == 0 {
+                    // Simulate a concurrent state transition publishing while snapshot #0 was in flight.
+                    r.store(11, Ordering::SeqCst);
+                    b.publish(json!({
+                        "authority_epoch": ep,
+                        "source_revision": 11,
+                        "type": "state",
+                        "occurred_at": "2026-11-26T10:00:01Z",
+                        "session_id": new_uuid_v7(),
+                        "data": {"schema": "miro-ego.capture-state-event.v1", "state": "recording"}
+                    }))
+                    .unwrap();
+                }
+                Ok(json!({
+                    "authority_epoch": ep,
+                    "source_revision": observed_rev,
+                    "type": "snapshot",
+                    "occurred_at": "2026-11-26T10:00:02Z",
+                    "session_id": null,
+                    "data": {"schema": "miro-ego.capture-snapshot-event.v1", "rev": observed_rev}
+                }))
+            }
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "must retry when publish_count changes during async snapshot"
+    );
+    assert_eq!(
+        events[0].source_event["source_revision"], 11,
+        "retried snapshot must reflect concurrent revision 11, not stale revision 10"
+    );
+}
+
+#[tokio::test]
+async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_schemas() {
+    let backend = Arc::new(MockGatewayBackend::new());
+    let (sid1, _, _) = backend.sample_session_and_artifact().unwrap();
+    let failed_sid = backend.sample_unsuccessful_session_id().unwrap();
+    let take_other = new_uuid_v7();
+    let (_sid2, _, _) = backend
+        .insert_sample_session(Some(take_other.clone()))
+        .unwrap();
+
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        Arc::new(SecurityPolicy::lab_default()),
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+
+    // 1. Validate MockGatewayBackend sealed manifest & unsuccessful recording_state against contract schema requirements!
+    let (st_man, _, man_bytes) = http_request(
+        srv.addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid1}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_man, StatusCode::OK);
+    let manifest: Value = serde_json::from_slice(&man_bytes).unwrap();
+    let man_obj = manifest.as_object().unwrap();
+    assert!(!man_obj.contains_key("artifacts"));
+    for req_key in [
+        "schema",
+        "manifest_id",
+        "sealed",
+        "sealed_at",
+        "session_id",
+        "volume_id",
+        "capture_mode",
+        "display_name",
+        "device",
+        "time",
+        "take",
+        "camera",
+        "video",
+        "imu",
+        "frames",
+        "audio",
+        "logs",
+        "integrity",
+    ] {
+        assert!(
+            man_obj.contains_key(req_key),
+            "mock manifest missing required schema key: {req_key}"
+        );
+    }
+
+    let (st_out, _, out_bytes) = http_request(
+        srv.addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{failed_sid}/unsuccessful-outcome"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_out, StatusCode::OK);
+    let outcome_doc: Value = serde_json::from_slice(&out_bytes).unwrap();
+    let rec_state = outcome_doc["outcome"]["recording_state"]
+        .as_object()
+        .unwrap();
+    for req_key in [
+        "schema",
+        "state",
+        "authority_epoch",
+        "state_revision",
+        "updated_at",
+        "session_id",
+        "take_id",
+        "display_name",
+        "device",
+        "storage",
+        "progress",
+        "diagnostics",
+    ] {
+        assert!(
+            rec_state.contains_key(req_key),
+            "mock recording_state missing required schema key: {req_key}"
+        );
+    }
+    assert_eq!(rec_state["diagnostics"][0]["severity"], "error");
+    assert_eq!(rec_state["diagnostics"][0]["recoverable"], false);
+
+    // 2. Unverified session returns 409 session_not_verified BEFORE 404 even for an unknown artifact_id!
+    backend.set_session_verified(&sid1, false, "unusable");
+    let unknown_aid = "f".repeat(64);
+    let (st_unv, hdrs_unv, body_unv) = http_request(
+        srv.addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid1}/artifacts/{unknown_aid}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_unv, StatusCode::CONFLICT);
+    assert_eq!(
+        hdrs_unv.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+        Some("session_not_verified")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_unv).unwrap()["error"]["details"]["reason"],
+        "unusable"
+    );
+    backend.set_session_verified(&sid1, true, "usable");
+
+    // 3. list_sessions cursor binds take_id and preserves identical catalog_revision across filters!
+    let (st_all, _, b_all) =
+        http_request(srv.addr, Method::GET, "/api/v1/sessions?limit=1", &[], None).await;
+    assert_eq!(st_all, StatusCode::OK);
+    let page1: Value = serde_json::from_slice(&b_all).unwrap();
+    let rev_all = page1["catalog_revision"].as_str().unwrap().to_owned();
+    let cursor1 = page1["next_cursor"].as_str().unwrap().to_owned();
+
+    let (st_filt, _, b_filt) = http_request(
+        srv.addr,
+        Method::GET,
+        &format!("/api/v1/sessions?take_id={take_other}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_filt, StatusCode::OK);
+    let filt_json: Value = serde_json::from_slice(&b_filt).unwrap();
+    assert_eq!(
+        filt_json["catalog_revision"].as_str(),
+        Some(rev_all.as_str()),
+        "catalog_revision must bind the complete catalog regardless of take_id filter"
+    );
+
+    let (st_bad_cur, hdrs_bad_cur, body_bad_cur) = http_request(
+        srv.addr,
+        Method::GET,
+        &format!("/api/v1/sessions?cursor={cursor1}&take_id={take_other}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_bad_cur, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hdrs_bad_cur
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("invalid_cursor")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_bad_cur).unwrap()["error"]["code"],
+        "invalid_cursor"
+    );
+
+    // 4. POST /api/v1/network/retry unknown transaction -> 404 network_transaction_not_found in BOTH body & header
+    let missing_tx = new_uuid_v7();
+    let (st_nf, hdrs_nf, body_nf) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/retry",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "retry-nf-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-retry-request.v1",
+                "transaction_id": missing_tx
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_nf, StatusCode::NOT_FOUND);
+    assert_eq!(
+        hdrs_nf.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+        Some("network_transaction_not_found")
+    );
+    let nf_json: Value = serde_json::from_slice(&body_nf).unwrap();
+    assert_eq!(nf_json["error"]["code"], "network_transaction_not_found");
+    assert_eq!(nf_json["error"]["details"]["transaction_id"], missing_tx);
+
+    // 5. Network 409 idempotency_conflict includes details { idempotency_scope: "network-mutation", original_transaction_id }
+    let (st_ap1, _, b_ap1) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "net-idem-conflict-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": { "mode": "hotspot", "wifi_client": null, "ethernet": null }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_ap1, StatusCode::ACCEPTED);
+    let orig_tx_id = serde_json::from_slice::<Value>(&b_ap1).unwrap()["transaction"]
+        ["transaction_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (st_ap2, hdrs_ap2, b_ap2) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "net-idem-conflict-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "ethernet-dhcp",
+                    "wifi_client": null,
+                    "ethernet": { "addressing": "dhcp", "static_ipv4": null }
+                }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_ap2, StatusCode::CONFLICT);
+    assert_eq!(
+        hdrs_ap2.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+        Some("idempotency_conflict")
+    );
+    let conflict_doc: Value = serde_json::from_slice(&b_ap2).unwrap();
+    assert_eq!(conflict_doc["error"]["code"], "idempotency_conflict");
+    assert_eq!(
+        conflict_doc["error"]["details"]["idempotency_scope"],
+        "network-mutation"
+    );
+    assert_eq!(
+        conflict_doc["error"]["details"]["original_transaction_id"],
+        orig_tx_id
+    );
+
+    // 6. Duplicate static_ipv4.dns rejected with 400 (uniqueItems: true)
+    let (st_dup_dns, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "net-dup-dns-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "ethernet-static",
+                    "wifi_client": null,
+                    "ethernet": {
+                        "addressing": "static",
+                        "static_ipv4": {
+                            "address": "192.168.10.20",
+                            "prefix_length": 24,
+                            "gateway": "192.168.10.1",
+                            "dns": ["1.1.1.1", "1.1.1.1"]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_dup_dns, StatusCode::BAD_REQUEST);
+
+    // 7. Multi-byte UTF-8 display_name (100 CJK chars = 300 bytes <= 160 chars) accepted, and stop_capture emits SSE snapshot!
+    let cjk_name = "镜".repeat(100);
+    let mut sse_tcp = TcpStream::connect(srv.addr).await.unwrap();
+    let sse_req = format!(
+        "GET /api/v1/capture/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        srv.addr.port()
+    );
+    sse_tcp.write_all(sse_req.as_bytes()).await.unwrap();
+    let mut sse_buf = [0_u8; 4096];
+    let mut sse_acc = Vec::new();
+    while !String::from_utf8_lossy(&sse_acc).contains("event: snapshot") {
+        let n = tokio::time::timeout(Duration::from_secs(1), sse_tcp.read(&mut sse_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        sse_acc.extend_from_slice(&sse_buf[..n]);
+    }
+
+    let (st_start, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "cjk-start-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.capture-start.v1",
+                "mode": "production",
+                "display_name": cjk_name,
+                "take": { "kind": "new" }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_start, StatusCode::ACCEPTED);
+    sse_acc.clear();
+    while !String::from_utf8_lossy(&sse_acc).contains("event: state") {
+        let n = tokio::time::timeout(Duration::from_secs(1), sse_tcp.read(&mut sse_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        sse_acc.extend_from_slice(&sse_buf[..n]);
+    }
+    assert!(String::from_utf8_lossy(&sse_acc).contains("\"state\":\"recording\""));
+
+    let (st_stop, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "cjk-stop-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.capture-stop.v1",
+                "reason": "user"
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_stop, StatusCode::ACCEPTED);
+    sse_acc.clear();
+    while !String::from_utf8_lossy(&sse_acc).contains("event: snapshot") {
+        let n = tokio::time::timeout(Duration::from_secs(1), sse_tcp.read(&mut sse_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        sse_acc.extend_from_slice(&sse_buf[..n]);
+    }
+    assert!(String::from_utf8_lossy(&sse_acc).contains("\"device_state\":\"idle\""));
+    drop(sse_tcp);
+
+    // 8. Disconnected camera returns 503 camera_not_connected on /preview & /preview/h264,
+    // and H264PreviewHub without init_segment returns 503 preview_unavailable!
+    backend.set_camera_connected(false);
+    for prev_path in ["/api/v1/preview", "/api/v1/preview/h264"] {
+        let (st_cam, hdrs_cam, body_cam) =
+            http_request(srv.addr, Method::GET, prev_path, &[], None).await;
+        assert_eq!(
+            st_cam,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "path={prev_path}"
+        );
+        assert_eq!(
+            hdrs_cam
+                .get(HEADER_ERROR_CODE)
+                .and_then(|v| v.to_str().ok()),
+            Some("camera_not_connected")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body_cam).unwrap()["error"]["code"],
+            "camera_not_connected"
+        );
+    }
+    backend.set_camera_connected(true);
+
+    // Clear H.264 init_segment via a fresh custom hub check: verify /preview/h264 without init_segment -> 503 preview_unavailable
+    struct UninitH264Backend {
+        inner: MockGatewayBackend,
+        empty_h264: Arc<miro_ego_api::H264PreviewHub>,
+    }
+    #[async_trait::async_trait]
+    impl GatewayBackend for UninitH264Backend {
+        async fn device_info(&self, sp: miro_ego_api::SecurityProfile) -> miro_ego_api::ApiResult<Value> { self.inner.device_info(sp).await }
+        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_status().await }
+        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_snapshot_event().await }
+        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_readiness().await }
+        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.capture_safe_swap().await }
+        async fn start_capture(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.start_capture(c).await }
+        async fn stop_capture(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.stop_capture(c).await }
+        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_timer().await }
+        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> { self.inner.set_capture_timer(e, d).await }
+        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.camera_focus().await }
+        async fn set_camera_focus(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.set_camera_focus(c).await }
+        async fn list_sessions(&self, q: miro_ego_api::ListSessionsQuery) -> miro_ego_api::ApiResult<Value> { self.inner.list_sessions(q).await }
+        async fn open_session_manifest(&self, s: &str) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> { self.inner.open_session_manifest(s).await }
+        async fn retained_unsuccessful_outcome(&self, s: &str) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.retained_unsuccessful_outcome(s).await }
+        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> { self.inner.artifact_io_busy_state().await }
+        async fn open_session_artifact(&self, s: &str, a: &str) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> { self.inner.open_session_artifact(s, a).await }
+        async fn delete_sessions(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.delete_sessions(c).await }
+        async fn list_logs(&self, q: miro_ego_api::ListLogsQuery) -> miro_ego_api::ApiResult<Value> { self.inner.list_logs(q).await }
+        async fn open_log_file(&self, n: &str) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> { self.inner.open_log_file(n).await }
+        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> { self.inner.preview_mjpeg_hub() }
+        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> { Some(Arc::clone(&self.empty_h264)) }
+        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> { self.inner.capture_event_buffer() }
+        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> { self.inner.network_event_buffer() }
+        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> { self.inner.clock_status(p).await }
+        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> { self.inner.clock_inspect(p).await }
+        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> { self.inner.clock_sync(p, b).await }
+        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.voice_status().await }
+        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> { self.inner.set_voice_volume(v).await }
+        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.network_status().await }
+        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> { self.inner.network_scan().await }
+        async fn create_network_credential(&self, p: &str, pw: &str) -> miro_ego_api::ApiResult<Value> { self.inner.create_network_credential(p, pw).await }
+        async fn apply_network_desired_state(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.apply_network_desired_state(c).await }
+        async fn retry_network_transaction(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.retry_network_transaction(c).await }
+        async fn forget_network_client_profile(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.forget_network_client_profile(c).await }
+        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.firmware_status().await }
+        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> { self.inner.firmware_check(f).await }
+        async fn firmware_update(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.firmware_update(c).await }
+        async fn firmware_rollback(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.firmware_rollback(c).await }
+        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> { self.inner.record_audit(e) }
+        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> { self.inner.get_web_asset(n) }
+    }
+
+    srv.shutdown().await;
+
+    let uninit_backend: Arc<dyn GatewayBackend> = Arc::new(UninitH264Backend {
+        inner: MockGatewayBackend::with_options(false),
+        empty_h264: Arc::new(miro_ego_api::H264PreviewHub::new_fmp4(16)),
+    });
+    let cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
+    let server = GatewayServer::bind(
+        cfg,
+        uninit_backend,
+        Arc::new(SecurityPolicy::lab_default()),
+    )
+    .await
+    .unwrap();
+    let addr2 = server.local_addr();
+    let (tx2, rx2) = oneshot::channel::<()>();
+    let h2 = tokio::spawn(async move {
+        let _ = server
+            .serve_with_graceful_shutdown(async {
+                let _ = rx2.await;
+            })
+            .await;
+    });
+    let (st_uninit, hdrs_uninit, body_uninit) =
+        http_request(addr2, Method::GET, "/api/v1/preview/h264", &[], None).await;
+    assert_eq!(st_uninit, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        hdrs_uninit
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("preview_unavailable")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_uninit).unwrap()["error"]["code"],
+        "preview_unavailable"
+    );
+    let _ = tx2.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), h2).await;
 }

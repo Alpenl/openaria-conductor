@@ -22,7 +22,10 @@ pub use backend::{
     MockArtifact, MockArtifactBacking, MockGatewayBackend, MockLogEntry, MockSession, RawManifest,
     StaticAsset,
 };
-pub use downloads::{DownloadSource, OpenRepresentation, ResolvedRange, open_safe_log_file};
+pub use downloads::{
+    DownloadSource, OpenRepresentation, ResolvedRange, open_safe_log_file, stream_download_body,
+    stream_download_body_with_lease,
+};
 pub use error::{
     API_ERROR_SCHEMA, ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE,
     HEADER_MANIFEST_SHA256, HEADER_WAIT_STATE,

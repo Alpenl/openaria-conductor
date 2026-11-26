@@ -2,7 +2,7 @@
 //! capture SSE events, and zero-copy MJPEG / H.264 preview streaming handlers.
 
 use crate::backend::IdempotentCommand;
-use crate::error::{ApiError, HEADER_ERROR_CODE};
+use crate::error::ApiError;
 use crate::handlers::parse_strict_query;
 use crate::middleware::{
     GatewayState, HeaderExtract, RequestCtx, read_strict_json_object, single_header_str,
@@ -219,7 +219,7 @@ fn validate_capture_start_body(body: &Value) -> Result<(), ApiError> {
     if let Some(name) = obj.get("display_name")
         && !name
             .as_str()
-            .is_some_and(|s| !s.is_empty() && s.len() <= 160)
+            .is_some_and(|s| !s.is_empty() && s.chars().count() <= 160)
     {
         return Err(ApiError::bad_request(
             "display_name must be 1..=160 characters",
@@ -424,24 +424,22 @@ pub async fn stream_capture_events(
         },
     };
     let Ok(permit) = Arc::clone(&state.sse_semaphore).try_acquire_owned() else {
-        return ctx.error_response(
-            ApiError::service_unavailable(
-                "stream_capacity_exhausted",
-                "maximum concurrent SSE connections reached",
-            )
-            .with_header("Retry-After", "1"),
-        );
+        return ctx.error_response(ApiError::stream_capacity_exhausted());
     };
 
-    // Subscribe BEFORE replay_or_snapshot so concurrent publishes never miss a broadcast wakeup.
+    // Subscribe BEFORE replay_or_snapshot_async so concurrent publishes never miss a broadcast wakeup,
+    // and evaluate capture_snapshot_event() INSIDE the publish_count loop to prevent stale anchors.
     let buffer = state.backend.capture_event_buffer();
     let sub = buffer.subscribe();
 
-    let current_snapshot = match state.backend.capture_snapshot_event().await {
-        Ok(snap) => snap,
-        Err(err) => return ctx.error_response(err),
-    };
-    let initial_events = match buffer.replay_or_snapshot(cursor, || Ok(current_snapshot.clone())) {
+    let backend_for_snap = Arc::clone(&state.backend);
+    let initial_events = match buffer
+        .replay_or_snapshot_async(cursor, || {
+            let b = Arc::clone(&backend_for_snap);
+            async move { b.capture_snapshot_event().await }
+        })
+        .await
+    {
         Ok(evs) => evs,
         Err(err) => return ctx.error_response(err),
     };
@@ -506,17 +504,14 @@ pub async fn get_preview(
         fps = Some(valid_fps);
     }
 
-    let Some(hub) = state.backend.preview_mjpeg_hub() else {
-        return ctx.error_response(
-            ApiError::service_unavailable("preview_unavailable", "preview stream is unavailable")
-                .with_header(HEADER_ERROR_CODE, "preview_unavailable"),
-        );
+    let hub = match state.backend.open_preview_mjpeg(fps).await {
+        Ok(h) => h,
+        Err(err) => return ctx.error_response(err),
     };
     let Some(latest) = hub.latest() else {
-        return ctx.error_response(
-            ApiError::service_unavailable("preview_unavailable", "no preview frame available yet")
-                .with_header(HEADER_ERROR_CODE, "preview_unavailable"),
-        );
+        return ctx.error_response(ApiError::preview_unavailable(
+            "no preview frame available yet",
+        ));
     };
 
     let wants_multipart = parts
@@ -544,14 +539,7 @@ pub async fn get_preview(
     }
 
     let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
-        return ctx.error_response(
-            ApiError::service_unavailable(
-                "preview_capacity_exhausted",
-                "maximum concurrent preview streams reached",
-            )
-            .with_header("Retry-After", "1")
-            .with_header(HEADER_ERROR_CODE, "preview_capacity_exhausted"),
-        );
+        return ctx.error_response(ApiError::preview_capacity_exhausted());
     };
     let body = mjpeg_stream_body(hub, fps, latest, permit);
     let mut builder = Response::builder()
@@ -582,20 +570,25 @@ pub async fn get_preview_h264(
         Ok(q) => q,
         Err(err) => return ctx.error_response(err),
     };
+    let mut fps: Option<u32> = None;
+    let mut bitrate_kbps: Option<u32> = None;
     for (k, v) in query {
         match k.as_str() {
             "fps" => {
-                if !v.parse::<u32>().is_ok_and(|n| (1..=60).contains(&n)) {
+                let Some(parsed) = v.parse::<u32>().ok().filter(|n| (1..=60).contains(n)) else {
                     return ctx
                         .error_response(ApiError::bad_request("fps must be an integer in 1..=60"));
-                }
+                };
+                fps = Some(parsed);
             }
             "bitrate_kbps" => {
-                if !v.parse::<u32>().is_ok_and(|n| (256..=16_000).contains(&n)) {
+                let Some(parsed) = v.parse::<u32>().ok().filter(|n| (256..=16_000).contains(n))
+                else {
                     return ctx.error_response(ApiError::bad_request(
                         "bitrate_kbps must be an integer in 256..=16000",
                     ));
-                }
+                };
+                bitrate_kbps = Some(parsed);
             }
             _ => {
                 return ctx.error_response(ApiError::bad_request(
@@ -605,24 +598,23 @@ pub async fn get_preview_h264(
         }
     }
 
-    let Some(hub) = state.backend.preview_h264_hub() else {
-        return ctx.error_response(ApiError::preview_h264_unsupported());
+    let hub = match state.backend.open_preview_h264(fps, bitrate_kbps).await {
+        Ok(h) => h,
+        Err(err) => return ctx.error_response(err),
     };
     let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
-        return ctx.error_response(
-            ApiError::service_unavailable(
-                "preview_capacity_exhausted",
-                "maximum concurrent preview streams reached",
-            )
-            .with_header("Retry-After", "1")
-            .with_header(HEADER_ERROR_CODE, "preview_capacity_exhausted"),
-        );
+        return ctx.error_response(ApiError::preview_capacity_exhausted());
     };
 
     let rx = hub.subscribe();
-    let init = hub.init_segment().await;
+    let Some(init) = hub.init_segment().await else {
+        return ctx.error_response(ApiError::preview_unavailable(
+            "H.264 preview initialization segment is not available yet",
+        ));
+    };
+    hub.record_stream_hints(fps, bitrate_kbps);
     let content_type = hub.content_type().to_owned();
-    let body = h264_stream_body(init, rx, permit);
+    let body = h264_stream_body(Some(init), rx, permit);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)

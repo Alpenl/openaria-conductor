@@ -2,13 +2,14 @@
 //! verified artifact Range/HEAD streaming with page-cache eviction, and idempotent deletion.
 
 use crate::backend::{IdempotentCommand, ListSessionsQuery};
-use crate::downloads::{resolve_range_selection, stream_download_body};
+use crate::downloads::{resolve_range_selection, stream_download_body_with_lease};
 use crate::error::{ApiError, HEADER_MANIFEST_SHA256};
 use crate::handlers::{DownloadResponseMeta, build_download_response, parse_strict_query};
 use crate::middleware::{
     GatewayState, HeaderExtract, RequestCtx, read_strict_json_object, single_header,
 };
 use axum::body::Body;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
@@ -89,7 +90,7 @@ pub async fn list_sessions(
 /// `GET /api/v1/sessions/{session_id}` (`getSession`)
 pub async fn get_session_manifest(
     State(state): State<Arc<GatewayState>>,
-    Path(session_id): Path<String>,
+    path_res: Result<Path<String>, PathRejection>,
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -97,6 +98,9 @@ pub async fn get_session_manifest(
     let principal = match ctx.authenticate_for_operation(&state, &headers, "getSession") {
         Ok(p) => p,
         Err(resp) => return *resp,
+    };
+    let Ok(Path(session_id)) = path_res else {
+        return ctx.error_response(ApiError::not_found("session not found"));
     };
     if !is_valid_uuid_v7(&session_id) {
         return ctx.error_response(ApiError::not_found("session not found"));
@@ -136,7 +140,7 @@ pub async fn get_session_manifest(
 /// `GET /api/v1/sessions/{session_id}/unsuccessful-outcome` (`getRetainedUnsuccessfulSessionOutcome`)
 pub async fn get_unsuccessful_outcome(
     State(state): State<Arc<GatewayState>>,
-    Path(session_id): Path<String>,
+    path_res: Result<Path<String>, PathRejection>,
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -148,6 +152,9 @@ pub async fn get_unsuccessful_outcome(
     ) {
         Ok(p) => p,
         Err(resp) => return *resp,
+    };
+    let Ok(Path(session_id)) = path_res else {
+        return ctx.error_response(ApiError::not_found("session not found"));
     };
     if !is_valid_uuid_v7(&session_id) {
         return ctx.error_response(ApiError::not_found("session not found"));
@@ -177,7 +184,7 @@ pub async fn get_unsuccessful_outcome(
 /// (`getSessionArtifact` / `headSessionArtifact`)
 pub async fn session_artifact(
     State(state): State<Arc<GatewayState>>,
-    Path((session_id, artifact_id)): Path<(String, String)>,
+    path_res: Result<Path<(String, String)>, PathRejection>,
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -191,6 +198,9 @@ pub async fn session_artifact(
     let principal = match ctx.authenticate_for_operation(&state, &headers, op_id) {
         Ok(p) => p,
         Err(resp) => return *resp,
+    };
+    let Ok(Path((session_id, artifact_id))) = path_res else {
+        return ctx.error_response(ApiError::not_found("artifact not found"));
     };
     if !is_valid_uuid_v7(&session_id) || !is_valid_sha256(&artifact_id) {
         return ctx.error_response(ApiError::not_found("artifact not found"));
@@ -207,6 +217,11 @@ pub async fn session_artifact(
         Ok(None) => {}
         Err(err) => return ctx.error_response(err),
     }
+
+    // Shared artifact download lease preventing concurrent session deletion while streaming.
+    let Ok(delete_lease) = Arc::clone(&state.artifact_delete_gate).try_read_owned() else {
+        return ctx.error_response(ApiError::capture_busy("finalizing", 1));
+    };
 
     // Bounded concurrent download semaphore.
     let Ok(permit) = Arc::clone(&state.download_semaphore).try_acquire_owned() else {
@@ -251,15 +266,17 @@ pub async fn session_artifact(
         .content_range
         .map(|r| r.content_range_header(representation.size));
     let body = if head {
+        drop(delete_lease);
         drop(permit);
         Body::empty()
     } else {
-        stream_download_body(
+        stream_download_body_with_lease(
             representation.source,
             resolved.offset,
             resolved.length,
             state.config.download_chunk_bytes,
             permit,
+            Some(delete_lease),
         )
     };
 
@@ -284,7 +301,11 @@ pub async fn delete_sessions(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "deleteSessions") {
+    let (principal, key) = match ctx.authorize_resource_command_headers(
+        &state,
+        &parts.headers,
+        "deleteSessions",
+    ) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -292,9 +313,44 @@ pub async fn delete_sessions(
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
-    if let Err(err) = validate_delete_sessions_body(&json) {
-        return ctx.error_response(err);
+    let target_sids = match validate_delete_sessions_body(&json) {
+        Ok(ids) => ids,
+        Err(err) => return ctx.error_response(err),
+    };
+
+    // Enforce per-session authorization when `deleteSessions` is resource-scoped on `Principal`.
+    if !principal.permits("deleteSessions", None) {
+        for sid in &target_sids {
+            if !principal.permits("deleteSessions", Some(sid.as_str())) {
+                ctx.audit(
+                    &state,
+                    "deleteSessions",
+                    Some(sid.as_str()),
+                    "forbidden",
+                    Some(&principal),
+                );
+                return ctx.error_response(ApiError::forbidden(
+                    "forbidden",
+                    "principal is not authorized for this operation or resource",
+                ));
+            }
+        }
+        if !ctx.audit(&state, "deleteSessions", None, "allowed", Some(&principal)) {
+            return ctx.error_response(ApiError::audit_unavailable());
+        }
     }
+
+    // Open downloads block session deletion per OpenAPI `deleteSessions` contract (`openapi.yaml:529-530`).
+    let Ok(_delete_guard) = Arc::clone(&state.artifact_delete_gate).try_write_owned() else {
+        return ctx.error_response(
+            ApiError::conflict(
+                "open_downloads",
+                "cannot delete sessions while artifact downloads are open",
+            )
+            .with_retryable(true),
+        );
+    };
+
     let cmd = IdempotentCommand {
         principal_id: principal.principal_id().to_owned(),
         idempotency_key: key,
@@ -325,7 +381,7 @@ pub async fn delete_sessions(
     }
 }
 
-fn validate_delete_sessions_body(body: &Value) -> Result<(), ApiError> {
+fn validate_delete_sessions_body(body: &Value) -> Result<Vec<String>, ApiError> {
     let Some(obj) = body.as_object() else {
         return Err(ApiError::bad_request(
             "delete request must be a JSON object",
@@ -347,6 +403,7 @@ fn validate_delete_sessions_body(body: &Value) -> Result<(), ApiError> {
         ));
     }
     let mut seen = HashSet::with_capacity(items.len());
+    let mut ordered_ids = Vec::with_capacity(items.len());
     for item in items {
         let Some(entry) = item.as_object() else {
             return Err(ApiError::bad_request(
@@ -369,6 +426,7 @@ fn validate_delete_sessions_body(body: &Value) -> Result<(), ApiError> {
                 "duplicate or invalid session_id / manifest_sha256",
             ));
         }
+        ordered_ids.push(sid.to_owned());
     }
-    Ok(())
+    Ok(ordered_ids)
 }

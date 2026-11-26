@@ -21,7 +21,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit};
 
 /// Backing byte source for an opened downloadable representation (artifact or log file).
 pub enum DownloadSource {
@@ -149,7 +149,21 @@ pub fn stream_download_body(
     chunk_bytes: usize,
     permit: OwnedSemaphorePermit,
 ) -> axum::body::Body {
+    stream_download_body_with_lease(source, offset, length, chunk_bytes, permit, None)
+}
+
+/// Build an async streaming `axum::body::Body` holding both `permit` and an optional
+/// shared artifact-delete read lease until streaming finishes or the client disconnects.
+pub fn stream_download_body_with_lease(
+    source: DownloadSource,
+    offset: u64,
+    length: u64,
+    chunk_bytes: usize,
+    permit: OwnedSemaphorePermit,
+    delete_lease: Option<OwnedRwLockReadGuard<()>>,
+) -> axum::body::Body {
     if length == 0 {
+        drop(delete_lease);
         drop(permit);
         return axum::body::Body::empty();
     }
@@ -159,6 +173,7 @@ pub fn stream_download_body(
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
             tokio::spawn(async move {
                 let _permit = permit;
+                let _delete_lease = delete_lease;
                 let mut pos = offset as usize;
                 let end = (offset.saturating_add(length) as usize).min(bytes.len());
                 while pos < end {
@@ -176,6 +191,7 @@ pub fn stream_download_body(
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
             tokio::spawn(async move {
                 let _permit = permit;
+                let _delete_lease = delete_lease;
                 if let (Ok(off_i64), Ok(len_i64)) = (i64::try_from(offset), i64::try_from(length)) {
                     let _ = fadvise_sequential(file.as_raw_fd(), off_i64, len_i64);
                 }
@@ -337,8 +353,21 @@ pub fn open_safe_log_file(logs_root: &Path, relative_name: &str) -> ApiResult<Op
     let size = u64::try_from(stat.st_size)
         .map_err(|_| ApiError::internal("invalid_source_state", "negative log file size"))?;
 
-    // Compute strong SHA-256 ETag matching OpenAPI `^"[0-9a-f]{64}"$` while evicting clean pages.
+    // Compute strong SHA-256 ETag matching OpenAPI `^"[0-9a-f]{64}"$` while evicting clean pages,
+    // verifying post-read `fstat` so concurrently truncated/rotated logs never mismatch ETag vs size.
     let etag_hex = sha256_fd(&file, size)?;
+    let after = fstat(file.as_raw_fd()).map_err(|err| map_log_open_error(err, relative_name))?;
+    let after_size = u64::try_from(after.st_size)
+        .map_err(|_| ApiError::internal("invalid_source_state", "negative log file size"))?;
+    if after.st_dev != stat.st_dev
+        || after_size != size
+        || after.st_mtime != stat.st_mtime
+        || after.st_mtime_nsec != stat.st_mtime_nsec
+    {
+        return Err(ApiError::storage_unavailable(
+            "diagnostic log file changed concurrently during read; retry",
+        ));
+    }
     let etag = format!("\"{etag_hex}\"");
     let media_type = infer_log_media_type(relative_name);
     let safe_filename = leaf.replace('"', "");
@@ -362,13 +391,20 @@ fn sha256_fd(file: &File, size: u64) -> ApiResult<String> {
         let n = pread_retry(fd, &mut buf[..want], off_t)
             .map_err(|err| ApiError::provider_failure(format!("read log file: {err}")))?;
         if n == 0 {
-            break;
+            return Err(ApiError::storage_unavailable(
+                "diagnostic log file was truncated during read; retry",
+            ));
         }
         hasher.update(&buf[..n]);
         if let (Ok(adv_off), Ok(adv_len)) = (i64::try_from(offset), i64::try_from(n)) {
             let _ = fadvise_dontneed(fd, adv_off, adv_len);
         }
         offset = offset.saturating_add(n as u64);
+    }
+    if offset != size {
+        return Err(ApiError::storage_unavailable(
+            "diagnostic log file size changed during read; retry",
+        ));
     }
     Ok(hex_encode(&hasher.finalize()))
 }
@@ -379,5 +415,31 @@ fn map_log_open_error(err: io::Error, _name: &str) -> ApiError {
             ApiError::not_found("diagnostic log file not found")
         }
         _ => ApiError::storage_unavailable(format!("failed to read diagnostic log: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sha256_fd_rejects_mid_read_file_truncation_with_503_storage_unavailable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "miro-ego-log-trunc-{}-{unique}.log",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"short-payload").unwrap();
+        let file = File::open(&path).unwrap();
+        // Simulate pre-stat seeing 4096 bytes before concurrent O_TRUNC shrank the file to 13 bytes.
+        let err = sha256_fd(&file, 4096).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.status_code, 503);
+        assert_eq!(err.code, "storage_unavailable");
+        assert!(err.retryable);
     }
 }

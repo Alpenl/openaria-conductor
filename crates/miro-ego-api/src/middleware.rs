@@ -59,6 +59,7 @@ pub struct GatewayState {
     pub config: GatewayRuntimeConfig,
     pub allowed_hosts: Arc<HashSet<String>>,
     pub download_semaphore: Arc<Semaphore>,
+    pub artifact_delete_gate: Arc<tokio::sync::RwLock<()>>,
     pub sse_semaphore: Arc<Semaphore>,
     pub preview_semaphore: Arc<Semaphore>,
     pub firmware_semaphore: Arc<Semaphore>,
@@ -81,6 +82,7 @@ impl GatewayState {
             config,
             allowed_hosts: Arc::new(allowed_hosts),
             download_semaphore: Arc::new(Semaphore::new(max_downloads)),
+            artifact_delete_gate: Arc::new(tokio::sync::RwLock::new(())),
             sse_semaphore: Arc::new(Semaphore::new(max_sse)),
             preview_semaphore: Arc::new(Semaphore::new(max_preview)),
             firmware_semaphore: Arc::new(Semaphore::new(max_fw)),
@@ -153,7 +155,37 @@ impl RequestCtx {
         headers: &HeaderMap,
         operation_id: &str,
     ) -> Result<Principal, Box<Response<Body>>> {
-        let principal = self.authorize_inner(state, headers, operation_id, None, false)?;
+        self.authorize_write_inner(state, headers, operation_id, true, true)
+    }
+
+    fn authorize_write_inner(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+        require_unscoped_permission: bool,
+        emit_allowed_audit: bool,
+    ) -> Result<Principal, Box<Response<Body>>> {
+        let (principal, authenticated_bearer) =
+            self.authenticate_caller(state, headers, operation_id, None)?;
+        let permitted = if require_unscoped_permission {
+            principal.permits(operation_id, None)
+        } else {
+            principal.permissions().contains_key(operation_id)
+        };
+        if !permitted {
+            self.audit(
+                state,
+                operation_id,
+                None,
+                "forbidden",
+                Some(&principal),
+            );
+            return Err(Box::new(self.error_response(ApiError::forbidden(
+                "forbidden",
+                "principal is not authorized for this operation or resource",
+            ))));
+        }
 
         let origin_ext = single_header(headers, header::ORIGIN);
         if state.security.profile() == SecurityProfile::Customer {
@@ -200,7 +232,12 @@ impl RequestCtx {
         let csrf_ok = match csrf_header {
             HeaderExtract::Multiple => false,
             HeaderExtract::Missing => !csrf_required,
-            HeaderExtract::Single(val) => !csrf_required || state.security.verify_csrf(Some(val)),
+            HeaderExtract::Single(val) => {
+                !csrf_required
+                    || state
+                        .security
+                        .verify_csrf_for_caller(Some(val), authenticated_bearer.as_deref())
+            }
         };
         if !csrf_ok {
             self.audit(
@@ -216,7 +253,8 @@ impl RequestCtx {
             ))));
         }
 
-        if !self.audit(state, operation_id, None, "allowed", Some(&principal)) {
+        if emit_allowed_audit && !self.audit(state, operation_id, None, "allowed", Some(&principal))
+        {
             return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
         }
         Ok(principal)
@@ -240,6 +278,29 @@ impl RequestCtx {
         }
     }
 
+    /// Authenticate & CSRF-validate a resource-scoped idempotent command (`deleteSessions`)
+    /// before per-target resource IDs are inspected in the JSON body.
+    pub fn authorize_resource_command_headers(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+    ) -> Result<(Principal, String), Box<Response<Body>>> {
+        let principal = self.authorize_write_inner(state, headers, operation_id, false, false)?;
+        let unscoped = principal.permits(operation_id, None);
+        if unscoped && !self.audit(state, operation_id, None, "allowed", Some(&principal)) {
+            return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
+        }
+        match single_header_str(headers, "idempotency-key") {
+            HeaderExtract::Single(key) if is_valid_idempotency_key(key) => {
+                Ok((principal, key.to_owned()))
+            }
+            _ => Err(Box::new(self.error_response(ApiError::bad_request(
+                "Idempotency-Key header is missing or invalid",
+            )))),
+        }
+    }
+
     /// Authenticate a caller (`Host`, `Origin`, Bearer token) and verify operation-level permission
     /// BEFORE validating parameterized path segments. Guarantees unauthenticated Customer callers
     /// always fail closed with `401 Unauthorized` even for malformed session IDs or log traversal paths.
@@ -249,7 +310,7 @@ impl RequestCtx {
         headers: &HeaderMap,
         operation_id: &str,
     ) -> Result<Principal, Box<Response<Body>>> {
-        let principal = self.authenticate_caller(state, headers, operation_id, None)?;
+        let (principal, _) = self.authenticate_caller(state, headers, operation_id, None)?;
         if !principal.permissions().contains_key(operation_id) {
             self.audit(state, operation_id, None, "forbidden", Some(&principal));
             return Err(Box::new(self.error_response(ApiError::forbidden(
@@ -294,7 +355,7 @@ impl RequestCtx {
         headers: &HeaderMap,
         operation_id: &str,
         resource_id: Option<&str>,
-    ) -> Result<Principal, Box<Response<Body>>> {
+    ) -> Result<(Principal, Option<String>), Box<Response<Body>>> {
         // 1. Host allowlist (anti-DNS-rebinding)
         let host_value = match single_header(headers, header::HOST) {
             HeaderExtract::Single(h) if is_allowed_gateway_host(h, &state.allowed_hosts) => Some(h),
@@ -348,13 +409,14 @@ impl RequestCtx {
                 ))));
             }
         };
-        let Some(principal) = state.security.authenticate(auth_header).cloned() else {
+        let Some((principal, bearer_tok)) = state.security.authenticate_with_token(auth_header)
+        else {
             self.audit(state, operation_id, resource_id, "unauthorized", None);
             return Err(Box::new(self.error_response(ApiError::unauthorized(
                 "bearer credential is missing or invalid",
             ))));
         };
-        Ok(principal)
+        Ok((principal.clone(), bearer_tok.map(str::to_owned)))
     }
 
     fn authorize_inner(
@@ -365,7 +427,8 @@ impl RequestCtx {
         resource_id: Option<&str>,
         emit_allowed_audit: bool,
     ) -> Result<Principal, Box<Response<Body>>> {
-        let principal = self.authenticate_caller(state, headers, operation_id, resource_id)?;
+        let (principal, _) =
+            self.authenticate_caller(state, headers, operation_id, resource_id)?;
 
         // 4. Operation / resource permission
         if !principal.permits(operation_id, resource_id) {

@@ -74,13 +74,7 @@ pub async fn stream_network_events(
         },
     };
     let Ok(permit) = Arc::clone(&state.sse_semaphore).try_acquire_owned() else {
-        return ctx.error_response(
-            ApiError::service_unavailable(
-                "stream_capacity_exhausted",
-                "maximum concurrent SSE connections reached",
-            )
-            .with_header("Retry-After", "1"),
-        );
+        return ctx.error_response(ApiError::stream_capacity_exhausted());
     };
 
     // Subscribe BEFORE replay_or_snapshot so concurrent publishes never miss a broadcast wakeup.
@@ -458,11 +452,15 @@ fn validate_desired_ethernet(value: &Value) -> Result<(), ApiError> {
                 _ => false,
             };
             let dns_ok = s.get("dns").and_then(Value::as_array).is_some_and(|arr| {
-                arr.len() <= 3
-                    && arr.iter().all(|item| {
-                        item.as_str()
-                            .is_some_and(|ip| ip.parse::<Ipv4Addr>().is_ok())
-                    })
+                if arr.len() > 3 {
+                    return false;
+                }
+                let mut seen = std::collections::HashSet::with_capacity(arr.len());
+                arr.iter().all(|item| {
+                    item.as_str()
+                        .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+                        .is_some_and(|parsed| seen.insert(parsed))
+                })
             });
             if !(addr_ok && prefix_ok && gw_ok && dns_ok) {
                 return Err(ApiError::bad_request("invalid static_ipv4 parameters"));

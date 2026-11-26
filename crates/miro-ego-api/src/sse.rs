@@ -198,15 +198,48 @@ impl EventReplayBuffer {
     where
         F: Fn() -> ApiResult<Value>,
     {
-        if let Some(EventCursor::Exact(cursor_id)) = cursor {
-            let guard = self.inner.lock().map_err(|_| {
-                ApiError::internal("state_poisoned", "capture replay buffer poisoned")
-            })?;
-            if let Some(replayed) = replay_after_locked(&guard, cursor_id) {
-                return Ok(replayed);
+        let after_cursor = match cursor {
+            Some(EventCursor::Exact(cursor_id)) => {
+                let guard = self.inner.lock().map_err(|_| {
+                    ApiError::internal("state_poisoned", "capture replay buffer poisoned")
+                })?;
+                if let Some(replayed) = replay_after_locked(&guard, cursor_id) {
+                    return Ok(replayed);
+                }
+                Some(cursor_id)
             }
-        }
-        let snapshot_event = self.issue_resync_snapshot(snapshot_fn)?;
+            _ => None,
+        };
+        let snapshot_event = self.issue_resync_snapshot_with_cursor(after_cursor, snapshot_fn)?;
+        Ok(vec![snapshot_event])
+    }
+
+    /// Async variant of [`Self::replay_or_snapshot`] that evaluates `snapshot_fn` inside the
+    /// optimistic `publish_count` retry loop so concurrent publishes during `.await` are never dropped.
+    pub async fn replay_or_snapshot_async<F, Fut>(
+        &self,
+        cursor: Option<EventCursor>,
+        snapshot_fn: F,
+    ) -> ApiResult<Vec<SseEvent>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ApiResult<Value>>,
+    {
+        let after_cursor = match cursor {
+            Some(EventCursor::Exact(cursor_id)) => {
+                let guard = self.inner.lock().map_err(|_| {
+                    ApiError::internal("state_poisoned", "capture replay buffer poisoned")
+                })?;
+                if let Some(replayed) = replay_after_locked(&guard, cursor_id) {
+                    return Ok(replayed);
+                }
+                Some(cursor_id)
+            }
+            _ => None,
+        };
+        let snapshot_event = self
+            .issue_resync_snapshot_with_cursor_async(after_cursor, snapshot_fn)
+            .await?;
         Ok(vec![snapshot_event])
     }
 
@@ -223,9 +256,20 @@ impl EventReplayBuffer {
     where
         F: Fn() -> ApiResult<Value>,
     {
+        self.issue_resync_snapshot_with_cursor(None, snapshot_fn)
+    }
+
+    pub fn issue_resync_snapshot_with_cursor<F>(
+        &self,
+        after_cursor: Option<u64>,
+        snapshot_fn: F,
+    ) -> ApiResult<SseEvent>
+    where
+        F: Fn() -> ApiResult<Value>,
+    {
         let mut last_snapshot = None;
         let mut publish_before = 0;
-        for _ in 0..3 {
+        for _ in 0..8 {
             publish_before = {
                 let guard = self.inner.lock().map_err(|_| {
                     ApiError::internal("state_poisoned", "capture replay buffer poisoned")
@@ -248,6 +292,7 @@ impl EventReplayBuffer {
                     &mut guard,
                     snap,
                     publish_before,
+                    after_cursor,
                     CAPTURE_EVENT_SCHEMA,
                 ));
             }
@@ -265,6 +310,7 @@ impl EventReplayBuffer {
             &mut guard,
             snap,
             publish_before,
+            after_cursor,
             CAPTURE_EVENT_SCHEMA,
         ))
     }
@@ -273,6 +319,19 @@ impl EventReplayBuffer {
     /// snapshot without holding the internal mutex across `.await`.
     pub async fn issue_resync_snapshot_async<F, Fut>(
         &self,
+        snapshot_fn: F,
+    ) -> ApiResult<SseEvent>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ApiResult<Value>>,
+    {
+        self.issue_resync_snapshot_with_cursor_async(None, snapshot_fn)
+            .await
+    }
+
+    pub async fn issue_resync_snapshot_with_cursor_async<F, Fut>(
+        &self,
+        after_cursor: Option<u64>,
         mut snapshot_fn: F,
     ) -> ApiResult<SseEvent>
     where
@@ -281,7 +340,7 @@ impl EventReplayBuffer {
     {
         let mut last_snapshot = None;
         let mut publish_before = 0;
-        for _ in 0..3 {
+        for _ in 0..8 {
             publish_before = {
                 let guard = self.inner.lock().map_err(|_| {
                     ApiError::internal("state_poisoned", "capture replay buffer poisoned")
@@ -304,6 +363,7 @@ impl EventReplayBuffer {
                     &mut guard,
                     snap,
                     publish_before,
+                    after_cursor,
                     CAPTURE_EVENT_SCHEMA,
                 ));
             }
@@ -321,6 +381,7 @@ impl EventReplayBuffer {
             &mut guard,
             snap,
             publish_before,
+            after_cursor,
             CAPTURE_EVENT_SCHEMA,
         ))
     }
@@ -330,8 +391,16 @@ fn allocate_resync_anchor_locked(
     guard: &mut ReplayInner,
     source_event: Value,
     next_publish_index: u64,
+    after_cursor: Option<u64>,
     schema: &'static str,
 ) -> SseEvent {
+    // Never allow an untrusted Last-Event-ID to jump `next_delivery_id` arbitrarily;
+    // only bump by 1 on an exact collision with the next sequential ID.
+    if let Some(cursor) = after_cursor
+        && cursor == guard.next_delivery_id
+    {
+        guard.next_delivery_id = guard.next_delivery_id.saturating_add(1);
+    }
     let delivery_id = guard.next_delivery_id;
     guard.next_delivery_id = guard.next_delivery_id.saturating_add(1);
     guard.resync_anchors.insert(
@@ -867,18 +936,12 @@ fn issue_network_resync_locked(
     map.insert("transaction_id".to_owned(), Value::Null);
     map.insert("data".to_owned(), selected);
 
-    // Never allow an untrusted Last-Event-ID to jump `next_delivery_id` arbitrarily;
-    // only bump by 1 on an exact collision with the next sequential ID.
-    if let Some(cursor) = after_cursor
-        && cursor == guard.replay.next_delivery_id
-    {
-        guard.replay.next_delivery_id = guard.replay.next_delivery_id.saturating_add(1);
-    }
     let publish_index = guard.replay.publish_count;
     Ok(allocate_resync_anchor_locked(
         &mut guard.replay,
         Value::Object(map),
         publish_index,
+        after_cursor,
         NETWORK_EVENT_SCHEMA,
     ))
 }
@@ -934,10 +997,13 @@ pub fn capture_sse_body(
                                 Ok(None) => {
                                     let backend_ref = Arc::clone(&backend);
                                     match buffer
-                                        .issue_resync_snapshot_async(|| {
-                                            let b = Arc::clone(&backend_ref);
-                                            async move { b.capture_snapshot_event().await }
-                                        })
+                                        .issue_resync_snapshot_with_cursor_async(
+                                            Some(cursor),
+                                            || {
+                                                let b = Arc::clone(&backend_ref);
+                                                async move { b.capture_snapshot_event().await }
+                                            },
+                                        )
                                         .await
                                     {
                                         Ok(snap) => vec![snap],

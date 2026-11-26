@@ -9,8 +9,8 @@
     {
       "major": 1,
       "path": "contracts/miro-ego-device-v1.openapi.yaml",
-      "sha256": "83a7b0caac1982a08d3a27fec56027233b440d75964c03904b0a6f921a379b61",
-      "bytes": 160114,
+      "sha256": "e4ef1e299cf296e70393fe382a9b9401b62380c3ec77297428d970747c919cd5",
+      "bytes": 163054,
       "info_version": "1.0.0",
       "server_base_path": "/api/v1",
       "lifecycle": "current"

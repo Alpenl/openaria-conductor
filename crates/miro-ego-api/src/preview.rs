@@ -152,6 +152,7 @@ pub fn mjpeg_stream_body(
 pub struct H264PreviewHub {
     content_type: String,
     init_segment: RwLock<Option<Arc<Bytes>>>,
+    last_hints: std::sync::Mutex<(Option<u32>, Option<u32>)>,
     tx: broadcast::Sender<Arc<Bytes>>,
 }
 
@@ -169,12 +170,25 @@ impl H264PreviewHub {
         Self {
             content_type: content_type.into(),
             init_segment: RwLock::new(None),
+            last_hints: std::sync::Mutex::new((None, None)),
             tx,
         }
     }
 
     pub fn content_type(&self) -> &str {
         &self.content_type
+    }
+
+    /// Record optional caller-requested `(fps, bitrate_kbps)` upper-bound hints.
+    pub fn record_stream_hints(&self, fps: Option<u32>, bitrate_kbps: Option<u32>) {
+        if let Ok(mut guard) = self.last_hints.lock() {
+            *guard = (fps, bitrate_kbps);
+        }
+    }
+
+    /// Return the most recent caller-requested `(fps, bitrate_kbps)` stream hints.
+    pub fn last_stream_hints(&self) -> (Option<u32>, Option<u32>) {
+        self.last_hints.lock().map(|g| *g).unwrap_or((None, None))
     }
 
     /// Store or update the initialization segment (e.g. fMP4 `ftyp+moov` or SPS/PPS header).
