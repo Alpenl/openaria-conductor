@@ -83,12 +83,15 @@ pub async fn stream_network_events(
         );
     };
 
+    // Subscribe BEFORE replay_or_snapshot so concurrent publishes never miss a broadcast wakeup.
+    let buffer = state.backend.network_event_buffer();
+    let sub = buffer.subscribe();
+
     let current_status = match state.backend.network_status().await {
         Ok(s) => s,
         Err(err) => return ctx.error_response(err),
     };
-    let buffer = state.backend.network_event_buffer();
-    let initial_events = match buffer.replay_or_snapshot(cursor, current_status.clone()) {
+    let initial_events = match buffer.replay_or_snapshot(cursor, current_status) {
         Ok(evs) => evs,
         Err(err) => return ctx.error_response(err),
     };
@@ -101,13 +104,13 @@ pub async fn stream_network_events(
         })
         .unwrap_or(0);
 
-    let fallback_status = current_status;
     let body = network_sse_body(
         buffer,
+        sub,
+        Arc::clone(&state.backend),
         initial_events,
         initial_cursor,
         state.config.sse_heartbeat_interval,
-        move || Ok(fallback_status.clone()),
         permit,
     );
 

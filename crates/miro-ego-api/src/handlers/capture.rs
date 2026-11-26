@@ -433,12 +433,14 @@ pub async fn stream_capture_events(
         );
     };
 
-    // Fetch current snapshot eagerly once so replay/resync can operate synchronously without blocking.
+    // Subscribe BEFORE replay_or_snapshot so concurrent publishes never miss a broadcast wakeup.
+    let buffer = state.backend.capture_event_buffer();
+    let sub = buffer.subscribe();
+
     let current_snapshot = match state.backend.capture_snapshot_event().await {
         Ok(snap) => snap,
         Err(err) => return ctx.error_response(err),
     };
-    let buffer = state.backend.capture_event_buffer();
     let initial_events = match buffer.replay_or_snapshot(cursor, || Ok(current_snapshot.clone())) {
         Ok(evs) => evs,
         Err(err) => return ctx.error_response(err),
@@ -452,13 +454,13 @@ pub async fn stream_capture_events(
         })
         .unwrap_or(0);
 
-    let fallback_snapshot = current_snapshot;
     let body = capture_sse_body(
         buffer,
+        sub,
+        Arc::clone(&state.backend),
         initial_events,
         initial_cursor,
         state.config.sse_heartbeat_interval,
-        move || Ok(fallback_snapshot.clone()),
         permit,
     );
 

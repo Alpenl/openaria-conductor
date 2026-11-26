@@ -3,11 +3,13 @@
 //! `Last-Event-ID` handling (never advancing internal monotonic delivery IDs), and
 //! configurable heartbeat keepalives.
 
+use crate::backend::GatewayBackend;
 use crate::error::{ApiError, ApiResult};
 use bytes::Bytes;
 use futures_util::Stream;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -254,6 +256,62 @@ impl EventReplayBuffer {
         let snap = match last_snapshot {
             Some(s) => s,
             None => snapshot_fn()?,
+        };
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ApiError::internal("state_poisoned", "capture replay buffer poisoned"))?;
+        Ok(allocate_resync_anchor_locked(
+            &mut guard,
+            snap,
+            publish_before,
+            CAPTURE_EVENT_SCHEMA,
+        ))
+    }
+
+    /// Async variant of [`Self::issue_resync_snapshot`] that fetches a fresh authoritative
+    /// snapshot without holding the internal mutex across `.await`.
+    pub async fn issue_resync_snapshot_async<F, Fut>(
+        &self,
+        mut snapshot_fn: F,
+    ) -> ApiResult<SseEvent>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ApiResult<Value>>,
+    {
+        let mut last_snapshot = None;
+        let mut publish_before = 0;
+        for _ in 0..3 {
+            publish_before = {
+                let guard = self.inner.lock().map_err(|_| {
+                    ApiError::internal("state_poisoned", "capture replay buffer poisoned")
+                })?;
+                guard.publish_count
+            };
+            let snap = snapshot_fn().await?;
+            let event_type = extract_event_type(&snap)?;
+            if event_type != "snapshot" {
+                return Err(ApiError::internal(
+                    "invalid_source_event",
+                    "capture snapshot callback must return type=snapshot",
+                ));
+            }
+            let mut guard = self.inner.lock().map_err(|_| {
+                ApiError::internal("state_poisoned", "capture replay buffer poisoned")
+            })?;
+            if guard.publish_count == publish_before {
+                return Ok(allocate_resync_anchor_locked(
+                    &mut guard,
+                    snap,
+                    publish_before,
+                    CAPTURE_EVENT_SCHEMA,
+                ));
+            }
+            last_snapshot = Some(snap);
+        }
+        let snap = match last_snapshot {
+            Some(s) => s,
+            None => snapshot_fn().await?,
         };
         let mut guard = self
             .inner
@@ -830,22 +888,23 @@ fn issue_network_resync_locked(
 // ---------------------------------------------------------------------------
 
 /// Build an async `axum::body::Body` for capture SSE streaming.
-pub fn capture_sse_body<F>(
+///
+/// `sub` MUST be subscribed BEFORE calling `replay_or_snapshot` so events published between
+/// replay and live streaming never miss a broadcast wakeup. Lagged resyncs always fetch a
+/// fresh authoritative snapshot from `backend`.
+pub fn capture_sse_body(
     buffer: Arc<EventReplayBuffer>,
+    mut sub: broadcast::Receiver<u64>,
+    backend: Arc<dyn GatewayBackend>,
     initial_events: Vec<SseEvent>,
     initial_cursor: u64,
     heartbeat_interval: Duration,
-    snapshot_fn: F,
     permit: OwnedSemaphorePermit,
-) -> axum::body::Body
-where
-    F: Fn() -> ApiResult<Value> + Send + Sync + 'static,
-{
+) -> axum::body::Body {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
         let _permit = permit;
         let mut cursor = initial_cursor;
-        let mut sub = buffer.subscribe();
 
         for event in initial_events {
             match event.encode() {
@@ -872,10 +931,19 @@ where
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                             let batch = match buffer.try_events_after(cursor) {
                                 Ok(Some(events)) => events,
-                                Ok(None) => match buffer.issue_resync_snapshot(&snapshot_fn) {
-                                    Ok(snap) => vec![snap],
-                                    Err(_) => return,
-                                },
+                                Ok(None) => {
+                                    let backend_ref = Arc::clone(&backend);
+                                    match buffer
+                                        .issue_resync_snapshot_async(|| {
+                                            let b = Arc::clone(&backend_ref);
+                                            async move { b.capture_snapshot_event().await }
+                                        })
+                                        .await
+                                    {
+                                        Ok(snap) => vec![snap],
+                                        Err(_) => return,
+                                    }
+                                }
                                 Err(_) => return,
                             };
                             for event in batch {
@@ -905,22 +973,22 @@ where
 }
 
 /// Build an async `axum::body::Body` for network SSE streaming.
-pub fn network_sse_body<F>(
+///
+/// `sub` MUST be subscribed BEFORE calling `replay_or_snapshot`. Lagged resyncs always fetch
+/// fresh authoritative network status from `backend`.
+pub fn network_sse_body(
     buffer: Arc<NetworkEventReplayBuffer>,
+    mut sub: broadcast::Receiver<u64>,
+    backend: Arc<dyn GatewayBackend>,
     initial_events: Vec<SseEvent>,
     initial_cursor: u64,
     heartbeat_interval: Duration,
-    status_fn: F,
     permit: OwnedSemaphorePermit,
-) -> axum::body::Body
-where
-    F: Fn() -> ApiResult<Value> + Send + Sync + 'static,
-{
+) -> axum::body::Body {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
         let _permit = permit;
         let mut cursor = initial_cursor;
-        let mut sub = buffer.subscribe();
 
         for event in initial_events {
             match event.encode() {
@@ -947,7 +1015,7 @@ where
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                             let batch = match buffer.try_events_after(cursor) {
                                 Ok(Some(events)) => events,
-                                Ok(None) => match status_fn().and_then(|s| buffer.issue_resync_snapshot(s, Some(cursor))) {
+                                Ok(None) => match backend.network_status().await.and_then(|s| buffer.issue_resync_snapshot(s, Some(cursor))) {
                                     Ok(snap) => vec![snap],
                                     Err(_) => return,
                                 },

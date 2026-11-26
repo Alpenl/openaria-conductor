@@ -94,10 +94,16 @@ pub async fn get_session_manifest(
     headers: HeaderMap,
 ) -> Response<Body> {
     let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let principal = match ctx.authenticate_for_operation(&state, &headers, "getSession") {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     if !is_valid_uuid_v7(&session_id) {
         return ctx.error_response(ApiError::not_found("session not found"));
     }
-    if let Err(resp) = ctx.authorize_read(&state, &headers, "getSession", Some(&session_id)) {
+    if let Err(resp) =
+        ctx.authorize_resource_read(&state, &principal, "getSession", Some(&session_id))
+    {
         return *resp;
     }
     let Ok(_permit) = Arc::clone(&state.download_semaphore).try_acquire_owned() else {
@@ -135,12 +141,20 @@ pub async fn get_unsuccessful_outcome(
     headers: HeaderMap,
 ) -> Response<Body> {
     let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let principal = match ctx.authenticate_for_operation(
+        &state,
+        &headers,
+        "getRetainedUnsuccessfulSessionOutcome",
+    ) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     if !is_valid_uuid_v7(&session_id) {
         return ctx.error_response(ApiError::not_found("session not found"));
     }
-    if let Err(resp) = ctx.authorize_read(
+    if let Err(resp) = ctx.authorize_resource_read(
         &state,
-        &headers,
+        &principal,
         "getRetainedUnsuccessfulSessionOutcome",
         Some(&session_id),
     ) {
@@ -174,10 +188,14 @@ pub async fn session_artifact(
         "getSessionArtifact"
     };
     let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let principal = match ctx.authenticate_for_operation(&state, &headers, op_id) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     if !is_valid_uuid_v7(&session_id) || !is_valid_sha256(&artifact_id) {
         return ctx.error_response(ApiError::not_found("artifact not found"));
     }
-    if let Err(resp) = ctx.authorize_read(&state, &headers, op_id, Some(&session_id)) {
+    if let Err(resp) = ctx.authorize_resource_read(&state, &principal, op_id, Some(&session_id)) {
         return *resp;
     }
 

@@ -1567,3 +1567,289 @@ async fn diagnostic_logs_disk_listing_range_read_and_traversal_symlink_rejection
     srv.shutdown().await;
     let _ = fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn sse_live_lag_resync_fetches_fresh_backend_state() {
+    let backend = Arc::new(MockGatewayBackend::new());
+    let runtime = GatewayRuntimeConfig {
+        sse_heartbeat_interval: Duration::from_secs(30),
+        ..GatewayRuntimeConfig::default()
+    };
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        Arc::new(SecurityPolicy::lab_default()),
+        runtime,
+    )
+    .await;
+
+    // 1. Capture SSE: connect while idle, receive initial "idle" snapshot.
+    let mut tcp = TcpStream::connect(srv.addr).await.unwrap();
+    let req = format!(
+        "GET /api/v1/capture/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        srv.addr.port()
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let n = tokio::time::timeout(Duration::from_millis(500), tcp.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "unexpected EOF waiting for initial capture snapshot");
+        received.extend_from_slice(&chunk[..n]);
+        if String::from_utf8_lossy(&received).contains("\"device_state\":\"idle\"") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&received).contains("\"device_state\":\"idle\""),
+        "initial snapshot must be idle"
+    );
+
+    // Mutate backend live state to "recording" and push a non-contiguous revision burst (>128 slots)
+    // to force a live resync snapshot on the already-open SSE stream.
+    backend.set_device_state("recording");
+    let new_epoch = new_uuid_v4();
+    let sid = new_uuid_v7();
+    let vid = new_uuid_v4();
+    let gid = new_uuid_v4();
+    for rev in 500..640_u64 {
+        backend
+            .capture_event_buffer()
+            .publish(json!({
+                "authority_epoch": new_epoch,
+                "source_revision": rev,
+                "type": "state",
+                "occurred_at": "2026-11-26T11:00:00Z",
+                "session_id": sid,
+                "data": {
+                    "schema": "miro-ego.capture-state-event.v1",
+                    "state": "recording",
+                    "volume_id": vid,
+                    "generation_id": gid
+                }
+            }))
+            .unwrap();
+    }
+
+    let mut after = Vec::new();
+    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline2 {
+        let n = tokio::time::timeout(Duration::from_millis(500), tcp.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            n > 0,
+            "unexpected EOF waiting for fresh capture resync snapshot"
+        );
+        after.extend_from_slice(&chunk[..n]);
+        let s = String::from_utf8_lossy(&after);
+        if s.contains("event: snapshot") && s.contains("\"device_state\":\"recording\"") {
+            break;
+        }
+    }
+    let after_str = String::from_utf8_lossy(&after);
+    assert!(
+        after_str.contains("event: snapshot")
+            && after_str.contains("\"device_state\":\"recording\""),
+        "lagged capture SSE resync must emit fresh 'recording' snapshot, got:\n{after_str}"
+    );
+    drop(tcp);
+
+    // 2. Network SSE: connect in hotspot mode, mutate backend desired state + overflow 128-slot ring.
+    let mut tcp_net = TcpStream::connect(srv.addr).await.unwrap();
+    let req_net = format!(
+        "GET /api/v1/network/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        srv.addr.port()
+    );
+    tcp_net.write_all(req_net.as_bytes()).await.unwrap();
+
+    let mut net_init = Vec::new();
+    let deadline3 = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline3 {
+        let n = tokio::time::timeout(Duration::from_millis(500), tcp_net.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        net_init.extend_from_slice(&chunk[..n]);
+        if String::from_utf8_lossy(&net_init).contains("\"mode\":\"hotspot\"") {
+            break;
+        }
+    }
+    assert!(String::from_utf8_lossy(&net_init).contains("\"mode\":\"hotspot\""));
+
+    // Mutate backend desired mode via /api/v1/network/apply to ethernet-dhcp
+    let (st_apply, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "lag-net-apply-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "ethernet-dhcp",
+                    "wifi_client": null,
+                    "ethernet": { "addressing": "dhcp", "static_ipv4": null }
+                }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_apply, StatusCode::ACCEPTED);
+
+    // Overflow the 128-slot network replay ring with a fresh authority epoch so client must resync
+    let mut base_status = backend.network_status().await.unwrap();
+    let fresh_net_epoch = new_uuid_v4();
+    for rev in 1..=140_u64 {
+        if let Some(obj) = base_status.as_object_mut() {
+            obj.insert("authority_epoch".to_owned(), json!(fresh_net_epoch));
+            obj.insert("source_revision".to_owned(), json!(rev));
+            obj.insert(
+                "transaction".to_owned(),
+                json!({"current": null, "latest": null}),
+            );
+        }
+        let _ = backend.network_event_buffer().observe(base_status.clone());
+    }
+
+    let mut net_after = Vec::new();
+    let deadline4 = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline4 {
+        let n = tokio::time::timeout(Duration::from_millis(500), tcp_net.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        net_after.extend_from_slice(&chunk[..n]);
+        let s = String::from_utf8_lossy(&net_after);
+        if s.contains("\"mode\":\"ethernet-dhcp\"") {
+            break;
+        }
+    }
+    let net_after_str = String::from_utf8_lossy(&net_after);
+    assert!(
+        net_after_str.contains("\"mode\":\"ethernet-dhcp\""),
+        "lagged network SSE resync must serve fresh 'ethernet-dhcp' state, got:\n{net_after_str}"
+    );
+    drop(tcp_net);
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn customer_mode_rejects_unauthenticated_invalid_paths_with_401_and_mirrors_error_code() {
+    let (tls_cfg, connector) = generate_test_tls();
+    let backend = Arc::new(MockGatewayBackend::new());
+
+    let admin = Principal::all_v1_operations("admin-client").unwrap();
+    let mut tokens = HashMap::new();
+    tokens.insert("admin-secret-token-9999".to_owned(), admin);
+    let security = Arc::new(
+        SecurityPolicy::customer(tokens, HashSet::new(), Some("csrf-secret-123".to_owned()))
+            .unwrap(),
+    );
+
+    let srv = RunningServer::start_https(
+        Arc::clone(&backend),
+        security,
+        tls_cfg,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let unauth_invalid_paths = [
+        (Method::GET, "/api/v1/sessions/not-a-uuid"),
+        (
+            Method::GET,
+            "/api/v1/sessions/not-a-uuid/unsuccessful-outcome",
+        ),
+        (Method::GET, "/api/v1/sessions/not-a-uuid/artifacts/bad"),
+        (Method::HEAD, "/api/v1/sessions/not-a-uuid/artifacts/bad"),
+        (Method::GET, "/api/v1/logs/../etc/passwd"),
+        (Method::GET, "/api/v1/logs/%2e%2e/secret"),
+    ];
+
+    for (method, path) in unauth_invalid_paths {
+        let is_head = method == Method::HEAD;
+        let (st, hdrs, body) = https_request(srv.addr, &connector, method, path, &[], None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated Customer request to {path} must return 401"
+        );
+        assert_eq!(
+            hdrs.get("www-authenticate").and_then(|v| v.to_str().ok()),
+            Some("Bearer"),
+            "missing WWW-Authenticate on {path}"
+        );
+        assert_eq!(
+            hdrs.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+            Some("unauthorized"),
+            "missing Miro-Ego-Error-Code on {path}"
+        );
+        if is_head {
+            assert!(body.is_empty());
+        } else {
+            let problem: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["schema"], "miro-ego.api-error.v1");
+            assert_eq!(problem["error"]["code"], "unauthorized");
+        }
+    }
+
+    // Confirm unauthorized audit events were recorded for all 6 unauthenticated probes
+    let unauth_audits = backend
+        .audit_events()
+        .into_iter()
+        .filter(|ev| ev.outcome == "unauthorized")
+        .count();
+    assert_eq!(unauth_audits, 6);
+
+    // Authenticated requests with invalid path params still return 404 (sessions) / 400 (logs)
+    // AND automatically mirror Miro-Ego-Error-Code!
+    let auth = [("Authorization", "Bearer admin-secret-token-9999")];
+    let (st_sess, hdrs_sess, _) = https_request(
+        srv.addr,
+        &connector,
+        Method::GET,
+        "/api/v1/sessions/not-a-uuid",
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(st_sess, StatusCode::NOT_FOUND);
+    assert_eq!(
+        hdrs_sess
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("not_found")
+    );
+
+    let (st_log, hdrs_log, _) = https_request(
+        srv.addr,
+        &connector,
+        Method::GET,
+        "/api/v1/logs/../etc/passwd",
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(st_log, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hdrs_log
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("invalid_request")
+    );
+
+    srv.shutdown().await;
+}

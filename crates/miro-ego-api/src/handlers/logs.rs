@@ -72,6 +72,12 @@ pub async fn get_log_file(
     let (parts, _) = req.into_parts();
     let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
 
+    // Authenticate BEFORE inspecting path syntax so unauthenticated Customer callers fail closed with 401.
+    let principal = match ctx.authenticate_for_operation(&state, &parts.headers, "getLogFile") {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
     // Inspect the raw URI path as well as decoded path to block `%2e`, `%2f`, `%5c`, `..`, etc.
     let raw_suffix = parts
         .uri
@@ -85,7 +91,8 @@ pub async fn get_log_file(
         ));
     }
 
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "getLogFile", Some(&decoded_name))
+    if let Err(resp) =
+        ctx.authorize_resource_read(&state, &principal, "getLogFile", Some(&decoded_name))
     {
         return *resp;
     }

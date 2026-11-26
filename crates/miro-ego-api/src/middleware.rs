@@ -2,7 +2,7 @@
 //! strict JSON body parsing, audit recording, and Problem Details HTTP response rendering.
 
 use crate::backend::GatewayBackend;
-use crate::error::{ApiError, ApiResult, HEADER_AUDIT_STATUS};
+use crate::error::{ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE};
 use crate::security::{
     AuditEvent, Principal, SecurityPolicy, SecurityProfile, is_allowed_gateway_host,
     is_same_gateway_origin, is_valid_idempotency_key,
@@ -240,13 +240,60 @@ impl RequestCtx {
         }
     }
 
-    fn authorize_inner(
+    /// Authenticate a caller (`Host`, `Origin`, Bearer token) and verify operation-level permission
+    /// BEFORE validating parameterized path segments. Guarantees unauthenticated Customer callers
+    /// always fail closed with `401 Unauthorized` even for malformed session IDs or log traversal paths.
+    pub fn authenticate_for_operation(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+    ) -> Result<Principal, Box<Response<Body>>> {
+        let principal = self.authenticate_caller(state, headers, operation_id, None)?;
+        if !principal.permissions().contains_key(operation_id) {
+            self.audit(state, operation_id, None, "forbidden", Some(&principal));
+            return Err(Box::new(self.error_response(ApiError::forbidden(
+                "forbidden",
+                "principal is not authorized for this operation or resource",
+            ))));
+        }
+        Ok(principal)
+    }
+
+    /// Enforce resource-scoped permission and fail-closed `"allowed"` audit after path parameters
+    /// have been validated for an already-authenticated principal.
+    pub fn authorize_resource_read(
+        &mut self,
+        state: &GatewayState,
+        principal: &Principal,
+        operation_id: &str,
+        resource_id: Option<&str>,
+    ) -> Result<(), Box<Response<Body>>> {
+        if !principal.permits(operation_id, resource_id) {
+            self.audit(
+                state,
+                operation_id,
+                resource_id,
+                "forbidden",
+                Some(principal),
+            );
+            return Err(Box::new(self.error_response(ApiError::forbidden(
+                "forbidden",
+                "principal is not authorized for this operation or resource",
+            ))));
+        }
+        if !self.audit(state, operation_id, resource_id, "allowed", Some(principal)) {
+            return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
+        }
+        Ok(())
+    }
+
+    fn authenticate_caller(
         &mut self,
         state: &GatewayState,
         headers: &HeaderMap,
         operation_id: &str,
         resource_id: Option<&str>,
-        emit_allowed_audit: bool,
     ) -> Result<Principal, Box<Response<Body>>> {
         // 1. Host allowlist (anti-DNS-rebinding)
         let host_value = match single_header(headers, header::HOST) {
@@ -307,6 +354,18 @@ impl RequestCtx {
                 "bearer credential is missing or invalid",
             ))));
         };
+        Ok(principal)
+    }
+
+    fn authorize_inner(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+        resource_id: Option<&str>,
+        emit_allowed_audit: bool,
+    ) -> Result<Principal, Box<Response<Body>>> {
+        let principal = self.authenticate_caller(state, headers, operation_id, resource_id)?;
 
         // 4. Operation / resource permission
         if !principal.permits(operation_id, resource_id) {
@@ -379,11 +438,17 @@ impl RequestCtx {
     pub fn error_response(&self, error: ApiError) -> Response<Body> {
         let status =
             StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let extra: Vec<(&str, &str)> = error
+        let mut extra: Vec<(&str, &str)> = error
             .headers_slice()
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        let has_error_code_header = extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(HEADER_ERROR_CODE));
+        if !has_error_code_header {
+            extra.push((HEADER_ERROR_CODE, error.code.as_str()));
+        }
         if self.is_head {
             return self.empty_response(status, &extra);
         }
