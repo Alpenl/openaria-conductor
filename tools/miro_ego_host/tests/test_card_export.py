@@ -384,6 +384,56 @@ class CardExportExfatTests(unittest.TestCase):
         ):
             self.assertEqual(tool.destination_check("/dev/sdb", self.root), self.root.resolve())
 
+    def test_case_insensitive_exfat_artifacts_verify_and_reject_folded_dups(self) -> None:
+        files, manifest_bytes = _sample_session_files(seed=33)
+        upper_tree = {
+            "MANIFEST.JSON": manifest_bytes,
+            "FRAMES.NDJSON": files["frames.ndjson"],
+            "IMU.NDJSON": files["imu.ndjson"],
+            "VIDEO": {
+                "LEFT_00000.MP4": files["video/left_00000.mp4"],
+                "RIGHT_00000.MP4": files["video/right_00000.mp4"],
+            },
+            "AUDIO": {
+                "AUDIO_00000.WAV": files["audio/audio_00000.wav"],
+            },
+            "LOGS": {
+                "CAPTURE.NDJSON": files["logs/capture.ndjson"],
+            },
+        }
+        exfat_img = self.root / "uppercase.exfat"
+        exfat_img.write_bytes(
+            build_exfat_image({"recordings": {"2026-11-26": {"18-00-00": upper_tree}}})
+        )
+        dest = self.root / "uppercase-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0]["sealed"])
+            output = tool.export_selected(records, dest)
+
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["verified_artifacts"], 6)
+        exported_left = output / "exfat/recordings/2026-11-26/18-00-00/video/left_00000.mp4"
+        self.assertEqual(exported_left.read_bytes(), files["video/left_00000.mp4"])
+
+        # Case-folded duplicate paths inside manifest.json must be rejected.
+        dup_manifest = build_session_manifest(files, extra_log_paths=("logs/capture.ndjson",))
+        dup_manifest["logs"].append(
+            {
+                "artifact_id": "0" * 64,
+                "role": "log.diagnostics",
+                "path": "LOGS/CAPTURE.NDJSON",
+                "media_type": "application/x-ndjson",
+                "bytes": len(files["logs/capture.ndjson"]),
+                "sha256": "0" * 64,
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "Duplicate artifact path"):
+            tool.manifest_artifacts(dup_manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,10 +80,22 @@ def target(layout: dict[str, Any], *, allow_mounted: bool = False) -> tuple[Path
     return root, data
 
 
-def _write_data_volume_config(partuuid: str, fs_uuid: str) -> None:
-    CONFIG.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    temporary = CONFIG.with_name(f".{CONFIG.name}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+def _write_data_volume_config(
+    partuuid: str,
+    fs_uuid: str,
+    *,
+    config_path: Path | None = None,
+) -> None:
+    target_cfg = config_path if config_path is not None else CONFIG
+    target_cfg.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    temporary = target_cfg.with_name(f".{target_cfg.name}.{uuid.uuid4().hex}.tmp")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     fd = os.open(temporary, flags, 0o644)
     replaced = False
     try:
@@ -93,19 +105,24 @@ def _write_data_volume_config(partuuid: str, fs_uuid: str) -> None:
             os.close(fd)
             raise
         with stream as dst:
-            os.fchmod(dst.fileno(), 0o644)
+            if hasattr(os, "fchmod"):
+                os.fchmod(dst.fileno(), 0o644)
             dst.write("MIRO_EGO_DATA_VOLUME_MODE=exfat\n")
             dst.write(f"MIRO_EGO_DATA_VOLUME_PARTUUID={partuuid}\n")
             dst.write(f"MIRO_EGO_DATA_VOLUME_UUID={fs_uuid}\n")
             dst.flush()
             os.fsync(dst.fileno())
-        os.replace(temporary, CONFIG)
+        if not hasattr(os, "fchmod"):
+            with suppress(OSError):
+                temporary.chmod(0o644)
+        os.replace(temporary, target_cfg)
         replaced = True
-        descriptor = os.open(CONFIG.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        if os.name == "posix":
+            descriptor = os.open(target_cfg.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
     except BaseException:
         if not replaced:
             with suppress(OSError):
@@ -138,7 +155,7 @@ def prepare(
         _, data = target(layout, allow_mounted=True)
         if previous.get("layout") != layout:
             raise RuntimeError("Unrelated storage transaction")
-        if run("blkid", "-s", "UUID", "-o", "value", str(data)) != previous["uuid"]:
+        if run("blkid", "-s", "UUID", "-o", "value", data.as_posix()) != previous["uuid"]:
             raise RuntimeError("Initialized recording filesystem identity changed")
         identity = str(previous["uuid"])
     else:
@@ -147,17 +164,17 @@ def prepare(
         root, data = target(layout)
         run("dpkg", "-i", str(package))
         run("modprobe", "exfat")
-        run("resize2fs", str(root), timeout=300)
+        run("resize2fs", root.as_posix(), timeout=300)
         # Durable journal permits retry before ready is recorded; never formats after ready.
         atomic_json(journal, {"phase": "formatting", "layout": layout})
-        run("mkfs.exfat", "-L", VOLUME_LABEL, str(data))
-        run("fsck.exfat", "-n", str(data))
-        identity = run("blkid", "-p", "-s", "UUID", "-o", "value", str(data))
+        run("mkfs.exfat", "-L", VOLUME_LABEL, data.as_posix())
+        run("fsck.exfat", "-n", data.as_posix())
+        identity = run("blkid", "-p", "-s", "UUID", "-o", "value", data.as_posix())
         if not identity:
             raise RuntimeError("New exFAT filesystem has no identity")
         atomic_json(journal, {"phase": "ready", "layout": layout, "uuid": identity})
 
-    run("udevadm", "trigger", "--action=change", str(data))
+    run("udevadm", "trigger", "--action=change", data.as_posix())
     run("udevadm", "settle", "--timeout=30")
     _write_data_volume_config(layout["partuuid"], identity)
     return data, identity
@@ -251,3 +268,110 @@ def mount_and_initialize(
             str(mountpoint),
         )
     return ensure_data_layout(mountpoint, miro_ego_bin=miro_ego_bin)
+
+
+def _blkid_optional(device: Path, tag: str) -> str:
+    try:
+        return run("blkid", "-s", tag, "-o", "value", device.as_posix())
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _reread_partition_table(disk: Path) -> None:
+    disk_posix = disk.as_posix()
+    for cmd in (
+        ("partx", "-u", disk_posix),
+        ("partprobe", disk_posix),
+        ("blockdev", "--rereadpt", disk_posix),
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                run(*cmd)
+                break
+            except subprocess.CalledProcessError:
+                continue
+    run("udevadm", "settle", "--timeout=30")
+
+
+def ensure_ssh_data_volume(
+    *,
+    config_path: Path | None = None,
+) -> dict[str, str]:
+    """Discover or provision partition 3 (``MIRO-EGO`` exFAT) and write data-volume config.
+
+    Used during SSH ``recover.py restore`` before ``ACTIVATE`` starts data-volume mount:
+    - Never reformats an existing exFAT recording partition.
+    - Creates MBR partition 3 in unallocated trailing space after partition 2 if absent.
+    - Formats partition 3 as ``MIRO-EGO`` exFAT only when partition 3 has no filesystem.
+    """
+    root_src = Path(run("findmnt", "-n", "-o", "SOURCE", "/")).resolve()
+    root_posix = root_src.as_posix()
+    if not re.fullmatch(r"/dev/mmcblk[0-9]+p2", root_posix):
+        raise RuntimeError("SSH recovery requires root on RDK SD partition 2")
+    disk = root_src.with_name(root_src.name[:-2])
+    data = root_src.with_name(root_src.name[:-1] + "3")
+    if not stat.S_ISBLK(disk.stat().st_mode):
+        raise RuntimeError(f"Missing whole-disk block device: {disk.as_posix()}")
+
+    if not (data.exists() and stat.S_ISBLK(data.stat().st_mode)):
+        with disk.open("rb") as src:
+            mbr = src.read(512)
+        if len(mbr) != 512 or mbr[510:512] != b"\x55\xaa":
+            raise RuntimeError("Expected valid MBR on RDK SD card")
+        entries = partition_layout.partitions(mbr)
+        if entries[2] != (0, 0, 0) or entries[3] != (0, 0, 0):
+            raise RuntimeError("Unexpected MBR partition entries while p3 block node is absent")
+        p2_type, p2_start, p2_sectors = entries[1]
+        if p2_type != 0x83 or p2_sectors <= 0:
+            raise RuntimeError("Unexpected root partition entry in MBR")
+        card_bytes = int(run("blockdev", "--getsize64", disk.as_posix()))
+        align = partition_layout.ALIGNMENT_SECTORS
+        sector_size = partition_layout.SECTOR_SIZE
+        min_data_bytes = partition_layout.MIN_DATA_GIB * partition_layout.GIB
+        p3_start = ((p2_start + p2_sectors + align - 1) // align) * align
+        p3_end = (card_bytes // sector_size // align) * align
+        if p3_end <= p3_start or (p3_end - p3_start) * sector_size < min_data_bytes:
+            raise RuntimeError(
+                "Insufficient unallocated space after p2 for MIRO-EGO exFAT volume; "
+                "use auto-flash to prepare a 20 GiB system + MIRO-EGO recording card"
+            )
+        updated_mbr = bytearray(mbr)
+        updated_mbr[478 + 4] = 0x07
+        struct.pack_into("<II", updated_mbr, 478 + 8, p3_start, p3_end - p3_start)
+        with disk.open("r+b") as dst:
+            dst.write(updated_mbr)
+            dst.flush()
+            os.fsync(dst.fileno())
+        _reread_partition_table(disk)
+        if not (data.exists() and stat.S_ISBLK(data.stat().st_mode)):
+            raise RuntimeError(f"Kernel did not expose recording partition {data.as_posix()}")
+
+    partuuid = _blkid_optional(data, "PARTUUID")
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-03", partuuid):
+        raise RuntimeError(
+            f"Invalid recording partition PARTUUID on {data.as_posix()}: {partuuid!r}"
+        )
+
+    fs_type = _blkid_optional(data, "TYPE")
+    if fs_type == "exfat":
+        fs_uuid = _blkid_optional(data, "UUID")
+        if not re.fullmatch(r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}", fs_uuid):
+            raise RuntimeError(f"Invalid exFAT UUID on existing {data.as_posix()}: {fs_uuid!r}")
+    elif fs_type == "":
+        if run("lsblk", "-nr", "-o", "MOUNTPOINTS", data.as_posix()):
+            raise RuntimeError("Unformatted recording partition is unexpectedly mounted")
+        run("modprobe", "exfat")
+        run("mkfs.exfat", "-L", VOLUME_LABEL, data.as_posix())
+        run("fsck.exfat", "-n", data.as_posix())
+        fs_uuid = run("blkid", "-p", "-s", "UUID", "-o", "value", data.as_posix())
+        if not re.fullmatch(r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}", fs_uuid):
+            raise RuntimeError(f"Formatted exFAT volume has invalid UUID: {fs_uuid!r}")
+        run("udevadm", "trigger", "--action=change", data.as_posix())
+        run("udevadm", "settle", "--timeout=30")
+    else:
+        raise RuntimeError(
+            f"Refusing to overwrite non-exFAT filesystem {fs_type!r} on {data.as_posix()}"
+        )
+
+    _write_data_volume_config(partuuid, fs_uuid, config_path=config_path)
+    return {"device": data.as_posix(), "partuuid": partuuid, "uuid": fs_uuid}

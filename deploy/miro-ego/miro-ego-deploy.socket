@@ -1,0 +1,15 @@
+[Unit]
+Description=Miro-Ego privileged firmware deployment control socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/miro-ego/deploy-control.sock
+SocketUser=miro-ego
+SocketGroup=miro-ego
+SocketMode=0660
+DirectoryMode=0755
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

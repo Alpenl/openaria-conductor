@@ -356,12 +356,18 @@ def windows_volume_locks(disk: Disk):
     raw = powershell(
         "@(Get-Partition -DiskNumber "
         + str(number)
-        + " | Get-Volume | Select-Object -ExpandProperty Path)"
+        + " -ErrorAction SilentlyContinue"
+        + " | Get-Volume -ErrorAction SilentlyContinue"
+        + " | Where-Object { $_.Path }"
+        + " | Select-Object -ExpandProperty Path)"
         " | ConvertTo-Json -Compress"
     )
-    paths = json.loads(raw) if raw.strip() else []
-    if isinstance(paths, str):
-        paths = [paths]
+    parsed = json.loads(raw) if raw.strip() else []
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    elif not isinstance(parsed, list):
+        parsed = []
+    paths = [item for item in parsed if isinstance(item, str) and item.strip()]
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [
         wintypes.LPCWSTR,

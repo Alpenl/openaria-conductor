@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +33,7 @@ BOOT = Path("/boot/config/miro-ego")
 HOBOT_HOOK = Path("/boot/config/hobot_config.sh")
 FIRSTBOOT_UNIT = Path("/etc/systemd/system/miro-ego-firstboot.service")
 VOICE_STATE = Path("/var/lib/miro-ego/voice.json")
+DEVICE_LOGIN_HELPER = Path("/usr/local/sbin/miro-ego-device-login")
 SERVICE_USER = "miro-ego"
 
 STATUS_SCHEMA = "miro-ego.autoinstall-status.v1"
@@ -61,7 +61,7 @@ StandardOutput=append:/var/lib/miro-ego-factory/firstboot/install.log
 StandardError=append:/var/lib/miro-ego-factory/firstboot/install.log
 """
 
-PHASES = ("restoring", "configured", "installed", "complete")
+PHASES = ("restoring", "configured", "installed", "cleaning", "complete")
 
 
 def _atomic_write_text(
@@ -74,7 +74,13 @@ def _atomic_write_text(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     fd = os.open(temporary, flags, mode)
     replaced = False
     try:
@@ -84,23 +90,32 @@ def _atomic_write_text(
             os.close(fd)
             raise
         with stream:
-            try:
-                os.fchmod(stream.fileno(), mode)
-            except OSError as exc:
-                if strict_mode or exc.errno not in (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP):
-                    raise
-            if owner is not None:
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError as exc:
+                    if strict_mode or exc.errno not in (
+                        errno.EPERM,
+                        errno.EINVAL,
+                        errno.EOPNOTSUPP,
+                    ):
+                        raise
+            if owner is not None and hasattr(os, "fchown"):
                 os.fchown(stream.fileno(), owner[0], owner[1])
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        if not hasattr(os, "fchmod"):
+            with suppress(OSError):
+                temporary.chmod(mode)
         os.replace(temporary, path)
         replaced = True
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        if os.name == "posix":
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
         if not replaced:
             with suppress(OSError):
@@ -220,6 +235,19 @@ def restore_voice(profile: dict[str, Any]) -> None:
     run("systemctl", "is-active", "--quiet", "miro-ego.service")
 
 
+def ensure_device_login(helper: Path | None = None) -> bool:
+    """Provision the ``MiroEgo`` SSH login account via ``miro-ego-device-login`` if present."""
+    target = helper if helper is not None else DEVICE_LOGIN_HELPER
+    if target.is_symlink():
+        raise RuntimeError("Unsafe device-login helper")
+    if not target.is_file():
+        return False
+    with suppress(OSError):
+        target.chmod(0o700)
+    run(str(target))
+    return True
+
+
 def cleanup_boot_partition(
     boot: Path,
     *,
@@ -246,14 +274,19 @@ def cleanup_boot_partition(
     )
 
     removed: list[str] = []
-    for entry in sorted(boot.iterdir(), key=lambda p: p.name):
-        if entry.name in KEEP_BOOT_FILES:
-            continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink(missing_ok=True)
-        removed.append(entry.name)
+    if boot.exists():
+        entries = sorted(
+            boot.iterdir(),
+            key=lambda p: (1 if p.suffix == ".py" else 0, p.name),
+        )
+        for entry in entries:
+            if entry.name in KEEP_BOOT_FILES:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+            removed.append(entry.name)
 
     if hook_path is not None and hook_path.exists():
         _atomic_write_text(hook_path, provision.CLEAN_HOOK, mode=0o755, strict_mode=False)
@@ -267,6 +300,19 @@ def execute() -> None:
     """Run the idempotent first-boot provisioning transaction and clean up p1 ``CONFIG``."""
     if complete():
         return
+    state_path = ROOT / "state.json"
+    if state_path.exists():
+        existing_state = json.loads(state_path.read_bytes())
+        if existing_state.get("phase") == "cleaning":
+            cleanup_boot_partition(BOOT, hook_path=HOBOT_HOOK, unit_path=FIRSTBOOT_UNIT)
+            shutil.rmtree(ROOT / "bundle", ignore_errors=True)
+            existing_state["phase"] = "complete"
+            atomic_json(state_path, existing_state)
+            if hasattr(os, "sync"):
+                os.sync()
+            run("systemctl", "reboot", "--no-block")
+            return
+
     manifest = json.loads((BOOT / "manifest.json").read_bytes())
     if manifest.get("schema") != provision.AUTOINSTALL_SCHEMA:
         raise RuntimeError("Invalid autoinstall manifest")
@@ -283,7 +329,6 @@ def execute() -> None:
         raise RuntimeError("Bundle digest mismatch")
 
     job = hashlib.sha256(sealed + manifest["bundle_sha256"].encode("utf-8")).hexdigest()
-    state_path = ROOT / "state.json"
     if state_path.exists():
         state = json.loads(state_path.read_bytes())
         if state.get("job") != job or state.get("phase") not in PHASES:
@@ -334,16 +379,25 @@ def execute() -> None:
         advance("installed")
 
     if state["phase"] == "installed":
+        ensure_device_login()
+        device.apply_service_permissions()
         restore_voice(profile)
-        state["phase"] = "complete"
+        state["phase"] = "cleaning"
         atomic_json(state_path, state)
+
+    if state["phase"] == "cleaning":
         cleanup_boot_partition(BOOT, hook_path=HOBOT_HOOK, unit_path=FIRSTBOOT_UNIT)
         shutil.rmtree(ROOT / "bundle", ignore_errors=True)
-        os.sync()
+        state["phase"] = "complete"
+        atomic_json(state_path, state)
+        if hasattr(os, "sync"):
+            os.sync()
         run("systemctl", "reboot", "--no-block")
 
 
 def main() -> None:
+    import fcntl
+
     if os.geteuid() != 0:
         raise RuntimeError("Root required")
     os.umask(0o077)

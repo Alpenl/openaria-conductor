@@ -300,9 +300,12 @@ def restore(args: argparse.Namespace) -> None:
     client, login = connection(args.host, args.user)
     try:
         stage = "/tmp/miro-ego-factory-" + uuid.uuid4().hex
+        recovery_dir = Path(__file__).resolve().parent
         with client.open_sftp() as sftp:
             sftp.mkdir(stage, mode=0o700)
             sftp.put(str(args.bundle), stage + "/bundle.tar")
+            for helper_name in ("device.py", "partition_layout.py", "storage_firstboot.py"):
+                sftp.put(str(recovery_dir / helper_name), stage + "/" + helper_name)
         prepared = json.loads(
             remote(client, login, args.user, INSTALL, (stage, args.bundle_sha256.lower()))
         )
@@ -310,10 +313,18 @@ def restore(args: argparse.Namespace) -> None:
             client,
             login,
             args.user,
-            Path(__file__).with_name("device.py").read_text(encoding="utf-8"),
+            (recovery_dir / "device.py").read_text(encoding="utf-8"),
             ("restore",),
             raw,
         )
+        ensure_data_script = (
+            "import json, pathlib, sys; "
+            "root = pathlib.Path(sys.argv[1]); "
+            "sys.path.insert(0, str(root)); "
+            "import storage_firstboot; "
+            "print(json.dumps(storage_firstboot.ensure_ssh_data_volume()))"
+        )
+        remote(client, login, args.user, ensure_data_script, (prepared["root"],))
         receipt = json.loads(remote(client, login, args.user, ACTIVATE, (prepared["root"],)))
         print("Persistent installation started. Remote log:", receipt["log"])
         for _ in range(180):
@@ -334,10 +345,20 @@ def restore(args: argparse.Namespace) -> None:
 
         voice_payload = device.voice_settings_payload(profile)
         has_alsa_state = "var/lib/alsa/asound.state" in profile["files"]
-        finalize_script = f"""import json, os, pathlib, pwd, subprocess, uuid
+        finalize_script = f"""import json, os, pathlib, pwd, subprocess, sys, uuid
+root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(root))
+import device
 subprocess.run(['systemctl', 'is-active', '--quiet', 'miro-ego.service'], check=True)
 subprocess.run(['systemctl', 'daemon-reload'], check=True)
 subprocess.run(['systemctl', 'stop', 'miro-ego.service'], check=True)
+login_helper = pathlib.Path('/usr/local/sbin/miro-ego-device-login')
+if login_helper.is_symlink():
+    raise RuntimeError('unsafe device-login helper')
+if login_helper.is_file():
+    login_helper.chmod(0o700)
+    subprocess.run([str(login_helper)], check=True)
+device.apply_service_permissions()
 voice = pathlib.Path('/var/lib/miro-ego/voice.json')
 voice.parent.mkdir(parents=True, exist_ok=True)
 tmp = voice.with_name(f'.{{voice.name}}.{{uuid.uuid4().hex}}.tmp')
@@ -364,7 +385,7 @@ subprocess.run(['systemctl', 'start', 'miro-ego.service'], check=True)
 subprocess.run(['systemctl', 'is-active', '--quiet', 'miro-ego.service'], check=True)
 print('installed')
 """
-        remote(client, login, args.user, finalize_script)
+        remote(client, login, args.user, finalize_script, (prepared["root"],))
         print("Software installed. Reboot to activate restored network, hostname, and machine-id.")
         print("DHCP may assign a different address. Check the router or use Ethernet.")
         if input("Reboot now? Type REBOOT: ") == "REBOOT":

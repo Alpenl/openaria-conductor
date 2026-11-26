@@ -1,0 +1,28 @@
+[Unit]
+Description=Miro-Ego privileged firmware deployment control worker
+Requires=miro-ego-recover.service miro-ego-deploy.socket
+After=local-fs.target systemd-tmpfiles-setup.service miro-ego-recover.service miro-ego-deploy.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+SupplementaryGroups=miro-ego
+Environment=RUST_LOG=info
+ExecStart=/opt/miro-ego/current/bin/miro-ego deploy serve-rpc
+LimitCORE=0
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=miro-ego-deploy
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=90s
+UMask=0022
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6

@@ -677,6 +677,7 @@ def manifest_artifacts(manifest: Any) -> dict[str, tuple[int, str]]:
     declared.extend(logs)
 
     expected: dict[str, tuple[int, str]] = {}
+    seen_folded: set[str] = set()
     for item in declared:
         if not isinstance(item, dict):
             raise RuntimeError("Malformed artifact entry in manifest")
@@ -687,8 +688,10 @@ def manifest_artifacts(manifest: Any) -> dict[str, tuple[int, str]]:
             raise RuntimeError(f"Invalid artifact byte count for {rel!r}")
         if not isinstance(digest_hex, str) or SHA256_RE.fullmatch(digest_hex) is None:
             raise RuntimeError(f"Invalid artifact SHA-256 for {rel!r}")
-        if rel in expected:
+        folded = rel.casefold()
+        if rel in expected or folded in seen_folded:
             raise RuntimeError(f"Duplicate artifact path in manifest: {rel!r}")
+        seen_folded.add(folded)
         expected[rel] = (byte_len, digest_hex)
     return expected
 
@@ -882,20 +885,31 @@ def export_selected(
     files: list[tuple[Path, Any, dict[str, Any] | None, str | None]] = []
     seen_names: set[str] = set()
     for record in selected:
-        present_relpaths: set[str] = set()
+        expected_by_folded: dict[str, tuple[str, tuple[int, str]]] = {
+            k.casefold(): (k, v) for k, v in record["expected_artifacts"].items()
+        }
+        present_folded: set[str] = set()
         for rel_path, node in walk(record["node"]):
             rel_posix = rel_path.as_posix()
-            present_relpaths.add(rel_posix)
-            out_path = record["prefix"] / rel_path
+            folded_rel = rel_posix.casefold()
+            present_folded.add(folded_rel)
+            matched = expected_by_folded.get(folded_rel) if record["sealed"] else None
+            canonical_rel = matched[0] if matched is not None else None
+            effective_rel = Path(canonical_rel) if canonical_rel is not None else rel_path
+            out_path = record["prefix"] / effective_rel
             normalized = str(out_path).casefold()
             if normalized in seen_names:
                 raise RuntimeError("Case-insensitive filename collision")
             seen_names.add(normalized)
-            files.append((out_path, node, record, rel_posix))
+            files.append((out_path, node, record, canonical_rel))
             if len(files) > MAX_EXPORT_FILES:
                 raise RuntimeError("Too many files")
         if record["sealed"]:
-            missing = sorted(set(record["expected_artifacts"]) - present_relpaths)
+            missing = sorted(
+                orig_rel
+                for folded_key, (orig_rel, _) in expected_by_folded.items()
+                if folded_key not in present_folded
+            )
             if missing:
                 raise RuntimeError(
                     f"Recording {record['id']} is missing manifest artifact(s): "
