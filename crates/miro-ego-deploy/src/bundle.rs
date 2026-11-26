@@ -389,7 +389,10 @@ pub fn copy_and_verify_safe(
         message: format!("destination path has no parent: {}", dst.display()),
     })?;
     fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
-        message: format!("failed creating destination dir {}: {err}", parent.display()),
+        message: format!(
+            "failed creating destination dir {}: {err}",
+            parent.display()
+        ),
     })?;
 
     let file_name = dst
@@ -790,7 +793,11 @@ mod tests {
             &commit,
             &[
                 ("miro-ego.service", b"[Unit]\nDescription=Miro-Ego\n", false),
-                ("share/voice/device_ready.wav", b"RIFF$\x00\x00\x00WAVE", false),
+                (
+                    "share/voice/device_ready.wav",
+                    b"RIFF$\x00\x00\x00WAVE",
+                    false,
+                ),
             ],
         );
 

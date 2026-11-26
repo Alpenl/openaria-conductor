@@ -1578,10 +1578,7 @@ mod tests {
         let mut misaligned_default = valid();
         misaligned_default.segment_frames = 100; // 100 % 30 != 0
         let mut misaligned_enc = EncoderProcess::new(misaligned_default).unwrap();
-        assert_eq!(
-            misaligned_enc.start().unwrap_err().code,
-            "invalid_argument"
-        );
+        assert_eq!(misaligned_enc.start().unwrap_err().code, "invalid_argument");
 
         // 0-byte frame rejected up front
         let mut zero_check = EncoderProcess::new(valid()).unwrap();
@@ -1656,9 +1653,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let err = encoder
-            .submit_frame(4, 5_000_000, &[0xCD; 64])
-            .unwrap_err();
+        let err = encoder.submit_frame(4, 5_000_000, &[0xCD; 64]).unwrap_err();
         let elapsed = started.elapsed();
         trigger.join().unwrap();
 

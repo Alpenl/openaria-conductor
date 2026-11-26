@@ -1890,7 +1890,8 @@ async fn customer_echoed_bearer_csrf_and_resource_scoped_session_deletion() {
     )
     .await;
     let origin = format!("https://localhost:{}", srv.addr.port());
-    let voice_body = Bytes::from(json!({"schema": "miro-ego.voice-set.v1", "volume": 55}).to_string());
+    let voice_body =
+        Bytes::from(json!({"schema": "miro-ego.voice-set.v1", "volume": 55}).to_string());
 
     // 1. Missing X-CSRF-Token -> 403 csrf_forbidden (NOT bypassed when csrf_token is None!)
     let (st, _, body) = https_request(
@@ -2311,7 +2312,9 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     .await;
     assert_eq!(st_unv, StatusCode::CONFLICT);
     assert_eq!(
-        hdrs_unv.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+        hdrs_unv
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
         Some("session_not_verified")
     );
     assert_eq!(
@@ -2411,11 +2414,11 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     )
     .await;
     assert_eq!(st_ap1, StatusCode::ACCEPTED);
-    let orig_tx_id = serde_json::from_slice::<Value>(&b_ap1).unwrap()["transaction"]
-        ["transaction_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let orig_tx_id =
+        serde_json::from_slice::<Value>(&b_ap1).unwrap()["transaction"]["transaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
     let (st_ap2, hdrs_ap2, b_ap2) = http_request(
         srv.addr,
@@ -2440,7 +2443,9 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     .await;
     assert_eq!(st_ap2, StatusCode::CONFLICT);
     assert_eq!(
-        hdrs_ap2.get(HEADER_ERROR_CODE).and_then(|v| v.to_str().ok()),
+        hdrs_ap2
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
         Some("idempotency_conflict")
     );
     let conflict_doc: Value = serde_json::from_slice(&b_ap2).unwrap();
@@ -2572,11 +2577,7 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     for prev_path in ["/api/v1/preview", "/api/v1/preview/h264"] {
         let (st_cam, hdrs_cam, body_cam) =
             http_request(srv.addr, Method::GET, prev_path, &[], None).await;
-        assert_eq!(
-            st_cam,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "path={prev_path}"
-        );
+        assert_eq!(st_cam, StatusCode::SERVICE_UNAVAILABLE, "path={prev_path}");
         assert_eq!(
             hdrs_cam
                 .get(HEADER_ERROR_CODE)
@@ -2597,46 +2598,179 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     }
     #[async_trait::async_trait]
     impl GatewayBackend for UninitH264Backend {
-        async fn device_info(&self, sp: miro_ego_api::SecurityProfile) -> miro_ego_api::ApiResult<Value> { self.inner.device_info(sp).await }
-        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_status().await }
-        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_snapshot_event().await }
-        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_readiness().await }
-        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.capture_safe_swap().await }
-        async fn start_capture(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.start_capture(c).await }
-        async fn stop_capture(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.stop_capture(c).await }
-        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> { self.inner.capture_timer().await }
-        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> { self.inner.set_capture_timer(e, d).await }
-        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.camera_focus().await }
-        async fn set_camera_focus(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.set_camera_focus(c).await }
-        async fn list_sessions(&self, q: miro_ego_api::ListSessionsQuery) -> miro_ego_api::ApiResult<Value> { self.inner.list_sessions(q).await }
-        async fn open_session_manifest(&self, s: &str) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> { self.inner.open_session_manifest(s).await }
-        async fn retained_unsuccessful_outcome(&self, s: &str) -> miro_ego_api::ApiResult<Option<Value>> { self.inner.retained_unsuccessful_outcome(s).await }
-        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> { self.inner.artifact_io_busy_state().await }
-        async fn open_session_artifact(&self, s: &str, a: &str) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> { self.inner.open_session_artifact(s, a).await }
-        async fn delete_sessions(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.delete_sessions(c).await }
-        async fn list_logs(&self, q: miro_ego_api::ListLogsQuery) -> miro_ego_api::ApiResult<Value> { self.inner.list_logs(q).await }
-        async fn open_log_file(&self, n: &str) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> { self.inner.open_log_file(n).await }
-        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> { self.inner.preview_mjpeg_hub() }
-        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> { Some(Arc::clone(&self.empty_h264)) }
-        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> { self.inner.capture_event_buffer() }
-        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> { self.inner.network_event_buffer() }
-        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> { self.inner.clock_status(p).await }
-        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> { self.inner.clock_inspect(p).await }
-        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> { self.inner.clock_sync(p, b).await }
-        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.voice_status().await }
-        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> { self.inner.set_voice_volume(v).await }
-        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.network_status().await }
-        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> { self.inner.network_scan().await }
-        async fn create_network_credential(&self, p: &str, pw: &str) -> miro_ego_api::ApiResult<Value> { self.inner.create_network_credential(p, pw).await }
-        async fn apply_network_desired_state(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.apply_network_desired_state(c).await }
-        async fn retry_network_transaction(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.retry_network_transaction(c).await }
-        async fn forget_network_client_profile(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.forget_network_client_profile(c).await }
-        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> { self.inner.firmware_status().await }
-        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> { self.inner.firmware_check(f).await }
-        async fn firmware_update(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.firmware_update(c).await }
-        async fn firmware_rollback(&self, c: miro_ego_api::IdempotentCommand) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> { self.inner.firmware_rollback(c).await }
-        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> { self.inner.record_audit(e) }
-        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> { self.inner.get_web_asset(n) }
+        async fn device_info(
+            &self,
+            sp: miro_ego_api::SecurityProfile,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.device_info(sp).await
+        }
+        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_status().await
+        }
+        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_snapshot_event().await
+        }
+        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_readiness().await
+        }
+        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.capture_safe_swap().await
+        }
+        async fn start_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.start_capture(c).await
+        }
+        async fn stop_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.stop_capture(c).await
+        }
+        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_timer().await
+        }
+        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_capture_timer(e, d).await
+        }
+        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.camera_focus().await
+        }
+        async fn set_camera_focus(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.set_camera_focus(c).await
+        }
+        async fn list_sessions(
+            &self,
+            q: miro_ego_api::ListSessionsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_sessions(q).await
+        }
+        async fn open_session_manifest(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> {
+            self.inner.open_session_manifest(s).await
+        }
+        async fn retained_unsuccessful_outcome(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.retained_unsuccessful_outcome(s).await
+        }
+        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> {
+            self.inner.artifact_io_busy_state().await
+        }
+        async fn open_session_artifact(
+            &self,
+            s: &str,
+            a: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_session_artifact(s, a).await
+        }
+        async fn delete_sessions(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.delete_sessions(c).await
+        }
+        async fn list_logs(
+            &self,
+            q: miro_ego_api::ListLogsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_logs(q).await
+        }
+        async fn open_log_file(
+            &self,
+            n: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_log_file(n).await
+        }
+        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> {
+            self.inner.preview_mjpeg_hub()
+        }
+        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> {
+            Some(Arc::clone(&self.empty_h264))
+        }
+        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> {
+            self.inner.capture_event_buffer()
+        }
+        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> {
+            self.inner.network_event_buffer()
+        }
+        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_status(p).await
+        }
+        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_inspect(p).await
+        }
+        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_sync(p, b).await
+        }
+        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.voice_status().await
+        }
+        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_voice_volume(v).await
+        }
+        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_status().await
+        }
+        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_scan().await
+        }
+        async fn create_network_credential(
+            &self,
+            p: &str,
+            pw: &str,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.create_network_credential(p, pw).await
+        }
+        async fn apply_network_desired_state(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.apply_network_desired_state(c).await
+        }
+        async fn retry_network_transaction(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.retry_network_transaction(c).await
+        }
+        async fn forget_network_client_profile(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.forget_network_client_profile(c).await
+        }
+        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_status().await
+        }
+        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_check(f).await
+        }
+        async fn firmware_update(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_update(c).await
+        }
+        async fn firmware_rollback(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_rollback(c).await
+        }
+        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> {
+            self.inner.record_audit(e)
+        }
+        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> {
+            self.inner.get_web_asset(n)
+        }
     }
 
     srv.shutdown().await;
@@ -2646,13 +2780,9 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
         empty_h264: Arc::new(miro_ego_api::H264PreviewHub::new_fmp4(16)),
     });
     let cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
-    let server = GatewayServer::bind(
-        cfg,
-        uninit_backend,
-        Arc::new(SecurityPolicy::lab_default()),
-    )
-    .await
-    .unwrap();
+    let server = GatewayServer::bind(cfg, uninit_backend, Arc::new(SecurityPolicy::lab_default()))
+        .await
+        .unwrap();
     let addr2 = server.local_addr();
     let (tx2, rx2) = oneshot::channel::<()>();
     let h2 = tokio::spawn(async move {

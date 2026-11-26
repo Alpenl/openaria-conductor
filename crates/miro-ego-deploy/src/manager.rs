@@ -566,14 +566,20 @@ impl LocalHttpHealthChecker {
             }
             Err(err) => {
                 return Err(DeployError::Failed {
-                    message: format!("cannot inspect device config {}: {err}", config_path.display()),
+                    message: format!(
+                        "cannot inspect device config {}: {err}",
+                        config_path.display()
+                    ),
                 });
             }
             Ok(_) => {}
         }
 
         let cfg = load_device_config(config_path).map_err(|err| DeployError::Failed {
-            message: format!("failed loading device config {}: {err}", config_path.display()),
+            message: format!(
+                "failed loading device config {}: {err}",
+                config_path.display()
+            ),
         })?;
         let addr = loopback_addr_from_listen(&cfg.listen).unwrap_or(fallback_addr);
         let checker = Self::new(addr, timeout);
@@ -584,13 +590,14 @@ impl LocalHttpHealthChecker {
                 tls_certificate_file,
                 ..
             } => {
-                let raw_tok =
-                    read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| DeployError::Failed {
+                let raw_tok = read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| {
+                    DeployError::Failed {
                         message: format!(
                             "failed reading customer bearer token {}: {err}",
                             bearer_token_file.display()
                         ),
-                    })?;
+                    }
+                })?;
                 let token = String::from_utf8(raw_tok)
                     .map_err(|_| DeployError::Failed {
                         message: "customer bearer token is not valid UTF-8".to_owned(),
@@ -602,14 +609,15 @@ impl LocalHttpHealthChecker {
                         message: "customer bearer token file is empty".to_owned(),
                     });
                 }
-                let cert_pem = read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
-                    DeployError::Failed {
-                        message: format!(
-                            "failed reading customer TLS certificate {}: {err}",
-                            tls_certificate_file.display()
-                        ),
-                    }
-                })?;
+                let cert_pem =
+                    read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
+                        DeployError::Failed {
+                            message: format!(
+                                "failed reading customer TLS certificate {}: {err}",
+                                tls_certificate_file.display()
+                            ),
+                        }
+                    })?;
                 checker.with_tls_and_bearer(&cert_pem, Some(token))
             }
         }
@@ -633,8 +641,8 @@ impl LocalHttpHealthChecker {
         let mut buf = [0u8; 256];
         let n = if let Some(tls_cfg) = &self.tls_config {
             let server_name = ServerName::try_from("localhost").map_err(|e| e.to_string())?;
-            let conn =
-                ClientConnection::new(Arc::clone(tls_cfg), server_name).map_err(|e| e.to_string())?;
+            let conn = ClientConnection::new(Arc::clone(tls_cfg), server_name)
+                .map_err(|e| e.to_string())?;
             let mut tls_stream = StreamOwned::new(conn, tcp);
             tls_stream
                 .write_all(req.as_bytes())
@@ -871,8 +879,8 @@ impl ReleaseManager {
         let old_previous = self.read_link_commit("previous")?;
         let new_commit = verified.commit().to_owned();
         let release_changed = old_current.as_deref() != Some(new_commit.as_str());
-        let replacing_live_commit =
-            old_current.as_deref() == Some(new_commit.as_str()) && self.paths.releases_dir().join(&new_commit).exists();
+        let replacing_live_commit = old_current.as_deref() == Some(new_commit.as_str())
+            && self.paths.releases_dir().join(&new_commit).exists();
 
         // Quiesce running services BEFORE mutating/replacing any live release directory or unit!
         let quiesced =
@@ -2317,8 +2325,7 @@ mod tests {
         let cert_pem = certified.cert.pem();
         let key_pem = certified.key_pair.serialize_pem();
 
-        let other_cert =
-            rcgen::generate_simple_self_signed(vec!["attacker.local".into()]).unwrap();
+        let other_cert = rcgen::generate_simple_self_signed(vec!["attacker.local".into()]).unwrap();
         let wrong_cert_pem = other_cert.cert.pem();
 
         let cert_file = paths.config_root.join("tls-cert.pem");
@@ -2374,14 +2381,12 @@ mod tests {
         let cert_der = certified.cert.der().clone();
         let key_der = PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
         let srv_cfg = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
-            .unwrap(),
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
         );
         listener.set_nonblocking(true).unwrap();
         let stop_srv = Arc::new(AtomicBool::new(false));
@@ -2475,12 +2480,28 @@ mod tests {
             &commit,
             &[
                 ("miro-ego.sysusers", b"u miro-ego - \"Miro-Ego\"\n", false),
-                ("miro-ego.tmpfiles", b"d /run/miro-ego 0750 root miro-ego -\n", false),
+                (
+                    "miro-ego.tmpfiles",
+                    b"d /run/miro-ego 0750 root miro-ego -\n",
+                    false,
+                ),
                 ("90-miro-ego-leds.rules", b"SUBSYSTEM==\"leds\"\n", false),
                 ("miro-ego-device-login", b"#!/bin/sh\nexit 0\n", true),
-                ("miro-ego-deploy.socket", b"[Socket]\nListenStream=/run/miro-ego/deploy-control.sock\n", false),
-                ("miro-ego-deploy.service", b"[Service]\nExecStart=/opt/miro-ego/current/bin/miro-ego\n", false),
-                ("share/voice/recording_started.wav", b"RIFF$\x00\x00\x00WAVE", false),
+                (
+                    "miro-ego-deploy.socket",
+                    b"[Socket]\nListenStream=/run/miro-ego/deploy-control.sock\n",
+                    false,
+                ),
+                (
+                    "miro-ego-deploy.service",
+                    b"[Service]\nExecStart=/opt/miro-ego/current/bin/miro-ego\n",
+                    false,
+                ),
+                (
+                    "share/voice/recording_started.wav",
+                    b"RIFF$\x00\x00\x00WAVE",
+                    false,
+                ),
             ],
         );
 
@@ -2493,7 +2514,10 @@ mod tests {
                 .join("share/voice/recording_started.wav")
                 .is_file()
         );
-        assert!(root.join("etc/udev/rules.d/90-miro-ego-leds.rules").is_file());
+        assert!(
+            root.join("etc/udev/rules.d/90-miro-ego-leds.rules")
+                .is_file()
+        );
         assert!(
             root.join("usr/lib/systemd/system/miro-ego-deploy.socket")
                 .is_file()
@@ -2507,7 +2531,11 @@ mod tests {
         assert!(calls.iter().any(|(p, _)| p == "systemd-sysusers"));
         assert!(calls.iter().any(|(p, _)| p == "systemd-tmpfiles"));
         assert!(calls.iter().any(|(p, _)| p == "udevadm"));
-        assert!(calls.iter().any(|(p, _)| p.ends_with("miro-ego-device-login")));
+        assert!(
+            calls
+                .iter()
+                .any(|(p, _)| p.ends_with("miro-ego-device-login"))
+        );
 
         stop_srv.store(true, Ordering::Release);
         srv_handle.join().unwrap();

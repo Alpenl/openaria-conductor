@@ -1817,10 +1817,24 @@ impl CaptureCoordinator {
             let meta = ctx.metadata_snapshot();
             guard.transition(CapturePhase::Stopping)?;
             self.phase_cv.notify_all();
-            (meta, handle, progress, code, msg)
+            let stop_epoch = guard.authority_epoch.clone();
+            let stop_rev = guard.source_revision;
+            (meta, handle, progress, code, msg, stop_epoch, stop_rev)
         };
 
-        let (meta, handle, progress, code, msg) = extracted;
+        let (meta, handle, progress, code, msg, stop_epoch, stop_rev) = extracted;
+        self.events.emit(
+            &stop_epoch,
+            stop_rev,
+            CaptureEventType::State,
+            Some(meta.session_id.clone()),
+            json!({
+                "schema": CAPTURE_STATE_EVENT_SCHEMA,
+                "state": "finalizing",
+                "volume_id": meta.admission.volume_id,
+                "generation_id": meta.admission.generation_id,
+            }),
+        );
         if let Some(h) = handle {
             h.abort();
         }
@@ -3314,11 +3328,30 @@ impl CaptureCoordinator {
             )
             .map_err(|e| StorageError::integrity("post_publish_verify_failed", e.message))?;
 
-            let indexed = parse_indexed_session_from_manifest(
+            let mut indexed = parse_indexed_session_from_manifest(
                 &relative_dir,
                 &manifest_value,
                 &manifest_sha256,
             )?;
+            let build_sha256 = sha256_hex(
+                format!(
+                    "miro-ego:{}:{}",
+                    self.config.software_version, self.config.commit
+                )
+                .as_bytes(),
+            );
+            indexed.verification = Some(crate::catalog::GatewayVerification {
+                actor: "gateway".to_owned(),
+                validator: crate::catalog::GatewayValidatorInfo {
+                    name: "miro-ego".to_owned(),
+                    version: self.config.software_version.clone(),
+                    build_sha256,
+                },
+                manifest_sha256: manifest_sha256.clone(),
+                verified_at: sealed_at.clone(),
+                verdict: "usable".to_owned(),
+                diagnostics: Vec::new(),
+            });
             self.catalog.admit_indexed_session(indexed)?;
             Ok(())
         })();

@@ -22,17 +22,19 @@ use miro_ego_capture::session::schema_validation::SchemaValidator;
 use miro_ego_capture::session::shm_ring::SHM_VERSION;
 use miro_ego_core::config::{
     AudioConfig, CameraConfig, DEVICE_CONFIG_SCHEMA, DeviceConfig, DeviceIdentity, ExposureSetting,
-    ListenConfig, RecordingEncoding, SecurityConfig, StorageConfig, load_device_config,
+    ListenConfig, RecordingEncoding, SecurityConfig, Settings, StorageConfig, load_device_config,
+    load_settings,
 };
 use miro_ego_core::ids::new_uuid_v4;
 use miro_ego_core::paths::{
     DataVolumePaths, RECORDING_MOUNTPOINT, RECORDING_VOLUME_LABEL, SYSTEM_CONFIG_DIR,
     SYSTEM_ENCODER_BIN, SYSTEM_INSTALL_ROOT, SYSTEM_RUN_DIR, SYSTEM_STATE_DIR,
 };
-use miro_ego_core::sys::fs::{set_exfat_hidden, write_bytes_atomic};
+use miro_ego_core::sys::fs::{read_bounded_bytes, set_exfat_hidden, write_bytes_atomic};
 use miro_ego_deploy::{
-    FIRMWARE_STATUS_SCHEMA, HealthChecker, LocalHttpHealthChecker, RealSystemctlRunner,
-    ReleaseManager, ReleaseManagerPaths, SystemctlRunner,
+    DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcServer, DeployRpcServerConfig, FIRMWARE_STATUS_SCHEMA,
+    HealthChecker, LocalHttpHealthChecker, RealSystemctlRunner, ReleaseManager,
+    ReleaseManagerPaths, SystemctlRunner,
 };
 use miro_ego_hw::thermal::{
     DEFAULT_THERMAL_ROOT, is_rdk_x5_model, read_board_model, read_soc_temperature_c,
@@ -44,10 +46,10 @@ use miro_ego_hw::{
     LocalHttpCaptureClient, SysfsGpioPin, SysfsLedController, VoiceController,
 };
 use miro_ego_network::{
-    AuthoritativeNetworkController, ControllerConfig, DEFAULT_CONTROL_SOCKET_PATH,
-    DEFAULT_ETHERNET_INTERFACE, DEFAULT_NETWORK_STATE_FILE, DEFAULT_WIFI_INTERFACE,
-    MDNS_SERVICE_TYPE, NetworkRpcClient, NetworkRpcServer, NetworkStateStore, NmcliBackend,
-    RpcServerConfig, SystemCommandRunner,
+    AuthoritativeNetworkController, ControllerConfig, DEFAULT_AVAHI_SERVICES_DIR,
+    DEFAULT_CONTROL_SOCKET_PATH, DEFAULT_ETHERNET_INTERFACE, DEFAULT_NETWORK_STATE_FILE,
+    DEFAULT_WIFI_INTERFACE, MDNS_SERVICE_TYPE, MdnsScheme, NetworkRpcClient, NetworkRpcServer,
+    NetworkStateStore, NmcliBackend, RpcServerConfig, SystemCommandRunner,
 };
 use miro_ego_storage::artifact_io::extract_manifest_artifacts;
 use miro_ego_storage::{
@@ -81,6 +83,7 @@ pub struct ServeArgs {
     pub encoder_bin: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    pub run_dir: Option<PathBuf>,
     pub relaxed_volume: bool,
 }
 
@@ -91,6 +94,8 @@ pub enum NetworkControlSubcommand {
         state: PathBuf,
         profiles_dir: PathBuf,
         run_dir: PathBuf,
+        config: Option<PathBuf>,
+        avahi_dir: Option<PathBuf>,
         device_id: Option<String>,
         wifi_iface: String,
         eth_iface: String,
@@ -119,6 +124,7 @@ pub enum DeployAction {
     Rollback { activate: bool },
     Recover { service_start: bool },
     Uninstall,
+    ServeRpc { socket: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +223,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeArgs, String> {
         encoder_bin: None,
         data_dir: None,
         state_dir: None,
+        run_dir: None,
         relaxed_volume: false,
     };
     let mut i = 0;
@@ -256,6 +263,9 @@ fn parse_serve_args(args: &[String]) -> Result<ServeArgs, String> {
                 parsed.state_dir =
                     Some(PathBuf::from(next_flag_value(args, &mut i, "--state-dir")?));
             }
+            "--run-dir" => {
+                parsed.run_dir = Some(PathBuf::from(next_flag_value(args, &mut i, "--run-dir")?));
+            }
             "--relaxed-volume" => {
                 parsed.relaxed_volume = true;
             }
@@ -289,6 +299,8 @@ fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcomman
             let mut state = default_network_state_path();
             let mut profiles_dir = PathBuf::from(DEFAULT_NETWORK_PROFILES_DIR);
             let mut run_dir = PathBuf::from(SYSTEM_RUN_DIR);
+            let mut config = None;
+            let mut avahi_dir = env::var_os("MIRO_EGO_AVAHI_DIR").map(PathBuf::from);
             let mut device_id = None;
             let mut wifi_iface = DEFAULT_WIFI_INTERFACE.to_owned();
             let mut eth_iface = DEFAULT_ETHERNET_INTERFACE.to_owned();
@@ -309,6 +321,13 @@ fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcomman
                     "--run-dir" => {
                         run_dir = PathBuf::from(next_flag_value(rest, &mut i, "--run-dir")?);
                     }
+                    "--config" => {
+                        config = Some(PathBuf::from(next_flag_value(rest, &mut i, "--config")?));
+                    }
+                    "--avahi-dir" => {
+                        avahi_dir =
+                            Some(PathBuf::from(next_flag_value(rest, &mut i, "--avahi-dir")?));
+                    }
                     "--device-id" => {
                         device_id = Some(next_flag_value(rest, &mut i, "--device-id")?.to_owned());
                     }
@@ -327,6 +346,8 @@ fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcomman
                 state,
                 profiles_dir,
                 run_dir,
+                config,
+                avahi_dir,
                 device_id,
                 wifi_iface,
                 eth_iface,
@@ -421,7 +442,7 @@ fn parse_button_args(args: &[String]) -> Result<ButtonArgs, String> {
 fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(
-            "usage: miro-ego deploy <status | install <bundle-dir> | rollback | recover | uninstall> [options]"
+            "usage: miro-ego deploy <status | install <bundle-dir> | rollback | recover | uninstall | serve-rpc> [options]"
                 .to_owned(),
         );
     };
@@ -436,6 +457,7 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
     let mut service_start = false;
     let mut health_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let mut health_timeout_secs = 20_u64;
+    let mut rpc_socket: Option<PathBuf> = env::var_os("MIRO_EGO_DEPLOY_SOCKET").map(PathBuf::from);
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -455,6 +477,9 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
             }
             "--system-root" => {
                 system_root = PathBuf::from(next_flag_value(args, &mut i, "--system-root")?);
+            }
+            "--socket" => {
+                rpc_socket = Some(PathBuf::from(next_flag_value(args, &mut i, "--socket")?));
             }
             "--no-systemctl" => {
                 no_systemctl = true;
@@ -522,9 +547,22 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
             }
             DeployAction::Uninstall
         }
+        "serve-rpc" => {
+            if !positional.is_empty() {
+                return Err("deploy serve-rpc takes no positional arguments".to_owned());
+            }
+            let socket = rpc_socket.unwrap_or_else(|| {
+                if run_dir != Path::new(SYSTEM_RUN_DIR) {
+                    run_dir.join("deploy-control.sock")
+                } else {
+                    PathBuf::from(DEFAULT_DEPLOY_SOCKET_PATH)
+                }
+            });
+            DeployAction::ServeRpc { socket }
+        }
         other => {
             return Err(format!(
-                "unknown deploy action '{other}'; expected status, install, rollback, recover, or uninstall"
+                "unknown deploy action '{other}'; expected status, install, rollback, recover, uninstall, or serve-rpc"
             ));
         }
     };
@@ -676,6 +714,9 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     if let Some(sock) = args.network_socket {
         options.network_socket = Some(sock);
     }
+    if let Some(run_dir) = args.run_dir {
+        options.run_dir = Some(run_dir);
+    }
     if args.relaxed_volume {
         options.relaxed_volume = true;
     }
@@ -688,16 +729,25 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         } else {
             CaptureModeKind::Native {
                 encoder_bin: enc,
-                imu_device: None,
+                imu_device: Some(device_config.camera.device.clone()),
             }
         };
     }
 
     // Best-effort hardware peripherals (LED & voice): silently degrade on dev hosts / WSL2.
     if !args.mock {
-        let led_dir = Path::new(DEFAULT_LEDS_SYSFS_ROOT).join("ACT");
-        if let Ok(led) = SysfsLedController::open(led_dir, false) {
-            options.indicator = Some(Arc::new(led));
+        let button_cfg_path = args
+            .config
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("button.json"))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BUTTON_CONFIG_PATH));
+        if let Some((led_name, inverted)) = resolve_serve_led_config(&button_cfg_path) {
+            let led_dir = Path::new(DEFAULT_LEDS_SYSFS_ROOT).join(led_name);
+            if let Ok(led) = SysfsLedController::open(led_dir, inverted) {
+                options.indicator = Some(Arc::new(led));
+            }
         }
         let voice_settings_path = device_config.state_root.join("voice.json");
         if let Ok(voice) = VoiceController::open(
@@ -728,10 +778,67 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     })
 }
 
+/// Resolve `(status_led, status_led_inverted)` for `miro-ego serve` from `button.json` when readable,
+/// falling back to `("ACT", false)` when `button.json` is absent or unreadable.
+pub fn resolve_serve_led_config(button_config_path: &Path) -> Option<(String, bool)> {
+    match ButtonConfig::load(button_config_path) {
+        Ok(cfg) => cfg.status_led.map(|name| (name, cfg.status_led_inverted)),
+        Err(_) => Some(("ACT".to_owned(), false)),
+    }
+}
+
+/// Validate mutable `Settings` against the device's `frame_decimation` and `segment_seconds`
+/// (`Settings::validate_for_device`) and merge them onto `DeviceConfig`.
+pub fn apply_settings_to_device_config(
+    config: &mut DeviceConfig,
+    settings: &Settings,
+) -> Result<(), String> {
+    settings
+        .validate_for_device(config.camera.frame_decimation, config.segment_seconds)
+        .map_err(|err| format!("invalid settings for device configuration: {err}"))?;
+    config.camera.width = settings.camera.width;
+    config.camera.height = settings.camera.height;
+    config.camera.fps = settings.camera.fps;
+    config.camera.exposure_time_absolute = settings.camera.exposure_time_absolute.clone();
+    config.audio = settings.audio.clone();
+    config.recording = settings.recording.clone();
+    config.storage.minimum_available_bytes = settings.storage.minimum_available_bytes;
+    config.storage.minimum_available_inodes = settings.storage.minimum_available_inodes;
+    config
+        .validate()
+        .map_err(|err| format!("merged device configuration invalid: {err}"))
+}
+
+/// Load `settings.json` if present, validate it with `Settings::validate_for_device`, and apply
+/// it to `config`. Returns `Ok(false)` when `settings_path` does not exist.
+pub fn load_and_apply_settings_for_device(
+    config: &mut DeviceConfig,
+    settings_path: &Path,
+) -> Result<bool, String> {
+    match fs::symlink_metadata(settings_path) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect settings {}: {err}",
+                settings_path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let settings = load_settings(settings_path)
+        .map_err(|err| format!("failed to load settings {}: {err}", settings_path.display()))?;
+    apply_settings_to_device_config(config, &settings)?;
+    Ok(true)
+}
+
 fn load_or_build_serve_config(args: &ServeArgs) -> Result<DeviceConfig, String> {
     if let Some(ref cfg_path) = args.config {
         let mut cfg = load_device_config(cfg_path)
             .map_err(|err| format!("failed to load device config {}: {err}", cfg_path.display()))?;
+        if let Some(parent) = cfg_path.parent() {
+            let settings_path = parent.join("settings.json");
+            let _ = load_and_apply_settings_for_device(&mut cfg, &settings_path)?;
+        }
         if let Some(ref data_dir) = args.data_dir {
             cfg.storage.mountpoint = data_dir.clone();
         }
@@ -743,12 +850,15 @@ fn load_or_build_serve_config(args: &ServeArgs) -> Result<DeviceConfig, String> 
 
     let default_path = Path::new(DEFAULT_DEVICE_CONFIG_PATH);
     if !args.mock && default_path.is_file() {
-        return load_device_config(default_path).map_err(|err| {
+        let mut cfg = load_device_config(default_path).map_err(|err| {
             format!(
                 "failed to load default device config {}: {err}",
                 default_path.display()
             )
-        });
+        })?;
+        let default_settings = Path::new(SYSTEM_CONFIG_DIR).join("settings.json");
+        let _ = load_and_apply_settings_for_device(&mut cfg, &default_settings)?;
+        return Ok(cfg);
     }
 
     if !args.mock {
@@ -847,17 +957,23 @@ fn run_network_control(sub: NetworkControlSubcommand) -> Result<(), String> {
             state,
             profiles_dir,
             run_dir,
+            config,
+            avahi_dir,
             device_id,
             wifi_iface,
             eth_iface,
         } => {
-            let resolved_device_id = device_id
-                .or_else(|| {
-                    load_device_config(Path::new(DEFAULT_DEVICE_CONFIG_PATH))
-                        .ok()
-                        .map(|c| c.device.device_id)
-                })
-                .unwrap_or_else(new_uuid_v4);
+            let cfg_path = config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE_CONFIG_PATH));
+            let ctrl_cfg = build_network_controller_config(
+                &cfg_path,
+                config.is_some(),
+                device_id,
+                run_dir,
+                &profiles_dir,
+                avahi_dir,
+            )?;
 
             let state_store = NetworkStateStore::open_or_init(&state).map_err(|err| {
                 format!("failed to open network state {}: {err}", state.display())
@@ -869,12 +985,8 @@ fn run_network_control(sub: NetworkControlSubcommand) -> Result<(), String> {
                 eth_iface,
             );
             let controller = Arc::new(
-                AuthoritativeNetworkController::new(
-                    backend,
-                    state_store,
-                    ControllerConfig::new(resolved_device_id, run_dir),
-                )
-                .map_err(|err| format!("failed to initialize network controller: {err}"))?,
+                AuthoritativeNetworkController::new(backend, state_store, ctrl_cfg)
+                    .map_err(|err| format!("failed to initialize network controller: {err}"))?,
             );
 
             let server = if let Some(listener) = take_systemd_socket_fd() {
@@ -1038,6 +1150,140 @@ fn notify_systemd(state: &str) {
     let _ = notify_systemd_to(&notify_socket, state);
 }
 
+/// Construct [`ControllerConfig`] for `miro-ego network-control serve` from `/etc/miro-ego/device.json`
+/// (populating `avahi_dir = Some("/etc/avahi/services")`, `mdns_port = listen.port`, and Customer `Https`).
+pub fn build_network_controller_config(
+    device_config_path: &Path,
+    explicit_config: bool,
+    device_id_override: Option<String>,
+    run_dir: PathBuf,
+    profiles_dir: &Path,
+    avahi_dir_override: Option<PathBuf>,
+) -> Result<ControllerConfig, String> {
+    let loaded_cfg = match fs::symlink_metadata(device_config_path) {
+        Err(err) if err.kind() == ErrorKind::NotFound && !explicit_config => None,
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect device config {}: {err}",
+                device_config_path.display()
+            ));
+        }
+        Ok(_) => Some(load_device_config(device_config_path).map_err(|err| {
+            format!(
+                "failed to load device config {}: {err}",
+                device_config_path.display()
+            )
+        })?),
+    };
+
+    let resolved_device_id = device_id_override
+        .or_else(|| loaded_cfg.as_ref().map(|c| c.device.device_id.clone()))
+        .unwrap_or_else(new_uuid_v4);
+
+    let mut ctrl_cfg = ControllerConfig::new(resolved_device_id, run_dir);
+    if let Some(cfg) = &loaded_cfg {
+        ctrl_cfg.mdns_port = cfg.listen.port;
+        ctrl_cfg.mdns_scheme = match cfg.security {
+            SecurityConfig::Customer { .. } => MdnsScheme::Https,
+            SecurityConfig::Lab { .. } => MdnsScheme::Http,
+        };
+    }
+    ctrl_cfg.avahi_dir = match avahi_dir_override {
+        Some(dir) => Some(dir),
+        None if profiles_dir == Path::new(DEFAULT_NETWORK_PROFILES_DIR) => {
+            Some(PathBuf::from(DEFAULT_AVAHI_SERVICES_DIR))
+        }
+        None => None,
+    };
+    Ok(ctrl_cfg)
+}
+
+/// Construct [`LocalHttpCaptureClient`] for `miro-ego button`, surfacing credential/TLS read errors
+/// and echoing the Customer bearer token as `X-CSRF-Token` unless `MIRO_EGO_CSRF_TOKEN` overrides it.
+pub fn build_button_capture_client(
+    device_config_override: Option<&Path>,
+    api_addr_override: Option<SocketAddr>,
+    timeout_ms: u64,
+) -> Result<LocalHttpCaptureClient, String> {
+    let explicit = device_config_override.is_some();
+    let cfg_path = device_config_override.unwrap_or_else(|| Path::new(DEFAULT_DEVICE_CONFIG_PATH));
+    let config_exists = match fs::symlink_metadata(cfg_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == ErrorKind::NotFound && !explicit => false,
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect device config {}: {err}",
+                cfg_path.display()
+            ));
+        }
+    };
+
+    let mut client = if config_exists {
+        match api_addr_override {
+            None => LocalHttpCaptureClient::from_device_config_path(cfg_path, timeout_ms)
+                .map_err(|err| format!("failed to configure button HTTP client: {err}"))?,
+            Some(addr) => {
+                let cfg = load_device_config(cfg_path).map_err(|err| {
+                    format!("failed to load device config {}: {err}", cfg_path.display())
+                })?;
+                match cfg.security {
+                    SecurityConfig::Lab { .. } => {
+                        LocalHttpCaptureClient::new(addr, None, timeout_ms)
+                    }
+                    SecurityConfig::Customer {
+                        bearer_token_file,
+                        tls_certificate_file,
+                        ..
+                    } => {
+                        let raw_tok =
+                            read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| {
+                                format!(
+                                    "failed reading customer bearer token file {}: {err}",
+                                    bearer_token_file.display()
+                                )
+                            })?;
+                        let tok = String::from_utf8(raw_tok)
+                            .map_err(|_| {
+                                format!(
+                                    "customer bearer token file {} is not valid UTF-8",
+                                    bearer_token_file.display()
+                                )
+                            })?
+                            .trim()
+                            .to_owned();
+                        if tok.is_empty() {
+                            return Err(format!(
+                                "customer bearer token file {} is empty",
+                                bearer_token_file.display()
+                            ));
+                        }
+                        LocalHttpCaptureClient::new(addr, Some(tok), timeout_ms)
+                            .with_pinned_tls_cert_file(&tls_certificate_file)
+                            .map_err(|err| {
+                                format!(
+                                    "failed loading customer TLS certificate {}: {err}",
+                                    tls_certificate_file.display()
+                                )
+                            })?
+                    }
+                }
+            }
+        }
+    } else {
+        let addr = api_addr_override
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080));
+        LocalHttpCaptureClient::new(addr, None, timeout_ms)
+    };
+
+    if let Ok(raw_csrf) = env::var("MIRO_EGO_CSRF_TOKEN") {
+        let trimmed = raw_csrf.trim();
+        if !trimmed.is_empty() {
+            client = client.with_csrf_token(trimmed.to_owned());
+        }
+    }
+    Ok(client)
+}
+
 fn run_button(args: ButtonArgs) -> Result<(), String> {
     let button_cfg = ButtonConfig::load(&args.config).map_err(|err| {
         format!(
@@ -1050,68 +1296,40 @@ fn run_button(args: ButtonArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let device_cfg_path = args
-        .device_config
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE_CONFIG_PATH));
-    let device_cfg = load_device_config(&device_cfg_path).ok();
-
-    let api_addr = match args.api_addr {
-        Some(addr) => addr,
-        None => match &device_cfg {
-            Some(cfg) => {
-                let ip: IpAddr = cfg
-                    .listen
-                    .host
-                    .parse()
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-                let target_ip = if ip.is_unspecified() {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
-                } else {
-                    ip
-                };
-                SocketAddr::new(target_ip, cfg.listen.port)
-            }
-            None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-        },
-    };
-
-    let bearer_token = device_cfg.as_ref().and_then(|cfg| match &cfg.security {
-        SecurityConfig::Lab { .. } => None,
-        SecurityConfig::Customer {
-            bearer_token_file, ..
-        } => fs::read_to_string(bearer_token_file)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty()),
-    });
+    let client = build_button_capture_client(
+        args.device_config.as_deref(),
+        args.api_addr,
+        button_cfg.request_timeout_ms,
+    )?;
 
     let pin = if let Some(val_path) = args.gpio_value {
         SysfsGpioPin::from_value_path(val_path)
     } else if let Some(soc_num) = args.gpio_num {
         SysfsGpioPin::from_gpio_number(soc_num)
+    } else if let Some(sysfs_root) = env::var_os("MIRO_EGO_GPIO_SYSFS_ROOT") {
+        SysfsGpioPin::open_rdk_x5_board_pin_in(Path::new(&sysfs_root), button_cfg.physical_pin)
+            .map_err(|err| {
+                format!(
+                    "failed to open RDK X5 GPIO board pin {}: {err}",
+                    button_cfg.physical_pin
+                )
+            })?
     } else {
-        SysfsGpioPin::from_gpio_number(u32::from(button_cfg.physical_pin))
+        SysfsGpioPin::open_rdk_x5_board_pin(button_cfg.physical_pin).map_err(|err| {
+            format!(
+                "failed to open RDK X5 GPIO board pin {}: {err}",
+                button_cfg.physical_pin
+            )
+        })?
     };
 
     let input = GpioButtonInput::new(pin, button_cfg.clone())
         .map_err(|err| format!("failed to initialize GPIO button input: {err}"))?;
-    let mut client = LocalHttpCaptureClient::new(
-        api_addr,
-        bearer_token.clone(),
-        button_cfg.request_timeout_ms,
-    );
-    if let Some(ref tok) = bearer_token {
-        let mut hasher = sha2::Sha256::new();
-        use sha2::Digest;
-        hasher.update(b"miro-ego.csrf.v1:");
-        hasher.update(tok.as_bytes());
-        let derived_csrf = miro_ego_core::ids::hex_encode(&hasher.finalize());
-        client = client.with_csrf_token(derived_csrf);
-    }
 
     let monitor = ButtonMonitor::new(input, client);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_sig = Arc::clone(&stop);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
     let sig_thread = std::thread::Builder::new()
         .name("miro-ego-button-sig".to_owned())
@@ -1120,8 +1338,14 @@ fn run_button(args: ButtonArgs) -> Result<(), String> {
                 .enable_all()
                 .build()
             {
-                rt.block_on(wait_for_termination_signal());
-                stop_sig.store(true, Ordering::Release);
+                rt.block_on(async move {
+                    tokio::select! {
+                        () = wait_for_termination_signal() => {
+                            stop_sig.store(true, Ordering::Release);
+                        }
+                        _ = cancel_rx => {}
+                    }
+                });
             }
         })
         .ok();
@@ -1130,6 +1354,7 @@ fn run_button(args: ButtonArgs) -> Result<(), String> {
         .run_until(&stop, button_cfg.poll_ms)
         .map_err(|err| format!("button monitor exited with error: {err}"));
     stop.store(true, Ordering::Release);
+    let _ = cancel_tx.send(());
     if let Some(handle) = sig_thread {
         let _ = handle.join();
     }
@@ -1149,18 +1374,22 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
     let systemctl: Arc<dyn SystemctlRunner> = if hermetic {
         Arc::new(NoopSystemctlRunner)
     } else {
-        Arc::new(RealSystemctlRunner)
+        Arc::new(RealSystemctlRunner::with_timeout(Duration::from_secs(60)))
     };
     let health: Arc<dyn HealthChecker> = if hermetic {
         Arc::new(NoopHealthChecker)
     } else {
-        Arc::new(LocalHttpHealthChecker::new(
+        let device_cfg_path = paths.config_root.join("device.json");
+        let checker = LocalHttpHealthChecker::from_device_config_path(
+            &device_cfg_path,
             args.health_addr,
             Duration::from_secs(args.health_timeout_secs.max(1)),
-        ))
+        )
+        .map_err(|err| format!("failed to initialize deploy health checker: {err}"))?;
+        Arc::new(checker)
     };
 
-    let manager = ReleaseManager::new(paths, systemctl, health);
+    let manager = Arc::new(ReleaseManager::new(paths, systemctl, health));
     match args.action {
         DeployAction::Status => {
             let st = manager
@@ -1194,6 +1423,39 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
                 .uninstall()
                 .map_err(|err| format!("deploy uninstall failed: {err}"))?;
             print_json(&report)
+        }
+        DeployAction::ServeRpc { socket } => {
+            let server = if let Some(listener) = take_systemd_socket_fd() {
+                DeployRpcServer::from_listener(
+                    listener,
+                    None,
+                    manager,
+                    DeployRpcServerConfig::default(),
+                )
+                .map_err(|err| format!("failed to attach systemd deploy socket listener: {err}"))?
+            } else {
+                DeployRpcServer::bind(&socket, manager, DeployRpcServerConfig::default()).map_err(
+                    |err| {
+                        format!(
+                            "failed to bind deploy-control socket {}: {err}",
+                            socket.display()
+                        )
+                    },
+                )?
+            };
+
+            notify_systemd("READY=1");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("failed to build deploy signal runtime: {err}"))?;
+            rt.block_on(wait_for_termination_signal());
+
+            notify_systemd("STOPPING=1");
+            let _ = server.wait_for_idle(Duration::from_secs(60));
+            server.shutdown();
+            Ok(())
         }
     }
 }
@@ -1508,6 +1770,8 @@ mod tests {
             "--mock",
             "--listen",
             "127.0.0.1:9090",
+            "--run-dir",
+            "/tmp/miro-ego-run",
         ]))
         .unwrap();
         assert_eq!(
@@ -1520,6 +1784,7 @@ mod tests {
                 encoder_bin: None,
                 data_dir: None,
                 state_dir: None,
+                run_dir: Some(PathBuf::from("/tmp/miro-ego-run")),
                 relaxed_volume: false,
             })
         );

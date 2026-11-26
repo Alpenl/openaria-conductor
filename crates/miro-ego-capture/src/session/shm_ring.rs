@@ -1064,11 +1064,13 @@ mod tests {
         );
 
         // Positive sub-millisecond wait clamps to >= 1ms without busy-spinning and times out cleanly.
-        assert!(!super::wait_and_drain_eventfd(
-            producer.done_fd.as_raw_fd(),
-            Duration::from_micros(250),
-        )
-        .unwrap());
+        assert!(
+            !super::wait_and_drain_eventfd(
+                producer.done_fd.as_raw_fd(),
+                Duration::from_micros(250),
+            )
+            .unwrap()
+        );
         // Negative fd is rejected immediately, and a closed non-negative fd triggers POLLNVAL.
         assert_eq!(
             super::wait_and_drain_eventfd(-1, Duration::from_millis(1))

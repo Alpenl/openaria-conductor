@@ -141,11 +141,7 @@ pub fn acquire_maintenance_lock(
     mode: LockMode,
     nonblocking: bool,
 ) -> CoreResult<FlockGuard> {
-    acquire_flock(
-        resolve_maintenance_lock_path(run_dir),
-        mode,
-        nonblocking,
-    )
+    acquire_flock(resolve_maintenance_lock_path(run_dir), mode, nonblocking)
 }
 
 /// Acquire `/run/miro-ego/network-operation.lock` (honoring
@@ -231,8 +227,7 @@ mod tests {
 
         if let Some(mode) = std::env::var_os("MIRO_EGO_TEST_LOCK_SUBPROCESS") {
             let maint_expected = PathBuf::from(std::env::var_os(MAINTENANCE_LOCK_ENV).unwrap());
-            let net_expected =
-                PathBuf::from(std::env::var_os(NETWORK_OPERATION_LOCK_ENV).unwrap());
+            let net_expected = PathBuf::from(std::env::var_os(NETWORK_OPERATION_LOCK_ENV).unwrap());
             let custom_dir =
                 PathBuf::from(std::env::var_os("MIRO_EGO_TEST_CUSTOM_RUN_DIR").unwrap());
 
@@ -263,7 +258,8 @@ mod tests {
             }
 
             // Custom test run_dir stays isolated even while env vars are set.
-            let isolated = acquire_maintenance_lock(&custom_dir, LockMode::Exclusive, true).unwrap();
+            let isolated =
+                acquire_maintenance_lock(&custom_dir, LockMode::Exclusive, true).unwrap();
             assert_eq!(
                 isolated.path(),
                 custom_dir.join(MAINTENANCE_LOCK_NAME).as_path()
@@ -294,8 +290,7 @@ mod tests {
         );
 
         let exe = std::env::current_exe().unwrap();
-        let test_name =
-            "locks::tests::honors_lock_env_overrides_for_canonical_run_dir_while_keeping_custom_dirs_isolated";
+        let test_name = "locks::tests::honors_lock_env_overrides_for_canonical_run_dir_while_keeping_custom_dirs_isolated";
 
         // 1. Hold locks in parent and verify child sees lock_busy via env-resolved paths.
         let maint_guard = acquire_flock(&maint_override, LockMode::Exclusive, true).unwrap();

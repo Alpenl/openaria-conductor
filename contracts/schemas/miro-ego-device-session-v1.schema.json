@@ -1104,7 +1104,8 @@
           "enum": [
             "user_disabled",
             "device_default_disabled",
-            "recording_interrupted"
+            "recording_interrupted",
+            "audio_open_failed"
           ]
         }
       }

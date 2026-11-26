@@ -1179,16 +1179,13 @@ mod tests {
                         security: WifiSecurity::Wpa2Personal,
                         credential_ref: Some(cred.credential_ref),
                     }),
-                ethernet: None,
+                    ethernet: None,
                 },
             )
             .unwrap();
         // Async RPC returns 202 Accepted immediately before tearing down AP!
         assert_eq!(applied.final_status, TransactionStatus::Accepted);
-        let settled = ctrl
-            .wait_for_idle(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Committed);
         assert_eq!(client.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
         let st = client.status().unwrap();

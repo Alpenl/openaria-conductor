@@ -508,11 +508,26 @@ impl StagingRecoveryManager {
             remove_control_markers(&final_root)?;
             let _ = fsync_directory(&final_root);
             if let Some(catalog) = &self.catalog {
-                let indexed = crate::catalog::parse_indexed_session_from_manifest(
+                let mut indexed = crate::catalog::parse_indexed_session_from_manifest(
                     &relative_dir,
                     &manifest_value,
                     &manifest_sha256,
                 )?;
+                let build_sha256 = sha256_hex(
+                    format!("miro-ego:{}:{}", meta.software_version, meta.commit).as_bytes(),
+                );
+                indexed.verification = Some(crate::catalog::GatewayVerification {
+                    actor: "gateway".to_owned(),
+                    validator: crate::catalog::GatewayValidatorInfo {
+                        name: "miro-ego".to_owned(),
+                        version: meta.software_version.clone(),
+                        build_sha256,
+                    },
+                    manifest_sha256: manifest_sha256.clone(),
+                    verified_at: now.clone(),
+                    verdict: "usable".to_owned(),
+                    diagnostics: Vec::new(),
+                });
                 catalog.admit_indexed_session(indexed)?;
             }
             Ok(())

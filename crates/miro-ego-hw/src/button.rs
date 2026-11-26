@@ -285,7 +285,8 @@ impl SysfsGpioPin {
             let export_path = sysfs_gpio_root.join("export");
             if let Err(err) = fs::write(&export_path, format!("{soc_gpio}\n")) {
                 // EBUSY (os error 16) occurs if another process exported the line concurrently.
-                let is_ebusy = err.raw_os_error() == Some(16) || err.kind() == ErrorKind::AlreadyExists;
+                let is_ebusy =
+                    err.raw_os_error() == Some(16) || err.kind() == ErrorKind::AlreadyExists;
                 if err.kind() == ErrorKind::NotFound {
                     return Err(HwError::Unavailable {
                         message: format!(
@@ -444,8 +445,9 @@ impl ButtonClassifier {
 
         // Check if a pending single-click window has elapsed without a second press starting.
         if let Some(deadline) = self.pending_short_deadline_ms {
-            let debouncing_second_press =
-                pressed && self.candidate_pressed == Some(true) && self.candidate_since_ms <= deadline;
+            let debouncing_second_press = pressed
+                && self.candidate_pressed == Some(true)
+                && self.candidate_since_ms <= deadline;
             if !self.stable_pressed
                 && !self.second_press_in_window
                 && !debouncing_second_press
@@ -766,14 +768,13 @@ impl LocalHttpCaptureClient {
                 tls_certificate_file,
                 ..
             } => {
-                let raw_tok = read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| {
-                    HwError::Io {
+                let raw_tok =
+                    read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| HwError::Io {
                         message: format!(
                             "failed reading bearer token {}: {err}",
                             bearer_token_file.display()
                         ),
-                    }
-                })?;
+                    })?;
                 let token = String::from_utf8(raw_tok)
                     .map_err(|_| HwError::Io {
                         message: "bearer token file contains invalid UTF-8".to_owned(),
@@ -905,7 +906,10 @@ impl LocalHttpCaptureClient {
     }
 }
 
-fn read_http_response_bounded<R: Read>(reader: &mut R, tolerate_tls_eof: bool) -> HwResult<Vec<u8>> {
+fn read_http_response_bounded<R: Read>(
+    reader: &mut R,
+    tolerate_tls_eof: bool,
+) -> HwResult<Vec<u8>> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -1289,14 +1293,12 @@ mod tests {
         let key_der = PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
 
         let srv_cfg = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
-            .unwrap(),
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1317,8 +1319,9 @@ mod tests {
                 assert!(req.contains("Authorization: Bearer pinned-tok-1\r\n"));
                 let idx = srv_calls_bg.fetch_add(1, Ordering::SeqCst);
                 let resp = match idx {
-                    0 => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\n{}"
-                        .to_owned(),
+                    0 => {
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\n{}".to_owned()
+                    }
                     1 => {
                         let body = r#"{"schema":"miro-ego.capture-status.v1","snapshot":{"device_state":"idle"}}"#;
                         format!(

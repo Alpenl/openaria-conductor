@@ -297,8 +297,8 @@
       "id": "urn:miro-ego:schema:device-session:v1",
       "schema": "miro-ego.device-session.v1",
       "path": "contracts/schemas/miro-ego-device-session-v1.schema.json",
-      "sha256": "892ec94bd9775c51175e80d40f7d702e287ca0084a34795ca0ae00aa44bc3035",
-      "bytes": 26811
+      "sha256": "e4922f5042f427982853ddc1f2b69c9c0b90e0ec28b37ac25e6ee4fc78214ced",
+      "bytes": 26844
     },
     {
       "id": "urn:miro-ego:schema:operational-event:v1",

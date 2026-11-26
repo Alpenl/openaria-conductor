@@ -989,8 +989,16 @@ mod tests {
         extension.extend_from_slice(&XU_GUID_BYTES);
         extension.extend_from_slice(&[0, 0, 0, 0]);
         let mut descriptors = vec![4, 4, 0, 0];
-        assert!(find_uvc_xu_unit(&descriptors).unwrap_err().is_xu_not_found());
-        assert!(find_uvc_xu_unit(&descriptors).unwrap_err().is_xu_unavailable());
+        assert!(
+            find_uvc_xu_unit(&descriptors)
+                .unwrap_err()
+                .is_xu_not_found()
+        );
+        assert!(
+            find_uvc_xu_unit(&descriptors)
+                .unwrap_err()
+                .is_xu_unavailable()
+        );
         descriptors.extend_from_slice(&extension);
         assert_eq!(find_uvc_xu_unit(&descriptors).unwrap(), 7);
     }

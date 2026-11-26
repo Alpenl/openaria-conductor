@@ -864,10 +864,15 @@ dependencies = [
 name = "miro-ego-deploy"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "miro-ego-core",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror",
 ]
 
@@ -875,9 +880,14 @@ dependencies = [
 name = "miro-ego-hw"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "miro-ego-core",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror",
 ]
 

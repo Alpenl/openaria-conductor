@@ -522,10 +522,7 @@ fn validate_segment_frame_bounds(
     code: &'static str,
 ) -> CoreResult<()> {
     let raw_frames = (f64::from(encoded_fps) * segment_seconds).round();
-    if !raw_frames.is_finite()
-        || raw_frames < 1.0
-        || raw_frames > (MAX_SEGMENT_FRAMES as f64)
-    {
+    if !raw_frames.is_finite() || raw_frames < 1.0 || raw_frames > (MAX_SEGMENT_FRAMES as f64) {
         return Err(CoreError::invalid_config(
             code,
             format!("segment frame count must be in 1..={MAX_SEGMENT_FRAMES}"),

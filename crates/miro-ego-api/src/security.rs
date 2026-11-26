@@ -593,14 +593,18 @@ mod tests {
         // Customer policy with `csrf_token = None` enforces per-caller echoed bearer token as X-CSRF-Token.
         let bearer_csrf_policy =
             SecurityPolicy::customer(tokens.clone(), HashSet::new(), None).unwrap();
-        assert!(bearer_csrf_policy.verify_csrf_for_caller(
-            Some("super-secret-token-01"),
-            Some("super-secret-token-01"),
-        ));
-        assert!(!bearer_csrf_policy.verify_csrf_for_caller(
-            Some("super-secret-token-02"),
-            Some("super-secret-token-01"),
-        ));
+        assert!(
+            bearer_csrf_policy.verify_csrf_for_caller(
+                Some("super-secret-token-01"),
+                Some("super-secret-token-01"),
+            )
+        );
+        assert!(
+            !bearer_csrf_policy.verify_csrf_for_caller(
+                Some("super-secret-token-02"),
+                Some("super-secret-token-01"),
+            )
+        );
         assert!(!bearer_csrf_policy.verify_csrf_for_caller(None, Some("super-secret-token-01")));
 
         // Wildcard origin must fail closed.
@@ -624,10 +628,12 @@ mod tests {
         assert!(policy.authenticate(Some("Basic abc")).is_none());
         assert!(policy.authenticate(None).is_none());
         assert!(policy.verify_csrf(Some("csrf-token-1")));
-        assert!(policy.verify_csrf_for_caller(
-            Some("super-secret-token-02"),
-            Some("super-secret-token-02"),
-        ));
+        assert!(
+            policy.verify_csrf_for_caller(
+                Some("super-secret-token-02"),
+                Some("super-secret-token-02"),
+            )
+        );
         assert!(!policy.verify_csrf(Some("csrf-token-2")));
         assert!(!policy.verify_csrf(None));
     }

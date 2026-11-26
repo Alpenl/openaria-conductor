@@ -262,7 +262,8 @@ impl IndicatorController for SysfsLedController {
                     .write_attr("brightness", &guard.max_brightness.to_string())?;
                 self.io.write_attr("trigger", "timer")?;
                 self.io.write_attr("delay_on", &actual_on_ms.to_string())?;
-                self.io.write_attr("delay_off", &actual_off_ms.to_string())?;
+                self.io
+                    .write_attr("delay_off", &actual_off_ms.to_string())?;
             }
         }
 

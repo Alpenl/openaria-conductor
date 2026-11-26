@@ -317,10 +317,7 @@ impl EventReplayBuffer {
 
     /// Async variant of [`Self::issue_resync_snapshot`] that fetches a fresh authoritative
     /// snapshot without holding the internal mutex across `.await`.
-    pub async fn issue_resync_snapshot_async<F, Fut>(
-        &self,
-        snapshot_fn: F,
-    ) -> ApiResult<SseEvent>
+    pub async fn issue_resync_snapshot_async<F, Fut>(&self, snapshot_fn: F) -> ApiResult<SseEvent>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = ApiResult<Value>>,
@@ -501,10 +498,7 @@ fn source_pair_is_contiguous(previous: &Value, current: &Value) -> bool {
     let Some(curr_rev) = current.get("source_revision").and_then(Value::as_u64) else {
         return false;
     };
-    if current.get("type").and_then(Value::as_str) == Some("progress")
-        && curr_rev == prev_rev
-        && current.get("session_id") == previous.get("session_id")
-    {
+    if curr_rev == prev_rev {
         return true;
     }
     prev_rev.checked_add(1) == Some(curr_rev)

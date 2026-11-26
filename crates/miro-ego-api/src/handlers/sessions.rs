@@ -301,14 +301,11 @@ pub async fn delete_sessions(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    let (principal, key) = match ctx.authorize_resource_command_headers(
-        &state,
-        &parts.headers,
-        "deleteSessions",
-    ) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let (principal, key) =
+        match ctx.authorize_resource_command_headers(&state, &parts.headers, "deleteSessions") {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
     let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),

@@ -899,7 +899,10 @@ fn build_mock_recording_state(
     if state_name == "verifying"
         && let Some(obj) = progress.as_object_mut()
     {
-        obj.insert("verification".to_owned(), json!({ "completed": 0, "total": 4 }));
+        obj.insert(
+            "verification".to_owned(),
+            json!({ "completed": 0, "total": 4 }),
+        );
     }
 
     let diagnostics = match state_name {
@@ -1595,9 +1598,10 @@ impl GatewayBackend for MockGatewayBackend {
             MockArtifactBacking::FilePath(path) => {
                 let media_type = artifact.media_type;
                 tokio::task::spawn_blocking(move || {
-                    let file = miro_ego_core::sys::fs::open_readonly_safe(&path).map_err(|err| {
-                        ApiError::provider_failure(format!("open artifact file: {err}"))
-                    })?;
+                    let file =
+                        miro_ego_core::sys::fs::open_readonly_safe(&path).map_err(|err| {
+                            ApiError::provider_failure(format!("open artifact file: {err}"))
+                        })?;
                     let meta = file.metadata().map_err(|err| {
                         ApiError::provider_failure(format!("stat artifact file: {err}"))
                     })?;
@@ -1610,7 +1614,10 @@ impl GatewayBackend for MockGatewayBackend {
                 })
                 .await
                 .map_err(|err| {
-                    ApiError::internal("task_join_error", format!("open artifact task failed: {err}"))
+                    ApiError::internal(
+                        "task_join_error",
+                        format!("open artifact task failed: {err}"),
+                    )
                 })?
             }
         }

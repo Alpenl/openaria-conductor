@@ -174,13 +174,7 @@ impl RequestCtx {
             principal.permissions().contains_key(operation_id)
         };
         if !permitted {
-            self.audit(
-                state,
-                operation_id,
-                None,
-                "forbidden",
-                Some(&principal),
-            );
+            self.audit(state, operation_id, None, "forbidden", Some(&principal));
             return Err(Box::new(self.error_response(ApiError::forbidden(
                 "forbidden",
                 "principal is not authorized for this operation or resource",
@@ -427,8 +421,7 @@ impl RequestCtx {
         resource_id: Option<&str>,
         emit_allowed_audit: bool,
     ) -> Result<Principal, Box<Response<Body>>> {
-        let (principal, _) =
-            self.authenticate_caller(state, headers, operation_id, resource_id)?;
+        let (principal, _) = self.authenticate_caller(state, headers, operation_id, resource_id)?;
 
         // 4. Operation / resource permission
         if !principal.permits(operation_id, resource_id) {

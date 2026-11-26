@@ -48,11 +48,7 @@ pub(crate) fn resolve_lock_path_with_env(
 /// `MIRO_EGO_MAINTENANCE_LOCK` when `run_dir` is the canonical `/run/miro-ego`.
 pub fn resolve_maintenance_lock_path(run_dir: impl AsRef<Path>) -> PathBuf {
     let env_val = std::env::var_os(MAINTENANCE_LOCK_ENV);
-    resolve_lock_path_with_env(
-        run_dir.as_ref(),
-        MAINTENANCE_LOCK_NAME,
-        env_val.as_deref(),
-    )
+    resolve_lock_path_with_env(run_dir.as_ref(), MAINTENANCE_LOCK_NAME, env_val.as_deref())
 }
 
 /// Resolve the network-operation lock file path for `run_dir`, honoring

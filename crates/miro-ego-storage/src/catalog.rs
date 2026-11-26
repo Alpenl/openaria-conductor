@@ -1964,7 +1964,12 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
             ) || audio.get("resolved_mode").and_then(Value::as_str) != Some("disabled")
                 || !matches!(
                     audio.get("reason").and_then(Value::as_str),
-                    Some("user_disabled" | "device_default_disabled" | "recording_interrupted")
+                    Some(
+                        "user_disabled"
+                            | "device_default_disabled"
+                            | "recording_interrupted"
+                            | "audio_open_failed"
+                    )
                 )
             {
                 return Err(StorageError::integrity(

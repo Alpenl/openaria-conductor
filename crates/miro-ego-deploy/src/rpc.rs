@@ -503,11 +503,17 @@ impl DeployRpcServer {
             let _ = fs::remove_file(&path);
         }
         let listener = UnixListener::bind(&path).map_err(|err| DeployError::Failed {
-            message: format!("failed to bind deploy Unix socket {}: {err}", path.display()),
+            message: format!(
+                "failed to bind deploy Unix socket {}: {err}",
+                path.display()
+            ),
         })?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).map_err(|err| {
             DeployError::Failed {
-                message: format!("failed to chmod deploy Unix socket {}: {err}", path.display()),
+                message: format!(
+                    "failed to chmod deploy Unix socket {}: {err}",
+                    path.display()
+                ),
             }
         })?;
         best_effort_chgrp_miro_ego(&path);
@@ -675,13 +681,13 @@ fn handle_connection(
         }
     };
 
-    let _ = write_framed_response(stream, &response, config.max_line_bytes, config.write_timeout);
-    if response.ok
-        && matches!(
-            response.operation.as_deref(),
-            Some("install" | "rollback")
-        )
-    {
+    let _ = write_framed_response(
+        stream,
+        &response,
+        config.max_line_bytes,
+        config.write_timeout,
+    );
+    if response.ok && matches!(response.operation.as_deref(), Some("install" | "rollback")) {
         coordinator.notify_response_flushed();
     }
 }
@@ -735,7 +741,12 @@ fn dispatch_raw_payload(
                 );
             };
             let Some(body) = &request.body else {
-                return DeployRpcResponse::error("request_invalid", "missing body", Some(op), false);
+                return DeployRpcResponse::error(
+                    "request_invalid",
+                    "missing body",
+                    Some(op),
+                    false,
+                );
             };
             let Some(bundle_dir_str) = body.get("bundle_dir").and_then(Value::as_str) else {
                 return DeployRpcResponse::error(
@@ -781,7 +792,12 @@ fn dispatch_raw_payload(
                 );
             };
             let Some(body) = &request.body else {
-                return DeployRpcResponse::error("request_invalid", "missing body", Some(op), false);
+                return DeployRpcResponse::error(
+                    "request_invalid",
+                    "missing body",
+                    Some(op),
+                    false,
+                );
             };
             let Some(expected_previous) = body.get("expected_previous").and_then(Value::as_str)
             else {
@@ -1247,12 +1263,18 @@ mod tests {
         let t1 = client.install(&b1, &commit_v1, true).unwrap();
         assert_eq!(t1.action, FirmwareTaskAction::Update);
         assert_eq!(t1.status, FirmwareTaskStatus::Accepted);
-        let s1 = server.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
+        let s1 = server
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         assert_eq!(s1.status, FirmwareTaskStatus::Succeeded);
 
         // Install v2
         let _ = client.install(&b2, &commit_v2, true).unwrap();
-        let s2 = server.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
+        let s2 = server
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         assert_eq!(s2.status, FirmwareTaskStatus::Succeeded);
 
         let st = client.status().unwrap();
@@ -1265,7 +1287,10 @@ mod tests {
         let rb = client.rollback(&commit_v1, true).unwrap();
         assert_eq!(rb.action, FirmwareTaskAction::Rollback);
         assert_eq!(rb.status, FirmwareTaskStatus::Accepted);
-        let s_rb = server.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
+        let s_rb = server
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         assert_eq!(s_rb.status, FirmwareTaskStatus::Succeeded);
 
         let after_rb = client.status().unwrap();
@@ -1273,7 +1298,10 @@ mod tests {
             after_rb.deployment.current.as_deref(),
             Some(commit_v1.as_str())
         );
-        assert_eq!(after_rb.deployment.current_version.as_deref(), Some("0.3.0"));
+        assert_eq!(
+            after_rb.deployment.current_version.as_deref(),
+            Some("0.3.0")
+        );
         assert_eq!(
             after_rb.deployment.previous.as_deref(),
             Some(commit_v2.as_str())

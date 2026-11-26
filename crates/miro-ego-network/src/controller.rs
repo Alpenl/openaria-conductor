@@ -495,10 +495,10 @@ impl AuthoritativeNetworkController {
                             self.core.config.activation_wait_secs,
                             false,
                         )?;
-                        let _ = self.core.backend.verify_activated_profile(
-                            lkg_eth,
-                            &ProfileSpec::EthernetStatic(cfg),
-                        )?;
+                        let _ = self
+                            .core
+                            .backend
+                            .verify_activated_profile(lkg_eth, &ProfileSpec::EthernetStatic(cfg))?;
                     }
                 }
                 Ok(())
@@ -534,8 +534,9 @@ impl AuthoritativeNetworkController {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(NetworkError::Busy {
-                        message: "controller_busy: timed out waiting for active network transaction"
-                            .to_owned(),
+                        message:
+                            "controller_busy: timed out waiting for active network transaction"
+                                .to_owned(),
                     });
                 }
                 let wait_for = deadline.saturating_duration_since(now);
@@ -569,7 +570,8 @@ impl AuthoritativeNetworkController {
         preserve_existing_psk: bool,
     ) -> NetworkResult<RescueHotspotInfo> {
         let _lock = self.core.acquire_op_lock()?;
-        self.core.ensure_rescue_hotspot_locked(preserve_existing_psk)
+        self.core
+            .ensure_rescue_hotspot_locked(preserve_existing_psk)
     }
 
     /// Issue a short-lived single-use opaque `credential_ref` for a Wi-Fi passphrase.
@@ -999,7 +1001,13 @@ impl AuthoritativeNetworkController {
 impl Drop for AuthoritativeNetworkController {
     fn drop(&mut self) {
         self.notify_rpc_response_flushed();
-        let handle = self.core.worker.state.lock().ok().and_then(|mut g| g.handle.take());
+        let handle = self
+            .core
+            .worker
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut g| g.handle.take());
         if let Some(h) = handle {
             let _ = h.join();
         }
@@ -1008,12 +1016,7 @@ impl Drop for AuthoritativeNetworkController {
 
 impl ControllerCore {
     fn is_busy(&self) -> NetworkResult<bool> {
-        let worker_busy = self
-            .worker
-            .state
-            .lock()
-            .map(|g| g.active)
-            .unwrap_or(false);
+        let worker_busy = self.worker.state.lock().map(|g| g.active).unwrap_or(false);
         Ok(worker_busy || self.state.has_active_transaction()?)
     }
 
@@ -1705,8 +1708,13 @@ impl NetworkController for AuthoritativeNetworkController {
         let terminal_status = if outcome.final_status.is_terminal() {
             outcome.final_status
         } else {
-            let wait_timeout =
-                Duration::from_secs(self.core.config.activation_wait_secs.saturating_mul(3).max(15));
+            let wait_timeout = Duration::from_secs(
+                self.core
+                    .config
+                    .activation_wait_secs
+                    .saturating_mul(3)
+                    .max(15),
+            );
             let _ = self.wait_for_idle(wait_timeout)?;
             self.core
                 .state
@@ -2019,7 +2027,13 @@ mod tests {
 
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
         let init_status = ctrl.controller_status().unwrap();
-        assert!(init_status.rescue_ssid.as_deref().unwrap().starts_with("MiroEgo-"));
+        assert!(
+            init_status
+                .rescue_ssid
+                .as_deref()
+                .unwrap()
+                .starts_with("MiroEgo-")
+        );
         assert_eq!(init_status.observed.ap.state, "active");
         assert_eq!(init_status.observed.ap.addresses, vec!["10.42.0.1"]);
 
@@ -2041,10 +2055,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.final_status, TransactionStatus::Accepted);
-        let settled = ctrl
-            .wait_for_idle(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Rescued);
 
         // Idempotent replay of the rescued request reflects terminal Rescued status!
@@ -2088,10 +2099,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry_outcome.final_status, TransactionStatus::Accepted);
-        let retry_settled = ctrl
-            .wait_for_idle(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let retry_settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(retry_settled.status, TransactionStatus::Committed);
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
         let committed_status = ctrl.controller_status().unwrap();
@@ -2129,10 +2137,7 @@ mod tests {
         // Forget restores hotspot and removes managed wifi-client profiles.
         let forget_outcome = ctrl.forget("client-1", "idem-forget-1").unwrap();
         assert_eq!(forget_outcome.final_status, TransactionStatus::Accepted);
-        let forget_settled = ctrl
-            .wait_for_idle(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let forget_settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(forget_settled.status, TransactionStatus::Committed);
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
         assert!(!ctrl.controller_status().unwrap().saved);
@@ -2246,8 +2251,8 @@ mod tests {
         let mock = MockNmcli::new(false);
         let backend = NmcliBackend::new(mock.clone(), root.join("profiles"), "wlan0", "eth0");
         let state = NetworkStateStore::open_or_init(root.join("network-state.json")).unwrap();
-        let cfg = ControllerConfig::new("rdk-x5-eth", root.join("run"))
-            .with_synchronous_mutations(true);
+        let cfg =
+            ControllerConfig::new("rdk-x5-eth", root.join("run")).with_synchronous_mutations(true);
         let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
 
         let dhcp = ctrl
@@ -2385,7 +2390,10 @@ mod tests {
         let rev_before = status.source_revision;
         let scan_res = ctrl.scan().unwrap();
         assert_eq!(scan_res.source_revision, rev_before);
-        assert_eq!(ctrl.controller_status().unwrap().source_revision, rev_before);
+        assert_eq!(
+            ctrl.controller_status().unwrap().source_revision,
+            rev_before
+        );
 
         // When network-operation.lock is held, `apply` MUST reject with Busy BEFORE consuming
         // single-use `credential_ref`, allowing the same `credential_ref` to succeed once idle!
@@ -2430,10 +2438,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ok_apply.final_status, TransactionStatus::Accepted);
-        let settled = ctrl
-            .wait_for_idle(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Committed);
 
         // Simulate reboot in WifiClient mode when upstream router is down -> falls back to rescue AP!
