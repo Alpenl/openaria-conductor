@@ -2,7 +2,11 @@
 //! domain-separated SHA-256 digests, and base64url cursor encoding.
 
 use miro_ego_core::ids::hex_encode;
+use miro_ego_core::sys::fs::fsync_directory;
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CRC32_TABLE: [u32; 256] = build_crc32_table();
@@ -91,10 +95,40 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, m as u32, d as u32)
 }
 
-/// Extract `(YYYY-MM-DD, HH-MM-SS)` for readable session publication from an RFC 3339 timestamp.
-///
-/// Requires a timezone-aware timestamp (`Z` or `±HH:MM`) and year in `2020..2100`.
-pub fn readable_date_time_from_rfc3339(timestamp: &str) -> Option<(String, String)> {
+/// Howard Hinnant's days-from-civil algorithm (days relative to 1970-01-01).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = u64::from(month);
+    let d = u64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + (doe as i64) - 719_468
+}
+
+const fn is_leap_year(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+const fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Strictly parse an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`) into
+/// UTC Unix epoch nanoseconds.
+pub fn parse_rfc3339_utc_nanos(timestamp: &str) -> Option<i128> {
     let bytes = timestamp.as_bytes();
     if bytes.len() < 20 {
         return None;
@@ -114,9 +148,11 @@ pub fn readable_date_time_from_rfc3339(timestamp: &str) -> Option<(String, Strin
     let minute: u32 = timestamp.get(14..16)?.parse().ok()?;
     let second: u32 = timestamp.get(17..19)?.parse().ok()?;
 
-    if !(2020..2100).contains(&year)
+    let max_day = days_in_month(year, month);
+    if year < 1970
         || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day == 0
+        || day > max_day
         || hour > 23
         || minute > 59
         || second > 59
@@ -124,29 +160,62 @@ pub fn readable_date_time_from_rfc3339(timestamp: &str) -> Option<(String, Strin
         return None;
     }
 
-    // Require an explicit timezone designator (`Z`/`z` or `±HH:MM`) after optional fractional secs.
     let mut rest = timestamp.get(19..)?;
+    let mut nanos: u32 = 0;
     if let Some(after_dot) = rest.strip_prefix('.') {
         let frac_len = after_dot.bytes().take_while(u8::is_ascii_digit).count();
         if frac_len == 0 {
             return None;
         }
+        let frac_digits = &after_dot.as_bytes()[..frac_len.min(9)];
+        let mut mul = 100_000_000_u32;
+        for &b in frac_digits {
+            nanos += u32::from(b - b'0') * mul;
+            mul /= 10;
+        }
         rest = after_dot.get(frac_len..)?;
     }
-    let tz_valid = rest == "Z"
-        || rest == "z"
-        || (rest.len() == 6
-            && matches!(rest.as_bytes()[0], b'+' | b'-')
-            && rest.as_bytes()[3] == b':'
-            && rest
-                .get(1..3)
-                .and_then(|h| h.parse::<u32>().ok())
-                .is_some_and(|h| h <= 23)
-            && rest
-                .get(4..6)
-                .and_then(|m| m.parse::<u32>().ok())
-                .is_some_and(|m| m <= 59));
-    if !tz_valid {
+
+    let tz_offset_secs: i64 = if rest == "Z" || rest == "z" {
+        0
+    } else if rest.len() == 6
+        && matches!(rest.as_bytes()[0], b'+' | b'-')
+        && rest.as_bytes()[3] == b':'
+    {
+        let tz_h: u32 = rest.get(1..3)?.parse().ok()?;
+        let tz_m: u32 = rest.get(4..6)?.parse().ok()?;
+        if tz_h > 23 || tz_m > 59 {
+            return None;
+        }
+        let abs = i64::from(tz_h) * 3600 + i64::from(tz_m) * 60;
+        if rest.as_bytes()[0] == b'-' {
+            -abs
+        } else {
+            abs
+        }
+    } else {
+        return None;
+    };
+
+    let days = days_from_civil(i64::from(year), month, day);
+    let local_secs =
+        days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    let utc_secs = local_secs - tz_offset_secs;
+    Some(i128::from(utc_secs) * 1_000_000_000 + i128::from(nanos))
+}
+
+/// Extract `(YYYY-MM-DD, HH-MM-SS)` for readable session publication from an RFC 3339 timestamp.
+///
+/// Requires a timezone-aware timestamp (`Z` or `±HH:MM`) and year in `2020..2100`.
+pub fn readable_date_time_from_rfc3339(timestamp: &str) -> Option<(String, String)> {
+    let _ = parse_rfc3339_utc_nanos(timestamp)?;
+    let year: u32 = timestamp.get(0..4)?.parse().ok()?;
+    let month: u32 = timestamp.get(5..7)?.parse().ok()?;
+    let day: u32 = timestamp.get(8..10)?.parse().ok()?;
+    let hour: u32 = timestamp.get(11..13)?.parse().ok()?;
+    let minute: u32 = timestamp.get(14..16)?.parse().ok()?;
+    let second: u32 = timestamp.get(17..19)?.parse().ok()?;
+    if !(2020..2100).contains(&year) {
         return None;
     }
 
@@ -154,6 +223,42 @@ pub fn readable_date_time_from_rfc3339(timestamp: &str) -> Option<(String, Strin
         format!("{year:04}-{month:02}-{day:02}"),
         format!("{hour:02}-{minute:02}-{second:02}"),
     ))
+}
+
+/// Remove orphaned atomic write temporary files (`.*.tmp`) inside `dir` left behind by crashes.
+pub fn sweep_stale_atomic_temps(dir: &Path) -> io::Result<usize> {
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Ok(0);
+    }
+
+    let mut removed = 0_usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with('.') || !name.ends_with(".tmp") || name.len() <= 5 {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(st) = fs::symlink_metadata(&path) {
+            if st.file_type().is_file() && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        let _ = fsync_directory(dir);
+    }
+    Ok(removed)
 }
 
 /// Encode bytes with RFC 4648 URL-safe Base64 without padding.

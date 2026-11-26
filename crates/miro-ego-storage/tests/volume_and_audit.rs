@@ -318,4 +318,149 @@ fn util_crc32_base64url_and_rfc3339_helpers_are_exact() {
     );
     assert!(readable_date_time_from_rfc3339("2019-01-01T00:00:00Z").is_none());
     assert!(readable_date_time_from_rfc3339("2026-11-26T10:25:01").is_none());
+    assert!(readable_date_time_from_rfc3339("2026-02-29T10:25:01Z").is_none());
+    assert!(readable_date_time_from_rfc3339("2026-02-31T10:25:01Z").is_none());
+}
+
+#[test]
+fn volume_admit_enforces_expected_uuid_and_partuuid_and_sweeps_stale_tmps() {
+    use miro_ego_storage::util::parse_rfc3339_utc_nanos;
+    use miro_ego_storage::volume::PosixVolumeProbe;
+
+    // PosixVolumeProbe on local ext4/tmpfs test directory must NOT claim exFAT.
+    let tmp = TempVolume::new("uuid-sweep");
+    let real_cap = PosixVolumeProbe.probe_volume(&tmp.root).unwrap();
+    assert!(!real_cap.is_exfat);
+
+    // Offset normalization check (`+08:00` vs `Z`).
+    assert_eq!(
+        parse_rfc3339_utc_nanos("2026-11-26T20:00:00+08:00"),
+        parse_rfc3339_utc_nanos("2026-11-26T12:00:00Z")
+    );
+    assert!(parse_rfc3339_utc_nanos("2024-02-29T23:59:59.123456789Z").is_some());
+    assert!(parse_rfc3339_utc_nanos("2025-02-29T00:00:00Z").is_none());
+
+    let probe = MockProbe::for_dir(&tmp.root, 16 * 1024 * 1024 * 1024);
+    let mut init_policy = VolumePolicy::production(2 * 1024 * 1024 * 1024, 1024);
+    init_policy.system_state_root = Some(tmp.root.clone());
+    // Simulate `volume init` creating `volume.json` without uuid/partuuid first.
+    let mgr_no_uuid =
+        ExfatVolumeManager::with_probe(tmp.paths(), init_policy, Arc::new(probe.clone()));
+    let _ = mgr_no_uuid.ensure_layout().unwrap();
+
+    // Direct `admit()` with `expected_uuid` configured MUST fail when `volume.json` lacks it.
+    let mut strict_policy = VolumePolicy::production(2 * 1024 * 1024 * 1024, 1024);
+    strict_policy.system_state_root = Some(tmp.root.clone());
+    strict_policy.expected_uuid = Some("CAFE-9999".to_owned());
+    strict_policy.expected_partuuid = Some("deadbeef-01".to_owned());
+    let mgr_strict =
+        ExfatVolumeManager::with_probe(tmp.paths(), strict_policy.clone(), Arc::new(probe.clone()));
+    assert_eq!(mgr_strict.admit(None).unwrap_err().code(), "volume_invalid");
+
+    // Plant orphan `.*.tmp` crash leftovers in `.miro-ego`, `index/`, and `receipts/`.
+    let stale1 = tmp.paths().hidden_meta_dir().join(".volume.json.999.0.tmp");
+    let stale2 = tmp.paths().index_dir().join(".catalog.bin.999.1.tmp");
+    let stale3 = tmp
+        .paths()
+        .receipts_dir()
+        .join(".coordinator-receipts.json.999.2.tmp");
+    fs::write(&stale1, b"orphan").unwrap();
+    fs::write(&stale2, b"orphan").unwrap();
+    fs::write(&stale3, b"orphan").unwrap();
+
+    // Running `ensure_layout()` sweeps stale `.tmp` files and backfills missing uuid/partuuid.
+    let _ = mgr_strict.ensure_layout().unwrap();
+    assert!(!stale1.exists());
+    assert!(!stale2.exists());
+    assert!(!stale3.exists());
+    let admitted = mgr_strict.admit(None).unwrap();
+    assert_eq!(admitted.uuid, "CAFE-9999");
+    assert_eq!(admitted.partuuid, "deadbeef-01");
+
+    // Mismatched expected_uuid / expected_partuuid MUST fail closed with VolumeInvalid!
+    let mut wrong_uuid_policy = strict_policy.clone();
+    wrong_uuid_policy.expected_uuid = Some("WRONG-0000".to_owned());
+    let mgr_wrong = ExfatVolumeManager::with_probe(tmp.paths(), wrong_uuid_policy, Arc::new(probe));
+    assert_eq!(mgr_wrong.admit(None).unwrap_err().code(), "volume_invalid");
+}
+
+#[test]
+fn audit_logger_repairs_partial_tail_line_on_reopen_and_skips_truncated_fallback_markers() {
+    let tmp = TempVolume::new("audit-repair");
+    let _ = tmp.paths().ensure_layout().unwrap();
+
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/schemas/miro-ego-api-audit-event-v1.schema.json");
+    let schema_text = fs::read_to_string(schema_path).unwrap();
+    let validator = SchemaValidator::new(&schema_text).unwrap();
+
+    // 1. Write one valid event, then append an unterminated partial line simulating power loss.
+    {
+        let logger1 = AuditLogger::new(tmp.paths(), AuditConfig::default(), Arc::new(|| true));
+        let ev1 = ApiAuditEvent::new("req-clean-1", None, "startCapture", None, "allowed");
+        assert_eq!(logger1.record(&ev1).unwrap(), AuditWriteTarget::Disk);
+    }
+    let active_path = tmp.paths().audit_dir().join("api-audit.ndjson");
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&active_path)
+            .unwrap();
+        f.write_all(b"{\"schema\":\"miro-ego.api-audit-event.v1\",\"partial_power_loss")
+            .unwrap();
+    }
+
+    // 2. Reopen AuditLogger and append a new event: partial tail MUST be repaired before append!
+    let mounted = Arc::new(AtomicBool::new(true));
+    let mounted_flag = Arc::clone(&mounted);
+    let logger2 = AuditLogger::new(
+        tmp.paths(),
+        AuditConfig {
+            max_file_bytes: 64 * 1024,
+            max_generations: 2,
+            // 1024-byte ring so an >1024-byte serialized JSON entry produces `{"truncated":true}`.
+            fallback_ring_bytes: 1024,
+        },
+        Arc::new(move || mounted_flag.load(Ordering::Acquire)),
+    );
+    let ev2 = ApiAuditEvent::new("req-clean-2", None, "stopCapture", None, "allowed");
+    assert_eq!(logger2.record(&ev2).unwrap(), AuditWriteTarget::Disk);
+
+    // 3. Simulate offline oversized event (> 1024 B via `\u0001` JSON escaping) -> truncated marker in ring,
+    //    followed by a normal compact offline event.
+    mounted.store(false, Ordering::Release);
+    let huge_ev = ApiAuditEvent::new(
+        "req-huge-offline",
+        None,
+        "deleteSessions",
+        Some("\u{0001}".repeat(300)),
+        "allowed",
+    );
+    let _ = logger2.record(&huge_ev).unwrap();
+    assert_eq!(
+        logger2.fallback_snapshot().unwrap()[0]
+            .payload
+            .get("truncated"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let normal_offline = ApiAuditEvent::new("req-offline-ok", None, "listLogs", None, "allowed");
+    let _ = logger2.record(&normal_offline).unwrap();
+
+    // Remount and flush: `{"truncated":true}` marker MUST be skipped, keeping 100% schema-valid lines!
+    mounted.store(true, Ordering::Release);
+    let _ = logger2.flush_fallback_to_disk().unwrap();
+
+    let final_text = fs::read_to_string(&active_path).unwrap();
+    let lines: Vec<&str> = final_text.lines().collect();
+    assert_eq!(lines.len(), 3, "lines: {lines:?}");
+    for line in &lines {
+        assert!(
+            validator.is_valid(line).unwrap(),
+            "corrupt audit line in api-audit.ndjson: {line}"
+        );
+    }
+    assert!(lines[0].contains("req-clean-1"));
+    assert!(lines[1].contains("req-clean-2"));
+    assert!(lines[2].contains("req-offline-ok"));
 }

@@ -88,12 +88,24 @@ impl OpenedLogFile {
             let read = pread_retry(self.file.as_raw_fd(), &mut buf[..to_read], off)
                 .map_err(|err| StorageError::io("log_read_failed", "hash diagnostic log", err))?;
             if read == 0 {
-                break;
+                return Err(StorageError::integrity(
+                    "log_truncated",
+                    "diagnostic log ended prematurely during digest calculation",
+                ));
             }
             hasher.update(&buf[..read]);
             remaining -= read as u64;
             offset += read as u64;
         }
+        let after = ArtifactFileIdentity::from_fd(self.file.as_raw_fd())?;
+        if !after.matches(&self.identity, self.is_exfat) {
+            return Err(StorageError::integrity(
+                "log_changed",
+                "diagnostic log changed during digest calculation",
+            ));
+        }
+        self.evict_page_cache();
+        let _ = fadvise_sequential(self.file.as_raw_fd(), 0, 0);
         let digest = hex_encode(hasher.finalize().as_slice());
         let etag = format!("\"{digest}\"");
         Ok((digest, etag))
@@ -118,10 +130,19 @@ impl OpenedLogFile {
             let read = pread_retry(self.file.as_raw_fd(), &mut out[filled..end], off)
                 .map_err(|err| StorageError::io("log_read_failed", "read diagnostic log", err))?;
             if read == 0 {
-                out.truncate(filled);
-                break;
+                return Err(StorageError::integrity(
+                    "log_truncated",
+                    "diagnostic log truncated during read",
+                ));
             }
             filled += read;
+        }
+        let after = ArtifactFileIdentity::from_fd(self.file.as_raw_fd())?;
+        if !after.matches(&self.identity, self.is_exfat) {
+            return Err(StorageError::integrity(
+                "log_changed",
+                "diagnostic log changed during read",
+            ));
         }
         self.evict_page_cache();
         Ok(out)
@@ -155,10 +176,19 @@ impl OpenedLogFile {
                     StorageError::io("log_read_failed", "read diagnostic log range", err)
                 })?;
             if read == 0 {
-                out.truncate(filled);
-                break;
+                return Err(StorageError::integrity(
+                    "log_truncated",
+                    "diagnostic log truncated during range read",
+                ));
             }
             filled += read;
+        }
+        let after = ArtifactFileIdentity::from_fd(self.file.as_raw_fd())?;
+        if !after.matches(&self.identity, self.is_exfat) {
+            return Err(StorageError::integrity(
+                "log_changed",
+                "diagnostic log changed during range read",
+            ));
         }
         if let (Ok(off), Ok(l)) = (i64::try_from(start), i64::try_from(length)) {
             let _ = fadvise_dontneed(self.file.as_raw_fd(), off, l);

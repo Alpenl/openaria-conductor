@@ -477,7 +477,19 @@ pub fn open_verified_artifact(
             session_id: artifact_id.to_owned(),
         })?;
 
-    let file = open_relative_regular_in_dir(&session_dir, root_dev, &descriptor.path)?;
+    let file =
+        open_relative_regular_in_dir(&session_dir, root_dev, &descriptor.path).map_err(|err| {
+            match err {
+                StorageError::NotFound { .. } => StorageError::integrity(
+                    "artifact_missing",
+                    format!(
+                        "declared manifest artifact '{}' is missing on disk",
+                        descriptor.path
+                    ),
+                ),
+                other => other,
+            }
+        })?;
     let raw_stat = fstat(file.as_raw_fd())
         .map_err(|err| StorageError::io("artifact_stat_failed", "fstat artifact", err))?;
     if (raw_stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
@@ -584,38 +596,56 @@ pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArt
 
     let mut raw_descriptors: Vec<&Value> = Vec::new();
 
-    if let Some(video) = obj.get("video").and_then(Value::as_object) {
-        if let Some(segments) = video.get("segments").and_then(Value::as_array) {
-            for seg in segments {
-                let seg_obj = seg.as_object().ok_or_else(|| {
-                    StorageError::integrity("manifest_invalid", "video segment must be object")
-                })?;
-                let arts = seg_obj
-                    .get("artifacts")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        StorageError::integrity(
-                            "manifest_invalid",
-                            "video segment missing artifacts object",
-                        )
-                    })?;
-                if let Some(left) = arts.get("left") {
-                    raw_descriptors.push(left);
-                } else {
-                    return Err(StorageError::integrity(
-                        "manifest_invalid",
-                        "video segment missing left artifact",
-                    ));
-                }
-                if let Some(right) = arts.get("right") {
-                    raw_descriptors.push(right);
-                } else {
-                    return Err(StorageError::integrity(
-                        "manifest_invalid",
-                        "video segment missing right artifact",
-                    ));
-                }
-            }
+    let video = obj
+        .get("video")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video section"))?;
+    if video.get("layout").and_then(Value::as_str) != Some("split-eyes") {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "video.layout must be 'split-eyes'",
+        ));
+    }
+    let segments = video
+        .get("segments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "missing video.segments array")
+        })?;
+    if segments.is_empty() {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "video.segments must contain at least one segment",
+        ));
+    }
+    for seg in segments {
+        let seg_obj = seg.as_object().ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "video segment must be object")
+        })?;
+        let arts = seg_obj
+            .get("artifacts")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                StorageError::integrity(
+                    "manifest_invalid",
+                    "video segment missing artifacts object",
+                )
+            })?;
+        if let Some(left) = arts.get("left") {
+            raw_descriptors.push(left);
+        } else {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "video segment missing left artifact",
+            ));
+        }
+        if let Some(right) = arts.get("right") {
+            raw_descriptors.push(right);
+        } else {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "video segment missing right artifact",
+            ));
         }
     }
 
@@ -629,8 +659,12 @@ pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArt
         raw_descriptors.push(art);
     }
 
-    if let Some(audio) = obj.get("audio").and_then(Value::as_object) {
-        if audio.get("state").and_then(Value::as_str) == Some("recorded") {
+    let audio = obj
+        .get("audio")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio section"))?;
+    match audio.get("state").and_then(Value::as_str) {
+        Some("recorded") => {
             let segments = audio
                 .get("segments")
                 .and_then(Value::as_array)
@@ -640,6 +674,12 @@ pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArt
                         "recorded audio missing segments array",
                     )
                 })?;
+            if segments.is_empty() {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "recorded audio must contain at least one segment",
+                ));
+            }
             for seg in segments {
                 let art = seg
                     .as_object()
@@ -653,12 +693,21 @@ pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArt
                 raw_descriptors.push(art);
             }
         }
+        Some("not_recorded") => {}
+        _ => {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "audio.state must be 'recorded' or 'not_recorded'",
+            ));
+        }
     }
 
-    if let Some(logs) = obj.get("logs").and_then(Value::as_array) {
-        for log in logs {
-            raw_descriptors.push(log);
-        }
+    let logs = obj
+        .get("logs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing logs array"))?;
+    for log in logs {
+        raw_descriptors.push(log);
     }
 
     let mut seen_paths = HashSet::new();

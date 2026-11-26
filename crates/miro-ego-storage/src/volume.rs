@@ -3,12 +3,12 @@
 //! Strictly enforces that recordings, logs, and internal metadata live on the mounted
 //! exFAT recording volume (`/data`) and **never** fall back to the 20 GiB ext4 system disk.
 
-use crate::util::now_rfc3339_utc;
+use crate::util::{now_rfc3339_utc, sweep_stale_atomic_temps};
 use crate::{StorageError, StorageResult, VOLUME_METADATA_SCHEMA, VolumeInfo, VolumeManager};
 use miro_ego_core::ids::{is_valid_uuid_v4, new_uuid_v4};
 use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL};
 use miro_ego_core::sys::fs::{
-    fstat, fsync_directory, is_exfat_or_msdos, open_directory_safe, read_bounded_json,
+    EXFAT_SUPER_MAGIC, fstat, fsync_directory, open_directory_safe, read_bounded_json,
     set_exfat_hidden, write_bytes_atomic,
 };
 use serde::{Deserialize, Serialize};
@@ -166,7 +166,7 @@ impl VolumeProbe for PosixVolumeProbe {
     fn probe_volume(&self, mountpoint: &Path) -> io::Result<FsCapacity> {
         let dir = open_directory_safe(mountpoint)?;
         let st = fstat(dir.as_raw_fd())?;
-        let is_exfat = is_exfat_or_msdos(dir.as_raw_fd())?;
+        let is_exfat = is_exfat_strict(dir.as_raw_fd())?;
         let vfs = fstatvfs_fd(dir.as_raw_fd())?;
         #[allow(clippy::useless_conversion)]
         let frsize = u64::from(vfs.f_frsize);
@@ -215,6 +215,27 @@ impl VolumeProbe for PosixVolumeProbe {
         let favail = u64::from(vfs.f_favail);
         let available_inodes = if files == 0 { bavail } else { favail };
         Ok((frsize.saturating_mul(bavail), available_inodes))
+    }
+}
+
+fn is_exfat_strict(fd: libc::c_int) -> io::Result<bool> {
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    loop {
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `buf` points to writable `libc::statfs` memory.
+        if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } == 0 {
+            // SAFETY: kernel initialized `buf` on 0 return.
+            let st = unsafe { buf.assume_init() };
+            #[allow(clippy::useless_conversion)]
+            let fs_type = i64::from(st.f_type);
+            return Ok(fs_type == EXFAT_SUPER_MAGIC);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }
 
@@ -325,7 +346,7 @@ impl ExfatVolumeManager {
             .map_err(|err| StorageError::VolumeInvalid {
                 message: format!("volume metadata unreadable or invalid: {err}"),
             })?;
-        validate_volume_metadata(&meta, &self.policy.expected_label)?;
+        validate_volume_metadata(&meta, &self.policy)?;
         Ok(meta)
     }
 
@@ -340,7 +361,34 @@ impl ExfatVolumeManager {
                         message: "volume metadata path must be a regular file".to_owned(),
                     });
                 }
-                let existing = self.read_metadata()?;
+                let mut existing: VolumeMetadata =
+                    read_bounded_json(&meta_path, MAX_VOLUME_METADATA_BYTES, 8).map_err(|err| {
+                        StorageError::VolumeInvalid {
+                            message: format!("volume metadata unreadable or invalid: {err}"),
+                        }
+                    })?;
+                validate_volume_metadata_base(&existing, &self.policy.expected_label)?;
+                let mut backfilled = false;
+                if existing.uuid.is_none() && self.policy.expected_uuid.is_some() {
+                    existing.uuid = self.policy.expected_uuid.clone();
+                    backfilled = true;
+                }
+                if existing.partuuid.is_none() && self.policy.expected_partuuid.is_some() {
+                    existing.partuuid = self.policy.expected_partuuid.clone();
+                    backfilled = true;
+                }
+                validate_volume_metadata(&existing, &self.policy)?;
+                if backfilled {
+                    let mut bytes = serde_json::to_vec_pretty(&existing).map_err(|e| {
+                        StorageError::VolumeInvalid {
+                            message: format!("serialize volume metadata failed: {e}"),
+                        }
+                    })?;
+                    bytes.push(b'\n');
+                    write_bytes_atomic(&meta_path, &bytes, 0o640, true).map_err(|e| {
+                        StorageError::io("volume_metadata_write_failed", "write volume.json", e)
+                    })?;
+                }
                 Ok((existing, false))
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -702,6 +750,14 @@ impl VolumeManager for ExfatVolumeManager {
             }
         }
 
+        for sweep_dir in [
+            self.paths.hidden_meta_dir(),
+            self.paths.index_dir(),
+            self.paths.receipts_dir(),
+        ] {
+            let _ = sweep_stale_atomic_temps(&sweep_dir);
+        }
+
         let _ = self.ensure_metadata()?;
         let hidden_applied =
             set_exfat_hidden(&self.paths.hidden_meta_dir(), true).map_err(|e| {
@@ -712,7 +768,7 @@ impl VolumeManager for ExfatVolumeManager {
     }
 }
 
-fn validate_volume_metadata(meta: &VolumeMetadata, expected_label: &str) -> StorageResult<()> {
+fn validate_volume_metadata_base(meta: &VolumeMetadata, expected_label: &str) -> StorageResult<()> {
     if meta.schema != VOLUME_METADATA_SCHEMA {
         return Err(StorageError::VolumeInvalid {
             message: format!("volume metadata schema must be {VOLUME_METADATA_SCHEMA}"),
@@ -730,6 +786,31 @@ fn validate_volume_metadata(meta: &VolumeMetadata, expected_label: &str) -> Stor
                 meta.label
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_volume_metadata(meta: &VolumeMetadata, policy: &VolumePolicy) -> StorageResult<()> {
+    validate_volume_metadata_base(meta, &policy.expected_label)?;
+    if let Some(expected_uuid) = &policy.expected_uuid {
+        if meta.uuid.as_deref() != Some(expected_uuid.as_str()) {
+            return Err(StorageError::VolumeInvalid {
+                message: format!(
+                    "volume metadata uuid {:?} does not match expected '{expected_uuid}'",
+                    meta.uuid
+                ),
+            });
+        }
+    }
+    if let Some(expected_partuuid) = &policy.expected_partuuid {
+        if meta.partuuid.as_deref() != Some(expected_partuuid.as_str()) {
+            return Err(StorageError::VolumeInvalid {
+                message: format!(
+                    "volume metadata partuuid {:?} does not match expected '{expected_partuuid}'",
+                    meta.partuuid
+                ),
+            });
+        }
     }
     Ok(())
 }

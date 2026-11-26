@@ -3,7 +3,8 @@
 
 use crate::catalog::{BinarySessionCatalog, DEVICE_SESSION_SCHEMA};
 use crate::util::{
-    UNKNOWN_DATE_DIR_NAME, now_rfc3339_utc, readable_date_time_from_rfc3339, sha256_hex,
+    UNKNOWN_DATE_DIR_NAME, now_rfc3339_utc, parse_rfc3339_utc_nanos,
+    readable_date_time_from_rfc3339, sha256_hex, sweep_stale_atomic_temps,
 };
 use crate::{RecoveryManager, RecoveryReport, StorageError, StorageResult};
 use miro_ego_capture::session::session_io::hash_file;
@@ -11,18 +12,18 @@ use miro_ego_core::config::{RecordingEncoding, VideoCodec};
 use miro_ego_core::ids::{is_valid_uuid_v4, is_valid_uuid_v7, new_uuid_v4, new_uuid_v7};
 use miro_ego_core::paths::DataVolumePaths;
 use miro_ego_core::sys::fs::{
-    fstat, fsync_directory, open_directory_safe, open_readonly_safe, read_bounded_json_value,
-    renameat2_noreplace, write_bytes_atomic,
+    fstat, fsync_directory, open_directory_safe, open_readonly_safe, pread_retry,
+    read_bounded_json_value, renameat2_noreplace, write_bytes_atomic,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -84,6 +85,10 @@ pub enum RecoveryItemOutcome {
         quarantine_name: String,
         reason: String,
     },
+    Deferred {
+        partial_name: String,
+        reason: String,
+    },
 }
 
 /// Rich recovery report detailing every scanned staging entry.
@@ -121,6 +126,14 @@ impl StagingRecoveryManager {
 
     /// Run crash prefix recovery over `/data/.miro-ego/staging/`, returning detailed outcomes.
     pub fn recover_staging_detailed(&self) -> StorageResult<DetailedRecoveryReport> {
+        for sweep_dir in [
+            self.paths.hidden_meta_dir(),
+            self.paths.index_dir(),
+            self.paths.receipts_dir(),
+        ] {
+            let _ = sweep_stale_atomic_temps(&sweep_dir);
+        }
+
         let staging_dir = self.paths.staging_dir();
         if !staging_dir.is_dir() {
             return Ok(DetailedRecoveryReport {
@@ -140,6 +153,8 @@ impl StagingRecoveryManager {
         let staging_dev = fstat(staging_fd.as_raw_fd())
             .map_err(|err| StorageError::io("staging_stat_failed", "fstat staging dir", err))?
             .st_dev;
+
+        let committed_terminal_unsuccessful = load_committed_terminal_session_ids(&self.paths);
 
         let mut partial_names: Vec<String> = fs::read_dir(&staging_dir)
             .map_err(|err| StorageError::io("staging_readdir_failed", "read staging dir", err))?
@@ -166,6 +181,33 @@ impl StagingRecoveryManager {
             }
             report.scanned += 1;
 
+            // Never resurrect a session that was already durably committed as terminal failed/abandoned.
+            if partial_matches_committed_unsuccessful(
+                &partial_path,
+                &name,
+                &committed_terminal_unsuccessful,
+            ) {
+                match move_to_quarantine(&self.paths.quarantine_dir(), &partial_path, &name) {
+                    Ok(q_name) => {
+                        report.quarantined += 1;
+                        items.push(RecoveryItemOutcome::Quarantined {
+                            partial_name: name,
+                            quarantine_name: q_name,
+                            reason: "session already committed as terminal unsuccessful outcome"
+                                .to_owned(),
+                        });
+                    }
+                    Err(err) if is_transient_storage_error(&err) => {
+                        items.push(RecoveryItemOutcome::Deferred {
+                            partial_name: name,
+                            reason: err.to_string(),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
+                continue;
+            }
+
             match self.recover_single_partial(&partial_path, &name) {
                 Ok(item @ RecoveryItemOutcome::Recovered { .. }) => {
                     report.recovered += 1;
@@ -175,15 +217,39 @@ impl StagingRecoveryManager {
                     report.quarantined += 1;
                     items.push(item);
                 }
-                Err(err) => {
-                    let q_name =
-                        move_to_quarantine(&self.paths.quarantine_dir(), &partial_path, &name)?;
-                    report.quarantined += 1;
-                    items.push(RecoveryItemOutcome::Quarantined {
+                Ok(item @ RecoveryItemOutcome::Deferred { .. }) => {
+                    items.push(item);
+                }
+                Err(err) if is_transient_storage_error(&err) => {
+                    // Preserve recoverable `.partial` in `staging/` on ENOSPC/EROFS/EIO!
+                    items.push(RecoveryItemOutcome::Deferred {
                         partial_name: name,
-                        quarantine_name: q_name,
                         reason: err.to_string(),
                     });
+                }
+                Err(err) => {
+                    if partial_path.exists() {
+                        match move_to_quarantine(&self.paths.quarantine_dir(), &partial_path, &name)
+                        {
+                            Ok(q_name) => {
+                                report.quarantined += 1;
+                                items.push(RecoveryItemOutcome::Quarantined {
+                                    partial_name: name,
+                                    quarantine_name: q_name,
+                                    reason: err.to_string(),
+                                });
+                            }
+                            Err(q_err) if is_transient_storage_error(&q_err) => {
+                                items.push(RecoveryItemOutcome::Deferred {
+                                    partial_name: name,
+                                    reason: q_err.to_string(),
+                                });
+                            }
+                            Err(q_err) => return Err(q_err),
+                        }
+                    } else {
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -211,19 +277,6 @@ impl StagingRecoveryManager {
                 reason: "no contiguous verified stereo video segments found".to_owned(),
             });
         }
-
-        // Quarantine any unrecoverable tail / temporary / unpaired files so the recovered
-        // recording directory placed into `/data/recordings/` stays completely spotless.
-        let kept_video_names: HashSet<String> = valid_pairs
-            .iter()
-            .flat_map(|pair| [pair.left_name.clone(), pair.right_name.clone()])
-            .collect();
-        let discarded_tail_files = quarantine_unrecoverable_tail_files(
-            &self.paths.quarantine_dir(),
-            partial_path,
-            partial_name,
-            &kept_video_names,
-        )?;
 
         let frames_path = partial_path.join("frames.ndjson");
         let imu_path = partial_path.join("imu.ndjson");
@@ -293,6 +346,13 @@ impl StagingRecoveryManager {
                 }
             }));
         }
+
+        let kept_video_names: HashSet<String> = valid_pairs
+            .iter()
+            .flat_map(|pair| [pair.left_name.clone(), pair.right_name.clone()])
+            .collect();
+        let planned_discarded_tail_files =
+            count_unrecoverable_tail_files(partial_path, &kept_video_names)?;
 
         let duration_seconds = (valid_pairs.len() as f64) * segment_secs;
         let now = now_rfc3339_utc();
@@ -390,7 +450,7 @@ impl StagingRecoveryManager {
                 "recovery": {
                     "recovered_prefix": true,
                     "recovered_segments": valid_pairs.len(),
-                    "discarded_tail_files": discarded_tail_files,
+                    "discarded_tail_files": planned_discarded_tail_files,
                     "recovered_at": now,
                 }
             }
@@ -403,6 +463,24 @@ impl StagingRecoveryManager {
         manifest_bytes.push(b'\n');
         let manifest_sha256 = sha256_hex(&manifest_bytes);
 
+        // Pre-validate manifest schema & duplicate session_id BEFORE mutating or publishing partial_path!
+        let _ = crate::catalog::parse_indexed_session_from_manifest(
+            "2026-01-01/00-00-00",
+            &manifest_value,
+            &manifest_sha256,
+        )?;
+        if let Some(catalog) = &self.catalog {
+            if catalog.get_indexed_session(&meta.session_id)?.is_some() {
+                let q_name =
+                    move_to_quarantine(&self.paths.quarantine_dir(), partial_path, partial_name)?;
+                return Ok(RecoveryItemOutcome::Quarantined {
+                    partial_name: partial_name.to_owned(),
+                    quarantine_name: q_name,
+                    reason: format!("session_id {} already exists in catalog", meta.session_id),
+                });
+            }
+        }
+
         let manifest_path = partial_path.join("manifest.json");
         write_bytes_atomic(&manifest_path, &manifest_bytes, 0o640, true).map_err(|err| {
             StorageError::io(
@@ -413,19 +491,57 @@ impl StagingRecoveryManager {
         })?;
         let _ = fsync_directory(partial_path);
 
+        // Quarantine any unrecoverable tail / temporary / unpaired files so the recovered
+        // recording directory placed into `/data/recordings/` stays completely spotless.
+        let discarded_tail_files = quarantine_unrecoverable_tail_files(
+            &self.paths.quarantine_dir(),
+            partial_path,
+            partial_name,
+            &kept_video_names,
+        )?;
+
         let relative_dir = publish_staging_directory(&self.paths, partial_path, &meta.started_at)?;
 
+        // --- Post-publish section: `partial_path` no longer exists; operate strictly on `final_root`! ---
         let final_root = self.paths.recordings_dir().join(&relative_dir);
-        remove_control_markers(&final_root)?;
-        let _ = fsync_directory(&final_root);
+        let post_publish_res: StorageResult<()> = (|| {
+            remove_control_markers(&final_root)?;
+            let _ = fsync_directory(&final_root);
+            if let Some(catalog) = &self.catalog {
+                let indexed = crate::catalog::parse_indexed_session_from_manifest(
+                    &relative_dir,
+                    &manifest_value,
+                    &manifest_sha256,
+                )?;
+                catalog.admit_indexed_session(indexed)?;
+            }
+            Ok(())
+        })();
 
-        if let Some(catalog) = &self.catalog {
-            let indexed = crate::catalog::parse_indexed_session_from_manifest(
-                &relative_dir,
-                &manifest_value,
-                &manifest_sha256,
-            )?;
-            let _ = catalog.admit_indexed_session(indexed);
+        if let Err(post_err) = post_publish_res {
+            if is_transient_storage_error(&post_err) {
+                // Roll back published directory back into `staging/` so recovery can retry cleanly
+                // once disk space / writability returns without split-brain.
+                if fs::rename(&final_root, partial_path).is_ok() {
+                    cleanup_empty_date_parent(&self.paths.recordings_dir(), &final_root);
+                    return Ok(RecoveryItemOutcome::Deferred {
+                        partial_name: partial_name.to_owned(),
+                        reason: post_err.to_string(),
+                    });
+                }
+                return Err(post_err);
+            }
+
+            // Non-transient post-publish failure (e.g. duplicate_session_id race or corrupt state):
+            // move `final_root` (NOT `partial_path`!) into `quarantine/` and clean up date parent.
+            let q_name =
+                move_to_quarantine(&self.paths.quarantine_dir(), &final_root, partial_name)?;
+            cleanup_empty_date_parent(&self.paths.recordings_dir(), &final_root);
+            return Ok(RecoveryItemOutcome::Quarantined {
+                partial_name: partial_name.to_owned(),
+                quarantine_name: q_name,
+                reason: post_err.to_string(),
+            });
         }
 
         Ok(RecoveryItemOutcome::Recovered {
@@ -451,6 +567,11 @@ pub fn publish_staging_directory(
     partial_root: &Path,
     started_at: &str,
 ) -> StorageResult<String> {
+    if !paths.hidden_meta_dir().is_dir() {
+        return Err(StorageError::Unavailable {
+            message: "recording volume metadata directory does not exist".to_owned(),
+        });
+    }
     let recordings_root = paths.recordings_dir();
     if !recordings_root.is_dir() {
         fs::create_dir_all(&recordings_root).map_err(|err| {
@@ -704,12 +825,95 @@ fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()>
     file.read_exact(buf)
 }
 
-fn quarantine_unrecoverable_tail_files(
-    quarantine_root: &Path,
+/// Check whether a [`StorageError`] represents a transient volume/capacity/writability fault
+/// (`ENOSPC`, `EROFS`, `EIO`, `EDQUOT`, `EACCES`, or `Unavailable`) where recoverable staging
+/// directories must NOT be moved into `quarantine/`.
+pub fn is_transient_storage_error(err: &StorageError) -> bool {
+    match err {
+        StorageError::Unavailable { .. } => true,
+        StorageError::Io { source, .. } => matches!(
+            source.raw_os_error(),
+            Some(libc::ENOSPC | libc::EROFS | libc::EIO | libc::EDQUOT | libc::EACCES)
+        ),
+        _ => false,
+    }
+}
+
+/// Quarantine a failed or split-brain session directory under `/data/.miro-ego/quarantine/`,
+/// verifying that `.miro-ego` exists on the mounted volume so `/data` is never created on ext4.
+pub fn quarantine_session_directory(
+    paths: &DataVolumePaths,
+    src_dir: &Path,
+    base_name: &str,
+) -> StorageResult<String> {
+    if !paths.hidden_meta_dir().is_dir() {
+        return Err(StorageError::Unavailable {
+            message: "recording volume metadata directory does not exist".to_owned(),
+        });
+    }
+    move_to_quarantine(&paths.quarantine_dir(), src_dir, base_name)
+}
+
+pub(crate) fn cleanup_empty_date_parent(recordings_root: &Path, final_root: &Path) {
+    if let Some(parent) = final_root.parent() {
+        if parent != recordings_root {
+            let _ = fs::remove_dir(parent);
+            let _ = fsync_directory(recordings_root);
+        }
+    }
+}
+
+fn load_committed_terminal_session_ids(paths: &DataVolumePaths) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let receipts_file = paths.receipts_dir().join("coordinator-receipts.json");
+    let Ok(val) = read_bounded_json_value(&receipts_file, 1024 * 1024, 16) else {
+        return out;
+    };
+    if let Some(items) = val.get("unsuccessful").and_then(Value::as_array) {
+        for item in items {
+            let rs = item.get("outcome").and_then(|o| o.get("recording_state"));
+            let state = rs.and_then(|r| r.get("state")).and_then(Value::as_str);
+            if matches!(state, Some("failed" | "abandoned")) {
+                if let Some(sid) = rs.and_then(|r| r.get("session_id")).and_then(Value::as_str) {
+                    out.insert(sid.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn partial_matches_committed_unsuccessful(
     partial_path: &Path,
     partial_name: &str,
+    committed_ids: &HashSet<String>,
+) -> bool {
+    if committed_ids.is_empty() {
+        return false;
+    }
+    if let Some(stem) = partial_name.strip_suffix(".partial") {
+        if committed_ids.contains(stem) {
+            return true;
+        }
+    }
+    for marker in ["capture.json", "recording.json"] {
+        if let Ok(v) =
+            read_bounded_json_value(&partial_path.join(marker), MAX_CONTROL_JSON_BYTES, 16)
+        {
+            if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
+                if committed_ids.contains(sid) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn collect_unrecoverable_tail_files(
+    partial_path: &Path,
     kept_video_names: &HashSet<String>,
-) -> StorageResult<usize> {
+) -> StorageResult<Vec<(PathBuf, String)>> {
     let mut stray_files: Vec<(PathBuf, String)> = Vec::new();
 
     let video_dir = partial_path.join("video");
@@ -737,7 +941,23 @@ fn quarantine_unrecoverable_tail_files(
             }
         }
     }
+    Ok(stray_files)
+}
 
+fn count_unrecoverable_tail_files(
+    partial_path: &Path,
+    kept_video_names: &HashSet<String>,
+) -> StorageResult<usize> {
+    Ok(collect_unrecoverable_tail_files(partial_path, kept_video_names)?.len())
+}
+
+fn quarantine_unrecoverable_tail_files(
+    quarantine_root: &Path,
+    partial_path: &Path,
+    partial_name: &str,
+    kept_video_names: &HashSet<String>,
+) -> StorageResult<usize> {
+    let stray_files = collect_unrecoverable_tail_files(partial_path, kept_video_names)?;
     if stray_files.is_empty() {
         return Ok(0);
     }
@@ -751,9 +971,14 @@ fn quarantine_unrecoverable_tail_files(
     let mut moved = 0_usize;
     for (src, flat_name) in stray_files {
         let dst = tail_dir.join(flat_name);
-        if fs::rename(&src, &dst).is_ok() {
-            moved += 1;
-        }
+        fs::rename(&src, &dst).map_err(|err| {
+            StorageError::io(
+                "quarantine_tail_move_failed",
+                format!("move unrecoverable tail file {}", src.display()),
+                err,
+            )
+        })?;
+        moved += 1;
     }
     let _ = fsync_directory(&tail_dir);
     let _ = fsync_directory(quarantine_root);
@@ -836,44 +1061,201 @@ fn allocate_unique_child_dir(parent: &Path, base_name: &str) -> StorageResult<St
     ))
 }
 
-fn sanitize_ndjson_file(path: &Path) -> StorageResult<u64> {
-    if fs::symlink_metadata(path).is_err() {
-        write_bytes_atomic(path, b"", 0o640, true).map_err(|err| {
-            StorageError::io("recovery_ndjson_create", "create empty ndjson file", err)
-        })?;
+/// Stream-scan an NDJSON file in bounded 64 KiB chunks and truncate in-place via `ftruncate`
+/// at the last valid newline-terminated JSON line (zero 2x-RAM or 2x-disk rewrite).
+pub fn sanitize_ndjson_file(path: &Path) -> StorageResult<u64> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(StorageError::integrity(
+                    "recovery_ndjson_invalid",
+                    format!("ndjson target is not a regular file: {}", path.display()),
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            write_bytes_atomic(path, b"", 0o640, true).map_err(|e| {
+                StorageError::io("recovery_ndjson_create", "create empty ndjson file", e)
+            })?;
+            return Ok(0);
+        }
+        Err(err) => {
+            return Err(StorageError::io(
+                "recovery_ndjson_stat",
+                "stat partial ndjson file",
+                err,
+            ));
+        }
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|err| StorageError::io("recovery_ndjson_open", "open partial ndjson file", err))?;
+    let st = fstat(file.as_raw_fd())
+        .map_err(|err| StorageError::io("recovery_ndjson_stat", "fstat partial ndjson", err))?;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(StorageError::integrity(
+            "recovery_ndjson_invalid",
+            "ndjson descriptor is not a regular file",
+        ));
+    }
+    #[allow(clippy::useless_conversion)]
+    let nlink = u64::from(st.st_nlink);
+    if nlink != 1 {
+        return Err(StorageError::integrity(
+            "recovery_ndjson_invalid",
+            "ndjson file must not have hardlinks",
+        ));
+    }
+    let file_size = u64::try_from(st.st_size).map_err(|_| {
+        StorageError::integrity("recovery_ndjson_invalid", "negative ndjson file size")
+    })?;
+    if file_size == 0 {
         return Ok(0);
     }
-    let raw = fs::read(path)
-        .map_err(|err| StorageError::io("recovery_ndjson_read", "read partial ndjson file", err))?;
-    let mut clean = Vec::with_capacity(raw.len());
-    let mut valid_count = 0_u64;
-    let mut modified = false;
 
-    for slice in raw.split_inclusive(|&b| b == b'\n') {
-        if !slice.ends_with(b"\n") {
-            modified = true;
+    const CHUNK_BYTES: usize = 64 * 1024;
+    const MAX_NDJSON_LINE_BYTES: usize = 2 * 1024 * 1024;
+
+    let mut chunk = vec![0_u8; CHUNK_BYTES];
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut read_offset = 0_u64;
+    let mut line_start_offset = 0_u64;
+    let mut write_offset = 0_u64;
+    let mut valid_count = 0_u64;
+    let mut needs_truncate = false;
+
+    'scan: while read_offset < file_size {
+        let to_read = usize::try_from((file_size - read_offset).min(CHUNK_BYTES as u64))
+            .unwrap_or(CHUNK_BYTES);
+        let off = libc::off_t::try_from(read_offset).map_err(|_| {
+            StorageError::integrity("recovery_ndjson_invalid", "ndjson offset overflow")
+        })?;
+        let n = pread_retry(file.as_raw_fd(), &mut chunk[..to_read], off).map_err(|err| {
+            StorageError::io("recovery_ndjson_read", "pread partial ndjson file", err)
+        })?;
+        if n == 0 {
             break;
         }
-        let trimmed = &slice[..slice.len() - 1];
-        if trimmed.is_empty() {
-            modified = true;
-            continue;
+
+        let mut slice = &chunk[..n];
+        let mut consumed_in_chunk = 0_u64;
+        while !slice.is_empty() {
+            if let Some(nl_idx) = slice.iter().position(|&b| b == b'\n') {
+                let piece = &slice[..=nl_idx];
+                if line_buf.len().saturating_add(piece.len()) > MAX_NDJSON_LINE_BYTES {
+                    needs_truncate = true;
+                    line_buf.clear();
+                    break 'scan;
+                }
+                line_buf.extend_from_slice(piece);
+                consumed_in_chunk += piece.len() as u64;
+                slice = &slice[nl_idx + 1..];
+
+                let trimmed = &line_buf[..line_buf.len() - 1];
+                if trimmed.is_empty() {
+                    needs_truncate = true;
+                    line_buf.clear();
+                    line_start_offset = read_offset + consumed_in_chunk;
+                    continue;
+                }
+                if serde_json::from_slice::<Value>(trimmed).is_ok() {
+                    if write_offset < line_start_offset {
+                        pwrite_all_fd(file.as_raw_fd(), &line_buf, write_offset).map_err(
+                            |err| {
+                                StorageError::io(
+                                    "recovery_ndjson_compact",
+                                    "compact sanitized ndjson in-place",
+                                    err,
+                                )
+                            },
+                        )?;
+                    }
+                    write_offset += line_buf.len() as u64;
+                    valid_count += 1;
+                    line_buf.clear();
+                    line_start_offset = read_offset + consumed_in_chunk;
+                } else {
+                    needs_truncate = true;
+                    line_buf.clear();
+                    break 'scan;
+                }
+            } else {
+                if line_buf.len().saturating_add(slice.len()) > MAX_NDJSON_LINE_BYTES {
+                    needs_truncate = true;
+                    line_buf.clear();
+                    break 'scan;
+                }
+                line_buf.extend_from_slice(slice);
+                consumed_in_chunk += slice.len() as u64;
+                break;
+            }
         }
-        if serde_json::from_slice::<Value>(trimmed).is_ok() {
-            clean.extend_from_slice(slice);
-            valid_count += 1;
-        } else {
-            modified = true;
-            break;
-        }
+        read_offset += consumed_in_chunk;
     }
 
-    if modified {
-        write_bytes_atomic(path, &clean, 0o640, true).map_err(|err| {
-            StorageError::io("recovery_ndjson_rewrite", "rewrite sanitized ndjson", err)
+    if !line_buf.is_empty() {
+        needs_truncate = true;
+    }
+
+    if needs_truncate || write_offset < file_size {
+        ftruncate_ndjson_fd(file.as_raw_fd(), write_offset).map_err(|err| {
+            StorageError::io(
+                "recovery_ndjson_truncate",
+                "ftruncate sanitized ndjson file",
+                err,
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            StorageError::io("recovery_ndjson_sync", "fsync sanitized ndjson file", err)
         })?;
     }
+
     Ok(valid_count)
+}
+
+fn pwrite_all_fd(fd: libc::c_int, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let off = libc::off_t::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pwrite offset overflow"))?;
+        // SAFETY: `fd` is a valid open file descriptor and `buf` points to valid memory.
+        let written = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off) };
+        if written < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "pwrite returned zero bytes",
+            ));
+        }
+        let n = written as usize;
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+fn ftruncate_ndjson_fd(fd: libc::c_int, new_size: u64) -> io::Result<()> {
+    let off = libc::off_t::try_from(new_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ftruncate size overflow"))?;
+    loop {
+        // SAFETY: `fd` is a valid open regular file descriptor.
+        if unsafe { libc::ftruncate(fd, off) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 struct PartialMetadata {
@@ -970,10 +1352,14 @@ fn load_partial_metadata(
         .filter(|m| m == "production" || m == "calibration")
         .unwrap_or_else(|| "production".to_owned());
     let display_name = pick_str("display_name")
-        .filter(|s| !s.is_empty() && s.len() <= 160)
+        .filter(|s| {
+            let count = s.chars().count();
+            (1..=160).contains(&count)
+        })
         .unwrap_or_else(|| format!("Recovered {session_id}"));
     let started_at = pick_str("started_at")
         .or_else(|| pick_str("updated_at"))
+        .filter(|s| parse_rfc3339_utc_nanos(s).is_some())
         .unwrap_or_else(now_rfc3339_utc);
 
     let segment_frames = capture_meta
