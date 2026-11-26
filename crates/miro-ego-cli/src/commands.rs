@@ -56,10 +56,12 @@ use miro_ego_storage::{
 };
 use serde_json::{Value, json};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -909,31 +911,131 @@ fn run_network_control(sub: NetworkControlSubcommand) -> Result<(), String> {
     }
 }
 
-fn take_systemd_socket_fd() -> Option<UnixListener> {
-    let listen_pid: u32 = env::var("LISTEN_PID").ok()?.parse().ok()?;
-    if listen_pid != std::process::id() {
+/// Check whether `fd` is an open, listening `AF_UNIX` `SOCK_STREAM` socket (`SO_ACCEPTCONN == 1`).
+pub fn is_listening_unix_socket(fd: libc::c_int) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let mut accept_conn: libc::c_int = 0;
+    let mut opt_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `accept_conn` and `opt_len` are valid stack pointers matching `SO_ACCEPTCONN`.
+    let rc_accept = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut accept_conn).cast::<libc::c_void>(),
+            &raw mut opt_len,
+        )
+    };
+    if rc_accept != 0 || accept_conn != 1 {
+        return false;
+    }
+
+    let mut domain: libc::c_int = 0;
+    let mut domain_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `domain` and `domain_len` are valid stack pointers matching `SO_DOMAIN`.
+    let rc_domain = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            (&raw mut domain).cast::<libc::c_void>(),
+            &raw mut domain_len,
+        )
+    };
+    if rc_domain != 0 || domain != libc::AF_UNIX {
+        return false;
+    }
+
+    let mut sock_type: libc::c_int = 0;
+    let mut type_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `sock_type` and `type_len` are valid stack pointers matching `SO_TYPE`.
+    let rc_type = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut sock_type).cast::<libc::c_void>(),
+            &raw mut type_len,
+        )
+    };
+    rc_type == 0 && sock_type == libc::SOCK_STREAM
+}
+
+/// Adopt a listening `AF_UNIX` socket descriptor as an owned [`UnixListener`].
+///
+/// When `dup_fd` is `true` (used for systemd `StandardInput=socket` on fd 0), duplicates the
+/// descriptor atomically with `F_DUPFD_CLOEXEC` so the returned listener owns an independent fd.
+pub fn adopt_listening_unix_socket_fd(fd: libc::c_int, dup_fd: bool) -> Option<UnixListener> {
+    if !is_listening_unix_socket(fd) {
         return None;
     }
-    let listen_fds: u32 = env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    if listen_fds < 1 {
-        return None;
+    if dup_fd {
+        // SAFETY: `fd` was verified as a valid open listening Unix socket above.
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicated < 0 {
+            return None;
+        }
+        // SAFETY: `duplicated` is a freshly duplicated owned fd referring to a listening Unix socket.
+        return Some(unsafe { UnixListener::from_raw_fd(duplicated) });
     }
-    // SAFETY: systemd passes the first activated socket at SD_LISTEN_FDS_START (fd 3)
-    // exclusively to LISTEN_PID.
-    let listener = unsafe { UnixListener::from_raw_fd(3) };
-    Some(listener)
+    // SAFETY: `fd` is owned exclusively by this process (SD_LISTEN_FDS_START) and verified above.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: `fd` was verified as a listening AF_UNIX SOCK_STREAM socket passed exclusively to us.
+    Some(unsafe { UnixListener::from_raw_fd(fd) })
+}
+
+/// Adopt a systemd socket-activated listening Unix socket.
+///
+/// Supports both standard `LISTEN_PID`/`LISTEN_FDS` activation (fd 3) and
+/// `StandardInput=socket` (`Accept=no`) activation (fd 0, as configured by
+/// `deploy/miro-ego/miro-ego-network.service`).
+pub fn take_systemd_socket_fd() -> Option<UnixListener> {
+    if let (Ok(pid_str), Ok(fds_str)) = (env::var("LISTEN_PID"), env::var("LISTEN_FDS")) {
+        if pid_str.parse::<u32>().ok() == Some(std::process::id())
+            && fds_str.parse::<u32>().ok().is_some_and(|n| n >= 1)
+        {
+            if let Some(listener) = adopt_listening_unix_socket_fd(3, false) {
+                return Some(listener);
+            }
+        }
+    }
+    adopt_listening_unix_socket_fd(libc::STDIN_FILENO, true)
+}
+
+/// Send an `sd_notify`-compatible datagram (`READY=1`, `STOPPING=1`) to `notify_socket`,
+/// supporting both filesystem paths and Linux abstract namespace (`@...`) sockets.
+pub fn notify_systemd_to(notify_socket: &OsStr, state: &str) -> bool {
+    let bytes = notify_socket.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return false;
+    };
+    if let Some(abstract_name) = bytes.strip_prefix(b"@") {
+        if abstract_name.is_empty() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name) {
+                return sock.send_to_addr(state.as_bytes(), &addr).is_ok();
+            }
+        }
+        return false;
+    }
+    sock.send_to(state.as_bytes(), Path::new(notify_socket))
+        .is_ok()
 }
 
 fn notify_systemd(state: &str) {
     let Some(notify_socket) = env::var_os("NOTIFY_SOCKET") else {
         return;
     };
-    if notify_socket.is_empty() {
-        return;
-    }
-    if let Ok(sock) = UnixDatagram::unbound() {
-        let _ = sock.send_to(state.as_bytes(), notify_socket);
-    }
+    let _ = notify_systemd_to(&notify_socket, state);
 }
 
 fn run_button(args: ButtonArgs) -> Result<(), String> {
@@ -1547,6 +1649,89 @@ mod tests {
             mountpoint: dir.clone(),
         })
         .unwrap();
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn adopts_listening_unix_socket_and_rejects_non_listening_fds() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "miro-ego-sock-adopt-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+
+        let sock_path = dir.join("test.sock");
+        let orig = UnixListener::bind(&sock_path).unwrap();
+        assert!(is_listening_unix_socket(orig.as_raw_fd()));
+
+        let adopted = adopt_listening_unix_socket_fd(orig.as_raw_fd(), true).unwrap();
+        // Dropping the original fd must leave the duplicated listener fully functional.
+        drop(orig);
+        let client = UnixStream::connect(&sock_path).unwrap();
+        let (_accepted, _) = adopted.accept().unwrap();
+        drop(client);
+        drop(adopted);
+
+        // Non-listening datagram socket and regular file must be rejected.
+        let dgram = UnixDatagram::unbound().unwrap();
+        assert!(!is_listening_unix_socket(dgram.as_raw_fd()));
+        assert!(adopt_listening_unix_socket_fd(dgram.as_raw_fd(), true).is_none());
+
+        let file_path = dir.join("regular.txt");
+        let reg = fs::File::create(&file_path).unwrap();
+        assert!(!is_listening_unix_socket(reg.as_raw_fd()));
+        assert!(adopt_listening_unix_socket_fd(reg.as_raw_fd(), true).is_none());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn notify_systemd_supports_filesystem_and_abstract_sockets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "miro-ego-notify-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+
+        // 1. Filesystem path socket
+        let path_sock = dir.join("notify.sock");
+        let rx_path = UnixDatagram::bind(&path_sock).unwrap();
+        rx_path
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(notify_systemd_to(path_sock.as_os_str(), "READY=1"));
+        let mut buf = [0u8; 32];
+        let n = rx_path.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+
+        // 2. Linux abstract namespace socket (@...)
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            let abs_name = format!("miro-ego-notify-{}-{unique}", std::process::id());
+            let abs_addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(abs_name.as_bytes()).unwrap();
+            let rx_abs = UnixDatagram::bind_addr(&abs_addr).unwrap();
+            rx_abs
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let env_val = format!("@{abs_name}");
+            assert!(notify_systemd_to(OsStr::new(&env_val), "READY=1"));
+            let n2 = rx_abs.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n2], b"READY=1");
+        }
 
         fs::remove_dir_all(dir).unwrap();
     }

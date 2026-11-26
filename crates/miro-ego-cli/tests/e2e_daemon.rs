@@ -1104,3 +1104,232 @@ fn cli_binary_subcommands_e2e() {
     net_srv.shutdown();
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Verifies systemd `StandardInput=socket` (fd 0, `Accept=no`) activation as configured in
+/// `deploy/miro-ego/miro-ego-network.service`: passes a real listening Unix socket on fd 0
+/// with `LISTEN_PID`/`LISTEN_FDS` unset, adopts it via `take_systemd_socket_fd()`, notifies
+/// over an abstract `NOTIFY_SOCKET=@...`, and serves live `NetworkRpcClient` requests.
+#[test]
+fn systemd_standard_input_socket_fd0_activation_serves_network_rpc() {
+    use miro_ego_cli::commands::{notify_systemd_to, take_systemd_socket_fd};
+    use std::ffi::OsStr;
+    use std::os::fd::AsRawFd;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener};
+    use std::os::unix::process::CommandExt;
+
+    // Child mode: spawned with listening Unix socket dup2'd onto fd 0 (`STDIN_FILENO`).
+    if let Ok(child_root_str) = std::env::var("MIRO_EGO_E2E_FD0_CHILD_ROOT") {
+        let child_root = PathBuf::from(child_root_str);
+        let listener = take_systemd_socket_fd()
+            .expect("take_systemd_socket_fd must adopt listening Unix socket on fd 0");
+        let state_path = child_root.join("net-state.json");
+        let profiles_dir = child_root.join("nm-profiles");
+        let run_dir = child_root.join("net-run");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let state_store = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let nmcli = NmcliBackend::new(Arc::new(StubNmcliRunner), profiles_dir, "wlan0", "eth0");
+        let controller = Arc::new(
+            AuthoritativeNetworkController::new(
+                nmcli,
+                state_store,
+                ControllerConfig::new(new_uuid_v4(), run_dir),
+            )
+            .unwrap(),
+        );
+        let server =
+            NetworkRpcServer::from_listener(listener, None, controller, RpcServerConfig::default())
+                .expect("mount NetworkRpcServer on adopted fd 0 listener");
+
+        let notify_sock = std::env::var_os("NOTIFY_SOCKET").expect("NOTIFY_SOCKET set by parent");
+        assert!(notify_systemd_to(&notify_sock, "READY=1"));
+
+        // Wait until parent touches the stop marker file, then shut down cleanly.
+        let stop_marker = child_root.join("stop");
+        for _ in 0..200 {
+            if stop_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(notify_systemd_to(&notify_sock, "STOPPING=1"));
+        server.shutdown();
+        return;
+    }
+
+    // Parent mode: bind listening Unix socket, bind abstract notify socket, spawn child with fd 0.
+    let root = temp_test_dir("fd0-activation");
+    let sock_path = root.join("network-control.sock");
+    let listener = UnixListener::bind(&sock_path).expect("bind parent UnixListener");
+    let listener_fd = listener.as_raw_fd();
+
+    let abs_name = format!(
+        "miro-ego-e2e-notify-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let abs_addr = UnixSocketAddr::from_abstract_name(abs_name.as_bytes()).unwrap();
+    let notify_rx = UnixDatagram::bind_addr(&abs_addr).unwrap();
+    notify_rx
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let current_exe = std::env::current_exe().expect("locate current test executable");
+    let mut cmd = Command::new(current_exe);
+    cmd.args([
+        "--exact",
+        "systemd_standard_input_socket_fd0_activation_serves_network_rpc",
+        "--nocapture",
+    ])
+    .env("MIRO_EGO_E2E_FD0_CHILD_ROOT", &root)
+    .env("NOTIFY_SOCKET", OsStr::new(&format!("@{abs_name}")))
+    .env_remove("LISTEN_PID")
+    .env_remove("LISTEN_FDS");
+
+    // SAFETY: `pre_exec` invokes only async-signal-safe `libc::dup2` to place the listening
+    // socket onto `STDIN_FILENO` (fd 0), mirroring systemd `StandardInput=socket`.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(listener_fd, libc::STDIN_FILENO) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().expect("spawn fd 0 socket activation child");
+    // Drop parent listener handle to prove child owns an independent dup'd descriptor.
+    drop(listener);
+
+    let mut notify_buf = [0u8; 64];
+    let n = notify_rx
+        .recv(&mut notify_buf)
+        .expect("receive READY=1 on abstract NOTIFY_SOCKET");
+    assert_eq!(&notify_buf[..n], b"READY=1");
+
+    // Talk to the child over the fd-0-adopted socket!
+    let client = NetworkRpcClient::new(&sock_path).with_timeout(Duration::from_secs(3));
+    let status = client.status().expect("RPC status over fd 0 socket");
+    assert_eq!(status.schema, "miro-ego.network-controller-status.v1");
+    let wd_mode = client
+        .watchdog_mode()
+        .expect("RPC watchdog-mode over fd 0 socket");
+    assert_eq!(wd_mode.as_str(), "hotspot");
+
+    fs::write(root.join("stop"), b"1").unwrap();
+    let n_stop = notify_rx
+        .recv(&mut notify_buf)
+        .expect("receive STOPPING=1 on abstract NOTIFY_SOCKET");
+    assert_eq!(&notify_buf[..n_stop], b"STOPPING=1");
+
+    let exit = child.wait().expect("wait for fd 0 child");
+    assert!(exit.success(), "fd 0 child exited with {exit:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Regression test proving `miro-ego serve --mock` uses `<state_root>/run` (NOT `/run/miro-ego`)
+/// by default so non-root `POST /api/v1/capture/start` succeeds without permission errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_serve_default_run_dir_allows_non_root_capture_start_and_stop() {
+    let root = temp_test_dir("mock-nonroot-run");
+    let data_dir = root.join("data");
+    let state_dir = root.join("state");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let _ = init_test_volume(&data_dir);
+
+    let cfg = make_lab_device_config(&data_dir, &state_dir);
+    let mut options = DaemonServeOptions::from_device_config(cfg, true);
+    assert_eq!(
+        options.run_dir.as_deref(),
+        Some(state_dir.join("run").as_path()),
+        "mock mode must default run_dir under state_root/run for non-root execution"
+    );
+    options.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    options.network_socket = None;
+
+    let bound = bind_daemon(options)
+        .await
+        .expect("bind mock daemon with default run_dir");
+    let addr = bound.server.local_addr();
+    let origin = format!("http://{addr}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let daemon_task = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let start_key = new_uuid_v4();
+    let start_payload = serde_json::to_vec(&json!({
+        "schema": "miro-ego.capture-start.v1",
+        "mode": "production",
+        "take": { "kind": "new" }
+    }))
+    .unwrap();
+    let (code, _, body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &start_key),
+        ],
+        Some(start_payload),
+    )
+    .await;
+    assert_eq!(
+        code,
+        202,
+        "mock capture start must succeed non-root: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        state_dir.join("run/maintenance.lock").is_file(),
+        "maintenance.lock must be created inside state_root/run"
+    );
+
+    let stop_key = new_uuid_v4();
+    let stop_payload = serde_json::to_vec(&json!({
+        "schema": "miro-ego.capture-stop.v1",
+        "reason": "user"
+    }))
+    .unwrap();
+    let (code, _, body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &stop_key),
+        ],
+        Some(stop_payload),
+    )
+    .await;
+    assert_eq!(
+        code,
+        202,
+        "mock capture stop failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (code, _, body) = http_request(addr, Method::GET, "/api/v1/sessions", &[], None).await;
+    assert_eq!(code, 200);
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+
+    let _ = shutdown_tx.send(());
+    daemon_task
+        .await
+        .expect("join mock daemon")
+        .expect("clean mock daemon exit");
+    let _ = fs::remove_dir_all(&root);
+}

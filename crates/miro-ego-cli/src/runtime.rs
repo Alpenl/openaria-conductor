@@ -2846,6 +2846,11 @@ impl DaemonServeOptions {
         let network_socket = std::env::var_os("MIRO_EGO_NETWORK_SOCKET")
             .map(PathBuf::from)
             .or_else(|| Some(PathBuf::from(miro_ego_network::DEFAULT_CONTROL_SOCKET_PATH)));
+        let run_dir = if mock {
+            Some(device_config.state_root.join("run"))
+        } else {
+            Some(PathBuf::from(miro_ego_core::paths::SYSTEM_RUN_DIR))
+        };
         Self {
             device_config,
             capture_mode,
@@ -2854,7 +2859,7 @@ impl DaemonServeOptions {
             release_paths: ReleaseManagerPaths::canonical(),
             relaxed_volume: mock,
             enable_h264_preview: true,
-            run_dir: Some(PathBuf::from(miro_ego_core::paths::SYSTEM_RUN_DIR)),
+            run_dir,
             voice_controller: None,
             indicator: None,
             reserve_poll_interval: DEFAULT_RESERVE_POLL_INTERVAL,
@@ -2880,6 +2885,11 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
         .map_err(|err| format!("invalid device config: {err}"))?;
 
     let volume_paths = DataVolumePaths::new(options.device_config.storage.mountpoint.clone());
+    if options.relaxed_volume {
+        if let Some(ref run_dir) = options.run_dir {
+            let _ = fs::create_dir_all(run_dir);
+        }
+    }
     let policy = if options.relaxed_volume {
         VolumePolicy::relaxed_for_tests(options.device_config.storage.minimum_available_bytes)
     } else {
