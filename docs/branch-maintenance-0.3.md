@@ -1,81 +1,66 @@
 # `refactor/0.3.0` 与 `main` 双线协同维护规范
 
-本文档记录 `openaria-conductor` 在 `0.3.0` 架构重构期间，`main`（`0.2.x` 稳定主干）与 `refactor/0.3.0`（`0.3.0` 重构演进分支）的定位、单向同步规则、冲突映射表及正式切换（Cutover）门禁。
+本文档记录 **Miro-Ego 0.3.0** 纯原生架构重构期间，`main`（`0.2.x` 历史稳定主干）与 `refactor/0.3.0`（Miro-Ego `0.3.0` 纯原生 Rust + C 主线）的分支定位、单向同步规则、架构落位及最终切换（Cutover）门禁。
 
 ---
 
 ## 一、分支定位与基线关系
 
-| 分支 | 定位与职责 | 版本与渠道约束 | 基线关系 |
+| 分支 | 定位与职责 | 版本与架构状态 | 基线关系 |
 | :--- | :--- | :--- | :--- |
-| **`main`** | `0.2.x` 线上稳定与现场修复主干。承载 RDK X5 实机问题修复、正式版本 tag（`v0.2.x`）与线上 OTA 渠道交付。 | 受分支保护（PR + `test` 必过、禁强推）；仅允许 `0.2.x` 版本与 `rdk-x5/latest.json` 主 OTA 渠道。 | 与 `origin/main` 保持一致；在 `0.3.0` 正式切换前继续作为唯一线上发布主干。 |
-| **`refactor/0.3.0`** | `0.3.0` 架构重构与演进主线。承载模块化拆分、并发/安全加固与测试基础设施重构。 | 切换前暂保持 `0.2.16` 四处版本一致性锁，不向线上 `rdk-x5/latest.json` 发布；仅运行 CI 与 RDK X5 离线测试包构建。 | 自 `v0.2.16`（`60b44a5`）分岔，纯 0.3.0 重构基线 `70f0623` 已先行备份至远端，并通过 `--no-ff` 合入 `origin/main`。 |
-| **`release/0.2`（未来切换期创建）** | `0.3.0` 合入 `main` 前，从 `main` 切出的 `0.2.x` 长期冻结维护线。 | 若需继续发包，须使用独立 OSS 前缀（如 `rdk-x5-0.2`），避免触发 `check_channel_promotion` 降级拦截。 | 切换后 `main` 升级为 `0.3.x` 主干。 |
+| **`main`** | `0.2.x` 线上稳定与现场修复主干。承载旧版 Python + PyO3 运行时在 RDK X5 上的紧急修复与 `v0.2.x` 发布。 | 仅允许 `0.2.x` 补丁版与旧版渠道；合入 `0.3.0` 前切出 `release/0.2` 冻结维护线。 | 与 `origin/main` 保持一致。 |
+| **`refactor/0.3.0`** | **Miro-Ego 0.3.0** 纯原生重构主线。单二进制 Rust（`crates/miro-ego-*`）+ 独立 C 硬件编码器（`csrc/miro-ego-encoder/`）+ 纯 exFAT `/data` + 20 GiB 零增长系统盘 + 设备 API v1（`/api/v1`）。 | 已完成纯原生切换（版本 `0.3.0`），移除旧 `src/rp_ylx/`、`native/`、`tests/` 与旧 `contracts/ylx-*`；主机工具迁至 `tools/miro_ego_host/`。 | 经 Wave 1–4 演进并保持 `scripts/check.py` 全绿。 |
+| **`release/0.2`（合入 `main` 前创建）** | `refactor/0.3.0` 合入 `main` 前从 `main` 切出的 `0.2.x` 长期冻结维护分支。 | 若需对存量 `0.2.x` 设备发包，须使用独立发布前缀，避免与 `0.3.x` 混用。 | 切换完成后 `main` 升级为 Miro-Ego `0.3.x` 主干。 |
 
 ---
 
 ## 二、双线协同与修复同步规则
 
-采用 **“单向主同步（`main -> refactor/0.3.0`）+ 分类分流”** 策略：
+在 `refactor/0.3.0` 尚未正式合入 `main` 之前，仍遵循 **“现场硬件修复单向同步（`main -> refactor/0.3.0`）”** 策略：
 
 | 改动类型 | 优先合入目标 | 跨分支同步策略 |
 | :--- | :--- | :--- |
-| **A. 现场硬件 / 存储安全 / 线上 Bug 修复** | `main`（走 `fix/*` PR） | **必须单向同步至 `refactor/0.3.0`**。 |
-| **B. `0.2.x` 发版元数据与发行说明**（版本号递增、`docs/releases/*.md`） | `main`（走 `release/0.2.x` PR） | 仍执行 `--no-ff` 合并进 `refactor/0.3.0` 推进 merge-base，但 4 处版本锁与 `uv.lock`/`Cargo.lock` 保留 `refactor/0.3.0` 侧；**禁止在未同步升版 `pyproject.toml` 时单独采纳新版 `src/rp_ylx/web/assets.json`**。 |
-| **C. `0.3.0` 架构重构、内部加固与测试基建** | `refactor/0.3.0` | **禁止反向合入 `main`**，避免在稳定主干引入大面积结构震荡。 |
-| **D. 在 `0.3.0` 发现且危及 `0.2.x` 线上安全的严重缺陷** | 双线紧急 PR | 合入 `main` 后再以 `--no-ff` 收口至 `refactor/0.3.0`，防止后续同步重复冲突。 |
-
-### 同步节奏与操作规范
-1. **同步节奏**：`origin/main` 每合入修复 PR 后 **24 小时内** 发起同步；打测试包或真机验收前强制对齐最新 `origin/main`。
-2. **统一使用 `--no-ff` 合并**（禁止对 `refactor/0.3.0` 执行 `git rebase origin/main`）：
-   ```bash
-   git fetch origin
-   git checkout -b sync/main-into-0.3.0-YYYYMMDD origin/refactor/0.3.0
-   git merge --no-ff origin/main -m "chore(sync): merge origin/main (<short-sha>, PR #N) into refactor/0.3.0"
-   ```
+| **A. 现场硬件 / 存储安全 / 线上 Bug 修复** | `main`（走 `fix/*` PR） | 将修复意图等价落地到 `refactor/0.3.0` 对应的 Rust crate / C 编码器 / `deploy/miro-ego/` / `tools/miro_ego_host/` 模块，**严禁恢复已删除的旧 Python 设备端代码**。 |
+| **B. `0.2.x` 发版元数据与发行说明** | `main` | 保持 `refactor/0.3.0` 的 `0.3.0` 版本锁（`Cargo.toml` / `pyproject.toml` / `uv.lock` / `Cargo.lock`），不采纳 `0.2.x` 版本元数据。 |
+| **C. `0.3.0` 纯原生架构演进、API v1 与 CI/打包基建** | `refactor/0.3.0` | **禁止反向合入 `main`**，直至完成真机浸泡验收与正式切换。 |
 
 ---
 
-## 三、冲突裁决与模块落位映射
+## 三、旧 `0.2.x` 到 Miro-Ego `0.3.0` 模块落位映射
 
-由于 `refactor/0.3.0` 已将多个旧单文件拆分为子模块并保留薄兼容垫片（shim），合并冲突时**严禁机械接受 `main` 文本或将逻辑写回垫片**。
+将 `main` 上发现的硬件或运维问题同步到 `refactor/0.3.0` 时，按以下映射直接修改新架构模块：
 
-### 裁决优先级（由高到低）
-1. **0.3.0 安全、锁序、状态机与纯标准库不变量**（最高优先级，不可回退）。
-2. **`main` 修复的真实业务意图**（须在映射模块中完整语义落地）。
-3. **0.3.0 模块边界与 `tests/testkit/` 规范**（不污染垫片、不引入循环依赖或跨测试 import）。
-4. **版本与契约校验锁**（OpenAPI YAML 合并后必须实时重算字节数与 SHA-256）。
-
-### 模块映射表（`main` -> `refactor/0.3.0`）
-
-| `main` (`0.2.x`) 修改位置 | `refactor/0.3.0` 真实落位 | 结构与安全约束 |
+| `main` (`0.2.x`) 旧位置 | `refactor/0.3.0` (`Miro-Ego 0.3.0`) 真实落位 | 说明 |
 | :--- | :--- | :--- |
-| `src/rp_ylx/deployment.py` | `src/rp_ylx/deploy_pkg/{schema,config,systemd,transaction,storage,bundle,network_migration}.py` | `deployment.py` 保持纯导出垫片；`deploy_pkg/` 保持**纯 Python 标准库（零第三方依赖）**。 |
-| `src/rp_ylx/api/gateway.py` | `src/rp_ylx/api/{router,http_server,middleware,streams}.py`、`api/controllers/*` | `gateway.py` 保持纯垫片；CORS/Header 放行需同步检查 `router.py`。 |
-| `src/rp_ylx/api/events.py` | `src/rp_ylx/api/validators/events.py`、`api/streams.py` | `events.py` 保持纯垫片；区分 API 响应校验与 SQLite 入库校验。 |
-| `src/rp_ylx/api/downloads.py` | `api/controllers/sessions.py`、`api/{range,locked_io,manifest_validator}.py` | `downloads.py` 仅保留 `DirectorySessionStore` 与兼容导出。 |
-| `src/rp_ylx/recording/{coordinator,catalog,device_session}.py` | `recording/{coordinator,session_catalog,lifecycle,stop_workflow,recovery_orchestrator,state_store,fs_safety}.py` | 严守锁序与 `CapturePhase` 状态机，保持 exFAT 安全写语义。 |
-| `src/rp_ylx/daemon.py` / `update.py` | 同路径文件 | 保留 `core.fs` 加固、有界严格 JSON 读取、Ed25519 验签与 `maintenance_lock`。 |
-| `native/src/{lib,audio,schema_validation}.rs` | `native/src/{py,audio,hardware,session,sys}/*` | 拒绝恢复已删旧文件；非测试代码保持零 `.unwrap()`/`.expect()`。 |
-| `src/rp_ylx/api/ylx-device-v4.openapi.yaml` | 同路径 + `contracts/ylx-device-api-support.json` + `tests/test_gateway_contract.py` | 合并后实时重算字节数与 SHA-256 并同步契约文件与测试。 |
-| `tests/test_*.py` | 对应单测 + `tests/testkit/*` | 公共桩留在 `tests/testkit/`，禁止跨测试文件 import 或写死系统锁路径。 |
+| `src/rp_ylx/core/`、`native/src/sys/` | `crates/miro-ego-core/` | 路径常量、配置、锁、`O_NOFOLLOW` 安全 I/O、exFAT `ATTR_HIDDEN` ioctl |
+| `src/rp_ylx/capture/`、`native/src/hardware/`、`native/src/audio/` | `crates/miro-ego-capture/` | V4L2 双目采集、IMU、ALSA 音频、`MEGO_SHM` 共享内存环 |
+| `src/rp_ylx/hobot/`、`native/hobot/` | `csrc/miro-ego-encoder/` | 独立 C11 硬件双目编码器与 ASan/UBSan 主机测试套 |
+| `src/rp_ylx/recording/`、`src/rp_ylx/sqlite*` | `crates/miro-ego-storage/` | 录制状态机、exFAT 会话封存、二进制 `catalog.bin`、断电恢复、诊断日志与审计 |
+| `src/rp_ylx/api/`、`ylx-device-v4.openapi.yaml` | `crates/miro-ego-api/` + `contracts/miro-ego-*` | Async Tokio/Axum/Rustls `/api/v1` 网关、Range 下载、SSE、MJPEG/H.264 预览 |
+| `src/rp_ylx/network*` | `crates/miro-ego-network/` | `nmcli` 控制、Unix Socket JSON-RPC、救援热点 `MiroEgo-XXXXXXXX`、`_miro-ego._tcp` mDNS |
+| `src/rp_ylx/recording_button.py`、`recording_indicator.py`、语音 | `crates/miro-ego-hw/` | 40-pin GPIO 按钮、sysfs LED、语音播报音量、温度/板型读取 |
+| `src/rp_ylx/deploy_pkg/`、`src/rp_ylx/deploy/` | `crates/miro-ego-deploy/` + `deploy/miro-ego/` | 纯原生 `miro-ego.rdk-x5-bundle.v1` 验包、A/B 事务发布/回滚、systemd 单元与零增长限额 |
+| `scripts/factory_recovery/`、`scripts/card_export/` | `tools/miro_ego_host/{factory_recovery,card_export}/` | 主机侧工厂恢复刷卡器（3 分区 exFAT）与只读 SD 卡导出器 |
+| `scripts/check.py`、`scripts/build_rdk_x5_bundle.py` | 同路径（纯原生重写） | 统一静态/契约/C/主机工具/Rust 检查与纯原生 AArch64 bundle 打包 |
 
 ### 每次同步强制验证门禁
+
 ```bash
 git diff --check
+uv sync --frozen --extra dev
 uv run --extra dev python scripts/release_version.py
 CI=true uv run --extra dev python scripts/check.py
 ```
 
 ---
 
-## 四、`0.2.x -> 0.3.0` 正式切换（Cutover）上线门禁
+## 四、`0.2.x -> 0.3.0` 正式切换（Cutover）上线门禁清单
 
-正式将 `refactor/0.3.0` 升版并合入 `main` 前，须集中完成以下 6 项准备（不要在日常同步中零散改动）：
-
-1. **解除 `(0, 2)` 与 `.0` 版本拦截**：同步放开 `scripts/release_version.py`、`scripts/publish_rdk_x5_oss.py` 与 `src/rp_ylx/firmware_control.py` 的版本系列限制，并更新 `tests/test_release_version.py` 与 `tests/test_firmware_control.py`。
-2. **原子升级版本号与锁文件**：同步升级 `pyproject.toml`、`native/Cargo.toml`、`src/rp_ylx/__init__.py`、`src/rp_ylx/web/assets.json`，并更新 `uv.lock`、`Cargo.lock` 与 `tests/test_web_resources.py`。
-3. **OSS 渠道隔离与升级桥接**：预发阶段使用独立前缀（如 `rdk-x5-next`），避免污染 `rdk-x5/latest.json`；正式升级需提供支持 `(0, 3)` 的过渡版或通过 `sudo openaria-update <manifest-url>` 引导。
-4. **Ed25519 签名闭环**：补齐仓库 `release-signing.pub` 并验证 `OPENARIA_RELEASE_SIGNING_KEY` 发布签名与设备端验签链路。
-5. **CI 与打包流水线就绪**：确认 `.github/workflows/ci.yml` 与 `.github/workflows/rdk-x5-bundle.yml` 在 `refactor/0.3.0` 全绿。
-6. **真机浸泡验收**：参照 Issue #87 标准完成至少一轮 RDK X5 实机安装/OTA、双目长录与重启恢复验证，从 `main` 切出 `release/0.2` 后再将 `refactor/0.3.0` 合入 `main` 并打 `v0.3.0` 附注标签。
+1. **[已完成] 解除 `(0, 2)` 与 `.0` 版本限制并统一升级至 `0.3.0`**：`Cargo.toml`、`pyproject.toml`、`uv.lock`、`scripts/release_version.py` 已切换至 `0.3.x` 门禁，旧 `src/rp_ylx/`、`native/`、`tests/`、`contracts/ylx-*` 已彻底清理。
+2. **[已完成] CI 与纯原生 RDK X5 打包流水线就绪**：`.github/workflows/ci.yml` 与 `.github/workflows/rdk-x5-bundle.yml` 已切换为纯 Rust + C 原生构建与验证，移除 CPython 运行时与 Python wheel 打包链路。
+3. **[已完成] 存储布局与 API v1 契约固化**：详见 [存储与 20 GiB 零增长系统盘规范](miro-ego-storage-layout.md) 与 [Miro-Ego API v1 迁移指南](miro-ego-v1-api-migration.md)。
+4. **[已规划至 0.3.0 后 Backlog] 增量 OTA、签名发布渠道与离线录制盘更新包**：`crates/miro-ego-deploy/src/bundle.rs` 已预留 `StoreLayer`（CAS 增量层）与 `OfflinePackageHook`（`/data/updates/` 离线更新包）扩展接口，线上 OSS 渠道与 Ed25519 签名发布在后续版本独立交付。
+5. **[待实机执行] RDK X5 实机浸泡验收与主干切换**：
+   - 在 RDK X5 V1.0 实机上使用本地/SDK 编译的 `miro-ego-encoder`（链接 `/usr/hobot/lib/libmultimedia.so`）与交叉编译 `miro-ego` 组装纯原生 bundle；
+   - 完成离线刷卡首启（验证 p1 `CONFIG` 清理、p2 20 GiB 零增长、p3 exFAT `MIRO-EGO` 挂载与 `ATTR_HIDDEN`）、双目长录、断电恢复及 `miro-ego deploy` A/B 升级回滚验收；
+   - 从 `main` 切出 `release/0.2` 冻结分支后，将 `refactor/0.3.0` 合入 `main` 并打附注标签 `v0.3.0`。

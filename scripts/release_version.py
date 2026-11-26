@@ -1,9 +1,8 @@
-"""Single release guard: only annotated v0.2.N tags matching all package identities."""
+"""Miro-Ego 0.3.x release version and annotated tag guard."""
 
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import re
 import subprocess
@@ -11,79 +10,98 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = re.compile(r"0\.2\.[1-9][0-9]*\Z")
-
-
-def _package_fallback_version(init_path: Path) -> str:
-    tree = ast.parse(init_path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ExceptHandler):
-            continue
-        for statement in node.body:
-            if (
-                isinstance(statement, ast.Assign)
-                and len(statement.targets) == 1
-                and isinstance(statement.targets[0], ast.Name)
-                and statement.targets[0].id == "__version__"
-                and isinstance(statement.value, ast.Constant)
-                and isinstance(statement.value.value, str)
-            ):
-                return statement.value.value
-    raise ValueError("src/rp_ylx/__init__.py 缺少 __version__ 回退定义")
+VERSION = re.compile(r"0\.3\.[0-9]+\Z")
+EXPECTED_SUPPORT_SCHEMA = "miro-ego.device-api-consumer-support.v1"
 
 
 def project_version(root: Path = ROOT) -> str:
-    value = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-        "version"
-    ]
-    if not VERSION.fullmatch(value):
-        raise ValueError("版本仅允许 0.2.x（x >= 1）；改变系列须用户明确授权")
-    native = tomllib.loads((root / "native/Cargo.toml").read_text(encoding="utf-8"))["package"][
-        "version"
-    ]
-    web = json.loads((root / "src/rp_ylx/web/assets.json").read_text(encoding="utf-8"))["version"]
-    if native != value or web != value:
-        raise ValueError("Conductor、Rust 与嵌入 Echo Web 必须使用相同版本")
-    init_path = root / "src/rp_ylx/__init__.py"
-    if root == ROOT and not init_path.is_file():
-        raise ValueError("缺少 src/rp_ylx/__init__.py")
-    if init_path.is_file() and _package_fallback_version(init_path) != value:
-        raise ValueError("Conductor、Rust、__init__.py 回退版本与嵌入 Echo Web 必须使用相同版本")
-    return value
+    """Validate and return the unified Miro-Ego 0.3.x version across repo manifests."""
+    cargo_data = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace = cargo_data.get("workspace", {})
+    workspace_version = workspace.get("package", {}).get("version")
+    if not isinstance(workspace_version, str) or not VERSION.fullmatch(workspace_version):
+        raise ValueError(
+            f"Cargo.toml workspace.package.version must match 0.3.x, got {workspace_version!r}"
+        )
+
+    pyproject_data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    pyproject_version = pyproject_data.get("project", {}).get("version")
+    if pyproject_version != workspace_version:
+        raise ValueError(
+            "Version mismatch: "
+            f"Cargo.toml={workspace_version!r} vs pyproject.toml={pyproject_version!r}"
+        )
+
+    members = workspace.get("members", [])
+    if not members:
+        raise ValueError("Cargo.toml workspace.members must not be empty")
+    for member in members:
+        member_manifest = root / member / "Cargo.toml"
+        if not member_manifest.is_file():
+            raise ValueError(f"Missing workspace member manifest: {member_manifest}")
+        member_pkg = tomllib.loads(member_manifest.read_text(encoding="utf-8")).get("package", {})
+        member_ver = member_pkg.get("version")
+        if member_ver != {"workspace": True} and member_ver != workspace_version:
+            raise ValueError(
+                f"Workspace member {member} version mismatch: "
+                f"{member_ver!r} != {workspace_version!r}"
+            )
+
+    support_path = root / "contracts" / "miro-ego-api-support.json"
+    if not support_path.is_file():
+        raise ValueError(f"Missing API contract support manifest: {support_path}")
+    support = json.loads(support_path.read_text(encoding="utf-8"))
+    if support.get("schema") != EXPECTED_SUPPORT_SCHEMA or support.get("consumer") != "miro-ego":
+        raise ValueError("contracts/miro-ego-api-support.json has unexpected schema or consumer")
+    if support.get("supported_device_api_majors") != [1]:
+        raise ValueError(
+            "contracts/miro-ego-api-support.json must pin supported_device_api_majors=[1]"
+        )
+    for version_key in ("version", "software_version"):
+        if version_key in support and support[version_key] != workspace_version:
+            raise ValueError(
+                f"contracts/miro-ego-api-support.json {version_key}={support[version_key]!r} "
+                f"!= {workspace_version!r}"
+            )
+
+    return workspace_version
 
 
 def release_tag(tag: str, root: Path = ROOT) -> tuple[str, str]:
+    """Verify an annotated v0.3.x Git release tag points cleanly to HEAD."""
     version = project_version(root)
-    if tag != "v" + version:
-        raise ValueError("发布标签与源码版本不一致")
+    expected_tag = f"v{version}"
+    if tag != expected_tag:
+        raise ValueError(f"Release tag {tag!r} does not match source version {expected_tag!r}")
 
-    def git(*args):
+    def git(*args: str) -> str:
         return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
 
     if git("cat-file", "-t", f"refs/tags/{tag}") != "tag":
-        raise ValueError("正式发布必须使用附注标签（git tag -a）")
+        raise ValueError("Release tag must be an annotated tag (git tag -a)")
     if git("rev-parse", f"refs/tags/{tag}^{{commit}}") != git("rev-parse", "HEAD"):
-        raise ValueError("标签没有指向当前构建提交")
+        raise ValueError("Release tag does not point to HEAD")
     if git("status", "--porcelain", "--untracked-files=no"):
-        raise ValueError("正式发布工作树存在未提交修改，拒绝混用标签与本地文件")
+        raise ValueError("Working tree has uncommitted changes; refusing release tag verification")
     notes = git("for-each-ref", "--format=%(contents)", f"refs/tags/{tag}")
     if not notes or len(notes) > 16000:
-        raise ValueError("附注标签必须包含不超过 16000 字符的发布说明")
+        raise ValueError("Annotated release tag must contain non-empty notes (<= 16000 chars)")
     return version, notes
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tag")
-    parser.add_argument("--notes-file", type=Path)
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate unified Miro-Ego 0.3.x version")
+    parser.add_argument("--tag", help="Optional annotated Git tag v0.3.x to verify")
+    parser.add_argument("--notes-file", type=Path, help="Optional path to write tag release notes")
+    args = parser.parse_args(argv)
     version = project_version()
     if args.tag:
         version, notes = release_tag(args.tag)
-        if args.notes_file:
+        if args.notes_file is not None:
             args.notes_file.write_text(notes + "\n", encoding="utf-8")
     print(version)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,142 +1,121 @@
-# Open Aria Conductor
+# Miro-Ego
 
-Open Aria Conductor 是运行在 D-Robotics RDK X5 V1.0 上、配套 YLX 2UQ2 的双目视频与 IMU
-同步录制软件。本版本只支持这一硬件组合；Raspberry Pi 不属于支持矩阵。代码仍保留
-历史 package、CLI、systemd unit 和数据标识作为兼容别名，以兼容现有安装与已录制会话。
+**Miro-Ego 0.3.0** is a pure-native stereo video, audio, and IMU capture appliance for **D-Robotics RDK X5 V1.0 + YLX 2UQ2**.
 
-当前版本为 **0.2.16**（属于 `0.2.x` 系列；自 `0.2.1` 起仅递增补丁号，未经用户明确授权不改变版本系列）。
-最新变更见 [0.2.16 发布说明](docs/releases/0.2.16.md)。
-网页顶部版本入口可检查更新、手动升级和回退，设备通过阿里云 OSS 获取完整应用包。
-发版采用附注标签，详细步骤见 [安装与发布手册](docs/one-click-install.md)。
+Version **0.3.0** replaces the legacy 0.2.x Python/PyO3/SQLite daemon with a **zero-Python on-device runtime**: a single Rust binary (`miro-ego`) paired with a standalone C hardware stereo encoder (`miro-ego-encoder`), a clean-break `/api/v1` Device API, an exFAT-only `MIRO-EGO` recording volume, and a zero-growth 20 GiB system disk.
 
-浏览器控制端由 [Open Aria Echo / Web](https://github.com/Alpenl/openaria-echo-web)
-独立构建，Conductor 固定其提交与摘要并在设备本地托管静态制品。
+---
 
-[Score D-049](https://github.com/mirrorbloom/openaria-score/blob/main/docs/DECISIONS.md#d-049-fixed-storage-and-lan-only-delivery-removable-and-interruption-workflows-retired)
-规定产品向部署配置的固定 `/data` 写入，并通过 LAN 交付封存会话。
-2026-09-15 根据录制兜底要求补充了完整前段恢复：录制失败或进程中断后，设备校验已完成的
-连续双目分段并发布可用前段，界面显示“录制已中断，已保存前 … 秒，可导出”。无法确认有效的
-尾段保留在设备上供排查。物理断电持久性、真实 TF `p3`、可移除介质、ENOSPC/inode 耗尽和
-安全换盘仍未完成硬件验收。实现、实机证据和限制见
-[分段恢复报告](docs/reports/2026-09-15-recording-recovery.md)及
-[消融实验](docs/reports/2026-09-15-recording-ablation.md)。
+## Architecture
 
-## 用户文档
+### On-Device Native Runtime (Zero Python)
 
-- [SQLite 持久化与维护](docs/sqlite-storage.md)：配置迁移、录制索引、备份恢复和空间保护。
+- **Unified Rust Binary (`miro-ego`)** — Workspace crates under `crates/`:
+  - `crates/miro-ego-core`: config, canonical paths, `flock` locks, strict bounded JSON I/O, atomic writes, Linux exFAT `ATTR_HIDDEN` ioctl, structured telemetry.
+  - `crates/miro-ego-capture`: V4L2 stereo camera discovery & capture, IMU reader, ALSA audio clock/capture, `memfd` + `eventfd` `MEGO_SHM` ring IPC with `miro-ego-encoder`, live MJPEG/H.264 preview feeders.
+  - `crates/miro-ego-storage`: capture coordinator state machine, exFAT-safe recording staging/sealing, binary `catalog.bin` index (replacing SQLite), interrupted-session recovery, diagnostic logs, and bounded API audit store.
+  - `crates/miro-ego-api`: async `tokio` + `axum` + `rustls` HTTP/HTTPS gateway implementing Miro-Ego Device API v1 (`/api/v1/...`), single-range artifact & log downloads, SSE event streams, MJPEG & H.264 fMP4 preview, and CORS/CSRF/Idempotency enforcement.
+  - `crates/miro-ego-network`: privileged `nmcli` Wi-Fi/hotspot/Ethernet controller, Unix socket JSON-RPC server (`/run/miro-ego/network-control.sock`), rescue hotspot (`MiroEgo-XXXXXXXX`), and `_miro-ego._tcp` mDNS helper.
+  - `crates/miro-ego-hw`: 40-pin GPIO recording button monitor, sysfs `ACT` LED indicator, ALSA voice feedback volume control, and RDK X5 thermal/board inspection.
+  - `crates/miro-ego-deploy`: transactional A/B release manager (`/opt/miro-ego/releases/<commit>`, `current`/`previous` symlinks, automatic activation rollback) verifying `miro-ego.rdk-x5-bundle.v1` AArch64 ELF64 bundles.
+  - `crates/miro-ego-cli`: single binary entrypoint (`serve`, `network-control`, `button`, `deploy`, `volume`, `status`, `probe`, `validate`).
+- **Hardware Stereo Encoder (`miro-ego-encoder`)** — Standalone C11 process under [`csrc/miro-ego-encoder/`](csrc/miro-ego-encoder/Makefile) driving the RDK X5 Hobot VPU/JPU hardware codecs (`hb_mm_mc` / `hb_mm_mx`) over the `MEGO_SHM` zero-copy ring buffer, with host-side `-Wall -Wextra -Werror` + ASan/UBSan test suites.
+- **Deployment Assets ([`deploy/miro-ego/`](deploy/miro-ego/))** — Hardened systemd units, `sysusers.d`/`tmpfiles.d`, Avahi `_miro-ego._tcp` service descriptors, exFAT `/data` mount verifier, POSIX `sh` Wi-Fi watchdog, idle TRIM wrapper, and zero-growth system disk caps.
 
-- [RDK X5 一键安装与更新](docs/one-click-install.md)：从阿里云 OSS 下载、校验并完成安装，以及发布新固件。
+### Host-PC Tooling (`tools/miro_ego_host/`)
 
-- [设备使用指南](docs/user-guide.md)：从开机、进入页面到录制、封存、下载和正常关机。
-- [网络连接与救援指南](docs/networking.md)：Wi-Fi、设备热点、固定地址、SSH 和正常网络回退。
+Python is used **exclusively on the operator's host PC** and during CI verification:
 
-热点模式下，Web 管理页面的固定入口是 `http://10.42.0.1:8080/`。
+- **Offline Factory Recovery & SD-Card Flasher**: [`tools/miro_ego_host/factory_recovery/README.md`](tools/miro_ego_host/factory_recovery/README.md) — composes and flashes 3-partition RDK OS 3.5.0 cards with board-bound `MEB1` encrypted profiles and automatic post-firstboot `CONFIG` cleanup.
+- **Read-Only exFAT Card Exporter**: [`tools/miro_ego_host/card_export/README.md`](tools/miro_ego_host/card_export/README.md) — strictly read-only SHA-256-verified exporter for `MIRO-EGO` recordings and `/logs/` diagnostics across Windows, macOS, and Linux.
 
-## 项目职责
+---
 
-- 发现并配置受支持的双目相机与 IMU。
-- 采集双目视频帧、完整 IMU 样本和明确的时间戳。
-- 检测丢帧、传感器停止、存储故障和无效设备状态。
-- 管理从准备、录制到结束封存的完整录制会话生命周期。
-- 持久写入会话元数据、清单、校验值和诊断记录。
-- 自身提供有版本的设备控制 Web API 与浏览器实时预览。
-- 报告设备健康状态、剩余容量、录制进度和故障原因。
-- 为受支持的 RDK X5 设备提供可重复的安装、升级和回退方法。
+## Storage Layout & Zero-Growth 20 GiB System Disk
 
-## 项目边界
+See [`docs/miro-ego-storage-layout.md`](docs/miro-ego-storage-layout.md) for the complete specification.
 
-Conductor 负责设备端采集以及写入部署配置的固定 `/data` 根目录。PC 端会话管理、批量数据
-处理和最终结果展示不属于本项目。
+| Partition | Filesystem | Label | Size | Mountpoint | Role |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **p1** | FAT32 (`0x0C`) | `CONFIG` | `256 MiB` | `/boot/config` | Vendor boot hook & one-shot provisioning (cleaned after first boot) |
+| **p2** | ext4 (`0x83`) | `rootfs` | Fixed `20 GiB` | `/` | Zero-growth appliance OS, native `miro-ego` + `miro-ego-encoder`, bounded configs |
+| **p3** | exFAT (`0x07`) | `MIRO-EGO` | Remaining (`>= 4 GiB`) | `/data` | Recordings (`recordings/`), diagnostics (`logs/`), future offline updates (`updates/`), hidden `.miro-ego/` (`ATTR_HIDDEN`) |
 
-录制正确性不能依赖预览客户端是否在线。预览、日志和控制通信不得暗中改变采集格式，
-也不得降低录制可靠性。
+- **Zero unbounded growth on p2**: journald (`<= 64 MiB` disk), logrotate (`maxsize 4M` every 5 min), core dumps disabled (`Storage=none`, `DefaultLimitCORE=0:0`), APT disk caches disabled, watchdog logs on `/data/logs/wifi-watchdog/` (tmpfs fallback only), and RAM-ring fallback for telemetry/audit when `/data` is unmounted.
+- **Fail-closed recording volume**: `/data` mounts strictly by verified `PARTUUID` + `UUID` + `exfat` with no loop-volume fallback onto p2.
 
-## 对外接口
+---
 
-- 供 Open Aria Bridge / SDK 与 Desktop 使用的录制会话格式。
-- Echo / Web 使用的实时预览、控制、状态和诊断 Device API。
-- 未来移动端可复用的同一 Device API；移动端不属于当前交付。
-- 可在没有真实相机时运行自动化测试的硬件抽象接口。
+## Miro-Ego Device API v1 & Device Access
 
-任何消费者依赖具体实现行为之前，都必须先确定接口版本和兼容规则。
+See [`docs/miro-ego-v1-api-migration.md`](docs/miro-ego-v1-api-migration.md) for the complete endpoint, header, and schema specification.
 
-## 初始工作方向
+- **API Prefix**: `/api/v1/...` (`api_version: "1.0"`, fail-closed `supported_device_api_majors: [1]`)
+- **OpenAPI 3.1 Contract**: [`contracts/miro-ego-device-v1.openapi.yaml`](contracts/miro-ego-device-v1.openapi.yaml)
+- **Consumer Support Manifest**: [`contracts/miro-ego-api-support.json`](contracts/miro-ego-api-support.json)
+- **JSON Schemas**:
+  - [`miro-ego-device-session-v1.schema.json`](contracts/schemas/miro-ego-device-session-v1.schema.json)
+  - [`miro-ego-recording-state-v1.schema.json`](contracts/schemas/miro-ego-recording-state-v1.schema.json)
+  - [`miro-ego-api-audit-event-v1.schema.json`](contracts/schemas/miro-ego-api-audit-event-v1.schema.json)
+  - [`miro-ego-operational-event-v1.schema.json`](contracts/schemas/miro-ego-operational-event-v1.schema.json)
+  - [`miro-ego-performance-report-v1.schema.json`](contracts/schemas/miro-ego-performance-report-v1.schema.json)
+- **Device Network Identity**:
+  - mDNS discovery: `_miro-ego._tcp` (`Miro-Ego on <host>`, TXT `api=/api/v1/device`, `miro-ego.local`)
+  - Rescue hotspot SSID: `MiroEgo-XXXXXXXX` (`http://10.42.0.1:8080/`)
+  - SSH admin account: `MiroEgo`
+  - Service user: `miro-ego:miro-ego`
 
-1. 硬件访问与确定性的设备发现。
-2. 双目视频帧和 IMU 数据采集。
-3. 时间戳、同步和数据丢失检测。
-4. 固定存储上的会话生命周期、正常停止、校验和封存。
-5. 设备控制接口与有资源上限的实时预览传输。
-6. RDK X5 端打包、服务管理、运行观测和真机测试。
+---
 
-## 旧代码复用规则
+## Development & Verification
 
-每个复用组件都要记录来源提交、保留行为、依赖、许可证、修改内容和回归测试。缺少可重复
-测试的硬件代码，应先固化其外部行为，再放到可测试接口之后重写。
-
-## 开发命令
-
-需要 Python 3.11 或更高版本，推荐使用 `uv`：
+Requires **Rust 1.85+** (edition 2024, `clippy`, `rustfmt`), **GCC + Make** (for C encoder host tests), and **uv** (for host-PC tools and verification scripts):
 
 ```bash
-uv sync --extra dev
-uv run openaria --version
-uv run openaria status
-uv run openaria probe
-uv run openaria hardware-smoke --help
-uv run openaria serve-mock
-uv run openaria serve-hardware-preview --device /dev/video0
-uv run openaria serve --help
-uv run openaria settings --help
-uv run openaria database --help
-uv run openaria validate --help
-uv run openaria timestamps --help
-uv run openaria volume --help
-uv run openaria network --help
-uv run openaria network-control --help
-uv run openaria benchmark --help
-uv run python scripts/check.py
-uv build
+# Sync host-PC & verification Python environment
+uv sync --frozen --extra dev
+
+# Verify unified 0.3.x version across Cargo.toml, pyproject.toml, and API contracts
+uv run --extra dev python scripts/release_version.py
+
+# Run full hardware-free verification gate (static/contracts/lint + C ASan/UBSan + host tools + Rust workspace)
+CI=true uv run --extra dev python scripts/check.py
+
+# Fast local iteration mode (refused under CI=true)
+uv run --extra dev python scripts/check.py --fast
+
+# Build release native binary
+cargo build --release -p miro-ego-cli
+./target/release/miro-ego --version
+
+# Run C encoder host test suite directly
+make -C csrc/miro-ego-encoder check
+
+# Assemble a pure-native RDK X5 AArch64 bundle (miro-ego.rdk-x5-bundle.v1)
+uv run --extra dev python scripts/build_rdk_x5_bundle.py --help
 ```
 
-> 注：`experiments/` 目录为已归档的历史基准测试与消融实验记录，不参与当前生产运行代码路径。
+> Note: Production on-device `miro-ego-encoder` binaries are compiled on RDK X5 (or against an RDK X5 Hobot SDK sysroot) via `make -C csrc/miro-ego-encoder` linking `/usr/hobot/lib/libmultimedia.so`.
 
-已完成的 Python/Rust 固定 trace 消融结果、原始报告和校验摘要见
-[`experiments/fixed-trace-20260905-132783d`](experiments/fixed-trace-20260905-132783d/README.md)。
+---
 
-全项目结构消融的删除依据、状态机对照实验和打包测量见
-[`experiments/code-structure-20260908`](experiments/code-structure-20260908/README.md)。
+## Backlog (Post-0.3.0)
 
-## 设备接入
+The following release-delivery capabilities are intentionally deferred to the post-0.3.0 backlog, with extension hooks already reserved in `crates/miro-ego-deploy/src/bundle.rs` and `/data/updates/`:
 
-- 救援热点名称：`OpenAria-XXXXXXXX`，后缀由设备身份生成并在该设备上保持不变。
-- 救援热点公共密码：`12345678`。
-- 救援热点固定管理地址：`10.42.0.1`，Web 入口为 `http://10.42.0.1:8080/`。
-- SSH 管理账号：`OpenAria`。
-- SSH 管理密码：`123456`。
+- **Incremental CAS-Layered OTA Updates**: content-addressed object layers (`StoreLayer` / `LocalCasStore`) and signed remote channel publishing (OSS / CDN).
+- **Offline Recording-Disk Update Packages**: discovering, verifying detached signatures, and applying bundles placed by operators under `/data/updates/` (`OfflinePackageHook` / `DefaultOfflinePackageHook`).
 
-`status` 在没有相机和 IMU 的电脑上也能正常运行，并明确报告硬件尚未探测。
-日常使用步骤见 [设备使用指南](docs/user-guide.md)。
-录制格式、背压策略与分段恢复语义见 [录制格式与时钟](docs/recording-v4.md) 及
-[分段恢复报告](docs/reports/2026-09-15-recording-recovery.md)。
-RDK X5 的安装部署、固件更新与网页 API 见 [安装与发布手册](docs/one-click-install.md) 及
-[网页固件更新 API](docs/firmware-api.md)。
-RDK X5 的热点、客户端、有线、mDNS 和救援行为见 [配网与救援](docs/networking.md)。
-实体按钮的 40PIN 接线、电平检测和录制控制配置见
-[RDK X5 实体录制按钮](docs/rdk-x5-recording-button.md)。
-结构化 journald 事件、隐私边界和 API 审计记录见
-[运行日志](docs/operational-logging.md)。
-Rust 数据面基准、结构消融与当前代码审计基线见
-[固定 trace 消融报告](experiments/fixed-trace-20260905-132783d/README.md) 及
-[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md)。
+---
 
-## 当前状态
+## Branch Maintenance & Archived Engineering History
 
-当前处于 **0.2.16** 生产交付阶段（参见 [0.2.16 发布说明](docs/releases/0.2.16.md)），并正在 `refactor/0.3.0` 分支按
-[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md) 与
-[Round 2 深度审查台账](docs/reports/2026-11-26-round2-perfection-audit.md) 推进稳定性加固、架构解耦与 CI 检查完善；双线协同规则见
-[0.3.0 与 main 双线维护规范](docs/branch-maintenance-0.3.md)。
-
-公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。
-
-定时结束采集的使用方式、接口和计时边界见[定时录制说明](docs/timed-capture.md)。
+- Dual-branch policy and cutover gates: [`docs/branch-maintenance-0.3.md`](docs/branch-maintenance-0.3.md)
+- Audit & architecture design records:
+  - [`docs/reports/2026-11-25-full-audit-and-refactor-plan.md`](docs/reports/2026-11-25-full-audit-and-refactor-plan.md)
+  - [`docs/reports/2026-11-26-round2-perfection-audit.md`](docs/reports/2026-11-26-round2-perfection-audit.md)
+  - [`docs/reports/2026-09-15-recording-recovery.md`](docs/reports/2026-09-15-recording-recovery.md)
+  - [`docs/reports/2026-09-15-recording-ablation.md`](docs/reports/2026-09-15-recording-ablation.md)
+- Archived historical benchmarks (`experiments/`, non-production):
+  - [`experiments/fixed-trace-20260905-132783d/README.md`](experiments/fixed-trace-20260905-132783d/README.md)
+  - [`experiments/code-structure-20260908/README.md`](experiments/code-structure-20260908/README.md)
