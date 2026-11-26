@@ -1,21 +1,13 @@
-name: RDK X5 离线安装包
+name: Miro-Ego RDK X5 Native Bundle
 
 on:
   workflow_dispatch:
-    inputs:
-      publish_oss:
-        description: "构建成功后发布到国内 OSS 并更新 latest"
-        type: boolean
-        default: false
   push:
     tags:
       - "v*"
     branches:
       - main
       - "refactor/0.3.0"
-      - "ci/**"
-      - "codex/**"
-      - "public-*"
   pull_request:
     branches:
       - main
@@ -24,33 +16,29 @@ on:
       - ".github/workflows/rdk-x5-bundle.yml"
       - "Cargo.lock"
       - "Cargo.toml"
-      - "build_backend.py"
-      - "native/**"
+      - "crates/**"
+      - "csrc/**"
+      - "deploy/miro-ego/**"
+      - "contracts/miro-ego-*"
+      - "contracts/schemas/miro-ego-*"
       - "pyproject.toml"
       - "uv.lock"
       - "scripts/build_rdk_x5_bundle.py"
-      - "scripts/rdk_x5_install.py"
-      - "scripts/publish_rdk_x5_oss.py"
+      - "scripts/check.py"
       - "scripts/release_version.py"
-      - "deploy/oss-release.json"
-      - "src/**"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ (startsWith(github.ref, 'refs/tags/') || inputs.publish_oss) && 'rdk-x5-public-release' || format('rdk-x5-build-{0}', github.ref) }}
+  group: miro-ego-rdk-x5-bundle-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: 构建 RDK X5 bundle
+    name: Build Pure-Native RDK X5 AArch64 Bundle
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      RDK_RUNTIME_NAME: cpython-3.11.16+20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
-      RDK_RUNTIME_URL: https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.11.16%2B20260814-aarch64-unknown-linux-gnu-install_only.tar.gz
-      RDK_RUNTIME_SHA256: 9142c12dd3559eaac58a18d8905b99a293979d5e5a1b4fb5cf4cebbf82ef6f33
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,171 +46,121 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.0.1
 
-      - name: 校验统一版本并解析构建身份
-        env:
-          PUBLISH_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss) }}
+      - name: Resolve and validate Miro-Ego version identity
         run: |
-          python - <<'PY'
-          import os
-          import subprocess
-          from pathlib import Path
-          from scripts.release_version import project_version, release_tag
-          version = project_version()
-          if os.environ["PUBLISH_RELEASE"] == "true":
-              if not os.environ["GITHUB_REF"].startswith("refs/tags/"):
-                  raise SystemExit("正式发布必须在附注标签 v0.2.x 上运行，不能发布分支")
-              version, notes = release_tag(os.environ["GITHUB_REF_NAME"])
-              Path("release-notes.txt").write_text(notes + "\n")
-          with open(os.environ["GITHUB_ENV"], "a") as stream:
-              stream.write(f"RDK_VERSION={version}\n")
-              stream.write("RDK_COMMIT=" + subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() + "\n")
-              stream.write(f"RDK_WHEEL=dist-aarch64/rp_ylx-{version}-cp311-abi3-manylinux_2_28_aarch64.whl\n")
-          PY
+          uv sync --frozen --extra dev
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$(uv run --extra dev python scripts/release_version.py --tag "$GITHUB_REF_NAME")"
+          else
+            version="$(uv run --extra dev python scripts/release_version.py)"
+          fi
+          commit="$(git rev-parse HEAD)"
+          {
+            echo "MIRO_EGO_VERSION=${version}"
+            echo "MIRO_EGO_COMMIT=${commit}"
+          } >> "$GITHUB_ENV"
+          echo "Resolved Miro-Ego ${version} (${commit})"
 
-      - name: 安装 Rust toolchain 与 shellcheck
+      - name: Install Rust toolchain (aarch64 target), GCC, and shellcheck
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt --target aarch64-unknown-linux-gnu
           rustup default stable
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y build-essential shellcheck
 
-      - name: 执行完整无硬件检查
+      - name: Run full hardware-free checks
         run: |
-          uv sync --frozen --extra dev
-          cargo fmt --manifest-path native/Cargo.toml --check
-          mapfile -t deploy_scripts < <(grep -l '^#!' src/rp_ylx/deploy/rp-ylx-*)
-          shellcheck "${deploy_scripts[@]}"
-          CI=true uv run python scripts/check.py
+          CI=true uv run --extra dev python scripts/check.py --require-shellcheck
 
-      - name: 暴露 zig linker
+      - name: Install zig and cargo-zigbuild for AArch64 cross-compilation
         run: |
+          uv venv --no-project /tmp/miro-ego-cross
+          uv pip install --python /tmp/miro-ego-cross/bin/python 'ziglang==0.16.0' 'cargo-zigbuild'
           zig_dir="$(
-            uv run --with ziglang==0.16.0 python - <<'PY'
+            /tmp/miro-ego-cross/bin/python - <<'PY'
           from pathlib import Path
           import ziglang
-
           print(Path(ziglang.__file__).resolve().parent)
           PY
           )"
           test -x "$zig_dir/zig"
+          test -x /tmp/miro-ego-cross/bin/cargo-zigbuild
+          echo "/tmp/miro-ego-cross/bin" >> "$GITHUB_PATH"
           echo "$zig_dir" >> "$GITHUB_PATH"
           "$zig_dir/zig" version
+          /tmp/miro-ego-cross/bin/cargo-zigbuild --version
 
-      - name: 构建 aarch64 manylinux wheel
+      - name: Cross-compile pure-Rust miro-ego for aarch64-unknown-linux-gnu
         run: |
-          uv run --python 3.11 --no-project --with 'build==1.6.1' --with 'maturin==1.16.0' python -m build \
-            --no-isolation \
-            --wheel \
-            --outdir dist-aarch64 \
-            -Cbuild-args="--target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 --zig"
+          cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.28 -p miro-ego-cli
 
-      - name: 校验 wheel 身份
+      - name: Cross-compile C miro-ego-encoder for aarch64-unknown-linux-gnu
         run: |
-          python - <<'PY'
+          mkdir -p dist-aarch64
+          SRCS=(
+            csrc/miro-ego-encoder/miro_ego_stereo_encoder.c
+            csrc/miro-ego-encoder/miro_ego_stereo_pipeline.c
+            csrc/miro-ego-encoder/miro_ego_shm_ring.c
+            csrc/miro-ego-encoder/miro_ego_sha256.c
+            csrc/miro-ego-encoder/miro_ego_split.c
+            csrc/miro-ego-encoder/miro_ego_mp4_meta.c
+          )
+          if [[ -n "${HOBOT_SDK_INCLUDE:-}" && -n "${HOBOT_SDK_LIB:-}" ]]; then
+            echo "Linking miro-ego-encoder against RDK X5 Hobot SDK"
+            zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
+              -I"$HOBOT_SDK_INCLUDE" -Icsrc/miro-ego-encoder \
+              "${SRCS[@]}" \
+              -L"$HOBOT_SDK_LIB" -lmultimedia -lpthread \
+              -o dist-aarch64/miro-ego-encoder
+          else
+            echo "Building AArch64 miro-ego-encoder CI artifact against stub Hobot SDK (on-board builds link /usr/hobot/lib/libmultimedia.so)"
+            zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
+              -Icsrc/miro-ego-encoder/tests/stubs -Icsrc/miro-ego-encoder -Icsrc/miro-ego-encoder/tests \
+              "${SRCS[@]}" csrc/miro-ego-encoder/tests/mock_hobot_sdk.c \
+              -lpthread \
+              -o dist-aarch64/miro-ego-encoder
+          fi
+
+      - name: Verify AArch64 ELF64 binary headers
+        run: |
+          uv run --extra dev python - <<'PY'
           from pathlib import Path
-          import os
-          import sys
-          import zipfile
+          from scripts.build_rdk_x5_bundle import sha256_file, validate_aarch64_elf64
 
-          wheel = Path(os.environ["RDK_WHEEL"])
-          expected_sha = os.environ["RDK_COMMIT"]
-          if not wheel.is_file():
-              raise SystemExit(f"missing wheel: {wheel}")
-          with zipfile.ZipFile(wheel) as archive:
-              build_info = archive.read("rp_ylx/_build_info.py").decode()
-              wheel_metadata = archive.read(f"rp_ylx-{os.environ['RDK_VERSION']}.dist-info/WHEEL").decode()
-          if expected_sha not in build_info:
-              sys.stderr.write(build_info)
-              raise SystemExit(f"wheel build_info does not contain {expected_sha}")
-          expected_tag = "Tag: cp311-abi3-manylinux_2_28_aarch64"
-          if expected_tag not in wheel_metadata:
-              sys.stderr.write(wheel_metadata)
-              raise SystemExit(f"wheel tag is not {expected_tag}")
+          for label, path in (
+              ("bin/miro-ego", Path("target/aarch64-unknown-linux-gnu/release/miro-ego")),
+              ("bin/miro-ego-encoder", Path("dist-aarch64/miro-ego-encoder")),
+          ):
+              size, digest, header = sha256_file(path)
+              validate_aarch64_elf64(header, label)
+              print(f"Verified AArch64 ELF64 {label}: {size} bytes, sha256={digest}")
           PY
 
-      - name: 下载并校验 package-owned runtime
+      - name: Assemble pure-native RDK X5 bundle and archive
         run: |
-          mkdir -p dist-runtime
-          curl -fL --retry 4 --retry-delay 2 --retry-max-time 600 \
-            --connect-timeout 30 --max-time 300 \
-            "$RDK_RUNTIME_URL" -o "dist-runtime/$RDK_RUNTIME_NAME"
-          printf '%s  %s\n' "$RDK_RUNTIME_SHA256" "dist-runtime/$RDK_RUNTIME_NAME" \
-            | sha256sum --check --strict
+          mkdir -p dist-rdk-x5
+          uv run --extra dev python scripts/build_rdk_x5_bundle.py \
+            --miro-ego-bin target/aarch64-unknown-linux-gnu/release/miro-ego \
+            --encoder-bin dist-aarch64/miro-ego-encoder \
+            --output dist-rdk-x5/bundle \
+            --archive dist-rdk-x5/miro-ego-rdk-x5-bundle.tar \
+            --version "$MIRO_EGO_VERSION" \
+            --commit "$MIRO_EGO_COMMIT"
 
-      - name: 生成 RDK X5 离线 bundle
+      - name: Verify SHA256SUMS and host factory-recovery bundle contract
         run: |
-          PYTHONPATH=src uv run --python 3.11 --no-project python scripts/build_rdk_x5_bundle.py \
-            --application-wheel "$RDK_WHEEL" \
-            --runtime "dist-runtime/$RDK_RUNTIME_NAME" \
-            --output dist-rdk-x5 \
-            --version "$RDK_VERSION" \
-            --build-info "Open Aria ${RDK_VERSION} (${RDK_COMMIT})"
-
-      - name: 校验 bundle manifest
-        run: |
-          (cd dist-rdk-x5 && sha256sum --check --strict SHA256SUMS)
-          PYTHONPATH=src uv run --python 3.11 --no-project python - <<'PY'
+          (cd dist-rdk-x5/bundle && sha256sum --check --strict SHA256SUMS)
+          PYTHONPATH=tools uv run --extra dev python - <<'PY'
           from pathlib import Path
-          from rp_ylx.deployment import load_bundle
+          from miro_ego_host.factory_recovery.provision import require_native_bundle
 
-          bundle = load_bundle(Path("dist-rdk-x5"))
-          print(bundle.version)
-          print(bundle.commit)
+          require_native_bundle(Path("dist-rdk-x5/miro-ego-rdk-x5-bundle.tar"))
+          print("Host provision.require_native_bundle() verification PASSED")
           PY
 
       - uses: actions/upload-artifact@v7
         with:
-          name: rp-ylx-rdk-x5-${{ github.sha }}
+          name: miro-ego-rdk-x5-${{ github.sha }}
           path: dist-rdk-x5/
           if-no-files-found: error
-
-  publish:
-    name: 发布 RDK X5 bundle 与 GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_oss)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: astral-sh/setup-uv@v10.0.1
-
-      - uses: actions/download-artifact@v7
-        with:
-          name: rp-ylx-rdk-x5-${{ github.sha }}
-          path: dist-rdk-x5
-
-      - name: 校验并提取发布说明
-        run: |
-          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
-            echo "正式发布必须在附注标签 v0.2.x 上运行，不能发布分支" >&2
-            exit 1
-          fi
-          uv run python scripts/release_version.py --tag "$GITHUB_REF_NAME" --notes-file release-notes.txt
-
-      - name: 发布到阿里云 OSS 国内下载源
-        env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-          OPENARIA_RELEASE_SIGNING_KEY: ${{ secrets.OPENARIA_RELEASE_SIGNING_KEY }}
-        run: |
-          uv run scripts/publish_rdk_x5_oss.py \
-            --bundle-dir dist-rdk-x5 \
-            --output dist-oss-release \
-            --publish --tag "$GITHUB_REF_NAME"
-
-      - name: 创建对应 GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            exit 0
-          fi
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
-            --title "OpenAria $GITHUB_REF_NAME" --notes-file release-notes.txt \
-            dist-oss-release/bundle.tar.gz dist-oss-release/latest.json \
-            dist-oss-release/install.sh
+          retention-days: 14

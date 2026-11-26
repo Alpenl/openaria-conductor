@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "native",
     "crates/miro-ego-core",
     "crates/miro-ego-capture",
     "crates/miro-ego-storage",

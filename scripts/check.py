@@ -1,289 +1,45 @@
-"""本地和 CI 共用的无硬件检查入口。"""
+"""Unified local and CI verification runner for Miro-Ego 0.3.0."""
 
 from __future__ import annotations
 
 import argparse
-import fnmatch
+import hashlib
+import json
 import os
+import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SERIAL_EXCLUSIVE: frozenset[str] = frozenset({"tests.test_distribution"})
-
-LPT_PRIORITY: tuple[str, ...] = (
-    "tests.test_deployment",
-    "tests.test_activation_failure_cleanup",
-    "tests.test_activation_success_cleanup",
-    "tests.test_audio_readback_deadline",
-    "tests.test_capture_coordinator",
-    "tests.test_audio_checkpoint_reads",
-    "tests.test_factory_autoinstall",
-    "tests.test_audit_file_admission",
-    "tests.test_regression_fixes_part1",
-    "tests.test_network",
-    "tests.test_gateway",
-    "tests.test_network_control",
-    "tests.test_regression_fixes_part2",
-    "tests.test_session_download",
-    "tests.test_factory_recovery",
-    "tests.test_capture_sources",
-    "tests.test_card_export",
-    "tests.test_split_eye_recording",
-    "tests.test_gateway_events",
+# Assemble retired legacy identifiers without embedding literal matches inside this file.
+_LEGACY_TERMS: tuple[str, ...] = (
+    "".join(("y", "l", "x")),
+    "".join(("rp-", "y", "l", "x")),
+    "".join(("rp_", "y", "l", "x")),
+    "".join(("open", "aria")),
 )
-_LPT_RANK = {name: idx for idx, name in enumerate(LPT_PRIORITY)}
-
-STUB_HB_MEDIA_CODEC_H = """\
-#ifndef HOBOT_STUB_HB_MEDIA_CODEC_H
-#define HOBOT_STUB_HB_MEDIA_CODEC_H
-
-#include <stdbool.h>
-#include <stdint.h>
-
-typedef int32_t hb_s32;
-
-enum {
-    MEDIA_CODEC_ID_MJPEG = 1,
-    MEDIA_CODEC_ID_H264 = 2,
-    MEDIA_CODEC_ID_H265 = 3,
-};
-
-enum {
-    MC_FEEDING_MODE_FRAME_SIZE = 1,
-    MC_PIXEL_FORMAT_NV12 = 1,
-    MC_CCW_0 = 0,
-    MC_DIRECTION_NONE = 0,
-    MC_H264_PROFILE_HP = 1,
-    MC_H264_LEVEL_UNSPECIFIED = 0,
-    MC_H265_LEVEL_UNSPECIFIED = 0,
-    MC_VIDEO_FRAME_BUFFER = 1,
-    MC_VIDEO_STREAM_BUFFER = 2,
-};
-
-typedef enum {
-    MC_AV_RC_MODE_H264CBR = 0,
-    MC_AV_RC_MODE_H264VBR = 1,
-    MC_AV_RC_MODE_H264FIXQP = 2,
-    MC_AV_RC_MODE_H264AVBR = 3,
-    MC_AV_RC_MODE_H265CBR = 4,
-    MC_AV_RC_MODE_H265VBR = 5,
-    MC_AV_RC_MODE_H265FIXQP = 6,
-    MC_AV_RC_MODE_H265AVBR = 7,
-} mc_video_rate_control_mode_t;
-
-typedef struct {
-    uint32_t frame_rate;
-    uint32_t bit_rate;
-    uint32_t intra_period;
-    uint32_t intra_qp;
-    int initial_rc_qp;
-    int vbv_buffer_size;
-    int mb_level_rc_enalbe;
-    int ctu_level_rc_enalbe;
-    uint32_t min_qp_I;
-    uint32_t min_qp_P;
-    uint32_t min_qp_B;
-    uint32_t max_qp_I;
-    uint32_t max_qp_P;
-    uint32_t max_qp_B;
-    int hvs_qp_enable;
-    int hvs_qp_scale;
-    int max_delta_qp;
-    int qp_map_enable;
-} mc_rate_control_budget_t;
-
-typedef struct {
-    uint32_t frame_rate;
-    uint32_t intra_period;
-    uint32_t intra_qp;
-    int qp_map_enable;
-} mc_rate_control_vbr_t;
-
-typedef struct {
-    uint32_t frame_rate;
-    uint32_t intra_period;
-    uint32_t force_qp_I;
-    uint32_t force_qp_P;
-    uint32_t force_qp_B;
-} mc_rate_control_fixqp_t;
-
-typedef struct {
-    mc_video_rate_control_mode_t mode;
-    mc_rate_control_budget_t h264_cbr_params;
-    mc_rate_control_vbr_t h264_vbr_params;
-    mc_rate_control_fixqp_t h264_fixqp_params;
-    mc_rate_control_budget_t h264_avbr_params;
-    mc_rate_control_budget_t h265_cbr_params;
-    mc_rate_control_vbr_t h265_vbr_params;
-    mc_rate_control_fixqp_t h265_fixqp_params;
-    mc_rate_control_budget_t h265_avbr_params;
-} mc_rate_control_params_t;
-
-typedef struct {
-    int feed_mode;
-    int pix_fmt;
-    uint32_t bitstream_buf_size;
-    int bitstream_buf_count;
-    int frame_buf_count;
-    struct {
-        int rot_degree;
-        int mir_direction;
-        bool frame_crop_enable;
-    } mjpeg_dec_config;
-} mc_video_codec_dec_params_t;
-
-typedef struct {
-    int width;
-    int height;
-    int pix_fmt;
-    uint32_t bitstream_buf_size;
-    int frame_buf_count;
-    bool external_frame_buf;
-    int bitstream_buf_count;
-    struct {
-        int gop_preset_idx;
-        int decoding_refresh_type;
-    } gop_params;
-    int rot_degree;
-    int mir_direction;
-    bool frame_cropping_flag;
-    int enable_user_pts;
-    mc_rate_control_params_t rc_params;
-    struct {
-        int main_still_picture_profile_enable;
-        int h265_level;
-    } h265_enc_config;
-    struct {
-        int h264_profile;
-        int h264_level;
-    } h264_enc_config;
-} mc_video_codec_enc_params_t;
-
-typedef struct {
-    int codec_id;
-    bool encoder;
-    mc_video_codec_dec_params_t video_dec_params;
-    mc_video_codec_enc_params_t video_enc_params;
-} media_codec_context_t;
-
-typedef struct {
-    int reserved;
-} mc_av_codec_startup_params_t;
-
-typedef struct {
-    int type;
-    struct {
-        uint8_t *vir_ptr;
-        uint32_t size;
-        int stream_end;
-    } vstream_buf;
-    struct {
-        uint8_t *vir_ptr[3];
-        int width;
-        int height;
-        int stride;
-        int pix_fmt;
-        uint32_t size;
-    } vframe_buf;
-} media_codec_buffer_t;
-
-typedef struct {
-    struct {
-        int decode_result;
-    } video_frame_info;
-} media_codec_output_buffer_info_t;
-
-hb_s32 hb_mm_mc_initialize(media_codec_context_t *context);
-hb_s32 hb_mm_mc_configure(media_codec_context_t *context);
-hb_s32 hb_mm_mc_start(media_codec_context_t *context, const mc_av_codec_startup_params_t *params);
-hb_s32 hb_mm_mc_pause(media_codec_context_t *context);
-hb_s32 hb_mm_mc_stop(media_codec_context_t *context);
-hb_s32 hb_mm_mc_release(media_codec_context_t *context);
-hb_s32 hb_mm_mc_get_rate_control_config(
-    media_codec_context_t *context, mc_rate_control_params_t *params
-);
-hb_s32 hb_mm_mc_dequeue_input_buffer(
-    media_codec_context_t *context, media_codec_buffer_t *buffer, int timeout_ms
-);
-hb_s32 hb_mm_mc_queue_input_buffer(
-    media_codec_context_t *context, media_codec_buffer_t *buffer, int timeout_ms
-);
-hb_s32 hb_mm_mc_dequeue_output_buffer(
-    media_codec_context_t *context,
-    media_codec_buffer_t *buffer,
-    media_codec_output_buffer_info_t *info,
-    int timeout_ms
-);
-hb_s32 hb_mm_mc_queue_output_buffer(
-    media_codec_context_t *context, media_codec_buffer_t *buffer, int timeout_ms
-);
-
-#endif
-"""
-
-STUB_HB_MEDIA_MUXER_H = """\
-#ifndef HOBOT_STUB_HB_MEDIA_MUXER_H
-#define HOBOT_STUB_HB_MEDIA_MUXER_H
-
-#include <stdint.h>
-
-enum {
-    MEDIA_MUXER_OUTPUT_FORMAT_MP4 = 1,
-};
-
-typedef struct {
-    const char *output_file_name;
-    int output_format;
-} media_muxer_context_t;
-
-typedef struct {
-    int codec_id;
-    int numerator;
-    int denominator;
-    struct {
-        int width;
-        int height;
-        int pix_fmt;
-        uint32_t frame_rate;
-        uint32_t bit_rate;
-    } video_params;
-} mx_stream_params_t;
-
-typedef struct {
-    uint8_t *vir_ptr;
-    uint32_t size;
-    uint64_t pts;
-    int is_key_frame;
-} mx_stream_t;
-
-int hb_mm_mx_get_default_context(media_muxer_context_t *context);
-int hb_mm_mx_initialize(media_muxer_context_t *context);
-int hb_mm_mx_add_stream(media_muxer_context_t *context, const mx_stream_params_t *params);
-int hb_mm_mx_start(media_muxer_context_t *context);
-int hb_mm_mx_stop(media_muxer_context_t *context);
-int hb_mm_mx_write_stream(media_muxer_context_t *context, const mx_stream_t *stream);
-
-#endif
-"""
-
-_STUB_HB_MEDIA_CODEC_H = STUB_HB_MEDIA_CODEC_H
-_STUB_HB_MEDIA_MUXER_H = STUB_HB_MEDIA_MUXER_H
+_LEGACY_RE = re.compile("|".join(re.escape(term) for term in _LEGACY_TERMS), re.IGNORECASE)
+_UNWRAP_RE = re.compile(r"\.(unwrap|expect)\s*\(")
+_IGNORED_DIR_NAMES = frozenset({"__pycache__", "target", ".git", ".venv"})
+_IGNORED_REL_PREFIXES = ("csrc/miro-ego-encoder/tests/build/",)
 
 
-def run(*command: str, extra_env: dict[str, str] | None = None) -> None:
-    env = {**os.environ, "PYTHONPATH": "src"}
+def _run(
+    *command: str,
+    extra_env: dict[str, str] | None = None,
+    cwd: Path = ROOT,
+) -> None:
+    env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
-    subprocess.run(command, check=True, cwd=ROOT, env=env)
+    subprocess.run(command, check=True, cwd=cwd, env=env)
 
 
 def _require_or_skip(tool: str, *, strict: bool, install_hint: str) -> str | None:
@@ -294,374 +50,468 @@ def _require_or_skip(tool: str, *, strict: bool, install_hint: str) -> str | Non
             resolved = str(sibling)
     if resolved is not None:
         return resolved
-    message = f"未安装 {tool}；{install_hint}"
+    message = f"Missing required tool {tool!r}; {install_hint}"
     if strict:
         raise RuntimeError(message)
-    print(f"{message}（已跳过）")
+    print(f"WARNING: {message} (skipped)")
     return None
 
 
-def _rust_env() -> dict[str, str]:
-    env: dict[str, str] = {}
-    if "PYO3_PYTHON" not in os.environ:
-        env["PYO3_PYTHON"] = sys.executable
-    libdir = sysconfig.get_config_var("LIBDIR")
-    if not libdir or not Path(libdir).is_dir():
-        candidate = Path(sys.executable).resolve().parent.parent / "lib"
-        if candidate.is_dir():
-            libdir = str(candidate)
-    if libdir and Path(libdir).is_dir():
-        rustflags = os.environ.get("RUSTFLAGS", "")
-        if f"-L {libdir}" not in rustflags and f"-L{libdir}" not in rustflags:
-            env["RUSTFLAGS"] = f"{rustflags} -L {libdir}".strip()
-        ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if libdir not in ld_library_path.split(os.pathsep):
-            env["LD_LIBRARY_PATH"] = (
-                f"{libdir}{os.pathsep}{ld_library_path}" if ld_library_path else libdir
-            )
-    return env
-
-
-def _check_hobot_c(gcc: str) -> None:
-    hobot_dir = ROOT / "src/rp_ylx/hobot"
-    native_hobot_dir = ROOT / "native/hobot"
-    c_files = [*sorted(hobot_dir.glob("*.c")), *sorted(native_hobot_dir.glob("*.c"))]
-    if not c_files:
-        return
-    sdk_include = os.environ.get("HOBOT_SDK_INCLUDE")
-    with tempfile.TemporaryDirectory() as temporary:
-        if sdk_include:
-            include_dir = sdk_include
-        else:
-            stub_dir = Path(temporary)
-            (stub_dir / "hb_media_codec.h").write_text(STUB_HB_MEDIA_CODEC_H, encoding="utf-8")
-            (stub_dir / "hb_media_muxer.h").write_text(STUB_HB_MEDIA_MUXER_H, encoding="utf-8")
-            include_dir = str(stub_dir)
-        for source in c_files:
-            run(
-                gcc,
-                "-fsyntax-only",
-                "-Wall",
-                "-Wextra",
-                "-std=gnu11",
-                f"-I{include_dir}",
-                f"-I{hobot_dir}",
-                str(source),
-            )
-
-
-def _check_deploy_shell_scripts() -> None:
+def _check_deploy_shell_scripts(*, require_shellcheck: bool) -> None:
     if os.name != "posix" or not Path("/bin/sh").exists():
+        print("WARNING: non-POSIX host; skipping shell script checks")
         return
-    deploy_dir = ROOT / "src/rp_ylx/deploy"
+
+    deploy_dir = ROOT / "deploy" / "miro-ego"
+    if not deploy_dir.is_dir():
+        raise RuntimeError(f"Missing deploy directory: {deploy_dir}")
+
     shebang_scripts: list[Path] = []
     bash_bin = shutil.which("bash")
-    for candidate in sorted(deploy_dir.glob("rp-ylx-*")):
+    for candidate in sorted(deploy_dir.iterdir(), key=lambda p: p.name):
         if not candidate.is_file():
             continue
-        first_line = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()[:1]
-        if not first_line or not first_line[0].startswith("#!"):
+        lines = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if not lines or not lines[0].startswith("#!"):
             continue
         shebang_scripts.append(candidate)
-        tokens = shlex.split(first_line[0][2:])
+        tokens = shlex.split(lines[0][2:])
         uses_bash = any(Path(tok).name == "bash" for tok in tokens)
         if uses_bash:
             if bash_bin is None:
-                raise RuntimeError(f"未安装 bash，无法语法检查 {candidate.name}")
-            run(bash_bin, "-n", str(candidate))
+                raise RuntimeError(f"bash is required to syntax-check {candidate.name}")
+            _run(bash_bin, "-n", str(candidate))
         else:
-            run("/bin/sh", "-n", str(candidate))
+            _run("/bin/sh", "-n", str(candidate))
+
     if not shebang_scripts:
-        return
-    if shellcheck := shutil.which("shellcheck"):
-        run(shellcheck, *[str(script) for script in shebang_scripts])
+        raise RuntimeError("No executable shell scripts found under deploy/miro-ego/")
+
+    shellcheck_bin = shutil.which("shellcheck")
+    if shellcheck_bin is not None:
+        _run(shellcheck_bin, *(str(script) for script in shebang_scripts))
+    elif require_shellcheck:
+        raise RuntimeError("shellcheck is required (--require-shellcheck) but not found on PATH")
     else:
-        print("未安装 shellcheck；跳过 deploy 脚本 shellcheck 检查（已跳过）")
-
-
-def _discover_test_modules() -> list[str]:
-    tests_dir = ROOT / "tests"
-    return [f"tests.{path.stem}" for path in sorted(tests_dir.glob("test_*.py"))]
-
-
-def _resolve_test_targets(filters: list[str], discovered: list[str]) -> list[str]:
-    if not filters:
-        return list(discovered)
-    discovered_set = set(discovered)
-    selected: list[str] = []
-    seen: set[str] = set()
-
-    def add(target: str) -> None:
-        if target not in seen:
-            seen.add(target)
-            selected.append(target)
-
-    for raw in filters:
-        normalized = raw.strip()
-        if not normalized:
-            continue
-        as_path = Path(normalized)
-        if normalized.endswith(".py") or as_path.is_file():
-            candidate_path = (ROOT / as_path).resolve() if not as_path.is_absolute() else as_path
-            try:
-                rel = candidate_path.relative_to(ROOT)
-            except ValueError as exc:
-                raise ValueError(f"测试路径不在仓库内：{raw}") from exc
-            module = ".".join(rel.with_suffix("").parts)
-            if module in discovered_set or candidate_path.is_file():
-                add(module)
-                continue
-        if normalized in discovered_set:
-            add(normalized)
-            continue
-        prefixed = f"tests.{normalized}"
-        if prefixed in discovered_set:
-            add(prefixed)
-            continue
-        if "." in normalized:
-            parts = normalized.split(".")
-            if parts[0] != "tests" and f"tests.{parts[0]}" in discovered_set:
-                add(f"tests.{normalized}")
-                continue
-            if ".".join(parts[:2]) in discovered_set:
-                add(normalized)
-                continue
-        matched = [
-            mod
-            for mod in discovered
-            if fnmatch.fnmatchcase(mod, normalized)
-            or fnmatch.fnmatchcase(mod.removeprefix("tests."), normalized)
-            or normalized in mod
-        ]
-        if not matched:
-            raise ValueError(f"未匹配到测试模块或用例：{raw}")
-        for mod in matched:
-            add(mod)
-    return selected
-
-
-def _is_serial_target(target: str) -> bool:
-    return target in SERIAL_EXCLUSIVE or any(
-        target.startswith(f"{serial}.") for serial in SERIAL_EXCLUSIVE
-    )
-
-
-def _lpt_sort(modules: list[str]) -> list[str]:
-    fallback = len(LPT_PRIORITY)
-    return sorted(modules, key=lambda name: (_LPT_RANK.get(name, fallback), name))
-
-
-def _run_unittest_target(target: str, *, verbose: bool) -> tuple[str, int, float, str]:
-    worker_tmp = tempfile.mkdtemp(prefix="oaw")
-    started = time.monotonic()
-    try:
-        env = {
-            **os.environ,
-            "PYTHONPATH": "src",
-            "TMPDIR": worker_tmp,
-            "TEMP": worker_tmp,
-            "TMP": worker_tmp,
-        }
-        cmd = [sys.executable, "-m", "unittest"]
-        if verbose:
-            cmd.append("-v")
-        cmd.append(target)
-        completed = subprocess.run(
-            cmd,
-            cwd=ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+        print(
+            "WARNING: shellcheck not installed; skipping shellcheck on deploy/miro-ego/ "
+            "(pass --require-shellcheck to enforce)"
         )
-        elapsed = time.monotonic() - started
-        return target, completed.returncode, elapsed, completed.stdout
-    finally:
-        shutil.rmtree(worker_tmp, ignore_errors=True)
 
 
-def _run_parallel_tests(
-    targets: list[str], *, workers: int, verbose: bool
-) -> tuple[bool, list[tuple[str, float]]]:
-    if not targets:
-        return True, []
-    ordered = _lpt_sort(targets)
-    total = len(ordered)
-    pool_size = max(1, min(workers, total))
-    timings: list[tuple[str, float]] = []
-    failed = False
-    completed_count = 0
-    stage_start = time.monotonic()
+def _check_contracts() -> None:
+    import jsonschema
+    import yaml
 
-    with ThreadPoolExecutor(max_workers=pool_size) as executor:
-        futures: dict[Future[tuple[str, int, float, str]], str] = {
-            executor.submit(_run_unittest_target, target, verbose=verbose): target
-            for target in ordered
-        }
-        for future in as_completed(futures):
-            if future.cancelled():
+    support_path = ROOT / "contracts" / "miro-ego-api-support.json"
+    support = json.loads(support_path.read_text(encoding="utf-8"))
+    if support.get("schema") != "miro-ego.device-api-consumer-support.v1":
+        raise RuntimeError("contracts/miro-ego-api-support.json has wrong schema discriminator")
+    if support.get("consumer") != "miro-ego":
+        raise RuntimeError("contracts/miro-ego-api-support.json has wrong consumer")
+    if support.get("supported_device_api_majors") != [1]:
+        raise RuntimeError("contracts/miro-ego-api-support.json must pin major [1]")
+    if support.get("unknown_major_policy") != "fail_closed":
+        raise RuntimeError("contracts/miro-ego-api-support.json must enforce fail_closed policy")
+
+    required_contracts = support.get("required_contracts", [])
+    if not required_contracts:
+        raise RuntimeError("contracts/miro-ego-api-support.json declares no required_contracts")
+
+    expected_routes = {
+        (route["path"], route["method"].lower(), route["operation_id"])
+        for route in support.get("routes", [])
+    }
+    if not expected_routes:
+        raise RuntimeError("contracts/miro-ego-api-support.json declares no routes")
+
+    for entry in required_contracts:
+        contract_path = ROOT / entry["path"]
+        raw = contract_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != entry["bytes"] or digest != entry["sha256"]:
+            raise RuntimeError(
+                f"Contract digest/byte mismatch for {entry['path']}: "
+                f"expected ({entry['bytes']} B, {entry['sha256']}), "
+                f"actual ({len(raw)} B, {digest})"
+            )
+        spec = yaml.safe_load(raw.decode("utf-8"))
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"OpenAPI spec is not a mapping: {entry['path']}")
+        openapi_ver = str(spec.get("openapi", ""))
+        if not openapi_ver.startswith("3.1."):
+            raise RuntimeError(f"Expected OpenAPI 3.1.x in {entry['path']}, got {openapi_ver!r}")
+        info_ver = spec.get("info", {}).get("version")
+        if info_ver != entry["info_version"]:
+            raise RuntimeError(
+                f"OpenAPI info.version mismatch in {entry['path']}: "
+                f"{info_ver!r} != {entry['info_version']!r}"
+            )
+        servers = spec.get("servers", [])
+        base_path = entry["server_base_path"]
+        if not any(
+            isinstance(srv, dict) and str(srv.get("url", "")).endswith(base_path) for srv in servers
+        ):
+            raise RuntimeError(
+                f"OpenAPI servers in {entry['path']} do not advertise base path {base_path!r}"
+            )
+        actual_routes: set[tuple[str, str, str]] = set()
+        for path_template, path_item in spec.get("paths", {}).items():
+            if not isinstance(path_item, dict):
                 continue
-            target, returncode, elapsed, output = future.result()
-            completed_count += 1
-            timings.append((target, elapsed))
-            status = "PASS" if returncode == 0 else "FAIL"
-            print(f"[{completed_count}/{total}] {status} {target} ({elapsed:.2f}s)", flush=True)
-            if returncode != 0:
-                failed = True
-                if output:
-                    print(
-                        f"--- {target} output ---\n{output.rstrip()}\n--- end {target} ---",
-                        flush=True,
-                    )
-                for pending in futures:
-                    if not pending.done():
-                        pending.cancel()
+            for method in ("get", "post", "put", "patch", "delete", "head", "options"):
+                operation = path_item.get(method)
+                if isinstance(operation, dict) and "operationId" in operation:
+                    actual_routes.add((path_template, method, operation["operationId"]))
+        if actual_routes != expected_routes:
+            missing = sorted(expected_routes - actual_routes)
+            extra = sorted(actual_routes - expected_routes)
+            raise RuntimeError(
+                f"OpenAPI route table drift vs miro-ego-api-support.json: "
+                f"missing={missing}, extra={extra}"
+            )
 
-    stage_elapsed = time.monotonic() - stage_start
-    print(f"Stage 2 并行测试完成：{len(timings)}/{total} 模块，总耗时 {stage_elapsed:.2f}s")
-    top_slowest = sorted(timings, key=lambda item: item[1], reverse=True)[:10]
-    if top_slowest:
-        print("Top 10 最慢测试模块：")
-        for idx, (name, secs) in enumerate(top_slowest, 1):
-            print(f"  {idx:>2}. {secs:6.2f}s  {name}")
-    return not failed, timings
+    schemas = support.get("schemas", [])
+    if not schemas:
+        raise RuntimeError("contracts/miro-ego-api-support.json declares no JSON schemas")
+    for entry in schemas:
+        schema_path = ROOT / entry["path"]
+        raw = schema_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != entry["bytes"] or digest != entry["sha256"]:
+            raise RuntimeError(
+                f"Schema digest/byte mismatch for {entry['path']}: "
+                f"expected ({entry['bytes']} B, {entry['sha256']}), "
+                f"actual ({len(raw)} B, {digest})"
+            )
+        schema_doc = json.loads(raw.decode("utf-8"))
+        if schema_doc.get("$id") != entry["id"]:
+            raise RuntimeError(
+                f"Schema $id mismatch in {entry['path']}: "
+                f"{schema_doc.get('$id')!r} != {entry['id']!r}"
+            )
+        validator_cls = jsonschema.validators.validator_for(schema_doc)
+        validator_cls.check_schema(schema_doc)
 
 
-def _run_serial_tests(targets: list[str], *, verbose: bool) -> bool:
+def _iter_legacy_scan_files() -> list[Path]:
+    targets = [
+        ROOT / "crates",
+        ROOT / "csrc",
+        ROOT / "deploy" / "miro-ego",
+        ROOT / "tools" / "miro_ego_host",
+        ROOT / "scripts",
+        *sorted((ROOT / "contracts").glob("miro-ego-*")),
+        *sorted((ROOT / "contracts" / "schemas").glob("miro-ego-*")),
+    ]
+    files: list[Path] = []
     for target in targets:
-        print(f"串行执行隔离测试：{target}", flush=True)
-        _, returncode, elapsed, output = _run_unittest_target(target, verbose=verbose)
-        status = "PASS" if returncode == 0 else "FAIL"
-        print(f"[serial] {status} {target} ({elapsed:.2f}s)", flush=True)
-        if returncode != 0:
-            if output:
-                print(
-                    f"--- {target} output ---\n{output.rstrip()}\n--- end {target} ---",
-                    flush=True,
-                )
-            return False
-    return True
+        if target.is_file():
+            files.append(target)
+        elif target.is_dir():
+            for path in sorted(target.rglob("*")):
+                if not path.is_file():
+                    continue
+                if any(part in _IGNORED_DIR_NAMES for part in path.parts):
+                    continue
+                rel = path.relative_to(ROOT).as_posix()
+                if any(rel.startswith(prefix) for prefix in _IGNORED_REL_PREFIXES):
+                    continue
+                files.append(path)
+    return files
+
+
+def _check_zero_legacy_naming() -> None:
+    hits: list[str] = []
+    for path in _iter_legacy_scan_files():
+        rel = path.relative_to(ROOT).as_posix()
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for line_no, line in enumerate(text.splitlines(), 1):
+            if _LEGACY_RE.search(line):
+                hits.append(f"{rel}:{line_no}: {line.strip()[:120]}")
+    if hits:
+        preview = "\n".join(hits[:25])
+        raise RuntimeError(f"Legacy naming leak detected ({len(hits)} hit(s)):\n{preview}")
+
+
+def _strip_rust_comments_and_strings(source: str) -> str:
+    """Replace Rust comments and string/char literals with spaces while preserving newlines."""
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        # Line comment
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            i += 2
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        # Nested block comment
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            depth = 1
+            i += 2
+            while i < n and depth > 0:
+                if source[i] == "/" and i + 1 < n and source[i + 1] == "*":
+                    depth += 1
+                    i += 2
+                elif source[i] == "*" and i + 1 < n and source[i + 1] == "/":
+                    depth -= 1
+                    i += 2
+                else:
+                    if source[i] == "\n":
+                        out.append("\n")
+                    i += 1
+            continue
+        # Raw string literal r"...", r#"..."#, br#"..."#
+        if ch == "r" or (ch == "b" and i + 1 < n and source[i + 1] == "r"):
+            start = i
+            j = i + (2 if ch == "b" else 1)
+            hashes = 0
+            while j < n and source[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and source[j] == '"':
+                j += 1
+                closing = '"' + ("#" * hashes)
+                out.append(" ")
+                while j < n:
+                    if source.startswith(closing, j):
+                        j += len(closing)
+                        break
+                    if source[j] == "\n":
+                        out.append("\n")
+                    j += 1
+                i = j
+                continue
+            out.append(source[start])
+            i = start + 1
+            continue
+        # Normal or byte string literal
+        if ch == '"' or (ch == "b" and i + 1 < n and source[i + 1] == '"'):
+            i += 2 if ch == "b" else 1
+            out.append(" ")
+            while i < n:
+                if source[i] == "\\":
+                    if i + 1 < n and source[i + 1] == "\n":
+                        out.append("\n")
+                    i += 2
+                    continue
+                if source[i] == '"':
+                    i += 1
+                    break
+                if source[i] == "\n":
+                    out.append("\n")
+                i += 1
+            continue
+        # Char literal ('a', '\n', '{') vs lifetime ('a, 'static)
+        if ch == "'":
+            if i + 2 < n and source[i + 1] == "\\":
+                j = i + 2
+                while j < n and source[j] != "'" and source[j] != "\n":
+                    j += 1
+                if j < n and source[j] == "'":
+                    out.append(" ")
+                    i = j + 1
+                    continue
+            elif i + 2 < n and source[i + 2] == "'" and source[i + 1] != "\n":
+                out.append(" ")
+                i += 3
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _check_zero_non_test_unwrap() -> None:
+    violations: list[str] = []
+    for rs_path in sorted(ROOT.glob("crates/*/src/**/*.rs")):
+        rel = rs_path.relative_to(ROOT).as_posix()
+        if rs_path.name == "tests.rs" or "/tests/" in rel:
+            continue
+        raw_lines = rs_path.read_text(encoding="utf-8").splitlines()
+        cleaned_lines = _strip_rust_comments_and_strings("\n".join(raw_lines)).splitlines()
+
+        in_cfg_test = False
+        cfg_test_pending = False
+        brace_depth = 0
+        for idx, cleaned in enumerate(cleaned_lines, 1):
+            stripped = cleaned.strip()
+            if in_cfg_test:
+                brace_depth += cleaned.count("{") - cleaned.count("}")
+                if brace_depth <= 0:
+                    in_cfg_test = False
+                    brace_depth = 0
+                continue
+
+            if re.search(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", stripped):
+                cfg_test_pending = True
+                if "{" in stripped:
+                    in_cfg_test = True
+                    cfg_test_pending = False
+                    brace_depth = stripped.count("{") - stripped.count("}")
+                    if brace_depth <= 0:
+                        in_cfg_test = False
+                        brace_depth = 0
+                continue
+
+            if cfg_test_pending:
+                if "{" in stripped:
+                    in_cfg_test = True
+                    cfg_test_pending = False
+                    brace_depth = stripped.count("{") - stripped.count("}")
+                    if brace_depth <= 0:
+                        in_cfg_test = False
+                        brace_depth = 0
+                    continue
+                if stripped == "" or stripped.startswith("#["):
+                    continue
+                if stripped.endswith(";"):
+                    cfg_test_pending = False
+                    continue
+
+            if _UNWRAP_RE.search(cleaned):
+                raw_line = raw_lines[idx - 1].strip() if idx - 1 < len(raw_lines) else stripped
+                violations.append(f"{rel}:{idx}: {raw_line}")
+
+    if violations:
+        preview = "\n".join(violations[:25])
+        raise RuntimeError(
+            f"Non-test .unwrap()/.expect() found in crates/*/src/ ({len(violations)} hit(s)):\n"
+            f"{preview}"
+        )
+
+
+def _check_native_bundle_builder() -> None:
+    """Smoke-test scripts/build_rdk_x5_bundle.py against provision.require_native_bundle."""
+    tools_dir = str(ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    from miro_ego_host.factory_recovery.provision import require_native_bundle
+
+    from scripts.build_rdk_x5_bundle import build_bundle
+    from scripts.release_version import project_version
+
+    header = bytearray(64)
+    header[:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    struct.pack_into("<HH", header, 16, 3, 183)
+
+    with tempfile.TemporaryDirectory(prefix="miro-ego-bundle-check-") as tmp:
+        tmp_path = Path(tmp)
+        miro_bin = tmp_path / "miro-ego"
+        enc_bin = tmp_path / "miro-ego-encoder"
+        miro_bin.write_bytes(bytes(header) + b"miro-ego-check")
+        enc_bin.write_bytes(bytes(header) + b"miro-ego-encoder-check")
+        bundle_dir = tmp_path / "bundle"
+        archive_path = tmp_path / "bundle.tar"
+
+        build_bundle(
+            miro_ego_bin=miro_bin,
+            encoder_bin=enc_bin,
+            output=bundle_dir,
+            archive=archive_path,
+            version=project_version(),
+            commit="0" * 40,
+        )
+        if sha256sum := shutil.which("sha256sum"):
+            _run(sha256sum, "--check", "--strict", "SHA256SUMS", cwd=bundle_dir)
+        require_native_bundle(archive_path)
 
 
 def main(argv: list[str] | None = None) -> int:
-    default_workers = min(os.cpu_count() or 4, 8)
-    parser = argparse.ArgumentParser(description="无硬件全量检查入口")
+    parser = argparse.ArgumentParser(description="Miro-Ego 0.3.0 unified local & CI check runner")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast local mode: skip cargo clippy and run cargo test --lib (refused in CI/strict)",
+    )
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="缺少 ruff/cargo/gcc 时报错退出（CI=true 时自动开启）",
+        help="Fail when required tools (cargo, ruff, gcc, make) are missing (auto under CI=true)",
+    )
+    parser.add_argument(
+        "--require-shellcheck",
+        action="store_true",
+        help="Fail if shellcheck binary is unavailable instead of warning and skipping",
     )
     parser.add_argument(
         "--skip-rust",
         action="store_true",
-        help="显式跳过 Rust cargo fmt/test/clippy 检查",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=default_workers,
-        help=f"Stage 2 并行测试 worker 数量（默认 {default_workers}）",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help=(
-            "快速本地开发模式：跳过串行分发测试与 cargo clippy，"
-            "仅跑 cargo test --lib（严格模式和 CI 禁止）"
-        ),
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="透传 -v 给 unittest 子进程",
-    )
-    parser.add_argument(
-        "tests",
-        nargs="*",
-        help="可选测试过滤（模块名、文件路径或匹配模式）",
+        help="Skip Rust workspace fmt/clippy/test checks (refused in CI/strict)",
     )
     args = parser.parse_args(argv)
-    if args.workers < 1:
-        parser.error("--workers 必须 >= 1")
+
     strict = args.strict or os.environ.get("CI") == "true"
     if args.fast and strict:
-        print("错误：--strict 或 CI=true 模式下禁止使用 --fast", file=sys.stderr)
+        print("ERROR: --fast is forbidden under CI=true or --strict", file=sys.stderr)
+        return 2
+    if args.skip_rust and strict:
+        print("ERROR: --skip-rust is forbidden under CI=true or --strict", file=sys.stderr)
         return 2
 
-    total_start = time.monotonic()
-    discovered = _discover_test_modules()
-    try:
-        selected = _resolve_test_targets(args.tests, discovered)
-    except ValueError as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 2
+    started = time.monotonic()
 
-    parallel_targets = [target for target in selected if not _is_serial_target(target)]
-    serial_targets = (
-        [] if args.fast else [target for target in selected if _is_serial_target(target)]
-    )
+    # Stage 1: Static analysis, contracts, and lint
+    print("=== Stage 1: Static Analysis, Contracts & Lint ===", flush=True)
+    _run(sys.executable, str(ROOT / "scripts" / "release_version.py"))
+    _run(sys.executable, "-m", "compileall", "-q", "tools", "scripts")
+
+    if ruff_bin := _require_or_skip(
+        "ruff", strict=strict, install_hint="run `uv sync --frozen --extra dev`"
+    ):
+        _run(ruff_bin, "check", "tools", "scripts")
+        _run(ruff_bin, "format", "--check", "tools", "scripts")
 
     cargo_bin: str | None = None
-    rust_env: dict[str, str] = {}
     if not args.skip_rust:
-        cargo_bin = _require_or_skip("cargo", strict=strict, install_hint="请安装 Rust toolchain")
-        if cargo_bin is not None:
-            rust_env = _rust_env()
-
-    # Stage 1: Fail-fast static preflight
-    run(sys.executable, "-m", "compileall", "-q", "src", "scripts", "tests")
-    if ruff_bin := _require_or_skip(
-        "ruff", strict=strict, install_hint="请使用 `uv sync --extra dev` 安装"
-    ):
-        run(ruff_bin, "check", ".")
-        run(ruff_bin, "format", "--check", ".")
-    if gcc := _require_or_skip("gcc", strict=strict, install_hint="请安装 gcc"):
-        _check_hobot_c(gcc)
-    _check_deploy_shell_scripts()
-    if cargo_bin is not None:
-        run(
-            cargo_bin,
-            "fmt",
-            "--manifest-path",
-            "native/Cargo.toml",
-            "--check",
-            extra_env=rust_env,
+        cargo_bin = _require_or_skip(
+            "cargo", strict=strict, install_hint="install Rust toolchain via rustup"
         )
+        if cargo_bin is not None:
+            _run(cargo_bin, "fmt", "--all", "--", "--check")
 
-    # Stage 2: Parallel unittest pool
-    parallel_ok, _ = _run_parallel_tests(
-        parallel_targets, workers=args.workers, verbose=args.verbose
+    _check_deploy_shell_scripts(require_shellcheck=args.require_shellcheck)
+    _check_contracts()
+    _check_zero_legacy_naming()
+    _check_zero_non_test_unwrap()
+    print("Stage 1 PASSED", flush=True)
+
+    # Stage 2: C Encoder & Host Tools
+    print("=== Stage 2: C Encoder & Host Tools ===", flush=True)
+    gcc_bin = _require_or_skip("gcc", strict=strict, install_hint="install gcc")
+    make_bin = _require_or_skip("make", strict=strict, install_hint="install make")
+    if gcc_bin is not None and make_bin is not None:
+        _run(make_bin, "-C", "csrc/miro-ego-encoder", "check")
+
+    _run(
+        sys.executable,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/miro_ego_host/tests",
+        extra_env={"PYTHONPATH": "tools"},
     )
-    if not parallel_ok:
-        return 1
+    _check_native_bundle_builder()
+    print("Stage 2 PASSED", flush=True)
 
-    # Stage 3: Serial isolation tests & Cargo test/clippy
-    if serial_targets and not _run_serial_tests(serial_targets, verbose=args.verbose):
-        return 1
-
+    # Stage 3: Rust Full Workspace
+    print("=== Stage 3: Rust Full Workspace ===", flush=True)
     if cargo_bin is not None:
-        test_cmd = [cargo_bin, "test", "--manifest-path", "native/Cargo.toml"]
+        if not args.fast:
+            _run(cargo_bin, "clippy", "--workspace", "--all-targets", "--", "-D", "warnings")
+        test_cmd = [cargo_bin, "test", "--workspace"]
         if args.fast:
             test_cmd.append("--lib")
-        run(*test_cmd, extra_env=rust_env)
-        if not args.fast:
-            run(
-                cargo_bin,
-                "clippy",
-                "--manifest-path",
-                "native/Cargo.toml",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-                extra_env=rust_env,
-            )
-
-    print(f"全部检查通过，总耗时 {time.monotonic() - total_start:.2f}s")
+        _run(*test_cmd)
+    print(f"ALL MIRO-EGO CHECKS PASSED in {time.monotonic() - started:.2f}s", flush=True)
     return 0
 
 
