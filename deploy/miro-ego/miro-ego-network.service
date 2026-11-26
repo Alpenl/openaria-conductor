@@ -1,0 +1,43 @@
+[Unit]
+Description=Miro-Ego privileged network and clock control worker
+Requires=NetworkManager.service miro-ego-recover.service miro-ego-network.socket
+After=NetworkManager.service miro-ego-recover.service miro-ego-network.socket systemd-tmpfiles-setup.service
+Before=miro-ego.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120s
+User=root
+Group=root
+SupplementaryGroups=miro-ego
+Environment=MIRO_EGO_NETWORK_STATE_DIR=/var/lib/miro-ego-network
+Environment=MIRO_EGO_NETWORK_OPERATION_LOCK_PATH=/run/miro-ego/network-operation.lock
+Environment=RUST_LOG=info
+ExecStart=/opt/miro-ego/current/bin/miro-ego network-control serve
+LimitCORE=0
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=miro-ego-network
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/miro-ego-network
+ReadWritePaths=/etc/NetworkManager/system-connections
+ReadWritePaths=-/etc/avahi/services
+ReadWritePaths=/run/miro-ego/network-operation.lock
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_SYS_TIME
+AmbientCapabilities=

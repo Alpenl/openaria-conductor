@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Miro-Ego RDK X5 Wi-Fi watchdog
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Unit=miro-ego-wifi-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT="${MIRO_EGO_DATA_VOLUME_MOUNT:-/data}"
+MODE="${MIRO_EGO_DATA_VOLUME_MODE:-exfat}"
+MIRO_EGO_BIN="${MIRO_EGO_BIN:-/opt/miro-ego/current/bin/miro-ego}"
+
+log() {
+    printf '[miro-ego-data-volume] %s\n' "$*"
+}
+
+usage() {
+    echo "usage: $0 ensure" >&2
+}
+
+hide_system_dir() {
+    local target="$1"
+    if command -v fatattr >/dev/null 2>&1; then
+        if fatattr +h "$target"; then
+            return 0
+        fi
+        log "warning: fatattr +h failed on $target; trying miro-ego volume hide"
+    fi
+    if [ -x "$MIRO_EGO_BIN" ]; then
+        if runuser -u miro-ego -- "$MIRO_EGO_BIN" volume hide "$target"; then
+            return 0
+        fi
+        log "warning: $MIRO_EGO_BIN volume hide failed on $target"
+        return 0
+    fi
+    log "warning: neither fatattr nor $MIRO_EGO_BIN is available to hide $target"
+    return 0
+}
+
+case "${1:-ensure}" in
+    ensure) ;;
+    *) usage; exit 2 ;;
+esac
+
+getent passwd miro-ego >/dev/null || {
+    echo 'miro-ego user is missing' >&2
+    exit 1
+}
+
+if [ "$MODE" != "exfat" ]; then
+    log "unsupported storage mode: $MODE (only exfat partition mode is supported)"
+    exit 1
+fi
+
+partuuid="${MIRO_EGO_DATA_VOLUME_PARTUUID:?missing recording partition identity}"
+[[ "$partuuid" =~ ^[[:xdigit:]]{8}-03$ ]] || {
+    log "invalid recording partition PARTUUID: $partuuid"
+    exit 1
+}
+uuid="${MIRO_EGO_DATA_VOLUME_UUID:?missing recording filesystem identity}"
+[[ "$uuid" =~ ^[[:xdigit:]]{4}-[[:xdigit:]]{4}$ ]] || {
+    log "invalid exFAT filesystem UUID: $uuid"
+    exit 1
+}
+
+device="/dev/disk/by-uuid/$uuid"
+waited=0
+while [ "$waited" -lt 5 ] && [ ! -b "$device" ]; do
+    sleep 1
+    waited=$((waited + 1))
+done
+[ -b "$device" ] || {
+    log 'recording partition is absent'
+    exit 1
+}
+
+actual_partuuid="$(blkid -s PARTUUID -o value "$device")"
+[ "$actual_partuuid" = "$partuuid" ] || {
+    log "recording partition PARTUUID mismatch: expected $partuuid, got ${actual_partuuid:-empty}"
+    exit 1
+}
+actual_uuid="$(blkid -s UUID -o value "$device")"
+[ "$actual_uuid" = "$uuid" ] || {
+    log "recording filesystem UUID mismatch: expected $uuid, got ${actual_uuid:-empty}"
+    exit 1
+}
+actual_type="$(blkid -s TYPE -o value "$device")"
+[ "$actual_type" = "exfat" ] || {
+    log "unexpected recording filesystem type: ${actual_type:-empty}"
+    exit 1
+}
+
+capture_uid="$(id -u miro-ego)"
+capture_gid="$(id -g miro-ego)"
+
+if ! mountpoint -q "$MOUNT"; then
+    install -d -o root -g root -m 0755 "$MOUNT"
+    # Safe automatic repairs only; never format a damaged recording volume.
+    # A failed or timed-out repair leaves the web service available while blocking capture.
+    rc=0
+    timeout --kill-after=5s 90s fsck.exfat -p "$device" || rc=$?
+    [ "$rc" = 0 ] || [ "$rc" = 1 ] || exit "$rc"
+    mount -t exfat -o "rw,nosuid,nodev,noexec,noatime,uid=$capture_uid,gid=$capture_gid,fmask=0137,dmask=0027,errors=remount-ro" "$device" "$MOUNT"
+fi
+
+fs_type="$(findmnt -rn --mountpoint "$MOUNT" -o FSTYPE)"
+[ "$fs_type" = "exfat" ] || {
+    log "unexpected filesystem type mounted at $MOUNT: ${fs_type:-unknown}"
+    exit 1
+}
+source_dev="$(findmnt -rn --mountpoint "$MOUNT" -o SOURCE)"
+[ "$(readlink -f "$source_dev")" = "$(readlink -f "$device")" ] || {
+    log "unexpected mount source at $MOUNT: ${source_dev:-unknown}"
+    exit 1
+}
+
+options="$(findmnt -rn --mountpoint "$MOUNT" -o OPTIONS)"
+if [[ ",$options," != *,rw,* ]]; then
+    log "remounting $MOUNT read-write"
+    mount -o remount,rw "$MOUNT"
+    options="$(findmnt -rn --mountpoint "$MOUNT" -o OPTIONS)"
+    [[ ",$options," == *,rw,* ]] || {
+        log "$MOUNT is not mounted read-write"
+        exit 1
+    }
+fi
+
+runuser -u miro-ego -- mkdir -p \
+    "$MOUNT/recordings" \
+    "$MOUNT/logs" \
+    "$MOUNT/updates" \
+    "$MOUNT/.miro-ego/index" \
+    "$MOUNT/.miro-ego/staging" \
+    "$MOUNT/.miro-ego/quarantine" \
+    "$MOUNT/.miro-ego/audit" \
+    "$MOUNT/.miro-ego/receipts" \
+    "$MOUNT/.miro-ego/telemetry"
+
+if [ ! -f "$MOUNT/.miro-ego/volume.json" ] && [ -x "$MIRO_EGO_BIN" ]; then
+    runuser -u miro-ego -- "$MIRO_EGO_BIN" volume init "$MOUNT"
+fi
+
+hide_system_dir "$MOUNT/.miro-ego"
+
+label="$(blkid -s LABEL -o value "$device" 2>/dev/null || true)"
+log "ready: $device exFAT (${label:-unlabeled}) at $MOUNT"
