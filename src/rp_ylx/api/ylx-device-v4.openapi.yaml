@@ -1125,6 +1125,12 @@ paths:
       security:
         - bearerAuth: []
       parameters:
+        - name: Prefer
+          in: header
+          required: false
+          description: Request include-recovery to mark sealed prefixes of interrupted recordings. Keep the same preference while paging.
+          schema:
+            type: string
         - name: cursor
           in: query
           required: false
@@ -3497,6 +3503,9 @@ components:
         - total_bytes
         - verification
       properties:
+        recovered_prefix:
+          const: true
+          description: The sealed manifest contains a recovery receipt. Only sent when the client requests include-recovery and independent of artifact verification.
         session_id:
           $ref: "#/components/schemas/UuidV7"
         producer_outcome:

@@ -64,6 +64,21 @@ class SessionCatalog(StateDatabase):
                 "PRIMARY KEY(volume,session,path), FOREIGN KEY(volume,session) "
                 "REFERENCES sessions(volume,session) ON DELETE CASCADE)"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS recovered_sessions ON artifacts(volume,session) "
+                "WHERE role='log.recording-recovery'"
+            )
+
+    def recovered_sessions(self, volume: str) -> set[str]:
+        with self.connection() as db:
+            return {
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT session FROM artifacts "
+                    "WHERE volume=? AND role='log.recording-recovery'",
+                    (volume,),
+                )
+            }
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

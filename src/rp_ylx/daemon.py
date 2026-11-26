@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import json
 import os
@@ -424,8 +425,11 @@ def _enable_customer_tls(server: Any, config: ProductionConfig) -> None:
         raise ProductionConfigError("无法启用 Customer TLS") from error
 
 
+API_AUDIT_FILE_BYTES = 32 * 1024 * 1024
+
+
 def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
-    lock = threading.Lock()
+    archive = path.with_name(path.name + ".1")
 
     def write(event: AuditEvent) -> None:
         value = {
@@ -441,7 +445,9 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= os.O_NONBLOCK
-        with lock:
+        if len(payload) > API_AUDIT_FILE_BYTES:
+            raise OSError("API audit record exceeds the log file budget")
+        while True:
             # Reject special files before open can block or affect a device.
             # The descriptor check below also covers replacement after lstat.
             try:
@@ -453,17 +459,29 @@ def _audit_sink(path: Path) -> Callable[[AuditEvent], None]:
                     raise OSError("API audit target must be an exclusively linked regular file")
             descriptor = os.open(path, flags, 0o600)
             try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
                 metadata = os.fstat(descriptor)
+                # Another writer may have rotated this inode while we waited.
+                try:
+                    current = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if not os.path.samestat(metadata, current):
+                    continue
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise OSError("API audit target must be an exclusively linked regular file")
                 if metadata.st_mode & 0o777 != 0o600:
                     os.fchmod(descriptor, 0o600)
+                if metadata.st_size + len(payload) > API_AUDIT_FILE_BYTES:
+                    os.replace(path, archive)
+                    continue
                 remaining = memoryview(payload)
                 while remaining:
                     written = os.write(descriptor, remaining)
                     if written <= 0:
                         raise OSError("API audit record was not fully written")
                     remaining = remaining[written:]
+                return
             finally:
                 os.close(descriptor)
 

@@ -281,6 +281,7 @@ class DeviceProvider(Protocol):
         limit: int,
         take_id: str | None,
         api_version: str,
+        include_recovery: bool = False,
     ) -> Mapping[str, object]: ...
 
     def open_manifest(self, session_id: str, api_version: str) -> LockedRepresentation: ...
@@ -1471,6 +1472,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers.extend(("Content-Type", "X-CSRF-Token"))
             if parts[3:] not in (["network", "credentials"], ["clock", "sync"]):
                 headers.append("Idempotency-Key")
+        elif path == "/api/v4/sessions" and method == "GET":
+            headers.append("Prefer")
         elif len(parts) == 5 and parts[3:] in (["capture", "events"], ["network", "events"]):
             headers.append("Last-Event-ID")
         elif self._artifact_route(parts) is not None:
@@ -2699,18 +2702,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if take_id is not None and UUID_V7.fullmatch(take_id) is None:
             self._problem(HTTPStatus.BAD_REQUEST, "invalid_request", "take_id 必须是 UUIDv7")
             return
+        preferences = self.headers.get("Prefer", "").lower().split(",")
+        include_recovery = api_version == "v4" and any(
+            token.strip() == "include-recovery" for token in preferences
+        )
         try:
             result = self.server.provider.list_sessions(
                 cursor=cursor,
                 limit=limit,
                 take_id=take_id,
                 api_version=api_version,
+                include_recovery=include_recovery,
             )
             validate_session_list(
                 result,
                 limit=limit,
                 take_id=take_id,
                 api_version=api_version,
+                include_recovery=include_recovery,
             )
         except InvalidSourceEvent:
             self._invalid_source_state("daemon session list 无效")

@@ -44,6 +44,27 @@ class AuditFileAdmissionTest(unittest.TestCase):
         os.mkfifo(self.path)
         self.check_fifo_child(race=False)
 
+    def test_multiple_writers_rotate_whole_records_and_bound_both_files(self):
+        sinks = [_audit_sink(self.path) for _ in range(4)]
+
+        def write(i):
+            sinks[i % 4](AuditEvent(str(i), None, "getDevice", None, "allowed"))
+
+        with patch("rp_ylx.daemon.API_AUDIT_FILE_BYTES", 4096):
+            with ThreadPoolExecutor(max_workers=8) as workers:
+                list(workers.map(write, range(240)))
+            write(240)
+        archive = self.path.with_name(self.path.name + ".1")
+        ids = []
+        for p in (archive, self.path):
+            self.assertLessEqual(p.stat().st_size, 4096)
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+            ids.extend(json.loads(line)["request_id"] for line in p.read_text().splitlines())
+        self.assertEqual(ids[-1], "240")
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreater(len(ids), 15)
+        self.assertEqual(set(self.root.iterdir()), {archive, self.path})
+
     def test_fifo_replacing_regular_file_between_inspection_and_open_does_not_block(self):
         self.path.write_text("")
         self.check_fifo_child(race=True)
