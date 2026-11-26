@@ -455,6 +455,7 @@ pub trait CaptureToggleClient: Send + Sync {
 pub struct LocalHttpCaptureClient {
     addr: SocketAddr,
     bearer_token: Option<String>,
+    csrf_token: Option<String>,
     timeout: Duration,
 }
 
@@ -464,8 +465,15 @@ impl LocalHttpCaptureClient {
         Self {
             addr,
             bearer_token,
+            csrf_token: None,
             timeout: Duration::from_millis(capped),
         }
+    }
+
+    /// Set a dedicated `X-CSRF-Token` header value distinct from the `Authorization: Bearer` token.
+    pub fn with_csrf_token(mut self, csrf_token: impl Into<String>) -> Self {
+        self.csrf_token = Some(csrf_token.into());
+        self
     }
 
     fn http_json(&self, method: &str, path: &str, body: Option<&Value>) -> HwResult<(u16, Value)> {
@@ -499,8 +507,8 @@ impl LocalHttpCaptureClient {
         if let Some(bytes) = &payload {
             req.push_str("Content-Type: application/json\r\n");
             req.push_str(&format!("Idempotency-Key: {}\r\n", new_uuid_v4()));
-            if let Some(tok) = &self.bearer_token {
-                req.push_str(&format!("X-CSRF-Token: {tok}\r\n"));
+            if let Some(csrf) = self.csrf_token.as_deref().or(self.bearer_token.as_deref()) {
+                req.push_str(&format!("X-CSRF-Token: {csrf}\r\n"));
             }
             req.push_str(&format!("Content-Length: {}\r\n", bytes.len()));
         }
@@ -759,6 +767,9 @@ mod tests {
                     1 => {
                         assert!(req.starts_with("POST /api/v1/capture/start "));
                         assert!(req.contains("Idempotency-Key:"));
+                        assert!(req.contains("Authorization: Bearer test-bearer-token\r\n"));
+                        assert!(req.contains("X-CSRF-Token: test-csrf-token\r\n"));
+                        assert!(!req.contains("X-CSRF-Token: test-bearer-token\r\n"));
                         "HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}".to_owned()
                     }
                     2 => {
@@ -770,6 +781,8 @@ mod tests {
                     }
                     _ => {
                         assert!(req.starts_with("POST /api/v1/capture/stop "));
+                        assert!(req.contains("Authorization: Bearer test-bearer-token\r\n"));
+                        assert!(req.contains("X-CSRF-Token: test-csrf-token\r\n"));
                         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_owned()
                     }
                 };
@@ -777,7 +790,8 @@ mod tests {
             }
         });
 
-        let client = LocalHttpCaptureClient::new(addr, Some("test-bearer-token".to_owned()), 2000);
+        let client = LocalHttpCaptureClient::new(addr, Some("test-bearer-token".to_owned()), 2000)
+            .with_csrf_token("test-csrf-token");
         assert_eq!(
             client.toggle_capture().unwrap(),
             CaptureToggleAction::Started

@@ -9,9 +9,9 @@ use crate::nmcli::{
 };
 use crate::state::{
     CredentialState, DesiredEthernet, DesiredMode, DesiredState, EthernetAddressing,
-    NetworkStateStore, RecoveryAction, RetainedCandidate, StateSnapshot, TransactionError,
-    TransactionOperation, TransactionReceipt, TransactionStage, TransactionStatus,
-    TransactionUpdate, TransactionWindow, format_utc_iso8601, utc_now_iso8601,
+    NetworkDeviceDeadline, NetworkStateStore, RecoveryAction, RetainedCandidate, StateSnapshot,
+    TransactionError, TransactionOperation, TransactionReceipt, TransactionStage,
+    TransactionStatus, TransactionUpdate, TransactionWindow, format_utc_iso8601, utc_now_iso8601,
 };
 use crate::{NetworkController, NetworkError, NetworkResult, StationCredentials, WifiStatus};
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
@@ -229,7 +229,7 @@ impl MutationCapability {
 }
 
 /// Secret-free controller status returned by RPC `status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControllerStatus {
     pub schema: String,
     pub authority_epoch: String,
@@ -252,7 +252,7 @@ pub struct ScanResponse {
 }
 
 /// Outcome of an authoritative mutation (`apply`, `retry`, `forget`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MutationOutcome {
     pub receipt: TransactionReceipt,
     pub replayed: bool,
@@ -604,6 +604,7 @@ impl AuthoritativeNetworkController {
                 status: TransactionStatus::Running,
                 stage: TransactionStage::Forgetting,
                 updated_at: utc_now_iso8601(),
+                deadline: None,
                 recovery_action: RecoveryAction::AwaitDevice,
                 ap_validated: None,
                 error: None,
@@ -631,6 +632,7 @@ impl AuthoritativeNetworkController {
                         status: TransactionStatus::Committed,
                         stage: TransactionStage::Forgotten,
                         updated_at: utc_now_iso8601(),
+                        deadline: None,
                         recovery_action: RecoveryAction::ReconnectRescueAp,
                         ap_validated: Some(true),
                         error: None,
@@ -660,6 +662,7 @@ impl AuthoritativeNetworkController {
                 status: TransactionStatus::Running,
                 stage: TransactionStage::Prepared,
                 updated_at: utc_now_iso8601(),
+                deadline: None,
                 recovery_action: RecoveryAction::AwaitDevice,
                 ap_validated: None,
                 error: None,
@@ -679,6 +682,7 @@ impl AuthoritativeNetworkController {
                         status: TransactionStatus::Running,
                         stage: TransactionStage::ApReady,
                         updated_at: utc_now_iso8601(),
+                        deadline: None,
                         recovery_action: RecoveryAction::AwaitDevice,
                         ap_validated: Some(true),
                         error: None,
@@ -695,6 +699,7 @@ impl AuthoritativeNetworkController {
                         status: TransactionStatus::Committed,
                         stage: TransactionStage::Committed,
                         updated_at: utc_now_iso8601(),
+                        deadline: None,
                         recovery_action: RecoveryAction::ReconnectRescueAp,
                         ap_validated: Some(true),
                         error: None,
@@ -711,6 +716,40 @@ impl AuthoritativeNetworkController {
         }
     }
 
+    fn validate_rescue_profile_ready_locked(&self) -> NetworkResult<()> {
+        let info = {
+            let existing = self.rescue_info.lock().ok().and_then(|g| g.clone());
+            match existing {
+                Some(info) => info,
+                None => {
+                    let ensured = self
+                        .backend
+                        .ensure_rescue_hotspot(&self.config.device_id, true)?;
+                    if let Ok(mut guard) = self.rescue_info.lock() {
+                        *guard = Some(ensured.clone());
+                    }
+                    ensured
+                }
+            }
+        };
+        let path = self.backend.profile_path(&info.profile_name);
+        let meta = std::fs::symlink_metadata(&path).map_err(|err| NetworkError::Backend {
+            message: format!(
+                "rescue_ap_unavailable: rescue profile {} missing: {err}",
+                info.profile_name
+            ),
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(NetworkError::Backend {
+                message: format!(
+                    "rescue_ap_unavailable: rescue profile {} is not a regular file",
+                    info.profile_name
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn execute_candidate_activation(
         &self,
         tx_id: &str,
@@ -722,10 +761,62 @@ impl AuthoritativeNetworkController {
             tx_id,
             TransactionUpdate {
                 status: TransactionStatus::Running,
-                stage: TransactionStage::Activating,
+                stage: TransactionStage::Prepared,
                 updated_at: utc_now_iso8601(),
+                deadline: None,
                 recovery_action: RecoveryAction::AwaitDevice,
                 ap_validated: Some(false),
+                error: None,
+                desired: None,
+                publish_desired: false,
+                saved: None,
+                verified: None,
+                retained_candidate: None,
+            },
+        )?;
+
+        if let Err(err) = self.validate_rescue_profile_ready_locked() {
+            let retained = RetainedCandidate {
+                transaction_id: tx_id.to_owned(),
+                profile_name: profile_name.to_owned(),
+                desired: desired.clone(),
+            };
+            return self.fallback_to_rescue(tx_id, &err, Some(retained));
+        }
+
+        self.state.transition(
+            tx_id,
+            TransactionUpdate {
+                status: TransactionStatus::Running,
+                stage: TransactionStage::ApReady,
+                updated_at: utc_now_iso8601(),
+                deadline: None,
+                recovery_action: RecoveryAction::AwaitDevice,
+                ap_validated: Some(true),
+                error: None,
+                desired: None,
+                publish_desired: false,
+                saved: None,
+                verified: None,
+                retained_candidate: None,
+            },
+        )?;
+
+        let wait_secs = self.config.activation_wait_secs.clamp(1, 10);
+        let now_mono_ns = miro_ego_core::sys::clock::monotonic_ns().unwrap_or(0);
+        let deadline_ns = now_mono_ns.saturating_add(wait_secs.saturating_mul(1_000_000_000));
+        let activating_deadline =
+            NetworkDeviceDeadline::device_monotonic(deadline_ns, wait_secs as f64);
+
+        self.state.transition(
+            tx_id,
+            TransactionUpdate {
+                status: TransactionStatus::Running,
+                stage: TransactionStage::Activating,
+                updated_at: utc_now_iso8601(),
+                deadline: Some(activating_deadline),
+                recovery_action: RecoveryAction::AwaitDevice,
+                ap_validated: Some(true),
                 error: None,
                 desired: None,
                 publish_desired: false,
@@ -748,14 +839,19 @@ impl AuthoritativeNetworkController {
                 self.config.activation_wait_secs,
                 is_wifi_client,
             )?;
+            let observed_ns = miro_ego_core::sys::clock::monotonic_ns().unwrap_or(now_mono_ns);
+            let remaining_secs = (deadline_ns.saturating_sub(observed_ns) as f64) / 1_000_000_000.0;
+            let verifying_deadline =
+                NetworkDeviceDeadline::device_monotonic(deadline_ns, remaining_secs);
             self.state.transition(
                 tx_id,
                 TransactionUpdate {
                     status: TransactionStatus::Running,
                     stage: TransactionStage::Verifying,
                     updated_at: utc_now_iso8601(),
+                    deadline: Some(verifying_deadline),
                     recovery_action: RecoveryAction::AwaitDevice,
-                    ap_validated: Some(false),
+                    ap_validated: Some(true),
                     error: None,
                     desired: None,
                     publish_desired: false,
@@ -778,8 +874,9 @@ impl AuthoritativeNetworkController {
                         status: TransactionStatus::Committed,
                         stage: TransactionStage::Committed,
                         updated_at: utc_now_iso8601(),
+                        deadline: None,
                         recovery_action: RecoveryAction::ReconnectTargetLan,
-                        ap_validated: Some(false),
+                        ap_validated: Some(true),
                         error: None,
                         desired: Some(desired.clone()),
                         publish_desired: true,
@@ -813,6 +910,7 @@ impl AuthoritativeNetworkController {
                 status: TransactionStatus::Running,
                 stage: TransactionStage::FallingBack,
                 updated_at: utc_now_iso8601(),
+                deadline: None,
                 recovery_action: RecoveryAction::AwaitDevice,
                 ap_validated: None,
                 error: None,
@@ -845,6 +943,7 @@ impl AuthoritativeNetworkController {
                 status,
                 stage,
                 updated_at: utc_now_iso8601(),
+                deadline: None,
                 recovery_action,
                 ap_validated: Some(rescued),
                 error: Some(map_transaction_error(cause)),
@@ -1364,6 +1463,17 @@ mod tests {
             .unwrap();
         assert_eq!(retry_outcome.final_status, TransactionStatus::Committed);
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
+        let committed_latest = ctrl
+            .controller_status()
+            .unwrap()
+            .transaction
+            .latest
+            .unwrap();
+        assert!(committed_latest.rescue.ap_validated);
+        assert!(committed_latest.deadline.is_none());
+        let tx_json = serde_json::to_value(&committed_latest).unwrap();
+        assert!(tx_json.as_object().unwrap().contains_key("deadline"));
+        assert!(tx_json["deadline"].is_null());
 
         // Forget restores hotspot and removes managed wifi-client profiles.
         let forget_outcome = ctrl.forget("client-1", "idem-forget-1").unwrap();
@@ -1389,6 +1499,7 @@ mod tests {
                     desired: DesiredState::hotspot(),
                     accepted_at: "2026-01-01T00:00:00Z".to_owned(),
                     updated_at: "2026-01-01T00:00:01Z".to_owned(),
+                    deadline: None,
                     recovery_action: RecoveryAction::None,
                     rescue: Default::default(),
                     error: None,
@@ -1520,6 +1631,14 @@ mod tests {
             .unwrap();
         assert_eq!(static_res.final_status, TransactionStatus::Committed);
         assert_eq!(ctrl.watchdog_mode().unwrap(), WatchdogMode::EthernetStatic);
+        let eth_latest = ctrl
+            .controller_status()
+            .unwrap()
+            .transaction
+            .latest
+            .unwrap();
+        assert!(eth_latest.rescue.ap_validated);
+        assert!(eth_latest.deadline.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }

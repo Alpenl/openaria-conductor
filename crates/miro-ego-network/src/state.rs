@@ -209,6 +209,46 @@ impl Default for RescueMetadata {
     }
 }
 
+pub const DEVICE_MONOTONIC_TIME_BASE: &str = "device_monotonic";
+
+/// Device-monotonic failure deadline matching OpenAPI `NetworkDeviceDeadline`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDeviceDeadline {
+    pub time_base: String,
+    pub deadline_ns: u64,
+    pub remaining_seconds: f64,
+}
+
+impl NetworkDeviceDeadline {
+    pub fn device_monotonic(deadline_ns: u64, remaining_seconds: f64) -> Self {
+        let clamped = if remaining_seconds.is_finite() {
+            remaining_seconds.clamp(0.0, 10.0)
+        } else {
+            0.0
+        };
+        Self {
+            time_base: DEVICE_MONOTONIC_TIME_BASE.to_owned(),
+            deadline_ns,
+            remaining_seconds: clamped,
+        }
+    }
+
+    pub fn validate(&self) -> NetworkResult<()> {
+        if self.time_base != DEVICE_MONOTONIC_TIME_BASE {
+            return Err(NetworkError::Invalid {
+                message: format!("invalid deadline time_base: {}", self.time_base),
+            });
+        }
+        if !self.remaining_seconds.is_finite() || !(0.0..=10.0).contains(&self.remaining_seconds) {
+            return Err(NetworkError::Invalid {
+                message: "deadline remaining_seconds must be finite in 0.0..=10.0".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionError {
@@ -217,7 +257,7 @@ pub struct TransactionError {
     pub retryable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkTransaction {
     pub schema: String,
@@ -230,19 +270,21 @@ pub struct NetworkTransaction {
     pub desired: DesiredState,
     pub accepted_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub deadline: Option<NetworkDeviceDeadline>,
     pub recovery_action: RecoveryAction,
     pub rescue: RescueMetadata,
     pub error: Option<TransactionError>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionWindow {
     pub current: Option<NetworkTransaction>,
     pub latest: Option<NetworkTransaction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionReceipt {
     pub schema: String,
@@ -250,7 +292,7 @@ pub struct TransactionReceipt {
     pub transaction: NetworkTransaction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredReceipt {
     pub scope: String,
@@ -269,7 +311,7 @@ pub struct RetainedCandidate {
 }
 
 /// Complete persisted network controller state stored in a single fixed-size JSON file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedNetworkState {
     pub schema: String,
@@ -332,6 +374,9 @@ impl PersistedNetworkState {
                     message: "current transaction cannot have terminal status".to_owned(),
                 });
             }
+            if let Some(deadline) = &current.deadline {
+                deadline.validate()?;
+            }
         }
         if let Some(latest) = &self.transaction.latest {
             if !latest.status.is_terminal() {
@@ -339,13 +384,16 @@ impl PersistedNetworkState {
                     message: "latest transaction must have terminal status".to_owned(),
                 });
             }
+            if let Some(deadline) = &latest.deadline {
+                deadline.validate()?;
+            }
         }
         Ok(())
     }
 }
 
 /// Public snapshot without internal receipt history or profile filenames.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub authority_epoch: String,
     pub source_revision: u64,
@@ -356,7 +404,7 @@ pub struct StateSnapshot {
 }
 
 /// Result of calling `accept_transaction`: either a fresh acceptance or an idempotent replay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AcceptOutcome {
     pub receipt: TransactionReceipt,
     pub replayed: bool,
@@ -368,6 +416,7 @@ pub struct TransactionUpdate {
     pub status: TransactionStatus,
     pub stage: TransactionStage,
     pub updated_at: String,
+    pub deadline: Option<NetworkDeviceDeadline>,
     pub recovery_action: RecoveryAction,
     pub ap_validated: Option<bool>,
     pub error: Option<TransactionError>,
@@ -574,6 +623,7 @@ impl NetworkStateStore {
             desired: desired.clone(),
             accepted_at: accepted_at.clone(),
             updated_at: accepted_at.clone(),
+            deadline: None,
             recovery_action: RecoveryAction::AwaitDevice,
             rescue: RescueMetadata::default(),
             error: None,
@@ -637,6 +687,7 @@ impl NetworkStateStore {
         current.stage = update.stage;
         current.updated_at = update.updated_at;
         current.source_revision = next.source_revision;
+        current.deadline = update.deadline;
         current.recovery_action = update.recovery_action;
         if let Some(ap_val) = update.ap_validated {
             current.rescue.ap_validated = ap_val;
@@ -847,8 +898,9 @@ mod tests {
                         status: TransactionStatus::Committed,
                         stage: TransactionStage::Committed,
                         updated_at: format_utc_iso8601(1_730_000_001 + u64::from(i)),
+                        deadline: None,
                         recovery_action: RecoveryAction::ReconnectTargetLan,
-                        ap_validated: Some(false),
+                        ap_validated: Some(true),
                         error: None,
                         desired: None,
                         publish_desired: false,
@@ -864,10 +916,21 @@ mod tests {
         let file_bytes = fs::metadata(&path).unwrap().len() as usize;
         assert!(file_bytes <= MAX_STATE_FILE_BYTES);
 
-        // Reload from disk verifies persistence and bounds.
+        // Reload from disk verifies persistence and bounds, plus required OpenAPI `deadline` key.
         let reloaded = NetworkStateStore::open_or_init(&path).unwrap();
         assert_eq!(reloaded.receipt_count().unwrap(), MAX_RETAINED_RECEIPTS);
-        assert!(reloaded.snapshot().unwrap().verified);
+        let snap = reloaded.snapshot().unwrap();
+        assert!(snap.verified);
+        let latest_json = serde_json::to_value(snap.transaction.latest.as_ref().unwrap()).unwrap();
+        assert!(latest_json.as_object().unwrap().contains_key("deadline"));
+        assert!(latest_json["deadline"].is_null());
+
+        let dl = NetworkDeviceDeadline::device_monotonic(123_456_789, 7.5);
+        dl.validate().unwrap();
+        let dl_json = serde_json::to_value(&dl).unwrap();
+        assert_eq!(dl_json["time_base"], "device_monotonic");
+        assert_eq!(dl_json["deadline_ns"], 123_456_789);
+        assert_eq!(dl_json["remaining_seconds"], 7.5);
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

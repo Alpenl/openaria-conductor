@@ -33,12 +33,13 @@ pub use rpc::{
     RpcServerConfig,
 };
 pub use state::{
-    CredentialState, DEFAULT_NETWORK_STATE_FILE, DesiredEthernet, DesiredMode, DesiredState,
-    DesiredWifiClient, EthernetAddressing, MAX_RETAINED_RECEIPTS, MAX_STATE_FILE_BYTES,
-    NETWORK_RECEIPT_SCHEMA, NETWORK_STATE_SCHEMA, NETWORK_TRANSACTION_SCHEMA, NetworkStateStore,
-    NetworkTransaction, PersistedNetworkState, RecoveryAction, RescueMetadata, RetainedCandidate,
-    StateSnapshot, TransactionError, TransactionOperation, TransactionReceipt, TransactionStage,
-    TransactionStatus, TransactionUpdate, TransactionWindow,
+    CredentialState, DEFAULT_NETWORK_STATE_FILE, DEVICE_MONOTONIC_TIME_BASE, DesiredEthernet,
+    DesiredMode, DesiredState, DesiredWifiClient, EthernetAddressing, MAX_RETAINED_RECEIPTS,
+    MAX_STATE_FILE_BYTES, NETWORK_RECEIPT_SCHEMA, NETWORK_STATE_SCHEMA, NETWORK_TRANSACTION_SCHEMA,
+    NetworkDeviceDeadline, NetworkStateStore, NetworkTransaction, PersistedNetworkState,
+    RecoveryAction, RescueMetadata, RetainedCandidate, StateSnapshot, TransactionError,
+    TransactionOperation, TransactionReceipt, TransactionStage, TransactionStatus,
+    TransactionUpdate, TransactionWindow,
 };
 
 pub const MDNS_SERVICE_TYPE: &str = "_miro-ego._tcp";

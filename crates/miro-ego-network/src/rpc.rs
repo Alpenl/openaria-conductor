@@ -410,7 +410,7 @@ fn execute_operation(
             200,
             json!({
                 "mutation_enabled": true,
-                "operations": ["apply", "forget", "retry"],
+                "operations": ["apply", "retry", "forget"],
                 "secret_handling": "opaque_credential_reference_only",
             }),
         ),
@@ -1103,6 +1103,7 @@ mod tests {
 
         let health = client.health().unwrap();
         assert_eq!(health["mutation_enabled"], true);
+        assert_eq!(health["operations"], json!(["apply", "retry", "forget"]));
         assert_eq!(client.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
 
         let scan = client.scan().unwrap();
