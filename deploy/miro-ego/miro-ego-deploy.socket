@@ -7,7 +7,7 @@ ListenStream=/run/miro-ego/deploy-control.sock
 SocketUser=miro-ego
 SocketGroup=miro-ego
 SocketMode=0660
-DirectoryMode=0755
+DirectoryMode=0750
 Accept=no
 RemoveOnStop=yes
 

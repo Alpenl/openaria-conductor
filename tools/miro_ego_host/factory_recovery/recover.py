@@ -297,6 +297,19 @@ def restore(args: argparse.Namespace) -> None:
     raw = decrypt(args.profile.read_bytes(), getpass.getpass("Backup encryption password: "))
     profile = json.loads(raw)
     device.validate(profile)
+    tools_dir = getattr(args, "tools_directory", None) or (Path(__file__).parent / "tools")
+    exfatprogs_deb = partition_layout.prepare_tools(
+        tools_dir,
+        partition_layout.EXFATPROGS_PACKAGE,
+        partition_layout.EXFATPROGS_URL,
+        partition_layout.EXFATPROGS_SHA256,
+    )
+    logrotate_deb = partition_layout.prepare_tools(
+        tools_dir,
+        partition_layout.LOGROTATE_PACKAGE,
+        partition_layout.LOGROTATE_URL,
+        partition_layout.LOGROTATE_SHA256,
+    )
     client, login = connection(args.host, args.user)
     try:
         stage = "/tmp/miro-ego-factory-" + uuid.uuid4().hex
@@ -304,6 +317,8 @@ def restore(args: argparse.Namespace) -> None:
         with client.open_sftp() as sftp:
             sftp.mkdir(stage, mode=0o700)
             sftp.put(str(args.bundle), stage + "/bundle.tar")
+            sftp.put(str(exfatprogs_deb), stage + "/" + exfatprogs_deb.name)
+            sftp.put(str(logrotate_deb), stage + "/" + logrotate_deb.name)
             for helper_name in ("device.py", "partition_layout.py", "storage_firstboot.py"):
                 sftp.put(str(recovery_dir / helper_name), stage + "/" + helper_name)
         prepared = json.loads(
@@ -322,7 +337,7 @@ def restore(args: argparse.Namespace) -> None:
             "root = pathlib.Path(sys.argv[1]); "
             "sys.path.insert(0, str(root)); "
             "import storage_firstboot; "
-            "print(json.dumps(storage_firstboot.ensure_ssh_data_volume()))"
+            "print(json.dumps(storage_firstboot.ensure_ssh_data_volume(tools_dir=root)))"
         )
         remote(client, login, args.user, ensure_data_script, (prepared["root"],))
         receipt = json.loads(remote(client, login, args.user, ACTIVATE, (prepared["root"],)))
@@ -345,7 +360,7 @@ def restore(args: argparse.Namespace) -> None:
 
         voice_payload = device.voice_settings_payload(profile)
         has_alsa_state = "var/lib/alsa/asound.state" in profile["files"]
-        finalize_script = f"""import json, os, pathlib, pwd, subprocess, sys, uuid
+        finalize_script = f"""import json, os, pathlib, pwd, shutil, subprocess, sys, uuid
 root = pathlib.Path(sys.argv[1])
 sys.path.insert(0, str(root))
 import device
@@ -383,6 +398,9 @@ if {has_alsa_state!r}:
     subprocess.run(['alsactl', 'restore'], check=True)
 subprocess.run(['systemctl', 'start', 'miro-ego.service'], check=True)
 subprocess.run(['systemctl', 'is-active', '--quiet', 'miro-ego.service'], check=True)
+(root / 'bundle.tar').unlink(missing_ok=True)
+shutil.rmtree(root / 'bundle', ignore_errors=True)
+shutil.rmtree(root, ignore_errors=True)
 print('installed')
 """
         remote(client, login, args.user, finalize_script, (prepared["root"],))
@@ -456,6 +474,11 @@ def parser() -> argparse.ArgumentParser:
         if action == "restore":
             c.add_argument("--bundle", type=Path, required=True)
             c.add_argument("--bundle-sha256", required=True)
+            c.add_argument(
+                "--tools-directory",
+                type=Path,
+                default=Path(__file__).parent / "tools",
+            )
     return p
 
 

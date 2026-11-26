@@ -27,18 +27,85 @@ else:
 MAGIC = b"MEB1"
 AUTOINSTALL_SCHEMA = "miro-ego.autoinstall.v1"
 NATIVE_BUNDLE_SCHEMA = "miro-ego.rdk-x5-bundle.v1"
+BUNDLE_SIG_DOMAIN = b"miro-ego.rdk-x5-bundle-sig.v1\n"
+DEFAULT_SIGNING_SEED_MATERIAL = b"miro-ego-0.3.0-default-release-signing-seed"
 TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
 REQUIRED_NATIVE_BINARIES = ("bin/miro-ego", "bin/miro-ego-encoder")
 BUNDLE_MANIFEST_KEYS = frozenset({"schema", "platform", "version", "commit", "binaries", "assets"})
 BUNDLE_ENTRY_KEYS = frozenset({"path", "bytes", "sha256", "executable"})
 ELF_MACHINE_AARCH64 = 183
 MAX_PROFILE_BYTES = 16 * 1024**2
+MAX_BUNDLE_FILES = 256
 MAX_BINARY_BYTES = 256 * 1024**2
 MAX_BUNDLE_MANIFEST_BYTES = 128 * 1024
+MAX_BUNDLE_SIG_BYTES = 256
+MAX_SHA256SUMS_BYTES = 256 * 1024
 MAX_DEPLOY_ASSET_BYTES = 1024**2
 MAX_VOICE_ASSET_BYTES = 4 * 1024**2
+MAX_TOTAL_DECLARED_BYTES = 512 * 1024**2
 MAX_BUNDLE_MEMBERS = 10000
 MAX_BUNDLE_TOTAL_BYTES = 4 * 1024**3
+_VOICE_STEM_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+_SHA256SUMS_LINE_RE = re.compile(r"^([0-9a-f]{64})  (.+)\Z")
+
+
+def default_release_public_key_hex() -> str:
+    """Return the compiled-in default 32-byte Ed25519 release public key as 64 lowercase hex."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    seed = hashlib.sha256(DEFAULT_SIGNING_SEED_MATERIAL).digest()
+    pub = Ed25519PrivateKey.from_private_bytes(seed).public_key()
+    return pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+
+
+def sign_bundle_manifest(manifest_bytes: bytes, *, seed: bytes | None = None) -> str:
+    """Sign ``BUNDLE_SIG_DOMAIN + manifest_bytes`` and return ``<128-lowercase-hex>\\n``."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    raw_seed = seed if seed is not None else hashlib.sha256(DEFAULT_SIGNING_SEED_MATERIAL).digest()
+    if len(raw_seed) != 32:
+        raise RuntimeError("Ed25519 signing seed must be exactly 32 bytes")
+    sig = Ed25519PrivateKey.from_private_bytes(raw_seed).sign(BUNDLE_SIG_DOMAIN + manifest_bytes)
+    return sig.hex() + "\n"
+
+
+def _resolve_trusted_public_key_bytes(trusted_public_key_hex: str | None) -> bytes:
+    candidate = trusted_public_key_hex
+    if candidate is None:
+        env_key = os.environ.get("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX", "").strip()
+        if env_key:
+            candidate = env_key
+    if candidate is not None:
+        cleaned = candidate.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", cleaned):
+            raise RuntimeError("Invalid trusted release public key hex (expected 64 hex chars)")
+        return bytes.fromhex(cleaned)
+    return bytes.fromhex(default_release_public_key_hex())
+
+
+def _verify_bundle_signature(
+    manifest_bytes: bytes,
+    sig_raw: bytes,
+    trusted_pubkey_bytes: bytes,
+) -> None:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        sig_text = sig_raw.decode("ascii").rstrip(" \t\r\n")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("bundle.json.sig is not valid ASCII hex") from exc
+    if not re.fullmatch(r"[0-9a-f]{128}", sig_text):
+        raise RuntimeError("bundle.json.sig must contain 128 lowercase hex characters")
+    try:
+        Ed25519PublicKey.from_public_bytes(trusted_pubkey_bytes).verify(
+            bytes.fromhex(sig_text),
+            BUNDLE_SIG_DOMAIN + manifest_bytes,
+        )
+    except InvalidSignature as exc:
+        raise RuntimeError("Invalid or untrusted Ed25519 signature in bundle.json.sig") from exc
+
 
 HOOK = """#!/bin/bash -e
 # Miro-Ego offline factory recovery; the vendor hobot-rc mounts this CONFIG partition.
@@ -127,7 +194,7 @@ def _normalize_tar_path(name: str) -> PurePosixPath | None:
 def _validate_bundle_manifest(
     metadata: Any,
     by_path: dict[str, tarfile.TarInfo],
-) -> None:
+) -> dict[str, tuple[int, str]]:
     if not isinstance(metadata, dict):
         raise RuntimeError("bundle.json must be a JSON object")
     unknown = set(metadata) - BUNDLE_MANIFEST_KEYS
@@ -152,7 +219,15 @@ def _validate_bundle_manifest(
     if not isinstance(binaries, list) or not binaries or not isinstance(assets, list):
         raise RuntimeError("bundle.json must declare non-empty binaries list and valid assets list")
 
+    total_entries = len(binaries) + len(assets)
+    if total_entries > MAX_BUNDLE_FILES:
+        raise RuntimeError(
+            f"bundle.json entry count {total_entries} exceeds MAX_BUNDLE_FILES ({MAX_BUNDLE_FILES})"
+        )
+
     declared_binaries: set[str] = set()
+    declared_entries: dict[str, tuple[int, str]] = {}
+    total_declared_bytes = 0
     for section_name, entries in (("binaries", binaries), ("assets", assets)):
         for entry in entries:
             if not isinstance(entry, dict):
@@ -167,16 +242,29 @@ def _validate_bundle_manifest(
             if (
                 not isinstance(rel, str)
                 or type(size) is not int
-                or size < 0
+                or size <= 0
+                or size > MAX_BINARY_BYTES
                 or not isinstance(digest, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", digest)
                 or type(executable) is not bool
             ):
                 raise RuntimeError(f"Malformed bundle.json entry in {section_name}")
+            if (
+                not rel
+                or rel.startswith("/")
+                or "\\" in rel
+                or any(ord(c) < 0x20 or ord(c) == 0x7F for c in rel)
+                or any(seg in ("", ".", "..") for seg in rel.split("/"))
+            ):
+                raise RuntimeError(f"Unsafe path in bundle.json: {rel!r}")
+            if rel in declared_entries:
+                raise RuntimeError(f"Duplicate entry path in bundle.json: {rel!r}")
             member = by_path.get(rel)
             if member is None or not member.isfile() or member.size != size:
                 raise RuntimeError(f"bundle.json entry {rel!r} missing or size mismatch in tar")
             if section_name == "binaries":
+                if not rel.startswith("bin/"):
+                    raise RuntimeError(f"Binary entry must live under bin/: {rel}")
                 declared_binaries.add(rel)
             elif rel.startswith("deploy/miro-ego/"):
                 rest = rel.removeprefix("deploy/miro-ego/")
@@ -184,10 +272,12 @@ def _validate_bundle_manifest(
                     raise RuntimeError(f"Invalid deploy asset in bundle.json: {rel}")
             elif rel.startswith("share/voice/"):
                 rest = rel.removeprefix("share/voice/")
+                stem = rest[:-4] if rest.endswith(".wav") else ""
                 if (
                     not rest
                     or "/" in rest
                     or not rest.endswith(".wav")
+                    or not _VOICE_STEM_RE.fullmatch(stem)
                     or executable
                     or size > MAX_VOICE_ASSET_BYTES
                 ):
@@ -196,21 +286,48 @@ def _validate_bundle_manifest(
                 raise RuntimeError(
                     f"bundle.json asset must live under deploy/miro-ego/ or share/voice/: {rel}"
                 )
+            declared_entries[rel] = (size, digest)
+            total_declared_bytes += size
+            if total_declared_bytes > MAX_TOTAL_DECLARED_BYTES:
+                raise RuntimeError("bundle.json declared total bytes exceed limit")
     for required in REQUIRED_NATIVE_BINARIES:
         if required not in declared_binaries:
             raise RuntimeError(f"bundle.json missing required binary declaration: {required}")
+    return declared_entries
 
 
-def require_native_bundle(bundle: str | Path) -> None:
-    """Validate a native AArch64 Miro-Ego bundle with exFAT ``miro-ego-data-volume`` support.
+def _parse_sha256sums(raw_text: str) -> dict[str, str]:
+    sums_map: dict[str, str] = {}
+    for line in raw_text.splitlines():
+        if not line:
+            raise RuntimeError("Empty line in SHA256SUMS")
+        matched = _SHA256SUMS_LINE_RE.fullmatch(line)
+        if matched is None:
+            raise RuntimeError(f"Malformed SHA256SUMS line: {line!r}")
+        digest_hex, rel = matched.group(1), matched.group(2)
+        if rel in sums_map:
+            raise RuntimeError(f"Duplicate path in SHA256SUMS: {rel!r}")
+        sums_map[rel] = digest_hex
+    if not sums_map:
+        raise RuntimeError("SHA256SUMS is empty")
+    return sums_map
+
+
+def require_native_bundle(
+    bundle: str | Path,
+    *,
+    trusted_public_key_hex: str | None = None,
+) -> None:
+    """Validate a signed native AArch64 Miro-Ego bundle with exFAT data-volume support.
 
     Strictly matches ``crates/miro-ego-deploy/src/bundle.rs``: requires both
     ``bin/miro-ego`` and ``bin/miro-ego-encoder`` (AArch64 ELF64), ``bundle.json``
     (``miro-ego.rdk-x5-bundle.v1``, ``platform == "linux_aarch64_rdk_x5_v1"``),
-    ``SHA256SUMS``, and exFAT-only ``deploy/miro-ego/miro-ego-data-volume*`` assets.
-    Rejects Python wheel/CPython runtime bundles, non-AArch64 binaries, unsafe tar
-    members, and any legacy loop-volume fallback assets.
+    detached Ed25519 signature ``bundle.json.sig``, ``SHA256SUMS``, full per-member
+    SHA-256 digest verification, and exFAT-only ``deploy/miro-ego/miro-ego-data-volume*``
+    assets.
     """
+    trusted_pubkey_bytes = _resolve_trusted_public_key_bytes(trusted_public_key_hex)
     with tarfile.open(bundle) as archive:
         members = archive.getmembers()
         if (
@@ -263,6 +380,7 @@ def require_native_bundle(bundle: str | Path) -> None:
         if (
             bundle_meta is None
             or not bundle_meta.isfile()
+            or bundle_meta.size == 0
             or bundle_meta.size > MAX_BUNDLE_MANIFEST_BYTES
         ):
             raise RuntimeError("Missing or invalid bundle.json in native bundle")
@@ -270,12 +388,77 @@ def require_native_bundle(bundle: str | Path) -> None:
         if extracted_meta is None:
             raise RuntimeError("Unable to read bundle.json")
         with extracted_meta as src:
-            metadata = json.loads(src.read())
-        _validate_bundle_manifest(metadata, by_path)
+            manifest_bytes = src.read(MAX_BUNDLE_MANIFEST_BYTES + 1)
+        if len(manifest_bytes) != bundle_meta.size:
+            raise RuntimeError("Short read on bundle.json")
+
+        sig_member = by_path.get("bundle.json.sig")
+        if (
+            sig_member is None
+            or not sig_member.isfile()
+            or sig_member.size == 0
+            or sig_member.size > MAX_BUNDLE_SIG_BYTES
+        ):
+            raise RuntimeError("Missing or invalid bundle.json.sig signature in native bundle")
+        extracted_sig = archive.extractfile(sig_member)
+        if extracted_sig is None:
+            raise RuntimeError("Unable to read bundle.json.sig")
+        with extracted_sig as src:
+            sig_bytes = src.read(MAX_BUNDLE_SIG_BYTES + 1)
+        if len(sig_bytes) != sig_member.size:
+            raise RuntimeError("Short read on bundle.json.sig")
+        _verify_bundle_signature(manifest_bytes, sig_bytes, trusted_pubkey_bytes)
+
+        try:
+            metadata = json.loads(manifest_bytes)
+        except ValueError as exc:
+            raise RuntimeError("bundle.json is not valid JSON") from exc
+        declared_entries = _validate_bundle_manifest(metadata, by_path)
 
         sums = by_path.get("SHA256SUMS")
-        if sums is None or not sums.isfile():
+        if sums is None or not sums.isfile() or sums.size == 0 or sums.size > MAX_SHA256SUMS_BYTES:
             raise RuntimeError("Missing SHA256SUMS manifest in native bundle")
+        extracted_sums = archive.extractfile(sums)
+        if extracted_sums is None:
+            raise RuntimeError("Unable to read SHA256SUMS")
+        with extracted_sums as src:
+            sums_bytes = src.read(MAX_SHA256SUMS_BYTES + 1)
+        if len(sums_bytes) != sums.size:
+            raise RuntimeError("Short read on SHA256SUMS")
+        try:
+            sums_map = _parse_sha256sums(sums_bytes.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("SHA256SUMS is not valid UTF-8") from exc
+
+        expected_sums = {rel: digest for rel, (_sz, digest) in declared_entries.items()}
+        expected_sums["bundle.json"] = hashlib.sha256(manifest_bytes).hexdigest()
+        if sums_map != expected_sums:
+            raise RuntimeError("SHA256SUMS does not match signed bundle.json manifest")
+
+        regular_files = {key for key, m in by_path.items() if m.isfile()}
+        allowed_files = set(declared_entries) | {"bundle.json", "bundle.json.sig", "SHA256SUMS"}
+        undeclared = sorted(regular_files - allowed_files)
+        if undeclared:
+            raise RuntimeError(
+                f"Bundle archive contains undeclared file(s): {', '.join(undeclared)}"
+            )
+
+        for rel, (expected_size, expected_sha) in sorted(declared_entries.items()):
+            member = by_path[rel]
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(f"Unable to read {rel} from bundle")
+            with extracted as src:
+                actual_sha, actual_size = disks.sha256_stream(src, expected_size)
+                extra = src.read(1)
+            if extra or actual_size != expected_size or actual_sha != expected_sha:
+                raise RuntimeError(f"Digest or byte-length mismatch for bundle member {rel}")
+            if rel.startswith("bin/"):
+                extracted_hdr = archive.extractfile(member)
+                if extracted_hdr is None:
+                    raise RuntimeError(f"Unable to inspect ELF header of {rel}")
+                with extracted_hdr as src:
+                    validate_aarch64_elf(src.read(64), name=rel)
 
         helper_member = by_path.get("deploy/miro-ego/miro-ego-data-volume")
         unit_member = by_path.get("deploy/miro-ego/miro-ego-data-volume.service")

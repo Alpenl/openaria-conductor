@@ -9,8 +9,10 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -71,15 +73,51 @@ _GROUP_READABLE_CONFIG_FILES = frozenset(
 
 def allowed(name: str) -> bool:
     """Return True iff *name* is a safe relative path within the config allowlist."""
-    if not name or "\\" in name:
+    if not name or "\\" in name or any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
         return False
     p = PurePosixPath(name)
-    return (
-        str(p) == name
-        and not p.is_absolute()
-        and ".." not in p.parts
-        and (name in FILES or str(p.parent) in DIRECTORIES)
-    )
+    if str(p) != name or p.is_absolute() or ".." in p.parts:
+        return False
+    if name in FILES or str(p.parent) in DIRECTORIES:
+        return True
+    if p.parts[:2] == ("etc", "miro-ego") and 3 <= len(p.parts) <= 4:
+        return not any(seg.startswith(".") or ".miro-ego-restore-" in seg for seg in p.parts[2:])
+    return False
+
+
+def _extract_security_files(config: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    """Validate ``config['security']`` (``lab`` or ``customer``) and return credential relpaths."""
+    security = config.get("security")
+    if not isinstance(security, dict):
+        raise RuntimeError("Unsupported bootstrap configuration")
+    mode = security.get("profile")
+    if mode == "lab":
+        return ("lab", {})
+    if mode != "customer":
+        raise RuntimeError("Unsupported security profile")
+
+    principal_id = security.get("principal_id")
+    if principal_id is not None and (
+        not isinstance(principal_id, str)
+        or not 1 <= len(principal_id) <= 128
+        or any(not (0x21 <= ord(ch) <= 0x7E) for ch in principal_id)
+    ):
+        raise RuntimeError("Invalid customer principal_id")
+
+    relpaths: dict[str, str] = {}
+    for field, key in (
+        ("bearer_token_file", "bearer"),
+        ("tls_certificate_file", "cert"),
+        ("tls_private_key_file", "key"),
+    ):
+        raw_path = security.get(field)
+        if not isinstance(raw_path, str) or not raw_path.startswith("/etc/miro-ego/"):
+            raise RuntimeError(f"Customer {field} must reside under /etc/miro-ego/")
+        rel = raw_path.removeprefix("/")
+        if not allowed(rel):
+            raise RuntimeError(f"Customer {field} path is forbidden: {raw_path}")
+        relpaths[key] = rel
+    return ("customer", relpaths)
 
 
 def is_rdk_x5_model(raw: bytes) -> bool:
@@ -146,10 +184,33 @@ def _probe_live_capture_idle(config: dict[str, Any]) -> None:
         if isinstance(listen_cfg, dict) and type(listen_cfg.get("port")) is int
         else 8080
     )
-    url = f"http://127.0.0.1:{port}/api/v1/capture/status"
+    host_str = "127.0.0.1"
+    if isinstance(listen_cfg, dict) and isinstance(listen_cfg.get("host"), str):
+        with contextlib.suppress(ValueError):
+            parsed_ip = ipaddress.ip_address(listen_cfg["host"])
+            if parsed_ip.version == 6:
+                host_str = "[::1]" if parsed_ip.is_unspecified else f"[{parsed_ip}]"
+            else:
+                host_str = "127.0.0.1" if parsed_ip.is_unspecified else str(parsed_ip)
+
+    security = config.get("security")
+    is_customer = isinstance(security, dict) and security.get("profile") == "customer"
+    scheme = "https" if is_customer else "http"
+    ssl_ctx = ssl._create_unverified_context() if is_customer else None
+    headers = {"Accept": "application/json"}
+    if is_customer and isinstance(security, dict):
+        bearer_cfg = security.get("bearer_token_file")
+        if isinstance(bearer_cfg, str) and bearer_cfg.startswith("/"):
+            tok_path = Path("/", bearer_cfg.lstrip("/"))
+            if tok_path.exists() and not tok_path.is_symlink() and tok_path.is_file():
+                token = tok_path.read_text(encoding="utf-8", errors="replace").strip()
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+
+    url = f"{scheme}://{host_str}:{port}/api/v1/capture/status"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=1.0) as resp:  # noqa: S310
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=1.0, context=ssl_ctx) as resp:  # noqa: S310
             if 200 <= resp.status < 300:
                 doc = json.loads(resp.read(65536))
                 snap = doc.get("snapshot", doc) if isinstance(doc, dict) else {}
@@ -190,14 +251,19 @@ def backup_locked() -> dict[str, Any]:
     config = json.loads(config_path.read_bytes())
     if config.get("state_root") != "/var/lib/miro-ego":
         raise RuntimeError("Custom state root is not supported")
-    if config.get("security", {}).get("profile") != "lab":
-        raise RuntimeError("This recovery version supports HTTP lab profile only")
+    sec_mode, customer_files = _extract_security_files(config)
 
     _probe_live_capture_idle(config)
     capture = _read_optional_json(Path("/var/lib/miro-ego/capture-state.json"))
     require_idle(capture)
 
     names = set(FILES)
+    if sec_mode == "customer":
+        for rel in customer_files.values():
+            cred_path = Path("/", rel)
+            if not cred_path.exists() or cred_path.is_symlink() or not cred_path.is_file():
+                raise RuntimeError(f"Customer credential file missing or unsafe: /{rel}")
+            names.add(rel)
     for directory in DIRECTORIES:
         dir_path = Path("/", directory)
         if dir_path.is_dir() and not dir_path.is_symlink():
@@ -299,12 +365,13 @@ def validate(profile: Any) -> dict[str, bytes]:
         raise RuntimeError("Profile is missing device identity")
 
     config = json.loads(decoded["etc/miro-ego/device.json"])
-    if (
-        not isinstance(config, dict)
-        or config.get("state_root") != "/var/lib/miro-ego"
-        or config.get("security", {}).get("profile") != "lab"
-    ):
+    if not isinstance(config, dict) or config.get("state_root") != "/var/lib/miro-ego":
         raise RuntimeError("Unsupported bootstrap configuration")
+    sec_mode, customer_files = _extract_security_files(config)
+    if sec_mode == "customer":
+        for rel in customer_files.values():
+            if rel not in decoded or len(decoded[rel]) == 0:
+                raise RuntimeError(f"Customer profile is missing required file: {rel}")
     if "schema" in config and config["schema"] != DEVICE_CONFIG_SCHEMA:
         raise RuntimeError("Unsupported device configuration schema")
 
@@ -346,7 +413,11 @@ def _resolve_service_ids(
 def _file_target_mode(name: str) -> int:
     if name in _PUBLIC_FILES or name.endswith(".conf"):
         return 0o644
-    if name in _GROUP_READABLE_CONFIG_FILES or name.startswith("var/lib/miro-ego/"):
+    if (
+        name in _GROUP_READABLE_CONFIG_FILES
+        or name.startswith("etc/miro-ego/")
+        or name.startswith("var/lib/miro-ego/")
+    ):
         return 0o640
     return 0o600
 
@@ -372,10 +443,17 @@ def apply_service_permissions(
         etc_dir.chmod(0o750)
         if ids is not None:
             _chown_if_root(etc_dir, 0, ids[1], force=force_chown)
-        for child in etc_dir.iterdir():
-            if child.is_symlink() or not child.is_file():
+        for child in etc_dir.rglob("*"):
+            if child.is_symlink():
                 continue
-            rel = f"etc/miro-ego/{child.name}"
+            if child.is_dir():
+                child.chmod(0o750)
+                if ids is not None:
+                    _chown_if_root(child, 0, ids[1], force=force_chown)
+                continue
+            if not child.is_file():
+                continue
+            rel = f"etc/miro-ego/{child.relative_to(etc_dir).as_posix()}"
             mode = _file_target_mode(rel)
             child.chmod(mode)
             if ids is not None:

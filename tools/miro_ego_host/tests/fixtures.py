@@ -62,17 +62,42 @@ def factory_profile(
     board: str = "a" * 64,
     voice_volume: int = 42,
     voice_enabled: bool | None = True,
+    security_profile: str = "lab",
     extra_files: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Build a valid ``miro-ego.factory-profile.v1`` profile dictionary."""
+    security: dict[str, Any]
+    default_extra: dict[str, bytes] = {}
+    if security_profile == "customer":
+        security = {
+            "profile": "customer",
+            "isolated_network": True,
+            "bearer_token_file": "/etc/miro-ego/bearer.token",
+            "tls_certificate_file": "/etc/miro-ego/tls.crt",
+            "tls_private_key_file": "/etc/miro-ego/tls.key",
+            "principal_id": "customer-op",
+        }
+        default_extra = {
+            "etc/miro-ego/bearer.token": b"customer-secret-token\n",
+            "etc/miro-ego/tls.crt": (
+                b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+            ),
+            "etc/miro-ego/tls.key": (
+                b"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"
+            ),
+        }
+    else:
+        security = {"profile": security_profile, "isolated_network": True}
+
     device_cfg = {
         "schema": "miro-ego.device-config.v1",
         "state_root": "/var/lib/miro-ego",
-        "security": {"profile": "lab", "isolated_network": True},
+        "security": security,
     }
     raw_files: dict[str, bytes] = {
         "etc/miro-ego/device.json": json.dumps(device_cfg).encode("utf-8"),
         "etc/machine-id": b"a" * 32,
+        **default_extra,
     }
     if extra_files:
         raw_files.update(extra_files)
@@ -101,13 +126,20 @@ def make_native_bundle(
     encoder_bytes: bytes | None = None,
     helper_bytes: bytes | None = DATA_VOLUME_SCRIPT,
     unit_bytes: bytes | None = DATA_VOLUME_UNIT,
+    voice_files: dict[str, bytes] | None = None,
     bundle_schema: str | None = "miro-ego.rdk-x5-bundle.v1",
     bundle_platform: str = "linux_aarch64_rdk_x5_v1",
     bundle_extra_fields: dict[str, Any] | None = None,
     include_sums: bool = True,
+    include_sig: bool = True,
+    sig_bytes: bytes | None = None,
+    signing_seed: bytes | None = None,
     extra_files: dict[str, bytes] | None = None,
+    tamper_after_signing: dict[str, bytes] | None = None,
 ) -> Path:
-    """Create a synthetic native Miro-Ego ``bundle.tar`` archive matching ``BundleManifest``."""
+    """Create a synthetic signed native Miro-Ego ``bundle.tar`` matching ``BundleManifest``."""
+    from miro_ego_host.factory_recovery import provision
+
     files: dict[str, tuple[bytes, int]] = {}
     if miro_ego_bytes is None:
         miro_ego_bytes = aarch64_elf_stub(payload=b"miro-ego-bin")
@@ -120,6 +152,12 @@ def make_native_bundle(
         files["deploy/miro-ego/miro-ego-data-volume"] = (helper_bytes, 0o755)
     if unit_bytes is not None:
         files["deploy/miro-ego/miro-ego-data-volume.service"] = (unit_bytes, 0o644)
+    if voice_files:
+        for name, data in voice_files.items():
+            rel = name if name.startswith("share/voice/") else f"share/voice/{name}"
+            files[rel] = (data, 0o644)
+
+    manifest_bytes: bytes | None = None
     if bundle_schema is not None:
         binaries = [
             {
@@ -139,7 +177,7 @@ def make_native_bundle(
                 "executable": bool(mode & 0o111),
             }
             for rel, (data, mode) in sorted(files.items())
-            if rel.startswith("deploy/miro-ego/")
+            if rel.startswith(("deploy/miro-ego/", "share/voice/"))
         ]
         manifest_obj: dict[str, Any] = {
             "schema": bundle_schema,
@@ -151,10 +189,8 @@ def make_native_bundle(
         }
         if bundle_extra_fields:
             manifest_obj.update(bundle_extra_fields)
-        files["bundle.json"] = (json.dumps(manifest_obj).encode("utf-8"), 0o644)
-    if extra_files:
-        for name, data in extra_files.items():
-            files[name] = (data, 0o644)
+        manifest_bytes = json.dumps(manifest_obj).encode("utf-8")
+        files["bundle.json"] = (manifest_bytes, 0o644)
 
     if include_sums:
         lines = [
@@ -162,6 +198,25 @@ def make_native_bundle(
             for name, (data, _mode) in sorted(files.items())
         ]
         files["SHA256SUMS"] = ("".join(lines).encode("utf-8"), 0o644)
+
+    if include_sig and (manifest_bytes is not None or sig_bytes is not None):
+        computed_sig = (
+            sig_bytes
+            if sig_bytes is not None
+            else provision.sign_bundle_manifest(manifest_bytes or b"", seed=signing_seed).encode(
+                "ascii"
+            )
+        )
+        files["bundle.json.sig"] = (computed_sig, 0o644)
+
+    if extra_files:
+        for name, data in extra_files.items():
+            files[name] = (data, 0o644)
+
+    if tamper_after_signing:
+        for name, data in tamper_after_signing.items():
+            old_mode = files[name][1] if name in files else 0o644
+            files[name] = (data, old_mode)
 
     with tarfile.open(path, "w") as tar:
         for name, (data, mode) in sorted(files.items()):

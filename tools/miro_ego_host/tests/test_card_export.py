@@ -249,6 +249,54 @@ class CardExportExfatTests(unittest.TestCase):
         parsed = json.loads(reports[0].read_bytes())
         self.assertEqual(parsed["status"], "incomplete")
         self.assertIn("Manifest SHA-256 mismatch", parsed["error"])
+        # Verify failed export unlinked .export-partial temporary files.
+        self.assertEqual(list(dest.rglob("*.export-partial")), [])
+
+    def test_undeclared_extra_file_rejected_in_sealed_session_and_report_oserror_suppressed(
+        self,
+    ) -> None:
+        files, manifest_bytes = _sample_session_files(seed=17)
+        tree = _session_tree(files, manifest_bytes)
+        tree["rogue_extra.txt"] = b"undeclared"
+        exfat_img = self.root / "extra-file.exfat"
+        exfat_img.write_bytes(build_exfat_image({"recordings": {"2026-11-26": {"15-05-00": tree}}}))
+        dest = self.root / "extra-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            with self.assertRaisesRegex(RuntimeError, "undeclared file"):
+                tool.export_selected(records, dest)
+            output = tool.export_selected(records, dest, allow_unsealed=True)
+            self.assertTrue(
+                (output / "exfat/recordings/2026-11-26/15-05-00/rogue_extra.txt").is_file()
+            )
+
+        # Verify OSError while writing export-report.json in finally never masks original error.
+        tampered = dict(files)
+        tampered["imu.ndjson"] = b"X" + files["imu.ndjson"][1:]
+        fail_img = self.root / "report-oserror.exfat"
+        fail_img.write_bytes(
+            build_exfat_image(
+                {
+                    "recordings": {
+                        "2026-11-26": {"15-06-00": _session_tree(tampered, manifest_bytes)}
+                    }
+                }
+            )
+        )
+        orig_open = Path.open
+
+        def fail_report_open(self_path: Path, *args: object, **kwargs: object):
+            if self_path.name == "export-report.json":
+                raise OSError("ENOSPC writing export-report.json")
+            return orig_open(self_path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            tool.volumes(fail_img) as found,
+            patch.object(Path, "open", fail_report_open),
+            self.assertRaisesRegex(RuntimeError, "Manifest SHA-256 mismatch"),
+        ):
+            tool.export_selected(tool.recordings(found), dest)
 
     def test_missing_manifest_artifact_and_bad_schema_rejected(self) -> None:
         files, manifest_bytes = _sample_session_files(seed=8)
@@ -365,8 +413,19 @@ class CardExportExfatTests(unittest.TestCase):
         for bad in ("..", "../escape", "a/b", "a\\b", "CON", "a:b", "x.", "NUL.mp4"):
             with self.assertRaises(RuntimeError):
                 tool.safe_name(bad)
-        for bad_rel in ("/abs.mp4", "../up.mp4", "manifest.json", "video/a.tmp", "video\\a.mp4"):
-            with self.assertRaises(RuntimeError):
+        for bad_rel in (
+            "/abs.mp4",
+            "../up.mp4",
+            "manifest.json",
+            "recording.json",
+            "capture.json",
+            "segments.json",
+            "checkpoint.json",
+            "audio/checkpoint.json",
+            "video/a.tmp",
+            "video\\a.mp4",
+        ):
+            with self.assertRaises(RuntimeError, msg=bad_rel):
                 tool.safe_artifact_relpath(bad_rel)
         self.assertEqual(tool.safe_name("left_00000.mp4"), "left_00000.mp4")
 

@@ -304,7 +304,10 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 self.assertTrue(
                     any(len(c) >= 3 and c[1] == "deploy" and c[2] == "install" for c in calls)
                 )
-                self.assertIn(("dpkg", "-i", str(logrotate_deb)), calls)
+                self.assertIn(
+                    ("dpkg", "-i", "--force-confdef", "--force-confold", str(logrotate_deb)),
+                    calls,
+                )
                 self.assertEqual(calls[-1], ("systemctl", "reboot", "--no-block"))
                 sync_mock.assert_called_once()
 
@@ -502,8 +505,59 @@ class FirstbootAndCleanupTests(unittest.TestCase):
                 info2 = storage_firstboot.ensure_ssh_data_volume(config_path=cfg_path)
             self.assertEqual(info2["uuid"], "1234-5678")
             self.assertTrue(any(c[:3] == ("mkfs.exfat", "-L", "MIRO-EGO") for c in calls))
-            entries = partition_layout.partitions(disk_img.read_bytes()[:512])
+            raw_mbr = disk_img.read_bytes()[:512]
+            entries = partition_layout.partitions(raw_mbr)
             self.assertEqual(entries[2][0], 0x07)
+            self.assertEqual(raw_mbr[479:482], b"\xfe\xff\xff")
+            self.assertEqual(raw_mbr[483:486], b"\xfe\xff\xff")
+
+            # Case 3: ensure_offline_packages installs missing exfatprogs & logrotate.
+            tools_dir = root / "offline_debs"
+            tools_dir.mkdir()
+            exfat_pkg = tools_dir / partition_layout.EXFATPROGS_PACKAGE
+            log_pkg = tools_dir / partition_layout.LOGROTATE_PACKAGE
+            exfat_pkg.write_bytes(b"exfat-deb")
+            log_pkg.write_bytes(b"logrotate-deb")
+            exfat_sha = hashlib.sha256(exfat_pkg.read_bytes()).hexdigest()
+            log_sha = hashlib.sha256(log_pkg.read_bytes()).hexdigest()
+            dpkg_calls: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+
+            def record_dpkg(*args: str, env: dict[str, str] | None = None, **_kw: object) -> str:
+                dpkg_calls.append((args, env))
+                return ""
+
+            with (
+                patch.object(partition_layout, "EXFATPROGS_SHA256", exfat_sha),
+                patch.object(partition_layout, "LOGROTATE_SHA256", log_sha),
+                patch.object(storage_firstboot.shutil, "which", return_value=None),
+                patch.object(storage_firstboot, "run", side_effect=record_dpkg),
+            ):
+                storage_firstboot.ensure_offline_packages(tools_dir)
+            self.assertEqual(len(dpkg_calls), 2)
+            for cmd_args, cmd_env in dpkg_calls:
+                self.assertEqual(cmd_args[:4], ("dpkg", "-i", "--force-confdef", "--force-confold"))
+                self.assertEqual(cmd_env, {"DEBIAN_FRONTEND": "noninteractive"})
+
+            # Case 4: fallback mount_and_initialize passes uid/gid/fmask/dmask options.
+            mount_calls: list[tuple[str, ...]] = []
+            mount_dir = root / "fallback_data"
+            with (
+                patch.object(storage_firstboot, "_is_mounted", return_value=False),
+                patch.object(
+                    storage_firstboot,
+                    "run",
+                    side_effect=lambda *a, **_k: mount_calls.append(a) or "",
+                ),
+                patch.object(storage_firstboot, "ensure_data_layout", return_value=True),
+            ):
+                storage_firstboot.mount_and_initialize(
+                    Path("/dev/mmcblk0p3"),
+                    mountpoint=mount_dir,
+                    helper=root / "missing-helper",
+                    service_ids=(997, 998),
+                )
+            self.assertEqual(len(mount_calls), 1)
+            self.assertIn("uid=997,gid=998,fmask=0137,dmask=0027", mount_calls[0][4])
 
     def test_wrong_board_aborts_before_touching_destination(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

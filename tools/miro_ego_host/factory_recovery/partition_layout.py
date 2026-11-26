@@ -26,7 +26,7 @@ SECTOR_SIZE = 512
 ALIGNMENT_SECTORS = 2048  # 1 MiB alignment
 SYSTEM_GIB = 20
 MIN_DATA_GIB = 4
-MIN_CARD_BYTES = 20 * GIB
+MIN_CARD_BYTES = (532480 + SYSTEM_GIB * GIB // SECTOR_SIZE) * SECTOR_SIZE + MIN_DATA_GIB * GIB
 MAX_CARD_BYTES = 512 * GIB
 
 LAYOUT_SCHEMA = "miro-ego.storage.exfat.v1"
@@ -81,7 +81,10 @@ def plan(
         or not MIN_CARD_BYTES <= card_bytes <= MAX_CARD_BYTES
         or card_bytes % SECTOR_SIZE != 0
     ):
-        raise RuntimeError("MIRO-EGO exFAT layout requires actual card capacity (20-512 GiB)")
+        raise RuntimeError(
+            "MIRO-EGO exFAT layout requires actual card capacity "
+            "(24.26-512 GiB; leave at least 4 GiB for recordings)"
+        )
     root_start = entries[1][1]
     root_sectors = system_gib * GIB // SECTOR_SIZE
     data_start = root_start + root_sectors

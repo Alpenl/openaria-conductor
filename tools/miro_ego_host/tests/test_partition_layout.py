@@ -53,7 +53,16 @@ class PartitionLayoutTests(unittest.TestCase):
                     partition_layout.check_fit(image, size - 1024**2)
 
     def test_plan_rejects_invalid_bounds_and_nonvendor_mbr(self) -> None:
+        self.assertEqual(
+            partition_layout.MIN_CARD_BYTES,
+            (532480 + 20 * 1024**3 // 512) * 512 + 4 * 1024**3,
+        )
+        # Exact MIN_CARD_BYTES succeeds with >= 4 GiB recording partition.
+        _, min_layout = partition_layout.plan(vendor_mbr(), partition_layout.MIN_CARD_BYTES)
+        self.assertEqual(min_layout["data_sectors"] * 512, 4 * 1024**3)
+
         for size, system in (
+            (partition_layout.MIN_CARD_BYTES - 512, 20),  # 1 sector below exact minimum
             (24 * 1024**3, 20),  # < 4 GiB remaining after p1+p2
             (20 * 1024**3 - 512, 20),  # below min card
             (512 * 1024**3 + 512, 20),  # above max card

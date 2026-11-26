@@ -52,15 +52,33 @@ partuuid="${MIRO_EGO_DATA_VOLUME_PARTUUID:?missing recording partition identity}
     log "invalid recording partition PARTUUID: $partuuid"
     exit 1
 }
+partuuid="${partuuid,,}"
 uuid="${MIRO_EGO_DATA_VOLUME_UUID:?missing recording filesystem identity}"
 [[ "$uuid" =~ ^[[:xdigit:]]{4}-[[:xdigit:]]{4}$ ]] || {
     log "invalid exFAT filesystem UUID: $uuid"
     exit 1
 }
+uuid="${uuid^^}"
+uuid_lower="${uuid,,}"
 
 device="/dev/disk/by-uuid/$uuid"
 waited=0
-while [ "$waited" -lt 5 ] && [ ! -b "$device" ]; do
+while [ "$waited" -lt 5 ]; do
+    if [ -b "/dev/disk/by-uuid/$uuid" ]; then
+        device="/dev/disk/by-uuid/$uuid"
+        break
+    fi
+    if [ -b "/dev/disk/by-uuid/$uuid_lower" ]; then
+        device="/dev/disk/by-uuid/$uuid_lower"
+        break
+    fi
+    for candidate in /dev/disk/by-uuid/*; do
+        cand_name="${candidate##*/}"
+        if [ -b "$candidate" ] && [ "${cand_name^^}" = "$uuid" ]; then
+            device="$candidate"
+            break 2
+        fi
+    done
     sleep 1
     waited=$((waited + 1))
 done
@@ -70,12 +88,12 @@ done
 }
 
 actual_partuuid="$(blkid -s PARTUUID -o value "$device")"
-[ "$actual_partuuid" = "$partuuid" ] || {
+[ "${actual_partuuid,,}" = "$partuuid" ] || {
     log "recording partition PARTUUID mismatch: expected $partuuid, got ${actual_partuuid:-empty}"
     exit 1
 }
 actual_uuid="$(blkid -s UUID -o value "$device")"
-[ "$actual_uuid" = "$uuid" ] || {
+[ "${actual_uuid^^}" = "$uuid" ] || {
     log "recording filesystem UUID mismatch: expected $uuid, got ${actual_uuid:-empty}"
     exit 1
 }

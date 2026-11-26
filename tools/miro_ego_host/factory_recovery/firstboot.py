@@ -363,7 +363,14 @@ def execute() -> None:
             if expected_logrotate != partition_layout.LOGROTATE_SHA256:
                 raise RuntimeError("Offline logrotate manifest digest mismatch")
             partition_layout.verify_deb(logrotate_pkg, partition_layout.LOGROTATE_SHA256)
-            run("dpkg", "-i", str(logrotate_pkg))
+            run(
+                "dpkg",
+                "-i",
+                "--force-confdef",
+                "--force-confold",
+                str(logrotate_pkg),
+                env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+            )
 
         bundle = ROOT / "bundle"
         if bundle.is_symlink():
