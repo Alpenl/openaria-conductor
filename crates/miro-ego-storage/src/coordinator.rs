@@ -1057,6 +1057,20 @@ impl CoordinatorConfig {
     }
 }
 
+#[derive(Clone)]
+struct SessionMetadata {
+    session_id: String,
+    take_id: String,
+    take_sequence: u64,
+    continuation_of: Option<String>,
+    mode: CaptureMode,
+    display_name: String,
+    started_at: String,
+    staging_dir: PathBuf,
+    admission: VolumeAdmission,
+    diagnostics: Vec<RecordingDiagnostic>,
+}
+
 struct ActiveSessionContext {
     session_id: String,
     take_id: String,
@@ -1069,12 +1083,30 @@ struct ActiveSessionContext {
     staging_dir: PathBuf,
     admission: VolumeAdmission,
     recording_stage: String,
+    last_progress: CaptureProgressSnapshot,
     verification_progress: Option<VerificationCounter>,
     diagnostics: Vec<RecordingDiagnostic>,
     timer_deadline_ns: Option<u64>,
     timer_duration_seconds: Option<u32>,
     handle: Option<Box<dyn ActiveCaptureHandle>>,
     _maintenance_lock: Option<FlockGuard>,
+}
+
+impl ActiveSessionContext {
+    fn metadata_snapshot(&self) -> SessionMetadata {
+        SessionMetadata {
+            session_id: self.session_id.clone(),
+            take_id: self.take_id.clone(),
+            take_sequence: self.take_sequence,
+            continuation_of: self.continuation_of.clone(),
+            mode: self.mode,
+            display_name: self.display_name.clone(),
+            started_at: self.started_at.clone(),
+            staging_dir: self.staging_dir.clone(),
+            admission: self.admission.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
 }
 
 struct CoordinatorState {
@@ -1391,9 +1423,9 @@ impl CaptureCoordinator {
     /// Read current V4L2 camera focus status.
     pub fn get_camera_focus(&self) -> StorageResult<CameraFocusStatus> {
         if !self.backend.is_camera_connected() {
-            return Err(StorageError::Unavailable {
-                message: "camera is not connected".to_owned(),
-            });
+            return Err(StorageError::camera_not_connected(
+                "configured camera is not connected",
+            ));
         }
         self.backend.camera_focus()?.ok_or_else(|| {
             StorageError::unsupported(
@@ -1441,9 +1473,9 @@ impl CaptureCoordinator {
         }
 
         if !self.backend.is_camera_connected() {
-            return Err(StorageError::Unavailable {
-                message: "camera is not connected".to_owned(),
-            });
+            return Err(StorageError::camera_not_connected(
+                "configured camera is not connected",
+            ));
         }
         let current = self.backend.camera_focus()?.ok_or_else(|| {
             StorageError::unsupported(
@@ -1504,20 +1536,24 @@ impl CaptureCoordinator {
             .state
             .lock()
             .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-        let active = guard.active.as_ref().and_then(|ctx| {
-            let deadline = ctx.timer_deadline_ns?;
-            let duration = ctx.timer_duration_seconds?;
-            let remaining = if now_ns >= deadline {
-                0.0
-            } else {
-                (deadline - now_ns) as f64 / 1_000_000_000.0
-            };
-            Some(ActiveCaptureTimer {
-                session_id: ctx.session_id.clone(),
-                duration_seconds: duration,
-                remaining_seconds: remaining.min(f64::from(duration)),
+        let active = if guard.phase == CapturePhase::Recording {
+            guard.active.as_ref().and_then(|ctx| {
+                let deadline = ctx.timer_deadline_ns?;
+                let duration = ctx.timer_duration_seconds?;
+                let remaining = if now_ns >= deadline {
+                    0.0
+                } else {
+                    (deadline - now_ns) as f64 / 1_000_000_000.0
+                };
+                Some(ActiveCaptureTimer {
+                    session_id: ctx.session_id.clone(),
+                    duration_seconds: duration,
+                    remaining_seconds: remaining.min(f64::from(duration)),
+                })
             })
-        });
+        } else {
+            None
+        };
         Ok(CaptureTimerStatus {
             schema: CAPTURE_TIMER_SCHEMA.to_owned(),
             settings: guard.timer_settings,
@@ -1657,9 +1693,9 @@ impl CaptureCoordinator {
         };
 
         if !self.backend.is_camera_connected() {
-            return Err(StorageError::Unavailable {
-                message: "camera_not_connected: configured camera is not connected".to_owned(),
-            });
+            return Err(StorageError::camera_not_connected(
+                "configured camera is not connected",
+            ));
         }
 
         // Verify volume admission and reserve budgets BEFORE transitioning FSM or creating files.
@@ -1821,6 +1857,7 @@ impl CaptureCoordinator {
                 staging_dir: staging_dir.clone(),
                 admission: admission.clone(),
                 recording_stage: "recording".to_owned(),
+                last_progress: CaptureProgressSnapshot::default(),
                 verification_progress: None,
                 diagnostics: Vec::new(),
                 timer_deadline_ns,
@@ -1914,7 +1951,7 @@ impl CaptureCoordinator {
             }
         }
 
-        let (mut active_ctx, authority_epoch, stopping_rev) = {
+        let (meta, handle, final_progress, authority_epoch, stopping_rev) = {
             let mut guard = self
                 .state
                 .lock()
@@ -1944,16 +1981,29 @@ impl CaptureCoordinator {
                     ),
                 ));
             }
-            guard.transition(CapturePhase::Stopping)?;
-            let ctx = guard.active.take().ok_or_else(|| {
+            let ctx = guard.active.as_mut().ok_or_else(|| {
                 StorageError::conflict("invalid_state", "missing active session context")
             })?;
-            (ctx, guard.authority_epoch.clone(), guard.source_revision)
+            let handle = ctx.handle.take().ok_or_else(|| {
+                StorageError::conflict("invalid_state", "missing active capture backend handle")
+            })?;
+            let last_progress = handle.progress();
+            ctx.recording_stage = "finalizing".to_owned();
+            ctx.last_progress = last_progress;
+            let meta = ctx.metadata_snapshot();
+            guard.transition(CapturePhase::Stopping)?;
+            (
+                meta,
+                handle,
+                last_progress,
+                guard.authority_epoch.clone(),
+                guard.source_revision,
+            )
         };
 
-        let session_id = active_ctx.session_id.clone();
-        let volume_id = active_ctx.admission.volume_id.clone();
-        let generation_id = active_ctx.admission.generation_id.clone();
+        let session_id = meta.session_id.clone();
+        let volume_id = meta.admission.volume_id.clone();
+        let generation_id = meta.admission.generation_id.clone();
 
         self.events.emit(
             &authority_epoch,
@@ -1968,15 +2018,11 @@ impl CaptureCoordinator {
             }),
         );
 
-        let handle = active_ctx.handle.take().ok_or_else(|| {
-            StorageError::conflict("invalid_state", "missing active capture backend handle")
-        })?;
-        let final_progress = handle.progress();
         let captured = match handle.finish(req.reason) {
             Ok(artifacts) => artifacts,
             Err(err) => {
                 self.record_unsuccessful_stop(
-                    &active_ctx,
+                    &meta,
                     final_progress,
                     "failed",
                     err.code(),
@@ -1987,12 +2033,30 @@ impl CaptureCoordinator {
             }
         };
 
-        // Emit verifying state transition before zero-reread seal & publish.
+        // Transition visible stage from "finalizing" to "verifying" while retaining active_recording.
+        let total_artifacts = count_captured_artifacts(&captured);
+        let captured_bytes = sum_captured_artifact_bytes(&captured);
+        let verify_progress = CaptureProgressSnapshot {
+            elapsed_seconds: captured
+                .duration_seconds
+                .max(final_progress.elapsed_seconds)
+                .max(0.0),
+            captured_frames: captured.frames_count.max(final_progress.captured_frames),
+            bytes_written: final_progress.bytes_written.max(captured_bytes),
+        };
         let verify_rev = {
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if let Some(ctx) = guard.active.as_mut() {
+                ctx.recording_stage = "verifying".to_owned();
+                ctx.last_progress = verify_progress;
+                ctx.verification_progress = Some(VerificationCounter {
+                    completed: 0,
+                    total: total_artifacts,
+                });
+            }
             guard.bump_revision()
         };
         self.events.emit(
@@ -2008,13 +2072,13 @@ impl CaptureCoordinator {
             }),
         );
 
-        let seal_result = self.seal_and_publish(&active_ctx, &captured);
+        let seal_result = self.seal_and_publish(&meta, &captured);
         let sealed = match seal_result {
             Ok(s) => s,
             Err(err) => {
                 self.record_unsuccessful_stop(
-                    &active_ctx,
-                    final_progress,
+                    &meta,
+                    verify_progress,
                     "failed",
                     err.code(),
                     &err.to_string(),
@@ -2024,9 +2088,17 @@ impl CaptureCoordinator {
             }
         };
 
-        // Drop active context (releasing maintenance lock and any staging handles) before emitting safe-swap receipt.
-        let admission_writable = active_ctx.admission.writable;
-        drop(active_ctx);
+        // Release active context (dropping maintenance lock and staging handles) BEFORE
+        // persisting/emitting a SafeSwapReceipt so open_handle_count == 0 holds strictly.
+        let admission_writable = meta.admission.writable;
+        let released_ctx = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            guard.active.take()
+        };
+        drop(released_ctx);
 
         let safe_swap_receipt = if req.reason == StopReason::SafeSwap {
             let receipt = SafeSwapReceipt {
@@ -2345,12 +2417,14 @@ impl CaptureCoordinator {
                     .handle
                     .as_ref()
                     .map(|h| h.progress())
-                    .unwrap_or_default();
+                    .unwrap_or(ctx.last_progress);
+                let meta = ctx.metadata_snapshot();
                 if let Some(handle) = ctx.handle.take() {
                     handle.abort();
                 }
+                drop(ctx);
                 self.record_unsuccessful_stop(
-                    &ctx,
+                    &meta,
                     progress,
                     "failed",
                     "media_lost",
@@ -2421,7 +2495,7 @@ impl CaptureCoordinator {
 
     fn seal_and_publish(
         &self,
-        ctx: &ActiveSessionContext,
+        ctx: &SessionMetadata,
         captured: &CapturedSessionArtifacts,
     ) -> StorageResult<SealedPublishOutput> {
         if captured.segments.is_empty() {
@@ -2811,7 +2885,7 @@ impl CaptureCoordinator {
 
     fn record_unsuccessful_stop(
         &self,
-        ctx: &ActiveSessionContext,
+        ctx: &SessionMetadata,
         progress: CaptureProgressSnapshot,
         terminal_state: &str,
         error_code: &str,
@@ -2831,11 +2905,12 @@ impl CaptureCoordinator {
             details: None,
         };
 
-        let (epoch, rev, outcome) = {
+        let (epoch, rev, outcome, released_ctx) = {
             let mut guard = match self.state.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let released = guard.active.take();
             let target_phase = if media_lost {
                 guard.last_failure_reason = Some(error_message.to_owned());
                 CapturePhase::Failed
@@ -2888,8 +2963,9 @@ impl CaptureCoordinator {
             } else {
                 guard.retained_unsuccessful = None;
             }
-            (epoch, rev, rec)
+            (epoch, rev, rec, released)
         };
+        drop(released_ctx);
 
         let volume_writable = !media_lost && self.volume.is_mounted_and_writable();
         self.receipts.record_unsuccessful(
@@ -2983,35 +3059,62 @@ impl CaptureCoordinator {
                 (state_str.to_owned(), active_rec, None)
             }
             CapturePhase::Stopping => {
-                let active_rec = guard.active.as_ref().map(|ctx| CaptureSnapshotRecording {
-                    generation_id: ctx.admission.generation_id.clone(),
-                    recording_state: RecordingState {
-                        schema: RECORDING_STATE_SCHEMA.to_owned(),
-                        state: "finalizing".to_owned(),
-                        authority_epoch: guard.authority_epoch.clone(),
-                        state_revision: guard.source_revision,
-                        updated_at: now_rfc3339_utc(),
-                        session_id: ctx.session_id.clone(),
-                        take_id: ctx.take_id.clone(),
-                        display_name: ctx.display_name.clone(),
-                        device: self.config.device_identity(),
-                        storage: RecordingStateStorage {
-                            volume_id: ctx.admission.volume_id.clone(),
-                            status: "sealing".to_owned(),
-                            writable: ctx.admission.writable,
-                            remaining_bytes: Some(ctx.admission.available_bytes),
+                let stage = guard
+                    .active
+                    .as_ref()
+                    .map(|ctx| match ctx.recording_stage.as_str() {
+                        "encoding" | "verifying" => ctx.recording_stage.clone(),
+                        _ => "finalizing".to_owned(),
+                    })
+                    .unwrap_or_else(|| "finalizing".to_owned());
+                let active_rec = guard.active.as_ref().map(|ctx| {
+                    let progress = ctx.last_progress;
+                    let elapsed_seconds = if progress.elapsed_seconds > 0.0 {
+                        progress.elapsed_seconds
+                    } else {
+                        monotonic_ns()
+                            .unwrap_or(ctx.started_monotonic_ns)
+                            .saturating_sub(ctx.started_monotonic_ns) as f64
+                            / 1_000_000_000.0
+                    };
+                    let verification = if stage == "verifying" {
+                        Some(ctx.verification_progress.unwrap_or(VerificationCounter {
+                            completed: 0,
+                            total: 0,
+                        }))
+                    } else {
+                        ctx.verification_progress
+                    };
+                    CaptureSnapshotRecording {
+                        generation_id: ctx.admission.generation_id.clone(),
+                        recording_state: RecordingState {
+                            schema: RECORDING_STATE_SCHEMA.to_owned(),
+                            state: stage.clone(),
+                            authority_epoch: guard.authority_epoch.clone(),
+                            state_revision: guard.source_revision,
+                            updated_at: now_rfc3339_utc(),
+                            session_id: ctx.session_id.clone(),
+                            take_id: ctx.take_id.clone(),
+                            display_name: ctx.display_name.clone(),
+                            device: self.config.device_identity(),
+                            storage: RecordingStateStorage {
+                                volume_id: ctx.admission.volume_id.clone(),
+                                status: "sealing".to_owned(),
+                                writable: ctx.admission.writable,
+                                remaining_bytes: Some(ctx.admission.available_bytes),
+                            },
+                            progress: RecordingStateProgress {
+                                elapsed_seconds: elapsed_seconds.max(0.0),
+                                captured_frames: progress.captured_frames,
+                                bytes_written: progress.bytes_written,
+                                verification,
+                            },
+                            diagnostics: ctx.diagnostics.clone(),
                         },
-                        progress: RecordingStateProgress {
-                            elapsed_seconds: 0.0,
-                            captured_frames: 0,
-                            bytes_written: 0,
-                            verification: ctx.verification_progress,
-                        },
-                        diagnostics: ctx.diagnostics.clone(),
-                    },
+                    }
                 });
                 if active_rec.is_some() {
-                    ("finalizing".to_owned(), active_rec, None)
+                    (stage, active_rec, None)
                 } else {
                     ("blocked".to_owned(), None, None)
                 }
@@ -3043,6 +3146,39 @@ struct SealedPublishOutput {
     manifest_id: String,
     manifest_sha256: String,
     sealed_at: String,
+}
+
+fn count_captured_artifacts(captured: &CapturedSessionArtifacts) -> u64 {
+    let audio_count = match &captured.audio {
+        CapturedAudioOutcome::Recorded { segments, .. } => segments.len() as u64,
+        CapturedAudioOutcome::NotRecorded { .. } => 0,
+    };
+    (captured.segments.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(2)
+        .saturating_add(audio_count)
+        .saturating_add(captured.logs.len() as u64)
+}
+
+fn sum_captured_artifact_bytes(captured: &CapturedSessionArtifacts) -> u64 {
+    let mut total = captured
+        .frames_artifact
+        .bytes
+        .saturating_add(captured.imu_artifact.bytes);
+    for seg in &captured.segments {
+        total = total
+            .saturating_add(seg.left_bytes)
+            .saturating_add(seg.right_bytes);
+    }
+    if let CapturedAudioOutcome::Recorded { segments, .. } = &captured.audio {
+        for aseg in segments {
+            total = total.saturating_add(aseg.artifact.bytes);
+        }
+    }
+    for log in &captured.logs {
+        total = total.saturating_add(log.bytes);
+    }
+    total
 }
 
 fn validate_start_request(req: &CaptureStartRequest) -> StorageResult<()> {

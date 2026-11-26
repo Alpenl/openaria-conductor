@@ -28,6 +28,9 @@ pub enum StorageError {
     #[error("storage unavailable: {message}")]
     Unavailable { message: String },
 
+    #[error("{code}: {message}")]
+    ServiceUnavailable { code: &'static str, message: String },
+
     #[error("volume verification failed: {message}")]
     VolumeInvalid { message: String },
 
@@ -74,6 +77,17 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::ServiceUnavailable {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn camera_not_connected(message: impl Into<String>) -> Self {
+        Self::service_unavailable("camera_not_connected", message)
+    }
+
     pub fn invalid_input(code: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidInput {
             code,
@@ -127,6 +141,7 @@ impl StorageError {
     pub fn code(&self) -> &str {
         match self {
             Self::Unavailable { .. } => "storage_unavailable",
+            Self::ServiceUnavailable { code, .. } => code,
             Self::VolumeInvalid { .. } => "volume_invalid",
             Self::NotFound { .. } => "not_found",
             Self::Catalog { .. } => "catalog_error",
@@ -145,7 +160,7 @@ impl StorageError {
 
     pub fn http_status(&self) -> u16 {
         match self {
-            Self::Unavailable { .. } => 503,
+            Self::Unavailable { .. } | Self::ServiceUnavailable { .. } => 503,
             Self::VolumeInvalid { .. } | Self::Catalog { .. } | Self::Io { .. } => 500,
             Self::NotFound { .. } | Self::Unsupported { .. } => 404,
             Self::CatalogChanged { .. } | Self::Conflict { .. } | Self::Integrity { .. } => 409,
@@ -164,7 +179,10 @@ impl StorageError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable { .. } | Self::CatalogChanged { .. } | Self::Locked { .. }
+            Self::Unavailable { .. }
+                | Self::ServiceUnavailable { .. }
+                | Self::CatalogChanged { .. }
+                | Self::Locked { .. }
         )
     }
 }

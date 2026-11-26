@@ -983,3 +983,285 @@ fn coordinator_records_retained_outcome_on_backend_start_and_finish_failures() {
             .is_some()
     );
 }
+
+#[test]
+fn camera_not_connected_reports_typed_503_code_across_camera_and_start_endpoints() {
+    let env = TestEnv::new("cam-disconnected");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let backend = Arc::new(MockBackend::new());
+    backend.connected.store(false, Ordering::Release);
+    let coord = make_coordinator(&env, probe, backend);
+
+    let err_get_focus = coord.get_camera_focus().unwrap_err();
+    assert_eq!(err_get_focus.code(), "camera_not_connected");
+    assert_eq!(err_get_focus.http_status(), 503);
+    assert!(err_get_focus.retryable());
+
+    let err_set_focus = coord
+        .set_camera_focus(
+            CameraFocusSetRequest {
+                schema: CAMERA_FOCUS_SET_SCHEMA.to_owned(),
+                value: Some(100),
+                auto_enabled: None,
+            },
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err_set_focus.code(), "camera_not_connected");
+    assert_eq!(err_set_focus.http_status(), 503);
+    assert!(err_set_focus.retryable());
+
+    let err_start = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(err_start.code(), "camera_not_connected");
+    assert_eq!(err_start.http_status(), 503);
+    assert!(err_start.retryable());
+
+    // Volume/storage unavailability remains distinct at "storage_unavailable".
+    let storage_err = StorageError::Unavailable {
+        message: "unmounted".to_owned(),
+    };
+    assert_eq!(storage_err.code(), "storage_unavailable");
+    assert_eq!(storage_err.http_status(), 503);
+}
+
+struct BarrierCaptureHandle {
+    staging_dir: PathBuf,
+    entered_finish: Arc<std::sync::Barrier>,
+    release_finish: Arc<std::sync::Barrier>,
+}
+
+impl ActiveCaptureHandle for BarrierCaptureHandle {
+    fn progress(&self) -> CaptureProgressSnapshot {
+        CaptureProgressSnapshot {
+            elapsed_seconds: 12.5,
+            captured_frames: 375,
+            bytes_written: 4096,
+        }
+    }
+
+    fn finish(self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+        // Synchronize with observer thread so capture_status() deterministically sees "finalizing".
+        self.entered_finish.wait();
+        self.release_finish.wait();
+
+        // Write a 16 MiB left artifact with sha256=None so seal_and_publish hashes it during
+        // the "verifying" stage, giving the subscriber thread a wide window to observe "verifying".
+        let left_bytes = vec![0x5a_u8; 16 * 1024 * 1024];
+        let right_bytes = synthetic_valid_mp4(b"right-eye-barrier");
+        let frames_bytes = b"{\"frame\":0,\"host_monotonic_ns\":1000}\n".to_vec();
+        let imu_bytes = b"{\"sequence\":0,\"host_monotonic_ns\":1000}\n".to_vec();
+
+        fs::write(self.staging_dir.join("video/left_00000.mp4"), &left_bytes).unwrap();
+        fs::write(self.staging_dir.join("video/right_00000.mp4"), &right_bytes).unwrap();
+        fs::write(self.staging_dir.join("frames.ndjson"), &frames_bytes).unwrap();
+        fs::write(self.staging_dir.join("imu.ndjson"), &imu_bytes).unwrap();
+
+        Ok(CapturedSessionArtifacts {
+            segments: vec![CapturedVideoSegment {
+                index: 0,
+                start_frame: 0,
+                end_frame: 375,
+                start_time_seconds: 0.0,
+                end_time_seconds: 12.5,
+                left_path: "video/left_00000.mp4".to_owned(),
+                left_bytes: left_bytes.len() as u64,
+                left_sha256: None,
+                right_path: "video/right_00000.mp4".to_owned(),
+                right_bytes: right_bytes.len() as u64,
+                right_sha256: Some(sha256_hex(&right_bytes)),
+            }],
+            frames_artifact: CapturedArtifact {
+                role: "frames.index".to_owned(),
+                path: "frames.ndjson".to_owned(),
+                media_type: "application/x-ndjson".to_owned(),
+                bytes: frames_bytes.len() as u64,
+                sha256: Some(sha256_hex(&frames_bytes)),
+            },
+            frames_count: 375,
+            imu_artifact: CapturedArtifact {
+                role: "imu.samples".to_owned(),
+                path: "imu.ndjson".to_owned(),
+                media_type: "application/x-ndjson".to_owned(),
+                bytes: imu_bytes.len() as u64,
+                sha256: Some(sha256_hex(&imu_bytes)),
+            },
+            imu_sample_count: 1,
+            audio: CapturedAudioOutcome::NotRecorded {
+                requested_mode: "disabled".to_owned(),
+                reason: "user_disabled".to_owned(),
+            },
+            logs: Vec::new(),
+            dropped_frames: 0,
+            drop_events: Vec::new(),
+            duration_seconds: 12.5,
+            effective_fps: 30.0,
+        })
+    }
+
+    fn abort(self: Box<Self>) {}
+}
+
+struct BarrierBackend {
+    entered_finish: Arc<std::sync::Barrier>,
+    release_finish: Arc<std::sync::Barrier>,
+}
+
+impl CaptureBackend for BarrierBackend {
+    fn is_camera_connected(&self) -> bool {
+        true
+    }
+
+    fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+        Ok(None)
+    }
+
+    fn set_camera_focus(&self, _req: &CameraFocusSetRequest) -> StorageResult<CameraFocusStatus> {
+        Err(StorageError::unsupported(
+            "camera_focus_unsupported",
+            "unsupported",
+        ))
+    }
+
+    fn begin_capture(
+        &self,
+        req: &BackendStartRequest,
+    ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+        Ok(Box::new(BarrierCaptureHandle {
+            staging_dir: req.staging_dir.clone(),
+            entered_finish: Arc::clone(&self.entered_finish),
+            release_finish: Arc::clone(&self.release_finish),
+        }))
+    }
+
+    fn runtime_observation(&self) -> RuntimeObservation {
+        RuntimeObservation::default_with_camera(true, None)
+    }
+}
+
+#[test]
+fn concurrent_status_observes_finalizing_and_verifying_with_active_recording_during_stop() {
+    let env = TestEnv::new("stopping-status");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let entered_finish = Arc::new(std::sync::Barrier::new(2));
+    let release_finish = Arc::new(std::sync::Barrier::new(2));
+    let backend = Arc::new(BarrierBackend {
+        entered_finish: Arc::clone(&entered_finish),
+        release_finish: Arc::clone(&release_finish),
+    });
+
+    let mut policy = VolumePolicy::production(1024 * 1024 * 1024, 100);
+    policy.system_state_root = Some(env.root.clone());
+    let vol = Arc::new(ExfatVolumeManager::with_probe(
+        env.paths(),
+        policy,
+        Arc::new(probe),
+    ));
+    let _ = vol.ensure_layout().unwrap();
+    let cat = Arc::new(BinarySessionCatalog::open(env.paths()).unwrap());
+    let cfg = CoordinatorConfig {
+        device_id: new_uuid_v4(),
+        device_label: "Miro-Ego-DEAD1234".to_owned(),
+        hardware_fingerprint: format!("sha256:{}", "d".repeat(64)),
+        run_dir: Some(env.run_dir.clone()),
+        ..CoordinatorConfig::default()
+    };
+    let coord = Arc::new(CaptureCoordinator::new(cfg, vol, cat, backend));
+    let rec_state_validator = load_schema("miro-ego-recording-state-v1.schema.json");
+    let sub = coord.subscribe_events();
+
+    // Enable capture timer to confirm active timer clears once Stopping begins.
+    coord
+        .set_capture_timer(CaptureTimerSetRequest {
+            schema: CAPTURE_TIMER_SET_SCHEMA.to_owned(),
+            enabled: true,
+            duration_seconds: 60,
+        })
+        .unwrap();
+
+    let started = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid = started
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .session_id
+        .clone();
+    assert!(coord.get_capture_timer().unwrap().active.is_some());
+
+    let stop_coord = Arc::clone(&coord);
+    let stopper = thread::spawn(move || stop_coord.stop_capture(CaptureStopRequest::user(), None));
+
+    // Wait until stop_capture() is actively inside handle.finish() ("finalizing").
+    entered_finish.wait();
+
+    let finalizing_status = coord.capture_status().unwrap();
+    assert_eq!(finalizing_status.snapshot.device_state, "finalizing");
+    assert!(finalizing_status.snapshot.retained_unsuccessful.is_none());
+    let fin_active = finalizing_status
+        .snapshot
+        .active_recording
+        .as_ref()
+        .expect("active_recording must be non-null while finalizing");
+    assert_eq!(fin_active.recording_state.session_id, sid);
+    assert_eq!(fin_active.recording_state.state, "finalizing");
+    assert_eq!(fin_active.recording_state.storage.status, "sealing");
+    assert_eq!(fin_active.recording_state.progress.elapsed_seconds, 12.5);
+    assert_eq!(fin_active.recording_state.progress.captured_frames, 375);
+    assert_eq!(fin_active.recording_state.progress.bytes_written, 4096);
+    let fin_json = serde_json::to_string(&fin_active.recording_state).unwrap();
+    assert!(
+        rec_state_validator.is_valid(&fin_json).unwrap(),
+        "finalizing recording_state invalid against schema: {fin_json}"
+    );
+    // Active timer MUST clear once stopping begins.
+    assert!(coord.get_capture_timer().unwrap().active.is_none());
+
+    // Release handle.finish() so stop_capture advances to "verifying" and hashes the 16 MiB file.
+    release_finish.wait();
+
+    // Wait for the "verifying" state event and immediately inspect capture_status().
+    let mut saw_verifying_event = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match sub.recv_timeout(Duration::from_millis(50)) {
+            Ok(ev)
+                if ev.event_type == CaptureEventType::State
+                    && ev.data.get("state").and_then(|v| v.as_str()) == Some("verifying") =>
+            {
+                saw_verifying_event = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_verifying_event, "expected verifying state event");
+
+    let verifying_status = coord.capture_status().unwrap();
+    assert_eq!(verifying_status.snapshot.device_state, "verifying");
+    let ver_active = verifying_status
+        .snapshot
+        .active_recording
+        .as_ref()
+        .expect("active_recording must be non-null while verifying");
+    assert_eq!(ver_active.recording_state.state, "verifying");
+    assert_eq!(ver_active.recording_state.session_id, sid);
+    assert!(ver_active.recording_state.progress.verification.is_some());
+    assert!(ver_active.recording_state.progress.bytes_written >= 16 * 1024 * 1024);
+    let ver_json = serde_json::to_string(&ver_active.recording_state).unwrap();
+    assert!(
+        rec_state_validator.is_valid(&ver_json).unwrap(),
+        "verifying recording_state invalid against schema: {ver_json}"
+    );
+
+    let stop_outcome = stopper.join().unwrap().unwrap();
+    assert!(stop_outcome.value.is_some());
+    assert_eq!(coord.phase().unwrap(), CapturePhase::Idle);
+    assert!(coord.catalog().get_session(&sid).unwrap().is_some());
+}
