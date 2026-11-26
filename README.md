@@ -132,8 +132,10 @@ Rust 数据面基准、结构消融与当前代码审计基线见
 
 ## 当前状态
 
-当前处于 **0.2.16** 生产交付阶段（参见 [0.2.16 发布说明](docs/releases/0.2.16.md)），并正在按
-[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md) 推进稳定性加固、架构解耦与 CI 检查完善。
+当前处于 **0.2.16** 生产交付阶段（参见 [0.2.16 发布说明](docs/releases/0.2.16.md)），并正在 `refactor/0.3.0` 分支按
+[全量代码审计与重构方案](docs/reports/2026-11-25-full-audit-and-refactor-plan.md) 与
+[Round 2 深度审查台账](docs/reports/2026-11-26-round2-perfection-audit.md) 推进稳定性加固、架构解耦与 CI 检查完善；双线协同规则见
+[0.3.0 与 main 双线维护规范](docs/branch-maintenance-0.3.md)。
 
 公开开发任务见 [GitHub Issues](https://github.com/Alpenl/openaria-conductor/issues)。
 

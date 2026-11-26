@@ -12,12 +12,14 @@ on:
       - "v*"
     branches:
       - main
+      - "refactor/0.3.0"
       - "ci/**"
       - "codex/**"
       - "public-*"
   pull_request:
     branches:
       - main
+      - "refactor/0.3.0"
     paths:
       - ".github/workflows/rdk-x5-bundle.yml"
       - "Cargo.lock"

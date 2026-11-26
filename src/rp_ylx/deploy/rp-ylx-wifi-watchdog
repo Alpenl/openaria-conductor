@@ -180,18 +180,19 @@ record_diagnostics()
 rotate_diagnostics()
 {
     [ "$DIAGNOSTIC_LOG_LIMIT" -gt 0 ] || return 0
-    old_ifs=$IFS
-    IFS='
-'
-    set -f
-    kept=0
-    for entry in $(set +f; ls -1t -- "$STATE_DIRECTORY"/diagnostic-*.log 2>/dev/null || true); do
+    total=0
+    for entry in "$STATE_DIRECTORY"/diagnostic-*.log; do
         [ -f "$entry" ] || continue
-        kept=$((kept + 1))
-        [ "$kept" -gt "$DIAGNOSTIC_LOG_LIMIT" ] && rm -f -- "$entry"
+        total=$((total + 1))
     done
-    set +f
-    IFS=$old_ifs
+    excess=$((total - DIAGNOSTIC_LOG_LIMIT))
+    [ "$excess" -gt 0 ] || return 0
+    for entry in "$STATE_DIRECTORY"/diagnostic-*.log; do
+        [ -f "$entry" ] || continue
+        rm -f -- "$entry"
+        excess=$((excess - 1))
+        [ "$excess" -gt 0 ] || break
+    done
 }
 
 recovery_is_in_cooldown()
