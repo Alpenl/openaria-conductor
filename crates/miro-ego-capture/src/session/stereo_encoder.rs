@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SHM_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWN_ETXTBSY_MAX_ATTEMPTS: usize = 8;
+const SPAWN_ETXTBSY_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 
@@ -301,7 +303,7 @@ impl EncoderProcess {
             }
         };
 
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = spawn_with_etxtbsy_retry(&mut command).map_err(|error| {
             EncoderProcessError::new(
                 "encoder_unavailable",
                 format!("failed to spawn encoder: {error}"),
@@ -770,6 +772,30 @@ fn set_failure(shared: &SharedProcess, error: EncoderProcessError) {
     }
 }
 
+fn spawn_with_etxtbsy_retry(command: &mut Command) -> std::io::Result<Child> {
+    retry_on_etxtbsy(SPAWN_ETXTBSY_MAX_ATTEMPTS, SPAWN_ETXTBSY_BACKOFF, || {
+        command.spawn()
+    })
+}
+
+fn retry_on_etxtbsy<T, F>(max_attempts: usize, backoff: Duration, mut op: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let max_retries = max_attempts.saturating_sub(1);
+    let mut retries = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && retries < max_retries => {
+                retries += 1;
+                thread::sleep(backoff);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn wait_child(
     child: &mut Child,
     timeout: Duration,
@@ -1212,5 +1238,41 @@ mod tests {
             Some(libc::ESRCH)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_on_etxtbsy_handles_transient_permanent_and_other_errors() {
+        let mut attempts = 0;
+        let value = super::retry_on_etxtbsy(4, std::time::Duration::ZERO, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok("spawned")
+            }
+        })
+        .unwrap();
+        assert_eq!(value, "spawned");
+        assert_eq!(attempts, 3);
+
+        let mut enoent_attempts = 0;
+        let err =
+            super::retry_on_etxtbsy(4, std::time::Duration::ZERO, || -> std::io::Result<()> {
+                enoent_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            })
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(enoent_attempts, 1);
+
+        let mut exhausted_attempts = 0;
+        let err =
+            super::retry_on_etxtbsy(3, std::time::Duration::ZERO, || -> std::io::Result<()> {
+                exhausted_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            })
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(exhausted_attempts, 3);
     }
 }
