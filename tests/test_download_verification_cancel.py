@@ -6,12 +6,15 @@ import threading
 import time
 import unittest
 
-import test_session_download as fixtures
-
 from rp_ylx.api import ProviderError, SecurityPolicy, create_gateway_server
+from tests.testkit import (
+    ARTIFACT_ID,
+    SESSION_ID,
+    MemoryArtifactProvider,
+)
 
 
-class _CancellableProvider(fixtures._MemoryProvider):
+class _CancellableProvider(MemoryArtifactProvider):
     def __init__(self):
         super().__init__()
         self.entered = threading.Event()
@@ -51,7 +54,7 @@ class DownloadVerificationCancelTest(unittest.TestCase):
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.path = f"/api/v4/sessions/{fixtures.SESSION_ID}/artifacts/{fixtures.ARTIFACT_ID}"
+        self.path = f"/api/v4/sessions/{SESSION_ID}/artifacts/{ARTIFACT_ID}"
 
     def tearDown(self):
         self.provider.block = False

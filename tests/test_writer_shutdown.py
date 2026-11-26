@@ -8,8 +8,13 @@ from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
 from rp_ylx.recording.device_session import DeviceRecordingError
-from tests import test_capture_coordinator as capture_fixtures
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    SplitEyeHarness,
+    split_eye_frame,
+    start_command,
+    stop_command,
+)
 
 
 class WriterShutdownTests(unittest.TestCase):
@@ -27,11 +32,9 @@ class WriterShutdownTests(unittest.TestCase):
                     raise TimeoutError("test did not release writer")
 
         with tempfile.TemporaryDirectory() as temporary:
-            recorder, encoders, _ = fixtures.SplitEyeRecordingTest().build(
-                Path(temporary), before_write=block
-            )
+            recorder, encoders, _ = SplitEyeHarness().build(Path(temporary), before_write=block)
             recorder.start()
-            recorder.submit_frame(fixtures.frame(0))
+            recorder.submit_frame(split_eye_frame(0))
             self.assertTrue(entered.wait(2))
             writer = recorder._writer
             original_join = writer.join
@@ -104,12 +107,11 @@ class WriterShutdownTests(unittest.TestCase):
 
 class CoordinatorShutdownTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = capture_fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.coordinator = self.fixture.coordinator(checkpoint_interval=0)
         self.addCleanup(self.coordinator.close)
-        self.coordinator.start_capture(capture_fixtures.start_command("close-start"))
+        self.coordinator.start_capture(start_command("close-start"))
 
     def test_close_releases_revision_lock_and_serializes_other_close_callers(self):
         coordinator = self.coordinator
@@ -141,9 +143,9 @@ class CoordinatorShutdownTests(unittest.TestCase):
                     coordinator._lock.release()
                 coordinator._next_revision()
                 with self.assertRaises(ProviderError):
-                    coordinator.start_capture(capture_fixtures.start_command("during-close"))
+                    coordinator.start_capture(start_command("during-close"))
                 with self.assertRaises(ProviderError):
-                    coordinator.request_stop_capture(capture_fixtures.stop_command("during-close"))
+                    coordinator.request_stop_capture(stop_command("during-close"))
                 callers[1].start()
             finally:
                 release.set()

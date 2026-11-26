@@ -30,7 +30,7 @@ from rp_ylx.network_credentials import NetworkCredentialError, NetworkCredential
 from rp_ylx.network_state import NetworkStateError, NetworkStateStore
 from rp_ylx.operational_logging import reset_operational_logging
 from rp_ylx.persistence import StateDatabase
-from rp_ylx.recording.coordinator import CaptureCoordinator
+from tests.testkit import CoordinatorHarness, FakeNmcli, start_command
 
 
 class NetworkCredentialStoreTest(unittest.TestCase):
@@ -358,6 +358,7 @@ class NetworkStateStoreTest(unittest.TestCase):
 class NetworkControllerCoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self._operation_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._operation_directory.cleanup)
         lock_path = Path(self._operation_directory.name) / "network-operation.lock"
         self._operation_environment = patch.dict(
             os.environ,
@@ -365,10 +366,10 @@ class NetworkControllerCoreTest(unittest.TestCase):
             clear=False,
         )
         self._operation_environment.start()
+        self.addCleanup(self._operation_environment.stop)
 
     def tearDown(self) -> None:
-        self._operation_environment.stop()
-        self._operation_directory.cleanup()
+        pass
 
     @staticmethod
     def _create_credential(controller: NetworkController, passphrase: str) -> str:
@@ -445,7 +446,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             with (
@@ -503,7 +503,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             with (
                 patch.dict(os.environ, environment, clear=False),
@@ -551,7 +550,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(
@@ -706,7 +704,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(token_factory=lambda: "durable-accept")
@@ -755,7 +752,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(token_factory=lambda: "restart-once")
@@ -812,7 +808,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             with (
@@ -862,7 +857,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             nmcli.fail_modes["wifi-client"] = "Secrets were required, but not provided"
@@ -973,7 +967,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             nmcli.timeout_modes.add("wifi-client")
@@ -1049,7 +1042,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
         self.assertEqual(len(rescue_activations), 1)
 
     def test_activation_deadline_includes_snapshot_and_is_strict_at_ten_seconds(self) -> None:
-        from tests.test_network import FakeNmcli
 
         for boundary_ns, expected_status in (
             (9_900_000_000, "committed"),
@@ -1110,7 +1102,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                     self.assertEqual(latest["error"]["code"], "dhcp_timeout")
 
     def test_candidate_failure_restores_rescue_strictly_before_fifteen_seconds(self) -> None:
-        from tests.test_network import FakeNmcli
 
         for rescue_finished_ns, expected_status in (
             (14_900_000_000, "rescued"),
@@ -1193,7 +1184,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             nmcli.dhcp_address_override = "169.254.20.30/16"
@@ -1226,7 +1216,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             clock = {"now": 0}
@@ -1278,7 +1267,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             with (
@@ -1316,7 +1304,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             with (
                 patch.dict(os.environ, environment, clear=False),
@@ -1336,8 +1323,8 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 controller._monitor_thread = monitor
                 controller.close()
 
-        worker.join.assert_called_once_with()
-        monitor.join.assert_called_once_with()
+        worker.join.assert_called_once_with(timeout=5.0)
+        monitor.join.assert_called_once_with(timeout=5.0)
 
     def test_capture_lease_rejects_mutation_and_pauses_health_monitor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1347,7 +1334,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             lease_acquired = threading.Event()
@@ -1432,7 +1418,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             probe_started = threading.Event()
@@ -1502,7 +1487,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             nmcli.scan_output = "Guest::70\nField LAN:WPA2:50\n"
@@ -1548,7 +1532,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             first_credentials = NetworkCredentialStore(token_factory=lambda: "forget-apply")
@@ -1642,7 +1625,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(
@@ -1708,7 +1690,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             clock = {"now": 0}
@@ -1813,7 +1794,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
         self.assertNotIn("health-secret-123", json.dumps(restored))
 
     def test_factory_wifi_install_and_boot_only_use_hotspot_after_connection_failure(self) -> None:
-        from tests.test_network import FakeNmcli
 
         for reconnect, fail, legacy in (
             (False, False, False),
@@ -1908,7 +1888,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
                 "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(token_factory=lambda: "boot-credential")
@@ -2019,7 +1998,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
                 "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             nmcli.fail_modes["wifi-client"] = "Secrets were required, but not provided"
@@ -2126,7 +2104,6 @@ class NetworkControllerCoreTest(unittest.TestCase):
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
                 "RP_YLX_BOOT_ID_PATH": str(boot_id_path),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(token_factory=lambda: "legacy-reboot-credential")
@@ -2227,6 +2204,7 @@ class NetworkControllerCoreTest(unittest.TestCase):
 class NetworkControlTest(unittest.TestCase):
     def setUp(self) -> None:
         self._operation_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._operation_directory.cleanup)
         lock_path = Path(self._operation_directory.name) / "network-operation.lock"
         self._operation_environment = patch.dict(
             os.environ,
@@ -2234,10 +2212,10 @@ class NetworkControlTest(unittest.TestCase):
             clear=False,
         )
         self._operation_environment.start()
+        self.addCleanup(self._operation_environment.stop)
 
     def tearDown(self) -> None:
-        self._operation_environment.stop()
-        self._operation_directory.cleanup()
+        pass
 
     def test_control_response_deadline_covers_root_scan_and_queue_margin(self) -> None:
         self.assertGreaterEqual(
@@ -2653,7 +2631,6 @@ class NetworkControlTest(unittest.TestCase):
                 "RP_YLX_NM_PROFILE_DIR": str(root / "profiles"),
                 "RP_YLX_AVAHI_SERVICE_DIR": str(root / "avahi"),
             }
-            from tests.test_network import FakeNmcli
 
             nmcli = FakeNmcli(root / "profiles")
             credentials = NetworkCredentialStore(token_factory=lambda: "socket-shared")
@@ -2783,9 +2760,10 @@ class NetworkControlTest(unittest.TestCase):
             },
             b'{"schema":"ylx.network-forget-request.v1"}',
         )
-        provider = object.__new__(CaptureCoordinator)
 
         with (
+            CoordinatorHarness() as harness,
+            harness.coordinator() as provider,
             patch(
                 "rp_ylx.recording.coordinator.request_network_control",
                 return_value={
@@ -2824,9 +2802,10 @@ class NetworkControlTest(unittest.TestCase):
             },
             b"{}",
         )
-        provider = object.__new__(CaptureCoordinator)
 
         with (
+            CoordinatorHarness() as harness,
+            harness.coordinator() as provider,
             patch(
                 "rp_ylx.recording.coordinator.request_network_control",
                 side_effect=NetworkControlClientError(
@@ -2863,18 +2842,21 @@ class NetworkControlTest(unittest.TestCase):
             },
             b"{}",
         )
-        provider = object.__new__(CaptureCoordinator)
 
-        with patch(
-            "rp_ylx.recording.coordinator.request_network_control",
-            return_value={
-                "schema": CONTROL_RESPONSE_SCHEMA,
-                "ok": True,
-                "operation": "apply",
-                "status": 202,
-                "body": receipt,
-                "replayed": True,
-            },
+        with (
+            CoordinatorHarness() as harness,
+            harness.coordinator() as provider,
+            patch(
+                "rp_ylx.recording.coordinator.request_network_control",
+                return_value={
+                    "schema": CONTROL_RESPONSE_SCHEMA,
+                    "ok": True,
+                    "operation": "apply",
+                    "status": 202,
+                    "body": receipt,
+                    "replayed": True,
+                },
+            ),
         ):
             result = provider.apply_network_desired_state(command)
 
@@ -2883,7 +2865,6 @@ class NetworkControlTest(unittest.TestCase):
         self.assertTrue(result.replayed)
 
     def test_coordinator_forwards_scan_and_transient_credential(self) -> None:
-        provider = object.__new__(CaptureCoordinator)
         scan = {
             "schema": "ylx.network-scan.v1",
             "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
@@ -2899,25 +2880,29 @@ class NetworkControlTest(unittest.TestCase):
             "ttl_seconds": 120,
             "single_use": True,
         }
-        with patch(
-            "rp_ylx.recording.coordinator.request_network_control",
-            side_effect=[
-                {
-                    "schema": CONTROL_RESPONSE_SCHEMA,
-                    "ok": True,
-                    "operation": "scan",
-                    "status": 200,
-                    "body": scan,
-                },
-                {
-                    "schema": CONTROL_RESPONSE_SCHEMA,
-                    "ok": True,
-                    "operation": "create_credential",
-                    "status": 201,
-                    "body": credential,
-                },
-            ],
-        ) as request:
+        with (
+            CoordinatorHarness() as harness,
+            harness.coordinator() as provider,
+            patch(
+                "rp_ylx.recording.coordinator.request_network_control",
+                side_effect=[
+                    {
+                        "schema": CONTROL_RESPONSE_SCHEMA,
+                        "ok": True,
+                        "operation": "scan",
+                        "status": 200,
+                        "body": scan,
+                    },
+                    {
+                        "schema": CONTROL_RESPONSE_SCHEMA,
+                        "ok": True,
+                        "operation": "create_credential",
+                        "status": 201,
+                        "body": credential,
+                    },
+                ],
+            ) as request,
+        ):
             self.assertEqual(provider.scan_networks(), scan)
             self.assertEqual(
                 provider.create_network_credential(
@@ -2940,11 +2925,6 @@ class NetworkControlTest(unittest.TestCase):
         )
 
     def test_coordinator_maps_missing_retry_and_blocks_mutation_during_capture(self) -> None:
-        provider = object.__new__(CaptureCoordinator)
-        provider._lock = threading.RLock()
-        provider._active = None
-        provider._network_operation_lease = None
-        provider._pending_focus = None
         command = NetworkCommand(
             "customer",
             "retry-missing",
@@ -2961,37 +2941,30 @@ class NetworkControlTest(unittest.TestCase):
             "error": {"code": "transaction_not_found", "message": "not retained"},
             "retryable": False,
         }
-        with (
-            patch(
-                "rp_ylx.recording.coordinator.request_network_control",
-                return_value=missing,
-            ),
-            self.assertRaises(ProviderError) as raised,
-        ):
-            provider.retry_network_transaction(command)
-        self.assertEqual(raised.exception.code, "network_transaction_not_found")
-        self.assertEqual(raised.exception.status, HTTPStatus.NOT_FOUND)
+        with CoordinatorHarness() as harness, harness.coordinator() as provider:
+            with (
+                patch(
+                    "rp_ylx.recording.coordinator.request_network_control",
+                    return_value=missing,
+                ),
+                self.assertRaises(ProviderError) as raised,
+            ):
+                provider.retry_network_transaction(command)
+            self.assertEqual(raised.exception.code, "network_transaction_not_found")
+            self.assertEqual(raised.exception.status, HTTPStatus.NOT_FOUND)
 
-        provider._active = object()
-        with (
-            patch("rp_ylx.recording.coordinator.request_network_control") as request,
-            self.assertRaises(ProviderError) as raised,
-        ):
-            provider.retry_network_transaction(command)
-        self.assertEqual(raised.exception.code, "network_mutation_unavailable")
-        self.assertEqual(raised.exception.status, HTTPStatus.SERVICE_UNAVAILABLE)
-        self.assertEqual(raised.exception.details, {"reason": "capture_active"})
-        request.assert_not_called()
+            provider.start_capture(start_command("active-capture"))
+            with (
+                patch("rp_ylx.recording.coordinator.request_network_control") as request,
+                self.assertRaises(ProviderError) as raised,
+            ):
+                provider.retry_network_transaction(command)
+            self.assertEqual(raised.exception.code, "network_mutation_unavailable")
+            self.assertEqual(raised.exception.status, HTTPStatus.SERVICE_UNAVAILABLE)
+            self.assertEqual(raised.exception.details, {"reason": "capture_active"})
+            request.assert_not_called()
 
     def test_capture_start_is_rejected_while_network_transaction_is_current(self) -> None:
-        provider = object.__new__(CaptureCoordinator)
-        provider._timer_settings = {"enabled": False, "duration_seconds": 600}
-        provider._voice_settings = {"volume": 100}
-        provider._active = None
-        provider._catalog_verification_epoch = 0
-        provider._catalog_verification_cancel = threading.Event()
-        provider._network_operation_lease = None
-        provider._pending_focus = None
         response = {
             "schema": CONTROL_RESPONSE_SCHEMA,
             "ok": True,
@@ -3000,6 +2973,8 @@ class NetworkControlTest(unittest.TestCase):
             "body": {"transaction": {"current": {"status": "running"}, "latest": None}},
         }
         with (
+            CoordinatorHarness() as harness,
+            harness.coordinator() as provider,
             patch(
                 "rp_ylx.recording.coordinator.request_network_control",
                 return_value=response,
@@ -3007,7 +2982,7 @@ class NetworkControlTest(unittest.TestCase):
             patch("rp_ylx.recording.coordinator.notify_voice") as voice,
             self.assertRaises(ProviderError) as raised,
         ):
-            provider._start_capture({})
+            provider.start_capture(start_command("blocked-by-net"))
         self.assertEqual(raised.exception.code, "network_mutation_active")
         self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
         voice.assert_called_once_with("start_failed", "", volume=100)

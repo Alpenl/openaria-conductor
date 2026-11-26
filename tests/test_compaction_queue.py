@@ -192,10 +192,10 @@ class CompactionQueueTests(unittest.TestCase):
 class VerificationQueueTests(unittest.TestCase):
     def test_failure_joins_active_verifier_before_closing_root_and_limits_submissions(self):
         from rp_ylx.recording import device_session as d
-        from tests import test_split_eye_recording as fixtures
+        from tests.testkit import SplitEyeHarness
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(temporary))
             recorder.start()
             fixture.feed(recorder, 3)

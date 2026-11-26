@@ -5,8 +5,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rp_ylx.recording import coordinator as module
+from rp_ylx.recording import session_catalog
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class Cancelled(BaseException):
@@ -15,8 +16,7 @@ class Cancelled(BaseException):
 
 class DownloadOpenCleanupTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.coordinator = self.fixture.coordinator()
         self.addCleanup(self.coordinator.close)
@@ -145,21 +145,23 @@ class DownloadOpenCleanupTests(unittest.TestCase):
         first, second = Mock(), Mock()
         with (
             patch.object(
-                module,
+                session_catalog,
                 "DirectorySessionStore",
                 side_effect=[first, second, OSError(errno.EMFILE, "limit")],
             ),
             self.assertRaises(OSError),
         ):
-            module._MultiRootSessionStore((self.fixture.mountpoint,) * 3, verified_manifests={})
+            session_catalog._MultiRootSessionStore(
+                (self.fixture.mountpoint,) * 3, verified_manifests={}
+            )
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
 
     def test_multi_root_close_continues_after_error_and_is_idempotent(self):
         first, second = Mock(), Mock()
         first.close.side_effect = OSError(errno.EIO, "close failed")
-        with patch.object(module, "DirectorySessionStore", side_effect=[first, second]):
-            store = module._MultiRootSessionStore(
+        with patch.object(session_catalog, "DirectorySessionStore", side_effect=[first, second]):
+            store = session_catalog._MultiRootSessionStore(
                 (self.fixture.mountpoint,) * 2, verified_manifests={}
             )
         with self.assertRaises(OSError):

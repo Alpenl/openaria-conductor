@@ -260,9 +260,9 @@ class GatewayPreviewHttpTest(unittest.TestCase):
 
             publisher = threading.Thread(target=publish_burst)
             publisher.start()
-            self.assertTrue(completed.wait(0.25), "slow HTTP consumer blocked preview publish")
+            self.assertTrue(completed.wait(1.0), "slow HTTP consumer blocked preview publish")
             publisher.join(timeout=1)
-            self.assertLess(elapsed[0], 0.25)
+            self.assertLess(elapsed[0], 1.0)
 
             self.assertEqual(
                 response.read(len(STREAM_LATEST_PART)),

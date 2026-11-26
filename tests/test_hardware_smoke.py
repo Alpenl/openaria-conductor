@@ -458,7 +458,10 @@ class HardwareSmokeBehaviorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "smoke"
             with (
-                patch.object(Path, "write_text", side_effect=OSError("fixture summary disk full")),
+                patch(
+                    "rp_ylx.hardware.smoke.write_json_atomic",
+                    side_effect=OSError("fixture summary disk full"),
+                ),
                 self.assertRaises(HardwareSmokeError) as raised,
             ):
                 record_hardware_smoke(

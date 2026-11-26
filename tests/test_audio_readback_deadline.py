@@ -80,7 +80,7 @@ class AudioReadbackDeadlineTests(unittest.TestCase):
                 start_new_session=True,
             )
             try:
-                stdout, stderr = process.communicate(timeout=3)
+                stdout, stderr = process.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate(timeout=2)

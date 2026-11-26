@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
 from rp_ylx.recording import coordinator as module
-from tests import test_capture_coordinator as fixture_module
+from tests.testkit import CoordinatorHarness
 
 
 def legacy_revision(items, diagnostics):
@@ -80,8 +80,7 @@ class CatalogRevisionStreamingTests(unittest.TestCase):
             module._session_catalog_revision(items, [])
 
     def test_cursor_from_legacy_revision_is_accepted_then_detects_change(self):
-        fixture = fixture_module.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         coordinator = fixture.coordinator()
         self.addCleanup(coordinator.close)

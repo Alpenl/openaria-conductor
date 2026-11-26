@@ -14,8 +14,48 @@ from unittest.mock import patch
 
 from rp_ylx import session_timestamps as timestamps
 from rp_ylx.api.downloads import iter_device_session_v1_artifacts
+from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
+from rp_ylx.recording.device_session import json_bytes
 from rp_ylx.recording.storage import compact_metadata
-from tests.test_spectacular_adapter import _json_bytes, _make_device_session
+from tests.testkit import SplitEyeHarness, split_eye_frame
+
+
+def _make_device_session(root: Path) -> Path:
+    recorder, _, _ = SplitEyeHarness().build(root)
+    recorder.start()
+    for sequence in range(4):
+        assert recorder.submit_frame(
+            split_eye_frame(
+                sequence,
+                host_monotonic_ns=1_000_000_000 + sequence * 33_333_333,
+            )
+        )
+    sample_sequence = 0
+    for packet_sequence in range(3):
+        host = 1_000_000_000 + packet_sequence * 16_666_667
+        device_ticks = 1_000 + packet_sequence * 1_000
+        samples = []
+        for sample_index in range(2):
+            samples.append(
+                ImuSample(
+                    sequence=sample_sequence,
+                    packet_sequence=packet_sequence,
+                    sample_index=sample_index,
+                    device_timestamp_raw=device_ticks,
+                    device_ticks=device_ticks,
+                    host_read_start_ns=host - 500,
+                    host_read_end_ns=host + 500,
+                    host_monotonic_ns=host,
+                    accelerometer=RawVector3(1 + sample_index, 2, 3),
+                    gyroscope=RawVector3(4, 5, 6 + sample_index),
+                    sync_offset_ns=None,
+                    sync_residual_ns=None,
+                    sync_quality="insufficient",
+                )
+            )
+            sample_sequence += 1
+        assert recorder.submit_imu(ImuObservation((samples[0], samples[1]), dropped_samples=0))
+    return recorder.stop().path
 
 
 class TimestampStreamingTests(unittest.TestCase):
@@ -31,12 +71,12 @@ class TimestampStreamingTests(unittest.TestCase):
 
     def save(self, rows, *, section="imu"):
         descriptor = self.manifest[section]["artifact"]
-        data = b"".join(_json_bytes(row) for row in rows)
+        data = b"".join(json_bytes(row) for row in rows)
         (self.root / descriptor["path"]).write_bytes(data)
         digest = hashlib.sha256(data).hexdigest()
         descriptor.update(bytes=len(data), sha256=digest, artifact_id=digest)
         self.manifest[section]["sample_count" if section == "imu" else "count"] = len(rows)
-        self.manifest_path.write_bytes(_json_bytes(self.manifest))
+        self.manifest_path.write_bytes(json_bytes(self.manifest))
 
     def packets(self, hosts, sizes):
         rows = []
@@ -198,7 +238,7 @@ class TimestampStreamingTests(unittest.TestCase):
 
     def test_count_mismatch_rejected(self):
         self.manifest["imu"]["sample_count"] += 1
-        self.manifest_path.write_bytes(_json_bytes(self.manifest))
+        self.manifest_path.write_bytes(json_bytes(self.manifest))
         with self.assertRaises(timestamps.SessionTimestampError):
             self.export()
 
@@ -210,7 +250,7 @@ class TimestampStreamingTests(unittest.TestCase):
         def changed(*args):
             result = original(*args)
             rows[-1]["device_ticks"] += 1
-            self.imu_path.write_bytes(b"".join(_json_bytes(row) for row in rows))
+            self.imu_path.write_bytes(b"".join(json_bytes(row) for row in rows))
             return result
 
         with (
@@ -290,7 +330,7 @@ class TimestampStreamingTests(unittest.TestCase):
             storage_encoding=encoding,
         )
         self.manifest["schema"] = "ylx.device-session.v4"
-        self.manifest_path.write_bytes(_json_bytes(self.manifest))
+        self.manifest_path.write_bytes(json_bytes(self.manifest))
         # The public v4 contract additionally requires session encoding parameters;
         # isolate the reader here; full v4 validation is covered by recording tests.
         with patch.object(timestamps, "validate_public_session", return_value=self.manifest):

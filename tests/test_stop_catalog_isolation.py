@@ -7,14 +7,19 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
+from rp_ylx.api.events import validate_capture_status
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    frame,
+    start_command,
+    stop_command,
+)
 
 
 class StopCatalogIsolationTest(unittest.TestCase):
     def exercise(self, stage, reason="user", late_failure=False):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         first = fixture.coordinator()
         try:
@@ -23,8 +28,8 @@ class StopCatalogIsolationTest(unittest.TestCase):
             first.close()
         coordinator = fixture.coordinator()
         self.addCleanup(coordinator.close)
-        coordinator.start_capture(fixtures.start_command("active"))
-        self.assertTrue(coordinator.submit_frame(fixtures.frame()))
+        coordinator.start_capture(start_command("active"))
+        self.assertTrue(coordinator.submit_frame(frame()))
         recorder, plan = coordinator._active, coordinator._active_plan
         waiting, entered, release = threading.Event(), threading.Event(), threading.Event()
         outcomes, errors, workers = {}, {}, []
@@ -112,13 +117,13 @@ class StopCatalogIsolationTest(unittest.TestCase):
                     if stage == "sqlite":
                         database = sqlite3.connect(fixture.state_root / "catalog.sqlite3")
                         database.execute("BEGIN IMMEDIATE")
-                command = fixtures.stop_command("stop", reason=reason)
+                command = stop_command("stop", reason=reason)
                 stop_done = launch("stop", lambda: coordinator.stop_capture(command))
                 self.assertTrue((waiting if stage == "list" else entered).wait(3))
                 status_done = launch("status", coordinator.capture_status)
                 self.assertTrue(status_done.wait(0.25), "catalog wait held the state lock")
                 self.assertNotIn("status", errors)
-                fixtures.validate_capture_status(outcomes["status"])
+                validate_capture_status(outcomes["status"])
                 self.assertEqual(outcomes["status"]["snapshot"]["device_state"], "finalizing")
                 self.assertIs(coordinator._active, recorder)
                 self.assertFalse(stop_done.is_set())
@@ -132,7 +137,7 @@ class StopCatalogIsolationTest(unittest.TestCase):
                 start_done = launch(
                     "start",
                     lambda: coordinator.start_capture(
-                        fixtures.start_command("forbidden-new-take"),
+                        start_command("forbidden-new-take"),
                     ),
                 )
                 self.assertTrue(start_done.wait(0.25))
@@ -161,10 +166,16 @@ class StopCatalogIsolationTest(unittest.TestCase):
                     thread.join(5)
                 self.assertTrue(all(not thread.is_alive() for thread in workers))
         if late_failure:
-            self.assertIsInstance(errors.pop("stop"), ProviderError)
+            self.assertEqual(outcomes["stop"].status, 202)
             self.assertEqual(coordinator.capture_status()["snapshot"]["device_state"], "idle")
-            retained = coordinator.retained_unsuccessful_outcome(plan.session_id)
-            self.assertIsNotNone(retained)
+            self.assertIsNone(coordinator.retained_unsuccessful_outcome(plan.session_id))
+            page = coordinator.list_sessions(
+                cursor=None,
+                limit=50,
+                take_id=None,
+                api_version="v4",
+            )
+            self.assertIn(plan.session_id, [item["session_id"] for item in page["items"]])
         else:
             expected = 204 if reason == "safe_swap" else 202
             self.assertEqual(outcomes["stop"].status, expected)

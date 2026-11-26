@@ -8,14 +8,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx.recording.device_session import DeviceRecordingError
-from tests import test_split_eye_recording as fixture
+from tests.testkit import FakeAudioRecorder, FakeSessionStore, SplitEyeHarness
 
 
 class CaptureGateBoundaryTest(unittest.TestCase):
     @contextmanager
     def recording(self, *, audio=False):
         with tempfile.TemporaryDirectory() as directory:
-            store = fixture.FakeSessionStore()
+            store = FakeSessionStore()
             with (
                 patch("rp_ylx.recording.device_session.native_session_store", return_value=store),
                 patch(
@@ -23,7 +23,7 @@ class CaptureGateBoundaryTest(unittest.TestCase):
                     return_value=Path("/bin/true"),
                 ),
             ):
-                recorder, _, _ = fixture.SplitEyeRecordingTest().build(
+                recorder, _, _ = SplitEyeHarness().build(
                     Path(directory), native_data_plane=True, audio_enabled=audio
                 )
                 recorder.start()
@@ -101,7 +101,7 @@ class CaptureGateBoundaryTest(unittest.TestCase):
 
     def test_real_audio_tail_extends_early_gate_without_including_later_drain(self):
         with self.recording(audio=True) as (recorder, transaction):
-            audio = fixture.FakeAudioRecorder(recorder._partial)
+            audio = FakeAudioRecorder(recorder._partial)
             audio.start()
             transaction.capture_stopped_monotonic_ns = audio.started_monotonic_ns
             audio_result = audio.stop()

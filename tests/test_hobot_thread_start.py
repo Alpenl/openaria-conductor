@@ -14,7 +14,7 @@ from pathlib import Path
 class HobotThreadStartTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("cc")
+        compiler = shutil.which("gcc") or shutil.which("cc")
         if not compiler:
             raise unittest.SkipTest("C compiler unavailable")
         cls.temporary = tempfile.TemporaryDirectory()

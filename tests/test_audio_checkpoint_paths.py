@@ -4,12 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests import test_live_sealing as fixtures
+from tests.testkit import audio_sealing
 
 
 class AudioCheckpointPathsTests(unittest.TestCase):
     def fixture(self, root, count):
-        sealing = fixtures.LiveSealingTests().audio_sealing(root)
+        sealing = audio_sealing(root)
         segments = [{"path": f"audio/audio_{i:05d}.wav", "index": i} for i in range(count)]
         sealing.prepared = {s["path"]: object() for s in segments}
         (root / "audio").mkdir()

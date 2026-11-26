@@ -1,4 +1,6 @@
+import fcntl
 import multiprocessing
+import os
 import sqlite3
 import threading
 import traceback
@@ -6,20 +8,76 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
-from tests import test_stop_state_commit as helpers
+from rp_ylx.api.events import validate_capture_status
+from tests.testkit import (
+    CoordinatorHarness,
+    CoordinatorMixin,
+    frame,
+    start_command,
+    stop_command,
+)
 
 
-class SafeSwapCommitTest(unittest.TestCase):
-    cleanup_workers = helpers.StopStateCommitTest.cleanup_workers
-    launch = helpers.StopStateCommitTest.launch
-    assert_responsive = helpers.StopStateCommitTest.assert_responsive
-    assert_busy_start = helpers.StopStateCommitTest.assert_busy_start
-    assert_lease_held = helpers.StopStateCommitTest.assert_lease_held
-
+class SafeSwapCommitTest(CoordinatorMixin):
     def setUp(self):
-        helpers.StopStateCommitTest.setUp(self)
-        self.command = fixtures.stop_command("safe-swap", reason="safe_swap")
+        super().setUp()
+        self.coordinator = self.harness.coordinator()
+        self.addCleanup(self.coordinator.close)
+        self.coordinator.start_capture(start_command("start"))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
+        self.sid = self.harness.active_session_id(self.coordinator)
+        self.command = stop_command("safe-swap", reason="safe_swap")
+        self.recorder = self.coordinator._active
+        self.workers = []
+        self.results = {}
+        self.errors = {}
+        self.release = threading.Event()
+        self.addCleanup(self.cleanup_workers)
+
+    def cleanup_workers(self):
+        self.release.set()
+        for worker in self.workers:
+            worker.join(5)
+        self.assertTrue(all(not worker.is_alive() for worker in self.workers))
+
+    def launch(self, name, function):
+        done = threading.Event()
+
+        def work():
+            try:
+                self.results[name] = function()
+            except BaseException as error:
+                self.errors[name] = error
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=work, name=name)
+        self.workers.append(worker)
+        worker.start()
+        return done
+
+    def assert_responsive(self):
+        self.assertTrue(self.launch("status", self.coordinator.capture_status).wait(0.25))
+        self.assertNotIn("status", self.errors)
+        validate_capture_status(self.results["status"])
+
+    def assert_busy_start(self):
+        done = self.launch(
+            "new-start",
+            lambda: self.coordinator.start_capture(start_command("new-start")),
+        )
+        self.assertTrue(done.wait(0.25))
+        error = self.errors.pop("new-start")
+        self.assertIsInstance(error, ProviderError)
+        self.assertEqual(error.code, "capture_busy")
+
+    def assert_lease_held(self):
+        fd = os.open(self.coordinator._network_operation_lock_path(), os.O_RDONLY)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
 
     def delay_commit(self, stage):
         c = self.coordinator
@@ -225,21 +283,20 @@ class SafeSwapCommitTest(unittest.TestCase):
 
 class SafeSwapCommitCrashTest(unittest.TestCase):
     def crash(self, after):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         context = multiprocessing.get_context("fork")
         receive, send = context.Pipe(duplex=False)
         self.addCleanup(receive.close)
         self.addCleanup(send.close)
-        command = fixtures.stop_command("crash-handoff", reason="safe_swap")
+        command = stop_command("crash-handoff", reason="safe_swap")
 
         def child():
             try:
                 c = fixture.coordinator()
-                c.start_capture(fixtures.start_command("crash-start"))
+                c.start_capture(start_command("crash-start"))
                 sid = fixture.active_session_id(c)
-                self.assertTrue(c.submit_frame(fixtures.frame()))
+                self.assertTrue(c.submit_frame(frame()))
                 original = c._state_db.put_capture_state
 
                 def boundary(value, *args, **kwargs):

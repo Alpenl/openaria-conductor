@@ -22,20 +22,12 @@ from rp_ylx.camera import (
     v4l2_stream_factory,
 )
 from rp_ylx.camera.v4l2 import (
-    V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC,
-    V4L2_BUF_TYPE_VIDEO_CAPTURE,
-    V4L2_CAP_STREAMING,
-    V4L2_CAP_VIDEO_CAPTURE,
-    VIDIOC_DQBUF,
-    VIDIOC_QBUF,
-    VIDIOC_QUERYBUF,
-    VIDIOC_QUERYCAP,
     VIDIOC_REQBUFS,
-    VIDIOC_S_FMT,
     VIDIOC_S_PARM,
     VIDIOC_STREAMOFF,
     VIDIOC_STREAMON,
 )
+from tests.testkit import FakeV4L2Device as _FakeV4L2Device
 
 MODE = CameraMode(1920, 1080, 30.0, "mjpg")
 FOCUS_STATUS = {
@@ -244,92 +236,6 @@ class V4L2DiscoveryTest(unittest.TestCase):
     def test_default_factory_is_real_v4l2_stream(self) -> None:
         backend = V4L2DiscoveryBackend(v4l2_ctl="", sys_root=Path("/missing"))
         self.assertIs(backend._stream_factory, v4l2_stream_factory)
-
-
-class _FakeMmap:
-    def __init__(self, length: int) -> None:
-        self.data = bytearray(length)
-        self.closed = False
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, item: object) -> object:
-        return self.data[item]  # type: ignore[index]
-
-    def __setitem__(self, item: object, value: object) -> None:
-        self.data[item] = value  # type: ignore[index]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _FakeV4L2Device:
-    def __init__(
-        self,
-        payloads: list[bytes],
-        *,
-        bad_flags: bool = False,
-        timestamps: tuple[int, ...] | None = None,
-        sequences: tuple[int, ...] | None = None,
-    ) -> None:
-        self.payloads = iter(payloads)
-        self.bad_flags = bad_flags
-        self.timestamps = iter(timestamps) if timestamps is not None else None
-        self.sequences = iter(sequences) if sequences is not None else None
-        self.buffers = [_FakeMmap(4096), _FakeMmap(4096)]
-        self.ioctls: list[int] = []
-        self.queued: list[int] = []
-        self.closed_fds: list[int] = []
-        self.sequence = 10
-        self.timestamp = 1
-
-    def ioctl(self, fd: int, request: int, payload: bytearray) -> None:
-        import struct
-
-        self.ioctls.append(request)
-        if request == VIDIOC_QUERYCAP:
-            struct.pack_into("<II", payload, 84, V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING, 0)
-        elif request == VIDIOC_S_FMT:
-            self.assert_format(payload)
-        elif request == VIDIOC_S_PARM:
-            struct.pack_into("<II", payload, 12, 1, 30)
-        elif request == VIDIOC_REQBUFS:
-            struct.pack_into("<I", payload, 0, 2)
-        elif request == VIDIOC_QUERYBUF:
-            index = struct.unpack_from("<I", payload, 0)[0]
-            struct.pack_into("<I", payload, 64, index * 4096)
-            struct.pack_into("<I", payload, 72, 4096)
-        elif request == VIDIOC_QBUF:
-            self.queued.append(struct.unpack_from("<I", payload, 0)[0])
-        elif request == VIDIOC_DQBUF:
-            index = self.queued.pop(0) if self.queued else 0
-            frame = next(self.payloads)
-            self.buffers[index].data[: len(frame)] = frame
-            struct.pack_into("<IIII", payload, 0, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, len(frame), 0)
-            flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC if not self.bad_flags else 0x40
-            struct.pack_into("<I", payload, 12, flags)
-            timestamp = next(self.timestamps) if self.timestamps is not None else self.timestamp
-            struct.pack_into("<qq", payload, 24, timestamp, 0)
-            sequence = next(self.sequences) if self.sequences is not None else self.sequence
-            struct.pack_into("<I", payload, 56, sequence)
-            self.sequence += 1
-            self.timestamp += 1
-        elif request in {VIDIOC_STREAMON, VIDIOC_STREAMOFF}:
-            return
-        else:
-            raise AssertionError(f"unexpected ioctl {request:#x}")
-
-    @staticmethod
-    def assert_format(payload: bytearray) -> None:
-        import struct
-
-        width, height = struct.unpack_from("<II", payload, 8)
-        if (width, height) != (3840, 1080):
-            raise AssertionError((width, height))
-
-    def mmap(self, fd: int, length: int, prot: int, flags: int, offset: int) -> _FakeMmap:
-        return self.buffers[offset // 4096]
 
 
 class V4L2StreamTest(unittest.TestCase):

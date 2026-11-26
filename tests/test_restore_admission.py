@@ -1,5 +1,6 @@
 """Validate the actual restore snapshot before moving existing authority."""
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -16,6 +17,11 @@ class RestoreAdmissionTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.source = StateDatabase(self.root / "source.sqlite3")
         for name in ("capture", "controller", "device"):
             self.source.put(name, {"revision": 7})

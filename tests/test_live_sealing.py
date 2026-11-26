@@ -14,38 +14,23 @@ from rp_ylx.recording.audit import capture_audit
 from rp_ylx.recording.device_session import DeviceRecordingError, validate_device_session_directory
 from rp_ylx.recording.live_seal import LiveSealing, _Journal
 from rp_ylx.recording.storage import BLOCK_BYTES, open_metadata
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import (
+    SplitEyeHarness,
+    audio_sealing,
+    compact_audio_stub,
+    publish_audio_checkpoint,
+)
 
 
 class LiveSealingTests(unittest.TestCase):
     def audio_sealing(self, root):
-        # Exercise checkpoint polling without starting audit/compaction workers.
-        sealing = object.__new__(LiveSealing)
-        sealing.root = root
-        sealing.prepared = {}
-        sealing._audio_checkpoint_identity = None
-        sealing.finished = threading.Event()
-        sealing.cancelled = threading.Event()
-        return sealing
+        return audio_sealing(root)
 
     def publish_checkpoint(self, root, indices):
-        directory = root / "audio"
-        directory.mkdir(exist_ok=True)
-        segments = []
-        for index in indices:
-            relative = f"audio/audio_{index:05d}.wav"
-            path = root / relative
-            if not path.exists():
-                path.write_bytes(f"closed audio segment {index}".encode())
-            segments.append({"path": relative, "index": index})
-        temporary = directory / "checkpoint.tmp"
-        temporary.write_text(json.dumps({"segments": segments}))
-        temporary.replace(directory / "checkpoint.json")
+        publish_audio_checkpoint(root, indices)
 
     def compact_audio(self, source, *, durable=True):
-        target = source.with_suffix(".flac")
-        target.write_bytes(b"compacted audio")
-        return target, {"codec": "flac"}
+        return compact_audio_stub(source, durable=durable)
 
     def test_prepared_audio_requires_durable_admission_and_propagates_sync_failure(self):
         from rp_ylx.recording.live_seal import PreparedArtifact, _read_back
@@ -250,7 +235,7 @@ class LiveSealingTests(unittest.TestCase):
 
     def test_progress_does_not_sync_coordinator_for_each_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
-            recorder, _, _ = fixtures.SplitEyeRecordingTest().build(Path(directory))
+            recorder, _, _ = SplitEyeHarness().build(Path(directory))
             recorder.start()
             sink = recorder._state_sink = Mock()
             try:
@@ -274,7 +259,7 @@ class LiveSealingTests(unittest.TestCase):
         from rp_ylx.api import downloads
 
         with tempfile.TemporaryDirectory() as directory:
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(directory))
             recorder.start()
             fixture.feed(recorder, 3)
@@ -406,7 +391,7 @@ class LiveSealingTests(unittest.TestCase):
 
     def test_verified_files_still_read_content_and_detect_restored_mtime_tamper(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(directory))
             recorder.start()
             fixture.feed(recorder, 3)

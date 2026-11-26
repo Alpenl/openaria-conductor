@@ -139,51 +139,33 @@ class UpdateAtomicCleanupTest(unittest.TestCase):
         firmware_control.atomic_json(self.path, {"recovered": True})
         self.assertEqual(json.loads(self.path.read_bytes()), {"recovered": True})
 
-    def _stream_failure(self, method):
-        factory = tempfile.NamedTemporaryFile
-        error = OSError(errno.ENOSPC, "stream failure")
+    def _write_failure(self, mode):
+        error = OSError(errno.ENOSPC, "write failure")
+        real_write = os.write
 
-        class FailingStream:
-            def __init__(self, *args, **kwargs):
-                self.stream = factory(*args, **kwargs)
-                self.name = self.stream.name
-
-            def __enter__(self):
-                self.stream.__enter__()
-                return self
-
-            def __exit__(self, *args):
-                return self.stream.__exit__(*args)
-
-            def write(self, value):
-                if method == "write":
-                    self.stream.write(value[:3])
-                    raise error
-                return self.stream.write(value)
-
-            def flush(self):
-                if method == "flush":
-                    raise error
-                return self.stream.flush()
-
-            def fileno(self):
-                return self.stream.fileno()
+        def failing_write(fd, data):
+            if mode == "write":
+                real_write(fd, data[:3])
+                raise error
+            return real_write(fd, data)
 
         before = len(os.listdir("/proc/self/fd"))
-        with (
-            patch.object(update.tempfile, "NamedTemporaryFile", FailingStream),
-            self.assertRaises(OSError) as raised,
-        ):
+        patcher = (
+            patch.object(update.os, "write", side_effect=failing_write)
+            if mode == "write"
+            else patch.object(update.os, "fsync", side_effect=error)
+        )
+        with patcher, self.assertRaises(OSError) as raised:
             update.atomic_json(self.path, {"new": True})
         self.assertIs(raised.exception, error)
         self.assert_old_only()
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_partial_write_failure_cleans_temporary(self):
-        self._stream_failure("write")
+        self._write_failure("write")
 
     def test_flush_failure_cleans_temporary(self):
-        self._stream_failure("flush")
+        self._write_failure("flush")
 
     def test_network_bootstrap_failure_cleans_temp_and_retry_succeeds(self):
         state = self.root / "network"

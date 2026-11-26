@@ -13,8 +13,9 @@ from unittest.mock import patch
 from rp_ylx.api import ProviderError
 from rp_ylx.recording import validate_device_session_directory
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
-from tests.test_async_stop import (
+from tests import testkit as fixtures
+from tests.testkit import (
+    CoordinatorHarness,
     check_started_worker_cancellation,
     check_worker_initialization_failures,
 )
@@ -22,8 +23,7 @@ from tests.test_async_stop import (
 
 class AsyncStopCrashTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def wait_finished(self, coordinator):

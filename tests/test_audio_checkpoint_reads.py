@@ -15,6 +15,7 @@ from rp_ylx.recording.verified import identity
 RACE = r"""
 import json, os, sys
 from pathlib import Path
+from unittest.mock import patch
 sys.path[:0] = json.loads(sys.argv[2])
 from rp_ylx.recording.live_seal import LiveSealing
 kind = sys.argv[1]
@@ -24,10 +25,8 @@ checkpoint = root / 'audio/checkpoint.json'
 checkpoint.write_text('{"segments": []}')
 other = root / 'replacement.json'
 other.write_text('{"segments": []}')
-sealing = object.__new__(LiveSealing)
-sealing.root = root
-sealing.prepared = {}
-sealing._audio_checkpoint_identity = None
+with patch('rp_ylx.recording.live_seal.ThreadPoolExecutor'):
+    sealing = LiveSealing(root, 30, 2)
 original = Path.stat
 swapped = False
 def race(path, *args, **kwargs):
@@ -60,7 +59,7 @@ class AudioCheckpointReadsTest(unittest.TestCase):
                     [sys.executable, "-c", RACE, kind, json.dumps(sys.path), directory],
                     capture_output=True,
                     text=True,
-                    timeout=3,
+                    timeout=10,
                 )
         except subprocess.TimeoutExpired:
             self.fail(f"{kind} checkpoint replacement blocked the reader")

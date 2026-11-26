@@ -11,7 +11,7 @@ from unittest.mock import patch
 from rp_ylx.camera import CameraError, CameraMode, V4L2CameraStream, split_sbs_mjpeg
 from rp_ylx.camera.v4l2 import _jpeg_dimensions, _jpeg_markers
 from rp_ylx.contracts.frame_stream import MAGIC, encode_frame
-from tests.test_camera import _FakeV4L2Device
+from tests.testkit import FakeV4L2Device as _FakeV4L2Device
 
 CORPUS = json.loads((Path(__file__).parents[1] / "contracts/golden/data-plane-v0.json").read_text())
 
@@ -48,17 +48,27 @@ class DataPlaneGoldenTest(unittest.TestCase):
         self.assertTrue(CORPUS["lifecycle"]["close_is_idempotent"])
         self.assertTrue(CORPUS["lifecycle"]["stop_after_close_is_noop"])
 
+    def _fake_stream(self) -> V4L2CameraStream:
+        fake = _FakeV4L2Device([])
+        stream = V4L2CameraStream(
+            "/dev/video-test",
+            CameraMode(3840, 1080, 30.0, "mjpg"),
+            ioctl=fake.ioctl,
+            mmap_factory=fake.mmap,
+            open_file=lambda path, flags: 7,
+            close_file=fake.closed_fds.append,
+            wait_readable=lambda fd, timeout: True,
+        )
+        self.addCleanup(stream.close)
+        return stream
+
     def test_v4l2_sequence_wrap_matches_corpus(self) -> None:
-        stream = object.__new__(V4L2CameraStream)
-        stream._last_sequence = None
-        stream._sequence_epoch = 0
+        stream = self._fake_stream()
         actual = [stream._source_sequence(value) for value in CORPUS["sequence"]["wrap_input"]]
         self.assertEqual(actual, CORPUS["sequence"]["wrap_output"])
 
     def test_v4l2_regressions_and_repeated_close_match_corpus(self) -> None:
-        stream = object.__new__(V4L2CameraStream)
-        stream._last_sequence = None
-        stream._sequence_epoch = 0
+        stream = self._fake_stream()
         stream._source_sequence(CORPUS["sequence"]["regression_input"][0])
         with self.assertRaises(CameraError) as sequence:
             stream._source_sequence(CORPUS["sequence"]["regression_input"][1])

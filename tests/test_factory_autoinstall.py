@@ -13,7 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.factory_recovery import device, disks, firstboot, partition_layout, provision, recover
-from tests.test_factory_recovery import profile
+from tests.testkit import factory_profile as profile
+from tests.testkit import vendor_mbr
 
 
 def bound_profile():
@@ -257,8 +258,6 @@ class AutoinstallTests(unittest.TestCase):
 
         from pyfatfs.PyFat import PyFat
         from pyfatfs.PyFatFS import PyFatFS
-
-        from tests.test_exfat_storage import vendor_mbr
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

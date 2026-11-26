@@ -9,7 +9,7 @@ import unittest
 
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
-from tests.test_gateway import DeviceProvider
+from tests.testkit import DeviceProvider
 
 
 class GatewayUriErrorsTest(unittest.TestCase):

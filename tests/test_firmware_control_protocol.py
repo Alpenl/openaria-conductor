@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 from rp_ylx import firmware_control as control
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
+from tests.testkit import FIRMWARE_STATUS
 
 
 class ReplyHandler(socketserver.StreamRequestHandler):
@@ -207,11 +208,11 @@ class FirmwareControlResponseTest(unittest.TestCase):
                 self.assertEqual(
                     json.loads(response.read())["error"]["code"], "update_service_unavailable"
                 )
-                self.reply({"ok": True, "body": {"recovered": True}})
+                self.reply({"ok": True, "body": FIRMWARE_STATUS})
                 client.request("GET", "/api/v4/firmware")
                 response = client.getresponse()
                 self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read()), {"recovered": True})
+                self.assertEqual(json.loads(response.read()), FIRMWARE_STATUS)
             finally:
                 client.close()
 

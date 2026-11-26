@@ -6,12 +6,14 @@ import socket
 import sys
 import threading
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from rp_ylx.api import CaptureCommandResult
 from rp_ylx.api.gateway import GatewayHandler, create_gateway_server
 from rp_ylx.api.security import Principal, SecurityPolicy
+from tests.testkit import FIRMWARE_STATUS, firmware_task
 
 SID = "01989f69-0000-7000-8000-000000000001"
 DELETE = {
@@ -24,7 +26,11 @@ class GatewayAuditFailuresTest(unittest.TestCase):
     def setUp(self):
         self.events = []
         self.fail_outcomes = {"completed"}
-        self.result = {"deleted_session_ids": [SID], "failed": []}
+        self.result = {
+            "schema": "ylx.session-delete-result.v1",
+            "deleted_session_ids": [SID],
+            "failed_sessions": [],
+        }
         self.delete = Mock(return_value=CaptureCommandResult(200, self.result, replayed=True))
         self.server = create_gateway_server(
             "127.0.0.1",
@@ -149,20 +155,19 @@ class GatewayAuditFailuresTest(unittest.TestCase):
 
     def test_firmware_completed_results_survive_audit_failure(self):
         for operation in ["status", "check", "update", "rollback"]:
+            mutation = operation in {"update", "rollback"}
+            expected = firmware_task(action=operation) if mutation else deepcopy(FIRMWARE_STATUS)
             with (
                 self.subTest(operation=operation),
-                patch(
-                    "rp_ylx.api.gateway.request_firmware", return_value={"task": "accepted"}
-                ) as firmware,
+                patch("rp_ylx.api.gateway.request_firmware", return_value=expected) as firmware,
             ):
-                mutation = operation in {"update", "rollback"}
                 response, payload = self.request(
                     "POST" if mutation else "GET",
                     "/api/v4/firmware" + ("" if operation == "status" else "/" + operation),
                     {"commit": "a" * 40} if mutation else None,
                 )
                 self.assertEqual(response.status, 202 if mutation else 200)
-                self.assertEqual(json.loads(payload), {"task": "accepted"})
+                self.assertEqual(json.loads(payload), expected)
                 self.assertEqual(response.getheader("YLX-Audit-Status"), "unavailable")
                 firmware.assert_called_once()
 
@@ -198,9 +203,12 @@ class GatewayAuditFailuresTest(unittest.TestCase):
             self.assertNotIn("secret", str(logger.mock_calls))
 
     def test_process_control_exceptions_propagate(self):
-        handler = GatewayHandler.__new__(GatewayHandler)
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        with patch.object(GatewayHandler, "handle"):
+            handler = GatewayHandler(left, ("127.0.0.1", 0), self.server)
         handler._request_id = "unit-only"
-        handler.server = self.server
         for error in [KeyboardInterrupt(), SystemExit()]:
             with self.subTest(error=type(error).__name__):
                 self.server.audit_sink = Mock(side_effect=error)

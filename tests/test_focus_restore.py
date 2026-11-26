@@ -1,6 +1,5 @@
 """Saved focus failures must not lock users out of correcting focus."""
 
-import copy
 import json
 import sqlite3
 import unittest
@@ -10,35 +9,13 @@ from rp_ylx.api import ProviderError
 from rp_ylx.api.events import validate_capture_status
 from rp_ylx.camera import CameraError
 from rp_ylx.persistence import StateDatabase
-from tests import test_capture_coordinator as fixtures
-
-
-class FocusSources(fixtures.FakeSources):
-    def __init__(self):
-        super().__init__()
-        self.focus = copy.deepcopy(fixtures.CAMERA_FOCUS_STATUS)
-        self.calls = []
-        self.failures = []
-
-    def set_camera_focus(self, *, value=None, auto_enabled=None):
-        self.calls.append((value, auto_enabled))
-        if self.failures:
-            raise self.failures.pop(0)
-        if value is not None and (type(value) is not int or not 0 <= value <= 255):
-            raise CameraError("invalid_focus_value", "fixture invalid focus")
-        if auto_enabled is not None and type(auto_enabled) is not bool:
-            raise CameraError("invalid_camera_focus", "fixture invalid auto mode")
-        return super().set_camera_focus(value=value, auto_enabled=auto_enabled)
-
-
-def focus_command(key, value):
-    return fixtures.command(key, {"schema": "ylx.camera-focus-set.v1", "value": value})
+from tests import testkit as fixtures
+from tests.testkit import FocusSources, focus_command
 
 
 class FocusRestoreTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = fixtures.CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         first = self.fixture.coordinator()
         first.close()

@@ -2,7 +2,6 @@
 
 import json
 import os
-import struct
 import subprocess
 import tempfile
 import unittest
@@ -12,16 +11,7 @@ from unittest.mock import patch
 
 from rp_ylx.recording.coordinator import _stat_capacity
 from scripts.factory_recovery import firstboot, partition_layout, storage_firstboot
-
-
-def vendor_mbr():
-    raw = bytearray(512)
-    raw[440:444] = bytes.fromhex("05722edb")
-    raw[450], raw[466] = 0xC, 0x83
-    struct.pack_into("<II", raw, 454, 8192, 524288)
-    struct.pack_into("<II", raw, 470, 532480, 19767296)
-    raw[510:] = b"\x55\xaa"
-    return bytes(raw)
+from tests.testkit import vendor_mbr
 
 
 class ExfatStorageTests(unittest.TestCase):

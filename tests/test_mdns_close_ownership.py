@@ -7,7 +7,7 @@ from contextlib import suppress
 from unittest.mock import Mock, patch
 
 from rp_ylx.mdns import MDNS_SERVICE_TYPES, MdnsPublisher
-from tests.test_mdns import FakeResponder
+from tests.testkit import FakeResponder
 
 
 class ResourceResponder(FakeResponder):

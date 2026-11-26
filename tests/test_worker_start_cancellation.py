@@ -3,11 +3,16 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rp_ylx.daemon import CaptureEventPump, StorageReserveMonitor, build_production_service
-from tests import test_daemon as fixture
+from rp_ylx.daemon import (
+    CaptureEventPump,
+    ProductionConfig,
+    StorageReserveMonitor,
+    build_production_service,
+)
 
 _REAL_START = threading.Thread.start
 _REAL_JOIN = threading.Thread.join
@@ -237,7 +242,20 @@ class WorkerStartCancellationTest(unittest.TestCase):
     def test_service_builder_unwinds_other_resources_after_real_worker_cancellation(self):
         for failing_name in ("rp-ylx-capture-events", "storage-reserve"):
             with self.subTest(thread=failing_name), tempfile.TemporaryDirectory() as directory:
-                config = fixture.ProductionDaemonTest().config(Path(directory))
+                root = Path(directory)
+                config = ProductionConfig(
+                    host="127.0.0.1",
+                    port=8080,
+                    camera_device=Path("/dev/video0"),
+                    mountpoint=root / "volume",
+                    state_root=root / "state",
+                    device_id=str(uuid.uuid4()),
+                    device_label="YLX-12AB34CD",
+                    hardware_fingerprint="sha256:" + "a" * 64,
+                    isolated_network=True,
+                    minimum_available_bytes=0,
+                    minimum_available_inodes=0,
+                )
                 coordinator = Mock()
                 coordinator.capture_recording_progress.return_value = ("epoch", 1, None)
                 coordinator.capture_snapshot_event.return_value = {

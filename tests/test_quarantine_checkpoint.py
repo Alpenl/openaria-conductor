@@ -7,13 +7,12 @@ import unittest
 
 from rp_ylx.api import ProviderError
 from rp_ylx.persistence import PersistenceError
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, start_command
 
 
 class QuarantineCheckpointTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         coordinator = self.fixture.coordinator()
         coordinator.close()
@@ -24,7 +23,7 @@ class QuarantineCheckpointTest(unittest.TestCase):
 
     def assert_blocked(self, coordinator):
         with self.assertRaises(ProviderError) as raised:
-            coordinator.start_capture(fixtures.start_command(self.scope[2]))
+            coordinator.start_capture(start_command(self.scope[2]))
         self.assertEqual(raised.exception.code, "command_receipt_invalid")
 
     def raw_row(self):
@@ -124,7 +123,7 @@ class QuarantineCheckpointTest(unittest.TestCase):
         coordinator = self.fixture.coordinator()
         try:
             state = self.database.get("capture")
-            command = fixtures.start_command(self.scope[2])
+            command = start_command(self.scope[2])
             replacement = {
                 "principal_id": self.scope[0],
                 "operation": self.scope[1],

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import rp_ylx.recording.device_session as session
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import SplitEyeHarness
 
 
 class StopFailureDrainTests(unittest.TestCase):
@@ -23,11 +23,9 @@ class StopFailureDrainTests(unittest.TestCase):
                     raise TimeoutError("test writer gate was not released")
 
         with tempfile.TemporaryDirectory() as temporary:
-            recorder, encoders, _ = fixtures.SplitEyeRecordingTest().build(
-                Path(temporary), before_write=block
-            )
+            recorder, encoders, _ = SplitEyeHarness().build(Path(temporary), before_write=block)
             recorder.start()
-            fixtures.SplitEyeRecordingTest.feed(recorder, 3)
+            SplitEyeHarness.feed(recorder, 3)
             self.assertTrue(entered.wait(3))
             writer = recorder._writer
             join, close = writer.join, recorder._close_files

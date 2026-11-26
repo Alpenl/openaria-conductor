@@ -10,6 +10,7 @@ from unittest.mock import patch
 from rp_ylx.camera import (
     CameraController,
     CameraDescriptor,
+    CameraMode,
     FrameObservation,
     StereoFrame,
     SyntheticCameraBackend,
@@ -17,7 +18,8 @@ from rp_ylx.camera import (
 from rp_ylx.native import NativeModuleError
 from rp_ylx.performance.metrics import PerformanceMetrics
 from rp_ylx.recording import RecordingConfig, SessionRecorder
-from tests.test_camera import MODE
+
+MODE = CameraMode(1920, 1080, 30.0, "mjpg")
 
 
 class PerformanceMetricsTest(unittest.TestCase):

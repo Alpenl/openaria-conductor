@@ -26,7 +26,7 @@ from rp_ylx.daemon import (
 from rp_ylx.deployment import ReleaseManager
 from rp_ylx.native import NativeCapabilities
 from rp_ylx.recording.encoding import RecordingEncoding
-from tests.test_capture_coordinator import idle_network_control
+from tests.testkit import idle_network_control
 
 PRODUCTION_NATIVE_FEATURES = (
     "capability_probe",
@@ -220,6 +220,7 @@ class ProductionDaemonTest(unittest.TestCase):
             context.wrap_socket.assert_called_once_with(
                 original_socket,
                 server_side=True,
+                do_handshake_on_connect=False,
             )
             self.assertIs(server.socket, wrapped)
 

@@ -1,29 +1,27 @@
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from rp_ylx.api.gateway import CaptureCommandResult
-from tests import test_capture_coordinator as fixtures
+from tests import testkit as fixtures
 
 
 class CommandReceiptRetryTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest(
-            "test_stop_without_active_recording_is_idempotent_no_op"
-        )
-        self.fixture.setUp()
+        self.fixture = fixtures.CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
-        self.coordinator = self.fixture.coordinator()
+        self.sources = fixtures.FakeSources()
+        self.sources.focus = dict(fixtures.CAMERA_FOCUS_STATUS)
+        self.coordinator = self.fixture.coordinator(sources=self.sources)
         self.addCleanup(self.coordinator.close)
 
     def rows(self):
         return self.coordinator._read_local_state()["commands"]
 
-    def invoke(self, operation, command, execute):
+    def invoke(self, operation, command):
         if operation == "stop":
             return self.coordinator.stop_capture(command)
-        with self.coordinator._lock:
-            return self.coordinator._idempotent(operation, command, execute)
+        return self.coordinator.set_camera_focus(command)
 
     def fill_receipts(self, operation):
         c = self.coordinator
@@ -47,11 +45,22 @@ class CommandReceiptRetryTests(unittest.TestCase):
         self.assertEqual(len(self.rows()), 1024)
 
     def test_retry_after_failed_write_commits_receipt_without_reexecuting(self):
-        for operation in ("stop", "receipt-test"):
+        for operation in ("stop", "set_camera_focus"):
             with self.subTest(operation=operation):
-                cmd = fixtures.stop_command("retry-" + operation)
-                execute = Mock(return_value=CaptureCommandResult(200, {"value": "first"}))
+                cmd = (
+                    fixtures.stop_command("retry-" + operation)
+                    if operation == "stop"
+                    else fixtures.command(
+                        "retry-" + operation,
+                        {"schema": "ylx.camera-focus-set.v1", "value": 77},
+                    )
+                )
                 with (
+                    patch.object(
+                        self.sources,
+                        "set_camera_focus",
+                        wraps=self.sources.set_camera_focus,
+                    ) as execute,
                     patch.object(
                         self.coordinator._state_db,
                         "put_capture_state",
@@ -59,31 +68,50 @@ class CommandReceiptRetryTests(unittest.TestCase):
                     ),
                     self.assertRaises(OSError),
                 ):
-                    self.invoke(operation, cmd, execute)
+                    self.invoke(operation, cmd)
                 self.assertFalse(
                     any(r["idempotency_key"] == cmd.idempotency_key for r in self.rows())
                 )
-                replay = self.invoke(operation, cmd, execute)
+                with patch.object(
+                    self.sources,
+                    "set_camera_focus",
+                    wraps=self.sources.set_camera_focus,
+                ) as retry_execute:
+                    replay = self.invoke(operation, cmd)
                 self.assertTrue(replay.replayed)
                 self.assertTrue(
                     any(r["idempotency_key"] == cmd.idempotency_key for r in self.rows())
                 )
                 if operation != "stop":
                     execute.assert_called_once()
+                    retry_execute.assert_not_called()
 
     def test_repeated_write_failure_is_not_reported_as_durable_success(self):
-        for operation in ("stop", "receipt-test"):
+        for operation in ("stop", "set_camera_focus"):
             with self.subTest(operation=operation):
-                cmd = fixtures.stop_command("still-failed-" + operation)
-                execute = Mock(return_value=CaptureCommandResult(200, None))
-                with patch.object(
-                    self.coordinator._state_db,
-                    "put_capture_state",
-                    side_effect=OSError("injected busy database"),
+                cmd = (
+                    fixtures.stop_command("still-failed-" + operation)
+                    if operation == "stop"
+                    else fixtures.command(
+                        "still-failed-" + operation,
+                        {"schema": "ylx.camera-focus-set.v1", "value": 88},
+                    )
+                )
+                with (
+                    patch.object(
+                        self.sources,
+                        "set_camera_focus",
+                        wraps=self.sources.set_camera_focus,
+                    ) as execute,
+                    patch.object(
+                        self.coordinator._state_db,
+                        "put_capture_state",
+                        side_effect=OSError("injected busy database"),
+                    ),
                 ):
                     for _ in range(2):
                         with self.assertRaises(OSError):
-                            self.invoke(operation, cmd, execute)
+                            self.invoke(operation, cmd)
                 self.assertFalse(
                     any(r["idempotency_key"] == cmd.idempotency_key for r in self.rows())
                 )
@@ -122,41 +150,50 @@ class CommandReceiptRetryTests(unittest.TestCase):
             self.invoke(
                 "set_camera_focus",
                 fixtures.command("overflow", {"schema": "ylx.camera-focus-set.v1", "value": 42}),
-                lambda: CaptureCommandResult(200, dict(fixtures.CAMERA_FOCUS_STATUS)),
             )
         reused = fixtures.command("cached-0", {"schema": "ylx.camera-focus-set.v1", "value": 42})
-        result = self.invoke(
+        with patch.object(
+            self.sources,
             "set_camera_focus",
-            reused,
-            lambda: CaptureCommandResult(200, {**fixtures.CAMERA_FOCUS_STATUS, "value": 99}),
-        )
+            return_value={**fixtures.CAMERA_FOCUS_STATUS, "value": 99},
+        ):
+            result = self.invoke("set_camera_focus", reused)
         self.assertFalse(result.replayed)
         c.close()
-        restarted = self.fixture.coordinator()
+        restarted_sources = fixtures.FakeSources()
+        restarted_sources.focus = dict(fixtures.CAMERA_FOCUS_STATUS)
+        restarted = self.fixture.coordinator(sources=restarted_sources)
         self.addCleanup(restarted.close)
-        execute = Mock(side_effect=AssertionError("must replay without side effect"))
-        with restarted._lock:
-            replay = restarted._idempotent("set_camera_focus", reused, execute)
+        with patch.object(
+            restarted_sources,
+            "set_camera_focus",
+            side_effect=AssertionError("must replay without side effect"),
+        ) as execute:
+            replay = restarted.set_camera_focus(reused)
         self.assertEqual(replay.body, {**fixtures.CAMERA_FOCUS_STATUS, "value": 99})
         self.assertTrue(replay.replayed)
         execute.assert_not_called()
 
     def test_durable_replay_needs_no_write_and_keeps_cached_body_private(self):
-        cmd = fixtures.stop_command("durable-private")
-        execute = Mock(return_value=CaptureCommandResult(200, {"nested": {"value": 1}}))
-        first = self.invoke("receipt-test", cmd, execute)
-        first.body["nested"]["value"] = 2
+        cmd = fixtures.command(
+            "durable-private", {"schema": "ylx.camera-focus-set.v1", "value": 55}
+        )
         with patch.object(
-            self.coordinator._state_db,
-            "put_capture_state",
-            side_effect=AssertionError("unneeded database write"),
-        ):
-            replay = self.invoke("receipt-test", cmd, execute)
-            self.assertEqual(replay.body, {"nested": {"value": 1}})
-            replay.body["nested"]["value"] = 3
-            self.assertEqual(
-                self.invoke("receipt-test", cmd, execute).body, {"nested": {"value": 1}}
-            )
+            self.sources,
+            "set_camera_focus",
+            wraps=self.sources.set_camera_focus,
+        ) as execute:
+            first = self.invoke("set_camera_focus", cmd)
+            first.body["value"] = 2
+            with patch.object(
+                self.coordinator._state_db,
+                "put_capture_state",
+                side_effect=AssertionError("unneeded database write"),
+            ):
+                replay = self.invoke("set_camera_focus", cmd)
+                self.assertEqual(replay.body["value"], 55)
+                replay.body["value"] = 3
+                self.assertEqual(self.invoke("set_camera_focus", cmd).body["value"], 55)
         execute.assert_called_once()
 
     def test_delayed_snapshot_cannot_restore_an_evicted_receipt(self):

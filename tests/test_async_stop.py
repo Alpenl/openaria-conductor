@@ -7,119 +7,18 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
-from tests import test_gateway as gateway_fixtures
-
-
-def check_worker_initialization_failures(case, coordinator, command, *, recording, interrupted):
-    kinds = (KeyboardInterrupt, SystemExit) if interrupted else (RuntimeError, MemoryError)
-    scope = (command.principal_id, "stop", command.idempotency_key)
-    active = coordinator._active
-    for stage in ("construct", "start"):
-        for kind in kinds:
-            with case.subTest(stage=stage, kind=kind.__name__):
-                injected = kind("injected worker initialization failure")
-                target = (
-                    patch("rp_ylx.recording.coordinator.threading.Thread", side_effect=injected)
-                    if stage == "construct"
-                    else patch.object(threading.Thread, "start", side_effect=injected)
-                )
-                caught = None
-                try:
-                    with target:
-                        try:
-                            coordinator.request_stop_capture(command)
-                        except BaseException as error:
-                            caught = error
-                    case.assertIsNone(coordinator._async_stop_worker)
-                    case.assertIsNone(coordinator._async_stop_reason)
-                    case.assertIsNone(coordinator._stop_inflight)
-                    case.assertIs(coordinator._active, active)
-                    case.assertNotIn(scope, coordinator._commands)
-                    case.assertFalse(
-                        any(
-                            receipt["idempotency_key"] == command.idempotency_key
-                            for receipt in coordinator._state_db.capture_state().get("commands", [])
-                        )
-                    )
-                    if recording:
-                        case.fixture.assert_network_operation_lock_held()
-                        case.assertEqual(
-                            coordinator.capture_status()["snapshot"]["device_state"], "recording"
-                        )
-                    else:
-                        case.fixture.assert_network_operation_lock_available()
-                        case.assertIsNone(coordinator.current_safe_swap_receipt())
-                    if interrupted:
-                        case.assertIs(caught, injected)
-                    else:
-                        case.assertIsInstance(caught, ProviderError)
-                        case.assertEqual(caught.code, "stop_worker_unavailable")
-                        case.assertEqual(caught.status, 503)
-                        case.assertTrue(caught.retryable)
-                        case.assertIs(caught.__cause__, injected)
-                finally:
-                    # These injected starts never launch a thread. Clean the
-                    # pre-fix orphan so unittest reports failure rather than hangs.
-                    with coordinator._stop_condition:
-                        worker = coordinator._async_stop_worker
-                        if worker is not None and worker.ident is None:
-                            coordinator._async_stop_worker = None
-                            coordinator._async_stop_reason = None
-                            coordinator._stop_inflight = None
-                            coordinator._stop_condition.notify_all()
-                        if not recording:
-                            coordinator._release_network_operation_lease()
-
-
-def check_started_worker_cancellation(case, coordinator, command, *, recording):
-    started = []
-    injected = KeyboardInterrupt("cancelled after OS thread start")
-    original_start = threading.Thread.start
-    operation = "_finish_stop_capture" if recording else "_check_pending_safe_swap"
-
-    def start(worker):
-        original_start(worker)
-        started.append(worker)
-        raise injected
-
-    with patch.object(coordinator, operation, wraps=getattr(coordinator, operation)) as work:
-        try:
-            caught = None
-            with patch.object(threading.Thread, "start", start):
-                try:
-                    coordinator.request_stop_capture(command)
-                except BaseException as error:
-                    caught = error
-            case.assertIs(caught, injected)
-            for worker in started:
-                worker.join(3)
-                case.assertFalse(worker.is_alive())
-            case.assertEqual(len(started), 1)
-            work.assert_not_called()
-            case.assertIsNone(coordinator._async_stop_worker)
-            case.assertIsNone(coordinator._async_stop_reason)
-            case.assertIsNone(coordinator._stop_inflight)
-            case.assertNotIn(
-                (command.principal_id, "stop", command.idempotency_key), coordinator._commands
-            )
-            if recording:
-                case.fixture.assert_network_operation_lock_held()
-                case.assertEqual(
-                    coordinator.capture_status()["snapshot"]["device_state"], "recording"
-                )
-            else:
-                case.fixture.assert_network_operation_lock_available()
-                case.assertIsNone(coordinator.current_safe_swap_receipt())
-        finally:
-            for worker in started:
-                worker.join(4)
+from tests import testkit as fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    GatewayHarness,
+    check_started_worker_cancellation,
+    check_worker_initialization_failures,
+)
 
 
 class AsyncStopTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.release = threading.Event()
         self.entered = threading.Event()
@@ -383,8 +282,7 @@ class AsyncStopTest(unittest.TestCase):
 
     def test_real_http_returns_accepted_while_finalization_is_blocked(self):
         self.block_finalization()
-        gateway = gateway_fixtures.GatewayHttpTest()
-        gateway.setUp()
+        gateway = GatewayHarness().setUp()
         gateway.server.provider = self.coordinator
         try:
             headers = {"Origin": gateway.base, "Idempotency-Key": "http-async"}
@@ -416,13 +314,13 @@ class AsyncStopTest(unittest.TestCase):
         original = self.coordinator._finish_stop_capture
 
         def slow_finalization(*args, **kwargs):
-            time.sleep(2.2)
+            time.sleep(0.02)
             return original(*args, **kwargs)
 
         with patch.object(self.coordinator, "_finish_stop_capture", slow_finalization):
-            self.check_sync_stop_waits_for_async_error_recovery()
+            self.check_sync_stop_waits_for_async_error_recovery(poll_interval=0.005)
 
-    def check_sync_stop_waits_for_async_error_recovery(self):
+    def check_sync_stop_waits_for_async_error_recovery(self, *, poll_interval: float = 0.05):
         original = self.coordinator._retain_active_failure
         recovering, recover = threading.Event(), threading.Event()
         sync_done = threading.Event()
@@ -455,7 +353,7 @@ class AsyncStopTest(unittest.TestCase):
                 # This selects the recovery phase for the concurrency test;
                 # durable finalization before it is not a two-second SLA.
                 deadline = time.monotonic() + 30
-                while not recovering.wait(0.05):
+                while not recovering.wait(poll_interval):
                     self.assertTrue(
                         worker is not None and worker.is_alive(),
                         "async stop exited before the recovery gate",

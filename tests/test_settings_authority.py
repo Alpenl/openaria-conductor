@@ -1,27 +1,59 @@
 import copy
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx import daemon, settings
 from rp_ylx.persistence import PersistenceError, StateDatabase
-from tests import test_settings_presets as fixtures
 
 
 class SettingsAuthorityTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.SettingsPresetTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
-        self.config = self.fixture.config
-        self.base = copy.deepcopy(self.fixture.base)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = self.root / "device.json"
+        self.base = {
+            "schema": "ylx.production-config.v1",
+            "listen": {"host": "127.0.0.1", "port": 8080},
+            "camera": {"device": "/dev/video0", "width": 3840, "height": 1080, "fps": 60},
+            "storage": {
+                "mountpoint": str(self.root / "data"),
+                "minimum_available_bytes": 2147483648,
+                "minimum_available_inodes": 1024,
+            },
+            "state_root": str(self.root / "state"),
+            "device": {
+                "device_id": "11111111-1111-4111-8111-111111111111",
+                "device_label": "YLX-12AB34CD",
+                "hardware_fingerprint": "sha256:" + "a" * 64,
+            },
+            "security": {"profile": "lab", "isolated_network": True},
+            "recording": {"preset": "efficient", "gop_frames": 90, "rate_control": "avbr"},
+        }
+        self.config.write_text(json.dumps(self.base))
+        self.initial = settings.manage(self.config, "show")["settings"]
+        self.database = StateDatabase(self.root / "state/settings.sqlite3")
+
+    def set_patch(self, value, name="patch.json"):
+        source = self.root / name
+        source.write_text(json.dumps(value))
+        return settings.manage(self.config, "set", source=source)
+
+    def snapshot(self):
+        with self.database.connection() as db:
+            return {
+                name: db.execute("SELECT * FROM " + name).fetchall()
+                for name in ("documents", "changes", "imports")
+            }
 
     def write(self, base):
         self.config.write_text(json.dumps(base))
 
     def test_stored_values_override_invalid_legacy_dynamic_values_without_rewrite(self):
-        before = self.fixture.snapshot()
+        before = self.snapshot()
         for group, name, value in (
             ("camera", "fps", -1),
             ("storage", "minimum_available_bytes", -1),
@@ -34,11 +66,9 @@ class SettingsAuthorityTests(unittest.TestCase):
                 raw = self.config.read_bytes()
                 expected = daemon.load_production_config(self.config)
                 settings.initialize(self.config)
-                self.assertEqual(
-                    settings.manage(self.config, "show")["settings"], self.fixture.initial
-                )
+                self.assertEqual(settings.manage(self.config, "show")["settings"], self.initial)
                 self.assertEqual(daemon.load_production_config(self.config), expected)
-                self.assertEqual(self.fixture.snapshot(), before)
+                self.assertEqual(self.snapshot(), before)
                 self.assertEqual(self.config.read_bytes(), raw)
 
     def test_service_start_reaches_builder_with_authoritative_dynamic_values(self):
@@ -60,17 +90,17 @@ class SettingsAuthorityTests(unittest.TestCase):
     def test_updates_validate_against_stored_settings_not_stale_json(self):
         self.base["camera"]["fps"] = -1
         self.write(self.base)
-        self.fixture.set_patch({"storage": {"minimum_available_bytes": 3000}})
+        self.set_patch({"storage": {"minimum_available_bytes": 3000}})
         effective = daemon.load_production_config(self.config)
         self.assertEqual(effective.fps, 60)
         self.assertEqual(effective.minimum_available_bytes, 3000)
-        before = self.fixture.snapshot()
+        before = self.snapshot()
         with self.assertRaises(daemon.ProductionConfigError):
-            self.fixture.set_patch({"camera": {"fps": -1}})
-        self.assertEqual(self.fixture.snapshot(), before)
+            self.set_patch({"camera": {"fps": -1}})
+        self.assertEqual(self.snapshot(), before)
 
     def test_invalid_bootstrap_identity_or_path_still_fails_without_state_changes(self):
-        before = self.fixture.snapshot()
+        before = self.snapshot()
         for group, key, value in (
             ("camera", "device", "relative"),
             ("listen", "port", 0),
@@ -83,10 +113,10 @@ class SettingsAuthorityTests(unittest.TestCase):
                 self.write(base)
                 with self.assertRaises(daemon.ProductionConfigError):
                     settings.initialize(self.config)
-                self.assertEqual(self.fixture.snapshot(), before)
+                self.assertEqual(self.snapshot(), before)
 
     def test_invalid_first_import_does_not_create_a_database(self):
-        self.base["state_root"] = str(self.fixture.root / "never-created")
+        self.base["state_root"] = str(self.root / "never-created")
         self.base["camera"]["fps"] = -1
         self.write(self.base)
         with self.assertRaises(daemon.ProductionConfigError):
@@ -94,7 +124,7 @@ class SettingsAuthorityTests(unittest.TestCase):
         self.assertFalse(Path(self.base["state_root"]).exists())
 
     def test_interrupted_schema_only_initialization_can_finish_once(self):
-        self.base["state_root"] = str(self.fixture.root / "schema-only")
+        self.base["state_root"] = str(self.root / "schema-only")
         self.write(self.base)
         database = StateDatabase(settings.settings_path(self.base))
         self.assertIsNone(database.get("device"))
@@ -110,7 +140,7 @@ class SettingsAuthorityTests(unittest.TestCase):
         for kind in ("document", "file", "corrupt", "future"):
             with self.subTest(kind=kind):
                 base = copy.deepcopy(self.base)
-                base["state_root"] = str(self.fixture.root / kind)
+                base["state_root"] = str(self.root / kind)
                 self.write(base)
                 settings.initialize(self.config)
                 database = StateDatabase(settings.settings_path(base))
@@ -132,21 +162,21 @@ class SettingsAuthorityTests(unittest.TestCase):
                     self.assertIsNone(database.get("device"))
 
     def test_invalid_stored_configuration_does_not_fall_back_to_json(self):
-        self.fixture.database.put("device", {"camera": {"fps": -1}})
-        before = self.fixture.snapshot()
+        self.database.put("device", {"camera": {"fps": -1}})
+        before = self.snapshot()
         with self.assertRaises(daemon.ProductionConfigError):
             settings.initialize(self.config)
-        self.assertEqual(self.fixture.snapshot(), before)
+        self.assertEqual(self.snapshot(), before)
 
     def test_manage_uses_one_bootstrap_snapshot(self):
-        original = Path.read_bytes
+        original = settings.read_bounded_json
         observations = []
 
-        def read(path):
+        def read(path, *args, **kwargs):
             if path == self.config:
                 observations.append(path)
-            return original(path)
+            return original(path, *args, **kwargs)
 
-        with patch.object(Path, "read_bytes", read):
-            self.assertEqual(settings.manage(self.config, "show")["settings"], self.fixture.initial)
+        with patch.object(settings, "read_bounded_json", read):
+            self.assertEqual(settings.manage(self.config, "show")["settings"], self.initial)
         self.assertEqual(observations, [self.config])

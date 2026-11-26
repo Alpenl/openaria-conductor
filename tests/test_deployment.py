@@ -23,6 +23,7 @@ from rp_ylx.deployment import (
     DEPLOYMENT_ASSETS,
     NETWORK_CONTROL_PROTOCOL,
     NETWORK_STATE_MIGRATION_MARKER,
+    PRESERVED_DEPLOYMENT_ASSETS,
     SUPPORTING_DEPLOYMENT_ASSETS,
     TARGET_PLATFORM,
     DeploymentError,
@@ -51,14 +52,22 @@ from scripts.rdk_x5_install import _prepare_runtime
 class ReleaseManagerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.install_root = self.root / "opt/rp-ylx"
         self.config_root = self.root / "etc/rp-ylx"
         self.state_root = self.root / "var/lib/rp-ylx"
+        self.maintenance_lock_path = self.root / "maintenance.lock"
+        self.enterContext(
+            patch.dict(
+                os.environ,
+                {"OPENARIA_MAINTENANCE_LOCK": str(self.maintenance_lock_path)},
+            )
+        )
         self.commands: list[tuple[str, ...]] = []
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        pass
 
     @staticmethod
     def commit(character: str) -> str:
@@ -1568,7 +1577,9 @@ class ReleaseManagerTest(unittest.TestCase):
             self.commands,
         )
         self.assertFalse(runtime_socket.exists())
-        for relative, _ in DEPLOYMENT_ASSETS.values():
+        for name, (relative, _) in DEPLOYMENT_ASSETS.items():
+            if name in PRESERVED_DEPLOYMENT_ASSETS:
+                continue
             self.assertFalse((self.root / relative).exists())
         # 卸载后设备不得继续广播一个已不存在的采集服务。
         self.assertFalse(advertised.exists())
@@ -1695,6 +1706,8 @@ class ReleaseManagerTest(unittest.TestCase):
             archive.writestr("rp_ylx/__init__.py", "from ._build_info import __commit__\n")
             archive.writestr("rp_ylx/deploy/__init__.py", "")
             archive.write(repository / "src/rp_ylx/deployment.py", "rp_ylx/deployment.py")
+            for path in sorted((repository / "src/rp_ylx/deploy_pkg").glob("*.py")):
+                archive.write(path, f"rp_ylx/deploy_pkg/{path.name}")
             for module in ("update.py", "firmware_control.py"):
                 archive.write(repository / "src/rp_ylx" / module, f"rp_ylx/{module}")
             archive.writestr("rp_ylx/_build_info.py", f'__commit__ = "{commit}"\n')
@@ -1813,7 +1826,7 @@ class ReleaseManagerTest(unittest.TestCase):
         self.assertIn("SyslogIdentifier=rp-ylx-recover", recover)
         self.assertIn("ProtectSystem=strict", recover)
         self.assertIn("ReadWritePaths=/etc/rp-ylx", recover)
-        self.assertIn("ReadWritePaths=/etc/avahi/services", recover)
+        self.assertIn("ReadWritePaths=-/etc/avahi/services", recover)
         self.assertNotIn("raspberry", unit.casefold())
 
     def test_data_volume_asset_uses_data_mount_and_reserved_backing_file(self) -> None:
@@ -1934,7 +1947,7 @@ class ReleaseManagerTest(unittest.TestCase):
         )
         self.assertIn("ReadWritePaths=/var/lib/rp-ylx-network", service)
         self.assertIn("ReadWritePaths=/etc/NetworkManager/system-connections", service)
-        self.assertIn("ReadWritePaths=/etc/avahi/services", service)
+        self.assertIn("ReadWritePaths=-/etc/avahi/services", service)
         self.assertIn("ReadWritePaths=/run/rp-ylx/network-operation.lock", service)
         self.assertIn("Before=rp-ylx.service", service)
         self.assertIn("Type=notify", service)
@@ -1976,6 +1989,8 @@ class ReleaseManagerTest(unittest.TestCase):
         operation_lock = self.root / "run/rp-ylx/network-operation.lock"
         operation_lock.parent.mkdir(parents=True)
         operation_lock.touch()
+        maintenance_lock = self.root / "run/rp-ylx/maintenance.lock"
+        maintenance_lock.touch()
         environment = os.environ | {
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "STATE_DIRECTORY": str(self.root / "state"),
@@ -1988,6 +2003,7 @@ class ReleaseManagerTest(unittest.TestCase):
             "WIFI_REBOOT_COOLDOWN_SECONDS": "21600",
             "RP_YLX_COMMAND": str(rp_ylx),
             "RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(operation_lock),
+            "OPENARIA_MAINTENANCE_LOCK": str(maintenance_lock),
         }
 
         first = subprocess.run(
@@ -2063,6 +2079,8 @@ class ReleaseManagerTest(unittest.TestCase):
                 desired_mode.chmod(0o755)
                 operation_lock = self.root / f"lock-{mode}"
                 operation_lock.touch()
+                maintenance_lock = self.root / f"maintenance-lock-{mode}"
+                maintenance_lock.touch()
                 result = subprocess.run(
                     [str(script), "recover"],
                     check=False,
@@ -2075,6 +2093,7 @@ class ReleaseManagerTest(unittest.TestCase):
                         "RUNTIME_DIRECTORY": str(self.root / f"watchdog-run-{mode}"),
                         "RP_YLX_COMMAND": str(desired_mode),
                         "RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(operation_lock),
+                        "OPENARIA_MAINTENANCE_LOCK": str(maintenance_lock),
                     },
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

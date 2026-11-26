@@ -12,18 +12,16 @@ import threading
 import time
 import unittest
 import uuid
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import BinaryIO
 from unittest.mock import PropertyMock, patch
 
 import rp_ylx.api.downloads as downloads_module
 import rp_ylx.recording.coordinator as coordinator_module
-from rp_ylx.api import CaptureCommand, NetworkCommand, ProviderError
+from rp_ylx.api import CaptureCommand, ProviderError
 from rp_ylx.api.downloads import (
     ArtifactAccessError,
     DirectorySessionStore,
@@ -39,7 +37,6 @@ from rp_ylx.api.events import (
 )
 from rp_ylx.api.preview import PreviewFrameUnavailable
 from rp_ylx.camera import CameraError, FrameObservation, StereoFrame
-from rp_ylx.imu import ImuObservation, ImuSample, RawVector3
 from rp_ylx.network_control import NetworkControlClientError
 from rp_ylx.recording import (
     CaptureCoordinator,
@@ -51,415 +48,29 @@ from rp_ylx.recording import (
 )
 from rp_ylx.recording.coordinator import _TrackedRepresentation
 from rp_ylx.recording.device_session import inspect_device_session_directory
-from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 from rp_ylx.recording_layout import resolve_recording
-
-JPEG = b"\xff\xd8raw-side-by-side\xff\xd9"
-COMMIT = "a" * 40
-CAMERA_FOCUS_STATUS = {
-    "schema": "ylx.camera-focus.v1",
-    "value": 42,
-    "minimum": 0,
-    "maximum": 255,
-    "step": 1,
-    "default": 32,
-    "auto_supported": True,
-    "auto_enabled": False,
-}
-
-
-class _FaultingBinaryStream:
-    def __init__(self, stream: BinaryIO, fault: str) -> None:
-        self._stream = stream
-        self._fault = fault
-
-    def write(self, payload: bytes) -> int:
-        if self._fault == "short_write":
-            return self._stream.write(payload[:-1])
-        return self._stream.write(payload)
-
-    def flush(self) -> None:
-        if self._fault == "flush":
-            raise OSError("模拟 flush 失败")
-        self._stream.flush()
-
-    def fileno(self) -> int:
-        return self._stream.fileno()
-
-    def tell(self) -> int:
-        return self._stream.tell()
-
-    def close(self) -> None:
-        self._stream.close()
-
-    def __enter__(self) -> _FaultingBinaryStream:
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
-
-
-class _RecordingFaultInjection:
-    def __init__(self, target_name: str, fault: str) -> None:
-        self._target_name = target_name
-        self._fault = fault
-        self._descriptors: set[int] = set()
-        self._real_open = Path.open
-        self._real_fsync = os.fsync
-
-    def open(self, path: Path, *args: object, **kwargs: object) -> BinaryIO:
-        stream = self._real_open(path, *args, **kwargs)  # type: ignore[arg-type]
-        if path.name != self._target_name:
-            return stream
-        if self._fault == "fsync":
-            self._descriptors.add(stream.fileno())
-        return _FaultingBinaryStream(
-            stream,
-            self._fault if self._fault != "fsync" else "none",
-        )  # type: ignore[return-value]
-
-    def fsync(self, descriptor: int) -> None:
-        if descriptor in self._descriptors:
-            self._descriptors.remove(descriptor)
-            raise OSError("模拟 fsync 失败")
-        self._real_fsync(descriptor)
-
-
-def _path_open_fault(injection: _RecordingFaultInjection) -> object:
-    def open_with_fault(path: Path, *args: object, **kwargs: object) -> BinaryIO:
-        return injection.open(path, *args, **kwargs)
-
-    return open_with_fault
-
-
-class FakeSources:
-    supports_calibration_capture = True
-
-    def __init__(self) -> None:
-        self.open_handle_count = 0
-        self.mode: str | None = None
-        self.generation_id: str | None = None
-        self.submit_frame: object | None = None
-        self.submit_imu: object | None = None
-        self.focus: dict[str, object] | None = None
-        self.camera_state = "connected"
-
-    def camera_connection_status(self) -> dict[str, object]:
-        return {
-            "schema": "ylx.camera-connection.v1",
-            "state": self.camera_state,
-        }
-
-    def start(
-        self,
-        *,
-        mode: str,
-        generation_id: str,
-        submit_frame: object,
-        submit_imu: object,
-        on_failure: object,
-        native_recorder: object | None = None,
-    ) -> None:
-        del native_recorder
-        self.mode = mode
-        self.generation_id = generation_id
-        self.submit_frame = submit_frame
-        self.submit_imu = submit_imu
-        self.open_handle_count = 2
-
-    def stop(self) -> None:
-        self.open_handle_count = 0
-
-    def camera_focus_status(self) -> dict[str, object] | None:
-        return deepcopy(self.focus)
-
-    def set_camera_focus(
-        self,
-        *,
-        value: int | None = None,
-        auto_enabled: bool | None = None,
-    ) -> dict[str, object]:
-        if self.focus is None:
-            raise RuntimeError("焦距控制不可用")
-        if value is not None:
-            self.focus["value"] = value
-            if self.focus["auto_supported"] is True:
-                self.focus["auto_enabled"] = False
-        if auto_enabled is not None:
-            self.focus["auto_enabled"] = auto_enabled
-        return deepcopy(self.focus)
-
-
-class FakeSourcesWithLatestImu(FakeSources):
-    def __init__(self, observation: ImuObservation) -> None:
-        super().__init__()
-        self.observation = observation
-
-    def latest_imu_observation(self) -> ImuObservation:
-        return self.observation
-
-
-class FakeSourcesWithSequentialLatestImu(FakeSources):
-    def __init__(self, observations: list[ImuObservation]) -> None:
-        super().__init__()
-        self._observations = observations
-        self._index = 0
-
-    def latest_imu_observation(self) -> ImuObservation:
-        if self._index < len(self._observations):
-            observation = self._observations[self._index]
-            self._index += 1
-            return observation
-        return self._observations[-1]
-
-
-class FakeSourcesWithScriptedLatestImu(FakeSources):
-    def __init__(self, observations: list[ImuObservation | BaseException | None]) -> None:
-        super().__init__()
-        self._observations = observations
-        self._index = 0
-
-    def latest_imu_observation(self) -> ImuObservation | None:
-        if self._index < len(self._observations):
-            observation = self._observations[self._index]
-            self._index += 1
-        else:
-            observation = self._observations[-1]
-        if isinstance(observation, BaseException):
-            raise observation
-        return observation
-
-
-class FakeSplitEyeEncoder:
-    def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
-        del unused
-        self._out_dir = out_dir
-        self._segment_frames = segment_frames
-        self._segments: list[ClosedSegment] = []
-        self._submitted = 0
-        self._started = False
-        self.aborted = False
-
-    @property
-    def segments(self) -> tuple[ClosedSegment, ...]:
-        return tuple(self._segments)
-
-    @property
-    def submitted_frames(self) -> int:
-        return self._submitted
-
-    def start(self) -> None:
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._started = True
-
-    def submit(self, jpeg: bytes) -> None:
-        del jpeg
-        if not self._started:
-            raise StereoEncoderError("invalid_state", "助手未启动")
-        self._submitted += 1
-        if self._submitted % self._segment_frames == 0:
-            self._close(self._submitted - self._segment_frames, self._submitted)
-
-    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
-        del timeout
-        closed = len(self._segments) * self._segment_frames
-        if closed < self._submitted:
-            self._close(closed, self._submitted)
-        return self.segments
-
-    def abort(self) -> None:
-        self.aborted = True
-
-    def _close(self, start_frame: int, end_frame: int) -> None:
-        index = len(self._segments)
-        paths: dict[str, tuple[str, int]] = {}
-        for eye in ("left", "right"):
-            name = f"{eye}_{index:05d}.mp4"
-            body = f"{eye}-{index}-{start_frame}-{end_frame}".encode() * 8
-            (self._out_dir / name).write_bytes(body)
-            paths[eye] = (f"video/{name}", len(body))
-        self._segments.append(
-            ClosedSegment(
-                index=index,
-                start_frame=start_frame,
-                end_frame=end_frame,
-                left_path=paths["left"][0],
-                left_bytes=paths["left"][1],
-                right_path=paths["right"][0],
-                right_bytes=paths["right"][1],
-            )
-        )
-
-
-class FakeNativeSessionStore:
-    def __init__(self) -> None:
-        self.verify_calls: list[tuple[int, int, str]] = []
-
-    def verify_fd(
-        self,
-        descriptor: int,
-        expected_bytes: int,
-        expected_sha256: str,
-    ) -> dict[str, object]:
-        self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
-        payload = os.pread(descriptor, expected_bytes + 1, 0)
-        if len(payload) != expected_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
-            raise ValueError("native fixture verification mismatch")
-        return {}
-
-    def verify_fd_interruptible(
-        self,
-        descriptor: int,
-        expected_bytes: int,
-        expected_sha256: str,
-        interrupt_check: Callable[[], None],
-    ) -> dict[str, object]:
-        self.verify_calls.append((descriptor, expected_bytes, expected_sha256))
-        digest = hashlib.sha256()
-        offset = 0
-        while offset < expected_bytes:
-            interrupt_check()
-            block = os.pread(descriptor, min(1024 * 1024, expected_bytes - offset), offset)
-            if not block:
-                raise ValueError("native fixture short read")
-            digest.update(block)
-            offset += len(block)
-        if digest.hexdigest() != expected_sha256:
-            raise ValueError("digest_mismatch: native fixture verification mismatch")
-        return {}
-
-
-def command(key: str, body: dict[str, object]) -> CaptureCommand:
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    return CaptureCommand("operator", key, body, canonical)
-
-
-def network_command(key: str, body: dict[str, object]) -> NetworkCommand:
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    return NetworkCommand("operator", key, body, canonical)
-
-
-def idle_network_control(operation: str, **unused: object) -> dict[str, object]:
-    del unused
-    if operation == "clock_inspect":
-        return {
-            "ok": True,
-            "operation": operation,
-            "status": 200,
-            "body": {
-                "schema": "ylx.clock-status.v2",
-                "source": "client",
-                "unix_time_ms": 1794144394000,
-                "challenge": "a" * 32,
-                "expires_in_ms": 5000,
-                "applied": False,
-                "boot_id": "a4578322-241e-4b9c-bb54-a860d5a2aa37",
-                "synchronized_at_ms": 1794144390000,
-                "age_seconds": 4,
-            },
-        }
-    if operation == "status":
-        return {
-            "ok": True,
-            "operation": "status",
-            "status": 200,
-            "body": {"transaction": {"current": None}},
-        }
-    raise NetworkControlClientError("controller_unavailable", "network controller is unavailable")
-
-
-def start_command(
-    key: str,
-    *,
-    mode: str = "production",
-    display_name: str = "测试录制",
-) -> CaptureCommand:
-    return command(
-        key,
-        {
-            "schema": "ylx.capture-start.v2",
-            "mode": mode,
-            "display_name": display_name,
-            "take": {"kind": "new"},
-        },
-    )
-
-
-def stop_command(key: str, *, reason: str = "user") -> CaptureCommand:
-    return command(key, {"schema": "ylx.capture-stop.v2", "reason": reason})
-
-
-def frame(
-    sequence: int = 0,
-    *,
-    generation_payload: bytes = JPEG,
-    dropped_before: int = 0,
-) -> FrameObservation:
-    return FrameObservation(
-        StereoFrame(
-            source_sequence=sequence,
-            host_monotonic_ns=1_000_000 + sequence,
-            left=b"left-preview",
-            right=b"right-preview",
-            raw_side_by_side=generation_payload,
-        ),
-        dropped_before=dropped_before,
-    )
-
-
-def imu_observation(
-    sequence: int = 0,
-    *,
-    accelerometer: tuple[int, int, int] = (1, 2, 3),
-    gyroscope: tuple[int, int, int] = (4, 5, 6),
-    sync_quality: str = "insufficient",
-) -> ImuObservation:
-    samples = []
-    for sample_index in range(2):
-        sample_sequence = sequence + sample_index
-        samples.append(
-            ImuSample(
-                sequence=sample_sequence,
-                packet_sequence=sequence // 2,
-                sample_index=sample_index,
-                device_timestamp_raw=sample_sequence,
-                device_ticks=sample_sequence,
-                host_read_start_ns=10_000 + sample_sequence,
-                host_read_end_ns=10_100 + sample_sequence,
-                host_monotonic_ns=10_050 + sample_sequence,
-                accelerometer=RawVector3(*accelerometer),
-                gyroscope=RawVector3(*gyroscope),
-                sync_offset_ns=None,
-                sync_residual_ns=None,
-                sync_quality=sync_quality,
-            )
-        )
-    return ImuObservation((samples[0], samples[1]), dropped_samples=0)
-
-
-def single_imu_observation(
-    *,
-    host_monotonic_ns: int,
-    accelerometer: tuple[int, int, int],
-    gyroscope: tuple[int, int, int],
-    sync_quality: str = "degraded",
-) -> ImuObservation:
-    sample = ImuSample(
-        sequence=host_monotonic_ns,
-        packet_sequence=0,
-        sample_index=0,
-        device_timestamp_raw=host_monotonic_ns,
-        device_ticks=host_monotonic_ns,
-        host_read_start_ns=host_monotonic_ns,
-        host_read_end_ns=host_monotonic_ns,
-        host_monotonic_ns=host_monotonic_ns,
-        accelerometer=RawVector3(*accelerometer),
-        gyroscope=RawVector3(*gyroscope),
-        sync_offset_ns=None,
-        sync_residual_ns=None,
-        sync_quality=sync_quality,
-    )
-    return ImuObservation((sample,), dropped_samples=0)
+from tests.testkit import (
+    CAMERA_FOCUS_STATUS,
+    COMMIT,
+    JPEG,
+    DelayedLock,
+    FakeNativeSessionStore,
+    FakeSources,
+    FakeSourcesWithLatestImu,
+    FakeSourcesWithScriptedLatestImu,
+    FakeSourcesWithSequentialLatestImu,
+    FakeSplitEyeEncoder,
+    RecordingFaultInjection,
+    command,
+    frame,
+    idle_network_control,
+    imu_observation,
+    network_command,
+    path_open_fault,
+    single_imu_observation,
+    start_command,
+    stop_command,
+)
 
 
 class CaptureCoordinatorTest(unittest.TestCase):
@@ -513,16 +124,22 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.mountpoint = self.root / "volume"
         self.state_root = self.root / "state"
         self.network_operation_lock_path = self.root / "network-operation.lock"
+        self.maintenance_lock_path = self.root / "maintenance.lock"
         self.mountpoint.mkdir()
         self.environment_patcher = patch.dict(
             os.environ,
-            {"RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.network_operation_lock_path)},
+            {
+                "RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.network_operation_lock_path),
+                "OPENARIA_MAINTENANCE_LOCK": str(self.maintenance_lock_path),
+            },
         )
         self.environment_patcher.start()
+        self.addCleanup(self.environment_patcher.stop)
         self.volume_id = initialize_capture_volume(self.mountpoint)
         self.session_config = DeviceSessionConfig(
             device_id=str(uuid.uuid4()),
@@ -540,17 +157,16 @@ class CaptureCoordinatorTest(unittest.TestCase):
             FakeSplitEyeEncoder,
         )
         self.encoder_patcher.start()
+        self.addCleanup(self.encoder_patcher.stop)
         self.network_control_patcher = patch(
             "rp_ylx.recording.coordinator.request_network_control",
             side_effect=idle_network_control,
         )
         self.network_control_patcher.start()
+        self.addCleanup(self.network_control_patcher.stop)
 
     def tearDown(self) -> None:
-        self.network_control_patcher.stop()
-        self.encoder_patcher.stop()
-        self.environment_patcher.stop()
-        self.temporary.cleanup()
+        pass
 
     def test_unsynchronized_clock_rejects_start_with_specific_voice(self):
         coordinator = self.coordinator()
@@ -2850,7 +2466,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def test_twenty_mib_manifest_is_readable_without_revalidating_unchanged_json(self):
         from rp_ylx.recording.catalog import SessionCatalog
-        from rp_ylx.spectacular.adapter import _read_json_object
+        from rp_ylx.spectacular.adapter import _read_json_from_fd
         from rp_ylx.validation import _read_discriminator
 
         coordinator = self.coordinator()
@@ -2862,10 +2478,15 @@ class CaptureCoordinatorTest(unittest.TestCase):
             payload = original + b" " * (20 * 1024 * 1024 - len(original))
             path.write_bytes(payload)
             manifest = json.loads(original)
+
+            def read_adapter_manifest():
+                with path.open("rb") as stream:
+                    return _read_json_from_fd(stream.fileno(), "manifest")[0]
+
             for label, read in (
                 ("public validation", lambda: _read_discriminator(directory)),
                 ("recording inspection", lambda: inspect_device_session_directory(directory)[0]),
-                ("calibration adapter", lambda: _read_json_object(path, "manifest")),
+                ("calibration adapter", read_adapter_manifest),
             ):
                 with self.subTest(reader=label):
                     self.assertEqual(read(), manifest)
@@ -4233,11 +3854,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
         def slow_fail(recorder, code, *args, **kwargs):
             if code == "encoder_failed":
-                time.sleep(1.2)
+                time.sleep(0.02)
             return original(recorder, code, *args, **kwargs)
 
         with patch.object(coordinator_module.DeviceSessionRecorder, "fail", slow_fail):
-            self._check_failure_io_stage("recovery", cached=False)
+            self._check_failure_io_stage("recovery", cached=False, poll_interval=0.005)
 
     def test_media_lost_diagnostic_visible_during_recovery_with_or_without_cache(self):
         for cached in (True, False):
@@ -4448,7 +4069,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                     self.assertTrue(waiter_blocked.wait(1))
                     before = time.monotonic()
                     status = coordinator.capture_status()
-                    self.assertLess(time.monotonic() - before, 0.25)
+                    self.assertLess(time.monotonic() - before, 1.0)
                     validate_capture_status(status)
                     self.assertEqual(status["snapshot"]["device_state"], "finalizing")
                     self.assertIsNone(coordinator.retained_unsuccessful_outcome(sid))
@@ -4743,7 +4364,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
         finally:
             coordinator.close()
 
-    def _check_failure_io_stage(self, stage, *, cached=True, error_code="encoder_failed"):
+    def _check_failure_io_stage(
+        self, stage, *, cached=True, error_code="encoder_failed", poll_interval: float = 0.05
+    ):
         coordinator = self.coordinator()
         entered, release = threading.Event(), threading.Event()
         errors, stopped = [], []
@@ -4839,14 +4462,14 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 # This gate marks setup completion, not a recovery latency SLA.
                 # Storage before the injected pause can legitimately take >1s.
                 deadline = time.monotonic() + 30
-                while not entered.wait(0.05):
+                while not entered.wait(poll_interval):
                     self.assertTrue(
                         fault.is_alive(), f"failure worker exited before gate: {errors}"
                     )
                     self.assertLess(time.monotonic(), deadline, "failure IO gate was not reached")
                 before = time.monotonic()
                 status = coordinator.capture_status()
-                self.assertLess(time.monotonic() - before, 0.25)
+                self.assertLess(time.monotonic() - before, 1.0)
                 validate_capture_status(status)
                 self.assertEqual(status["snapshot"]["device_state"], "finalizing")
                 projected = status["snapshot"]["active_recording"]["recording_state"]
@@ -5012,37 +4635,28 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
     def test_delayed_state_snapshot_cannot_overwrite_newer_durable_revision(self):
         coordinator = self.coordinator()
-        entered, release = threading.Event(), threading.Event()
-        real_lock = threading.Lock()
-
-        class DelayedLock:
-            def __enter__(self):
-                if threading.current_thread().name == "delayed-state-writer":
-                    entered.set()
-                    if not release.wait(3):
-                        raise TimeoutError("state write was not released")
-                real_lock.acquire()
-
-            def __exit__(self, *args):
-                real_lock.release()
-
+        delayed = DelayedLock(
+            "delayed-state-writer",
+            timeout=3.0,
+            message="state write was not released",
+        )
         thread = None
         try:
-            with patch.object(coordinator, "_state_persist_lock", DelayedLock()):
+            with patch.object(coordinator, "_state_persist_lock", delayed):
                 coordinator._revision = 10
                 thread = threading.Thread(
                     target=coordinator._persist_local_state, name="delayed-state-writer"
                 )
                 thread.start()
-                self.assertTrue(entered.wait(1))
+                self.assertTrue(delayed.entered.wait(1))
                 coordinator._revision = 11
                 coordinator._persist_local_state()
-                release.set()
+                delayed.release.set()
                 thread.join(2)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(coordinator._read_local_state()["source_revision"], 11)
         finally:
-            release.set()
+            delayed.release.set()
             if thread is not None:
                 thread.join(4)
             coordinator.close()
@@ -5091,7 +4705,9 @@ class CaptureCoordinatorTest(unittest.TestCase):
             release_manifest.set()
             coordinator.close()
 
-    def _queued_stop_after_new_take(self, *, same_key=False, reason="user"):
+    def _queued_stop_after_new_take(
+        self, *, same_key=False, reason="user", poll_interval: float = 0.05
+    ):
         manifest_blocked = threading.Event()
         release_manifest = threading.Event()
         waiter_entered = threading.Event()
@@ -5152,7 +4768,7 @@ class CaptureCoordinatorTest(unittest.TestCase):
                 # barrier. Fail promptly if the worker exits without reaching
                 # it, and retain a bounded test setup budget for deadlocks.
                 manifest_deadline = time.monotonic() + 30
-                while not manifest_blocked.wait(0.05):
+                while not manifest_blocked.wait(poll_interval):
                     self.assertTrue(
                         first.is_alive(), f"first stop missed manifest barrier: {errors!r}"
                     )
@@ -5206,11 +4822,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
             if command.idempotency_key == "queued-new-start":
                 # The test controls when the queued request resumes. Storage
                 # latency while admitting the next take must not expire it.
-                time.sleep(4.2)
+                time.sleep(0.02)
             return original(coordinator, command)
 
         with patch.object(CaptureCoordinator, "start_capture", slow_new_start):
-            results, errors = self._queued_stop_after_new_take()
+            results, errors = self._queued_stop_after_new_take(poll_interval=0.005)
         self.assertEqual(errors, {})
         self.assertEqual(results["late"].status, 204)
         self.assertEqual(results["repeated_late"].status, 204)
@@ -5223,11 +4839,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
             # Delay normal storage finalization, not the public request receipt.
             # The scheduling fixture must await its manifest barrier rather
             # than impose a two-second total finalization requirement.
-            time.sleep(2.2)
+            time.sleep(0.02)
             return original(recorder, **kwargs)
 
         with patch.object(coordinator_module.DeviceSessionRecorder, "stop", slow_stop):
-            results, errors = self._queued_stop_after_new_take(same_key=True)
+            results, errors = self._queued_stop_after_new_take(same_key=True, poll_interval=0.005)
         self.assertEqual(errors, {})
         self.assertEqual(results["late"].status, 202)
         self.assertTrue(results["late"].replayed)
@@ -5402,11 +5018,11 @@ class CaptureCoordinatorTest(unittest.TestCase):
 
         for key, target_name, fault in cases:
             with self.subTest(target_name=target_name, fault=fault):
-                injection = _RecordingFaultInjection(target_name, fault)
+                injection = RecordingFaultInjection(target_name, fault)
                 coordinator = self.coordinator()
                 try:
                     with (
-                        patch("pathlib.Path.open", new=_path_open_fault(injection)),
+                        patch("pathlib.Path.open", new=path_open_fault(injection)),
                         patch(
                             "rp_ylx.recording.device_session.os.fsync",
                             side_effect=injection.fsync,

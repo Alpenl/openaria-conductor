@@ -8,20 +8,25 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
+from rp_ylx.api.events import validate_capture_status
+from tests.testkit import (
+    CoordinatorHarness,
+    frame,
+    start_command,
+    stop_command,
+)
 
 
 class StopStateCommitTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.coordinator = self.fixture.coordinator()
         self.addCleanup(self.coordinator.close)
-        self.coordinator.start_capture(fixtures.start_command("start"))
-        self.assertTrue(self.coordinator.submit_frame(fixtures.frame()))
+        self.coordinator.start_capture(start_command("start"))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
         self.sid = self.fixture.active_session_id(self.coordinator)
-        self.command = fixtures.stop_command("stop")
+        self.command = stop_command("stop")
         self.recorder = self.coordinator._active
         self.workers = []
         self.results = {}
@@ -54,13 +59,13 @@ class StopStateCommitTest(unittest.TestCase):
     def assert_responsive(self):
         self.assertTrue(self.launch("status", self.coordinator.capture_status).wait(0.25))
         self.assertNotIn("status", self.errors)
-        fixtures.validate_capture_status(self.results["status"])
+        validate_capture_status(self.results["status"])
 
     def assert_busy_start(self):
         done = self.launch(
             "new-start",
             lambda: self.coordinator.start_capture(
-                fixtures.start_command("new-start"),
+                start_command("new-start"),
             ),
         )
         self.assertTrue(done.wait(0.25))
@@ -116,7 +121,7 @@ class StopStateCommitTest(unittest.TestCase):
                 self.assertFalse(duplicate.wait(0.05))
                 for name, command in (
                     ("same-api", self.command),
-                    ("other-api", fixtures.stop_command("other-stop")),
+                    ("other-api", stop_command("other-stop")),
                 ):
                     done = self.launch(
                         name, lambda command=command: coordinator.request_stop_capture(command)
@@ -204,7 +209,7 @@ class StopStateCommitTest(unittest.TestCase):
         self.assertIsNotNone(coordinator._state_db.capture_state()["active_session"])
         self.assert_busy_start()
         replay = coordinator.request_stop_capture(
-            fixtures.stop_command("retry-new-key") if different_key else self.command,
+            stop_command("retry-new-key") if different_key else self.command,
         )
         if different_key:
             self.assertEqual(replay.status, 204)
@@ -268,31 +273,30 @@ class StopStateCommitTest(unittest.TestCase):
         self.assertIsNotNone(coordinator._pending_stop_state_commit)
         # The idle safe-swap request retains its historical no-op semantics;
         # its successful state write must also settle the completed recording.
-        result = coordinator.stop_capture(fixtures.stop_command("idle-swap", reason="safe_swap"))
+        result = coordinator.stop_capture(stop_command("idle-swap", reason="safe_swap"))
         self.assertEqual(result.status, 204)
         self.assertIsNone(coordinator._pending_stop_state_commit)
         self.assert_committed()
-        coordinator.start_capture(fixtures.start_command("after-committed-stop"))
+        coordinator.start_capture(start_command("after-committed-stop"))
         self.assertIsNotNone(coordinator._active)
 
 
 class StopStateCommitCrashTest(unittest.TestCase):
     def crash(self, after):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         context = multiprocessing.get_context("fork")
         receive, send = context.Pipe(duplex=False)
         self.addCleanup(receive.close)
         self.addCleanup(send.close)
-        command = fixtures.stop_command("crash-completed-state")
+        command = stop_command("crash-completed-state")
 
         def child():
             try:
                 coordinator = fixture.coordinator()
-                coordinator.start_capture(fixtures.start_command("crash-start"))
+                coordinator.start_capture(start_command("crash-start"))
                 sid = fixture.active_session_id(coordinator)
-                self.assertTrue(coordinator.submit_frame(fixtures.frame()))
+                self.assertTrue(coordinator.submit_frame(frame()))
                 original = coordinator._state_db.put_capture_state
 
                 def boundary(value, *args, **kwargs):

@@ -10,10 +10,10 @@ from unittest.mock import patch
 
 import rp_ylx.recording.device_session as session
 import rp_ylx.recording.live_seal as live
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import FakeSessionStore, SplitEyeHarness
 
 
-class SeededStore(fixtures.FakeSessionStore):
+class SeededStore(FakeSessionStore):
     def begin_recording(self, plan):
         transaction = super().begin_recording(plan)
         for name in ("frames.ndjson", "imu.ndjson"):
@@ -66,12 +66,13 @@ class LiveSealStartTests(unittest.TestCase):
                 patches.enter_context(patch.object(pool, "submit", side_effect=observed_submit))
                 return pool
 
-            def make_sealing(*args):
-                sealing = object.__new__(live.LiveSealing)
-                instances.append(sealing)
-                sealing.__init__(*args)
-                return sealing
+            original_init = live.LiveSealing.__init__
 
+            def track_sealing(self_sealing, *args):
+                instances.append(self_sealing)
+                original_init(self_sealing, *args)
+
+            patches.enter_context(patch.object(live.LiveSealing, "__init__", track_sealing))
             patches.enter_context(patch.object(live, "ThreadPoolExecutor", side_effect=make_pool))
             patches.enter_context(patch.object(threading.Thread, "start", start))
             patches.enter_context(patch.object(live, "capture_audit", side_effect=observed_audit))
@@ -79,14 +80,11 @@ class LiveSealStartTests(unittest.TestCase):
             try:
                 if recorder_mode:
                     store = SeededStore()
-                    recorder, _, _ = fixtures.SplitEyeRecordingTest().build(
-                        root, native_data_plane=True
-                    )
+                    recorder, _, _ = SplitEyeHarness().build(root, native_data_plane=True)
                     recorder._config = replace(recorder._config, lossless_storage=True)
                     with (
                         patch.object(session, "native_session_store", return_value=store),
                         patch.object(session, "resolve_executable", return_value=Path("/bin/true")),
-                        patch.object(session, "LiveSealing", side_effect=make_sealing),
                         self.assertRaises(session.DeviceRecordingError) as raised,
                     ):
                         recorder.start()
@@ -97,7 +95,7 @@ class LiveSealStartTests(unittest.TestCase):
                     self.assertIsNone(recorder._live_sealing)
                 else:
                     with self.assertRaises(type(injected)) as raised:
-                        make_sealing(root, 30, 2)
+                        live.LiveSealing(root, 30, 2)
                     self.assertIs(raised.exception, injected)
                 self.assertEqual(len(instances), 1)
                 self.assertTrue(

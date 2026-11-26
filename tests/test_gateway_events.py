@@ -567,7 +567,8 @@ class GatewayEventHttpTest(unittest.TestCase):
         initial_id = str(parse_sse(initial_payload)[0]["id"])
         self.event_buffer.publish(STATE_SOURCE_EVENT)
         self.event_buffer.publish(PROGRESS_SOURCE_EVENT)
-        latest_id = self.event_buffer.publish({**PROGRESS_SOURCE_EVENT, "source_revision": 48})
+        self.event_buffer.publish({**PROGRESS_SOURCE_EVENT, "source_revision": 48})
+        latest_id = self.event_buffer.publish({**PROGRESS_SOURCE_EVENT, "source_revision": 49})
 
         current_snapshot = {
             **SNAPSHOT_SOURCE_EVENT,

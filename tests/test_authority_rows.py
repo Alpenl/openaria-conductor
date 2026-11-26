@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 from rp_ylx.network_state import NetworkStateStore
 from rp_ylx.persistence import PersistenceError, StateDatabase
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class AuthorityRowsTests(unittest.TestCase):
@@ -167,8 +167,7 @@ store.import_json('capture', Path(sys.argv[1]).with_suffix('.json'))
                 self.assertEqual(self.dump(state), before)
 
     def test_capture_restart_refuses_lost_authority(self):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         coordinator = fixture.coordinator()
         coordinator.close()

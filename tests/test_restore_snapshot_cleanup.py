@@ -20,6 +20,11 @@ class RestoreSnapshotCleanupTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.source = self.root / "source.sqlite3"
         self.target = self.root / "state.sqlite3"
         StateDatabase(self.source).put("capture", {"revision": 7})

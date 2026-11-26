@@ -35,6 +35,7 @@ class CaptureTimerGatewayTest(unittest.TestCase):
         self.server = create_gateway_server("127.0.0.1", 0, self.provider, security=policy)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+        self.addCleanup(self.thread.join, 2)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/api/v4/capture/timer"

@@ -7,8 +7,7 @@ from unittest.mock import patch
 
 from rp_ylx.recording import device_session, recovery, verified
 from rp_ylx.recording.live_seal import PreparedArtifact, _read_back
-from tests import test_recording_recovery as recovery_fixtures
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import RecoveryFixtureBuilder, SplitEyeHarness
 
 
 class ArtifactContentChecks(unittest.TestCase):
@@ -45,7 +44,7 @@ class ArtifactContentChecks(unittest.TestCase):
 
     def test_seal_does_not_return_old_digest_from_colliding_stat(self):
         with tempfile.TemporaryDirectory() as temporary:
-            recorder, _, _ = fixtures.SplitEyeRecordingTest().build(Path(temporary))
+            recorder, _, _ = SplitEyeHarness().build(Path(temporary))
             recorder.start()
             try:
                 path = recorder.partial_path / "fixture.bin"
@@ -61,7 +60,7 @@ class ArtifactContentChecks(unittest.TestCase):
 
     def test_publication_checks_bytes_despite_matching_proof_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(temporary))
             recorder.start()
             fixture.feed(recorder, 3)
@@ -89,7 +88,7 @@ class ArtifactContentChecks(unittest.TestCase):
 
     def test_recovery_does_not_repeat_full_readback_and_explicit_diagnostics_still_work(self):
         with tempfile.TemporaryDirectory() as temporary:
-            recorder = recovery_fixtures.RecordingRecoveryTests().recording(Path(temporary))
+            recorder = RecoveryFixtureBuilder().recording(Path(temporary))
             partial = recorder.partial_path
             target = partial / "video/left_00000.mp4"
             original_identity = verified.identity(target.stat())

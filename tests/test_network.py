@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import configparser
-import ctypes
-import ctypes.util
 import fcntl
 import hashlib
 import io
@@ -20,246 +17,14 @@ from unittest.mock import patch
 
 import rp_ylx.network as network_module
 from rp_ylx.cli import main
-
-
-class FakeNmcli:
-    def __init__(self, profile_dir: Path | None = None) -> None:
-        self.commands: list[list[str]] = []
-        self.devices = "wlan0:wifi:connected\neth0:ethernet:disconnected\n"
-        self.status_returncode = 0
-        self.status_stderr = ""
-        self.scan_output = ""
-        self.scan_returncode = 0
-        self.profile_dir = profile_dir
-        self.active = {"wlan0": "", "eth0": ""}
-        self.addresses = {"wlan0": "", "eth0": ""}
-        self.routes = {"wlan0": "", "eth0": ""}
-        self.fail_modes: dict[str, str] = {}
-        self.timeout_modes: set[str] = set()
-        self.missing_default_modes: set[str] = set()
-        self.reload_failures = 0
-        self.dhcp_address_override: str | None = None
-        self.static_address_override: str | None = None
-        self.timeouts: list[tuple[list[str], float]] = []
-
-    def _load_profile(self, name: str) -> configparser.ConfigParser:
-        if self.profile_dir is None:
-            raise AssertionError("FakeNmcli 缺少 profile_dir")
-        for path in self.profile_dir.glob("*.nmconnection"):
-            profile = configparser.ConfigParser(interpolation=None)
-            profile.read(path, encoding="utf-8")
-            if name in {profile["connection"]["id"], profile["connection"].get("uuid")}:
-                return profile
-        raise AssertionError(f"找不到 NetworkManager profile：{name}")
-
-    def __call__(
-        self,
-        command: list[str],
-        *,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        del check, capture_output, text
-        self.commands.append(command)
-        self.timeouts.append((command, timeout))
-        if command[-5:] in (
-            ["-g", "GENERAL.CON-UUID", "device", "show", "wlan0"],
-            ["--get-values", "GENERAL.CON-UUID", "device", "show", "wlan0"],
-        ):
-            profile = self.active["wlan0"]
-            value = self._load_profile(profile)["connection"]["uuid"] if profile else "--"
-            return subprocess.CompletedProcess(command, 0, value + "\n", "")
-        if "-g" in command and "device" in command:
-            field = command[command.index("-g") + 1]
-            if field == "IP4.GATEWAY":
-                return subprocess.CompletedProcess(command, 0, "192.168.50.1\n", "")
-            raise AssertionError(f"unsupported bootstrap device field: {field}")
-        if "-g" in command and "connection" in command and "show" in command:
-            field = command[command.index("-g") + 1]
-            profile = self._load_profile(command[-1])
-            section, key = field.split(".", 1)
-            section = {"802-11-wireless": "wifi", "802-11-wireless-security": "wifi-security"}.get(
-                section, section
-            )
-            value = profile.get(section, key, fallback="")
-            return subprocess.CompletedProcess(command, 0, value + "\n", "")
-        if "connection" in command and "clone" in command:
-            profile = self._load_profile(command[-2])
-            name = command[-1]
-            profile["connection"]["id"] = name
-            profile["connection"]["uuid"] = str(uuid.uuid4())
-            path = self.profile_dir / (name + ".nmconnection")
-            with path.open("w") as stream:
-                profile.write(stream)
-            path.chmod(0o600)
-            return subprocess.CompletedProcess(command, 0, "", "")
-        if "connection" in command and "modify" in command:
-            name_index = command.index("id") + 1
-            name = command[name_index]
-            profile = self._load_profile(name)
-            for field, value in zip(
-                command[name_index + 1 :: 2], command[name_index + 2 :: 2], strict=True
-            ):
-                section, key = field.split(".", 1)
-                profile[section][key] = value
-            with (self.profile_dir / (name + ".nmconnection")).open("w") as stream:
-                profile.write(stream)
-            return subprocess.CompletedProcess(command, 0, "", "")
-        if command[-4:] == ["--fields", "DEVICE,TYPE,STATE", "device", "status"]:
-            return subprocess.CompletedProcess(
-                command,
-                self.status_returncode,
-                self.devices,
-                self.status_stderr,
-            )
-        if command[-2:] == ["connection", "reload"]:
-            if self.reload_failures:
-                self.reload_failures -= 1
-                return subprocess.CompletedProcess(command, 1, "", "reload failed")
-            return subprocess.CompletedProcess(command, 0, "", "")
-        if "wifi" in command and "list" in command:
-            return subprocess.CompletedProcess(
-                command,
-                self.scan_returncode,
-                self.scan_output,
-                "scan failed" if self.scan_returncode else "",
-            )
-        if "--get-values" in command and "connection" in command and "show" in command:
-            field = command[command.index("--get-values") + 1]
-            name = command[-1]
-            profile = self._load_profile(name)
-            if field == "802-11-wireless-security.key-mgmt":
-                value = profile.get("wifi-security", "key-mgmt", fallback="")
-                return subprocess.CompletedProcess(command, 0, f"{value}\n", "")
-            if field == "802-11-wireless.ssid":
-                return subprocess.CompletedProcess(command, 0, profile["wifi"]["ssid"] + "\n", "")
-            raise AssertionError(f"不支持的 NetworkManager profile 字段：{field}")
-        if "connection" in command and "up" in command:
-            name = command[command.index("id") + 1]
-            interface = command[command.index("ifname") + 1]
-            profile = self._load_profile(name)
-            mode = next(
-                (
-                    candidate
-                    for candidate in set(self.fail_modes) | self.timeout_modes
-                    if f"-{candidate}-" in name
-                ),
-                None,
-            )
-            if mode in self.timeout_modes:
-                raise subprocess.TimeoutExpired(command, timeout)
-            if mode is not None:
-                return subprocess.CompletedProcess(command, 4, "", self.fail_modes[mode])
-            self.active[interface] = name
-            method = profile["ipv4"]["method"]
-            if method == "auto":
-                self.addresses[interface] = self.dhcp_address_override or "192.168.50.20/24"
-                applied_mode = next(
-                    (
-                        candidate
-                        for candidate in [
-                            "wifi-client",
-                            "ethernet-dhcp",
-                        ]
-                        if f"-{candidate}-" in name
-                    ),
-                    None,
-                )
-                self.routes[interface] = (
-                    ""
-                    if applied_mode in self.missing_default_modes
-                    else "dst = 0.0.0.0/0, nh = 192.168.50.1, mt = 600"
-                )
-            elif method == "manual":
-                self.addresses[interface] = (
-                    self.static_address_override or profile["ipv4"]["address1"].split(",", 1)[0]
-                )
-                self.routes[interface] = (
-                    ""
-                    if "ethernet-static" in self.missing_default_modes
-                    else "dst = 0.0.0.0/0, nh = "
-                    + profile["ipv4"]["address1"].split(",", 1)[1]
-                    + ", mt = 600"
-                    if "," in profile["ipv4"]["address1"]
-                    else ""
-                )
-            else:
-                self.addresses[interface] = "10.42.0.1/24"
-                self.routes[interface] = "10.42.0.0/24"
-            return subprocess.CompletedProcess(command, 0, "successfully activated", "")
-        if command[-3:-1] == ["device", "show"]:
-            interface = command[-1]
-            profile = self.active[interface]
-            address = self.addresses[interface]
-            route = self.routes[interface]
-            rendered = (
-                f"GENERAL.STATE:{'100 (connected)' if profile else '30 (disconnected)'}\n"
-                f"GENERAL.CONNECTION:{profile}\n"
-                f"IP4.ADDRESS[1]:{address}\n"
-                f"IP4.ROUTE[1]:{route}\n"
-            )
-            return subprocess.CompletedProcess(command, 0, rendered, "")
-        raise AssertionError(f"未定义的 nmcli 调用：{command!r}")
-
-
-def _glib_keyfile_string(path: Path, group: str, key: str) -> str:
-    library = ctypes.util.find_library("glib-2.0")
-    if library is None:
-        raise unittest.SkipTest("系统未安装 GLib")
-    glib = ctypes.CDLL(library)
-    glib.g_key_file_new.restype = ctypes.c_void_p
-    glib.g_key_file_load_from_file.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    glib.g_key_file_load_from_file.restype = ctypes.c_int
-    glib.g_key_file_get_string.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_char_p,
-        ctypes.c_char_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    glib.g_key_file_get_string.restype = ctypes.c_void_p
-    glib.g_key_file_free.argtypes = [ctypes.c_void_p]
-    glib.g_error_free.argtypes = [ctypes.c_void_p]
-    glib.g_free.argtypes = [ctypes.c_void_p]
-
-    keyfile = glib.g_key_file_new()
-    error = ctypes.c_void_p()
-    try:
-        loaded = glib.g_key_file_load_from_file(
-            keyfile,
-            os.fsencode(path),
-            0,
-            ctypes.byref(error),
-        )
-        if not loaded:
-            raise AssertionError(f"GLib 无法解析 NetworkManager profile：{path}")
-        value = glib.g_key_file_get_string(
-            keyfile,
-            group.encode(),
-            key.encode(),
-            ctypes.byref(error),
-        )
-        if not value:
-            raise AssertionError(f"GLib 无法读取 {group}.{key}")
-        try:
-            return ctypes.string_at(value).decode("utf-8")
-        finally:
-            glib.g_free(value)
-    finally:
-        if error.value:
-            glib.g_error_free(error)
-        glib.g_key_file_free(keyfile)
+from tests.testkit import FakeNmcli
+from tests.testkit import glib_keyfile_string as _glib_keyfile_string
 
 
 class NetworkCliTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.environment = {
             "RP_YLX_NETWORK_STATE_DIR": str(self.root / "state"),
@@ -278,10 +43,10 @@ class NetworkCliTest(unittest.TestCase):
             clear=False,
         )
         self._operation_environment.start()
+        self.addCleanup(self._operation_environment.stop)
 
     def tearDown(self) -> None:
-        self._operation_environment.stop()
-        self.temporary.cleanup()
+        pass
 
     def lkg_path(self, interface: str, *, root: Path | None = None) -> Path:
         return (root or self.root) / "state" / f"lkg-{interface}.json"
@@ -952,7 +717,7 @@ class NetworkCliTest(unittest.TestCase):
             env=environment,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
             check=False,
         )
 

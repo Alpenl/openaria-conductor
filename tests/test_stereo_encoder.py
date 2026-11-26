@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,11 +66,18 @@ class StereoEncoderResolutionTest(unittest.TestCase):
         self.assertEqual(b"".join(writes), b"abcdefgh")
 
     def test_submit_uses_one_python_writev_in_explicit_test_adapter(self) -> None:
-        encoder = object.__new__(StereoEncoderProcess)
-        encoder._process = SimpleNamespace(stdin=SimpleNamespace(fileno=lambda: 7))
-        encoder._lock = threading.Lock()
-        encoder._failure = None
-        encoder._submitted = 0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "ylx-stereo-encoder"
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            encoder = StereoEncoderProcess(
+                root / "video",
+                executable=helper,
+                width=3840,
+                height=1080,
+                fps=30,
+            )
+        encoder._process = SimpleNamespace(stdin=SimpleNamespace(fileno=lambda: 7))  # type: ignore[assignment]
 
         with patch("rp_ylx.recording.stereo_encoder._writev_all") as writev:
             encoder.submit(b"abc")
@@ -92,11 +98,17 @@ class StereoEncoderResolutionTest(unittest.TestCase):
         )
 
     def test_handle_event_records_segment_and_failure(self) -> None:
-        encoder = object.__new__(StereoEncoderProcess)
-        encoder._lock = threading.Lock()
-        encoder._segments = []
-        encoder._stats = {}
-        encoder._failure = None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "ylx-stereo-encoder"
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            encoder = StereoEncoderProcess(
+                root / "video",
+                executable=helper,
+                width=3840,
+                height=1080,
+                fps=30,
+            )
         encoder._handle_event(
             b'{"event":"segment","index":1,"start_frame":2,"end_frame":3,'
             b'"left":{"path":"video/left_00001.mp4","bytes":10},'

@@ -3,46 +3,25 @@
 import tempfile
 import threading
 import unittest
-import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from rp_ylx.recording import audio_finalizer
 from rp_ylx.recording import device_session as d
+from tests.testkit import (
+    audio_inventory_recorder,
+    make_audio_result,
+    make_multiple_audio_result,
+)
 
 
 class AudioInventoryTests(unittest.TestCase):
     def recorder(self, root):
-        recorder = object.__new__(d.DeviceSessionRecorder)
-        recorder._partial = root
-        recorder._artifact_identities = {}
-        recorder._verified_artifacts = {}
-        return recorder
+        return audio_inventory_recorder(root)
 
     def audio(self, root, relative="audio/audio_00000.wav"):
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(path), "wb") as wav:
-            wav.setnchannels(2)
-            wav.setsampwidth(2)
-            wav.setframerate(48000)
-            wav.writeframes(b"\x01\x02\x03\x04" * 4)
-        return {
-            "sample_rate_hz": 48000,
-            "channels": 2,
-            "sample_format": "S16_LE",
-            "sample_count": 4,
-            "segments": [
-                {
-                    "index": 0,
-                    "start_sample": 0,
-                    "end_sample": 4,
-                    "start_time_seconds": 0.0,
-                    "end_time_seconds": 4 / 48000,
-                    "path": relative,
-                }
-            ],
-        }
+        return make_audio_result(root, relative)
 
     def test_noncanonical_segment_paths_are_rejected_before_read(self):
         for relative in (
@@ -76,20 +55,7 @@ class AudioInventoryTests(unittest.TestCase):
             self.assertEqual(set(recorder._verified_artifacts), {"audio/audio_00000.wav"})
 
     def multiple_audio(self, root, count=5):
-        segments = []
-        for index in range(count):
-            result = self.audio(root, f"audio/audio_{index:05d}.wav")
-            segment = result["segments"][0]
-            segment.update(
-                index=index,
-                start_sample=index * 4,
-                end_sample=(index + 1) * 4,
-                start_time_seconds=index * 4 / 48000,
-                end_time_seconds=(index + 1) * 4 / 48000,
-            )
-            segments.append(segment)
-        result.update(segments=segments, sample_count=count * 4)
-        return result
+        return make_multiple_audio_result(root, count)
 
     def test_late_invalid_inventory_is_rejected_before_any_read(self):
         for corruption in ("path", "index", "start_sample", "sample_count"):
@@ -188,7 +154,7 @@ class AudioInventoryTests(unittest.TestCase):
 
             with (
                 patch.object(d, "_verified_finalization", side_effect=verify),
-                patch.object(d, "ThreadPoolExecutor", TrackedPool),
+                patch.object(audio_finalizer, "ThreadPoolExecutor", TrackedPool),
             ):
                 caller = threading.Thread(target=apply)
                 caller.start()

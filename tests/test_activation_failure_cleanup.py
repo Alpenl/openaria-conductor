@@ -8,13 +8,12 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from rp_ylx import deployment as deploy
-from tests import test_deployment as fixtures
+from tests.testkit import DeploymentHarness
 
 
 class ActivationFailureCleanupTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.manager = self.fixture.manager()
         self.good_health = self.manager.health_checker

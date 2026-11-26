@@ -19,6 +19,11 @@ class ReadonlyBackupTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.source_dir = self.root / "inputs"
         self.source_dir.mkdir()
         self.producer = StateDatabase(self.root / "producer.sqlite3")

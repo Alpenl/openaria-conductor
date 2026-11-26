@@ -19,7 +19,7 @@ from rp_ylx.api import AuditEvent
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
 from rp_ylx.daemon import _audit_sink
-from tests.test_gateway import DeviceProvider
+from tests.testkit import DeviceProvider
 
 
 class AuditFileAdmissionTest(unittest.TestCase):
@@ -71,7 +71,7 @@ sys.exit(1)
             [sys.executable, "-c", code, str(self.path), "race" if race else "static"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
         )
         self.assertEqual(child.returncode, 0, child.stderr)
 

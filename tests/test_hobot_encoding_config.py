@@ -7,13 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.check import STUB_HB_MEDIA_CODEC_H, STUB_HB_MEDIA_MUXER_H
+
 
 class HobotEncodingConfigTest(unittest.TestCase):
     def test_all_codec_and_rate_control_combinations(self):
-        include = os.environ.get("HOBOT_SDK_INCLUDE")
-        compiler = shutil.which("cc")
-        if not include or not compiler:
-            self.skipTest("set HOBOT_SDK_INCLUDE to the X5 libmm headers")
+        compiler = shutil.which("gcc") or shutil.which("cc")
+        if not compiler:
+            self.skipTest("C compiler unavailable")
+        sdk_include = os.environ.get("HOBOT_SDK_INCLUDE")
         root = Path(__file__).resolve().parents[1]
         source = (root / "src/rp_ylx/hobot/ylx_stereo_pipeline.c").read_text()
         config = source[
@@ -77,9 +79,16 @@ int main(void) {
 }
 """
         with tempfile.TemporaryDirectory() as temporary:
-            harness = Path(temporary) / "config.c"
+            temp_dir = Path(temporary)
+            if sdk_include:
+                include = sdk_include
+            else:
+                (temp_dir / "hb_media_codec.h").write_text(STUB_HB_MEDIA_CODEC_H, encoding="utf-8")
+                (temp_dir / "hb_media_muxer.h").write_text(STUB_HB_MEDIA_MUXER_H, encoding="utf-8")
+                include = str(temp_dir)
+            harness = temp_dir / "config.c"
             harness.write_text(body)
-            binary = Path(temporary) / "config"
+            binary = temp_dir / "config"
             subprocess.run(
                 [
                     compiler,

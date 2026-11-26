@@ -14,15 +14,44 @@ from rp_ylx.recording.device_session import (
     write_json_atomic,
 )
 from rp_ylx.recording.recovery import recover_device_session
-from tests import test_recording_recovery as fixtures
-from tests.test_audio_journal import publish
+from tests.testkit import RecoveryFixtureBuilder
 
 LIMIT = 1024 * 1024
 
 
+def _publish_audio_journal(root: Path, rows: list[dict[str, object]]) -> dict[str, object]:
+    payload = b"".join(json.dumps(row).encode() + b"\n" for row in rows)
+    segments = [segment for row in rows for segment in row["segments"]]  # type: ignore[attr-defined]
+    anchors = [anchor for row in rows for anchor in row["anchors"]]  # type: ignore[attr-defined]
+    head: dict[str, object] = {
+        "schema": "openaria.audio-checkpoint.v3",
+        "journal_bytes": len(payload),
+        "journal_sha256": hashlib.sha256(payload).hexdigest(),
+        "journal_records": len(rows),
+        "anchor_count": len(anchors),
+        "segment_count": len(segments),
+        "sample_count": segments[-1]["end_sample"] if segments else 0,
+        "last_anchor": None,
+        "thread_started_monotonic_ns": 100,
+        "period_frames": 1024,
+        "buffer_frames": 8192,
+        "queue_capacity_frames": 786432,
+        "queue_peak_frames": 1024,
+        "max_write_ns": 5,
+    }
+    audio = root / "audio"
+    audio.mkdir(exist_ok=True)
+    path = audio / "checkpoint.ndjson"
+    prior = path.read_bytes() if path.exists() else b""
+    with path.open("ab") as output:
+        output.write(payload[len(prior) :])
+    write_json_atomic(audio / "checkpoint.json", head)
+    return head
+
+
 class RecoveryJournalBoundsTests(unittest.TestCase):
     def recording(self, root):
-        return fixtures.RecordingRecoveryTests().recording(root)
+        return RecoveryFixtureBuilder().recording(root)
 
     def test_nested_frame_tail_retains_complete_pairs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -140,7 +169,9 @@ class RecoveryJournalBoundsTests(unittest.TestCase):
                     write_json_atomic(root / "capture.json", capture)
                     (root / "audio").mkdir()
                 if name.endswith(".ndjson"):
-                    head = publish(root, [{"sequence": 0, "anchors": [], "segments": []}])
+                    head = _publish_audio_journal(
+                        root, [{"sequence": 0, "anchors": [], "segments": []}]
+                    )
                     head["journal_bytes"] = len(damaged)
                     head["journal_sha256"] = hashlib.sha256(damaged).hexdigest()
                     write_json_atomic(root / "audio/checkpoint.json", head)

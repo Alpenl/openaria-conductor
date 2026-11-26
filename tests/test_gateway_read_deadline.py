@@ -9,7 +9,7 @@ import unittest
 
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
-from tests.test_gateway import DeviceProvider
+from tests.testkit import DeviceProvider
 
 
 class GatewayReadDeadlineTest(unittest.TestCase):
@@ -20,7 +20,7 @@ class GatewayReadDeadlineTest(unittest.TestCase):
             0,
             self.provider,
             security=SecurityPolicy.lab(allowed_operations={"getDevice", "startCapture"}),
-            request_timeout_seconds=0.3,
+            request_timeout_seconds=0.15,
         )
         self.finished = threading.Event()
         original = self.server.finish_request
@@ -60,7 +60,7 @@ class GatewayReadDeadlineTest(unittest.TestCase):
                 client.sendall(prefix)
 
             def drip():
-                while not done.wait(0.05):
+                while not done.wait(0.025):
                     try:
                         client.sendall(b"x")
                     except OSError:
@@ -69,7 +69,7 @@ class GatewayReadDeadlineTest(unittest.TestCase):
             sender = threading.Thread(target=drip, daemon=True)
             sender.start()
             try:
-                wait = 0.6 if header_delay else 1
+                wait = 0.45 if header_delay else 0.8
                 self.assertTrue(self.finished.wait(wait), "trickle input retained the handler")
                 self.assertEqual(self.provider.commands, {})
             finally:
@@ -87,8 +87,8 @@ class GatewayReadDeadlineTest(unittest.TestCase):
         self.check_drip(self.headers(2048) + b"{")
 
     def test_headers_and_body_share_one_input_budget(self) -> None:
-        self.server.request_timeout_seconds = 1
-        self.check_drip(self.headers(2048) + b"{", header_delay=0.65)
+        self.server.request_timeout_seconds = 0.5
+        self.check_drip(self.headers(2048) + b"{", header_delay=0.35)
 
     def test_fragmented_valid_command_within_budget_runs_once(self) -> None:
         payload = json.dumps(
@@ -96,7 +96,7 @@ class GatewayReadDeadlineTest(unittest.TestCase):
         ).encode()
         with socket.create_connection(self.server.server_address, timeout=2) as client:
             client.sendall(self.headers(len(payload)) + payload[:10])
-            time.sleep(0.1)
+            time.sleep(0.05)
             client.sendall(payload[10:])
             response = http.client.HTTPResponse(client)
             response.begin()
@@ -106,12 +106,12 @@ class GatewayReadDeadlineTest(unittest.TestCase):
             self.assertEqual(len(self.provider.commands), 1)
 
     def test_keepalive_idle_wait_does_not_consume_next_input_budget(self) -> None:
-        self.server.request_timeout_seconds = 0.4
+        self.server.request_timeout_seconds = 0.2
         with socket.create_connection(self.server.server_address, timeout=2) as client:
             for _ in range(2):
-                time.sleep(0.25)
+                time.sleep(0.12)
                 client.sendall(b"GET /api/v4/device HTTP/1.1\r\nHost: ")
-                time.sleep(0.25)
+                time.sleep(0.12)
                 client.sendall(b"local\r\n\r\n")
                 response = http.client.HTTPResponse(client)
                 response.begin()

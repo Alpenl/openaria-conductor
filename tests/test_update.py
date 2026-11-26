@@ -14,24 +14,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import tests.test_deployment as fixtures
 from rp_ylx import update
 from rp_ylx.network import saved_network_candidate
 from rp_ylx.network_state import NetworkStateStore
 from scripts import publish_rdk_x5_oss as publisher
+from tests.testkit import DeploymentHarness
 
 
 class OnlineUpdateTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.root = self.fixture.root
-        maintenance = patch.dict(
-            os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
-        )
-        maintenance.start()
-        self.addCleanup(maintenance.stop)
         self.bundle = self.fixture.bundle("a")
         self.config = {
             "public_base_url": "https://downloads.example.test/rdk-x5",

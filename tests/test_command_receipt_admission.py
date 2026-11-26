@@ -10,13 +10,12 @@ from rp_ylx.api.events import validate_capture_status
 from rp_ylx.persistence import PersistenceError
 from rp_ylx.recording.device_session import uuid7
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests import testkit as fixtures
 
 
 class CommandReceiptAdmissionTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = fixtures.CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         coordinator = self.fixture.coordinator()
         self.command = fixtures.start_command("original-start")
@@ -174,7 +173,7 @@ class CommandReceiptAdmissionTest(unittest.TestCase):
                 coordinator.close()
 
     def test_delete_receipt_cannot_hide_a_session_absent_from_its_request(self):
-        coordinator, sid = self.fixture._retained_catalog_entry(
+        coordinator, sid = self.fixture.retained_catalog_entry(
             recovered=True, prefix="unrelated-delete"
         )
         manifest = json.loads(

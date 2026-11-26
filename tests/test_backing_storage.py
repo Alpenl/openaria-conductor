@@ -38,7 +38,7 @@ class BackingCapacityTest(unittest.TestCase):
 
         def statvfs(path):
             free, inodes = self.capacities[path]
-            return SimpleNamespace(f_bavail=free, f_frsize=4096, f_favail=inodes)
+            return SimpleNamespace(f_bavail=free, f_frsize=4096, f_favail=inodes, f_files=inodes)
 
         for context in [
             patch("rp_ylx.recording.backing_storage.SYS_DEV_BLOCK", self.sys),

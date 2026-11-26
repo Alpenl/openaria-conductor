@@ -249,26 +249,23 @@ class FirmwareControlTest(unittest.TestCase):
 
     def test_capture_coordinator_holds_maintenance_lease_for_recording_lifetime(self):
         from rp_ylx.api.gateway import ProviderError
-        from rp_ylx.recording.coordinator import CaptureCoordinator
+        from tests.testkit import CoordinatorHarness
 
-        coordinator = CaptureCoordinator.__new__(CaptureCoordinator)
-        coordinator._network_operation_lease = None
-        with (
-            patch.dict(os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance")}),
-            patch.object(
-                coordinator, "_network_operation_lock_path", return_value=self.root / "network"
-            ),
-        ):
-            with update.maintenance_lock(), self.assertRaises(ProviderError) as raised:
-                coordinator._acquire_network_operation_lease()
-            self.assertEqual(raised.exception.code, "maintenance_active")
-            self.assertTrue(raised.exception.retryable)
-            self.assertIsInstance(raised.exception.__cause__, update.MaintenanceBusyError)
-            coordinator._acquire_network_operation_lease()
+        with CoordinatorHarness() as harness:
+            coordinator = harness.coordinator()
             try:
-                with self.assertRaises(ValueError), update.maintenance_lock():
-                    self.fail("updater entered during a capture lease")
+                with update.maintenance_lock(), self.assertRaises(ProviderError) as raised:
+                    coordinator._acquire_network_operation_lease()
+                self.assertEqual(raised.exception.code, "maintenance_active")
+                self.assertTrue(raised.exception.retryable)
+                self.assertIsInstance(raised.exception.__cause__, update.MaintenanceBusyError)
+                coordinator._acquire_network_operation_lease()
+                try:
+                    with self.assertRaises(ValueError), update.maintenance_lock():
+                        self.fail("updater entered during a capture lease")
+                finally:
+                    coordinator._release_network_operation_lease()
+                with update.maintenance_lock():
+                    pass
             finally:
-                coordinator._release_network_operation_lease()
-            with update.maintenance_lock():
-                pass
+                coordinator.close()

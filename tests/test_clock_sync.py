@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import tempfile
 import threading
 import unittest
@@ -14,8 +13,8 @@ from urllib.request import Request, urlopen
 from rp_ylx.api import Principal, SecurityPolicy, create_gateway_server
 from rp_ylx.api.gateway import ProviderError
 from rp_ylx.clock_sync import ClockSyncError, ClockSynchronizer, valid_clock_response
-from rp_ylx.network_control import NetworkController, handle_control_request
-from rp_ylx.recording.coordinator import CaptureCoordinator
+from rp_ylx.network_control import handle_control_request
+from tests.testkit import CoordinatorHarness, NetworkHarness, start_command
 
 CLIENT_MS = 1789524000000
 
@@ -127,9 +126,6 @@ class ClockSyncTest(unittest.TestCase):
         self.assertEqual(self.wall, CLIENT_MS * 1_000_000 + 500_000000)
 
     def test_privileged_controller_obeys_real_capture_flock(self) -> None:
-        controller = NetworkController.__new__(NetworkController)
-        controller._clock = self.syncer
-        controller._log_control_failure = Mock()
         body = self.request()
         request = {
             "schema": "ylx.network-control-request.v1",
@@ -137,30 +133,37 @@ class ClockSyncTest(unittest.TestCase):
             "principal_id": "phone",
             "body": body,
         }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "capture.lock"
-            with patch.dict(os.environ, {"RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(path)}):
-                with path.open("w") as capture:
-                    fcntl.flock(capture, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    result = handle_control_request(request, controller=controller)
-                    self.assertFalse(result["ok"])
-                    self.assertEqual(result["error"]["code"], "capture_active")
-                    self.clock.clock_settime_ns.assert_not_called()
+        with (
+            NetworkHarness(patch_all_env=True, patch_nmcli=True) as net,
+            net.controller(device_id="device-clock-flock", require_root=False) as controller,
+        ):
+            controller._clock = self.syncer
+            path = net.operation_lock_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w") as capture:
+                fcntl.flock(capture, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 result = handle_control_request(request, controller=controller)
-                self.assertTrue(result["ok"])
-                self.assertEqual(result["body"]["source"], "client")
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"]["code"], "capture_active")
+                self.clock.clock_settime_ns.assert_not_called()
+            result = handle_control_request(request, controller=controller)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["body"]["source"], "client")
 
     def test_coordinator_refuses_active_capture_before_calling_controller(self) -> None:
-        coordinator = CaptureCoordinator.__new__(CaptureCoordinator)
-        coordinator._lock = threading.RLock()
-        coordinator._active = object()
-        with (
-            patch("rp_ylx.recording.coordinator.request_network_control") as request,
-            self.assertRaises(ProviderError) as raised,
-        ):
-            coordinator.sync_clock("phone", self.request())
-        self.assertEqual(raised.exception.status, 409)
-        request.assert_not_called()
+        with CoordinatorHarness() as harness:
+            coordinator = harness.coordinator()
+            try:
+                coordinator.start_capture(start_command("active-for-clock"))
+                with (
+                    patch("rp_ylx.recording.coordinator.request_network_control") as request,
+                    self.assertRaises(ProviderError) as raised,
+                ):
+                    coordinator.sync_clock("phone", self.request())
+                self.assertEqual(raised.exception.status, 409)
+                request.assert_not_called()
+            finally:
+                coordinator.close()
 
     def extended_request(self, *, replace=False):
         status = self.syncer.status("phone", extended=True)
@@ -280,7 +283,12 @@ class ClockGatewayTest(unittest.TestCase):
         policy = SecurityPolicy.customer(
             tokens={
                 "owner": Principal(
-                    "phone", permissions={"getDeviceClock": None, "syncDeviceClock": None}
+                    "phone",
+                    permissions={
+                        "getDeviceClock": None,
+                        "inspectDeviceClock": None,
+                        "syncDeviceClock": None,
+                    },
                 ),
                 "viewer": Principal("viewer", permissions={"getDevice": None}),
             },

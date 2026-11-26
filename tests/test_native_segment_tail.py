@@ -5,10 +5,28 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 
-from tests.test_native import _recording_plan
+from rp_ylx.native import NativeRecordingPlan
+
+
+def _recording_plan(root: Path, helper: Path) -> NativeRecordingPlan:
+    return NativeRecordingPlan(
+        session_root=str(root),
+        session_id="01993e29-74e8-7000-8000-000000000001",
+        encoder_executable=str(helper),
+        width=3840,
+        height=1080,
+        fps=30,
+        bitrate_kbps=8192,
+        segment_frames=900,
+        recording_start_monotonic_ns=1,
+        audio_enabled=False,
+        audio_device="default",
+        audio_sample_rate_hz=48_000,
+        audio_channels=2,
+        audio_segment_seconds=30.0,
+    )
 
 
 def transaction(root, count, append=0):
@@ -45,9 +63,7 @@ def transaction(root, count, append=0):
         'print(\'{"event":"done","frames":0}\', flush=True)\n'
     )
     helper.chmod(0o755)
-    return extension.NativeSessionStore().begin_recording(
-        replace(_recording_plan(), session_root=str(root), encoder_executable=str(helper))
-    )
+    return extension.NativeSessionStore().begin_recording(_recording_plan(root, helper))
 
 
 class NativeSegmentTailTests(unittest.TestCase):

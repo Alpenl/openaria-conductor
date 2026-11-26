@@ -12,18 +12,19 @@ from pathlib import Path
 
 from rp_ylx.api.events import validate_capture_status, validate_retained_unsuccessful_outcome
 from rp_ylx.recording import coordinator as module
-from tests import test_capture_coordinator as fixtures
+from rp_ylx.recording.device_session import validate_device_session_directory
+from rp_ylx.recording.recovery import recover_device_session
+from tests.testkit import CoordinatorHarness, RecoveryFixtureBuilder, start_command
 
 
 class PartialStateAdmissionTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def interrupted(self):
         first = self.fixture.coordinator()
-        first.start_capture(fixtures.start_command("state-admission-start"))
+        first.start_capture(start_command("state-admission-start"))
         sid = self.fixture.active_session_id(first)
         active = copy.deepcopy(first._active.current_recording_state)
         first.close()
@@ -94,12 +95,11 @@ class PartialStateAdmissionTest(unittest.TestCase):
     def test_fifo_recording_control_cannot_block_service_startup(self):
         script = r"""
 import os
-from tests import test_capture_coordinator as fixtures
-case = fixtures.CaptureCoordinatorTest()
-case.setUp()
+from tests.testkit import CoordinatorHarness, start_command
+case = CoordinatorHarness().setUp()
 try:
     coordinator = case.coordinator()
-    coordinator.start_capture(fixtures.start_command("fifo-state"))
+    coordinator.start_capture(start_command("fifo-state"))
     sid = case.active_session_id(coordinator)
     coordinator.close()
     path = case.mountpoint / "recordings" / (sid + ".partial") / "recording.json"
@@ -171,12 +171,10 @@ print("started")
                 restarted.close()
 
     def test_bad_control_diagnostics_are_replaced_in_verified_prefix_receipt(self):
-        from rp_ylx.recording.recovery import recover_device_session
-        from tests import test_recording_recovery as recovery_fixtures
-
+        builder = RecoveryFixtureBuilder()
         for kind in ("nonfinite-diagnostic", "wrong-session", "wrong-volume", "missing-field"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
-                recorder = recovery_fixtures.RecordingRecoveryTests().recording(Path(temp))
+                recorder = builder.recording(Path(temp))
                 partial = recorder.partial_path
                 index = (partial / "frames.ndjson").read_bytes()
                 state = json.loads((partial / "recording.json").read_bytes())
@@ -192,7 +190,7 @@ print("started")
                 (partial / "recording.json").write_bytes(raw)
                 recovered = recover_device_session(partial)
                 self.assertIsNotNone(recovered)
-                verified = fixtures.validate_device_session_directory(recovered.path)
+                verified = validate_device_session_directory(recovered.path)
                 self.assertEqual(verified["frames"]["count"], 30)
                 self.assertEqual((recovered.path / "frames.ndjson").read_bytes(), index)
                 self.assertEqual((recovered.path / "recovery/recording.json").read_bytes(), raw)

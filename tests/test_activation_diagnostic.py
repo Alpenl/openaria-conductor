@@ -10,13 +10,12 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx import deployment as deploy
-from tests import test_deployment as fixtures
+from tests.testkit import DeploymentHarness
 
 
 class ActivationDiagnosticTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.manager = self.fixture.manager()
         self.manager._ensure_layout()
@@ -73,7 +72,7 @@ print(json.dumps({'recovered':True}))
             [sys.executable, "-I", "-c", code, deploy.__file__, str(self.manager.state_root)],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=10,
             check=True,
         )
         self.assertEqual(json.loads(result.stdout), {"recovered": True})

@@ -10,13 +10,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from rp_ylx import deployment as deploy
-from tests import test_deployment as fixtures
+from tests.testkit import DeploymentHarness
 
 
 class DeploymentMetadataTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.root = self.fixture.install_root
         self.release = self.root / "releases" / ("a" * 40)
@@ -358,8 +357,7 @@ else:raise AssertionError('FIFO accepted')
         self.assertEqual(os.readlink(self.root / "current"), "releases/" + "a" * 40)
 
     def test_public_rollback_rejects_before_quiesce_then_recovers(self):
-        fixture = fixtures.ReleaseManagerTest()
-        fixture.setUp()
+        fixture = DeploymentHarness().setUp()
         self.addCleanup(fixture.tearDown)
         manager = fixture.manager()
         manager.install(fixture.bundle("a"), activate=False)

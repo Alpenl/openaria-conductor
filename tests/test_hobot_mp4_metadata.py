@@ -16,7 +16,7 @@ def box(kind: bytes, data: bytes) -> bytes:
 
 class HobotMp4MetadataTest(unittest.TestCase):
     def test_metadata_patch_preserves_media_and_indexes_actual_idr(self) -> None:
-        compiler = shutil.which("cc")
+        compiler = shutil.which("gcc") or shutil.which("cc")
         if compiler is None:
             self.skipTest("C compiler unavailable")
         source = (

@@ -21,7 +21,6 @@ from rp_ylx.recording import (
     StorageStatus,
     uuid7,
 )
-from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 from rp_ylx.spectacular import (
     CaptureValidationError,
     analyze_capture,
@@ -33,68 +32,9 @@ from rp_ylx.spectacular import (
     write_frame_timestamp_csv,
 )
 from rp_ylx.spectacular.check_cli import main as check_main
+from tests.testkit import FakeSplitEyeEncoder
 
 JPEG = b"\xff\xd8spectacular-raw-sbs\xff\xd9"
-
-
-class FakeSplitEyeEncoder:
-    def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
-        del unused
-        self._out_dir = out_dir
-        self._segment_frames = segment_frames
-        self._segments: list[ClosedSegment] = []
-        self._submitted = 0
-        self._started = False
-
-    @property
-    def segments(self) -> tuple[ClosedSegment, ...]:
-        return tuple(self._segments)
-
-    @property
-    def submitted_frames(self) -> int:
-        return self._submitted
-
-    def start(self) -> None:
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._started = True
-
-    def submit(self, jpeg: bytes) -> None:
-        del jpeg
-        if not self._started:
-            raise StereoEncoderError("invalid_state", "fake encoder is not started")
-        self._submitted += 1
-        if self._submitted % self._segment_frames == 0:
-            self._close(self._submitted - self._segment_frames, self._submitted)
-
-    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
-        del timeout
-        closed = len(self._segments) * self._segment_frames
-        if closed < self._submitted:
-            self._close(closed, self._submitted)
-        return self.segments
-
-    def abort(self) -> None:
-        return
-
-    def _close(self, start_frame: int, end_frame: int) -> None:
-        index = len(self._segments)
-        artifacts: dict[str, tuple[str, int]] = {}
-        for eye in ("left", "right"):
-            name = f"{eye}_{index:05d}.mp4"
-            payload = f"{eye}-{index}-{start_frame}-{end_frame}".encode() * 8
-            (self._out_dir / name).write_bytes(payload)
-            artifacts[eye] = (f"video/{name}", len(payload))
-        self._segments.append(
-            ClosedSegment(
-                index=index,
-                start_frame=start_frame,
-                end_frame=end_frame,
-                left_path=artifacts["left"][0],
-                left_bytes=artifacts["left"][1],
-                right_path=artifacts["right"][0],
-                right_bytes=artifacts["right"][1],
-            )
-        )
 
 
 def _json_bytes(value: object) -> bytes:

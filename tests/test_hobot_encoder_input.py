@@ -13,7 +13,7 @@ from pathlib import Path
 class HobotEncoderInputTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        compiler = shutil.which("cc")
+        compiler = shutil.which("gcc") or shutil.which("cc")
         if compiler is None:
             raise unittest.SkipTest("C compiler unavailable")
         cls.temporary = tempfile.TemporaryDirectory()

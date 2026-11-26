@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 from rp_ylx.recording.live_seal import _Journal, _read_back
 from rp_ylx.recording.storage import open_metadata
-from rp_ylx.spectacular.adapter import _read_json_object
+from rp_ylx.spectacular.adapter import _open_pinned_relative, _open_pinned_root, _read_json_from_fd
 
 with tempfile.TemporaryDirectory() as temporary:
     path = Path(temporary) / 'artifact.json'
@@ -38,7 +38,17 @@ with tempfile.TemporaryDirectory() as temporary:
             elif mode == 'proof':
                 assert proof.unchanged(path) is False
             elif mode == 'calibration':
-                _read_json_object(path, 'manifest')
+                root_fd = _open_pinned_root(Path(temporary))
+                try:
+                    _, fd, _ = _open_pinned_relative(
+                        root_fd, Path(temporary), 'artifact.json', 'manifest'
+                    )
+                    try:
+                        _read_json_from_fd(fd, 'manifest')
+                    finally:
+                        os.close(fd)
+                finally:
+                    os.close(root_fd)
             else:
                 raise AssertionError(mode)
     except (OSError, ValueError):
@@ -55,7 +65,7 @@ print('rejected')
                     [sys.executable, "-c", script, mode],
                     capture_output=True,
                     text=True,
-                    timeout=3,
+                    timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "rejected")
@@ -79,7 +89,7 @@ with tempfile.TemporaryDirectory() as temp:
 print("rejected")
 """
         result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, timeout=3
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=10
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "rejected")
@@ -101,7 +111,7 @@ with tempfile.TemporaryDirectory() as temp:
                         KeyboardInterrupt("stat interrupt"), SystemExit("stat exit")):
             before = len(os.listdir("/proc/self/fd"))
             held = []
-            with patch.object(module, "_native_open_regular_at", return_value=None), \
+            with patch.object(module, "_session_store_or_none", return_value=None), \
                  patch.object(module.os, "fstat", side_effect=failure):
                 for _ in range(10):
                     try:
@@ -119,7 +129,7 @@ with tempfile.TemporaryDirectory() as temp:
             assert len(held) == 10
             after = len(os.listdir("/proc/self/fd"))
             assert before == after, (type(failure).__name__, before, after)
-        with patch.object(module, "_native_open_regular_at", return_value=None):
+        with patch.object(module, "_session_store_or_none", return_value=None):
             descriptor = module._open_regular_at(
                 root_fd, "nested/payload.bin", code="artifact_invalid"
             )

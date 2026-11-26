@@ -3,7 +3,7 @@ import math
 import unittest
 
 from rp_ylx.audio_clock import audio_clock_report, audio_sample_time_ns, raw_audio_clock_model
-from tests.test_audio_clock import audio_fixture
+from tests.testkit import audio_fixture
 
 
 def raw_fixture():

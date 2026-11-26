@@ -10,8 +10,15 @@ from unittest.mock import patch
 
 import rp_ylx.recording.device_session as session
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as capture
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    FakeAudioRecorder,
+    FakeSessionStore,
+    FakeStereoEncoder,
+    SplitEyeHarness,
+    split_eye_frame,
+    start_command,
+)
 
 
 @contextmanager
@@ -54,8 +61,8 @@ class SessionWorkerStartTests(unittest.TestCase):
     def check_worker(self, role, native=False):
         for stage in ("construct", "start"):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
-                store = fixtures.FakeSessionStore()
-                recorder, encoders, audios = fixtures.SplitEyeRecordingTest().build(
+                store = FakeSessionStore()
+                recorder, encoders, audios = SplitEyeHarness().build(
                     Path(directory), native_data_plane=native, audio_enabled=not native
                 )
                 threads = []
@@ -85,7 +92,7 @@ class SessionWorkerStartTests(unittest.TestCase):
                     self.assertEqual(document["diagnostics"][0]["code"], "start_failed")
                     recorder.abort()
                     with self.assertRaises(session.DeviceRecordingError):
-                        recorder.submit_frame(fixtures.frame(0))
+                        recorder.submit_frame(split_eye_frame(0))
                 finally:
                     cleanup_fixture(recorder)
 
@@ -100,10 +107,10 @@ class SessionWorkerStartTests(unittest.TestCase):
 
     def check_adapter(self, kind):
         with tempfile.TemporaryDirectory() as directory:
-            recorder, encoders, audios = fixtures.SplitEyeRecordingTest().build(
+            recorder, encoders, audios = SplitEyeHarness().build(
                 Path(directory), audio_enabled=True
             )
-            cls = fixtures.FakeStereoEncoder if kind == "encoder" else fixtures.FakeAudioRecorder
+            cls = FakeStereoEncoder if kind == "encoder" else FakeAudioRecorder
             original = cls.start
             injected = RuntimeError("injected partially started adapter")
 
@@ -139,8 +146,7 @@ class CoordinatorWorkerStartTests(unittest.TestCase):
     def test_worker_start_failure_releases_capture_and_allows_new_start(self):
         for role in ("writer", "harvester"):
             with self.subTest(role=role):
-                fixture = capture.CaptureCoordinatorTest()
-                fixture.setUp()
+                fixture = CoordinatorHarness().setUp()
                 coordinator = fixture.coordinator()
                 threads = []
                 try:
@@ -148,7 +154,7 @@ class CoordinatorWorkerStartTests(unittest.TestCase):
                         fail_worker(role, "start", threads, RuntimeError("no worker")),
                         self.assertRaises(ProviderError) as failure,
                     ):
-                        coordinator.start_capture(capture.start_command("failed-" + role))
+                        coordinator.start_capture(start_command("failed-" + role))
                     self.assertEqual(failure.exception.code, "start_failed")
                     self.assertIsNone(coordinator._active)
                     self.assertIsNone(coordinator._active_plan)
@@ -157,7 +163,7 @@ class CoordinatorWorkerStartTests(unittest.TestCase):
                     self.assertEqual(
                         coordinator.capture_status()["snapshot"]["device_state"], "idle"
                     )
-                    accepted = coordinator.start_capture(capture.start_command("retry-" + role))
+                    accepted = coordinator.start_capture(start_command("retry-" + role))
                     self.assertEqual(accepted.status, 202)
                     self.assertIsNotNone(coordinator._active)
                 finally:

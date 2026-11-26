@@ -1,26 +1,85 @@
+import fcntl
 import multiprocessing
+import os
 import threading
 import traceback
 import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
+from rp_ylx.api.events import validate_capture_status
 from rp_ylx.recording.device_session import DeviceRecordingError
-from tests import test_capture_coordinator as fixtures
-from tests import test_stop_state_commit as helpers
+from tests.testkit import (
+    CoordinatorHarness,
+    CoordinatorMixin,
+    frame,
+    start_command,
+    stop_command,
+)
 
 
-class StopAcceptanceTest(unittest.TestCase):
-    cleanup_workers = helpers.StopStateCommitTest.cleanup_workers
-    launch = helpers.StopStateCommitTest.launch
-    assert_responsive = helpers.StopStateCommitTest.assert_responsive
-    assert_busy_start = helpers.StopStateCommitTest.assert_busy_start
-    assert_lease_held = helpers.StopStateCommitTest.assert_lease_held
-
+class StopAcceptanceTest(CoordinatorMixin):
     def setUp(self):
-        helpers.StopStateCommitTest.setUp(self)
+        super().setUp()
+        self.coordinator = self.harness.coordinator()
+        self.addCleanup(self.coordinator.close)
+        self.coordinator.start_capture(start_command("start"))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
+        self.sid = self.harness.active_session_id(self.coordinator)
+        self.command = stop_command("stop")
+        self.recorder = self.coordinator._active
+        self.workers = []
+        self.results = {}
+        self.errors = {}
+        self.release = threading.Event()
+        self.addCleanup(self.cleanup_workers)
         self.worker_release = threading.Event()
         self.addCleanup(self.worker_release.set)
+
+    def cleanup_workers(self):
+        self.release.set()
+        for worker in self.workers:
+            worker.join(5)
+        self.assertTrue(all(not worker.is_alive() for worker in self.workers))
+
+    def launch(self, name, function):
+        done = threading.Event()
+
+        def work():
+            try:
+                self.results[name] = function()
+            except BaseException as error:
+                self.errors[name] = error
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=work, name=name)
+        self.workers.append(worker)
+        worker.start()
+        return done
+
+    def assert_responsive(self):
+        self.assertTrue(self.launch("status", self.coordinator.capture_status).wait(0.25))
+        self.assertNotIn("status", self.errors)
+        validate_capture_status(self.results["status"])
+
+    def assert_busy_start(self):
+        done = self.launch(
+            "new-start",
+            lambda: self.coordinator.start_capture(start_command("new-start")),
+        )
+        self.assertTrue(done.wait(0.25))
+        error = self.errors.pop("new-start")
+        self.assertIsInstance(error, ProviderError)
+        self.assertEqual(error.code, "capture_busy")
+
+    def assert_lease_held(self):
+        fd = os.open(self.coordinator._network_operation_lock_path(), os.O_RDONLY)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
 
     def wait_finished(self):
         with self.coordinator._stop_condition:
@@ -61,7 +120,7 @@ class StopAcceptanceTest(unittest.TestCase):
                 self.assertFalse(
                     any(x["operation"] == "stop" for x in c._state_db.capture_state()["commands"])
                 )
-                for command in (self.command, fixtures.stop_command("other")):
+                for command in (self.command, stop_command("other")):
                     with self.assertRaises(ProviderError) as raised:
                         c.request_stop_capture(command)
                     self.assertEqual(raised.exception.code, "capture_busy")
@@ -154,7 +213,7 @@ class StopAcceptanceTest(unittest.TestCase):
         working, entered = threading.Event(), threading.Event()
         original_finish = c._finish_stop_capture
         original_write = c._state_db.put_capture_state
-        other = fixtures.stop_command("other-stop")
+        other = stop_command("other-stop")
 
         def finish(*args, **kwargs):
             working.set()
@@ -210,7 +269,7 @@ class StopAcceptanceTest(unittest.TestCase):
 
     def resume(self, fail):
         c = self.coordinator
-        command = fixtures.stop_command("handoff", reason="safe_swap")
+        command = stop_command("handoff", reason="safe_swap")
         with patch.object(c, "_publish_safe_swap", side_effect=OSError("handoff unavailable")):
             original_accepted = c.request_stop_capture(command)
             self.wait_finished()
@@ -278,7 +337,7 @@ class StopAcceptanceTest(unittest.TestCase):
             return original(*args, **kwargs)
 
         with patch.object(c._state_db, "put_capture_state", side_effect=put):
-            self.launch("idle", lambda: c.request_stop_capture(fixtures.stop_command("idle")))
+            self.launch("idle", lambda: c.request_stop_capture(stop_command("idle")))
             try:
                 self.assertTrue(entered.wait(3))
                 self.assert_responsive()
@@ -294,20 +353,19 @@ class StopAcceptanceTest(unittest.TestCase):
 
 class StopAcceptanceCrashTest(unittest.TestCase):
     def crash(self, after):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         context = multiprocessing.get_context("fork")
         receive, send = context.Pipe(duplex=False)
         self.addCleanup(receive.close)
         self.addCleanup(send.close)
-        command = fixtures.stop_command("crash-acceptance")
+        command = stop_command("crash-acceptance")
 
         def child():
             try:
                 c = fixture.coordinator()
-                c.start_capture(fixtures.start_command("crash-start"))
-                self.assertTrue(c.submit_frame(fixtures.frame()))
+                c.start_capture(start_command("crash-start"))
+                self.assertTrue(c.submit_frame(frame()))
                 original = c._state_db.put_capture_state
 
                 def put(value, commands, *args, **kwargs):

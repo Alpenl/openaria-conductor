@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import errno
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,12 +17,9 @@ class LiveCloseErrorsTest(unittest.TestCase):
         return root
 
     def cancelled(self, root):
-        sealing = object.__new__(LiveSealing)
-        sealing.root = root
-        sealing.prepared = {}
-        sealing.cancelled = threading.Event()
+        with patch("rp_ylx.recording.live_seal.ThreadPoolExecutor"):
+            sealing = LiveSealing(root, 30, 2)
         sealing.cancelled.set()
-        sealing.finished = threading.Event()
         return sealing
 
     def test_real_enospc_on_close_releases_both_journals(self):

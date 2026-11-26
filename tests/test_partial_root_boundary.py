@@ -4,21 +4,22 @@ import json
 import unittest
 from unittest.mock import patch
 
-from rp_ylx.recording import coordinator as module
+from rp_ylx.recording import coordinator
+from rp_ylx.recording import recovery_orchestrator as module
+from rp_ylx.recording.device_session import validate_device_session_directory
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, start_command
 
 
 class PartialRootBoundaryTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def test_linked_partial_does_not_delete_or_rewrite_external_metadata(self):
         first = self.fixture.coordinator()
         try:
-            first.start_capture(fixtures.start_command("partial-root-start"))
+            first.start_capture(start_command("partial-root-start"))
             sid = self.fixture.active_session_id(first)
             state = first.capture_status()["snapshot"]["active_recording"]["recording_state"]
         finally:
@@ -43,7 +44,7 @@ class PartialRootBoundaryTest(unittest.TestCase):
     def make_interrupted_partial(self):
         first = self.fixture.coordinator()
         try:
-            first.start_capture(fixtures.start_command("partial-boundary-start"))
+            first.start_capture(start_command("partial-boundary-start"))
             sid = self.fixture.active_session_id(first)
             state = first.capture_status()["snapshot"]["active_recording"]["recording_state"]
         finally:
@@ -64,17 +65,19 @@ class PartialRootBoundaryTest(unittest.TestCase):
         sid, partial, external = self.make_interrupted_partial()
         (partial / "manifest.json").write_text("{}")
         before = {path.name: path.read_bytes() for path in external.iterdir()}
-        inspect = module.inspect_device_session_directory
+        inspect = coordinator.inspect_device_session_directory
 
         def replace_directory(*args, **kwargs):
             if args[0] != partial:
                 return inspect(*args, **kwargs)
             self.replace_with_link(partial, external)
             if rejected:
-                raise module.DeviceRecordingError("manifest_invalid", "injected validation error")
+                raise coordinator.DeviceRecordingError(
+                    "manifest_invalid", "injected validation error"
+                )
 
         with patch.object(
-            module, "inspect_device_session_directory", side_effect=replace_directory
+            coordinator, "inspect_device_session_directory", side_effect=replace_directory
         ) as validate:
             restarted = self.fixture.coordinator()
         try:
@@ -142,6 +145,6 @@ class PartialRootBoundaryTest(unittest.TestCase):
             final = resolve_recording(self.fixture.mountpoint / "recordings", sid)
             self.assertEqual((final / "manifest.json").read_bytes(), manifest)
             self.assertNotIn(sid, restarted._verified)
-            fixtures.validate_device_session_directory(final)
+            validate_device_session_directory(final)
         finally:
             restarted.close()

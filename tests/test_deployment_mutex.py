@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx import deployment as deploy
-from tests import test_deployment as fixtures
+from tests.testkit import DeploymentHarness
 
 CHILD = """import json,runpy,sys,time
 from pathlib import Path
@@ -38,8 +38,7 @@ else:
 
 class DeploymentMutexTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.manager = self.fixture.manager()
         self.peer = self.fixture.manager()

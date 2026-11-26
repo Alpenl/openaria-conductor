@@ -5,17 +5,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from rp_ylx.recording import audio_finalizer
 from rp_ylx.recording import device_session as d
-from tests import test_audio_inventory as fixtures
+from tests.testkit import audio_inventory_recorder, make_multiple_audio_result
 
 
 class AudioInventoryPipelineTests(unittest.TestCase):
     def exercise(self, fail_second):
-        helper = fixtures.AudioInventoryTests()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            result = helper.multiple_audio(root, 6)
-            recorder = helper.recorder(root)
+            result = make_multiple_audio_result(root, 6)
+            recorder = audio_inventory_recorder(root)
             recorder._audio_result = {"previous": True}
             recorder._audio_segment_records = ["previous"]
             recorder._audio_bytes = 123
@@ -59,7 +59,7 @@ class AudioInventoryPipelineTests(unittest.TestCase):
 
             with (
                 patch.object(d, "_verified_finalization", side_effect=read),
-                patch.object(d, "ThreadPoolExecutor", TrackedPool),
+                patch.object(audio_finalizer, "ThreadPoolExecutor", TrackedPool),
             ):
                 caller = threading.Thread(target=apply)
                 caller.start()

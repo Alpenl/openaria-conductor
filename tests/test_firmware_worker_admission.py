@@ -8,15 +8,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-import tests.test_firmware_control as fixtures
 from rp_ylx import firmware_control as control
+from tests.testkit import FirmwareHarness
 
 
 class FirmwareWorkerAdmissionTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.FirmwareControlTest()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = FirmwareHarness().setUp()
+        self.addCleanup(self.fixture.tearDown)
         self.s = self.fixture.supervisor
         self.s.runner = Mock(side_effect=self.install)
         self.workers = []

@@ -6,14 +6,12 @@ import os
 import tempfile
 import unittest
 import wave
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import rp_ylx.recording.device_session as session_module
 import rp_ylx.recording.recovery as recovery_module
 from rp_ylx.audio_clock import audio_clock_report
-from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.recording.coordinator import (
     CaptureCoordinator,
     CoordinatorConfig,
@@ -25,7 +23,37 @@ from rp_ylx.recording.device_session import (
     write_json_atomic,
 )
 from rp_ylx.recording.recovery import _frames, _write_records, recover_device_session
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import RecoveryFixtureBuilder
+
+
+def _publish_audio_journal(root: Path, rows: list[dict[str, object]]) -> dict[str, object]:
+    payload = b"".join(json.dumps(row).encode() + b"\n" for row in rows)
+    segments = [segment for row in rows for segment in row["segments"]]  # type: ignore[attr-defined]
+    anchors = [anchor for row in rows for anchor in row["anchors"]]  # type: ignore[attr-defined]
+    head: dict[str, object] = {
+        "schema": "openaria.audio-checkpoint.v3",
+        "journal_bytes": len(payload),
+        "journal_sha256": hashlib.sha256(payload).hexdigest(),
+        "journal_records": len(rows),
+        "anchor_count": len(anchors),
+        "segment_count": len(segments),
+        "sample_count": segments[-1]["end_sample"] if segments else 0,
+        "last_anchor": None,
+        "thread_started_monotonic_ns": 100,
+        "period_frames": 1024,
+        "buffer_frames": 8192,
+        "queue_capacity_frames": 786432,
+        "queue_peak_frames": 1024,
+        "max_write_ns": 5,
+    }
+    audio = root / "audio"
+    audio.mkdir(exist_ok=True)
+    path = audio / "checkpoint.ndjson"
+    prior = path.read_bytes() if path.exists() else b""
+    with path.open("ab") as output:
+        output.write(payload[len(prior) :])
+    write_json_atomic(audio / "checkpoint.json", head)
+    return head
 
 
 class RecordingRecoveryTests(unittest.TestCase):
@@ -231,29 +259,7 @@ class RecordingRecoveryTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), b"".join(json_bytes(row) for row in rows))
 
     def recording(self, root, frames=32):
-        recorder, _, _ = fixtures.SplitEyeRecordingTest().build(root)
-        with patch.object(recorder, "_now", return_value=datetime.now(UTC) - timedelta(seconds=10)):
-            recorder.start()
-        origin = recorder._started_monotonic_ns
-        for index in range(frames):
-            recorder.submit_frame(
-                FrameObservation(
-                    StereoFrame(
-                        source_sequence=100 + index * 2,
-                        host_monotonic_ns=origin + 10_000_000 + round(index * 1e9 / 30),
-                        left=b"",
-                        right=b"",
-                        raw_side_by_side=fixtures.FRAME,
-                    ),
-                    dropped_before=0,
-                )
-            )
-        recorder._stop_writer()
-        recorder._abandon_encoder()
-        recorder._close_files(ignore_errors=False)
-        self.assertIsNone(recorder._writer_error, "recovery fixture writer failed")
-        self.assertEqual(recorder._frames_written, frames)
-        return recorder
+        return RecoveryFixtureBuilder().recording(root, frames=frames)
 
     def test_ten_committed_pairs_survive_failed_eleventh_and_are_downloadable(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -609,11 +615,9 @@ class RecordingRecoveryTests(unittest.TestCase):
                 },
             )
             if journal:
-                from tests.test_audio_journal import publish
-
                 head = json.loads((root / "audio/checkpoint.json").read_bytes())
                 head["segments"][0]["index"] = 0
-                published = publish(
+                published = _publish_audio_journal(
                     root, [{"sequence": 0, "anchors": anchors, "segments": head["segments"]}]
                 )
                 published["thread_started_monotonic_ns"] = head["thread_started_monotonic_ns"]

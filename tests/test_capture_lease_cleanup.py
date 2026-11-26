@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 from rp_ylx import update
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
+from rp_ylx.recording import hardware_proxies
+from tests import testkit as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class ExitFailure:
@@ -26,8 +28,7 @@ class ExitFailure:
 
 class CaptureLeaseCleanupTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.maintenance = self.fixture.root / "maintenance.lock"
         env = patch.dict(os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.maintenance)})
@@ -133,7 +134,7 @@ class CaptureLeaseCleanupTest(unittest.TestCase):
 
         before = len(os.listdir("/proc/self/fd"))
         with (
-            patch.object(update, "maintenance_lock", side_effect=lease),
+            patch.object(hardware_proxies, "maintenance_lock", side_effect=lease),
             self.assertRaises(ProviderError) as caught,
         ):
             self.coordinator._acquire_network_operation_lease()
@@ -174,7 +175,7 @@ class CaptureLeaseCleanupTest(unittest.TestCase):
 
         with (
             patch.object(os, "fstat", side_effect=stat),
-            patch.object(update, "maintenance_lock", side_effect=lease),
+            patch.object(hardware_proxies, "maintenance_lock", side_effect=lease),
             self.assertRaises(KeyboardInterrupt) as caught,
         ):
             self.coordinator._acquire_network_operation_lease()
@@ -195,7 +196,7 @@ class CaptureLeaseCleanupTest(unittest.TestCase):
 
         before = len(os.listdir("/proc/self/fd"))
         with (
-            patch.object(update, "maintenance_lock", side_effect=lease),
+            patch.object(hardware_proxies, "maintenance_lock", side_effect=lease),
             self.assertRaises(KeyboardInterrupt) as caught,
         ):
             self.coordinator._acquire_network_operation_lease()

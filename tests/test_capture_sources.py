@@ -31,71 +31,10 @@ from rp_ylx.recording import (
     initialize_capture_volume,
     validate_device_session_directory,
 )
-from rp_ylx.recording.stereo_encoder import ClosedSegment, StereoEncoderError
 from rp_ylx.recording_layout import resolve_recording
-from tests.test_capture_coordinator import idle_network_control
+from tests.testkit import FakeSplitEyeEncoder, idle_network_control
 
 JPEG = b"\xff\xd8threaded-sbs\xff\xd9"
-
-
-class FakeSplitEyeEncoder:
-    def __init__(self, out_dir: Path, *, segment_frames: int, **unused: object) -> None:
-        del unused
-        self._out_dir = out_dir
-        self._segment_frames = segment_frames
-        self._segments: list[ClosedSegment] = []
-        self._submitted = 0
-        self._started = False
-
-    @property
-    def segments(self) -> tuple[ClosedSegment, ...]:
-        return tuple(self._segments)
-
-    @property
-    def submitted_frames(self) -> int:
-        return self._submitted
-
-    def start(self) -> None:
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._started = True
-
-    def submit(self, jpeg: bytes) -> None:
-        del jpeg
-        if not self._started:
-            raise StereoEncoderError("invalid_state", "fake encoder is not started")
-        self._submitted += 1
-        if self._submitted % self._segment_frames == 0:
-            self._close(self._submitted - self._segment_frames, self._submitted)
-
-    def finish(self, *, timeout: float = 30.0) -> tuple[ClosedSegment, ...]:
-        del timeout
-        closed = len(self._segments) * self._segment_frames
-        if closed < self._submitted:
-            self._close(closed, self._submitted)
-        return self.segments
-
-    def abort(self) -> None:
-        return
-
-    def _close(self, start_frame: int, end_frame: int) -> None:
-        index = len(self._segments)
-        artifacts: dict[str, tuple[str, int]] = {}
-        for eye in ("left", "right"):
-            name = f"{eye}_{index:05d}.mp4"
-            payload = f"{eye}-{index}-{start_frame}-{end_frame}".encode() * 8
-            (self._out_dir / name).write_bytes(payload)
-            artifacts[eye] = (f"video/{name}", len(payload))
-        self._segments.append(
-            ClosedSegment(
-                index=index,
-                start_frame=start_frame,
-                end_frame=end_frame,
-                left_path=artifacts["left"][0],
-                left_bytes=artifacts["left"][1],
-                right_path=artifacts["right"][0],
-                right_bytes=artifacts["right"][1],
-            )
-        )
 
 
 class GatedSequenceCamera:
@@ -495,22 +434,29 @@ class CaptureSourcesTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.environment_patcher = patch.dict(
             os.environ,
-            {"RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.root / "network-operation.lock")},
+            {
+                "RP_YLX_NETWORK_OPERATION_LOCK_PATH": str(self.root / "network-operation.lock"),
+                "OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock"),
+            },
         )
         self.environment_patcher.start()
+        self.addCleanup(self.environment_patcher.stop)
         self.network_control_patcher = patch(
             "rp_ylx.recording.coordinator.request_network_control",
             side_effect=idle_network_control,
         )
         self.network_control_patcher.start()
+        self.addCleanup(self.network_control_patcher.stop)
         self.encoder_patcher = patch(
             "rp_ylx.recording.device_session.StereoEncoderProcess",
             FakeSplitEyeEncoder,
         )
         self.encoder_patcher.start()
+        self.addCleanup(self.encoder_patcher.stop)
         self.volume = self.root / "volume"
         self.volume.mkdir()
         initialize_capture_volume(self.volume)
@@ -531,12 +477,6 @@ class CaptureSourcesTest(unittest.TestCase):
             minimum_available_bytes=0,
             minimum_available_inodes=0,
         )
-
-    def tearDown(self) -> None:
-        self.encoder_patcher.stop()
-        self.network_control_patcher.stop()
-        self.environment_patcher.stop()
-        self.temporary.cleanup()
 
     def start(self, coordinator: CaptureCoordinator, *, key: str) -> str:
         result = coordinator.start_capture(

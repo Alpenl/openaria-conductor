@@ -9,14 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx.recording.device_session import DeviceRecordingError
-from tests import test_split_eye_recording as fixture
+from tests.testkit import SplitEyeHarness
 
 
 class CaptureEndBoundaryTest(unittest.TestCase):
     def build(self, root, *, audio=False):
-        recorder, _, audios = fixture.SplitEyeRecordingTest().build(root, audio_enabled=audio)
+        recorder, _, audios = SplitEyeHarness().build(root, audio_enabled=audio)
         recorder.start()
-        fixture.SplitEyeRecordingTest.feed(recorder, 4)
+        SplitEyeHarness.feed(recorder, 4)
         self.addCleanup(
             lambda: recorder.abort() if recorder.state in {"recording", "finalizing"} else None
         )
@@ -107,12 +107,10 @@ class CaptureEndBoundaryTest(unittest.TestCase):
                     if not release.wait(5):
                         raise RuntimeError("test writer gate timed out")
 
-            recorder, _, _ = fixture.SplitEyeRecordingTest().build(
-                Path(directory), before_write=hold_first_frame
-            )
+            recorder, _, _ = SplitEyeHarness().build(Path(directory), before_write=hold_first_frame)
             recorder.start()
             try:
-                fixture.SplitEyeRecordingTest.feed(recorder, 4)
+                SplitEyeHarness.feed(recorder, 4)
                 self.assertTrue(entered.wait(2))
                 persist = recorder._persist_state
 

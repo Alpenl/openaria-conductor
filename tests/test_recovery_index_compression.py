@@ -2,25 +2,45 @@
 
 import hashlib
 import json
+import multiprocessing
 import os
+import signal
+import sqlite3
 import tempfile
+import time
+import traceback
 import unittest
+import wave
 from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
 import rp_ylx.recording.recovery as recovery
-from rp_ylx.recording.device_session import json_bytes, validate_device_session_directory
+from rp_ylx.audio_clock import audio_clock_report
+from rp_ylx.recording.coordinator import (
+    CaptureCoordinator,
+    CoordinatorConfig,
+    initialize_capture_volume,
+)
+from rp_ylx.recording.device_session import (
+    json_bytes,
+    validate_device_session_directory,
+    write_json_atomic,
+)
 from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.recovery_index import RecoveryIndex
 from rp_ylx.recording.storage import BLOCK_BYTES, open_metadata
-from tests import test_recording_recovery as fixtures
-from tests import test_recovery_publish_crash as crash_fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    RecoveryFixtureBuilder,
+    frame,
+    start_command,
+)
 
 
 class RecoveryIndexCompressionTests(unittest.TestCase):
     def recording(self, root):
-        recorder = fixtures.RecordingRecoveryTests().recording(root)
+        recorder = RecoveryFixtureBuilder().recording(root)
         capture = recorder.partial_path / "capture.json"
         value = json.loads(capture.read_bytes())
         value["config"]["lossless_storage"] = True
@@ -221,46 +241,207 @@ class RecoveryIndexCompressionTests(unittest.TestCase):
             validate_device_session_directory(result.path)
 
     def test_audio_clock_versions_and_original_pcm_survive_compressed_recovery(self):
-        fixture = fixtures.RecordingRecoveryTests()
-        fixture.recording = self.recording
+        def publish_journal(root: Path, rows: list[dict[str, object]]) -> dict[str, object]:
+            payload = b"".join(json.dumps(row).encode() + b"\n" for row in rows)
+            segments = [s for row in rows for s in row["segments"]]  # type: ignore[attr-defined]
+            anchors = [a for row in rows for a in row["anchors"]]  # type: ignore[attr-defined]
+            head: dict[str, object] = {
+                "schema": "openaria.audio-checkpoint.v3",
+                "journal_bytes": len(payload),
+                "journal_sha256": hashlib.sha256(payload).hexdigest(),
+                "journal_records": len(rows),
+                "anchor_count": len(anchors),
+                "segment_count": len(segments),
+                "sample_count": segments[-1]["end_sample"] if segments else 0,
+                "last_anchor": None,
+                "thread_started_monotonic_ns": 100,
+                "period_frames": 1024,
+                "buffer_frames": 8192,
+                "queue_capacity_frames": 786432,
+                "queue_peak_frames": 1024,
+                "max_write_ns": 5,
+            }
+            audio = root / "audio"
+            audio.mkdir(exist_ok=True)
+            path = audio / "checkpoint.ndjson"
+            prior = path.read_bytes() if path.exists() else b""
+            with path.open("ab") as output:
+                output.write(payload[len(prior) :])
+            write_json_atomic(audio / "checkpoint.json", head)
+            return head
+
         for raw, journal in ((False, False), (True, False), (True, True)):
-            with self.subTest(raw=raw, journal=journal):
-                fixture._check_audio_prefix(raw, journal=journal)
+            with self.subTest(raw=raw, journal=journal), tempfile.TemporaryDirectory() as temporary:
+                recorder = self.recording(Path(temporary))
+                root = recorder.partial_path
+                pcm, _ = RecoveryFixtureBuilder.write_audio_prefix(
+                    root,
+                    recorder._started_monotonic_ns,
+                    raw_clock=raw,
+                    journal=journal,
+                    journal_publisher=publish_journal if journal else None,
+                )
+                recovered = recovery.recover_device_session(root)
+                self.assertIsNotNone(recovered)
+                audio = recovered.manifest["audio"]
+                report = audio_clock_report(audio, recovered.manifest["time"]["duration_seconds"])
+                self.assertEqual(report["continuity"], "verified")
+                if raw:
+                    self.assertEqual(audio["capture_clock"]["schema"], "openaria.audio-clock.v2")
+                    self.assertEqual(report["mapping"], "piecewise-linear")
+                self.assertLess(audio["sample_count"], len(pcm) // 4)
+                with wave.open(
+                    str(recovered.path / audio["segments"][0]["artifact"]["path"]), "rb"
+                ) as stream:
+                    self.assertEqual(
+                        stream.readframes(audio["sample_count"]),
+                        pcm[: audio["sample_count"] * 4],
+                    )
+                self.assertEqual((recovered.path / "audio/audio_00000.wav").read_bytes()[44:], pcm)
 
     def test_recovered_compressed_artifacts_remain_downloadable_after_coordinator_restart(self):
-        fixture = fixtures.RecordingRecoveryTests()
-        fixture.recording = self.recording
-        fixture.test_coordinator_restart_publishes_recovery_through_normal_catalog()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            volume = root / "volume"
+            volume.mkdir()
+            volume_id = initialize_capture_volume(volume)
+            sessions = volume / "recordings"
+            sessions.mkdir(exist_ok=True)
+            recorder = self.recording(sessions)
+            capture_path = recorder.partial_path / "capture.json"
+            capture = json.loads(capture_path.read_bytes())
+            capture["plan"]["volume_id"] = volume_id
+            write_json_atomic(capture_path, capture)
+            recording_path = recorder.partial_path / "recording.json"
+            recording = json.loads(recording_path.read_bytes())
+            recording["storage"]["volume_id"] = volume_id
+            write_json_atomic(recording_path, recording)
+            config = CoordinatorConfig(
+                volume,
+                root / "state",
+                recorder._config,
+                minimum_available_bytes=0,
+                minimum_available_inodes=0,
+            )
+            for _ in range(2):
+                coordinator = CaptureCoordinator(config, mount_checker=lambda path: path == volume)
+                try:
+                    retained = coordinator.capture_status()["snapshot"]["retained_unsuccessful"]
+                    saved = retained["recording_state"]
+                    self.assertIn(
+                        "recording_prefix_saved", [d["code"] for d in saved["diagnostics"]]
+                    )
+                    listed = coordinator.list_sessions(
+                        cursor=None, limit=50, take_id=None, api_version="v4"
+                    )
+                    self.assertEqual(len(listed["items"]), 1)
+                    session = listed["items"][0]
+                    self.assertEqual(session["session_id"], recorder._plan.session_id)
+                    coordinator._catalog_sessions(verify_session=recorder._plan.session_id)
+                    representation = coordinator.open_manifest(recorder._plan.session_id, "v4")
+                    manifest = json.loads(representation.read())
+                    representation.close()
+                    receipt = manifest["logs"][0]
+                    representation = coordinator.open_verified_artifact(
+                        recorder._plan.session_id, receipt["artifact_id"], "v4"
+                    )
+                    self.assertEqual(json.loads(representation.read())["saved_frames"], 30)
+                    representation.close()
+                finally:
+                    coordinator.close()
 
     def test_compressed_recovery_survives_publication_crash_boundaries(self):
-        cases = (
-            "test_archived_controls_survive_crash_before_publication_rename",
-            "test_published_prefix_fault_survives_crash_before_coordinator_commit",
-            "test_fault_survives_crash_with_all_failure_database_writes_unavailable",
-        )
-        for case in cases:
-            with self.subTest(case=case):
-                fixture = crash_fixtures.RecoveryPublishCrashTest()
-                fixture.setUp()
+        for case in ("before_rename", "commit_boundary", "database_failure"):
+            with self.subTest(case=case), CoordinatorHarness() as harness:
+                harness.session_config = replace(
+                    harness.session_config,
+                    frame_decimation=2,
+                    video_layout="split-eyes",
+                    segment_seconds=0.1,
+                    lossless_storage=True,
+                    recording_encoding=RecordingEncoding(gop_frames=3),
+                )
+                context = multiprocessing.get_context("fork")
+                receive, send = context.Pipe(duplex=False)
+
+                def child(
+                    case=case,
+                    harness=harness,
+                    send=send,
+                ):
+                    try:
+                        coordinator = harness.coordinator()
+                        coordinator.start_capture(start_command("recovery-publish-crash"))
+                        sid = harness.active_session_id(coordinator)
+                        recorder = coordinator._active
+                        origin = recorder._started_monotonic_ns
+                        for index in range(6):
+                            observation = frame(index * 2)
+                            observation = replace(
+                                observation,
+                                frame=replace(
+                                    observation.frame,
+                                    host_monotonic_ns=origin + 10_000_000 + round(index * 1e9 / 30),
+                                ),
+                            )
+                            self.assertTrue(coordinator.submit_frame(observation))
+                        recorder._stop_writer()
+                        time.sleep(0.25)
+
+                        def boundary(active):
+                            self.assertIs(active, recorder)
+                            send.send({"session_id": sid})
+                            signal.pause()
+
+                        if case == "database_failure":
+                            coordinator._state_db.put_capture_state = lambda *a, **k: (
+                                _ for _ in ()
+                            ).throw(sqlite3.OperationalError("injected database unavailable"))
+                        if case == "before_rename":
+                            rename = os.rename
+
+                            def before_publish(source, destination, *args, **kwargs):
+                                if destination.name == sid:
+                                    send.send({"session_id": sid})
+                                    signal.pause()
+                                return rename(source, destination, *args, **kwargs)
+
+                            os.rename = before_publish
+                        coordinator._commit_active_failure = boundary
+                        coordinator._source_failure(
+                            coordinator.generation_id,
+                            "source_sequence_gap",
+                            "original capture fault",
+                        )
+                    except BaseException:
+                        send.send({"error": traceback.format_exc()})
+                        raise
+
+                process = context.Process(target=child)
+                process.start()
+                send.close()
                 try:
-                    fixture.fixture.session_config = replace(
-                        fixture.fixture.session_config,
-                        lossless_storage=True,
-                        recording_encoding=RecordingEncoding(gop_frames=3),
-                    )
-                    getattr(fixture, case)()
-                    manifests = list(
-                        (fixture.fixture.mountpoint / "recordings").rglob("manifest.json")
-                    )
-                    self.assertEqual(len(manifests), 1)
-                    manifest = json.loads(manifests[0].read_bytes())
-                    self.assertEqual(manifest["schema"], "ylx.device-session.v4")
-                    self.assertEqual(
-                        manifest["frames"]["artifact"]["media_type"], "application/zstd"
-                    )
-                    validate_device_session_directory(manifests[0].parent)
+                    self.assertTrue(receive.poll(15))
+                    message = receive.recv()
+                    self.assertNotIn("error", message, message)
+                    process.kill()
+                    process.join(5)
+                    self.assertEqual(process.exitcode, -signal.SIGKILL)
                 finally:
-                    fixture.doCleanups()
+                    if process.is_alive():
+                        process.kill()
+                        process.join(5)
+                    receive.close()
+                    process.close()
+                with harness.coordinator() as restarted:
+                    outcome = restarted.retained_unsuccessful_outcome(message["session_id"])
+                    self.assertIsNotNone(outcome)
+                manifests = list((harness.mountpoint / "recordings").rglob("manifest.json"))
+                self.assertEqual(len(manifests), 1)
+                manifest = json.loads(manifests[0].read_bytes())
+                self.assertEqual(manifest["schema"], "ylx.device-session.v4")
+                self.assertEqual(manifest["frames"]["artifact"]["media_type"], "application/zstd")
+                validate_device_session_directory(manifests[0].parent)
 
     def test_wrong_valid_compression_payload_fails_independent_logical_readback(self):
         with tempfile.TemporaryDirectory() as temporary:

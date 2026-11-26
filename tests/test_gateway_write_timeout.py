@@ -11,7 +11,7 @@ import unittest
 from rp_ylx.api.gateway import create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
 from rp_ylx.native import native_session_store_or_none
-from tests.test_gateway import SESSION_ID, DeviceProvider, MemoryRepresentation
+from tests.testkit import SESSION_ID, DeviceProvider, MemoryRepresentation
 
 
 class GatewayWriteTimeoutTest(unittest.TestCase):

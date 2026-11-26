@@ -8,14 +8,12 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from tests import test_capture_coordinator as fixtures
-from tests.test_focus_restore import FocusSources, focus_command
+from tests.testkit import CoordinatorHarness, FocusSources, focus_command
 
 
 class FocusAtomicTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         initial = self.fixture.coordinator()
         initial.close()

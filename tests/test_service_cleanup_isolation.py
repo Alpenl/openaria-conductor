@@ -5,6 +5,7 @@ import signal
 import socketserver
 import tempfile
 import unittest
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,20 +13,36 @@ from unittest.mock import Mock, patch
 
 from rp_ylx.daemon import (
     CaptureEventPump,
+    ProductionConfig,
     ProductionService,
     StorageReserveMonitor,
     build_production_service,
     run_production_service,
 )
-from tests import test_daemon as fixture
 
 _STAGES = (
-    ("storage_monitor", "close"),
     ("server", "server_close"),
-    ("mdns_publisher", "close"),
+    ("storage_monitor", "close"),
     ("event_pump", "close"),
+    ("mdns_publisher", "close"),
     ("coordinator", "close"),
 )
+
+
+def _production_config(root: Path) -> ProductionConfig:
+    return ProductionConfig(
+        host="127.0.0.1",
+        port=8080,
+        camera_device=Path("/dev/video0"),
+        mountpoint=root / "volume",
+        state_root=root / "state",
+        device_id=str(uuid.uuid4()),
+        device_label="YLX-12AB34CD",
+        hardware_fingerprint="sha256:" + "a" * 64,
+        isolated_network=True,
+        minimum_available_bytes=0,
+        minimum_available_inodes=0,
+    )
 
 
 class ServiceCleanupIsolationTest(unittest.TestCase):
@@ -154,7 +171,7 @@ class ServiceCleanupIsolationTest(unittest.TestCase):
     def test_late_construction_failure_unwinds_every_constructed_component(self):
         for failing in ("StorageReserveMonitor", "ProductionService"):
             with self.subTest(failing=failing), tempfile.TemporaryDirectory() as directory:
-                config = fixture.ProductionDaemonTest().config(Path(directory))
+                config = _production_config(Path(directory))
                 components = {name: Mock() for name, _ in _STAGES}
                 error = MemoryError("late construction")
                 monitor_factory = Mock(return_value=components["storage_monitor"])

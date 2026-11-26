@@ -1,45 +1,93 @@
+import gc
 import json
 import multiprocessing
 import os
 import stat
+import tempfile
 import threading
 import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from rp_ylx import settings
-from rp_ylx.persistence import PersistenceError
-from tests import test_settings_presets as fixtures
+from rp_ylx.persistence import PersistenceError, StateDatabase
+
+
+def _create_settings_fixture(test_case: unittest.TestCase):
+    temporary = tempfile.TemporaryDirectory()
+    test_case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    config = root / "device.json"
+    base = {
+        "schema": "ylx.production-config.v1",
+        "listen": {"host": "127.0.0.1", "port": 8080},
+        "camera": {"device": "/dev/video0", "width": 3840, "height": 1080, "fps": 60},
+        "storage": {
+            "mountpoint": str(root / "data"),
+            "minimum_available_bytes": 2147483648,
+            "minimum_available_inodes": 1024,
+        },
+        "state_root": str(root / "state"),
+        "device": {
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "device_label": "YLX-12AB34CD",
+            "hardware_fingerprint": "sha256:" + "a" * 64,
+        },
+        "security": {"profile": "lab", "isolated_network": True},
+        "recording": {"preset": "efficient", "gop_frames": 90, "rate_control": "avbr"},
+    }
+    config.write_text(json.dumps(base))
+    initial = settings.manage(config, "show")["settings"]
+    database = StateDatabase(root / "state/settings.sqlite3")
+    test_case.addCleanup(database.close)
+    return SimpleNamespace(
+        root=root,
+        config=config,
+        base=base,
+        initial=initial,
+        database=database,
+    )
 
 
 class SettingsExportTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.SettingsPresetTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = _create_settings_fixture(self)
         self.root = self.fixture.root
+        self.config = self.fixture.config
+        self.initial = self.fixture.initial
+        self.database = self.fixture.database
         self.destination = self.root / "export.json"
-        self.before = self.fixture.snapshot()
-        self.addCleanup(lambda: self.assertEqual(self.fixture.snapshot(), self.before))
+        self.before = self.snapshot()
+        self.addCleanup(lambda: self.assertEqual(self.snapshot(), self.before))
+
+    def snapshot(self):
+        with self.database.connection() as db:
+            return {
+                name: db.execute("SELECT * FROM " + name).fetchall()
+                for name in ("documents", "changes", "imports")
+            }
 
     def export(self):
-        return settings.manage(self.fixture.config, "export", destination=self.destination)
+        return settings.manage(self.config, "export", destination=self.destination)
 
     def staging(self):
         return list(self.destination.parent.glob(".openaria-settings-*.tmp"))
 
     def assert_export(self):
-        self.assertEqual(json.loads(self.destination.read_bytes()), self.fixture.initial)
+        self.assertEqual(json.loads(self.destination.read_bytes()), self.initial)
         self.assertEqual(stat.S_IMODE(self.destination.stat().st_mode), 0o600)
 
     def fails_cleanly(self, injection, error):
+        gc.collect()
         descriptors = len(os.listdir("/proc/self/fd"))
         with injection, self.assertRaises(error):
             self.export()
         self.assertFalse(os.path.lexists(self.destination))
         self.assertEqual(self.staging(), [])
+        gc.collect()
         self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
         self.assertEqual(self.export(), {"export": str(self.destination)})
         self.assert_export()
@@ -147,9 +195,11 @@ class SettingsExportTest(unittest.TestCase):
         )
 
     def test_non_ascii_values_are_utf8_and_resolved(self):
-        self.fixture.set_patch({"audio": {"device": "测试声卡"}})
-        self.fixture.initial = settings.manage(self.fixture.config, "show")["settings"]
-        self.before = self.fixture.snapshot()
+        patch_file = self.root / "patch.json"
+        patch_file.write_text(json.dumps({"audio": {"device": "测试声卡"}}))
+        settings.manage(self.config, "set", source=patch_file)
+        self.initial = settings.manage(self.config, "show")["settings"]
+        self.before = self.snapshot()
         self.export()
         self.assertIn("测试声卡".encode(), self.destination.read_bytes())
         self.assert_export()
@@ -393,9 +443,7 @@ class SettingsExportTest(unittest.TestCase):
 
 class SettingsExportCrashTest(unittest.TestCase):
     def crash(self, after):
-        fixture = fixtures.SettingsPresetTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
+        fixture = _create_settings_fixture(self)
         destination = fixture.root / "export.json"
         context = multiprocessing.get_context("fork")
         receive, send = context.Pipe(duplex=False)

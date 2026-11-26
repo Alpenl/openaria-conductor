@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -20,7 +21,8 @@ from rp_ylx.recording_button import (
     main,
     run_button,
 )
-from tests.test_gateway import DeviceProvider, _active_capture_status
+from tests.testkit import DeviceProvider, active_capture_status
+from tests.testkit.tls import write_self_signed_tls
 
 
 class ButtonInputTest(unittest.TestCase):
@@ -206,7 +208,7 @@ class ButtonGatewayTest(unittest.TestCase):
     def test_authenticated_start_stop_use_current_contract_and_distinct_keys(self) -> None:
         with patch.dict("os.environ", {"HTTP_PROXY": "http://127.0.0.1:1"}):
             self.assertEqual(self.client.handle_press(), "start")
-        self.provider.status = _active_capture_status()
+        self.provider.status = active_capture_status()
         self.assertEqual(self.client.handle_press(), "stop")
         commands = list(self.provider.commands.items())
         self.assertEqual([key[1] for key, _ in commands], ["start", "stop"])
@@ -243,7 +245,7 @@ class ButtonGatewayTest(unittest.TestCase):
         ):
             self.client.handle_press()
         self.assertFalse(self.provider.commands)
-        self.provider.status = _active_capture_status()
+        self.provider.status = active_capture_status()
         self.assertEqual(self.client.handle_press(), "stop")
 
     def test_auth_failure_and_camera_failure_do_not_retry_commands(self) -> None:
@@ -271,28 +273,56 @@ class ButtonGatewayTest(unittest.TestCase):
                 request.assert_called_once_with("/capture/status")
 
     def test_client_uses_installed_certificate_and_loopback_for_customer(self) -> None:
-        config = Mock(
-            host="0.0.0.0",
-            port=8080,
-            security_profile="customer",
-            bearer_token_file=Path("/token"),
-            tls_certificate_file=Path("/cert"),
-        )
-        with (
-            patch("rp_ylx.daemon.load_production_config", return_value=config),
-            patch("rp_ylx.daemon._read_bearer_token", return_value="button-test-token"),
-            patch("rp_ylx.recording_button.ssl.create_default_context") as context,
-            patch("rp_ylx.recording_button.CaptureClient") as factory,
-        ):
-            create_capture_client(Path("/config"), 3)
-            context.assert_called_once_with(cafile="/cert")
-            self.assertFalse(context.return_value.check_hostname)
-            factory.assert_called_once_with(
-                "https://127.0.0.1:8080",
-                token="button-test-token",
-                timeout_seconds=3,
-                tls_context=context.return_value,
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cert_path = root / "device.crt"
+            key_path = root / "device.key"
+            write_self_signed_tls(
+                cert_path,
+                key_path,
+                common_name="127.0.0.1",
+                ip_addresses=("127.0.0.1",),
+                cert_mode=0o644,
+                key_mode=0o640,
             )
+            token_path = root / "customer.token"
+            token_path.write_text("button-test-token\n", encoding="ascii")
+            token_path.chmod(0o640)
+            config_path = root / "device.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "ylx.production-config.v1",
+                        "listen": {"host": "0.0.0.0", "port": 8080},
+                        "state_root": str(root / "state"),
+                        "security": {
+                            "profile": "customer",
+                            "isolated_network": True,
+                            "bearer_token_file": str(token_path),
+                            "tls_certificate_file": str(cert_path),
+                            "tls_private_key_file": str(key_path),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("sqlite3.connect", side_effect=AssertionError("must not touch sqlite")):
+                client = create_capture_client(config_path, 3)
+
+            self.assertEqual(client.base_url, "https://127.0.0.1:8080")
+            self.assertEqual(client.token, "button-test-token")
+            self.assertEqual(client.timeout_seconds, 3.0)
+            https_handlers = [
+                h for h in client.opener.handlers if getattr(h, "_context", None) is not None
+            ]
+            self.assertEqual(len(https_handlers), 1)
+            context = https_handlers[0]._context
+            self.assertFalse(context.check_hostname)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+            if partial_chain:
+                self.assertTrue(context.verify_flags & partial_chain)
+            self.assertFalse((root / "state" / "settings.sqlite3").exists())
 
 
 if __name__ == "__main__":

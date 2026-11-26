@@ -19,6 +19,11 @@ class RestoreRollbackJournalTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.source = self.root / "source.sqlite3"
         self.target = self.root / "state.sqlite3"
         source = StateDatabase(self.source)
@@ -155,14 +160,14 @@ class RestoreRollbackJournalTest(unittest.TestCase):
         originals = self.dirty_transaction()
 
         def interrupted():
-            sync = database_admin._sync_parent
+            sync = database_admin.sync_parent
 
             def after_sync(path):
                 sync(path)
                 if list(self.root.glob(self.journal.name + ".before-restore-*")):
                     os._exit(79)
 
-            with patch.object(database_admin, "_sync_parent", after_sync):
+            with patch.object(database_admin, "sync_parent", after_sync):
                 self.restore()
             os._exit(80)
 

@@ -10,13 +10,12 @@ from unittest.mock import patch
 from rp_ylx.api.events import validate_session_list
 from rp_ylx.recording.device_session import inspect_device_session_directory
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class CatalogRecoveryTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def sealed_pair(self):
@@ -171,7 +170,7 @@ class CatalogRecoveryTest(unittest.TestCase):
             reopened.close()
 
     def test_bad_cache_cannot_publish_an_unrecovered_failed_recording(self):
-        coordinator, session_id = self.fixture._retained_catalog_entry(recovered=False)
+        coordinator, session_id = self.fixture.retained_catalog_entry(recovered=False)
         try:
             with coordinator._catalog_db.connection() as db, db:
                 changed = db.execute(

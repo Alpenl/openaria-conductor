@@ -1,26 +1,90 @@
 """Persisted handoff metadata must be validated before changing ownership."""
 
 import copy
+import multiprocessing
+import signal
+import threading
+import traceback
 import unittest
 
 from rp_ylx.api import ProviderError
 from rp_ylx.api.events import validate_capture_status, validate_safe_swap_v3_receipt
 from rp_ylx.recording.device_session import uuid7
-from tests import test_async_stop_crash as crash_fixtures
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, frame, start_command, stop_command
+
+
+def _kill_before_release(fixture: CoordinatorHarness):
+    context = multiprocessing.get_context("fork")
+    receive, send = context.Pipe(duplex=False)
+    command = stop_command("killed-stop-before_release", reason="safe_swap")
+
+    def child():
+        lock = threading.Lock()
+
+        def message(value):
+            with lock:
+                send.send(value)
+
+        def boundary(*args, **kwargs):
+            message({"boundary": "before_release"})
+            threading.Event().wait()
+
+        try:
+            coordinator = fixture.coordinator()
+            coordinator.start_capture(start_command("killed-start-before_release"))
+            session_id = fixture.active_session_id(coordinator)
+            if not coordinator.submit_frame(frame()):
+                raise AssertionError("frame rejected")
+            coordinator._publish_safe_swap = boundary
+            accepted = coordinator.request_stop_capture(command)
+            message(
+                {"accepted": accepted.body, "status": accepted.status, "session_id": session_id}
+            )
+            threading.Event().wait()
+        except BaseException:
+            message({"error": traceback.format_exc()})
+            raise
+
+    process = context.Process(target=child)
+    process.start()
+    send.close()
+    try:
+        messages = []
+        for _ in range(2):
+            if not receive.poll(10):
+                raise AssertionError("child did not reach durability boundary")
+            item = receive.recv()
+            if "error" in item:
+                raise AssertionError(item["error"])
+            messages.append(item)
+        if {"boundary": "before_release"} not in messages:
+            raise AssertionError("missing boundary message")
+        accepted = next(item for item in messages if "accepted" in item)
+        if accepted["status"] != 202:
+            raise AssertionError(f"expected 202, got {accepted['status']}")
+        process.kill()
+        process.join(5)
+        if process.exitcode != -signal.SIGKILL:
+            raise AssertionError(f"expected SIGKILL, got {process.exitcode}")
+        return command, accepted
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        receive.close()
+        process.close()
 
 
 class SafeSwapStateAdmissionTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def released_state(self):
         coordinator = self.fixture.coordinator()
-        coordinator.start_capture(fixtures.start_command("release-start"))
-        coordinator.submit_frame(fixtures.frame())
-        coordinator.stop_capture(fixtures.stop_command("release-stop", reason="safe_swap"))
+        coordinator.start_capture(start_command("release-start"))
+        coordinator.submit_frame(frame())
+        coordinator.stop_capture(stop_command("release-stop", reason="safe_swap"))
         receipt = coordinator.current_safe_swap_receipt()
         validate_safe_swap_v3_receipt(receipt["receipt"])
         coordinator.close()
@@ -49,9 +113,9 @@ class SafeSwapStateAdmissionTest(unittest.TestCase):
                     self.assertFalse(coordinator._released)
                     self.assertIsNone(database.capture_state()["safe_swap_resource"])
                     validate_capture_status(coordinator.capture_status())
-                    coordinator.start_capture(fixtures.start_command("new-" + name))
-                    coordinator.submit_frame(fixtures.frame())
-                    coordinator.stop_capture(fixtures.stop_command("finish-" + name))
+                    coordinator.start_capture(start_command("new-" + name))
+                    coordinator.submit_frame(frame())
+                    coordinator.stop_capture(stop_command("finish-" + name))
                 finally:
                     coordinator.close()
 
@@ -100,16 +164,18 @@ class SafeSwapStateAdmissionTest(unittest.TestCase):
                     coordinator.close()
 
     def test_valid_crash_pending_intent_still_resumes_original_receipt(self):
-        crash = crash_fixtures.AsyncStopCrashTest()
-        crash.setUp()
-        self.addCleanup(crash.doCleanups)
-        command, accepted = crash.kill_at("before_release", "safe_swap")
-        coordinator = crash.fixture.coordinator()
+        command, accepted = _kill_before_release(self.fixture)
+        coordinator = self.fixture.coordinator()
         try:
             self.assertIsNotNone(coordinator._pending_safe_swap)
             self.assertFalse(coordinator._released)
             coordinator.request_stop_capture(command)
-            crash.wait_finished(coordinator)
+            with coordinator._stop_condition:
+                self.assertTrue(
+                    coordinator._stop_condition.wait_for(
+                        lambda: coordinator._async_stop_worker is None, timeout=4
+                    )
+                )
             receipt = coordinator.current_safe_swap_receipt()["receipt"]
             validate_safe_swap_v3_receipt(receipt)
             self.assertEqual(receipt["session_id"], accepted["session_id"])
@@ -132,7 +198,7 @@ class SafeSwapStateAdmissionTest(unittest.TestCase):
                 coordinator = self.fixture.coordinator()
                 try:
                     coordinator.request_stop_capture(
-                        fixtures.stop_command("mismatch-" + field, reason="safe_swap")
+                        stop_command("mismatch-" + field, reason="safe_swap")
                     )
                     with coordinator._stop_condition:
                         self.assertTrue(

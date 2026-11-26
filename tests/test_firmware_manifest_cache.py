@@ -10,14 +10,13 @@ from unittest.mock import Mock, patch
 from rp_ylx import firmware_control as control
 from rp_ylx import update
 from scripts import publish_rdk_x5_oss as publisher
-from tests import test_firmware_control as fixtures
+from tests.testkit import FirmwareHarness
 
 
 class ManifestCacheTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.FirmwareControlTest()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = FirmwareHarness().setUp()
+        self.addCleanup(self.fixture.tearDown)
         self.supervisor = self.fixture.supervisor
         self.fetch = self.fixture.fetch
         self.manifest = dict(self.fixture.manifest)

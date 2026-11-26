@@ -40,8 +40,8 @@ CONTRACT_GOLDENS = {
     },
     "v4": {
         "filename": "ylx-device-v4.openapi.yaml",
-        "sha256": "8d175307d2d86324dc739494ee76a66e2a2e968073f82fa2a9ad6d61514464d5",
-        "bytes": 142363,
+        "sha256": "0b162d75d702b9641038b4df7686f3ff8561a577ac1d9628d6ecc3b2f3d58fd5",
+        "bytes": 152_136,
         "info_version": "4.0.0",
         "server_suffix": "/api/v4",
         "lifecycle": "current",
@@ -107,6 +107,10 @@ ROUTE_GOLDENS = {
         ("/clock", "get", "getDeviceClock"),
         ("/clock/check", "get", "inspectDeviceClock"),
         ("/clock/sync", "post", "syncDeviceClock"),
+        ("/firmware", "get", "firmwareStatus"),
+        ("/firmware/check", "get", "checkFirmware"),
+        ("/firmware/update", "post", "firmwareUpdate"),
+        ("/firmware/rollback", "post", "rollbackFirmware"),
         ("/network", "get", "getNetworkStatus"),
         ("/network/scan", "get", "scanNetworks"),
         ("/network/credentials", "post", "createNetworkCredentialReference"),
@@ -360,6 +364,21 @@ class GatewayContractResourceTest(unittest.TestCase):
                 payload = schema_resources.joinpath(filename).read_bytes()
                 self.assertEqual(_sha256(payload), expected_sha256)
                 self.assertIsInstance(json.loads(payload), dict)
+
+    def test_live_router_routes_match_openapi_operations_across_versions(self) -> None:
+        from rp_ylx.api.router import ALL_DECLARED_OPENAPI_ROUTES
+
+        api_resources = files("rp_ylx.api")
+        for version, golden in CONTRACT_GOLDENS.items():
+            contract = api_resources.joinpath(golden["filename"]).read_text(encoding="utf-8")
+            declared = _declared_routes(contract)
+            live = {
+                (path, method, op_id)
+                for route_version, path, method, op_id in ALL_DECLARED_OPENAPI_ROUTES
+                if route_version == version
+            }
+            with self.subTest(version=version):
+                self.assertEqual(live, declared)
 
 
 class _Manifest:

@@ -7,13 +7,12 @@ from unittest.mock import patch
 
 from rp_ylx import update
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, frame, start_command, stop_command
 
 
 class MaintenanceRetryTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.path = self.fixture.root / "maintenance.lock"
         env = patch.dict(os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.path)})
@@ -23,7 +22,7 @@ class MaintenanceRetryTests(unittest.TestCase):
         self.addCleanup(self.coordinator.close)
 
     def test_same_start_request_succeeds_after_maintenance_releases(self):
-        command = fixtures.start_command("retry-after-maintenance")
+        command = start_command("retry-after-maintenance")
         with update.maintenance_lock():
             with self.assertRaises(ProviderError) as caught:
                 self.coordinator.start_capture(command)
@@ -39,8 +38,8 @@ class MaintenanceRetryTests(unittest.TestCase):
             )
         self.coordinator.start_capture(command)
         self.assertEqual(self.coordinator.capture_status()["snapshot"]["device_state"], "recording")
-        self.assertTrue(self.coordinator.submit_frame(fixtures.frame()))
-        self.coordinator.stop_capture(fixtures.stop_command("completed-after-maintenance"))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
+        self.coordinator.stop_capture(stop_command("completed-after-maintenance"))
         self.assertEqual(self.coordinator.capture_status()["snapshot"]["device_state"], "idle")
         with update.maintenance_lock():
             pass
@@ -55,7 +54,7 @@ class MaintenanceRetryTests(unittest.TestCase):
     def test_invalid_directory_is_not_advertised_as_retryable_contention(self):
         self.path.mkdir()
         with self.assertRaises(ProviderError) as caught:
-            self.coordinator.start_capture(fixtures.start_command("invalid-maintenance"))
+            self.coordinator.start_capture(start_command("invalid-maintenance"))
         self.assertFalse(caught.exception.retryable)
         self.assertIsNone(self.coordinator._active)
         self.assertTrue(self.path.is_dir())
@@ -65,7 +64,7 @@ class MaintenanceRetryTests(unittest.TestCase):
         target.write_bytes(b"preserve")
         self.path.symlink_to(target)
         with self.assertRaises(ProviderError) as caught:
-            self.coordinator.start_capture(fixtures.start_command("unsafe-maintenance"))
+            self.coordinator.start_capture(start_command("unsafe-maintenance"))
         self.assertFalse(caught.exception.retryable)
         self.assertIsNone(self.coordinator._active)
         self.assertEqual(target.read_bytes(), b"preserve")
@@ -82,6 +81,6 @@ class MaintenanceRetryTests(unittest.TestCase):
             patch.object(update.os, "open", side_effect=open_file),
             self.assertRaises(ProviderError) as caught,
         ):
-            self.coordinator.start_capture(fixtures.start_command("unreadable-maintenance"))
+            self.coordinator.start_capture(start_command("unreadable-maintenance"))
         self.assertFalse(caught.exception.retryable)
         self.assertIsNone(self.coordinator._active)

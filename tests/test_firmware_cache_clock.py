@@ -5,15 +5,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-import tests.test_firmware_control as fixtures
 from rp_ylx import firmware_control as control
+from tests.testkit import FirmwareHarness
 
 
 class FirmwareCacheClockTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.FirmwareControlTest()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = FirmwareHarness().setUp()
+        self.addCleanup(self.fixture.tearDown)
         self.s = self.fixture.supervisor
         self.fetch = self.fixture.fetch
         wall = patch.object(control.time, "time", return_value=10000)

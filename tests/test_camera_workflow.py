@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 from rp_ylx.api.downloads import ArtifactAccessError
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests import testkit as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class CameraWorkflowTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def prohibit_media_verification(self):

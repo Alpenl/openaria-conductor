@@ -7,12 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import rp_ylx.recording.device_session as session
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import SplitEyeHarness
 
 
 class StopCheckpointTests(unittest.TestCase):
     def build(self, root, **kwargs):
-        return fixtures.SplitEyeRecordingTest().build(root, **kwargs)[0]
+        return SplitEyeHarness().build(root, **kwargs)[0]
 
     def test_draining_frames_does_not_republish_recording_after_finalizing(self):
         entered, release, finalizing = threading.Event(), threading.Event(), threading.Event()
@@ -34,7 +34,7 @@ class StopCheckpointTests(unittest.TestCase):
                     finalizing.set()
 
             recorder._state_sink = sink
-            fixtures.SplitEyeRecordingTest.feed(recorder, 32)
+            SplitEyeHarness.feed(recorder, 32)
             self.assertTrue(entered.wait(2))
 
             def stop():
@@ -92,7 +92,7 @@ class StopCheckpointTests(unittest.TestCase):
                 patch.object(recorder, "_persist_state", side_effect=observed),
             ):
                 try:
-                    fixtures.SplitEyeRecordingTest.feed(recorder, 3)
+                    SplitEyeHarness.feed(recorder, 3)
                     self.assertTrue(entered.wait(2))
                     worker.start()
                     self.assertTrue(stop_entered.wait(2))
@@ -122,7 +122,7 @@ class StopCheckpointTests(unittest.TestCase):
             recorder = self.build(Path(temporary), before_write=block)
             recorder.start()
             recorder._state_sink = lambda document: states.append(document["state"])
-            fixtures.SplitEyeRecordingTest.feed(recorder, 32)
+            SplitEyeHarness.feed(recorder, 32)
             self.assertTrue(entered.wait(2))
             writer = recorder._writer
             join = writer.join

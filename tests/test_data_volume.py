@@ -27,8 +27,14 @@ class DataVolumeOwnershipTest(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         # OS/mount setup is mocked; ownership traversal uses real find/chown.
-        for name in ("getent", "install", "mountpoint", "findmnt", "df"):
+        for name in ("getent", "install", "mountpoint", "df"):
             self.executable(name, "#!/bin/sh\nexit 0\n")
+        self.executable(
+            "findmnt",
+            '#!/bin/sh\ncase "$*" in *FSTYPE*) echo ext4 ;; *SOURCE*) echo /dev/loop9 ;; '
+            "*OPTIONS*) echo rw,nosuid,nodev,noexec,noatime ;; *) echo ok ;; esac\n",
+        )
+        self.executable("losetup", f'#!/bin/sh\necho "{self.image}"\n')
         self.executable(
             "id",
             f'#!/bin/sh\ncase "$1" in -u) echo {os.getuid()};; -g) echo {os.getgid()};; esac\n',

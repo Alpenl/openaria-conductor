@@ -5,18 +5,23 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from rp_ylx.api.events import validate_capture_status
 from rp_ylx.recording import device_session
 from rp_ylx.recording.encoding import RecordingEncoding
-from tests import test_capture_coordinator as coordinator_fixtures
-from tests import test_split_eye_recording as recorder_fixtures
+from tests.testkit import (
+    CoordinatorHarness,
+    SplitEyeHarness,
+    frame,
+    start_command,
+    stop_command,
+)
 
 
 class VerificationProgressTests(unittest.TestCase):
     def test_stop_has_no_verification_progress_for_raw_or_lossless_recordings(self):
         for lossless in (False, True):
             with self.subTest(lossless=lossless):
-                fixture = coordinator_fixtures.CaptureCoordinatorTest()
-                fixture.setUp()
+                fixture = CoordinatorHarness().setUp()
                 fixture.session_config = replace(
                     fixture.session_config,
                     lossless_storage=lossless,
@@ -25,8 +30,8 @@ class VerificationProgressTests(unittest.TestCase):
                 coordinator = fixture.coordinator()
                 observed = []
                 try:
-                    coordinator.start_capture(coordinator_fixtures.start_command("progress-start"))
-                    self.assertTrue(coordinator.submit_frame(coordinator_fixtures.frame()))
+                    coordinator.start_capture(start_command("progress-start"))
+                    self.assertTrue(coordinator.submit_frame(frame()))
                     recorder = coordinator._active
                     original = recorder._verification_progress
 
@@ -39,14 +44,12 @@ class VerificationProgressTests(unittest.TestCase):
                     ):
                         original(completed, total)
                         status = coordinator.capture_status()
-                        coordinator_fixtures.validate_capture_status(status)
+                        validate_capture_status(status)
                         self.assertEqual(status["snapshot"]["device_state"], "verifying")
                         observed.append((completed, total))
 
                     with patch.object(recorder, "_verification_progress", side_effect=report):
-                        stopped = coordinator.stop_capture(
-                            coordinator_fixtures.stop_command("progress-stop")
-                        )
+                        stopped = coordinator.stop_capture(stop_command("progress-stop"))
                     self.assertEqual(stopped.body["snapshot"]["device_state"], "idle")
                     self.assertEqual(observed, [])
                 finally:
@@ -55,7 +58,7 @@ class VerificationProgressTests(unittest.TestCase):
 
     def test_directory_progress_follows_actual_content_reads(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = recorder_fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(directory))
             recorder.start()
             fixture.feed(recorder, 3)
@@ -88,7 +91,7 @@ class VerificationProgressTests(unittest.TestCase):
 
     def test_corrupt_content_never_reports_complete_even_with_cached_identities(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = recorder_fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(directory))
             recorder.start()
             fixture.feed(recorder, 3)

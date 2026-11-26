@@ -11,12 +11,12 @@ from unittest.mock import patch
 import zstandard
 
 from rp_ylx.api.downloads import DirectorySessionStore
+from rp_ylx.camera import FrameObservation, StereoFrame
 from rp_ylx.recording.device_session import DeviceRecordingError, validate_device_session_directory
 from rp_ylx.recording.encoding import RecordingEncoding
 from rp_ylx.recording.recovery import recover_device_session
 from rp_ylx.recording.storage import BLOCK_BYTES, compact_metadata, open_metadata
-from tests import test_recording_recovery as recovery_fixtures
-from tests import test_split_eye_recording as fixtures
+from tests.testkit import FRAME, FakeAudioRecorder, RecoveryFixtureBuilder, SplitEyeHarness
 
 
 class LosslessStorageTests(unittest.TestCase):
@@ -52,7 +52,7 @@ class LosslessStorageTests(unittest.TestCase):
     def _check_sealed_v4_audio_clock(self, *, raw_clock):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(
                 root,
                 audio_enabled=True,
@@ -61,12 +61,12 @@ class LosslessStorageTests(unittest.TestCase):
             recorder._config = replace(recorder._config, lossless_storage=True)
             recorder.start()
             fixture.feed(recorder, 3)
-            original_stop = fixtures.FakeAudioRecorder.stop
+            original_stop = FakeAudioRecorder.stop
 
             def stop_with_clock(audio, *args, **kwargs):
                 result = original_stop(audio, *args, **kwargs)
                 if raw_clock:
-                    from tests.test_audio_clock import audio_fixture
+                    from tests.testkit import audio_fixture
 
                     clock = audio_fixture()["capture_clock"]
                     start = result["started_monotonic_ns"]
@@ -92,7 +92,7 @@ class LosslessStorageTests(unittest.TestCase):
                     result["capture_clock_json"] = json.dumps(clock)
                 return result
 
-            with patch.object(fixtures.FakeAudioRecorder, "stop", stop_with_clock):
+            with patch.object(FakeAudioRecorder, "stop", stop_with_clock):
                 sealed = recorder.stop()
             manifest = validate_device_session_directory(sealed.path)
             if raw_clock:
@@ -137,7 +137,7 @@ class LosslessStorageTests(unittest.TestCase):
 
     def test_crash_during_compaction_keeps_raw_prefix_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
-            recorder = recovery_fixtures.RecordingRecoveryTests().recording(Path(directory))
+            recorder = RecoveryFixtureBuilder().recording(Path(directory))
             original = (recorder.partial_path / "frames.ndjson").read_bytes()
             compact_metadata(recorder.partial_path / "frames.ndjson")
             (recorder.partial_path / "imu.ndjson.zst.tmp").write_bytes(b"interrupted")
@@ -148,7 +148,7 @@ class LosslessStorageTests(unittest.TestCase):
 
     def test_audit_failure_after_parallel_compaction_keeps_recovery_journals(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = fixtures.SplitEyeRecordingTest()
+            fixture = SplitEyeHarness()
             recorder, _, _ = fixture.build(Path(directory))
             recorder._config = replace(recorder._config, lossless_storage=True)
             with patch.object(
@@ -157,15 +157,15 @@ class LosslessStorageTests(unittest.TestCase):
                 recorder.start()
             for index in range(3):
                 recorder.submit_frame(
-                    fixtures.FrameObservation(
-                        fixtures.StereoFrame(
+                    FrameObservation(
+                        StereoFrame(
                             source_sequence=index * 2,
                             host_monotonic_ns=recorder._started_monotonic_ns
                             + 10_000_000
                             + index * 33_333_333,
                             left=b"",
                             right=b"",
-                            raw_side_by_side=fixtures.FRAME,
+                            raw_side_by_side=FRAME,
                         ),
                         dropped_before=0,
                     )

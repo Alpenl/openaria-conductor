@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import rp_ylx.recording.coordinator as coordinator_module
 from rp_ylx.recording.catalog import SessionCatalog
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class CatalogSummaryValidationTest(unittest.TestCase):
@@ -306,8 +306,7 @@ class CatalogSummaryValidationTest(unittest.TestCase):
         )
 
     def test_coordinator_uses_validation_cache_but_rechecks_manifest_identity(self):
-        fixture = fixtures.CaptureCoordinatorTest()
-        fixture.setUp()
+        fixture = CoordinatorHarness().setUp()
         self.addCleanup(fixture.tearDown)
         original = fixture.coordinator()
         try:

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx.recording.audio_journal import AudioJournalReader
-from tests import test_live_sealing as live_fixtures
+from tests.testkit import audio_sealing, compact_audio_stub
 
 
 def publish(root, rows, *, last=None):
@@ -148,11 +148,10 @@ class AudioJournalTest(unittest.TestCase):
 
     def test_live_sealing_accepts_reobserved_point_and_final_reverification(self):
         value, head = self.repeated_point()
-        fixture = live_fixtures.LiveSealingTests()
-        sealing = fixture.audio_sealing(self.root)
+        sealing = audio_sealing(self.root)
         (self.root / "audio/audio_00000.wav").write_bytes(b"fixture")
         with patch(
-            "rp_ylx.recording.live_seal.compact_audio", side_effect=fixture.compact_audio
+            "rp_ylx.recording.live_seal.compact_audio", side_effect=compact_audio_stub
         ) as compact:
             sealing._audio()
             sealing._audio(force=True)
@@ -240,12 +239,11 @@ class AudioJournalTest(unittest.TestCase):
                     AudioJournalReader(self.root).read(self.head)
 
     def test_live_compaction_reads_deltas_and_final_pass_reverifies_prefix(self):
-        fixture = live_fixtures.LiveSealingTests()
-        sealing = fixture.audio_sealing(self.root)
+        sealing = audio_sealing(self.root)
         for index in range(2):
             (self.root / f"audio/audio_{index:05d}.wav").write_bytes(b"fixture")
         with patch(
-            "rp_ylx.recording.live_seal.compact_audio", side_effect=fixture.compact_audio
+            "rp_ylx.recording.live_seal.compact_audio", side_effect=compact_audio_stub
         ) as compact:
             sealing._audio()
             publish(self.root, [row(0), row(1)])

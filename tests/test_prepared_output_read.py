@@ -8,14 +8,35 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx.recording import live_seal, storage, verified
-from tests import test_prepared_output_admission as fixtures
+from rp_ylx.recording.live_seal import _Journal
+
+
+def _prepared_fixture(root: Path):
+    manifest = {"schema": "old"}
+    prepared = {}
+    for kind in ("frames", "imu"):
+        path = root / f"{kind}.ndjson"
+        payload = b'{"value":1}\n'
+        path.write_bytes(payload)
+        journal = _Journal(path)
+        artifact = journal.finish()
+        prepared[path.name] = artifact
+        manifest[kind] = {
+            "artifact": {
+                "path": path.name,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "media_type": "application/x-ndjson",
+            }
+        }
+    return manifest, prepared
 
 
 class PreparedOutputReadTests(unittest.TestCase):
     def test_final_admission_reads_each_output_once_and_checks_source_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest, prepared = fixtures.PreparedOutputAdmissionTests().fixture(root)
+            manifest, prepared = _prepared_fixture(root)
             counts = collections.Counter()
             real_open = verified.open_regular
 
@@ -65,7 +86,7 @@ class PreparedOutputReadTests(unittest.TestCase):
     def reject_corruption(self, *, source):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest, prepared = fixtures.PreparedOutputAdmissionTests().fixture(root)
+            manifest, prepared = _prepared_fixture(root)
             artifact = prepared["frames.ndjson"]
             target = root / "frames.ndjson" if source else artifact.target
             proof = artifact.source if source else artifact.output
@@ -74,10 +95,10 @@ class PreparedOutputReadTests(unittest.TestCase):
             target.write_bytes(data)
             identity = verified.identity
 
-            def collide(metadata):
-                return (
-                    proof.identity if metadata.st_ino == proof.identity[1] else identity(metadata)
-                )
+            def collide(metadata, *, include_inode=True):
+                if metadata.st_ino == proof.identity[1]:
+                    return proof.identity
+                return identity(metadata, include_inode=include_inode)
 
             def finalize(path):
                 data = path.read_bytes()

@@ -8,7 +8,6 @@ import tempfile
 import threading
 import unittest
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -24,10 +23,13 @@ from rp_ylx.api.downloads import (
     parse_single_range,
 )
 from rp_ylx.recording import RecordingConfig, SessionRecorder
-
-SESSION_ID = "01989f6a-2c00-7a1b-8c2d-3e4f50617283"
-ARTIFACT_BYTES = b"immutable-session-artifact"
-ARTIFACT_ID = hashlib.sha256(ARTIFACT_BYTES).hexdigest()
+from tests.testkit import (
+    ARTIFACT_BYTES,
+    ARTIFACT_ID,
+    SESSION_ID,
+    DirectoryArtifactProvider,
+    MemoryArtifactProvider,
+)
 
 
 class RangeParserTest(unittest.TestCase):
@@ -40,101 +42,6 @@ class RangeParserTest(unittest.TestCase):
         with self.assertRaises(UnsatisfiableRange) as raised:
             parse_single_range("bytes=26-", 26)
         self.assertEqual(raised.exception.complete_size, 26)
-
-
-@dataclass(frozen=True, slots=True)
-class _Descriptor:
-    artifact_id: str
-    path: str
-    media_type: str
-    bytes: int
-    sha256: str
-
-
-class _MemoryArtifact:
-    def __init__(self, payload: bytes) -> None:
-        digest = hashlib.sha256(payload).hexdigest()
-        self.descriptor = _Descriptor(
-            artifact_id=digest,
-            path="video/left.mp4",
-            media_type="video/mp4",
-            bytes=len(payload),
-            sha256=digest,
-        )
-        self.etag = f'"{digest}"'
-        self.size = len(payload)
-        self.content_type = "video/mp4"
-        self._payload = payload
-
-    def __enter__(self) -> _MemoryArtifact:
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        return None
-
-    def read(self, offset: int = 0, length: int | None = None) -> bytes:
-        end = None if length is None else offset + length
-        return self._payload[offset:end]
-
-    def iter_chunks(
-        self,
-        offset: int = 0,
-        length: int | None = None,
-        *,
-        chunk_size: int = 1024 * 1024,
-    ) -> object:
-        del chunk_size
-        yield self.read(offset, length)
-
-
-class _MemoryProvider:
-    def __init__(
-        self,
-        *,
-        io_state: str | None = None,
-        access_error: ArtifactAccessError | None = None,
-    ) -> None:
-        self.io_state = io_state
-        self.access_error = access_error
-        self.open_count = 0
-
-    def artifact_io_state(self) -> str | None:
-        return self.io_state
-
-    def open_verified_artifact(
-        self, session_id: str, artifact_id: str, api_version: str
-    ) -> _MemoryArtifact:
-        self.open_count += 1
-        if api_version not in {"v2", "v3", "v4"}:
-            raise AssertionError("gateway 传递了未知 API 版本")
-        if self.access_error is not None:
-            raise self.access_error
-        if session_id != SESSION_ID or artifact_id != ARTIFACT_ID:
-            raise AssertionError("gateway changed the authorized artifact identity")
-        return _MemoryArtifact(ARTIFACT_BYTES)
-
-
-class _DirectoryProvider:
-    def __init__(self, store: DirectorySessionStore) -> None:
-        self.store = store
-        self.io_state: str | None = None
-        self.after_open: object | None = None
-        self.after_manifest_open: object | None = None
-
-    def artifact_io_state(self) -> str | None:
-        return self.io_state
-
-    def open_manifest(self, session_id: str, api_version: str) -> object:
-        locked = self.store.open_manifest(session_id, api_version)
-        if callable(self.after_manifest_open):
-            self.after_manifest_open()
-        return locked
-
-    def open_verified_artifact(self, session_id: str, artifact_id: str, api_version: str) -> object:
-        locked = self.store.open_verified_artifact(session_id, artifact_id, api_version)
-        if callable(self.after_open):
-            self.after_open()
-        return locked
 
 
 class _FakeNativeSessionStore:
@@ -221,7 +128,7 @@ class _NativeOpenVerifiedArtifact(_NativeOpenRelativeRegular):
 
 class SessionDownloadHttpTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.provider = _MemoryProvider()
+        self.provider = MemoryArtifactProvider()
         reader = Principal(
             "reader",
             permissions={
@@ -618,7 +525,7 @@ class DirectorySessionDownloadHttpTest(unittest.TestCase):
             self.generation_root,
             verified_manifests=self.verdicts,
         )
-        self.provider = _DirectoryProvider(self.store)
+        self.provider = DirectoryArtifactProvider(self.store)
         reader = Principal(
             "reader",
             permissions={

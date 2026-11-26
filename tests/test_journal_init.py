@@ -3,12 +3,12 @@
 import gc
 import os
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import rp_ylx.recording.live_seal as live
+from rp_ylx.recording import fs_safety
 
 
 class JournalInitTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class JournalInitTests(unittest.TestCase):
             original = b"original recovery evidence\n"
             for name in ("frames.ndjson", "imu.ndjson"):
                 (root / name).write_bytes(original)
-            target = live.zstandard if kind == "compressor" else live.hashlib
+            target = fs_safety.zstandard if kind == "compressor" else live.hashlib
             attribute = "ZstdCompressor" if kind == "compressor" else "sha256"
             factory = getattr(target, attribute)
             calls = 0
@@ -37,9 +37,8 @@ class JournalInitTests(unittest.TestCase):
                 with patch.object(target, attribute, side_effect=allocate):
                     try:
                         if pair:
-                            sealing = object.__new__(live.LiveSealing)
-                            sealing.root = root
-                            sealing.cancelled = threading.Event()
+                            with patch.object(live, "ThreadPoolExecutor"):
+                                sealing = live.LiveSealing(root, 30, 2)
                             sealing.cancelled.set()
                             sealing._compact()
                         else:

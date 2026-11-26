@@ -8,10 +8,15 @@ from pathlib import Path
 
 
 class HobotCodecFailuresTest(unittest.TestCase):
-    def run_case(self, body: str) -> None:
-        compiler = shutil.which("cc")
+    _binary: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        compiler = shutil.which("gcc") or shutil.which("cc")
         if not compiler:
-            self.skipTest("C compiler unavailable")
+            raise unittest.SkipTest("C compiler unavailable")
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temporary.cleanup)
         source = (
             Path(__file__).resolve().parents[1] / "src/rp_ylx/hobot/ylx_stereo_pipeline.c"
         ).read_text()
@@ -84,6 +89,7 @@ static int hb_mm_mc_dequeue_input_buffer(
     media_codec_context_t *c, media_codec_buffer_t *b, int timeout) {
     assert(timeout > 0); input_calls[c->id]++;
     b->vstream_buf.size = capacity; b->vstream_buf.vir_ptr = payload_buffer;
+    b->vframe_buf.size = capacity;
     return dequeue_result[c->id];
 }
 static int hb_mm_mc_queue_input_buffer(
@@ -104,7 +110,9 @@ static int hb_mm_mc_queue_output_buffer(
     (void)c; (void)b; (void)timeout; released++; return 0;
 }
 static void split_eye(const media_codec_buffer_t *s, media_codec_buffer_t *t, int w, int h, int x) {
-    (void)s; (void)t; (void)w; (void)h; (void)x; copied++;
+    (void)s; (void)x;
+    t->vframe_buf.size = (uint32_t)((uint64_t)w * (uint64_t)h * 3ULL / 2ULL);
+    copied++;
 }
 static int h264_has_idr(const unsigned char *data, size_t length) {
     (void)data; (void)length; return 1;
@@ -121,33 +129,8 @@ static ylx_pipeline_t make_pipeline(void) {
     p.eyes[0].codec.id = 1; p.eyes[1].codec.id = 2; return p;
 }
 """
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path, binary = root / "case.c", root / "case"
-            used_body = body.replace(
-                "int main(void) {",
-                "int main(void) { (void)encoder_output_thread; (void)split_thread_main;",
-            )
-            path.write_text(harness + constants + "\n" + submit + split + output + used_body)
-            subprocess.run(
-                [
-                    compiler,
-                    "-std=gnu11",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    str(path),
-                    "-o",
-                    str(binary),
-                ],
-                check=True,
-            )
-            subprocess.run([str(binary)], check=True, timeout=5)
-
-    def test_input_failures_preserve_causal_reason_and_reject_following_frames(self):
-        self.run_case(r"""
-int main(void) {
-    (void)split_thread_main;
+        cases = r"""
+static int case_input_failures(void) {
     unsigned char jpeg[] = {1,2,3,4};
     ylx_pipeline_t p = make_pipeline();
     dequeue_result[0] = -42;
@@ -168,11 +151,8 @@ int main(void) {
     assert(p.submitted == 1 && memcmp(jpeg, payload_buffer, 4) == 0);
     return 0;
 }
-""")
 
-    def test_missing_decoder_output_has_bounded_failed_drain(self):
-        self.run_case(r"""
-int main(void) {
+static int case_missing_decoder_output(void) {
     ylx_pipeline_t p = make_pipeline(); p.submitted = 1; p.stopping = 1;
     split_thread_main(&p);
     assert(output_calls == DECODER_DRAIN_POLLS && p.split_done && p.failed);
@@ -184,11 +164,8 @@ int main(void) {
     assert(output_calls == 2 && released == 1 && copied == 2);
     return 0;
 }
-""")
 
-    def test_missing_encoded_frame_is_failed_instead_of_successful_drain(self):
-        self.run_case(r"""
-int main(void) {
+static int case_missing_encoded_frame(void) {
     ylx_pipeline_t p = make_pipeline();
     p.split_done = 1; p.fed[0] = 1; p.eyes[0].pipeline = &p;
     encoder_output_thread(&p.eyes[0]);
@@ -199,11 +176,8 @@ int main(void) {
     assert(output_calls == 1 && !p.failed && p.eyes[0].packets);
     return 0;
 }
-""")
 
-    def test_bad_output_or_one_eye_failure_never_skips_into_next_frame(self):
-        self.run_case(r"""
-int main(void) {
+static int case_bad_output_or_one_eye_failure(void) {
     ylx_pipeline_t p = make_pipeline(); output_mode = 2;
     split_thread_main(&p);
     assert(p.failed && p.split_done && p.drop_decoder_output == 1);
@@ -219,4 +193,47 @@ int main(void) {
     assert(p.fed[0] == 1 && p.fed[1] == 0 && output_calls == 1 && released == 3);
     return 0;
 }
-""")
+
+int main(int argc, char **argv) {
+    (void)encoder_output_thread;
+    (void)split_thread_main;
+    if (argc != 2) return 2;
+    if (strcmp(argv[1], "input_failures") == 0) return case_input_failures();
+    if (strcmp(argv[1], "missing_decoder_output") == 0) return case_missing_decoder_output();
+    if (strcmp(argv[1], "missing_encoded_frame") == 0) return case_missing_encoded_frame();
+    if (strcmp(argv[1], "bad_output_or_one_eye_failure") == 0)
+        return case_bad_output_or_one_eye_failure();
+    return 2;
+}
+"""
+        root = Path(cls._temporary.name)
+        path, cls._binary = root / "case.c", root / "case"
+        path.write_text(harness + constants + "\n" + submit + split + output + cases)
+        subprocess.run(
+            [
+                compiler,
+                "-std=gnu11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                str(path),
+                "-o",
+                str(cls._binary),
+            ],
+            check=True,
+        )
+
+    def run_case(self, name: str) -> None:
+        subprocess.run([str(self._binary), name], check=True, timeout=5)
+
+    def test_input_failures_preserve_causal_reason_and_reject_following_frames(self):
+        self.run_case("input_failures")
+
+    def test_missing_decoder_output_has_bounded_failed_drain(self):
+        self.run_case("missing_decoder_output")
+
+    def test_missing_encoded_frame_is_failed_instead_of_successful_drain(self):
+        self.run_case("missing_encoded_frame")
+
+    def test_bad_output_or_one_eye_failure_never_skips_into_next_frame(self):
+        self.run_case("bad_output_or_one_eye_failure")

@@ -2,18 +2,17 @@ import unittest
 from unittest.mock import patch
 
 from rp_ylx.api import ProviderError
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, FakeSources, frame, start_command, stop_command
 
 
 class StartReceiptRecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
-        self.sources = fixtures.FakeSources()
+        self.sources = FakeSources()
         self.coordinator = self.fixture.coordinator(sources=self.sources)
         self.addCleanup(self.coordinator.close)
-        self.command = fixtures.start_command("retry-start")
+        self.command = start_command("retry-start")
         self.real_write = self.coordinator._state_db.put_capture_state
 
     def fail_after_sources_started(self, *args, **kwargs):
@@ -32,7 +31,7 @@ class StartReceiptRecoveryTests(unittest.TestCase):
         active = self.coordinator.capture_status()["snapshot"]["active_recording"]
         self.assertIsNotNone(active)
         self.assertEqual(active["recording_state"]["state"], "recording")
-        self.assertTrue(self.coordinator.submit_frame(fixtures.frame()))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
         return active["recording_state"]["session_id"]
 
     def test_retry_persists_original_start_without_starting_sources_again(self):
@@ -46,7 +45,7 @@ class StartReceiptRecoveryTests(unittest.TestCase):
                 session_id,
             )
             start.assert_called_once()
-        self.coordinator.stop_capture(fixtures.stop_command("finish"))
+        self.coordinator.stop_capture(stop_command("finish"))
         self.coordinator.close()
         restarted = self.fixture.coordinator()
         self.addCleanup(restarted.close)
@@ -70,9 +69,7 @@ class StartReceiptRecoveryTests(unittest.TestCase):
     def test_failed_receipt_retains_conflict_detection(self):
         session_id = self.start_with_failed_receipt()
         with self.assertRaises(ProviderError) as raised:
-            self.coordinator.start_capture(
-                fixtures.start_command("retry-start", display_name="changed")
-            )
+            self.coordinator.start_capture(start_command("retry-start", display_name="changed"))
         self.assertEqual(raised.exception.code, "idempotency_conflict")
         current = self.coordinator.capture_status()["snapshot"]["active_recording"]
         self.assertEqual(current["recording_state"]["session_id"], session_id)
@@ -92,7 +89,7 @@ class StartReceiptRecoveryTests(unittest.TestCase):
         result = self.coordinator.start_capture(self.command)
         self.assertEqual(result.status, 202)
         self.assertFalse(result.replayed)
-        self.assertTrue(self.coordinator.submit_frame(fixtures.frame()))
+        self.assertTrue(self.coordinator.submit_frame(frame()))
 
 
 if __name__ == "__main__":

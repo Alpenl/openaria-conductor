@@ -7,13 +7,13 @@ from unittest.mock import patch
 from rp_ylx.api import ProviderError
 from rp_ylx.capture_readiness import SYSTEM_RESERVE_BYTES, valid_readiness
 from rp_ylx.daemon import CaptureRecoveryMonitor
-from tests import test_capture_coordinator as fixtures
+from tests import testkit as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class CaptureReadinessTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.c = self.fixture.coordinator()
         self.addCleanup(self.c.close)

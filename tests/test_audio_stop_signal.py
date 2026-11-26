@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rp_ylx.recording.device_session import DeviceRecordingError
-from tests import test_split_eye_recording as fixture
+from tests.testkit import FakeSessionStore, SplitEyeHarness
 
 
 class AudioStopSignalTest(unittest.TestCase):
@@ -17,7 +17,7 @@ class AudioStopSignalTest(unittest.TestCase):
                 self.subTest(checkpoint_fails=checkpoint_fails),
                 tempfile.TemporaryDirectory() as directory,
             ):
-                store = fixture.FakeSessionStore()
+                store = FakeSessionStore()
                 with (
                     patch(
                         "rp_ylx.recording.device_session.native_session_store", return_value=store
@@ -27,7 +27,7 @@ class AudioStopSignalTest(unittest.TestCase):
                         return_value=Path("/bin/true"),
                     ),
                 ):
-                    recorder, _, _ = fixture.SplitEyeRecordingTest().build(
+                    recorder, _, _ = SplitEyeHarness().build(
                         Path(directory), native_data_plane=True
                     )
                     recorder.start()

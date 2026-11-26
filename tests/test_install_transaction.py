@@ -9,13 +9,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rp_ylx import deployment as deploy
-from tests import test_deployment as fixtures
+from tests.testkit import DeploymentHarness
 
 
 class InstallTransactionTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.ReleaseManagerTest()
-        self.fixture.setUp()
+        self.fixture = DeploymentHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.manager = self.fixture.manager()
         self.manager._ensure_layout()

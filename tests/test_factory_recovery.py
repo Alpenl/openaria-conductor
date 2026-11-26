@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import io
@@ -17,20 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.factory_recovery import device, disks, prepare_image, recover
-
-
-def profile():
-    files = {}
-    config = {"state_root": "/var/lib/rp-ylx", "security": {"profile": "lab"}}
-    for name, raw in {
-        "etc/rp-ylx/device.json": json.dumps(config).encode(),
-        "etc/machine-id": b"a" * 32,
-    }.items():
-        files[name] = {
-            "data": base64.b64encode(raw).decode(),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-    return {"schema": device.SCHEMA, "board": "test-board", "files": files}
+from tests.testkit import factory_profile as profile
 
 
 class RecoveryTests(unittest.TestCase):

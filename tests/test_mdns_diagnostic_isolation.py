@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rp_ylx.mdns import MDNS_SERVICE_TYPES, MdnsPublisher
-from tests.test_mdns import FakeResponder
+from tests.testkit import FakeResponder
 
 
 class MdnsDiagnosticIsolationTest(unittest.TestCase):

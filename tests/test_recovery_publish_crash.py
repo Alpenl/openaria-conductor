@@ -14,13 +14,12 @@ from unittest.mock import patch
 
 from rp_ylx.recording import coordinator as module
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness, FakeSources, frame, start_command, stop_command
 
 
 class RecoveryPublishCrashTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         self.fixture.session_config = replace(
             self.fixture.session_config,
@@ -38,12 +37,12 @@ class RecoveryPublishCrashTest(unittest.TestCase):
         def child():
             try:
                 coordinator = self.fixture.coordinator()
-                coordinator.start_capture(fixtures.start_command("recovery-publish-crash"))
+                coordinator.start_capture(start_command("recovery-publish-crash"))
                 sid = self.fixture.active_session_id(coordinator)
                 recorder = coordinator._active
                 origin = recorder._started_monotonic_ns
                 for index in range(6):
-                    observation = fixtures.frame(index * 2)
+                    observation = frame(index * 2)
                     observation = replace(
                         observation,
                         frame=replace(
@@ -86,7 +85,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
                         return persist()
 
                     coordinator._persist_local_state = after_normal_publication
-                    coordinator.stop_capture(fixtures.stop_command("normal-stop-crash"))
+                    coordinator.stop_capture(stop_command("normal-stop-crash"))
                     raise AssertionError("normal stop crash boundary returned")
                 if database_failure:
 
@@ -297,7 +296,7 @@ class RecoveryPublishCrashTest(unittest.TestCase):
             coordinator.close()
 
     def test_active_identity_is_durable_before_sources_start_and_clears_on_success(self):
-        sources = fixtures.FakeSources()
+        sources = FakeSources()
         coordinator = self.fixture.coordinator(sources=sources)
         original_start = sources.start
         observed = []
@@ -312,10 +311,10 @@ class RecoveryPublishCrashTest(unittest.TestCase):
 
         try:
             with patch.object(sources, "start", side_effect=start):
-                coordinator.start_capture(fixtures.start_command("identity-start"))
+                coordinator.start_capture(start_command("identity-start"))
             self.assertEqual(len(observed), 1)
-            self.assertTrue(coordinator.submit_frame(fixtures.frame()))
-            coordinator.stop_capture(fixtures.stop_command("identity-stop"))
+            self.assertTrue(coordinator.submit_frame(frame()))
+            coordinator.stop_capture(stop_command("identity-stop"))
             self.assertIsNone(coordinator._read_local_state()["active_session"])
         finally:
             coordinator.close()

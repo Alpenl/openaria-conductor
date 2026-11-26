@@ -10,7 +10,7 @@ from rp_ylx.api.events import (
     validate_device_descriptor,
 )
 from rp_ylx.runtime import _temperature, collect_linux_runtime
-from tests import test_capture_coordinator as fixture
+from tests.testkit import CoordinatorHarness, FakeSources
 
 
 class ThermalMillidegreesTest(unittest.TestCase):
@@ -88,10 +88,9 @@ class ThermalMillidegreesTest(unittest.TestCase):
 
     def test_status_and_descriptor_preserve_subdegree_readings(self) -> None:
         self.temp.write_text("125\n", encoding="ascii")
-        case = fixture.CaptureCoordinatorTest()
-        case.setUp()
+        case = CoordinatorHarness().setUp()
         self.addCleanup(case.tearDown)
-        coordinator = case.coordinator(sources=fixture.FakeSources())
+        coordinator = case.coordinator(sources=FakeSources())
         self.addCleanup(coordinator.close)
         coordinator._runtime = lambda: collect_linux_runtime(
             net_root=self.root / "missing_net",

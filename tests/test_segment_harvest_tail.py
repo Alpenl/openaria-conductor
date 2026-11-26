@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from rp_ylx.recording import device_session as d
+from tests.testkit import SplitEyeHarness
 
 
 class _PreviouslySealed(dict):
@@ -14,7 +15,7 @@ class _PreviouslySealed(dict):
 
 class SegmentHarvestTailTests(unittest.TestCase):
     def recorder(self, root, segments, indexed):
-        recorder = object.__new__(d.DeviceSessionRecorder)
+        recorder, _, _ = SplitEyeHarness().build(root, native_data_plane=True)
         recorder._native_transaction = SimpleNamespace(
             segments=lambda: segments,
             snapshot=lambda: {"sink": {"frames_indexed": indexed[0]}},
@@ -22,10 +23,7 @@ class SegmentHarvestTailTests(unittest.TestCase):
         recorder._harvested_segments = 1000
         recorder._segment_records = [{"index": i} for i in range(1000)]
         recorder._segment_record = lambda segment: {"index": segment.index}
-        recorder._capture_diagnostics = lambda: {}
         recorder._partial = root
-        recorder._files = {}
-        recorder._plan = SimpleNamespace(session_id="test-harvest-tail")
         return recorder
 
     def segment(self, index):

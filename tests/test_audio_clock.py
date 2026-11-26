@@ -2,49 +2,7 @@ import copy
 import unittest
 
 from rp_ylx.audio_clock import audio_clock_report
-
-
-def audio_fixture():
-    return {
-        "channels": 2,
-        "segments": [
-            {
-                "index": 0,
-                "start_sample": 0,
-                "end_sample": 20000,
-                "start_time_seconds": 0.0,
-                "end_time_seconds": 2.0,
-                "pcm_payload_bytes": 80000,
-                "wav_header_bytes": 44,
-                "artifact": {"bytes": 80044},
-            }
-        ],
-        "state": "recorded",
-        "sample_rate": 10000,
-        "sample_count": 20000,
-        "sync": {"start_time_seconds": 0.1, "end_time_seconds": 2.1},
-        "capture_clock": {
-            "schema": "openaria.audio-clock.v1",
-            "clock": "host_monotonic",
-            "timestamp_source": "alsa_htimestamp_dma",
-            "continuity": "verified",
-            "device": "hw:CARD=D2UQ2,DEV=0",
-            "period_frames": 1024,
-            "buffer_frames": 8192,
-            "thread_started_monotonic_ns": 1100000000,
-            "thread_stopped_monotonic_ns": 3110000000,
-            "sample_start_monotonic_ns": 1100000000,
-            "sample_end_monotonic_ns": 3100000000,
-            "session_start_monotonic_ns": 1000000000,
-            "max_residual_ns": 0,
-            "anchors": [[1024, 1202400000], [11024, 2202400000], [20000, 3100000000]],
-            "queue_capacity_frames": 262144,
-            "queue_peak_frames": 1024,
-            "max_write_ns": 500000,
-            "xrun_count": 0,
-            "suspend_count": 0,
-        },
-    }
+from tests.testkit import audio_fixture
 
 
 class AudioClockTests(unittest.TestCase):

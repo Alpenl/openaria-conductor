@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from rp_ylx.api.gateway import _StreamRegistry, create_gateway_server
 from rp_ylx.api.security import SecurityPolicy
-from tests.test_gateway_stream_lifecycle import _LifecycleProvider
+from tests.testkit import LifecycleProvider as _LifecycleProvider
 
 
 class StreamAdmissionRecoveryTest(unittest.TestCase):

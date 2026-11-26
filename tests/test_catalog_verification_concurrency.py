@@ -8,17 +8,15 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from unittest.mock import patch
 
-import test_capture_coordinator as fixtures
-
 from rp_ylx.api import ProviderError
 from rp_ylx.api.downloads import ArtifactAccessError
 from rp_ylx.recording_layout import resolve_recording
+from tests import testkit as fixtures
 
 
 class CatalogVerificationConcurrencyTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = fixtures.CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
         original = self.fixture.coordinator()
         try:

@@ -9,17 +9,16 @@ from unittest.mock import patch
 from rp_ylx.api import CaptureCommand, ProviderError
 from rp_ylx.recording import deletion
 from rp_ylx.recording_layout import resolve_recording
-from tests import test_capture_coordinator as fixtures
+from tests.testkit import CoordinatorHarness
 
 
 class DeletedRecordingOutcomesTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CaptureCoordinatorTest()
-        self.fixture.setUp()
+        self.fixture = CoordinatorHarness().setUp()
         self.addCleanup(self.fixture.tearDown)
 
     def recovered(self, prefix):
-        coordinator, sid = self.fixture._retained_catalog_entry(recovered=True, prefix=prefix)
+        coordinator, sid = self.fixture.retained_catalog_entry(recovered=True, prefix=prefix)
         manifest = json.loads(
             (
                 resolve_recording(self.fixture.mountpoint / "recordings", sid) / "manifest.json"

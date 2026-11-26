@@ -18,6 +18,11 @@ class RestorePublicationTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.source = StateDatabase(self.root / "source.sqlite3")
         self.source.put("capture", {"revision": 7})
         self.destination = self.root / "state.sqlite3"

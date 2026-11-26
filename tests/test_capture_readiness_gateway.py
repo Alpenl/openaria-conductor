@@ -31,6 +31,7 @@ class ReadinessGatewayTests(unittest.TestCase):
         server = create_gateway_server("127.0.0.1", 0, provider, security=policy)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         url = f"http://127.0.0.1:{server.server_address[1]}/api/v4/capture/readiness"

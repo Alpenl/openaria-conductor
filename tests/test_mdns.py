@@ -11,23 +11,7 @@ from rp_ylx.mdns import (
     MdnsPublisher,
     runtime_ipv4_addresses,
 )
-
-
-class FakeResponder:
-    def __init__(self, addresses: tuple[str, ...]) -> None:
-        self.addresses = addresses
-        self.registered = []
-        self.unregistered = []
-        self.closed = False
-
-    def register_service(self, info, **kwargs) -> None:
-        self.registered.append((info, kwargs))
-
-    def unregister_service(self, info) -> None:
-        self.unregistered.append(info)
-
-    def close(self) -> None:
-        self.closed = True
+from tests.testkit import FakeResponder
 
 
 class MdnsPublisherTest(unittest.TestCase):

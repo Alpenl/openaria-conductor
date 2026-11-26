@@ -20,6 +20,11 @@ class RestoreConcurrencyTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.enterContext(
+            patch.dict(
+                os.environ, {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance.lock")}
+            )
+        )
         self.target = self.root / "state.sqlite3"
         StateDatabase(self.target).put("capture", {"revision": 42})
         self.sources = []
@@ -129,7 +134,11 @@ class RestoreConcurrencyTest(unittest.TestCase):
         process, resume = self.gated_restore()
         second = self.root / "second.sqlite3"
         StateDatabase(second).put("capture", {"revision": 21})
-        database_admin.restore(self.sources[1], second)
+        with patch.dict(
+            os.environ,
+            {"OPENARIA_MAINTENANCE_LOCK": str(self.root / "maintenance-second.lock")},
+        ):
+            database_admin.restore(self.sources[1], second)
         self.assertEqual(self.value(second), 99)
         self.assertFalse(self.target.exists())
         resume.set()
