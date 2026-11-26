@@ -2,6 +2,7 @@
 set -eu
 
 LOGIN_USER=OpenAria
+# shellcheck disable=SC2016
 LOGIN_PASSWORD_HASH='$6$OpenAria$sG47eil4DeVNV.9dRDeX15Fev0WuDuVolbkGFH.FJ/4elFempW5GJrepN2lr4coM.y91cSj26eLZYS6B5Zk8r.'
 
 if ! getent passwd "$LOGIN_USER" >/dev/null; then
