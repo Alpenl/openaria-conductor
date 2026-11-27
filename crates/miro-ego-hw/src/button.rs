@@ -1,6 +1,7 @@
-//! 40-pin GPIO recording button monitor, RDK X5 BOARD-to-SoC sysfs GPIO export,
-//! debounce/short/double/long press classifier, `/etc/miro-ego/button.json` schema loader,
-//! and bounded HTTP/HTTPS local capture toggle client with pinned TLS certificate verification.
+//! 40-pin GPIO recording button monitor, Linux `/dev/gpiochip*` character-device GPIO (`v2` +
+//! `v1` + sysfs fallback), debounce/short/double/long press classifier, `/etc/miro-ego/button.json`
+//! schema loader, and deadline-bounded HTTP/HTTPS local capture toggle client with pinned TLS
+//! certificate verification.
 
 use crate::{ButtonEvent, ButtonInput, HwError, HwResult};
 use miro_ego_core::config::{ListenConfig, SecurityConfig, load_device_config};
@@ -12,9 +13,11 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,8 +27,10 @@ use subtle::ConstantTimeEq;
 pub const BUTTON_CONFIG_SCHEMA: &str = "miro-ego.button-config.v1";
 pub const DEFAULT_BUTTON_CONFIG_PATH: &str = "/etc/miro-ego/button.json";
 pub const DEFAULT_GPIO_SYSFS_ROOT: &str = "/sys/class/gpio";
+pub const DEFAULT_DEV_ROOT: &str = "/dev";
 pub const MAX_BUTTON_CONFIG_BYTES: usize = 8 * 1024;
 pub const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 /// Valid 40-pin RDK X5 BOARD GPIO physical pins (excluding 3V3, 5V, and GND pins).
 pub const RDK_X5_GPIO_PINS: &[u8] = &[
@@ -78,6 +83,18 @@ pub fn rdk_x5_board_pin_to_soc_gpio(physical_pin: u8) -> HwResult<u32> {
         }
     };
     Ok(soc_gpio)
+}
+
+/// Map a Sunrise X5 SoC GPIO number (`347..=505`) to `(bank_keywords, line_offset)` for
+/// `/dev/gpiochip*` character-device resolution.
+pub fn rdk_x5_soc_gpio_to_bank_offset(soc_gpio: u32) -> Option<(&'static [&'static str], u32)> {
+    match soc_gpio {
+        347..=363 => Some((&["lsio_gpio1", "32150000"], soc_gpio - 347)),
+        379..=410 => Some((&["lsio_gpio0", "32140000"], soc_gpio - 379)),
+        411..=433 => Some((&["dsp_gpio0", "31040000"], soc_gpio - 411)),
+        498..=505 => Some((&["aon_gpio0", "31020000"], soc_gpio - 498)),
+        _ => None,
+    }
 }
 
 fn default_schema() -> String {
@@ -204,9 +221,9 @@ impl ButtonConfig {
                 message: "poll_ms must be in 5..=100".to_owned(),
             });
         }
-        if !(100..=10_000).contains(&self.request_timeout_ms) {
+        if !(100..=MAX_REQUEST_TIMEOUT_MS).contains(&self.request_timeout_ms) {
             return Err(HwError::Io {
-                message: "request_timeout_ms must be in 100..=10000".to_owned(),
+                message: format!("request_timeout_ms must be in 100..={MAX_REQUEST_TIMEOUT_MS}"),
             });
         }
         if self.poll_ms > self.debounce_ms || self.cooldown_ms < self.debounce_ms {
@@ -247,6 +264,508 @@ impl ButtonConfig {
 pub trait GpioPin: Send + Sync {
     /// Read current electrical logic level (`true` = high / `1`, `false` = low / `0`).
     fn read_level(&self) -> HwResult<bool>;
+}
+
+// ---------------------------------------------------------------------------
+// Linux `/dev/gpiochip*` Character-Device GPIO (ABI v2 + v1 fallback)
+// ---------------------------------------------------------------------------
+
+const GPIO_MAX_NAME_SIZE: usize = 32;
+const GPIO_V2_LINES_MAX: usize = 64;
+const GPIO_V2_LINE_NUM_ATTRS_MAX: usize = 10;
+const GPIOHANDLES_MAX: usize = 64;
+
+const GPIO_V2_LINE_FLAG_INPUT: u64 = 1 << 2;
+const GPIOHANDLE_REQUEST_INPUT: u32 = 1 << 0;
+
+/// `_IOR(0xB4, 0x01, struct gpiochip_info)` (`sizeof == 68`).
+const GPIO_GET_CHIPINFO_IOCTL: u32 = 0x8044_B401;
+/// `_IOWR(0xB4, 0x07, struct gpio_v2_line_request)` (`sizeof == 592`).
+const GPIO_V2_GET_LINE_IOCTL: u32 = 0xC250_B407;
+/// `_IOWR(0xB4, 0x0E, struct gpio_v2_line_values)` (`sizeof == 16`).
+const GPIO_V2_LINE_GET_VALUES_IOCTL: u32 = 0xC010_B40E;
+/// `_IOWR(0xB4, 0x03, struct gpiohandle_request)` (`sizeof == 364`).
+const GPIO_GET_LINEHANDLE_IOCTL: u32 = 0xC16C_B403;
+/// `_IOWR(0xB4, 0x08, struct gpiohandle_data)` (`sizeof == 64`).
+const GPIOHANDLE_GET_LINE_VALUES_IOCTL: u32 = 0xC040_B408;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioChipInfoRaw {
+    name: [u8; GPIO_MAX_NAME_SIZE],
+    label: [u8; GPIO_MAX_NAME_SIZE],
+    lines: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioV2LineAttributeRaw {
+    id: u32,
+    padding: u32,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioV2LineConfigAttributeRaw {
+    attr: GpioV2LineAttributeRaw,
+    mask: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioV2LineConfigRaw {
+    flags: u64,
+    num_attrs: u32,
+    padding: [u32; 5],
+    attrs: [GpioV2LineConfigAttributeRaw; GPIO_V2_LINE_NUM_ATTRS_MAX],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioV2LineRequestRaw {
+    offsets: [u32; GPIO_V2_LINES_MAX],
+    consumer: [u8; GPIO_MAX_NAME_SIZE],
+    config: GpioV2LineConfigRaw,
+    num_lines: u32,
+    event_buffer_size: u32,
+    padding: [u32; 5],
+    fd: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpioV2LineValuesRaw {
+    bits: u64,
+    mask: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioHandleRequestRaw {
+    lineoffsets: [u32; GPIOHANDLES_MAX],
+    flags: u32,
+    default_values: [u8; GPIOHANDLES_MAX],
+    consumer_label: [u8; GPIO_MAX_NAME_SIZE],
+    lines: u32,
+    fd: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpioHandleDataRaw {
+    values: [u8; GPIOHANDLES_MAX],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<GpioChipInfoRaw>() == 68);
+    assert!(std::mem::size_of::<GpioV2LineAttributeRaw>() == 16);
+    assert!(std::mem::size_of::<GpioV2LineConfigAttributeRaw>() == 24);
+    assert!(std::mem::size_of::<GpioV2LineConfigRaw>() == 272);
+    assert!(std::mem::size_of::<GpioV2LineRequestRaw>() == 592);
+    assert!(std::mem::size_of::<GpioV2LineValuesRaw>() == 16);
+    assert!(std::mem::size_of::<GpioHandleRequestRaw>() == 364);
+    assert!(std::mem::size_of::<GpioHandleDataRaw>() == 64);
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpioAbiVersion {
+    V2,
+    V1,
+}
+
+trait GpioIoctlOps: Send + Sync {
+    fn query_chip_info(&self, chip_fd: RawFd) -> std::io::Result<(String, String, u32)>;
+    fn request_line_v2(&self, chip_fd: RawFd, line_offset: u32) -> std::io::Result<OwnedFd>;
+    fn request_line_v1(&self, chip_fd: RawFd, line_offset: u32) -> std::io::Result<OwnedFd>;
+    fn read_value_v2(&self, line_fd: RawFd) -> std::io::Result<bool>;
+    fn read_value_v1(&self, line_fd: RawFd) -> std::io::Result<bool>;
+}
+
+struct RealGpioIoctlOps;
+
+fn c_bytes_to_string(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+fn fill_consumer_label(dst: &mut [u8; GPIO_MAX_NAME_SIZE], label: &[u8]) {
+    dst.fill(0);
+    let max_copy = label.len().min(GPIO_MAX_NAME_SIZE - 1);
+    dst[..max_copy].copy_from_slice(&label[..max_copy]);
+}
+
+impl GpioIoctlOps for RealGpioIoctlOps {
+    fn query_chip_info(&self, chip_fd: RawFd) -> std::io::Result<(String, String, u32)> {
+        // SAFETY: `GpioChipInfoRaw` is POD and zeroed before `GPIO_GET_CHIPINFO_IOCTL`.
+        let mut info: GpioChipInfoRaw = unsafe { std::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)]
+        let req = GPIO_GET_CHIPINFO_IOCTL as libc::Ioctl;
+        if unsafe { libc::ioctl(chip_fd, req, &mut info) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((
+            c_bytes_to_string(&info.name),
+            c_bytes_to_string(&info.label),
+            info.lines,
+        ))
+    }
+
+    fn request_line_v2(&self, chip_fd: RawFd, line_offset: u32) -> std::io::Result<OwnedFd> {
+        // SAFETY: `GpioV2LineRequestRaw` is POD and zero-initialized before setting request fields.
+        let mut req_data: GpioV2LineRequestRaw = unsafe { std::mem::zeroed() };
+        req_data.offsets[0] = line_offset;
+        req_data.num_lines = 1;
+        req_data.config.flags = GPIO_V2_LINE_FLAG_INPUT;
+        fill_consumer_label(&mut req_data.consumer, b"miro-ego-button");
+
+        #[allow(clippy::unnecessary_cast)]
+        let ioctl_code = GPIO_V2_GET_LINE_IOCTL as libc::Ioctl;
+        if unsafe { libc::ioctl(chip_fd, ioctl_code, &mut req_data) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if req_data.fd < 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let _ = unsafe { libc::fcntl(req_data.fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        // SAFETY: Kernel returned a fresh owned file descriptor in `req_data.fd`.
+        Ok(unsafe { OwnedFd::from_raw_fd(req_data.fd) })
+    }
+
+    fn request_line_v1(&self, chip_fd: RawFd, line_offset: u32) -> std::io::Result<OwnedFd> {
+        // SAFETY: `GpioHandleRequestRaw` is POD and zero-initialized before setting request fields.
+        let mut req_data: GpioHandleRequestRaw = unsafe { std::mem::zeroed() };
+        req_data.lineoffsets[0] = line_offset;
+        req_data.lines = 1;
+        req_data.flags = GPIOHANDLE_REQUEST_INPUT;
+        fill_consumer_label(&mut req_data.consumer_label, b"miro-ego-button");
+
+        #[allow(clippy::unnecessary_cast)]
+        let ioctl_code = GPIO_GET_LINEHANDLE_IOCTL as libc::Ioctl;
+        if unsafe { libc::ioctl(chip_fd, ioctl_code, &mut req_data) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if req_data.fd < 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let _ = unsafe { libc::fcntl(req_data.fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        // SAFETY: Kernel returned a fresh owned file descriptor in `req_data.fd`.
+        Ok(unsafe { OwnedFd::from_raw_fd(req_data.fd) })
+    }
+
+    fn read_value_v2(&self, line_fd: RawFd) -> std::io::Result<bool> {
+        let mut vals = GpioV2LineValuesRaw { bits: 0, mask: 1 };
+        #[allow(clippy::unnecessary_cast)]
+        let ioctl_code = GPIO_V2_LINE_GET_VALUES_IOCTL as libc::Ioctl;
+        loop {
+            if unsafe { libc::ioctl(line_fd, ioctl_code, &mut vals) } == 0 {
+                return Ok((vals.bits & 1) != 0);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
+    fn read_value_v1(&self, line_fd: RawFd) -> std::io::Result<bool> {
+        // SAFETY: `GpioHandleDataRaw` is POD `[u8; 64]`.
+        let mut data: GpioHandleDataRaw = unsafe { std::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)]
+        let ioctl_code = GPIOHANDLE_GET_LINE_VALUES_IOCTL as libc::Ioctl;
+        loop {
+            if unsafe { libc::ioctl(line_fd, ioctl_code, &mut data) } == 0 {
+                return Ok(data.values[0] != 0);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Linux `/dev/gpiochip*` character-device GPIO input pin holding a persistent line descriptor
+/// (`GPIO_V2_GET_LINE_IOCTL` with automatic v1 `GPIO_GET_LINEHANDLE_IOCTL` fallback).
+pub struct CharDevGpioPin {
+    chip_path: PathBuf,
+    line_offset: u32,
+    abi: GpioAbiVersion,
+    line_fd: OwnedFd,
+    ops: Arc<dyn GpioIoctlOps>,
+}
+
+impl std::fmt::Debug for CharDevGpioPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CharDevGpioPin")
+            .field("chip_path", &self.chip_path)
+            .field("line_offset", &self.line_offset)
+            .field("abi", &self.abi)
+            .finish()
+    }
+}
+
+impl CharDevGpioPin {
+    /// Open a specific `(chip_path, line_offset)` via Linux GPIO character-device ABI v2,
+    /// falling back automatically to ABI v1 on older kernels.
+    pub fn open_line(chip_path: &Path, line_offset: u32) -> HwResult<Self> {
+        let chip_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(chip_path)
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    HwError::Unavailable {
+                        message: format!("gpiochip device missing: {}", chip_path.display()),
+                    }
+                } else {
+                    HwError::Io {
+                        message: format!("failed opening gpiochip {}: {err}", chip_path.display()),
+                    }
+                }
+            })?;
+        Self::open_line_with_ops(
+            chip_path,
+            chip_file.as_raw_fd(),
+            line_offset,
+            Arc::new(RealGpioIoctlOps),
+        )
+    }
+
+    fn open_line_with_ops(
+        chip_path: &Path,
+        chip_fd: RawFd,
+        line_offset: u32,
+        ops: Arc<dyn GpioIoctlOps>,
+    ) -> HwResult<Self> {
+        match ops.request_line_v2(chip_fd, line_offset) {
+            Ok(line_fd) => Ok(Self {
+                chip_path: chip_path.to_path_buf(),
+                line_offset,
+                abi: GpioAbiVersion::V2,
+                line_fd,
+                ops,
+            }),
+            Err(v2_err) if is_v2_unsupported_errno(&v2_err) => {
+                let line_fd = ops
+                    .request_line_v1(chip_fd, line_offset)
+                    .map_err(|v1_err| HwError::Io {
+                        message: format!(
+                            "failed requesting GPIO line {} on {} (v2: {v2_err}; v1: {v1_err})",
+                            line_offset,
+                            chip_path.display()
+                        ),
+                    })?;
+                Ok(Self {
+                    chip_path: chip_path.to_path_buf(),
+                    line_offset,
+                    abi: GpioAbiVersion::V1,
+                    line_fd,
+                    ops,
+                })
+            }
+            Err(err) => Err(HwError::Io {
+                message: format!(
+                    "failed requesting GPIO v2 line {} on {}: {err}",
+                    line_offset,
+                    chip_path.display()
+                ),
+            }),
+        }
+    }
+
+    /// Resolve a Sunrise X5 SoC GPIO number (`e.g. 401`) against `/dev/gpiochip*` (matching sysfs
+    /// `gpiochip<base>/label` or Sunrise X5 controller bank labels) and open the line handle.
+    pub fn open_soc_gpio_in(
+        dev_root: &Path,
+        sysfs_gpio_root: &Path,
+        soc_gpio: u32,
+    ) -> HwResult<Self> {
+        let ops: Arc<dyn GpioIoctlOps> = Arc::new(RealGpioIoctlOps);
+        let Some((chip_path, offset)) =
+            discover_chardev_for_soc_gpio(dev_root, sysfs_gpio_root, soc_gpio, ops.as_ref())
+        else {
+            return Err(HwError::Unavailable {
+                message: format!(
+                    "no matching /dev/gpiochip* found for SoC GPIO {soc_gpio} under {}",
+                    dev_root.display()
+                ),
+            });
+        };
+        Self::open_line(&chip_path, offset)
+    }
+
+    /// Open an RDK X5 40-pin BOARD physical header pin via `/dev/gpiochip*`.
+    pub fn open_rdk_x5_board_pin(physical_pin: u8) -> HwResult<Self> {
+        let soc_gpio = rdk_x5_board_pin_to_soc_gpio(physical_pin)?;
+        Self::open_soc_gpio_in(
+            Path::new(DEFAULT_DEV_ROOT),
+            Path::new(DEFAULT_GPIO_SYSFS_ROOT),
+            soc_gpio,
+        )
+    }
+
+    pub fn chip_path(&self) -> &Path {
+        &self.chip_path
+    }
+
+    pub fn line_offset(&self) -> u32 {
+        self.line_offset
+    }
+}
+
+impl GpioPin for CharDevGpioPin {
+    fn read_level(&self) -> HwResult<bool> {
+        let fd = self.line_fd.as_raw_fd();
+        let res = match self.abi {
+            GpioAbiVersion::V2 => self.ops.read_value_v2(fd),
+            GpioAbiVersion::V1 => self.ops.read_value_v1(fd),
+        };
+        res.map_err(|err| HwError::Io {
+            message: format!(
+                "failed reading GPIO line {} on {}: {err}",
+                self.line_offset,
+                self.chip_path.display()
+            ),
+        })
+    }
+}
+
+fn is_v2_unsupported_errno(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
+}
+
+fn discover_chardev_for_soc_gpio(
+    dev_root: &Path,
+    sysfs_gpio_root: &Path,
+    soc_gpio: u32,
+    ops: &dyn GpioIoctlOps,
+) -> Option<(PathBuf, u32)> {
+    // Optional sysfs `gpiochip<base>` metadata (`base`, `ngpio`, `label`) if readable.
+    let mut sysfs_label_and_offset: Option<(String, u32)> = None;
+    if let Ok(entries) = fs::read_dir(sysfs_gpio_root) {
+        for entry in entries.filter_map(Result::ok) {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.starts_with("gpiochip") {
+                continue;
+            }
+            let p = entry.path();
+            let Ok(base_txt) = fs::read_to_string(p.join("base")) else {
+                continue;
+            };
+            let Ok(ngpio_txt) = fs::read_to_string(p.join("ngpio")) else {
+                continue;
+            };
+            let (Ok(base), Ok(ngpio)) = (
+                base_txt.trim().parse::<u32>(),
+                ngpio_txt.trim().parse::<u32>(),
+            ) else {
+                continue;
+            };
+            if soc_gpio >= base && soc_gpio < base.saturating_add(ngpio) {
+                if let Ok(lbl) = fs::read_to_string(p.join("label")) {
+                    let trimmed = lbl.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        sysfs_label_and_offset = Some((trimmed, soc_gpio - base));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let bank_fallback = rdk_x5_soc_gpio_to_bank_offset(soc_gpio);
+    let entries = fs::read_dir(dev_root).ok()?;
+    let mut dev_candidates: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("gpiochip").then(|| e.path())
+        })
+        .collect();
+    dev_candidates.sort();
+
+    for chip_path in dev_candidates {
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&chip_path)
+        else {
+            continue;
+        };
+        let Ok((name, label, lines)) = ops.query_chip_info(file.as_raw_fd()) else {
+            continue;
+        };
+        if let Some((ref expected_label, offset)) = sysfs_label_and_offset {
+            if label == *expected_label && offset < lines {
+                return Some((chip_path, offset));
+            }
+        }
+        if let Some((keywords, offset)) = bank_fallback {
+            let lower_label = label.to_ascii_lowercase();
+            let lower_name = name.to_ascii_lowercase();
+            if offset < lines
+                && keywords
+                    .iter()
+                    .any(|kw| lower_label.contains(kw) || lower_name.contains(kw))
+            {
+                return Some((chip_path, offset));
+            }
+        }
+    }
+    None
+}
+
+/// Unified platform GPIO input pin preferring `/dev/gpiochip*` (`GPIO_V2_GET_LINE_IOCTL` ->
+/// `GPIO_GET_LINEHANDLE_IOCTL`) with automatic fallback to [`SysfsGpioPin`].
+#[derive(Debug)]
+pub enum PlatformGpioPin {
+    CharDev(CharDevGpioPin),
+    Sysfs(SysfsGpioPin),
+}
+
+impl PlatformGpioPin {
+    /// Open an RDK X5 40-pin BOARD header pin via `/dev/gpiochip*`, falling back cleanly to
+    /// `/sys/class/gpio` when character-device GPIO is unavailable.
+    pub fn open_rdk_x5_board_pin(physical_pin: u8) -> HwResult<Self> {
+        let soc_gpio = rdk_x5_board_pin_to_soc_gpio(physical_pin)?;
+        match CharDevGpioPin::open_soc_gpio_in(
+            Path::new(DEFAULT_DEV_ROOT),
+            Path::new(DEFAULT_GPIO_SYSFS_ROOT),
+            soc_gpio,
+        ) {
+            Ok(cdev) => Ok(Self::CharDev(cdev)),
+            Err(_) => SysfsGpioPin::open_rdk_x5_board_pin(physical_pin).map(Self::Sysfs),
+        }
+    }
+
+    /// Open a SoC GPIO number via `/dev/gpiochip*`, falling back to `/sys/class/gpio/gpio<N>/value`.
+    pub fn from_gpio_number(soc_gpio: u32) -> Self {
+        match CharDevGpioPin::open_soc_gpio_in(
+            Path::new(DEFAULT_DEV_ROOT),
+            Path::new(DEFAULT_GPIO_SYSFS_ROOT),
+            soc_gpio,
+        ) {
+            Ok(cdev) => Self::CharDev(cdev),
+            Err(_) => Self::Sysfs(SysfsGpioPin::from_gpio_number(soc_gpio)),
+        }
+    }
+
+    pub fn from_value_path(path: impl Into<PathBuf>) -> Self {
+        Self::Sysfs(SysfsGpioPin::from_value_path(path))
+    }
+}
+
+impl GpioPin for PlatformGpioPin {
+    fn read_level(&self) -> HwResult<bool> {
+        match self {
+            Self::CharDev(c) => c.read_level(),
+            Self::Sysfs(s) => s.read_level(),
+        }
+    }
 }
 
 /// Linux sysfs GPIO input pin (`/sys/class/gpio/gpio<N>/value`).
@@ -378,6 +897,7 @@ pub struct ButtonClassifier {
     cooldown_ms: u64,
     double_press_window_ms: u64,
     long_press_ms: u64,
+    single_press_only: bool,
     candidate_pressed: Option<bool>,
     candidate_since_ms: u64,
     stable_pressed: bool,
@@ -410,6 +930,7 @@ impl ButtonClassifier {
             cooldown_ms,
             double_press_window_ms,
             long_press_ms,
+            single_press_only: false,
             candidate_pressed: None,
             candidate_since_ms: 0,
             stable_pressed: false,
@@ -419,6 +940,22 @@ impl ButtonClassifier {
             pending_short_deadline_ms: None,
             second_press_in_window: false,
             last_event_ms: None,
+        }
+    }
+
+    /// When enabled (used automatically by [`ButtonMonitor`]), emits [`ButtonEvent::ShortPress`]
+    /// immediately on debounced release without 400ms double-press suppression, and never lets
+    /// unhandled `DoublePress`/`LongPress` gestures swallow taps or stamp `cooldown_ms`.
+    pub fn with_single_press_only(mut self, single_press_only: bool) -> Self {
+        self.set_single_press_only(single_press_only);
+        self
+    }
+
+    pub fn set_single_press_only(&mut self, single_press_only: bool) {
+        self.single_press_only = single_press_only;
+        if single_press_only {
+            self.pending_short_deadline_ms = None;
+            self.second_press_in_window = false;
         }
     }
 
@@ -444,17 +981,19 @@ impl ButtonClassifier {
         }
 
         // Check if a pending single-click window has elapsed without a second press starting.
-        if let Some(deadline) = self.pending_short_deadline_ms {
-            let debouncing_second_press = pressed
-                && self.candidate_pressed == Some(true)
-                && self.candidate_since_ms <= deadline;
-            if !self.stable_pressed
-                && !self.second_press_in_window
-                && !debouncing_second_press
-                && now_ms >= deadline
-            {
-                self.pending_short_deadline_ms = None;
-                return self.emit_if_cooled_down(ButtonEvent::ShortPress, now_ms);
+        if !self.single_press_only {
+            if let Some(deadline) = self.pending_short_deadline_ms {
+                let debouncing_second_press = pressed
+                    && self.candidate_pressed == Some(true)
+                    && self.candidate_since_ms <= deadline;
+                if !self.stable_pressed
+                    && !self.second_press_in_window
+                    && !debouncing_second_press
+                    && now_ms >= deadline
+                {
+                    self.pending_short_deadline_ms = None;
+                    return self.emit_if_cooled_down(ButtonEvent::ShortPress, now_ms);
+                }
             }
         }
 
@@ -477,6 +1016,10 @@ impl ButtonClassifier {
                     self.second_press_in_window = false;
 
                     if !fired_long {
+                        if self.single_press_only {
+                            self.pending_short_deadline_ms = None;
+                            return self.emit_if_cooled_down(ButtonEvent::ShortPress, now_ms);
+                        }
                         if latched_double
                             || self
                                 .pending_short_deadline_ms
@@ -495,9 +1038,11 @@ impl ButtonClassifier {
                     self.stable_pressed = true;
                     self.press_started_ms = Some(now_ms);
                     self.long_press_fired = false;
-                    if let Some(deadline) = self.pending_short_deadline_ms {
-                        if self.candidate_since_ms <= deadline || now_ms <= deadline {
-                            self.second_press_in_window = true;
+                    if !self.single_press_only {
+                        if let Some(deadline) = self.pending_short_deadline_ms {
+                            if self.candidate_since_ms <= deadline || now_ms <= deadline {
+                                self.second_press_in_window = true;
+                            }
                         }
                     }
                 } else if !self.long_press_fired {
@@ -506,6 +1051,10 @@ impl ButtonClassifier {
                             self.long_press_fired = true;
                             self.pending_short_deadline_ms = None;
                             self.second_press_in_window = false;
+                            if self.single_press_only {
+                                // Do NOT stamp `last_event_ms` (`cooldown_ms`) for unhandled LongPress!
+                                return Some(ButtonEvent::LongPress);
+                            }
                             return self.emit_if_cooled_down(ButtonEvent::LongPress, now_ms);
                         }
                     }
@@ -545,6 +1094,17 @@ impl<G: GpioPin> GpioButtonInput<G> {
             epoch: Instant::now(),
             classifier: Mutex::new(classifier),
         })
+    }
+
+    pub fn with_single_press_only(self, single_press_only: bool) -> Self {
+        self.set_single_press_only(single_press_only);
+        self
+    }
+
+    pub fn set_single_press_only(&self, single_press_only: bool) {
+        if let Ok(mut guard) = self.classifier.lock() {
+            guard.set_single_press_only(single_press_only);
+        }
     }
 
     pub fn disarm(&self) {
@@ -587,6 +1147,10 @@ impl<G: GpioPin> ButtonInput for GpioButtonInput<G> {
 
     fn disarm(&self) {
         GpioButtonInput::disarm(self);
+    }
+
+    fn enable_single_press_mode(&self) {
+        self.set_single_press_only(true);
     }
 }
 
@@ -703,6 +1267,16 @@ fn format_authority_host(addr: &SocketAddr) -> String {
     }
 }
 
+fn remaining_until_deadline(deadline: Instant) -> HwResult<Duration> {
+    let now = Instant::now();
+    match deadline.checked_duration_since(now) {
+        Some(rem) if !rem.is_zero() => Ok(rem),
+        _ => Err(HwError::Io {
+            message: "capture API request exceeded total deadline".to_owned(),
+        }),
+    }
+}
+
 /// Bounded HTTP/1.1 & HTTPS loopback client calling `GET /api/v1/capture/status` and
 /// `POST /api/v1/capture/{start,stop}` on the local `miro-ego serve` daemon.
 #[derive(Debug, Clone)]
@@ -716,7 +1290,7 @@ pub struct LocalHttpCaptureClient {
 
 impl LocalHttpCaptureClient {
     pub fn new(addr: SocketAddr, bearer_token: Option<String>, timeout_ms: u64) -> Self {
-        let capped = timeout_ms.clamp(100, 10_000);
+        let capped = timeout_ms.clamp(100, MAX_REQUEST_TIMEOUT_MS);
         Self {
             addr,
             bearer_token,
@@ -796,13 +1370,16 @@ impl LocalHttpCaptureClient {
     }
 
     fn http_json(&self, method: &str, path: &str, body: Option<&Value>) -> HwResult<(u16, Value)> {
-        let tcp = TcpStream::connect_timeout(&self.addr, self.timeout).map_err(|err| {
+        let deadline = Instant::now() + self.timeout;
+        let connect_rem = remaining_until_deadline(deadline)?;
+        let tcp = TcpStream::connect_timeout(&self.addr, connect_rem).map_err(|err| {
             HwError::Unavailable {
                 message: format!("capture API {} unreachable: {err}", self.addr),
             }
         })?;
-        tcp.set_read_timeout(Some(self.timeout))
-            .and_then(|()| tcp.set_write_timeout(Some(self.timeout)))
+        let write_rem = remaining_until_deadline(deadline)?;
+        tcp.set_read_timeout(Some(write_rem))
+            .and_then(|()| tcp.set_write_timeout(Some(write_rem)))
             .map_err(|err| HwError::Io {
                 message: format!("failed to configure capture API timeout: {err}"),
             })?;
@@ -851,28 +1428,38 @@ impl LocalHttpCaptureClient {
                 .write_all(req.as_bytes())
                 .and_then(|()| {
                     if let Some(bytes) = &payload {
+                        let rem =
+                            remaining_until_deadline(deadline).map_err(std::io::Error::other)?;
+                        let _ = tls_stream.get_ref().set_write_timeout(Some(rem));
                         tls_stream.write_all(bytes)?;
                     }
+                    let rem = remaining_until_deadline(deadline).map_err(std::io::Error::other)?;
+                    let _ = tls_stream.get_ref().set_write_timeout(Some(rem));
                     tls_stream.flush()
                 })
                 .map_err(|err| HwError::Io {
                     message: format!("capture HTTPS API write/handshake failed: {err}"),
                 })?;
-            read_http_response_bounded(&mut tls_stream, true)?
+            read_http_response_bounded_tls(&mut tls_stream, deadline)?
         } else {
             let mut plain = tcp;
             plain
                 .write_all(req.as_bytes())
                 .and_then(|()| {
                     if let Some(bytes) = &payload {
+                        let rem =
+                            remaining_until_deadline(deadline).map_err(std::io::Error::other)?;
+                        let _ = plain.set_write_timeout(Some(rem));
                         plain.write_all(bytes)?;
                     }
+                    let rem = remaining_until_deadline(deadline).map_err(std::io::Error::other)?;
+                    let _ = plain.set_write_timeout(Some(rem));
                     plain.flush()
                 })
                 .map_err(|err| HwError::Io {
                     message: format!("capture API write failed: {err}"),
                 })?;
-            read_http_response_bounded(&mut plain, false)?
+            read_http_response_bounded_plain(&mut plain, deadline)?
         };
 
         let header_end = raw
@@ -906,13 +1493,39 @@ impl LocalHttpCaptureClient {
     }
 }
 
-fn read_http_response_bounded<R: Read>(
-    reader: &mut R,
-    tolerate_tls_eof: bool,
+fn read_http_response_bounded_plain(
+    stream: &mut TcpStream,
+    deadline: Instant,
 ) -> HwResult<Vec<u8>> {
+    read_http_response_with_deadline(stream, deadline, false, |s, rem| {
+        let _ = s.set_read_timeout(Some(rem));
+    })
+}
+
+fn read_http_response_bounded_tls(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    deadline: Instant,
+) -> HwResult<Vec<u8>> {
+    read_http_response_with_deadline(stream, deadline, true, |s, rem| {
+        let _ = s.get_ref().set_read_timeout(Some(rem));
+    })
+}
+
+fn read_http_response_with_deadline<R, F>(
+    reader: &mut R,
+    deadline: Instant,
+    tolerate_tls_eof: bool,
+    mut set_timeout: F,
+) -> HwResult<Vec<u8>>
+where
+    R: Read,
+    F: FnMut(&mut R, Duration),
+{
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
+        let rem = remaining_until_deadline(deadline)?;
+        set_timeout(reader, rem);
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -1027,6 +1640,7 @@ pub struct ButtonMonitor<B: ButtonInput, C: CaptureToggleClient> {
 
 impl<B: ButtonInput, C: CaptureToggleClient> ButtonMonitor<B, C> {
     pub fn new(input: B, client: C) -> Self {
+        input.enable_single_press_mode();
         Self { input, client }
     }
 
@@ -1073,6 +1687,7 @@ impl<B: ButtonInput, C: CaptureToggleClient> ButtonMonitor<B, C> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::fs::File;
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1091,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_deploy_button_json_and_validates_pin_allowlist_and_window() {
+    fn loads_deploy_button_json_and_validates_pin_allowlist_and_30s_timeout() {
         let deploy_cfg = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy/miro-ego/miro-ego-button.json");
         let cfg = ButtonConfig::load(&deploy_cfg).unwrap();
@@ -1101,6 +1716,15 @@ mod tests {
         assert_eq!(cfg.cooldown_ms, 1000);
         assert_eq!(cfg.poll_ms, 20);
         assert_eq!(cfg.status_led.as_deref(), Some("ACT"));
+
+        // 25s..30s request_timeout_ms (exceeding 20s ENCODER_FINISH_TIMEOUT) MUST be accepted!
+        let mut long_timeout = cfg.clone();
+        long_timeout.request_timeout_ms = 25_000;
+        long_timeout.validate().unwrap();
+        long_timeout.request_timeout_ms = 30_000;
+        long_timeout.validate().unwrap();
+        long_timeout.request_timeout_ms = 30_001;
+        assert!(long_timeout.validate().is_err());
 
         // Pin 1 is 3.3V power — must be rejected!
         let mut bad = cfg.clone();
@@ -1121,6 +1745,10 @@ mod tests {
     #[test]
     fn maps_all_28_rdk_x5_board_pins_and_exports_sysfs_gpio_direction_in() {
         assert_eq!(rdk_x5_board_pin_to_soc_gpio(37).unwrap(), 401);
+        assert_eq!(
+            rdk_x5_soc_gpio_to_bank_offset(401),
+            Some((&["lsio_gpio0", "32140000"][..], 22))
+        );
         assert!(rdk_x5_board_pin_to_soc_gpio(1).is_err());
         assert!(rdk_x5_board_pin_to_soc_gpio(6).is_err());
         assert!(rdk_x5_board_pin_to_soc_gpio(39).is_err());
@@ -1128,6 +1756,10 @@ mod tests {
         let mut seen_soc = HashSet::new();
         for &board_pin in RDK_X5_GPIO_PINS {
             let soc = rdk_x5_board_pin_to_soc_gpio(board_pin).unwrap();
+            assert!(
+                rdk_x5_soc_gpio_to_bank_offset(soc).is_some(),
+                "missing bank mapping for SoC GPIO {soc}"
+            );
             assert!(
                 seen_soc.insert(soc),
                 "duplicate SoC GPIO {soc} for pin {board_pin}"
@@ -1167,6 +1799,90 @@ mod tests {
         assert!(pin.read_level().unwrap());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chardev_gpio_supports_v2_and_falls_back_to_v1_cleanly() {
+        struct MockGpioIoctl {
+            allow_v2: bool,
+            level: AtomicBool,
+            v2_requests: AtomicUsize,
+            v1_requests: AtomicUsize,
+        }
+        impl GpioIoctlOps for MockGpioIoctl {
+            fn query_chip_info(&self, _chip_fd: RawFd) -> std::io::Result<(String, String, u32)> {
+                Ok(("gpiochip0".to_owned(), "32140000.gpio".to_owned(), 32))
+            }
+            fn request_line_v2(
+                &self,
+                _chip_fd: RawFd,
+                line_offset: u32,
+            ) -> std::io::Result<OwnedFd> {
+                self.v2_requests.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(line_offset, 22);
+                if !self.allow_v2 {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTTY));
+                }
+                let f = File::open("/dev/null")?;
+                Ok(OwnedFd::from(f))
+            }
+            fn request_line_v1(
+                &self,
+                _chip_fd: RawFd,
+                line_offset: u32,
+            ) -> std::io::Result<OwnedFd> {
+                self.v1_requests.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(line_offset, 22);
+                let f = File::open("/dev/null")?;
+                Ok(OwnedFd::from(f))
+            }
+            fn read_value_v2(&self, _line_fd: RawFd) -> std::io::Result<bool> {
+                Ok(self.level.load(Ordering::SeqCst))
+            }
+            fn read_value_v1(&self, _line_fd: RawFd) -> std::io::Result<bool> {
+                Ok(self.level.load(Ordering::SeqCst))
+            }
+        }
+
+        let dir = temp_dir("chardev");
+        let fake_chip = dir.join("gpiochip0");
+        fs::write(&fake_chip, b"").unwrap();
+
+        // 1. GPIO v2 character-device path
+        let v2_ops = Arc::new(MockGpioIoctl {
+            allow_v2: true,
+            level: AtomicBool::new(true),
+            v2_requests: AtomicUsize::new(0),
+            v1_requests: AtomicUsize::new(0),
+        });
+        let (resolved_chip, offset) =
+            discover_chardev_for_soc_gpio(&dir, &dir, 401, v2_ops.as_ref()).unwrap();
+        assert_eq!(resolved_chip, fake_chip);
+        assert_eq!(offset, 22);
+
+        let pin_v2 =
+            CharDevGpioPin::open_line_with_ops(&fake_chip, 0, offset, v2_ops.clone()).unwrap();
+        assert_eq!(pin_v2.abi, GpioAbiVersion::V2);
+        assert!(pin_v2.read_level().unwrap());
+        v2_ops.level.store(false, Ordering::SeqCst);
+        assert!(!pin_v2.read_level().unwrap());
+        assert_eq!(v2_ops.v1_requests.load(Ordering::SeqCst), 0);
+
+        // 2. GPIO v2 ENOTTY -> automatic fallback to GPIO v1 linehandle!
+        let v1_ops = Arc::new(MockGpioIoctl {
+            allow_v2: false,
+            level: AtomicBool::new(true),
+            v2_requests: AtomicUsize::new(0),
+            v1_requests: AtomicUsize::new(0),
+        });
+        let pin_v1 =
+            CharDevGpioPin::open_line_with_ops(&fake_chip, 0, offset, v1_ops.clone()).unwrap();
+        assert_eq!(pin_v1.abi, GpioAbiVersion::V1);
+        assert_eq!(v1_ops.v2_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(v1_ops.v1_requests.load(Ordering::SeqCst), 1);
+        assert!(pin_v1.read_level().unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1220,7 +1936,35 @@ mod tests {
     }
 
     #[test]
-    fn local_http_capture_client_toggles_idle_and_recording_cleanly() {
+    fn single_press_only_mode_emits_immediately_and_long_press_never_stamps_cooldown() {
+        let mut clf = ButtonClassifier::new(50, 1000, 400, 1000).with_single_press_only(true);
+
+        // Arm via initial release.
+        assert_eq!(clf.update(false, 0), None);
+        assert_eq!(clf.update(false, 60), None);
+
+        // Short tap emits ShortPress IMMEDIATELY on debounced release (0ms double-press wait!).
+        assert_eq!(clf.update(true, 100), None);
+        assert_eq!(clf.update(true, 160), None);
+        assert_eq!(clf.update(false, 200), None);
+        assert_eq!(clf.update(false, 260), Some(ButtonEvent::ShortPress));
+
+        // Long press after cooldown emits LongPress WITHOUT stamping cooldown_ms, so an
+        // immediate follow-up short tap at 2650ms (< 1000ms after LongPress) still fires!
+        assert_eq!(clf.update(true, 1400), None);
+        assert_eq!(clf.update(true, 1460), None);
+        assert_eq!(clf.update(true, 2500), Some(ButtonEvent::LongPress));
+        assert_eq!(clf.update(false, 2520), None);
+        assert_eq!(clf.update(false, 2580), None);
+
+        assert_eq!(clf.update(true, 2600), None);
+        assert_eq!(clf.update(true, 2660), None);
+        assert_eq!(clf.update(false, 2700), None);
+        assert_eq!(clf.update(false, 2760), Some(ButtonEvent::ShortPress));
+    }
+
+    #[test]
+    fn local_http_capture_client_toggles_idle_recording_and_enforces_total_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let step = Arc::new(AtomicUsize::new(0));
@@ -1268,9 +2012,10 @@ mod tests {
             }
         });
 
-        let client = LocalHttpCaptureClient::new(addr, Some("test-bearer-token".to_owned()), 9000)
-            .with_csrf_token("test-csrf-token");
-        assert_eq!(client.timeout, Duration::from_millis(9000));
+        let client =
+            LocalHttpCaptureClient::new(addr, Some("test-bearer-token".to_owned()), 25_000)
+                .with_csrf_token("test-csrf-token");
+        assert_eq!(client.timeout, Duration::from_millis(25_000));
         assert_eq!(
             client.toggle_capture().unwrap(),
             CaptureToggleAction::Started
@@ -1280,6 +2025,28 @@ mod tests {
             CaptureToggleAction::Stopped
         );
         srv.join().unwrap();
+
+        // Slowloris dribble server (1 byte every 40ms) MUST be cut off by total 150ms deadline!
+        let slow_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let slow_srv = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = slow_listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                for &b in b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" {
+                    if sock.write_all(&[b]).is_err() {
+                        break;
+                    }
+                    let _ = sock.flush();
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            }
+        });
+        let fast_deadline_client = LocalHttpCaptureClient::new(slow_addr, None, 150);
+        let t0 = Instant::now();
+        assert!(fast_deadline_client.toggle_capture().is_err());
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        slow_srv.join().unwrap();
     }
 
     #[test]

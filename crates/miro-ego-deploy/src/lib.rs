@@ -12,12 +12,14 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use bundle::{
-    BUNDLE_SCHEMA, BundleFileEntry, BundleManifest, DefaultOfflinePackageHook, LocalCasStore,
-    MAX_BINARY_BYTES, MAX_BUNDLE_FILES, MAX_MANIFEST_BYTES, MAX_TOTAL_BUNDLE_BYTES,
-    OfflinePackageDescriptor, OfflinePackageHook, REQUIRED_BINARIES, StoreLayer, TARGET_PLATFORM,
-    VerifiedBundle, copy_and_verify_safe, hash_file_safe, is_allowed_bundle_asset_path,
-    validate_aarch64_elf64_header, validate_bundle_relative_path, validate_commit_sha,
-    verify_bundle_dir,
+    BUNDLE_SCHEMA, BUNDLE_SIGNATURE_DOMAIN, BUNDLE_SIGNATURE_FILENAME, BundleFileEntry,
+    BundleManifest, DEFAULT_RELEASE_SIGNING_SEED_LABEL, DefaultOfflinePackageHook, LocalCasStore,
+    MAX_BINARY_BYTES, MAX_BUNDLE_FILES, MAX_MANIFEST_BYTES, MAX_SIGNATURE_FILE_BYTES,
+    MAX_TOTAL_BUNDLE_BYTES, OfflinePackageDescriptor, OfflinePackageHook, REQUIRED_BINARIES,
+    StoreLayer, TARGET_PLATFORM, VerifiedBundle, copy_and_verify_safe, default_release_public_key,
+    default_release_signing_seed, hash_file_safe, is_allowed_bundle_asset_path,
+    sign_bundle_manifest_with_seed, validate_aarch64_elf64_header, validate_bundle_relative_path,
+    validate_commit_sha, verify_bundle_dir, verify_bundle_dir_with_key,
 };
 pub use manager::{
     ACTIVATION_FAILURE_SCHEMA, ActivationFailureRecord, AssetSpec, BoundedSystemctlRunner,
@@ -27,10 +29,12 @@ pub use manager::{
     ReleaseManagerPaths, SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
 };
 pub use rpc::{
-    DEFAULT_DEPLOY_CLIENT_TIMEOUT, DEFAULT_DEPLOY_SOCKET_PATH, DEPLOY_REQUEST_SCHEMA,
-    DEPLOY_RESPONSE_SCHEMA, DeployControlStatus, DeployRpcClient, DeployRpcErrorBody,
-    DeployRpcRequest, DeployRpcResponse, DeployRpcServer, DeployRpcServerConfig,
-    FirmwareTaskAction, FirmwareTaskSnapshot, FirmwareTaskStatus, MAX_DEPLOY_RPC_LINE_BYTES,
+    DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_CLIENT_TIMEOUT, DEFAULT_DEPLOY_IDLE_TIMEOUT,
+    DEFAULT_DEPLOY_SOCKET_PATH, DEPLOY_REQUEST_SCHEMA, DEPLOY_RESPONSE_SCHEMA, DeployControlStatus,
+    DeployMutationOutcome, DeployRpcClient, DeployRpcConfig, DeployRpcErrorBody, DeployRpcRequest,
+    DeployRpcResponse, DeployRpcServer, DeployRpcServerConfig, FIRMWARE_TASK_STATE_SCHEMA,
+    FirmwareTaskAction, FirmwareTaskSnapshot, FirmwareTaskStatus, MAX_DEPLOY_IDEMPOTENCY_ENTRIES,
+    MAX_DEPLOY_RPC_LINE_BYTES,
 };
 
 pub const FIRMWARE_STATUS_SCHEMA: &str = "miro-ego.firmware-status.v1";

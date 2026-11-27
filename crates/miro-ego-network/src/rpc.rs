@@ -1,8 +1,10 @@
 //! Framed NDJSON Unix-domain-socket RPC server & client (`/run/miro-ego/network-control.sock`).
 //!
-//! Enforces strict bounded line sizes (`MAX_RPC_LINE_BYTES`), read/write timeouts,
-//! concurrent read / serialized mutation dispatch, secret-field redaction, and graceful shutdown.
+//! Enforces strict bounded line sizes (`MAX_RPC_LINE_BYTES`), deadline-aware buffered read/write
+//! timeouts, concurrent read / serialized mutation dispatch, privileged `clock.status` /
+//! `clock.sync` & `notify_response_flushed` methods, secret-field redaction, and graceful shutdown.
 
+use crate::clock::ClockStatusSnapshot;
 use crate::controller::{
     ApplyDesiredState, AuthoritativeNetworkController, ControllerStatus, CredentialReceipt,
     MutationOutcome, ScanResponse, WatchdogMode,
@@ -10,13 +12,15 @@ use crate::controller::{
 use crate::{NetworkError, NetworkResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ffi::CString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -28,6 +32,8 @@ pub const DEFAULT_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(45);
 pub const DEFAULT_MAX_CONCURRENT_CONNS: usize = 8;
+
+static NET_UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 const MUTATION_INLINE_SECRET_KEYS: &[&str] = &["password", "passphrase", "psk", "secret", "token"];
 const RESPONSE_FORBIDDEN_SECRET_KEYS: &[&str] = &[
@@ -134,6 +140,16 @@ impl Default for RpcServerConfig {
     }
 }
 
+struct ActiveRpcConnDropGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveRpcConnDropGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Bounded framed-JSON Unix domain socket server exposing [`AuthoritativeNetworkController`].
 pub struct NetworkRpcServer {
     socket_path: Option<PathBuf>,
@@ -143,7 +159,8 @@ pub struct NetworkRpcServer {
 }
 
 impl NetworkRpcServer {
-    /// Bind a new Unix domain socket at `socket_path` (mode `0600`) and start serving requests.
+    /// Bind a new Unix domain socket at `socket_path` (mode `0600`) under a restrictive `umask`
+    /// (`0o077`) with `AT_SYMLINK_NOFOLLOW` protection and start serving requests.
     pub fn bind(
         socket_path: impl Into<PathBuf>,
         controller: Arc<AuthoritativeNetworkController>,
@@ -155,20 +172,75 @@ impl NetworkRpcServer {
                 fs::create_dir_all(parent).map_err(|err| NetworkError::Backend {
                     message: format!("failed to create socket dir {}: {err}", parent.display()),
                 })?;
+                if let Ok(pmeta) = fs::symlink_metadata(parent) {
+                    if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+                        return Err(NetworkError::Backend {
+                            message: format!(
+                                "socket parent {} must be a real directory, not a symlink",
+                                parent.display()
+                            ),
+                        });
+                    }
+                }
             }
         }
-        if fs::symlink_metadata(&path).is_ok() {
+        if let Ok(existing) = fs::symlink_metadata(&path) {
+            if existing.file_type().is_dir() {
+                return Err(NetworkError::Backend {
+                    message: format!(
+                        "refusing to unlink directory at socket path {}",
+                        path.display()
+                    ),
+                });
+            }
             let _ = fs::remove_file(&path);
         }
-        let listener = UnixListener::bind(&path).map_err(|err| NetworkError::Backend {
-            message: format!("failed to bind Unix socket {}: {err}", path.display()),
-        })?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            NetworkError::Backend {
-                message: format!("failed to chmod Unix socket {}: {err}", path.display()),
+
+        let listener = {
+            let _umask_guard = NET_UMASK_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let prev_mask = unsafe { libc::umask(0o077) };
+            let bind_res = UnixListener::bind(&path);
+            unsafe {
+                libc::umask(prev_mask);
             }
-        })?;
-        Self::from_listener(listener, Some(path), controller, config)
+            bind_res.map_err(|err| NetworkError::Backend {
+                message: format!("failed to bind Unix socket {}: {err}", path.display()),
+            })?
+        };
+
+        let setup_res = (|| -> NetworkResult<()> {
+            let meta = fs::symlink_metadata(&path).map_err(|err| NetworkError::Backend {
+                message: format!("failed to stat Unix socket {}: {err}", path.display()),
+            })?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+                return Err(NetworkError::Backend {
+                    message: format!("bound path {} is not a Unix socket", path.display()),
+                });
+            }
+            best_effort_chown_miro_ego_nofollow(&path);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+                NetworkError::Backend {
+                    message: format!("failed to chmod Unix socket {}: {err}", path.display()),
+                }
+            })?;
+            Ok(())
+        })();
+
+        if let Err(err) = setup_res {
+            drop(listener);
+            let _ = fs::remove_file(&path);
+            return Err(err);
+        }
+
+        match Self::from_listener(listener, Some(path.clone()), controller, config) {
+            Ok(srv) => Ok(srv),
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                Err(err)
+            }
+        }
     }
 
     /// Start serving on an already-bound (or systemd socket-activated) `UnixListener`.
@@ -215,20 +287,20 @@ impl NetworkRpcServer {
                                 continue;
                             }
                             workers_loop.fetch_add(1, Ordering::AcqRel);
+                            let conn_guard = ActiveRpcConnDropGuard {
+                                counter: Arc::clone(&workers_loop),
+                            };
                             let ctrl = Arc::clone(&controller);
                             let mlock = Arc::clone(&mutation_lock);
                             let cfg = config.clone();
-                            let counter = Arc::clone(&workers_loop);
                             if let Ok(handle) = thread::Builder::new()
                                 .name("miro-ego-net-conn".to_owned())
                                 .spawn(move || {
+                                    let _guard = conn_guard;
                                     handle_connection(stream, &ctrl, &mlock, &cfg);
-                                    counter.fetch_sub(1, Ordering::AcqRel);
                                 })
                             {
                                 handles.push(handle);
-                            } else {
-                                workers_loop.fetch_sub(1, Ordering::AcqRel);
                             }
                         }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -284,6 +356,31 @@ impl Drop for NetworkRpcServer {
     }
 }
 
+fn best_effort_chown_miro_ego_nofollow(path: &Path) {
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let Ok(name_c) = CString::new("miro-ego") else {
+        return;
+    };
+    let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    unsafe {
+        let pwd = libc::getpwnam(name_c.as_ptr());
+        let grp = libc::getgrnam(name_c.as_ptr());
+        if !pwd.is_null() && !grp.is_null() {
+            let _ = libc::fchownat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                (*pwd).pw_uid,
+                (*grp).gr_gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
+        }
+    }
+}
+
 fn handle_connection(
     mut stream: UnixStream,
     controller: &AuthoritativeNetworkController,
@@ -316,14 +413,6 @@ fn handle_connection(
 
     let sealed = seal_rpc_response(response);
     let _ = write_framed_response(stream, &sealed, config.max_line_bytes, config.write_timeout);
-    if sealed.ok
-        && matches!(
-            sealed.operation.as_deref(),
-            Some("apply" | "retry" | "forget")
-        )
-    {
-        controller.notify_rpc_response_flushed();
-    }
 }
 
 /// Dispatch one parsed JSON line against the controller.
@@ -391,18 +480,11 @@ pub fn dispatch_raw_payload(
 
     if matches!(
         operation.as_str(),
-        "health" | "status" | "watchdog_mode" | "scan"
+        "health" | "status" | "watchdog_mode" | "scan" | "clock.status" | "notify_response_flushed"
     ) {
         execute_operation(&request, controller)
     } else {
-        let Ok(_guard) = mutation_lock.lock() else {
-            return RpcResponse::error(
-                "controller_failure",
-                "mutation lock poisoned",
-                Some(operation.as_str()),
-                true,
-            );
-        };
+        let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
         execute_operation(&request, controller)
     }
 }
@@ -434,6 +516,35 @@ fn execute_operation(
             Ok(scan) => serialize_ok("scan", 200, &scan, None),
             Err(err) => error_from_network_error(op, &err),
         },
+        "notify_response_flushed" => {
+            controller.notify_rpc_response_flushed();
+            RpcResponse::ok("notify_response_flushed", 200, json!({ "ok": true }))
+        }
+        "clock.status" => match controller.clock_status() {
+            Ok(snap) => serialize_ok("clock.status", 200, &snap, None),
+            Err(err) => error_from_network_error(op, &err),
+        },
+        "clock.sync" => {
+            let Some(body) = &request.body else {
+                return RpcResponse::error("request_invalid", "missing body", Some(op), false);
+            };
+            let Some(unix_time_ms) = body.get("unix_time_ms").and_then(Value::as_u64) else {
+                return RpcResponse::error(
+                    "request_invalid",
+                    "clock.sync requires unix_time_ms",
+                    Some(op),
+                    false,
+                );
+            };
+            let replace = body
+                .get("replace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match controller.clock_sync(unix_time_ms, replace) {
+                Ok(snap) => serialize_ok("clock.sync", 200, &snap, None),
+                Err(err) => error_from_network_error(op, &err),
+            }
+        }
         "create_credential" => {
             let Some(body) = &request.body else {
                 return RpcResponse::error("request_invalid", "missing body", Some(op), false);
@@ -627,34 +738,45 @@ enum FrameReadError {
     Invalid(String),
 }
 
-fn read_ndjson_line<R: Read>(
-    reader: &mut R,
+fn read_ndjson_line(
+    stream: &mut UnixStream,
     max_bytes: usize,
     timeout: Duration,
 ) -> Result<Option<Vec<u8>>, FrameReadError> {
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(max_bytes.min(4096));
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; 4096];
 
     loop {
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(FrameReadError::Timeout);
+        };
+        if remaining.is_zero() {
             return Err(FrameReadError::Timeout);
         }
-        match reader.read(&mut byte) {
+        let _ = stream.set_read_timeout(Some(remaining));
+
+        match stream.read(&mut chunk) {
             Ok(0) => {
                 if buf.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(buf));
             }
-            Ok(_) => {
-                if byte[0] == b'\n' {
+            Ok(n) => {
+                let slice = &chunk[..n];
+                if let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
+                    if buf.len().saturating_add(nl_pos) > max_bytes {
+                        return Err(FrameReadError::TooLarge);
+                    }
+                    buf.extend_from_slice(&slice[..nl_pos]);
                     return Ok(Some(buf));
                 }
-                if buf.len() >= max_bytes {
+                if buf.len().saturating_add(n) > max_bytes {
                     return Err(FrameReadError::TooLarge);
                 }
-                buf.push(byte[0]);
+                buf.extend_from_slice(slice);
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
@@ -846,6 +968,51 @@ impl NetworkRpcClient {
         decode_body(resp)
     }
 
+    /// Notify the privileged network controller that the HTTP `202 Accepted` response has been
+    /// flushed to the client so background interface transitions can proceed immediately.
+    pub fn notify_response_flushed(&self) -> NetworkResult<()> {
+        let resp = self.send(&RpcRequest {
+            schema: CONTROL_REQUEST_SCHEMA.to_owned(),
+            operation: "notify_response_flushed".to_owned(),
+            principal_id: None,
+            idempotency_key: None,
+            body: None,
+        })?;
+        let _ = extract_body(resp)?;
+        Ok(())
+    }
+
+    /// Query privileged OS clock status (`adjtimex`, `boot_id`, `<run_dir>/clock-state.json`).
+    pub fn clock_status(&self) -> NetworkResult<ClockStatusSnapshot> {
+        let resp = self.send(&RpcRequest {
+            schema: CONTROL_REQUEST_SCHEMA.to_owned(),
+            operation: "clock.status".to_owned(),
+            principal_id: None,
+            idempotency_key: None,
+            body: None,
+        })?;
+        decode_body(resp)
+    }
+
+    /// Synchronize OS wall clock via privileged `clock_settime(CLOCK_REALTIME)`.
+    pub fn clock_sync(
+        &self,
+        unix_time_ms: u64,
+        replace: bool,
+    ) -> NetworkResult<ClockStatusSnapshot> {
+        let resp = self.send(&RpcRequest {
+            schema: CONTROL_REQUEST_SCHEMA.to_owned(),
+            operation: "clock.sync".to_owned(),
+            principal_id: None,
+            idempotency_key: None,
+            body: Some(json!({
+                "unix_time_ms": unix_time_ms,
+                "replace": replace,
+            })),
+        })?;
+        decode_body(resp)
+    }
+
     /// Query `watchdog-mode` for `miro-ego-wifi-watchdog`.
     pub fn watchdog_mode(&self) -> NetworkResult<WatchdogMode> {
         let resp = self.send(&RpcRequest {
@@ -990,11 +1157,13 @@ fn decode_body<T: serde::de::DeserializeOwned>(resp: RpcResponse) -> NetworkResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::MockSystemClockBackend;
     use crate::controller::{ApplyWifiClient, ControllerConfig};
     use crate::nmcli::{
         CommandOutput, CommandRunner, DEFAULT_HOTSPOT_IPV4_CIDR, NmcliBackend, WifiSecurity,
     };
     use crate::state::{DesiredMode, NetworkStateStore, TransactionStatus};
+    use miro_ego_core::ids::new_uuid_v4;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1114,25 +1283,35 @@ mod tests {
     }
 
     #[test]
-    fn live_unix_socket_rpc_roundtrip_scan_apply_watchdog_and_shutdown() {
+    fn live_unix_socket_rpc_roundtrip_scan_apply_clock_flush_watchdog_and_shutdown() {
         let dir = temp_dir("live");
         let sock = dir.join("network-control.sock");
         let runner = Arc::new(DynamicMockRunner {
             active: Mutex::new(None),
         });
+        let mock_clock = Arc::new(MockSystemClockBackend::new(
+            new_uuid_v4(),
+            10_000,
+            5_000_000_000,
+        ));
         let backend = NmcliBackend::new(runner, dir.join("profiles"), "wlan0", "eth0");
         let state = NetworkStateStore::open_or_init(dir.join("network-state.json")).unwrap();
         let ctrl = Arc::new(
             AuthoritativeNetworkController::new(
                 backend,
                 state,
-                ControllerConfig::new("rdk-x5-rpc-1", dir.join("run")),
+                ControllerConfig::new("rdk-x5-rpc-1", dir.join("run"))
+                    .with_clock_backend(mock_clock.clone()),
             )
             .unwrap(),
         );
 
         let server =
             NetworkRpcServer::bind(&sock, Arc::clone(&ctrl), RpcServerConfig::default()).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&sock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let client = NetworkRpcClient::new(&sock);
         assert_eq!(DEFAULT_CLIENT_TIMEOUT, Duration::from_secs(45));
 
@@ -1140,6 +1319,23 @@ mod tests {
         assert_eq!(health["mutation_enabled"], true);
         assert_eq!(health["operations"], json!(["apply", "retry", "forget"]));
         assert_eq!(client.watchdog_mode().unwrap(), WatchdogMode::Hotspot);
+
+        // Clock status & sync RPC roundtrip!
+        let c0 = client.clock_status().unwrap();
+        assert_eq!(c0.source, "unsynchronized");
+        assert!(!c0.applied);
+        assert_eq!(c0.age_seconds, None);
+
+        let c_sync = client.clock_sync(1_760_111_222_333, false).unwrap();
+        assert_eq!(c_sync.source, "client");
+        assert!(c_sync.applied);
+        assert_eq!(c_sync.synchronized_at_ms, Some(1_760_111_222_333));
+        assert_eq!(c_sync.age_seconds, Some(0));
+
+        mock_clock.advance_seconds(19);
+        let c_repeat = client.clock_sync(1_760_999_000_000, false).unwrap();
+        assert!(!c_repeat.applied);
+        assert_eq!(c_repeat.age_seconds, Some(19));
 
         let scan = client.scan().unwrap();
         assert_eq!(scan.networks.len(), 1);
@@ -1183,8 +1379,10 @@ mod tests {
                 },
             )
             .unwrap();
-        // Async RPC returns 202 Accepted immediately before tearing down AP!
+        // Async RPC returns 202 Accepted WITHOUT prematurely firing notify_response_flushed
+        // before the HTTP gateway flushes its response; explicit notify_response_flushed wakes it!
         assert_eq!(applied.final_status, TransactionStatus::Accepted);
+        client.notify_response_flushed().unwrap();
         let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Committed);
         assert_eq!(client.watchdog_mode().unwrap(), WatchdogMode::WifiClient);

@@ -20,6 +20,17 @@ pub struct ThermalZoneReading {
     pub temperature_celsius: f64,
 }
 
+fn thermal_zone_sort_key(name: &str) -> (u8, u64, &str) {
+    if let Some(suffix) = name.strip_prefix("thermal_zone") {
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(num) = suffix.parse::<u64>() {
+                return (0, num, name);
+            }
+        }
+    }
+    (1, u64::MAX, name)
+}
+
 /// Read all valid nonblocking thermal zones under `thermal_root` (`thermal_zone*/temp`).
 ///
 /// Linux `thermal_zone*/temp` always reports millidegrees Celsius. Readings outside
@@ -39,7 +50,7 @@ pub fn read_thermal_zones_in(thermal_root: &Path) -> Vec<ThermalZoneReading> {
             }
         })
         .collect();
-    zones.sort_by(|a, b| a.0.cmp(&b.0));
+    zones.sort_by(|a, b| thermal_zone_sort_key(&a.0).cmp(&thermal_zone_sort_key(&b.0)));
 
     let mut readings = Vec::new();
     for (zone, temp_path) in zones {
@@ -142,7 +153,8 @@ mod tests {
             ("thermal_zone1", "58500\n"),
             ("thermal_zone2", "250000\n"), // out of range (> 125C)
             ("thermal_zone3", "not-a-number\n"),
-            ("thermal_zone4", "-500\n"), // -0.5C valid!
+            ("thermal_zone4", "-500\n"),   // -0.5C valid!
+            ("thermal_zone10", "49000\n"), // must sort numerically AFTER thermal_zone4!
         ] {
             let zdir = dir.join(zone);
             fs::create_dir_all(&zdir).unwrap();
@@ -150,7 +162,16 @@ mod tests {
         }
 
         let zones = read_thermal_zones_in(&dir);
-        assert_eq!(zones.len(), 3);
+        let zone_names: Vec<&str> = zones.iter().map(|z| z.zone.as_str()).collect();
+        assert_eq!(
+            zone_names,
+            vec![
+                "thermal_zone0",
+                "thermal_zone1",
+                "thermal_zone4",
+                "thermal_zone10"
+            ]
+        );
         assert_eq!(read_soc_temperature_c_in(&dir), Some(58.5));
 
         let model_path = dir.join("model");

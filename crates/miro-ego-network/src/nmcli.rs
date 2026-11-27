@@ -571,6 +571,16 @@ pub fn render_nmconnection(
     wifi_iface: &str,
     eth_iface: &str,
 ) -> NetworkResult<String> {
+    render_nmconnection_with_autoconnect(profile_name, spec, wifi_iface, eth_iface, None)
+}
+
+fn render_nmconnection_with_autoconnect(
+    profile_name: &str,
+    spec: &ProfileSpec,
+    wifi_iface: &str,
+    eth_iface: &str,
+    autoconnect_override: Option<bool>,
+) -> NetworkResult<String> {
     spec.validate()?;
     let iface = spec.interface_name(wifi_iface, eth_iface);
     let conn_type = if iface == wifi_iface {
@@ -578,10 +588,15 @@ pub fn render_nmconnection(
     } else {
         "ethernet"
     };
-    let (autoconnect, priority) = match spec {
-        ProfileSpec::Hotspot { .. } => ("false", 100),
-        ProfileSpec::WifiClient { .. } => ("false", 800),
-        ProfileSpec::EthernetDhcp | ProfileSpec::EthernetStatic(_) => ("true", 900),
+    let (default_autoconnect, priority) = match spec {
+        ProfileSpec::Hotspot { .. } => (false, 100),
+        ProfileSpec::WifiClient { .. } => (false, 800),
+        ProfileSpec::EthernetDhcp | ProfileSpec::EthernetStatic(_) => (true, 900),
+    };
+    let autoconnect = if autoconnect_override.unwrap_or(default_autoconnect) {
+        "true"
+    } else {
+        "false"
     };
     let uuid = deterministic_profile_uuid(profile_name);
 
@@ -1246,11 +1261,46 @@ impl NmcliBackend {
 
     /// Write a `.nmconnection` profile atomically (`0600`) and reload NetworkManager.
     pub fn write_profile(&self, profile_name: &str, spec: &ProfileSpec) -> NetworkResult<PathBuf> {
-        let rendered = render_nmconnection(
+        self.write_profile_inner(profile_name, spec, None)
+    }
+
+    /// Stage a candidate `.nmconnection` profile with `autoconnect=false` until its activation
+    /// and routing are verified.
+    pub fn write_profile_staged(
+        &self,
+        profile_name: &str,
+        spec: &ProfileSpec,
+    ) -> NetworkResult<PathBuf> {
+        self.write_profile_inner(profile_name, spec, Some(false))
+    }
+
+    /// Promote a verified Ethernet profile to `autoconnect=true` and reload NetworkManager.
+    pub fn promote_profile_autoconnect(
+        &self,
+        profile_name: &str,
+        spec: &ProfileSpec,
+    ) -> NetworkResult<()> {
+        if matches!(
+            spec,
+            ProfileSpec::EthernetDhcp | ProfileSpec::EthernetStatic(_)
+        ) {
+            let _ = self.write_profile_inner(profile_name, spec, Some(true))?;
+        }
+        Ok(())
+    }
+
+    fn write_profile_inner(
+        &self,
+        profile_name: &str,
+        spec: &ProfileSpec,
+        autoconnect_override: Option<bool>,
+    ) -> NetworkResult<PathBuf> {
+        let rendered = render_nmconnection_with_autoconnect(
             profile_name,
             spec,
             &self.wifi_interface,
             &self.ethernet_interface,
+            autoconnect_override,
         )?;
         fs::create_dir_all(&self.profile_dir).map_err(|err| NetworkError::Backend {
             message: format!(

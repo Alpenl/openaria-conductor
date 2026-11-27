@@ -117,11 +117,12 @@ impl AvahiServiceRecord {
             });
         }
         if self.instance_name.is_empty()
-            || self.instance_name.len() > 128
-            || self.instance_name.bytes().any(|b| b < 0x20)
+            || self.instance_name.len() > 63
+            || self.instance_name.bytes().any(|b| b < 0x20 || b == 0x7f)
         {
             return Err(NetworkError::Invalid {
-                message: "mDNS instance_name is invalid".to_owned(),
+                message: "mDNS instance_name must be 1..=63 UTF-8 bytes without control characters"
+                    .to_owned(),
             });
         }
         if !is_valid_service_type(&self.service_type) {
@@ -129,17 +130,22 @@ impl AvahiServiceRecord {
                 message: format!("invalid mDNS service_type: {}", self.service_type),
             });
         }
-        if !self.api_path.starts_with('/') || self.api_path.bytes().any(|b| b < 0x20) {
+        if !self.api_path.starts_with('/')
+            || self.api_path.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || 4usize.saturating_add(self.api_path.len()) > 255
+        {
             return Err(NetworkError::Invalid {
-                message: "mDNS api_path must start with '/' and contain no control characters"
-                    .to_owned(),
+                message:
+                    "mDNS api_path must start with '/', fit in a 255-byte TXT record, and contain no control characters"
+                        .to_owned(),
             });
         }
         for (k, v) in &self.extra_txt_records {
             if k.is_empty()
                 || k.contains('=')
-                || k.bytes().any(|b| b < 0x20)
-                || v.bytes().any(|b| b < 0x20)
+                || k.bytes().any(|b| b < 0x20 || b == 0x7f)
+                || v.bytes().any(|b| b < 0x20 || b == 0x7f)
+                || k.len().saturating_add(1).saturating_add(v.len()) > 255
             {
                 return Err(NetworkError::Invalid {
                     message: format!("invalid mDNS TXT record key/value: {k}"),
@@ -300,6 +306,18 @@ mod tests {
         let bad_txt = AvahiServiceRecord::for_host("rdk-x5", 8080, MdnsScheme::Http)
             .with_txt_record("a=b", "val");
         assert!(bad_txt.render_xml().is_err());
+
+        // Reject >63 UTF-8 bytes instance_name, >255 byte TXT entry, and 0x7f DEL.
+        let mut long_name = AvahiServiceRecord::for_host("rdk-x5", 8080, MdnsScheme::Http);
+        long_name.instance_name = "x".repeat(64);
+        assert!(long_name.render_xml().is_err());
+
+        let del_name = AvahiServiceRecord::for_host("rdk\x7fx5", 8080, MdnsScheme::Http);
+        assert!(del_name.render_xml().is_err());
+
+        let huge_txt = AvahiServiceRecord::for_host("rdk-x5", 8080, MdnsScheme::Http)
+            .with_txt_record("note", "v".repeat(252));
+        assert!(huge_txt.render_xml().is_err());
     }
 
     #[test]

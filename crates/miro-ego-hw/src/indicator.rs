@@ -1,14 +1,20 @@
 //! Linux sysfs LED `IndicatorController` (`/sys/class/leds/<led>/trigger` & `brightness`).
 //!
 //! Resets its cached indicator state BEFORE issuing any sysfs write so a partial write
-//! error can never leave the LED wedged in a stale blinking state.
+//! error can never leave the LED wedged in a stale blinking state, and retries transient
+//! `PermissionDenied` / `NotFound` errors on `delay_on` / `delay_off` while `udevd` applies
+//! `0660` permissions after switching `trigger` to `"timer"`.
 
 use crate::{HwError, HwResult, IndicatorController, IndicatorState};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const DEFAULT_LEDS_SYSFS_ROOT: &str = "/sys/class/leds";
+pub const DEFAULT_UDEV_DELAY_RETRY_ATTEMPTS: u32 = 15;
+pub const DEFAULT_UDEV_DELAY_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Low-level LED attribute I/O abstraction (real sysfs default + deterministic fault injection).
 pub trait LedIo: Send + Sync {
@@ -51,7 +57,7 @@ impl LedIo for SysfsLedIo {
     fn read_attr(&self, attr: &str) -> HwResult<String> {
         let path = self.led_dir.join(attr);
         fs::read_to_string(&path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if err.kind() == ErrorKind::NotFound {
                 HwError::Unavailable {
                     message: format!("LED sysfs attribute missing: {}", path.display()),
                 }
@@ -65,8 +71,19 @@ impl LedIo for SysfsLedIo {
 
     fn write_attr(&self, attr: &str, value: &str) -> HwResult<()> {
         let path = self.led_dir.join(attr);
-        fs::write(&path, format!("{value}\n")).map_err(|err| HwError::Io {
-            message: format!("failed to write LED attribute {}: {err}", path.display()),
+        fs::write(&path, format!("{value}\n")).map_err(|err| match err.kind() {
+            ErrorKind::NotFound => HwError::Unavailable {
+                message: format!("LED sysfs attribute missing: {}", path.display()),
+            },
+            ErrorKind::PermissionDenied => HwError::Io {
+                message: format!(
+                    "permission denied writing LED attribute {}: {err}",
+                    path.display()
+                ),
+            },
+            _ => HwError::Io {
+                message: format!("failed to write LED attribute {}: {err}", path.display()),
+            },
         })
     }
 }
@@ -117,6 +134,8 @@ struct LedInner {
 pub struct SysfsLedController {
     io: Arc<dyn LedIo>,
     inner: Mutex<LedInner>,
+    udev_retry_attempts: u32,
+    udev_retry_backoff: Duration,
 }
 
 impl SysfsLedController {
@@ -188,7 +207,33 @@ impl SysfsLedController {
                 current_state: None,
                 owned: false,
             }),
+            udev_retry_attempts: DEFAULT_UDEV_DELAY_RETRY_ATTEMPTS,
+            udev_retry_backoff: DEFAULT_UDEV_DELAY_RETRY_BACKOFF,
         })
+    }
+
+    /// Customize retry attempts and backoff when waiting for `udevd` to `chmod 0660` newly
+    /// created `delay_on` / `delay_off` attributes after writing `"timer"` to `trigger`.
+    pub fn with_udev_retry(mut self, attempts: u32, backoff: Duration) -> Self {
+        self.udev_retry_attempts = attempts;
+        self.udev_retry_backoff = backoff;
+        self
+    }
+
+    fn write_timer_delay_with_retry(&self, attr: &str, value: &str) -> HwResult<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.io.write_attr(attr, value) {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if attempt < self.udev_retry_attempts && is_retryable_udev_delay_err(&err) =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(self.udev_retry_backoff);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Return the currently committed cached state (`None` if unset or after a partial write error).
@@ -213,11 +258,22 @@ impl SysfsLedController {
             .write_attr("brightness", &guard.previous_brightness.to_string())?;
         self.io.write_attr("trigger", &guard.previous_trigger)?;
         if let Some((on, off)) = &guard.previous_timer_delays {
-            self.io.write_attr("delay_on", on)?;
-            self.io.write_attr("delay_off", off)?;
+            self.write_timer_delay_with_retry("delay_on", on)?;
+            self.write_timer_delay_with_retry("delay_off", off)?;
         }
         guard.owned = false;
         Ok(())
+    }
+}
+
+fn is_retryable_udev_delay_err(err: &HwError) -> bool {
+    match err {
+        HwError::Unavailable { .. } => true,
+        HwError::Io { message } => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("permission denied") || lower.contains("eacces")
+        }
+        HwError::Core(_) => false,
     }
 }
 
@@ -261,9 +317,8 @@ impl IndicatorController for SysfsLedController {
                 self.io
                     .write_attr("brightness", &guard.max_brightness.to_string())?;
                 self.io.write_attr("trigger", "timer")?;
-                self.io.write_attr("delay_on", &actual_on_ms.to_string())?;
-                self.io
-                    .write_attr("delay_off", &actual_off_ms.to_string())?;
+                self.write_timer_delay_with_retry("delay_on", &actual_on_ms.to_string())?;
+                self.write_timer_delay_with_retry("delay_off", &actual_off_ms.to_string())?;
             }
         }
 
@@ -276,7 +331,7 @@ impl IndicatorController for SysfsLedController {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FaultyLedIo {
@@ -359,6 +414,75 @@ mod tests {
         led.set_state(IndicatorState::Recording).unwrap();
         assert_eq!(io.read_attr("trigger").unwrap().trim(), "none");
         assert_eq!(io.read_attr("brightness").unwrap().trim(), "255");
+    }
+
+    #[test]
+    fn retries_transient_udev_permission_denied_and_not_found_on_timer_delays() {
+        struct UdevRaceLedIo {
+            delay_on_attempts: AtomicUsize,
+            delay_off_attempts: AtomicUsize,
+            attrs: Mutex<HashMap<String, String>>,
+        }
+        impl LedIo for UdevRaceLedIo {
+            fn read_attr(&self, attr: &str) -> HwResult<String> {
+                self.attrs
+                    .lock()
+                    .unwrap()
+                    .get(attr)
+                    .cloned()
+                    .ok_or_else(|| HwError::Unavailable {
+                        message: format!("missing {attr}"),
+                    })
+            }
+            fn write_attr(&self, attr: &str, value: &str) -> HwResult<()> {
+                if attr == "delay_on" {
+                    let n = self.delay_on_attempts.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        return Err(HwError::Unavailable {
+                            message: "LED sysfs attribute missing: delay_on".to_owned(),
+                        });
+                    }
+                    if n < 3 {
+                        return Err(HwError::Io {
+                            message: "permission denied writing LED attribute delay_on".to_owned(),
+                        });
+                    }
+                }
+                if attr == "delay_off" {
+                    let n = self.delay_off_attempts.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        return Err(HwError::Io {
+                            message: "permission denied writing LED attribute delay_off".to_owned(),
+                        });
+                    }
+                }
+                self.attrs
+                    .lock()
+                    .unwrap()
+                    .insert(attr.to_owned(), format!("{value}\n"));
+                Ok(())
+            }
+        }
+
+        let mut init = HashMap::new();
+        init.insert("max_brightness".to_owned(), "1\n".to_owned());
+        init.insert("brightness".to_owned(), "0\n".to_owned());
+        init.insert("trigger".to_owned(), "[none] timer\n".to_owned());
+        let io = Arc::new(UdevRaceLedIo {
+            delay_on_attempts: AtomicUsize::new(0),
+            delay_off_attempts: AtomicUsize::new(0),
+            attrs: Mutex::new(init),
+        });
+        let led = SysfsLedController::with_io(io.clone(), false)
+            .unwrap()
+            .with_udev_retry(10, Duration::from_millis(1));
+
+        led.set_state(IndicatorState::Ready).unwrap();
+        assert_eq!(led.cached_state().unwrap(), Some(IndicatorState::Ready));
+        assert_eq!(io.delay_on_attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(io.delay_off_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(io.read_attr("delay_on").unwrap().trim(), "150");
+        assert_eq!(io.read_attr("delay_off").unwrap().trim(), "1850");
     }
 
     #[test]
