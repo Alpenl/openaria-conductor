@@ -198,6 +198,16 @@ static void test_pipeline_failure_modes(void)
     char dir[] = "/tmp/miro_ego_fail_XXXXXX";
     assert(mkdtemp(dir) != NULL);
 
+    /* NULL pipeline guards fail closed without crashing */
+    miro_ego_pipeline_stats_t null_st;
+    memset(&null_st, 0xff, sizeof(null_st));
+    miro_ego_pipeline_stats(NULL, &null_st);
+    assert(null_st.offered == 0 && null_st.submitted == 0);
+    miro_ego_pipeline_stats(NULL, NULL);
+    assert(miro_ego_pipeline_submit(NULL, (const unsigned char *)"x", 1, 10) == -1);
+    assert(miro_ego_pipeline_failed(NULL) == 1);
+    assert(strcmp(miro_ego_pipeline_error(NULL), "") == 0);
+
     /* Invalid configuration fails cleanly */
     miro_ego_pipeline_config_t bad_cfg = {
         .sbs_width = 3, /* not divisible by 4 */

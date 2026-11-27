@@ -5,7 +5,8 @@ use crate::session::recording::{
     SegmentPlannerSnapshot,
 };
 use crate::session::stereo_encoder::{
-    EncoderConfig, EncoderProcess, EncoderProcessError, EncoderTransport, SegmentEvent,
+    EncoderAbortHandle, EncoderConfig, EncoderProcess, EncoderProcessError, EncoderTransport,
+    SegmentEvent,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -121,6 +122,7 @@ pub struct SessionTransaction {
     pub active_take: Arc<Mutex<ActiveTakeWriter>>,
     pub sink: Arc<Mutex<RecordingSink>>,
     pub encoder: Arc<Mutex<EncoderProcess>>,
+    encoder_abort: EncoderAbortHandle,
     pub segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     pub recording_start_monotonic_ns: u64,
     pub capture_stopped_monotonic_ns: Arc<AtomicU64>,
@@ -165,6 +167,7 @@ impl SessionTransaction {
             }
             return Err(error.into());
         }
+        let encoder_abort = encoder.abort_handle();
         let encoder = Arc::new(Mutex::new(encoder));
         let audio = match plan.audio {
             Some(audio_plan) => {
@@ -176,6 +179,7 @@ impl SessionTransaction {
                     audio_plan.segment_seconds,
                 )?);
                 if let Err(error) = recorder.start() {
+                    encoder_abort.abort();
                     if let Ok(mut encoder) = encoder.lock() {
                         encoder.abort();
                     }
@@ -192,6 +196,7 @@ impl SessionTransaction {
             active_take,
             sink,
             encoder,
+            encoder_abort,
             segment_planner,
             recording_start_monotonic_ns: plan.recording_start_monotonic_ns,
             capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
@@ -203,6 +208,10 @@ impl SessionTransaction {
             }),
             segment_inventory: Mutex::new(()),
         })
+    }
+
+    pub fn encoder_abort_handle(&self) -> EncoderAbortHandle {
+        self.encoder_abort.clone()
     }
 
     pub fn ensure_recording(&self) -> Result<(), StoreError> {
@@ -472,10 +481,10 @@ impl SessionTransaction {
             )
         };
         let registration = self.register_segments(&segments);
-        let active_take = active_take?;
-        let audio = audio?;
-        let sink = sink?;
         encoder_result?;
+        let sink = sink?;
+        let audio = audio?;
+        let active_take = active_take?;
         registration?;
         let planner = self
             .segment_planner
@@ -571,6 +580,13 @@ impl SessionTransaction {
     }
 
     fn abort_resources(&self) {
+        let _ = self.capture_stopped_monotonic_ns.compare_exchange(
+            0,
+            u64::MAX,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        self.encoder_abort.abort();
         if let Some(audio) = &self.audio {
             audio.abort();
             audio.close();
@@ -938,5 +954,84 @@ printf '{"event":"done","frames":0}\n'
             assert_eq!(transaction.open_handle_count(), 0);
         }
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn concurrent_abort_unblocks_held_encoder_mutex_during_blocked_submit() {
+        let root = temp_root("abort-deadlock-free");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = root.join("stalled-shm-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut p = plan(&root, &helper, "session", 1);
+        p.width = 64;
+        p.height = 32;
+        p.encoder_transport =
+            super::EncoderTransport::ShmRing(crate::session::shm_ring::ShmRingConfig {
+                slot_count: 2,
+                slot_capacity: 4096,
+            });
+        let transaction = std::sync::Arc::new(SessionTransaction::begin(p).unwrap());
+
+        let tx_producer = std::sync::Arc::clone(&transaction);
+        let producer = std::thread::spawn(move || {
+            let mut enc = tx_producer.encoder.lock().unwrap();
+            enc.submit_frame(0, 1_000, &[0xAA; 64]).unwrap();
+            enc.submit_frame(1, 2_000, &[0xAA; 64]).unwrap();
+            // Ring is now full; this blocks while holding Mutex<EncoderProcess>!
+            enc.submit_frame(2, 3_000, &[0xBB; 64])
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        transaction.abort();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "transaction.abort() blocked waiting on Mutex<EncoderProcess>"
+        );
+        let err = producer.join().unwrap().unwrap_err();
+        assert!(matches!(
+            err.code.as_str(),
+            "encoder_aborted" | "encoder_unexpected_eof"
+        ));
+        assert_eq!(transaction.open_handle_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finish_surfaces_causal_encoder_error_before_pending_active_take_state() {
+        let root = temp_root("causal-finish-order");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = root.join("error-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\nprintf '{\"event\":\"error\",\"code\":\"vpu_hw_timeout\",\"message\":\"vpu hung\"}\\n'\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let transaction = SessionTransaction::begin(plan(&root, &helper, "session", 1)).unwrap();
+        // Reserve a frame without finishing it (simulating mid-frame encoder failure).
+        transaction
+            .active_take
+            .lock()
+            .unwrap()
+            .reserve_frame(crate::session::active_take::ActiveSourceFrame {
+                source_sequence: 1,
+                host_monotonic_ns: 1_000,
+                source_gap: 0,
+            })
+            .unwrap();
+
+        let err = transaction
+            .finish(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(err.code, "vpu_hw_timeout");
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -8,7 +8,7 @@
 
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -Werror -std=gnu11 -I/usr/include
-LDFLAGS ?= -L/usr/hobot/lib
+LDFLAGS ?= -L/usr/hobot/lib -Wl,-rpath,/usr/hobot/lib
 LDLIBS ?= -lmultimedia -lpthread
 DESTDIR ?= .
 

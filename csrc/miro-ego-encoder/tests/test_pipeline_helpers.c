@@ -5,6 +5,7 @@
 #include "miro_ego_split.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -457,8 +458,22 @@ static void test_mp4_v1_64bit_durations(void)
     assert(get_be64(elst_pos - 4 + 16) == 900ULL);
     assert(get_be64(elst_pos - 4 + 36) == expected_dur);
 
-    /* Failure cases: invalid fps, corrupt moov, version 2 */
+    /* Failure cases: invalid fd/fps, symlink rejection, corrupt moov */
+    assert(miro_ego_mp4_extend_durations_fd(-1, 30, reason, sizeof(reason)) == -1);
     assert(miro_ego_mp4_extend_durations(path, 0, reason, sizeof(reason)) == -1);
+
+    char sym_path[128];
+    snprintf(sym_path, sizeof(sym_path), "%s.symlink", path);
+    unlink(sym_path);
+    assert(symlink(path, sym_path) == 0);
+    assert(miro_ego_mp4_extend_durations(sym_path, 30, reason, sizeof(reason)) == -1);
+    unlink(sym_path);
+
+    int rw_fd = open(path, O_RDWR | O_CLOEXEC);
+    assert(rw_fd >= 0);
+    assert(miro_ego_mp4_extend_durations_fd(rw_fd, 30, reason, sizeof(reason)) == 0);
+    close(rw_fd);
+
     uint8_t bad_moov[24];
     uint8_t bad_trak[12] = {0, 0, 0, 12, 't', 'r', 'a', 'k', 0, 0, 0, 0};
     size_t bad_len = make_box(bad_moov, "moov", bad_trak, sizeof(bad_trak));

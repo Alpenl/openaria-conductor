@@ -2,10 +2,10 @@
 use miro_ego_core::sys::fs as sys_fs;
 use sha2::{Digest, Sha256};
 use std::ffi::CStr;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const NAME: &CStr = c"manifest.json";
@@ -19,10 +19,10 @@ type Identity = (
     i128,
 );
 
-fn identity(value: &libc::stat) -> Identity {
+fn identity(value: &libc::stat, ignore_ino: bool) -> Identity {
     (
         value.st_dev,
-        value.st_ino,
+        if ignore_ino { 0 } else { value.st_ino },
         value.st_mode,
         value.st_nlink,
         value.st_size,
@@ -45,17 +45,20 @@ fn signature_inner(
     force_exfat: Option<bool>,
     after_read: impl FnOnce(),
 ) -> io::Result<String> {
-    let parent = fs::symlink_metadata(path)?;
-    if !parent.is_dir() {
-        return Err(invalid("catalog directory must not be a symbolic link"));
-    }
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| {
+            if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                invalid("catalog directory must not be a symbolic link")
+            } else {
+                error
+            }
+        })?;
     let opened = sys_fs::fstat(directory.as_raw_fd())?;
-    if parent.dev() != opened.st_dev || parent.ino() != opened.st_ino {
-        return Err(invalid("catalog directory changed during open"));
+    if (opened.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(invalid("catalog directory must not be a symbolic link"));
     }
     let exfat = match force_exfat {
         Some(value) => value,
@@ -76,7 +79,7 @@ fn signature_inner(
             "catalog manifest must be a bounded exclusively linked file",
         ));
     }
-    let expected = identity(&before);
+    let expected = identity(&before, exfat);
     let mut remaining = before.st_size as u64;
     let mut buffer = vec![0_u8; remaining.clamp(1, 1024 * 1024) as usize];
     let mut digest = Sha256::new();
@@ -91,12 +94,12 @@ fn signature_inner(
     }
     after_read();
     if sys_fs::read_retry(&mut file, &mut [0_u8; 1])? != 0
-        || identity(&sys_fs::fstat(file.as_raw_fd())?) != expected
+        || identity(&sys_fs::fstat(file.as_raw_fd())?, exfat) != expected
     {
         return Err(invalid("catalog manifest changed during read"));
     }
     let current = sys_fs::fstatat_nofollow(directory.as_raw_fd(), NAME)?;
-    if identity(&current) != expected {
+    if identity(&current, exfat) != expected {
         return Err(invalid("catalog manifest replaced during read"));
     }
     // On exFAT/FAT, kernel st_ino is an ephemeral dcache counter that changes across
@@ -104,12 +107,12 @@ fn signature_inner(
     let (reported_parent_ino, reported_file_ino) = if exfat {
         (0, 0)
     } else {
-        (parent.ino(), expected.1)
+        (opened.st_ino, expected.1)
     };
     // Preserve the existing json.dumps signature byte-for-byte, including spaces.
     Ok(format!(
         "[{}, {}, {}, {}, {}, {}, {}, {}, {}, \"{:x}\"]",
-        parent.dev(),
+        opened.st_dev,
         reported_parent_ino,
         expected.0,
         reported_file_ino,
@@ -125,7 +128,7 @@ fn signature_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     struct Fixture(std::path::PathBuf);

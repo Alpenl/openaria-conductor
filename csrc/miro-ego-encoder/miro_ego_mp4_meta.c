@@ -285,19 +285,12 @@ int miro_ego_mp4_fix_color(unsigned char *moov, size_t moov_size,
  * The samples themselves are complete, so extend the four duration fields by
  * exactly one frame interval.
  */
-int miro_ego_mp4_extend_durations(const char *path, int fps,
-                                  char *reason, size_t reason_len)
+int miro_ego_mp4_extend_durations_fd(int fd, int fps,
+                                     char *reason, size_t reason_len)
 {
-    if (path == NULL || fps <= 0) {
+    if (fd < 0 || fps <= 0) {
         if (reason != NULL && reason_len > 0) {
-            snprintf(reason, reason_len, "invalid fps");
-        }
-        return -1;
-    }
-    int fd = open(path, O_RDWR);
-    if (fd < 0) {
-        if (reason != NULL && reason_len > 0) {
-            snprintf(reason, reason_len, "open: %s", strerror(errno));
+            snprintf(reason, reason_len, fd < 0 ? "invalid fd" : "invalid fps");
         }
         return -1;
     }
@@ -349,7 +342,6 @@ int miro_ego_mp4_extend_durations(const char *path, int fps,
         if (reason != NULL && reason_len > 0) {
             snprintf(reason, reason_len, "no usable moov box");
         }
-        close(fd);
         return -1;
     }
 
@@ -358,7 +350,6 @@ int miro_ego_mp4_extend_durations(const char *path, int fps,
         if (reason != NULL && reason_len > 0) {
             snprintf(reason, reason_len, "out of memory");
         }
-        close(fd);
         return -1;
     }
     if (pread_full(fd, moov, moov_size, moov_offset) != 0) {
@@ -366,7 +357,6 @@ int miro_ego_mp4_extend_durations(const char *path, int fps,
             snprintf(reason, reason_len, "short moov read");
         }
         free(moov);
-        close(fd);
         return -1;
     }
 
@@ -511,6 +501,31 @@ int miro_ego_mp4_extend_durations(const char *path, int fps,
     }
 
     free(moov);
+    return result;
+}
+
+int miro_ego_mp4_extend_durations(const char *path, int fps,
+                                  char *reason, size_t reason_len)
+{
+    if (path == NULL || fps <= 0) {
+        if (reason != NULL && reason_len > 0) {
+            snprintf(reason, reason_len, path == NULL ? "invalid path" : "invalid fps");
+        }
+        return -1;
+    }
+    int fd;
+    do {
+        fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        if (reason != NULL && reason_len > 0) {
+            snprintf(reason, reason_len, "open: %s", strerror(errno));
+        }
+        return -1;
+    }
+    int result = miro_ego_mp4_extend_durations_fd(fd, fps, reason, reason_len);
+    int saved_errno = errno;
     close(fd);
+    errno = saved_errno;
     return result;
 }

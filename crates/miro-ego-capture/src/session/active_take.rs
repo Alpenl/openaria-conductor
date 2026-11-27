@@ -55,6 +55,8 @@ pub struct ActiveTakeWriter {
     frame_domain: u64,
     frames_written: u64,
     bytes_written: u64,
+    dropped_frames: u64,
+    drop_events: Vec<ActiveDropEvent>,
     pending_frame: Option<u64>,
     closed: bool,
 }
@@ -72,9 +74,46 @@ impl ActiveTakeWriter {
             frame_domain: 0,
             frames_written: 0,
             bytes_written: 0,
+            dropped_frames: 0,
+            drop_events: Vec::new(),
             pending_frame: None,
             closed: false,
         })
+    }
+
+    pub fn record_recovered_drops(
+        &mut self,
+        dropped: u64,
+        at_time_seconds: f64,
+    ) -> Result<(), ActiveTakeError> {
+        self.ensure_open()?;
+        if dropped == 0 {
+            return Ok(());
+        }
+        let at_time_seconds = if at_time_seconds.is_finite() && at_time_seconds >= 0.0 {
+            at_time_seconds
+        } else {
+            0.0
+        };
+        let start_frame = self.frames_written;
+        let end_frame = start_frame.checked_add(dropped).ok_or_else(|| {
+            ActiveTakeError::new("counter_overflow", "active take drop frame range overflow")
+        })?;
+        let next_dropped = self.dropped_frames.checked_add(dropped).ok_or_else(|| {
+            ActiveTakeError::new(
+                "counter_overflow",
+                "active take dropped frame count overflow",
+            )
+        })?;
+        self.dropped_frames = next_dropped;
+        self.drop_events.push(ActiveDropEvent {
+            start_frame,
+            end_frame,
+            at_time_seconds,
+            reason: "write_backpressure",
+            dropped,
+        });
+        Ok(())
     }
 
     pub fn reserve_frame(
@@ -150,10 +189,10 @@ impl ActiveTakeWriter {
             frames_written: self.frames_written,
             bytes_written: self.bytes_written,
             // The encoded frame index is dense. Source gaps remain visible in
-            // its original source sequences and timestamps, and in the audit.
-            dropped_frames: 0,
+            // its original source sequences and timestamps, and in drop_events.
+            dropped_frames: self.dropped_frames,
             pending_frames: u64::from(self.pending_frame.is_some()),
-            drop_events: Vec::new(),
+            drop_events: self.drop_events.clone(),
         }
     }
 
@@ -337,5 +376,31 @@ mod tests {
         );
         assert_eq!(writer.snapshot(), before);
         assert_error_code(writer.finish().unwrap_err(), "invalid_state");
+    }
+
+    #[test]
+    fn recovered_drops_record_dense_drop_events_and_total_count() {
+        let mut writer = ActiveTakeWriter::new("session").unwrap();
+        let f0 = writer.reserve_frame(source_frame(0)).unwrap();
+        writer.finish_frame(f0, 50).unwrap();
+
+        writer.record_recovered_drops(0, 0.05).unwrap();
+        assert_eq!(writer.snapshot().dropped_frames, 0);
+        assert!(writer.snapshot().drop_events.is_empty());
+
+        writer.record_recovered_drops(2, 0.125).unwrap();
+        let f1 = writer.reserve_frame(source_frame(3)).unwrap();
+        writer.finish_frame(f1, 60).unwrap();
+
+        let summary = writer.finish().unwrap();
+        assert_eq!(summary.frames_written, 2);
+        assert_eq!(summary.frame_domain, 2);
+        assert_eq!(summary.dropped_frames, 2);
+        assert_eq!(summary.drop_events.len(), 1);
+        assert_eq!(summary.drop_events[0].start_frame, 1);
+        assert_eq!(summary.drop_events[0].end_frame, 3);
+        assert_eq!(summary.drop_events[0].dropped, 2);
+        assert_eq!(summary.drop_events[0].reason, "write_backpressure");
+        assert!((summary.drop_events[0].at_time_seconds - 0.125).abs() < 1e-9);
     }
 }

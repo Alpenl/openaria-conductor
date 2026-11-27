@@ -1,6 +1,6 @@
 use crate::session::session_io;
 use crate::session::shm_ring::{
-    ShmRingConfig, ShmRingError, ShmRingProducer, wake_eventfd_best_effort,
+    ShmRingConfig, ShmRingError, ShmRingProducer, create_eventfd, wake_eventfd_best_effort,
 };
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::clock::monotonic_ns;
@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -210,9 +211,20 @@ impl ProcessState {
 struct SharedProcess {
     state: Mutex<ProcessState>,
     changed: Condvar,
+    aborted: AtomicBool,
+    live_pgid: Mutex<Option<i32>>,
 }
 
 impl SharedProcess {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ProcessState::new()),
+            changed: Condvar::new(),
+            aborted: AtomicBool::new(false),
+            live_pgid: Mutex::new(None),
+        }
+    }
+
     fn raise_if_failed(&self) -> Result<(), EncoderProcessError> {
         let state = self.state.lock().map_err(|_| {
             EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
@@ -220,8 +232,98 @@ impl SharedProcess {
         if let Some(error) = state.effective_failure() {
             return Err(error);
         }
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(EncoderProcessError::new(
+                "encoder_aborted",
+                "encoder process was aborted",
+            ));
+        }
         Ok(())
     }
+
+    fn wake_producer(&self) {
+        if let Ok(state) = self.state.lock() {
+            state.wake_producer();
+        }
+        self.changed.notify_all();
+    }
+
+    fn wake_raw_fd(&self) -> Option<libc::c_int> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.wake_done_fd.as_ref().map(AsRawFd::as_raw_fd))
+    }
+
+    fn signal_abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            if state.failure.is_none() {
+                state.failure = Some(EncoderProcessError::new(
+                    "encoder_aborted",
+                    "encoder process was aborted",
+                ));
+            }
+            state.wake_producer();
+            self.changed.notify_all();
+        }
+        if let Ok(guard) = self.live_pgid.lock() {
+            if let Some(pgid) = *guard {
+                if pgid > 0 {
+                    // SAFETY: `live_pgid` is cleared atomically under `live_pgid` lock when
+                    // `try_wait` reaps the child, so `pgid` cannot refer to a recycled PID.
+                    // The child is spawned with `process_group(0)` so `-pgid` kills the group.
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGKILL);
+                        let _ = libc::kill(pgid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Lock-free handle capable of aborting or waking a blocked [`EncoderProcess`] without
+/// waiting on an external `Mutex<EncoderProcess>` held by an in-flight `submit_frame`.
+#[derive(Clone)]
+pub struct EncoderAbortHandle {
+    shared: Arc<SharedProcess>,
+}
+
+impl EncoderAbortHandle {
+    pub fn abort(&self) {
+        self.shared.signal_abort();
+    }
+
+    pub fn wake(&self) {
+        self.shared.wake_producer();
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.shared.aborted.load(Ordering::Acquire)
+    }
+}
+
+/// Minimum SHM slot capacity (bytes) matching the C encoder's JPU bitstream buffer size
+/// `((width * height * 3 / 2 + 0x3ff) & !0x3ff)`.
+pub fn min_shm_slot_capacity(width: u64, height: u64) -> Result<usize, EncoderProcessError> {
+    let pixels = width.checked_mul(height).ok_or_else(|| {
+        EncoderProcessError::new("invalid_argument", "encoder frame dimensions overflow")
+    })?;
+    let yuv420_bytes = pixels
+        .checked_mul(3)
+        .map(|v| v / 2)
+        .and_then(|v| v.checked_add(0x3ff))
+        .map(|v| v & !0x3ff)
+        .ok_or_else(|| {
+            EncoderProcessError::new("invalid_argument", "encoder frame buffer size overflow")
+        })?;
+    usize::try_from(yuv420_bytes).map_err(|_| {
+        EncoderProcessError::new(
+            "invalid_argument",
+            "encoder frame buffer size exceeds usize",
+        )
+    })
 }
 
 pub struct EncoderProcess {
@@ -230,6 +332,8 @@ pub struct EncoderProcess {
     fps: u64,
     segment_frames: u64,
     intra_period: Option<u64>,
+    min_qp: Option<u8>,
+    max_qp: Option<u8>,
     transport_mode: EncoderTransport,
     shared: Arc<SharedProcess>,
     child: Option<Child>,
@@ -279,6 +383,16 @@ impl EncoderProcess {
         }
         if let EncoderTransport::ShmRing(shm_cfg) = transport_mode {
             shm_cfg.validate()?;
+            let min_capacity = min_shm_slot_capacity(config.width, config.height)?;
+            if (shm_cfg.slot_capacity as usize) < min_capacity {
+                return Err(EncoderProcessError::new(
+                    "invalid_shm_config",
+                    format!(
+                        "SHM ring slot_capacity ({}) is smaller than minimum bitstream buffer ({min_capacity}) for {}x{}",
+                        shm_cfg.slot_capacity, config.width, config.height
+                    ),
+                ));
+            }
         }
         Ok(Self {
             executable: config.executable.to_path_buf(),
@@ -301,11 +415,10 @@ impl EncoderProcess {
             fps: config.fps,
             segment_frames: config.segment_frames,
             intra_period: None,
+            min_qp: None,
+            max_qp: None,
             transport_mode,
-            shared: Arc::new(SharedProcess {
-                state: Mutex::new(ProcessState::new()),
-                changed: Condvar::new(),
-            }),
+            shared: Arc::new(SharedProcess::new()),
             child: None,
             active_transport: None,
             reader: None,
@@ -353,6 +466,12 @@ impl EncoderProcess {
         self.transport_mode
     }
 
+    pub fn abort_handle(&self) -> EncoderAbortHandle {
+        EncoderAbortHandle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     pub fn start(&mut self) -> Result<(), EncoderProcessError> {
         if self.child.is_some() {
             return Err(EncoderProcessError::new(
@@ -361,6 +480,10 @@ impl EncoderProcess {
             ));
         }
         self.validate_segment_gop()?;
+        self.shared.aborted.store(false, Ordering::Release);
+        if let Ok(mut pgid) = self.shared.live_pgid.lock() {
+            *pgid = None;
+        }
         {
             let mut state = self.shared.state.lock().map_err(|_| {
                 EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
@@ -371,6 +494,7 @@ impl EncoderProcess {
         let mut command = Command::new(&self.executable);
         command.args(&self.args);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.process_group(0);
 
         let (shm_producer, wake_done_fd) = match self.transport_mode {
             EncoderTransport::ShmRing(shm_config) => {
@@ -404,8 +528,9 @@ impl EncoderProcess {
                 (Some(producer), Some(wake_fd))
             }
             EncoderTransport::StdinPipe => {
+                let wake_fd = create_eventfd()?;
                 command.stdin(Stdio::piped());
-                (None, None)
+                (None, Some(wake_fd))
             }
         };
 
@@ -415,6 +540,13 @@ impl EncoderProcess {
                 format!("failed to spawn encoder: {error}"),
             )
         })?;
+        if let Ok(pid) = i32::try_from(child.id()) {
+            if pid > 0 {
+                if let Ok(mut guard) = self.shared.live_pgid.lock() {
+                    *guard = Some(pid);
+                }
+            }
+        }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
@@ -433,7 +565,16 @@ impl EncoderProcess {
         self.active_transport = match shm_producer {
             Some(producer) => Some(ActiveTransport::ShmRing(producer)),
             None => match stdin {
-                Some(pipe) => Some(ActiveTransport::StdinPipe(pipe)),
+                Some(pipe) => {
+                    if let Err(error) = set_fd_nonblocking(pipe.as_raw_fd()) {
+                        self.abort();
+                        return Err(EncoderProcessError::new(
+                            "encoder_failed",
+                            format!("failed to configure non-blocking encoder stdin: {error}"),
+                        ));
+                    }
+                    Some(ActiveTransport::StdinPipe(pipe))
+                }
                 None => {
                     self.abort();
                     return Err(EncoderProcessError::new(
@@ -499,6 +640,8 @@ impl EncoderProcess {
         }
         let mut next_intra_period = self.intra_period;
         let mut saw_intra_period = false;
+        let mut next_min_qp = self.min_qp;
+        let mut next_max_qp = self.max_qp;
         for pair in args.chunks_exact(2) {
             let flag = pair[0].as_str();
             let value = pair[1].as_str();
@@ -546,6 +689,11 @@ impl EncoderProcess {
                             "qp setting must be in 0..=51",
                         ));
                     }
+                    if flag == "--min-qp" {
+                        next_min_qp = Some(qp);
+                    } else if flag == "--max-qp" {
+                        next_max_qp = Some(qp);
+                    }
                 }
                 "--intra-period" => {
                     let period = value.parse::<u64>().map_err(|_| {
@@ -579,6 +727,12 @@ impl EncoderProcess {
                 }
             }
         }
+        if next_min_qp.unwrap_or(20) > next_max_qp.unwrap_or(51) {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "min-qp must not exceed max-qp",
+            ));
+        }
         if saw_intra_period {
             let effective_gop = next_intra_period.filter(|&p| p > 0).unwrap_or(self.fps);
             if self.segment_frames > 0
@@ -594,6 +748,8 @@ impl EncoderProcess {
             }
         }
         self.intra_period = next_intra_period;
+        self.min_qp = next_min_qp;
+        self.max_qp = next_max_qp;
         self.args.extend_from_slice(args);
         Ok(())
     }
@@ -609,6 +765,19 @@ impl EncoderProcess {
         host_monotonic_ns: u64,
         jpeg: &[u8],
     ) -> Result<u64, EncoderProcessError> {
+        self.submit_frame_with_stop_check(frame_seq, host_monotonic_ns, jpeg, || false)
+    }
+
+    pub fn submit_frame_with_stop_check<F>(
+        &mut self,
+        frame_seq: u64,
+        host_monotonic_ns: u64,
+        jpeg: &[u8],
+        mut stop_check: F,
+    ) -> Result<u64, EncoderProcessError>
+    where
+        F: FnMut() -> bool,
+    {
         if jpeg.is_empty() {
             return Err(EncoderProcessError::new(
                 "invalid_argument",
@@ -617,18 +786,28 @@ impl EncoderProcess {
         }
         self.raise_if_failed()?;
         let shared = &self.shared;
+        let wake_fd = shared.wake_raw_fd();
         let transport = self.active_transport.as_mut().ok_or_else(|| {
             EncoderProcessError::new("invalid_state", "encoder process not started")
         })?;
         let written = match transport {
             ActiveTransport::ShmRing(ring) => {
-                match ring.push_wait_with_check(
+                match ring.push_wait_with_backpressure_check(
                     frame_seq,
                     host_monotonic_ns,
                     0,
                     jpeg,
                     SHM_SUBMIT_TIMEOUT,
-                    || shared.raise_if_failed(),
+                    |is_full| {
+                        shared.raise_if_failed()?;
+                        if is_full && stop_check() {
+                            return Err(EncoderProcessError::new(
+                                "capture_stopped",
+                                "capture stopped while encoder input was backpressured",
+                            ));
+                        }
+                        Ok(())
+                    },
                 ) {
                     Ok(_) => u64::try_from(jpeg.len()).unwrap_or(u64::MAX),
                     Err(error) => {
@@ -638,9 +817,38 @@ impl EncoderProcess {
                 }
             }
             ActiveTransport::StdinPipe(stdin) => {
-                match session_io::write_encoder_frame(stdin.as_raw_fd(), jpeg) {
+                let mut check_error: Option<EncoderProcessError> = None;
+                match session_io::write_encoder_frame_nonblocking(
+                    stdin.as_raw_fd(),
+                    wake_fd,
+                    jpeg,
+                    SHM_SUBMIT_TIMEOUT,
+                    |mid_frame, would_block| {
+                        if let Err(causal) = shared.raise_if_failed() {
+                            check_error = Some(causal);
+                            return Err(session_io::SessionIoError {
+                                code: "write_failed",
+                                message: "encoder process failed".to_owned(),
+                            });
+                        }
+                        if would_block && !mid_frame && stop_check() {
+                            check_error = Some(EncoderProcessError::new(
+                                "capture_stopped",
+                                "capture stopped while encoder stdin pipe was backpressured",
+                            ));
+                            return Err(session_io::SessionIoError {
+                                code: "write_failed",
+                                message: "capture stopped".to_owned(),
+                            });
+                        }
+                        Ok(())
+                    },
+                ) {
                     Ok(written) => written,
                     Err(error) => {
+                        if let Some(captured) = check_error {
+                            return Err(captured);
+                        }
                         // Prefer the helper's causal error over the subsequent EPIPE.
                         shared.raise_if_failed()?;
                         return Err(error.into());
@@ -687,12 +895,19 @@ impl EncoderProcess {
             let child = self.child.as_mut().ok_or_else(|| {
                 EncoderProcessError::new("invalid_state", "encoder process not started")
             })?;
-            wait_child(child, timeout).map_err(|error| {
+            wait_child_and_clear_pgid(child, &self.shared.live_pgid, timeout).map_err(|error| {
                 EncoderProcessError::new("encoder_failed", format!("wait encoder failed: {error}"))
             })?
         };
         let Some(status) = status else {
+            let pre_abort_failure = self.failure();
             self.abort();
+            if let Some(failure) = pre_abort_failure {
+                return Err(failure);
+            }
+            if let Some(failure) = self.failure().filter(|err| err.code != "encoder_aborted") {
+                return Err(failure);
+            }
             return Err(EncoderProcessError::new(
                 "encoder_failed",
                 self.with_stderr("encoder did not exit before timeout"),
@@ -714,12 +929,11 @@ impl EncoderProcess {
         if let Some(ActiveTransport::ShmRing(ring)) = self.active_transport.as_ref() {
             let _ = ring.signal_eof();
         }
+        self.shared.signal_abort();
         let mut child_reaped = true;
         if let Some(mut child) = self.child.take() {
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill();
-            }
-            match wait_child(&mut child, ABORT_WAIT_TIMEOUT) {
+            match wait_child_and_clear_pgid(&mut child, &self.shared.live_pgid, ABORT_WAIT_TIMEOUT)
+            {
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
                     // Uninterruptible kernel D-state child cannot be waited forever on close.
@@ -1034,14 +1248,34 @@ where
     }
 }
 
-fn wait_child(
+fn set_fd_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `fd` is an open owned pipe write descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn wait_child_and_clear_pgid(
     child: &mut Child,
+    live_pgid: &Mutex<Option<i32>>,
     timeout: Duration,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+        {
+            let mut pgid_guard = live_pgid.lock().ok();
+            if let Some(status) = child.try_wait()? {
+                if let Some(guard) = pgid_guard.as_mut() {
+                    **guard = None;
+                }
+                return Ok(Some(status));
+            }
         }
         if Instant::now() >= deadline {
             return Ok(None);
@@ -1413,8 +1647,8 @@ mod tests {
             EncoderConfig {
                 out_dir: &root,
                 executable: &helper,
-                width: 3840,
-                height: 1080,
+                width: 64,
+                height: 32,
                 fps: 30,
                 bitrate_kbps: 8192,
                 segment_frames: 30,
@@ -1622,8 +1856,8 @@ mod tests {
             EncoderConfig {
                 out_dir: &root,
                 executable: &helper,
-                width: 3840,
-                height: 1080,
+                width: 64,
+                height: 32,
                 fps: 30,
                 bitrate_kbps: 8192,
                 segment_frames: 30,
@@ -1671,6 +1905,193 @@ mod tests {
         assert_eq!(encoder.failure().unwrap().code, "encoder_unexpected_eof");
 
         encoder.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shm_slot_capacity_validates_against_4k_dimensions_and_accepts_8mib_default() {
+        let cfg = || EncoderConfig {
+            out_dir: std::path::Path::new("/unused"),
+            executable: std::path::Path::new("/unused/helper"),
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 12_000,
+            segment_frames: 150,
+            path_prefix: "video/",
+        };
+        let err = match EncoderProcess::with_transport(
+            cfg(),
+            EncoderTransport::ShmRing(ShmRingConfig {
+                slot_count: 8,
+                slot_capacity: 4 * 1024 * 1024,
+            }),
+        ) {
+            Ok(_) => panic!("expected 4 MiB slot_capacity to be rejected for 3840x1080"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "invalid_shm_config");
+        assert!(EncoderProcess::new(cfg()).is_ok());
+    }
+
+    #[test]
+    fn configure_rejects_inverted_qp_bounds_and_finish_timeout_preserves_causal_error() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let mut enc = EncoderProcess::new(EncoderConfig {
+            out_dir: std::path::Path::new("/unused"),
+            executable: std::path::Path::new("/unused/helper"),
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 12_000,
+            segment_frames: 150,
+            path_prefix: "video/",
+        })
+        .unwrap();
+        assert_eq!(
+            enc.configure(&[
+                "--min-qp".to_owned(),
+                "42".to_owned(),
+                "--max-qp".to_owned(),
+                "30".to_owned(),
+            ])
+            .unwrap_err()
+            .code,
+            "invalid_argument"
+        );
+        enc.configure(&["--min-qp".to_owned(), "35".to_owned()])
+            .unwrap();
+        assert_eq!(
+            enc.configure(&["--max-qp".to_owned(), "30".to_owned()])
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "miro-ego-encoder-causal-timeout-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let helper = root.join("causal-timeout.sh");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\nprintf '{\"event\":\"error\",\"code\":\"vpu_hw_timeout\",\"message\":\"hardware hung\"}\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut encoder = EncoderProcess::with_transport(
+            EncoderConfig {
+                out_dir: &root,
+                executable: &helper,
+                width: 64,
+                height: 32,
+                fps: 30,
+                bitrate_kbps: 8192,
+                segment_frames: 30,
+                path_prefix: "video/",
+            },
+            EncoderTransport::StdinPipe,
+        )
+        .unwrap();
+        encoder.start().unwrap();
+        let err = encoder.finish(Duration::from_millis(80)).unwrap_err();
+        assert_eq!(err.code, "vpu_hw_timeout");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abort_handle_unblocks_full_stdin_submission_and_kills_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "miro-ego-encoder-pgid-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sub_pid_file = root.join("grandchild.pid");
+        let helper = root.join("pgid-helper.sh");
+        // Spawn a grandchild sleep in the same process group and never read stdin so pipe fills!
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > \"{}\"\nprintf '{{\"event\":\"ready\"}}\\n'\nwait\n",
+                sub_pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut encoder = EncoderProcess::with_transport(
+            EncoderConfig {
+                out_dir: &root,
+                executable: &helper,
+                width: 64,
+                height: 32,
+                fps: 30,
+                bitrate_kbps: 8192,
+                segment_frames: 30,
+                path_prefix: "video/",
+            },
+            EncoderTransport::StdinPipe,
+        )
+        .unwrap();
+        encoder.start().unwrap();
+        let abort_handle = encoder.abort_handle();
+        let encoder = std::sync::Arc::new(std::sync::Mutex::new(encoder));
+
+        let grandchild_pid: i32 = std::fs::read_to_string(&sub_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let enc_writer = std::sync::Arc::clone(&encoder);
+        let writer = std::thread::spawn(move || {
+            let mut guard = enc_writer.lock().unwrap();
+            let big = vec![0x55_u8; 256 * 1024];
+            for seq in 0..64_u64 {
+                guard.submit_frame(seq, (seq + 1) * 1000, &big)?;
+            }
+            Ok::<(), super::EncoderProcessError>(())
+        });
+
+        std::thread::sleep(Duration::from_millis(40));
+        let started = Instant::now();
+        abort_handle.abort();
+        let err = writer.join().unwrap().unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            err.code.as_str(),
+            "encoder_aborted" | "encoder_unexpected_eof" | "write_failed"
+        ));
+        encoder.lock().unwrap().abort();
+
+        // Wait briefly for grandchild in process group to be reaped by init after SIGKILL -pgid.
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let alive = unsafe { libc::kill(grandchild_pid, 0) };
+            if alive == -1 {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "grandchild in encoder process group survived abort()"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

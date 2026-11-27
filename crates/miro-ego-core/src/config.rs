@@ -16,6 +16,7 @@ pub const RECORDING_ENCODING_SCHEMA: &str = "miro-ego.recording-encoding.v1";
 pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_CONFIG_JSON_DEPTH: usize = 32;
 pub const MAX_CAMERA_DIMENSION: u32 = 16_384;
+pub const MAX_RAW_CAMERA_FPS: u32 = 240;
 pub const MAX_ENCODED_FPS: u32 = 60;
 pub const MAX_SEGMENT_FRAMES: u64 = 1_000_000;
 
@@ -304,6 +305,12 @@ impl RecordingEncoding {
                 ));
             }
         }
+        if self.min_qp > self.max_qp {
+            return Err(CoreError::invalid_config(
+                "invalid_config",
+                "recording.min_qp must not exceed recording.max_qp",
+            ));
+        }
         if self.min_qp > self.intra_qp || self.intra_qp > self.max_qp {
             return Err(CoreError::invalid_config(
                 "invalid_config",
@@ -406,11 +413,12 @@ impl DeviceConfig {
             || self.camera.height % 2 != 0
             || self.camera.height > MAX_CAMERA_DIMENSION
             || self.camera.fps == 0
+            || self.camera.fps > MAX_RAW_CAMERA_FPS
             || self.camera.frame_decimation == 0
         {
             return Err(CoreError::invalid_config(
                 "invalid_config",
-                "camera width (multiple of 4, <= 16384), height (even, <= 16384), fps, and frame_decimation must be valid",
+                "camera width (multiple of 4, <= 16384), height (even, <= 16384), fps (1..=240), and frame_decimation must be valid",
             ));
         }
         if self.camera.fps % self.camera.frame_decimation != 0 {
@@ -604,11 +612,11 @@ impl Settings {
             || self.camera.height % 2 != 0
             || self.camera.height > MAX_CAMERA_DIMENSION
             || self.camera.fps == 0
-            || self.camera.fps > MAX_ENCODED_FPS
+            || self.camera.fps > MAX_RAW_CAMERA_FPS
         {
             return Err(CoreError::invalid_config(
                 "invalid_settings",
-                "settings.camera width (multiple of 4, <= 16384), height (even, <= 16384), and fps (1..=60) must be valid",
+                "settings.camera width (multiple of 4, <= 16384), height (even, <= 16384), and fps (1..=240) must be valid",
             ));
         }
         if let Some(exposure) = &self.camera.exposure_time_absolute {
@@ -830,8 +838,18 @@ mod tests {
         zero_eff_fps.camera.fps = 30;
         zero_eff_fps.camera.frame_decimation = 60;
         assert!(zero_eff_fps.validate().is_err());
-        let mut high_settings = Settings::from_device_config(&cfg);
-        high_settings.camera.fps = 90;
+        // Raw fps > 60 allowed when decimated encoded_fps <= 60; rejected when encoded_fps > 60 or raw > 240
+        let mut decimated_120 = cfg.clone();
+        decimated_120.camera.fps = 120;
+        decimated_120.camera.frame_decimation = 2;
+        assert!(decimated_120.validate().is_ok());
+
+        let mut high_settings = Settings::from_device_config(&decimated_120);
+        assert!(high_settings.validate().is_ok());
+        assert!(high_settings.validate_for_device(2, 5.0).is_ok());
+        assert!(high_settings.validate_for_device(1, 5.0).is_err());
+
+        high_settings.camera.fps = MAX_RAW_CAMERA_FPS + 1;
         assert!(high_settings.validate().is_err());
 
         // segment_seconds exceeding 1,000,000 frames rejected

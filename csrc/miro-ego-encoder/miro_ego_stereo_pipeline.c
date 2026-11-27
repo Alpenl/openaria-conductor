@@ -40,6 +40,7 @@
 typedef struct segment {
     struct segment *next;
     media_muxer_context_t muxer;
+    int seal_fd;
     int eye;
     int index;
     char absolute[PATH_LEN];
@@ -328,6 +329,14 @@ static int configure_encoder(media_codec_context_t *context,
 
 /* --------------------------------------------------------------- muxer --- */
 
+static void close_seal_fd(segment_t *segment)
+{
+    if (segment != NULL && segment->seal_fd >= 0) {
+        close(segment->seal_fd);
+        segment->seal_fd = -1;
+    }
+}
+
 static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
                         unsigned long long start_frame)
 {
@@ -347,6 +356,7 @@ static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
         fail(pipeline, "out_of_memory: segment %d", index);
         return -1;
     }
+    segment->seal_fd = -1;
     segment->eye = eye->eye;
     segment->index = index;
     segment->start_frame = start_frame;
@@ -364,8 +374,25 @@ static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
         return -1;
     }
 
+    /* Open seal_fd before the vendor muxer writes byte 0 so struct file->f_wb_err
+     * samples the inode errseq_t cursor prior to any page-cache writeback error. */
+    do {
+        segment->seal_fd = open(segment->absolute,
+                                O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                                0640);
+    } while (segment->seal_fd < 0 && errno == EINTR);
+    if (segment->seal_fd < 0) {
+        fail(pipeline, "segment_open_failed: open %s: %s",
+             segment->relative, strerror(errno));
+        free(segment);
+        atomic_fetch_sub(&pipeline->pending_segments, 1u);
+        return -1;
+    }
+
     if (hb_mm_mx_get_default_context(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: default context for %s", segment->relative);
+        close_seal_fd(segment);
+        unlink(segment->absolute);
         free(segment);
         atomic_fetch_sub(&pipeline->pending_segments, 1u);
         return -1;
@@ -374,6 +401,8 @@ static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
     segment->muxer.output_format = MEDIA_MUXER_OUTPUT_FORMAT_MP4;
     if (hb_mm_mx_initialize(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: initialize %s", segment->relative);
+        close_seal_fd(segment);
+        unlink(segment->absolute);
         free(segment);
         atomic_fetch_sub(&pipeline->pending_segments, 1u);
         return -1;
@@ -393,6 +422,7 @@ static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
         hb_mm_mx_start(&segment->muxer) != 0) {
         fail(pipeline, "muxer_unavailable: start %s", segment->relative);
         hb_mm_mx_stop(&segment->muxer);
+        close_seal_fd(segment);
         unlink(segment->absolute);
         free(segment);
         atomic_fetch_sub(&pipeline->pending_segments, 1u);
@@ -506,16 +536,19 @@ static int segment_finalize(miro_ego_pipeline_t *pipeline, segment_t *segment)
     if (segment->end_frame == segment->start_frame) {
         /* A segment with zero frames has no media; release muxer best-effort and unlink. */
         (void)hb_mm_mx_stop(&segment->muxer);
+        close_seal_fd(segment);
         unlink(segment->absolute);
         return 0;
     }
     if (hb_mm_mx_stop(&segment->muxer) != 0) {
+        close_seal_fd(segment);
         fail(pipeline, "segment_seal_failed: stop %s", segment->relative);
         return 0;
     }
     char reason[128] = {0};
-    if (miro_ego_mp4_extend_durations(segment->absolute, pipeline->config.fps,
-                                      reason, sizeof(reason)) != 0) {
+    if (miro_ego_mp4_extend_durations_fd(segment->seal_fd, pipeline->config.fps,
+                                         reason, sizeof(reason)) != 0) {
+        close_seal_fd(segment);
         fail(pipeline, "segment_seal_failed: %s duration fixup: %s",
              segment->relative, reason);
         return 0;
@@ -526,15 +559,22 @@ static int segment_finalize(miro_ego_pipeline_t *pipeline, segment_t *segment)
 static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
 {
     /*
-     * Compute SHA-256 right after moov fixup while segment pages are hot in page
-     * cache using our 256 KiB page-aligned read buffer, then fsync() for power-cut
-     * durability and evict the sealed pages via posix_fadvise(POSIX_FADV_DONTNEED)
-     * to prevent dirty-page writeback stalls on exFAT TF cards.
+     * Reuse segment->seal_fd opened before byte 0 so fsync() observes any
+     * asynchronous page-cache writeback failure via f_wb_err, compute SHA-256
+     * while pages are hot, fsync() for durability, and evict clean pages via
+     * posix_fadvise(POSIX_FADV_DONTNEED).
      */
-    int fd = open(segment->absolute, O_RDONLY);
+    int fd = segment->seal_fd;
+    segment->seal_fd = -1;
     if (fd < 0) {
-        fail(pipeline, "segment_seal_failed: open %s: %s",
+        fail(pipeline, "segment_seal_failed: missing descriptor for %s",
+             segment->relative);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        fail(pipeline, "segment_seal_failed: lseek %s: %s",
              segment->relative, strerror(errno));
+        close(fd);
         return;
     }
     struct stat metadata;
@@ -566,7 +606,11 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
         close(fd);
         return;
     }
-    if (fsync(fd) != 0) {
+    int sync_ret;
+    do {
+        sync_ret = fsync(fd);
+    } while (sync_ret < 0 && errno == EINTR);
+    if (sync_ret != 0) {
         fail(pipeline, "segment_seal_failed: sync %s: %s",
              segment->relative, strerror(errno));
         close(fd);
@@ -576,12 +620,21 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
     (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     close(fd);
 
-    int dir_fd = open(pipeline->config.out_dir, O_RDONLY | O_DIRECTORY);
-    if (dir_fd < 0 || fsync(dir_fd) != 0) {
+    int dir_fd;
+    do {
+        dir_fd = open(pipeline->config.out_dir,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (dir_fd < 0 && errno == EINTR);
+    if (dir_fd < 0) {
+        fail(pipeline, "segment_seal_failed: open video directory: %s", strerror(errno));
+        return;
+    }
+    do {
+        sync_ret = fsync(dir_fd);
+    } while (sync_ret < 0 && errno == EINTR);
+    if (sync_ret != 0 && errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) {
         fail(pipeline, "segment_seal_failed: sync video directory: %s", strerror(errno));
-        if (dir_fd >= 0) {
-            close(dir_fd);
-        }
+        close(dir_fd);
         return;
     }
     close(dir_fd);
@@ -635,6 +688,7 @@ static void *closer_thread_main(void *argument)
         if (pending >= MAX_PENDING_COMMITS) {
             fail(pipeline, "segment_commit_queue_exhausted: pending=%u limit=%u",
                  pending, MAX_PENDING_COMMITS);
+            close_seal_fd(segment);
             free(segment);
         }
     }
@@ -725,6 +779,7 @@ static void *mux_writer_thread(void *argument)
         }
     } else if (eye->current != NULL) {
         hb_mm_mx_stop(&eye->current->muxer);
+        close_seal_fd(eye->current);
         free(eye->current);
         atomic_fetch_sub(&pipeline->pending_segments, 1u);
         eye->current = NULL;
@@ -747,15 +802,17 @@ static void *encoder_output_thread(void *argument)
         if (ret != 0) {
             /* Only the split thread knows how many frames this eye owes, so the
              * encoder cannot stop draining before the split thread is done. */
-            if (atomic_load(&pipeline->split_done) != 0 &&
-                (atomic_load(&pipeline->encoded[eye->eye]) >= atomic_load(&pipeline->fed[eye->eye]) ||
-                 ++idle_polls >= ENCODER_DRAIN_POLLS)) {
-                if (atomic_load(&pipeline->encoded[eye->eye]) < atomic_load(&pipeline->fed[eye->eye])) {
+            if (atomic_load(&pipeline->split_done) != 0) {
+                if (atomic_load(&pipeline->failed) != 0 ||
+                    atomic_load(&pipeline->encoded[eye->eye]) >= atomic_load(&pipeline->fed[eye->eye])) {
+                    break;
+                }
+                if (++idle_polls >= ENCODER_DRAIN_POLLS) {
                     fail(pipeline, "encoder_drain_timeout: eye=%s ret=%d fed=%llu encoded=%llu",
                          EYE_NAMES[eye->eye], ret, atomic_load(&pipeline->fed[eye->eye]),
                          atomic_load(&pipeline->encoded[eye->eye]));
+                    break;
                 }
-                break;
             }
             continue;
         }
@@ -837,6 +894,9 @@ static void *split_thread_main(void *argument)
     int idle_polls = 0;
 
     for (;;) {
+        if (atomic_load(&pipeline->failed) != 0) {
+            break;
+        }
         media_codec_buffer_t frame;
         media_codec_output_buffer_info_t info;
         memset(&frame, 0, sizeof(frame));
@@ -844,6 +904,9 @@ static void *split_thread_main(void *argument)
         int ret = hb_mm_mc_dequeue_output_buffer(&pipeline->decoder, &frame, &info,
                                                  DECODER_OUTPUT_TIMEOUT_MS);
         if (ret != 0) {
+            if (atomic_load(&pipeline->failed) != 0) {
+                break;
+            }
             if (atomic_load(&pipeline->stopping) != 0) {
                 if (atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) {
                     break;
@@ -1115,6 +1178,9 @@ open_failed:
 int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char *jpeg,
                              size_t length, int timeout_ms)
 {
+    if (pipeline == NULL) {
+        return -1;
+    }
     atomic_fetch_add(&pipeline->offered, 1ULL);
     if (atomic_load(&pipeline->failed) != 0) {
         return -1;
@@ -1261,8 +1327,14 @@ void miro_ego_pipeline_close(miro_ego_pipeline_t *pipeline)
 void miro_ego_pipeline_stats(const miro_ego_pipeline_t *pipeline,
                              miro_ego_pipeline_stats_t *out)
 {
-    miro_ego_pipeline_t *mutable_pipeline = (miro_ego_pipeline_t *)pipeline;
+    if (out == NULL) {
+        return;
+    }
     memset(out, 0, sizeof(*out));
+    if (pipeline == NULL) {
+        return;
+    }
+    miro_ego_pipeline_t *mutable_pipeline = (miro_ego_pipeline_t *)pipeline;
     out->offered = atomic_load(&mutable_pipeline->offered);
     out->submitted = atomic_load(&mutable_pipeline->submitted);
     out->decoded = atomic_load(&mutable_pipeline->decoded);
@@ -1274,12 +1346,14 @@ void miro_ego_pipeline_stats(const miro_ego_pipeline_t *pipeline,
         out->encoded[eye] = atomic_load(&mutable_pipeline->encoded[eye]);
         out->bytes[eye] = atomic_load(&mutable_pipeline->bytes[eye]);
         out->max_write_ns[eye] = atomic_load(&mutable_pipeline->eyes[eye].max_write_ns);
-        miro_ego_packet_queue_t *queue = &mutable_pipeline->eyes[eye].packets;
-        pthread_mutex_lock(&queue->lock);
-        out->write_queue_peak_bytes[eye] = queue->peak_bytes;
-        out->write_queue_peak_frames[eye] = queue->peak_frames;
-        out->write_queue_rejected[eye] = queue->rejected;
-        pthread_mutex_unlock(&queue->lock);
+        if (mutable_pipeline->eyes[eye].packets_initialized) {
+            miro_ego_packet_queue_t *queue = &mutable_pipeline->eyes[eye].packets;
+            pthread_mutex_lock(&queue->lock);
+            out->write_queue_peak_bytes[eye] = queue->peak_bytes;
+            out->write_queue_peak_frames[eye] = queue->peak_frames;
+            out->write_queue_rejected[eye] = queue->rejected;
+            pthread_mutex_unlock(&queue->lock);
+        }
     }
 }
 
@@ -1294,6 +1368,9 @@ int miro_ego_pipeline_failed(const miro_ego_pipeline_t *pipeline)
 
 const char *miro_ego_pipeline_error(const miro_ego_pipeline_t *pipeline)
 {
+    if (pipeline == NULL || !pipeline->error_initialized) {
+        return "";
+    }
     /* An input error is reported before worker drain completes. Copy under the
      * lock so the caller never races the first error from another thread. */
     static _Thread_local char error[ERROR_LEN];

@@ -156,13 +156,27 @@ impl SegmentWriter {
         progress: Arc<AudioProgress>,
     ) -> Result<Self, AudioError> {
         let segment_frames = (config.sample_rate_hz as f64 * config.segment_seconds).round();
-        if !segment_frames.is_finite() || segment_frames < 1.0 || segment_frames > u64::MAX as f64 {
+        if !segment_frames.is_finite() || segment_frames < 1.0 || segment_frames >= u64::MAX as f64
+        {
             return Err(AudioError::new(
                 "invalid_argument",
                 "audio segment duration is invalid",
             ));
         }
+        let segment_frames_u64 = segment_frames as u64;
         let bytes_per_frame = u64::from(config.channels) * BYTES_PER_SAMPLE;
+        let Some(max_segment_bytes) = segment_frames_u64.checked_mul(bytes_per_frame) else {
+            return Err(AudioError::new(
+                "audio_too_large",
+                "WAV segment size overflow",
+            ));
+        };
+        if max_segment_bytes > u64::from(u32::MAX - 36) {
+            return Err(AudioError::new(
+                "audio_too_large",
+                "WAV segment exceeds 4 GiB RIFF limit",
+            ));
+        }
         let root = config.session_root.clone();
         let state = Arc::clone(&progress);
         let mut durable_records = Vec::new();
@@ -192,7 +206,7 @@ impl SegmentWriter {
             sample_rate_hz: config.sample_rate_hz,
             channels: config.channels,
             bytes_per_frame,
-            segment_frames: segment_frames as u64,
+            segment_frames: segment_frames_u64,
             next_index: 0,
             active: None,
             records: Vec::new(),
@@ -337,6 +351,9 @@ impl SegmentWriter {
             .take()
             .ok_or_else(|| AudioError::new("invalid_state", "audio segment is missing"))?;
         if segment.data_bytes == 0 {
+            let empty_path = self.root.join(&segment.relative_path);
+            drop(segment.writer);
+            let _ = std::fs::remove_file(empty_path);
             return Ok(());
         }
         let final_header =
@@ -790,6 +807,38 @@ mod tests {
         assert_eq!(records[1].end_sample, 5);
         assert!(root.join("audio/audio_00000.wav").is_file());
         assert!(root.join("audio/audio_00001.wav").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_4gib_wav_segment_up_front_and_unlinks_empty_active_segment() {
+        let root = tempfile_dir();
+        let oversized = RecorderConfig {
+            session_root: root.clone(),
+            device: "hw:0,0".to_owned(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            segment_seconds: 30_000.0, // 30000 * 192000 = 5.76 GB > u32::MAX - 36
+        };
+        assert_eq!(
+            SegmentWriter::new(&oversized).err().unwrap().code,
+            "audio_too_large"
+        );
+
+        let normal = RecorderConfig {
+            session_root: root.clone(),
+            device: "hw:0,0".to_owned(),
+            sample_rate_hz: 10,
+            channels: 2,
+            segment_seconds: 1.0,
+        };
+        let mut writer = SegmentWriter::new(&normal).unwrap();
+        writer.open_segment(0).unwrap();
+        assert!(root.join("audio/audio_00000.wav").exists());
+        let records = writer.finish().unwrap();
+        assert!(records.is_empty());
+        assert!(!root.join("audio/audio_00000.wav").exists());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -20,7 +20,9 @@ static inline void copy_row_fast(uint8_t *dst, const uint8_t *src, size_t width)
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     size_t offset = 0;
     while (width - offset >= 64u) {
-        prefetch_read(src + offset + 256u);
+        if (offset + 256u < width) {
+            prefetch_read(src + offset + 256u);
+        }
         uint8x16_t v0 = vld1q_u8(src + offset);
         uint8x16_t v1 = vld1q_u8(src + offset + 16u);
         uint8x16_t v2 = vld1q_u8(src + offset + 32u);

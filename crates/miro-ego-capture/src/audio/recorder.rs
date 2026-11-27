@@ -10,7 +10,7 @@ use miro_ego_core::sys::clock as sys_clock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -31,12 +31,14 @@ pub struct RecorderConfig {
 pub struct Recorder {
     config: RecorderConfig,
     lifecycle: Mutex<Lifecycle>,
+    lifecycle_changed: Condvar,
     stop: Arc<AtomicBool>,
     progress: Arc<AudioProgress>,
 }
 
 struct Lifecycle {
     state: State,
+    abort_requested: bool,
     done: Option<Receiver<Result<AudioRecordingResult, AudioError>>>,
     worker: Option<JoinHandle<()>>,
     result: Option<AudioRecordingResult>,
@@ -84,10 +86,12 @@ impl Recorder {
             },
             lifecycle: Mutex::new(Lifecycle {
                 state: State::Open,
+                abort_requested: false,
                 done: None,
                 worker: None,
                 result: None,
             }),
+            lifecycle_changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AudioProgress::default()),
         })
@@ -106,6 +110,7 @@ impl Recorder {
                 ));
             }
             lifecycle.state = State::Starting;
+            lifecycle.abort_requested = false;
         }
         self.stop.store(false, Ordering::Release);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -126,8 +131,13 @@ impl Recorder {
             Err(error) => {
                 if let Ok(mut lifecycle) = self.lifecycle.lock() {
                     if lifecycle.state == State::Starting {
-                        lifecycle.state = State::Closed;
+                        lifecycle.state = if lifecycle.abort_requested {
+                            State::Aborted
+                        } else {
+                            State::Closed
+                        };
                     }
+                    self.lifecycle_changed.notify_all();
                 }
                 return Err(AudioError::new(
                     "audio_start_failed",
@@ -141,8 +151,10 @@ impl Recorder {
                 let mut lifecycle = self.lifecycle.lock().map_err(|_| {
                     AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
                 })?;
-                if lifecycle.state != State::Starting {
+                if lifecycle.state != State::Starting || lifecycle.abort_requested {
                     self.stop.store(true, Ordering::Release);
+                    lifecycle.state = State::Aborted;
+                    self.lifecycle_changed.notify_all();
                     drop(lifecycle);
                     let _ = worker.join();
                     return Err(AudioError::new(
@@ -153,6 +165,7 @@ impl Recorder {
                 lifecycle.done = Some(done_rx);
                 lifecycle.worker = Some(worker);
                 lifecycle.state = State::Running;
+                self.lifecycle_changed.notify_all();
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -161,20 +174,42 @@ impl Recorder {
                     AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
                 })?;
                 if lifecycle.state == State::Starting {
-                    lifecycle.state = State::Closed;
+                    lifecycle.state = if lifecycle.abort_requested {
+                        State::Aborted
+                    } else {
+                        State::Closed
+                    };
                 }
+                self.lifecycle_changed.notify_all();
                 Err(error)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.stop.store(true, Ordering::Release);
-                // Bound waiting outside the lifecycle lock; detach if ALSA initialization is wedged.
-                if done_rx.recv_timeout(START_TIMEOUT_JOIN_WAIT).is_ok() {
+                let joined = if done_rx.recv_timeout(START_TIMEOUT_JOIN_WAIT).is_ok() {
                     let _ = worker.join();
-                }
+                    None
+                } else {
+                    Some((done_rx, worker))
+                };
                 if let Ok(mut lifecycle) = self.lifecycle.lock() {
-                    if lifecycle.state == State::Starting {
-                        lifecycle.state = State::Closed;
+                    if let Some((done_rx, worker)) = joined {
+                        lifecycle.done = Some(done_rx);
+                        lifecycle.worker = Some(worker);
+                        if lifecycle.state == State::Starting {
+                            lifecycle.state = if lifecycle.abort_requested {
+                                State::Aborted
+                            } else {
+                                State::Failed
+                            };
+                        }
+                    } else if lifecycle.state == State::Starting {
+                        lifecycle.state = if lifecycle.abort_requested {
+                            State::Aborted
+                        } else {
+                            State::Closed
+                        };
                     }
+                    self.lifecycle_changed.notify_all();
                 }
                 Err(AudioError::new(
                     "audio_start_timeout",
@@ -185,8 +220,13 @@ impl Recorder {
                 let _ = worker.join();
                 if let Ok(mut lifecycle) = self.lifecycle.lock() {
                     if lifecycle.state == State::Starting {
-                        lifecycle.state = State::Closed;
+                        lifecycle.state = if lifecycle.abort_requested {
+                            State::Aborted
+                        } else {
+                            State::Closed
+                        };
                     }
+                    self.lifecycle_changed.notify_all();
                 }
                 Err(AudioError::new(
                     "audio_start_failed",
@@ -255,50 +295,40 @@ impl Recorder {
 
         match done.recv_timeout(timeout) {
             Ok(result) => {
-                worker.join().map_err(|_| {
-                    AudioError::new("native_audio_worker_failed", "audio worker panicked")
-                })?;
+                let join_res = worker.join();
                 let mut lifecycle = self.lifecycle.lock().map_err(|_| {
                     AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
                 })?;
-                if lifecycle.state == State::Stopping {
-                    match &result {
-                        Ok(ok_result) => {
+                if lifecycle.abort_requested {
+                    lifecycle.state = State::Aborted;
+                } else if lifecycle.state == State::Stopping {
+                    match (&join_res, &result) {
+                        (Ok(()), Ok(ok_result)) => {
                             lifecycle.state = State::Stopped;
                             lifecycle.result = Some(ok_result.clone());
                         }
-                        Err(_) => {
+                        _ => {
                             lifecycle.state = State::Failed;
                         }
                     }
                 }
+                self.lifecycle_changed.notify_all();
+                drop(lifecycle);
+                join_res.map_err(|_| {
+                    AudioError::new("native_audio_worker_failed", "audio worker panicked")
+                })?;
                 result
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                {
-                    let mut lifecycle = self.lifecycle.lock().map_err(|_| {
-                        AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
-                    })?;
-                    if lifecycle.state == State::Stopping {
-                        lifecycle.done = Some(done);
-                        lifecycle.worker = Some(worker);
+                if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                    lifecycle.done = Some(done);
+                    lifecycle.worker = Some(worker);
+                    if lifecycle.abort_requested {
+                        lifecycle.state = State::Aborted;
+                    } else if lifecycle.state == State::Stopping {
                         lifecycle.state = State::Running;
-                        return Err(AudioError::new(
-                            "audio_stop_timeout",
-                            "native audio recorder did not stop in time",
-                        ));
                     }
-                    if lifecycle.state == State::Aborted {
-                        lifecycle.done = Some(done);
-                        lifecycle.worker = Some(worker);
-                        return Err(AudioError::new(
-                            "audio_stop_timeout",
-                            "native audio recorder did not stop in time",
-                        ));
-                    }
-                }
-                if done.try_recv().is_ok() {
-                    let _ = worker.join();
+                    self.lifecycle_changed.notify_all();
                 }
                 Err(AudioError::new(
                     "audio_stop_timeout",
@@ -306,15 +336,20 @@ impl Recorder {
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                worker.join().map_err(|_| {
-                    AudioError::new("native_audio_worker_failed", "audio worker panicked")
-                })?;
+                let join_res = worker.join();
                 let mut lifecycle = self.lifecycle.lock().map_err(|_| {
                     AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
                 })?;
-                if lifecycle.state == State::Stopping {
+                if lifecycle.abort_requested {
+                    lifecycle.state = State::Aborted;
+                } else if lifecycle.state == State::Stopping {
                     lifecycle.state = State::Closed;
                 }
+                self.lifecycle_changed.notify_all();
+                drop(lifecycle);
+                join_res.map_err(|_| {
+                    AudioError::new("native_audio_worker_failed", "audio worker panicked")
+                })?;
                 Err(AudioError::new(
                     "audio_failed",
                     "native audio recorder exited without a result",
@@ -356,15 +391,34 @@ impl Recorder {
 
     pub fn abort(&self) {
         self.stop.store(true, Ordering::Release);
-        let worker = self.lifecycle.lock().ok().and_then(|mut lifecycle| {
-            lifecycle.done = None;
-            if !matches!(lifecycle.state, State::Stopped | State::Closed) {
-                lifecycle.state = State::Aborted;
+        let worker = match self.lifecycle.lock() {
+            Ok(mut lifecycle) => {
+                lifecycle.abort_requested = true;
+                while matches!(lifecycle.state, State::Starting | State::Stopping) {
+                    lifecycle = match self.lifecycle_changed.wait(lifecycle) {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+                lifecycle.done = None;
+                if !matches!(lifecycle.state, State::Stopped | State::Closed) {
+                    lifecycle.state = State::Aborted;
+                }
+                let worker = lifecycle.worker.take();
+                self.lifecycle_changed.notify_all();
+                worker
             }
-            lifecycle.worker.take()
-        });
+            Err(poisoned) => {
+                let mut lifecycle = poisoned.into_inner();
+                lifecycle.abort_requested = true;
+                lifecycle.done = None;
+                lifecycle.worker.take()
+            }
+        };
         if let Some(worker) = worker {
-            let _ = worker.join();
+            if worker.thread().id() != thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 
@@ -372,6 +426,7 @@ impl Recorder {
         self.abort();
         if let Ok(mut lifecycle) = self.lifecycle.lock() {
             lifecycle.state = State::Closed;
+            self.lifecycle_changed.notify_all();
         }
     }
 }
@@ -395,6 +450,15 @@ fn start_and_capture(
             return Err(error);
         }
     };
+    if stop.load(Ordering::Acquire) {
+        let _ = pcm.close();
+        let error = AudioError::new(
+            "invalid_state",
+            "native audio recorder was stopped during start",
+        );
+        let _ = ready.send(Err(error.clone()));
+        return Err(error);
+    }
     let mut writer = match SegmentWriter::with_progress(&config, Arc::clone(&progress)) {
         Ok(writer) => writer,
         Err(error) => {
@@ -616,16 +680,23 @@ fn start_and_capture(
             return Err(error);
         }
     };
+    let min_tail_gap = (u64::from(config.sample_rate_hz) / 10).max(1);
     if let Some(anchor) = last_anchor {
         let mut guard = progress
             .clock_checkpoint
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(clock) = guard.as_mut() {
-            let last_global = clock.anchors.last().copied().or(clock.last_anchor);
-            if last_global != Some(anchor) || clock.base_index == 0 && clock.anchors.is_empty() {
-                clock.anchors.push(anchor);
-            }
+            clock.last_anchor = Some(anchor);
+            let total_len = clock.base_index.saturating_add(clock.anchors.len());
+            append_or_replace_tail_anchor(
+                &mut clock.anchors,
+                anchor,
+                min_tail_gap,
+                total_len,
+                pcm.buffer_frames,
+                pcm.period_frames,
+            );
         }
     }
     let closed = pcm.close();
@@ -634,9 +705,15 @@ fn start_and_capture(
         .join()
         .map_err(|_| AudioError::new("audio_failed", "audio writer panicked"))?;
     if let Some(anchor) = last_anchor {
-        if anchors.last() != Some(&anchor) {
-            anchors.push(anchor);
-        }
+        let total_len = anchors.len();
+        append_or_replace_tail_anchor(
+            &mut anchors,
+            anchor,
+            min_tail_gap,
+            total_len,
+            pcm.buffer_frames,
+            pcm.period_frames,
+        );
     }
     let clock_result = capture_clock(
         &config,
@@ -676,9 +753,19 @@ fn start_and_capture(
         "period_frames": pcm.period_frames,
         "buffer_frames": pcm.buffer_frames,
     });
-    let diagnostic_path = config.session_root.join("audio/capture-clock.json");
-    if let Ok(payload) = serde_json::to_vec(&diagnostic) {
-        let _ = std::fs::write(diagnostic_path, payload);
+    if !config.session_root.as_os_str().is_empty() {
+        let audio_dir = config.session_root.join("audio");
+        if std::fs::create_dir_all(&audio_dir).is_ok() {
+            let diagnostic_path = audio_dir.join("capture-clock.json");
+            if let Ok(payload) = serde_json::to_vec(&diagnostic) {
+                let _ = miro_ego_core::sys::fs::write_bytes_atomic(
+                    &diagnostic_path,
+                    &payload,
+                    0o640,
+                    true,
+                );
+            }
+        }
     }
     captured?;
     closed?;
@@ -709,6 +796,37 @@ fn start_and_capture(
         stopped_monotonic_ns,
         segments,
     })
+}
+
+fn append_or_replace_tail_anchor(
+    anchors: &mut Vec<clock::Anchor>,
+    anchor: clock::Anchor,
+    min_tail_gap: u64,
+    total_len: usize,
+    buffer_frames: u64,
+    period_frames: u64,
+) {
+    if anchors.is_empty() {
+        if total_len == 0 {
+            anchors.push(anchor);
+        }
+        return;
+    }
+    let Some(last) = anchors.last_mut() else {
+        return;
+    };
+    if *last == anchor {
+        return;
+    }
+    let close_tail = anchor[0] >= last[0] && anchor[0] - last[0] < min_tail_gap;
+    if close_tail
+        && (total_len >= 2
+            || (total_len == 1 && anchor[0] <= buffer_frames.saturating_add(period_frames)))
+    {
+        *last = anchor;
+    } else {
+        anchors.push(anchor);
+    }
 }
 
 fn capture_clock(
@@ -848,17 +966,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_abort_during_stop_preserves_aborted_state() {
+    fn concurrent_abort_during_stop_waits_for_worker_and_preserves_aborted_state() {
         let root = tempfile_dir();
         let recorder =
             Arc::new(Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap());
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
             let _ = release_rx.recv_timeout(Duration::from_secs(2));
             let _ = done_tx.send(Err(AudioError::new("audio_failed", "aborted")));
+            let _ = exited_tx.send(());
         });
         {
             let mut lifecycle = recorder.lifecycle.lock().unwrap();
@@ -870,12 +990,83 @@ mod tests {
         let stopper_rec = Arc::clone(&recorder);
         let stopper = std::thread::spawn(move || stopper_rec.stop(Duration::from_millis(50)));
         std::thread::sleep(Duration::from_millis(10));
-        recorder.abort();
-        assert_eq!(recorder.lifecycle.lock().unwrap().state, State::Aborted);
+
+        let aborter_rec = Arc::clone(&recorder);
+        let (abort_done_tx, abort_done_rx) = mpsc::channel();
+        let aborter = std::thread::spawn(move || {
+            aborter_rec.abort();
+            abort_done_tx.send(()).unwrap();
+        });
+
+        // Stopper times out while worker is still blocked; aborter must NOT return until worker exits!
+        let stop_res = stopper.join().unwrap();
+        assert_eq!(stop_res.unwrap_err().code, "audio_stop_timeout");
+        assert!(
+            abort_done_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err()
+        );
+
         release_tx.send(()).unwrap();
-        let _ = stopper.join().unwrap();
+        abort_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        aborter.join().unwrap();
+        // Worker is guaranteed to have exited before abort() returned.
+        assert!(exited_rx.try_recv().is_ok());
         assert_eq!(recorder.lifecycle.lock().unwrap().state, State::Aborted);
+        assert!(recorder.lifecycle.lock().unwrap().worker.is_none());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sub_millisecond_tail_anchor_replaces_last_anchor_without_rate_jitter_error() {
+        let mut anchors = vec![
+            [
+                48,
+                2_001_000_000,
+                1_101_400_000,
+                2_001_010_000,
+                2_001_810_000,
+            ],
+            [
+                48_048,
+                3_001_000_000,
+                2_101_400_000,
+                3_001_010_000,
+                3_001_810_000,
+            ],
+        ];
+        // Final read only 24 samples (0.5ms) later with slightly shifted valid host bracket:
+        let tail = [
+            48_072,
+            3_001_500_000,
+            2_102_250_000,
+            3_001_550_000,
+            3_002_350_000,
+        ];
+        let len = anchors.len();
+        append_or_replace_tail_anchor(&mut anchors, tail, 4_800, len, 48_000, 1024);
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[1], tail);
+
+        let config = RecorderConfig {
+            session_root: PathBuf::new(),
+            device: "hw:test".into(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            segment_seconds: 5.0,
+        };
+        let progress = AudioProgress::default();
+        let clock = capture_clock(
+            &config,
+            (1024, 48_000),
+            48_072,
+            1_100_000_000,
+            2_105_000_000,
+            &anchors,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(clock["continuity"], "verified");
     }
 
     #[test]

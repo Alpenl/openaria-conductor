@@ -239,12 +239,20 @@ pub fn open_readonly_safe(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+fn normalize_dir_path(path: &Path) -> &Path {
+    if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    }
+}
+
 /// Safely open a directory read-only with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`.
 pub fn open_directory_safe(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+        .open(normalize_dir_path(path))
 }
 
 /// Safely create a new regular file exclusively with `O_NOFOLLOW | O_CLOEXEC`.
@@ -257,10 +265,21 @@ pub fn open_create_exclusive(path: &Path, mode: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Flush directory metadata to disk (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`).
+/// Flush directory metadata to disk (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`),
+/// tolerating filesystems (such as exFAT/FAT) whose directory `fsync` returns
+/// `EINVAL`, `ENOSYS`, or `EOPNOTSUPP`.
 pub fn fsync_directory(path: &Path) -> io::Result<()> {
     let dir = open_directory_safe(path)?;
-    dir.sync_all()
+    if let Err(error) = dir.sync_all() {
+        let exfat_dir_sync_unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EBADF)
+        );
+        if !(exfat_dir_sync_unsupported && is_exfat_or_msdos(dir.as_raw_fd()).unwrap_or(false)) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Read FAT / exFAT file attributes via `FAT_IOCTL_GET_ATTRIBUTES`.
@@ -268,14 +287,18 @@ pub fn get_fat_attributes(fd: RawFd) -> io::Result<u32> {
     if fd < 0 {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
-    let mut attrs: u32 = 0;
     #[allow(clippy::unnecessary_cast)]
     let request = FAT_IOCTL_GET_ATTRIBUTES as libc::Ioctl;
-    // SAFETY: `attrs` is a valid mutable `u32` expected by `FAT_IOCTL_GET_ATTRIBUTES`.
-    if unsafe { libc::ioctl(fd, request, &mut attrs) } == 0 {
-        Ok(attrs)
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        let mut attrs: u32 = 0;
+        // SAFETY: `attrs` is a valid mutable `u32` expected by `FAT_IOCTL_GET_ATTRIBUTES`.
+        if unsafe { libc::ioctl(fd, request, &mut attrs) } == 0 {
+            return Ok(attrs);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -284,14 +307,18 @@ pub fn set_fat_attributes(fd: RawFd, attrs: u32) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
-    let mut value = attrs;
     #[allow(clippy::unnecessary_cast)]
     let request = FAT_IOCTL_SET_ATTRIBUTES as libc::Ioctl;
-    // SAFETY: `value` points to a readable `u32` expected by `FAT_IOCTL_SET_ATTRIBUTES`.
-    if unsafe { libc::ioctl(fd, request, &mut value) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        let mut value = attrs;
+        // SAFETY: `value` points to a readable `u32` expected by `FAT_IOCTL_SET_ATTRIBUTES`.
+        if unsafe { libc::ioctl(fd, request, &mut value) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -305,26 +332,34 @@ pub fn set_exfat_hidden(path: &Path, hidden: bool) -> io::Result<bool> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
-    match set_exfat_hidden_fd(file.as_raw_fd(), hidden) {
-        Ok(()) => Ok(true),
-        Err(error) if is_fat_ioctl_unsupported(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+    try_set_exfat_hidden_fd(file.as_raw_fd(), hidden)
 }
 
-/// Toggle exFAT/FAT native `ATTR_HIDDEN` on an open descriptor without suppressing
-/// unsupported-filesystem errors.
+/// Toggle exFAT/FAT native `ATTR_HIDDEN` on an open descriptor, tolerating kernels
+/// or filesystems (such as Linux 6.1 exFAT) where `FAT_IOCTL_*_ATTRIBUTES` returns `ENOTTY`.
 pub fn set_exfat_hidden_fd(fd: RawFd, hidden: bool) -> io::Result<()> {
-    let current = get_fat_attributes(fd)?;
+    try_set_exfat_hidden_fd(fd, hidden).map(|_| ())
+}
+
+fn try_set_exfat_hidden_fd(fd: RawFd, hidden: bool) -> io::Result<bool> {
+    let current = match get_fat_attributes(fd) {
+        Ok(attrs) => attrs,
+        Err(error) if is_fat_ioctl_unsupported(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
     let updated = if hidden {
         current | FAT_ATTR_HIDDEN
     } else {
         current & !FAT_ATTR_HIDDEN
     };
     if updated == current {
-        return Ok(());
+        return Ok(true);
     }
-    set_fat_attributes(fd, updated)
+    match set_fat_attributes(fd, updated) {
+        Ok(()) => Ok(true),
+        Err(error) if is_fat_ioctl_unsupported(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn is_fat_ioctl_unsupported(error: &io::Error) -> bool {
@@ -512,12 +547,13 @@ pub fn write_bytes_atomic(
     mode: u32,
     sync_dir: bool,
 ) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
+    let raw_parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic write path has no parent directory",
         )
     })?;
+    let parent = normalize_dir_path(raw_parent);
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -571,9 +607,10 @@ pub fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> 
             "max_bytes must be positive",
         ));
     }
-    let parent = path.parent().ok_or_else(|| {
+    let raw_parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
     })?;
+    let parent = normalize_dir_path(raw_parent);
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -932,12 +969,17 @@ mod tests {
         fadvise_dontneed(file.as_raw_fd(), 0, 0).unwrap();
         sync_and_evict_page_cache(&file).unwrap();
 
-        // On Linux tmpfs/ext4, FAT_IOCTL_GET_ATTRIBUTES returns ENOTTY/EINVAL,
-        // so set_exfat_hidden cleanly reports Ok(false) instead of failing.
+        // On Linux tmpfs/ext4/6.1-exFAT, FAT_IOCTL_GET_ATTRIBUTES returns ENOTTY/EINVAL,
+        // so both set_exfat_hidden and set_exfat_hidden_fd tolerate unsupported ioctls.
         let hidden_dir = root.join(".miro-ego");
         fs::create_dir(&hidden_dir).unwrap();
         assert!(!set_exfat_hidden(&hidden_dir, true).unwrap());
-        assert!(set_exfat_hidden_fd(file.as_raw_fd(), true).is_err());
+        assert!(set_exfat_hidden_fd(file.as_raw_fd(), true).is_ok());
+        assert_eq!(
+            set_exfat_hidden_fd(-1, true).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(get_fat_attributes(file.as_raw_fd()).is_err());
 
         // Verify exact Linux ioctl numbers match <linux/msdos_fs.h>
         assert_eq!(FAT_IOCTL_GET_ATTRIBUTES, 0x8004_7210);
@@ -1016,6 +1058,36 @@ mod tests {
         fs::hard_link(&target, &hard_path).unwrap();
         assert!(read_bounded_bytes(&target, 1024).is_err());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bare_relative_paths_work_with_write_bytes_atomic_and_read_bounded_bytes() {
+        use std::process::Command;
+
+        if std::env::var_os("MIRO_EGO_TEST_BARE_REL_SUBPROCESS").is_some() {
+            let bare = Path::new("bare-settings.json");
+            write_bytes_atomic(bare, br#"{"ok":true}"#, 0o640, true).unwrap();
+            let loaded = read_bounded_json_value(bare, 1024, 4).unwrap();
+            assert_eq!(loaded["ok"], true);
+            fsync_directory(Path::new("")).unwrap();
+            return;
+        }
+
+        let root = temp_dir("bare-rel");
+        let exe = std::env::current_exe().unwrap();
+        let status = Command::new(&exe)
+            .args([
+                "--exact",
+                "sys::fs::tests::bare_relative_paths_work_with_write_bytes_atomic_and_read_bounded_bytes",
+                "--nocapture",
+            ])
+            .current_dir(&root)
+            .env("MIRO_EGO_TEST_BARE_REL_SUBPROCESS", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(root.join("bare-settings.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -33,9 +33,16 @@ int miro_ego_mp4_fix_color(unsigned char *moov, size_t moov_size,
 
 /*
  * Extends mvhd, tkhd, mdhd, and elst durations in-place by one frame interval
- * (supporting both 32-bit version-0 and 64-bit version-1 boxes as well as 64-bit
- * largesize top-level/child boxes) and applies the colorimetry fixup.
+ * on an already-open read/write file descriptor (without closing fd) and
+ * applies the colorimetry fixup.
  * Returns 0 on success, -1 on failure with a diagnostic message in reason.
+ */
+int miro_ego_mp4_extend_durations_fd(int fd, int fps,
+                                     char *reason, size_t reason_len);
+
+/*
+ * Path wrapper around miro_ego_mp4_extend_durations_fd opening path with
+ * O_RDWR | O_NOFOLLOW | O_CLOEXEC.
  */
 int miro_ego_mp4_extend_durations(const char *path, int fps,
                                   char *reason, size_t reason_len);

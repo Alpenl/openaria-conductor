@@ -101,11 +101,15 @@ pub struct DeviceSessionSealResult {
 }
 
 pub fn hash_file(path: &Path) -> Result<FileDigest, SessionIoError> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|error| SessionIoError::os("artifact_invalid", "无法打开 artifact", error))?;
+    hash_opened_regular_file(file)
+}
+
+fn hash_opened_regular_file(mut file: File) -> Result<FileDigest, SessionIoError> {
     let raw = fstat_raw(file.as_raw_fd())?;
     let before = identity_from_stat(&raw)?;
     before.require_regular(raw.st_mode)?;
@@ -170,30 +174,70 @@ pub fn finalize_artifact_with_digest(
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|error| SessionIoError::os("artifact_invalid", "无法打开 artifact", error))?;
-        let raw = fstat_raw(file.as_raw_fd())?;
-        let identity = identity_from_stat(&raw)?;
-        identity.require_regular(raw.st_mode)?;
-        if identity.nlink != 1 {
-            return Err(SessionIoError::new(
-                "artifact_invalid",
-                "artifact 不是独占普通文件",
-            ));
-        }
-        if let Some(expected) = expected_bytes {
-            if identity.size != expected {
-                return Err(SessionIoError::new(
-                    "artifact_invalid",
-                    "artifact 大小与声明不一致",
-                ));
-            }
-        }
-        return Ok(FileDigest {
-            identity,
-            sha256: precomputed.to_owned(),
-        });
+        return finalize_opened_file_with_precomputed_digest(file, expected_bytes, precomputed);
     }
 
     let digest = hash_file(path)?;
+    if let Some(expected) = expected_bytes {
+        if digest.identity.size != expected {
+            return Err(SessionIoError::new(
+                "artifact_invalid",
+                "artifact 大小与声明不一致",
+            ));
+        }
+    }
+    Ok(digest)
+}
+
+fn finalize_opened_file_with_precomputed_digest(
+    file: File,
+    expected_bytes: Option<u64>,
+    precomputed: &str,
+) -> Result<FileDigest, SessionIoError> {
+    let raw = fstat_raw(file.as_raw_fd())?;
+    let identity = identity_from_stat(&raw)?;
+    identity.require_regular(raw.st_mode)?;
+    if identity.nlink != 1 {
+        return Err(SessionIoError::new(
+            "artifact_invalid",
+            "artifact 不是独占普通文件",
+        ));
+    }
+    if let Some(expected) = expected_bytes {
+        if identity.size != expected {
+            return Err(SessionIoError::new(
+                "artifact_invalid",
+                "artifact 大小与声明不一致",
+            ));
+        }
+    }
+    Ok(FileDigest {
+        identity,
+        sha256: precomputed.to_owned(),
+    })
+}
+
+fn finalize_relative_artifact_with_digest(
+    root_fd: libc::c_int,
+    relative_path: &str,
+    expected_bytes: Option<u64>,
+    precomputed_sha256: Option<&str>,
+) -> Result<FileDigest, SessionIoError> {
+    if let Some(precomputed) = precomputed_sha256 {
+        if !is_sha256(precomputed) {
+            return Err(SessionIoError::new(
+                "artifact_invalid",
+                "precomputed SHA-256 format is invalid",
+            ));
+        }
+    }
+    let descriptor = open_relative_regular(root_fd, relative_path)?;
+    // SAFETY: `open_relative_regular` returns a freshly opened, owned file descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if let Some(precomputed) = precomputed_sha256 {
+        return finalize_opened_file_with_precomputed_digest(file, expected_bytes, precomputed);
+    }
+    let digest = hash_opened_regular_file(file)?;
     if let Some(expected) = expected_bytes {
         if digest.identity.size != expected {
             return Err(SessionIoError::new(
@@ -214,13 +258,16 @@ pub fn finalize_segment_artifacts(
 ) -> Result<(FileDigest, FileDigest), SessionIoError> {
     validate_relative_artifact_path(&segment.left_path)?;
     validate_relative_artifact_path(&segment.right_path)?;
-    let left = finalize_artifact_with_digest(
-        &session_root.join(&segment.left_path),
+    let root = open_directory(session_root, "artifact_invalid", "无法安全打开会话目录")?;
+    let left = finalize_relative_artifact_with_digest(
+        root.as_raw_fd(),
+        &segment.left_path,
         Some(segment.left_bytes),
         segment.left_sha256.as_deref(),
     )?;
-    let right = finalize_artifact_with_digest(
-        &session_root.join(&segment.right_path),
+    let right = finalize_relative_artifact_with_digest(
+        root.as_raw_fd(),
+        &segment.right_path,
         Some(segment.right_bytes),
         segment.right_sha256.as_deref(),
     )?;
@@ -343,12 +390,154 @@ fn sendfile_error(error: std::io::Error) -> SessionIoError {
 }
 
 pub fn write_encoder_frame(fd: libc::c_int, jpeg: &[u8]) -> Result<u64, SessionIoError> {
+    write_encoder_frame_nonblocking(
+        fd,
+        None,
+        jpeg,
+        std::time::Duration::from_secs(10),
+        |_, _| Ok(()),
+    )
+}
+
+pub fn write_encoder_frame_nonblocking<F>(
+    fd: libc::c_int,
+    wake_fd: Option<libc::c_int>,
+    jpeg: &[u8],
+    timeout: std::time::Duration,
+    mut check_state: F,
+) -> Result<u64, SessionIoError>
+where
+    F: FnMut(bool, bool) -> Result<(), SessionIoError>,
+{
+    if fd < 0 {
+        return Err(SessionIoError::new("write_failed", "文件描述符无效"));
+    }
     let length = u32::try_from(jpeg.len())
         .map_err(|_| SessionIoError::new("write_failed", "encoder frame 超出长度限制"))?;
     let mut header = [0_u8; 8];
     header[..4].copy_from_slice(ENCODER_FRAME_MAGIC);
     header[4..].copy_from_slice(&length.to_le_bytes());
-    writev_all(fd, &[&header, jpeg])
+
+    let chunks: [&[u8]; 2] = [&header, jpeg];
+    let deadline = std::time::Instant::now() + timeout;
+    let mut index = 0_usize;
+    let mut offset = 0_usize;
+    let mut total = 0_u64;
+
+    while index < chunks.len() {
+        while index < chunks.len() && chunks[index].is_empty() {
+            index += 1;
+            offset = 0;
+        }
+        if index >= chunks.len() {
+            break;
+        }
+        check_state(total > 0, false)?;
+
+        let mut vectors = [iovec(&[]); 2];
+        let mut count = 0_usize;
+        for (chunk_idx, chunk) in chunks[index..].iter().enumerate() {
+            let slice = if chunk_idx == 0 {
+                &chunk[offset..]
+            } else {
+                *chunk
+            };
+            if !slice.is_empty() {
+                vectors[count] = iovec(slice);
+                count += 1;
+            }
+        }
+
+        let written = unsafe { libc::writev(fd, vectors.as_ptr(), count as libc::c_int) };
+        if written > 0 {
+            let mut remaining = written as usize;
+            total += written as u64;
+            while index < chunks.len() {
+                if chunks[index].is_empty() {
+                    index += 1;
+                    offset = 0;
+                    continue;
+                }
+                let available = chunks[index].len() - offset;
+                if remaining < available {
+                    offset += remaining;
+                    break;
+                }
+                remaining -= available;
+                index += 1;
+                offset = 0;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            continue;
+        }
+        if written == 0 {
+            return Err(SessionIoError::new("write_failed", "writev 写入零字节"));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            loop {
+                check_state(total > 0, true)?;
+                let remaining_time = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining_time.is_zero() {
+                    return Err(SessionIoError::new(
+                        "encoder_backpressure_timeout",
+                        "timed out waiting for encoder stdin pipe",
+                    ));
+                }
+                let slice_timeout = remaining_time.min(std::time::Duration::from_millis(50));
+                let timeout_ms =
+                    libc::c_int::try_from(slice_timeout.as_millis().max(1)).unwrap_or(50);
+                let mut pfds = [
+                    libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wake_fd.unwrap_or(-1),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let nfds: libc::nfds_t = if wake_fd.is_some() { 2 } else { 1 };
+                // SAFETY: `pfds` points to valid stack `pollfd` entries for `nfds` items.
+                let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms) };
+                if rc < 0 {
+                    let poll_err = std::io::Error::last_os_error();
+                    if poll_err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(SessionIoError::os(
+                        "write_failed",
+                        "poll encoder stdin 失败",
+                        poll_err,
+                    ));
+                }
+                if let Some(wfd) = wake_fd {
+                    if (pfds[1].revents & libc::POLLIN) != 0 {
+                        let mut val = 0_u64;
+                        // SAFETY: Draining 8-byte eventfd counter into stack `u64`.
+                        let _ =
+                            unsafe { libc::read(wfd, (&raw mut val).cast::<libc::c_void>(), 8) };
+                    }
+                }
+                if (pfds[0].revents
+                    & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL))
+                    != 0
+                {
+                    break;
+                }
+            }
+            continue;
+        }
+        return Err(SessionIoError::os("write_failed", "writev 失败", error));
+    }
+    Ok(total)
 }
 
 pub fn open_relative_regular(
@@ -614,11 +803,21 @@ pub fn seal_device_session(
     for control_name in control_names {
         validate_control_name(control_name)?;
     }
-    if std::fs::symlink_metadata(final_root).is_ok() {
-        return Err(SessionIoError::new(
-            "session_exists",
-            "最终会话目录已经存在",
-        ));
+    match std::fs::symlink_metadata(final_root) {
+        Ok(_) => {
+            return Err(SessionIoError::new(
+                "session_exists",
+                "最终会话目录已经存在",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SessionIoError::os(
+                "write_failed",
+                "检查最终会话目录失败",
+                error,
+            ));
+        }
     }
     // Verify artifacts before writing manifest or publishing so failed seals leave
     // partial_root intact with all control files untouched.
@@ -637,37 +836,87 @@ pub fn seal_device_session(
         let _ = fsync_directory(partial_root, "write_failed", "同步会话目录失败");
         return Err(error);
     }
-    if let Some(parent) = final_root.parent() {
-        fsync_directory(parent, "write_failed", "同步 generation 根目录失败")?;
-    }
-    // Unlink control markers only after final_root is published so a failed rename
-    // never leaves partial_root without recording.json / capture.json.
-    for control_name in control_names {
-        match std::fs::remove_file(final_root.join(control_name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(SessionIoError::os(
-                    "write_failed",
-                    "删除录制控制文件失败",
-                    error,
-                ));
+
+    let post_publish = (|| -> Result<(), SessionIoError> {
+        if let Some(final_parent) = final_root.parent() {
+            fsync_directory(final_parent, "write_failed", "同步 generation 根目录失败")?;
+        }
+        if let Some(partial_parent) = partial_root.parent() {
+            if Some(partial_parent) != final_root.parent() {
+                fsync_directory(partial_parent, "write_failed", "同步 staging 根目录失败")?;
             }
         }
+        // Unlink control markers only after final_root is published so a failed rename
+        // never leaves partial_root without recording.json / capture.json.
+        for control_name in control_names {
+            match std::fs::remove_file(final_root.join(control_name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SessionIoError::os(
+                        "write_failed",
+                        "删除录制控制文件失败",
+                        error,
+                    ));
+                }
+            }
+        }
+        fsync_directory(final_root, "write_failed", "同步会话目录失败")?;
+        verify_device_session_artifacts(
+            final_root,
+            manifest_payload,
+            expected_session_id,
+            expected_identities,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = post_publish {
+        rollback_published_directory(final_root, partial_root);
+        return Err(error);
     }
-    fsync_directory(final_root, "write_failed", "同步会话目录失败")?;
-    verify_device_session_artifacts(
-        final_root,
-        manifest_payload,
-        expected_session_id,
-        expected_identities,
-    )?;
+
     Ok(DeviceSessionSealResult {
         manifest_sha256: hex_digest(Sha256::digest(manifest_payload).as_slice()),
         artifact_count,
         manifest_bytes: u64::try_from(manifest_payload.len())
             .map_err(|_| SessionIoError::new("write_failed", "manifest 大小超出可表示范围"))?,
     })
+}
+
+fn rollback_published_directory(final_root: &Path, partial_root: &Path) {
+    let _ = std::fs::remove_file(final_root.join("manifest.json"));
+    let _ = fsync_directory(final_root, "write_failed", "回滚同步会话目录失败");
+    if let (Ok(old_c), Ok(new_c)) = (
+        path_cstring(final_root, "write_failed"),
+        path_cstring(partial_root, "write_failed"),
+    ) {
+        match renameat2_noreplace(&old_c, &new_c) {
+            Ok(()) => {}
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+                if matches!(
+                    std::fs::symlink_metadata(partial_root),
+                    Err(ref stat_err) if stat_err.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    let _ = std::fs::rename(final_root, partial_root);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = std::fs::remove_file(partial_root.join("manifest.json"));
+    let _ = fsync_directory(
+        partial_root,
+        "write_failed",
+        "回滚同步 staging 会话目录失败",
+    );
+    if let Some(final_parent) = final_root.parent() {
+        let _ = fsync_directory(final_parent, "write_failed", "回滚同步目录失败");
+    }
+    if let Some(partial_parent) = partial_root.parent() {
+        if Some(partial_parent) != final_root.parent() {
+            let _ = fsync_directory(partial_parent, "write_failed", "回滚同步目录失败");
+        }
+    }
 }
 
 fn path_cstring(path: &Path, code: &'static str) -> Result<CString, SessionIoError> {
@@ -688,14 +937,22 @@ fn publish_directory_noreplace(
         ),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
             // Filesystems or kernels without RENAME_NOREPLACE support fall back to an
-            // explicit O_DIRECTORY/lstat pre-check plus standard rename.
-            if open_directory(final_root, "session_exists", "检查最终会话目录失败").is_ok()
-                || std::fs::symlink_metadata(final_root).is_ok()
-            {
-                return Err(SessionIoError::new(
-                    "session_exists",
-                    "最终会话目录已经存在",
-                ));
+            // explicit lstat pre-check verifying NotFound before standard rename.
+            match std::fs::symlink_metadata(final_root) {
+                Ok(_) => {
+                    return Err(SessionIoError::new(
+                        "session_exists",
+                        "最终会话目录已经存在",
+                    ));
+                }
+                Err(stat_err) if stat_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(stat_err) => {
+                    return Err(SessionIoError::os(
+                        "write_failed",
+                        "检查最终会话目录失败",
+                        stat_err,
+                    ));
+                }
             }
             std::fs::rename(partial_root, final_root).map_err(|rename_err| {
                 SessionIoError::os("write_failed", "发布会话目录失败", rename_err)
@@ -923,7 +1180,10 @@ fn validate_relative_artifact_path(path: &str) -> Result<(), SessionIoError> {
         .split('/')
         .next()
         .ok_or_else(|| SessionIoError::new("manifest_invalid", "manifest artifact 路径无效"))?;
-    if first == "manifest.json" || first == "recording.json" {
+    if matches!(
+        first,
+        "manifest.json" | "recording.json" | "capture.json" | "segments.json" | "checkpoint.json"
+    ) {
         return Err(SessionIoError::new(
             "manifest_invalid",
             "manifest artifact 路径无效",
@@ -1184,10 +1444,15 @@ fn expected_identity_map(
 }
 
 fn open_directory(path: &Path, code: &'static str, context: &str) -> Result<File, SessionIoError> {
+    let target = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
+        .open(target)
         .map_err(|error| SessionIoError::os(code, context, error))?;
     let metadata = file
         .metadata()
@@ -1205,8 +1470,16 @@ fn write_manifest_atomic(
     manifest_path: &Path,
     payload: &[u8],
 ) -> Result<(), SessionIoError> {
-    if std::fs::symlink_metadata(manifest_path).is_ok() {
-        return Err(SessionIoError::new("write_failed", "manifest 已经存在"));
+    match std::fs::symlink_metadata(manifest_path) {
+        Ok(_) => return Err(SessionIoError::new("write_failed", "manifest 已经存在")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SessionIoError::os(
+                "write_failed",
+                "检查 manifest 状态失败",
+                error,
+            ));
+        }
     }
     let seq = TEMP_MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_path = partial_root.join(format!("manifest.json.tmp.{}.{}", std::process::id(), seq));
@@ -1233,8 +1506,16 @@ fn write_manifest_atomic(
                 Err(SessionIoError::new("write_failed", "manifest 已经存在"))
             }
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
-                if std::fs::symlink_metadata(manifest_path).is_ok() {
-                    return Err(SessionIoError::new("write_failed", "manifest 已经存在"));
+                match std::fs::symlink_metadata(manifest_path) {
+                    Ok(_) => return Err(SessionIoError::new("write_failed", "manifest 已经存在")),
+                    Err(stat_err) if stat_err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(stat_err) => {
+                        return Err(SessionIoError::os(
+                            "write_failed",
+                            "检查 manifest 状态失败",
+                            stat_err,
+                        ));
+                    }
                 }
                 std::fs::rename(&temp_path, manifest_path)
                     .map_err(|err| SessionIoError::os("write_failed", "发布 manifest 失败", err))
@@ -1254,9 +1535,18 @@ fn write_manifest_atomic(
 
 fn fsync_directory(path: &Path, code: &'static str, context: &str) -> Result<(), SessionIoError> {
     let directory = open_directory(path, code, context)?;
-    directory
-        .sync_all()
-        .map_err(|error| SessionIoError::os(code, context, error))
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EBADF)
+            ) && is_exfat_or_msdos(directory.as_raw_fd()).unwrap_or(false) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(SessionIoError::os(code, context, error)),
+    }
 }
 
 fn validate_control_name(name: &str) -> Result<(), SessionIoError> {
@@ -1560,10 +1850,111 @@ mod tests {
     #[test]
     fn artifact_paths_reject_session_reserved_filenames() {
         assert!(super::validate_relative_regular_path("manifest.json").is_ok());
-        let error = super::validate_relative_artifact_path("manifest.json").unwrap_err();
-        assert_eq!(error.code, "manifest_invalid");
-        let error = super::validate_relative_artifact_path("recording.json").unwrap_err();
-        assert_eq!(error.code, "manifest_invalid");
+        for reserved in [
+            "manifest.json",
+            "recording.json",
+            "capture.json",
+            "segments.json",
+            "checkpoint.json",
+        ] {
+            let error = super::validate_relative_artifact_path(reserved).unwrap_err();
+            assert_eq!(error.code, "manifest_invalid");
+        }
+    }
+
+    #[test]
+    fn finalize_segment_artifacts_rejects_intermediate_directory_symlinks() {
+        let root = tempfile_dir();
+        let outside = tempfile_dir();
+        fs::write(outside.join("left.mp4"), b"left-bytes").unwrap();
+        fs::write(outside.join("right.mp4"), b"right-bytes").unwrap();
+        symlink(&outside, root.join("video")).unwrap();
+
+        let segment = super::SegmentEvent {
+            index: 0,
+            start_frame: 0,
+            end_frame: 30,
+            left_path: "video/left.mp4".to_owned(),
+            left_bytes: 10,
+            left_sha256: Some("1".repeat(64)),
+            right_path: "video/right.mp4".to_owned(),
+            right_bytes: 11,
+            right_sha256: None,
+        };
+        let err = super::finalize_segment_artifacts(&root, &segment).unwrap_err();
+        assert_eq!(err.code, "artifact_invalid");
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn seal_post_publish_failure_rolls_back_to_partial_root_without_manifest() {
+        let root = tempfile_dir();
+        let staging_parent = root.join("staging");
+        let recordings_parent = root.join("recordings");
+        fs::create_dir(&staging_parent).unwrap();
+        fs::create_dir(&recordings_parent).unwrap();
+
+        let session_id = "01989f6a-2c00-7a1b-8c2d-3e4f50617283";
+        let partial = staging_parent.join(format!("{session_id}.partial"));
+        let final_root = recordings_parent.join(session_id);
+        fs::create_dir(&partial).unwrap();
+        fs::create_dir(partial.join("video")).unwrap();
+        // Make `recording.json` a directory so `remove_file` fails AFTER `publish_directory_noreplace`.
+        fs::create_dir(partial.join("recording.json")).unwrap();
+        fs::write(partial.join("video/raw.mjpeg"), b"frame").unwrap();
+        fs::write(partial.join("frames.ndjson"), b"frame-index\n").unwrap();
+        fs::write(partial.join("imu.ndjson"), b"imu\n").unwrap();
+
+        let video = finalize_artifact(&partial.join("video/raw.mjpeg"), Some(5)).unwrap();
+        let frames = finalize_artifact(&partial.join("frames.ndjson"), Some(12)).unwrap();
+        let imu = finalize_artifact(&partial.join("imu.ndjson"), Some(4)).unwrap();
+        let manifest = format!(
+            r#"{{
+              "schema":"miro-ego.device-session.v1",
+              "sealed":true,
+              "session_id":"{session_id}",
+              "video":{{"layout":"raw-side-by-side","artifact":{{"artifact_id":"{video_sha}","role":"video.raw-side-by-side","path":"video/raw.mjpeg","media_type":"video/x-motion-jpeg","bytes":5,"sha256":"{video_sha}"}}}},
+              "frames":{{"artifact":{{"artifact_id":"{frames_sha}","role":"frames.index","path":"frames.ndjson","media_type":"application/x-ndjson","bytes":12,"sha256":"{frames_sha}"}}}},
+              "imu":{{"artifact":{{"artifact_id":"{imu_sha}","role":"imu.samples","path":"imu.ndjson","media_type":"application/x-ndjson","bytes":4,"sha256":"{imu_sha}"}}}}
+            }}"#,
+            video_sha = video.sha256,
+            frames_sha = frames.sha256,
+            imu_sha = imu.sha256,
+        );
+        let expected = vec![
+            ExpectedArtifactIdentity {
+                path: "video/raw.mjpeg".to_owned(),
+                identity: video.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "frames.ndjson".to_owned(),
+                identity: frames.identity,
+            },
+            ExpectedArtifactIdentity {
+                path: "imu.ndjson".to_owned(),
+                identity: imu.identity,
+            },
+        ];
+
+        let err = seal_device_session(
+            &partial,
+            &final_root,
+            manifest.as_bytes(),
+            session_id,
+            &expected,
+            &["recording.json".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "write_failed");
+        assert!(!final_root.exists(), "final_root must be rolled back");
+        assert!(partial.exists(), "partial_root must be restored");
+        assert!(
+            !partial.join("manifest.json").exists(),
+            "rolled-back partial_root must not retain manifest.json"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -167,8 +167,10 @@ static void test_eof_drain_and_backpressure(void)
            MIRO_EGO_SHM_FULL);
     assert(miro_ego_shm_ring_dropped(&consumer) == 1u);
 
-    /* Set EOF while 4 frames are still queued: consumer MUST drain all 4 before EOF! */
+    /* Set EOF while 4 frames are still queued: push must now return EOF, and consumer MUST drain all 4 before EOF! */
     assert(miro_ego_shm_ring_set_eof(&producer) == MIRO_EGO_SHM_OK);
+    assert(miro_ego_shm_ring_push(&producer, msg, sizeof(msg), 100u, 100u, 0u, 0) ==
+           MIRO_EGO_SHM_EOF);
 
     for (uint32_t i = 0; i < 4u; i += 1) {
         miro_ego_shm_frame_t frame;
@@ -274,6 +276,12 @@ static void test_bounds_and_corruption_rejection(void)
     /* Corrupt slot: payload_len > slot_capacity */
     prod.slots[0].payload_len = 1025u;
     assert(miro_ego_shm_ring_receive(&ring, &frame, 10) == MIRO_EGO_SHM_CORRUPT);
+
+    /* Corrupt slot: data_offset pointing to another valid slot (slot 1 instead of slot 0) */
+    prod.slots[0].payload_len = 64u;
+    prod.slots[0].data_offset = prod.data_offset + 1024u;
+    assert(miro_ego_shm_ring_receive(&ring, &frame, 10) == MIRO_EGO_SHM_CORRUPT);
+    prod.slots[0].data_offset = prod.data_offset;
 
     /* Corrupt ring indices: write_idx - read_idx > slot_count */
     prod.slots[0].payload_len = 64u;
