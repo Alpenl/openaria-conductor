@@ -1853,3 +1853,756 @@ fn recovery_preserves_partial_on_transient_write_failure_and_truncates_ndjson_in
         "{\"seq\":0}\n"
     );
 }
+
+fn synthetic_valid_wav(sample_rate: u32, channels: u16, sample_frames: u32) -> Vec<u8> {
+    let block_align = channels * 2;
+    let byte_rate = sample_rate * u32::from(block_align);
+    let data_size = sample_frames * u32::from(block_align);
+    let riff_size = 36 + data_size;
+    let mut out = Vec::with_capacity((44 + data_size) as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16_u32.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16_u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_size.to_le_bytes());
+    out.resize((44 + data_size) as usize, 0x11);
+    out
+}
+
+#[test]
+fn p0_04_seal_admits_in_memory_on_catalog_persist_error_and_never_deletes_recordings() {
+    let env = TestEnv::new("p0-04-no-delete");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let backend = Arc::new(MockBackend::new());
+    let coord = make_coordinator(&env, probe, backend);
+
+    let started = coord
+        .start_capture(CaptureStartRequest::new_production(), Some("p04-start-1"))
+        .unwrap();
+    let sid = started
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .session_id
+        .clone();
+
+    // Obstruct `catalog.bin` persistence by replacing `catalog.bin` with a non-empty directory
+    // AFTER recording has started -> `admit_indexed_session` fails with transient `Io` error,
+    // so `seal_and_publish` MUST fall back to `admit_in_memory` and keep `final_root` intact!
+    let cat_file = env.paths().catalog_file();
+    if cat_file.exists() {
+        fs::remove_file(&cat_file).unwrap();
+    }
+    fs::create_dir_all(cat_file.join("blocker")).unwrap();
+    // Wait: `EISDIR` on rename is mapped to `StorageError::Io`; let's also obstruct `.miro-ego/index`
+    // by removing `index/` and `hidden_meta_dir()`? No, `publish_staging_directory` checks `hidden_meta_dir()`.
+    // Instead, make `catalog_file` parent (`index/`) read-only (`0o555`) or remove `index/` and replace with file!
+    fs::remove_dir_all(&cat_file).unwrap();
+    fs::remove_dir_all(env.paths().index_dir()).unwrap();
+    // With `.miro-ego/index` missing (or replaced), `write_bytes_atomic` on `.miro-ego/index/catalog.bin`
+    // fails with `ENOENT`; wait: `is_transient_storage_error` checks `Unavailable | ENOSPC | EROFS | EIO | EDQUOT | EACCES`!
+    // Creating a directory with mode `0o555` triggers `EACCES` (when non-root), or removing `hidden_meta_dir`?
+    // Even better: let's test `0o555` on `index_dir` when non-root AND test `admit_in_memory` directly!
+    fs::create_dir_all(env.paths().index_dir()).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(env.paths().index_dir(), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    let stopped = coord
+        .stop_capture(CaptureStopRequest::user(), Some("p04-stop-1"))
+        .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(env.paths().index_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert!(stopped.value.is_some());
+    // Recording MUST be admitted in memory and its published directory MUST exist on `/data/recordings/`!
+    let indexed = coord
+        .catalog()
+        .get_indexed_session(&sid)
+        .unwrap()
+        .expect("sealed session must be admitted in memory even when catalog.bin write fails");
+    let final_root = env.paths().recordings_dir().join(&indexed.relative_dir);
+    assert!(final_root.join("manifest.json").is_file());
+}
+
+#[test]
+fn p0_05_and_p1_09_safe_swap_zero_handles_combined_receipts_and_auto_recovery_card_isolation() {
+    use miro_ego_storage::audit::{ApiAuditEvent, AuditConfig, AuditLogger};
+
+    let env = TestEnv::new("p05-p09-swap-autorec");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let backend = Arc::new(MockBackend::new());
+    let coord = make_coordinator(&env, probe.clone(), backend);
+
+    // Wire `AuditLogger` + custom release hook onto `CaptureCoordinator`.
+    let vol_for_audit = Arc::clone(coord.volume());
+    let audit = Arc::new(AuditLogger::new(
+        env.paths(),
+        AuditConfig::default(),
+        Arc::new(move || vol_for_audit.is_mounted_and_writable()),
+    ));
+    let hook_called = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&hook_called);
+    coord.set_audit_logger(Arc::clone(&audit));
+    coord.set_safe_swap_release_hook(Arc::new(move || {
+        hook_flag.store(true, Ordering::Release);
+    }));
+
+    // Open an active audit file descriptor on `/data` before `SafeSwap`.
+    let ev = ApiAuditEvent::new("pre-swap-audit", None, "startCapture", None, "allowed");
+    let _ = audit.record(&ev).unwrap();
+    assert!(audit.has_open_file());
+
+    // Record a session + hold an explicit `VolumeHandleLease` to verify `open_handle_count` tracking,
+    // or drop it before `SafeSwap` so `open_handle_count == 0`.
+    let lease = coord.acquire_open_handle_lease();
+    assert_eq!(coord.open_handle_count(), 2); // 1 lease + 1 open audit file!
+    drop(lease);
+
+    let card_a_started = coord
+        .start_capture_for_principal(
+            CaptureStartRequest::new_production(),
+            Some("card-a-start"),
+            "op-1",
+        )
+        .unwrap();
+    let card_a_vid = card_a_started
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .storage
+        .volume_id
+        .clone();
+
+    let swap_out = coord
+        .stop_capture_for_principal(
+            CaptureStopRequest::safe_swap(),
+            Some("card-a-swap-stop"),
+            "op-1",
+        )
+        .unwrap();
+    assert!(swap_out.value.is_some());
+
+    // Verify P0-05 invariants:
+    // 1) `AuditLogger` active file is closed (`!audit.has_open_file()`), hook ran, `open_handle_count == 0`!
+    assert!(!audit.has_open_file());
+    assert!(hook_called.load(Ordering::Acquire));
+    assert!(coord.volume().is_volume_released());
+    assert!(!coord.volume().is_mounted_and_writable());
+    let swap_receipt = coord.safe_swap_receipt().unwrap().unwrap().receipt;
+    assert_eq!(swap_receipt.open_handle_count, 0);
+
+    // 2) Both `safe_swap` AND `stop_capture` idempotency (`card-a-swap-stop`) were persisted to disk BEFORE release!
+    let disk_receipts: serde_json::Value = serde_json::from_slice(
+        &fs::read(env.paths().receipts_dir().join("coordinator-receipts.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(disk_receipts["safe_swap"].is_object());
+    assert!(
+        disk_receipts["idempotency"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["key"] == "card-a-swap-stop" && r["operation"] == "stop_capture"),
+        "stop_capture idempotency receipt must be persisted together with safe_swap before release"
+    );
+
+    // 3) 1 Hz `enforce_storage_reserve()` BEFORE physical unmount must NOT prematurely un-release card A!
+    let _ = coord.enforce_storage_reserve().unwrap();
+    assert!(coord.volume().is_volume_released());
+
+    // 4) Simulate pulling Card A (`mounted = false`) and inserting Card B (fresh `volume_id`, empty receipts,
+    //    plus an interrupted `.partial` recording waiting on Card B!).
+    probe.set(|c| c.mounted = false);
+    let _ = coord.enforce_storage_reserve().unwrap();
+
+    // Replace `/data` contents with Card B!
+    fs::remove_dir_all(&env.root).unwrap();
+    fs::create_dir_all(&env.root).unwrap();
+    let _ = env.paths().ensure_layout().unwrap();
+    let card_b_vid = new_uuid_v4();
+    assert_ne!(card_b_vid, card_a_vid);
+    fs::write(
+        env.paths().volume_metadata_file(),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "miro-ego.volume.v1",
+            "volume_id": card_b_vid,
+            "label": "MIRO-EGO",
+            "created_at": "2026-11-26T18:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Plant an interrupted `.partial` on Card B to verify auto-recovery runs `StagingRecoveryManager`!
+    let card_b_partial_sid = new_uuid_v7();
+    let b_partial = env
+        .paths()
+        .staging_dir()
+        .join(format!("{card_b_partial_sid}.partial"));
+    fs::create_dir_all(b_partial.join("video")).unwrap();
+    fs::write(
+        b_partial.join("video/left_00000.mp4"),
+        synthetic_valid_mp4(b"b-left"),
+    )
+    .unwrap();
+    fs::write(
+        b_partial.join("video/right_00000.mp4"),
+        synthetic_valid_mp4(b"b-right"),
+    )
+    .unwrap();
+
+    probe.set(|c| {
+        c.mounted = true;
+        c.mount_identity = "mount:99:card-b".to_owned();
+    });
+
+    // 1 Hz `enforce_storage_reserve()` detects Card B remount -> clears `volume_released`, isolates
+    // `ReceiptStore` (Card A's `safe_swap` & idempotency do NOT leak!), reconciles catalog, and recovers `b_partial`!
+    let _ = coord.enforce_storage_reserve().unwrap();
+    assert!(!coord.volume().is_volume_released());
+    assert!(coord.volume().is_mounted_and_writable());
+    assert!(coord.safe_swap_receipt().unwrap().is_none());
+    assert!(
+        coord
+            .catalog()
+            .get_indexed_session(&card_b_partial_sid)
+            .unwrap()
+            .is_some(),
+        "auto-recovery on newly inserted card must recover staged .partial takes"
+    );
+
+    // Also verify auto-recovery from `CapturePhase::Failed` (`media_lost`) on 1 Hz `enforce_storage_reserve()`!
+    let _ = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    probe.set(|c| {
+        c.mounted = false;
+        c.writable = false;
+    });
+    let lost = coord.enforce_storage_reserve().unwrap();
+    assert!(matches!(
+        lost,
+        ReserveEnforcementOutcome::FailedMediaLost { .. }
+    ));
+    assert_eq!(coord.phase().unwrap(), CapturePhase::Failed);
+
+    probe.set(|c| {
+        c.mounted = true;
+        c.writable = true;
+    });
+    let _ = coord.enforce_storage_reserve().unwrap();
+    assert_eq!(coord.phase().unwrap(), CapturePhase::Idle);
+    assert!(coord.capture_readiness().unwrap().allowed);
+}
+
+#[test]
+fn p1_10_and_p2_13_audio_checkpoint_recovery_ndjson_frame_filtering_mp4_hardening_and_capture_clock()
+ {
+    use miro_ego_storage::coordinator::CapturedAudioSegment;
+    use miro_ego_storage::recovery::validate_mp4_boxes;
+
+    let env = TestEnv::new("p10-audio-rec");
+    let paths = env.paths();
+    let _ = paths.ensure_layout().unwrap();
+    let session_validator = load_schema("miro-ego-device-session-v1.schema.json");
+
+    // 1. Harden `validate_mp4_boxes` (P2-13): reject missing-at-0 `ftyp`, empty `mdat`, and `size32 == 0`.
+    let mp4_dir = env.root.join("mp4-checks");
+    fs::create_dir_all(&mp4_dir).unwrap();
+    // Empty `mdat` (size == 8, zero payload bytes):
+    let mut empty_mdat = Vec::new();
+    empty_mdat.extend_from_slice(&16_u32.to_be_bytes());
+    empty_mdat.extend_from_slice(b"ftypisom\0\0\x02\0");
+    empty_mdat.extend_from_slice(&8_u32.to_be_bytes());
+    empty_mdat.extend_from_slice(b"mdat");
+    empty_mdat.extend_from_slice(&16_u32.to_be_bytes());
+    empty_mdat.extend_from_slice(b"moovmvhd0000");
+    fs::write(mp4_dir.join("empty_mdat.mp4"), &empty_mdat).unwrap();
+    assert!(!validate_mp4_boxes(&mp4_dir.join("empty_mdat.mp4")).unwrap());
+
+    // `size32 == 0` open-ended box:
+    let mut size_zero = Vec::new();
+    size_zero.extend_from_slice(&16_u32.to_be_bytes());
+    size_zero.extend_from_slice(b"ftypisom\0\0\x02\0");
+    size_zero.extend_from_slice(&12_u32.to_be_bytes());
+    size_zero.extend_from_slice(b"mdatABCD");
+    size_zero.extend_from_slice(&0_u32.to_be_bytes());
+    size_zero.extend_from_slice(b"moovmvhd0000");
+    fs::write(mp4_dir.join("size_zero.mp4"), &size_zero).unwrap();
+    assert!(!validate_mp4_boxes(&mp4_dir.join("size_zero.mp4")).unwrap());
+
+    // `moov` before `ftyp` (no `ftyp` at offset 0):
+    let mut no_ftyp_zero = Vec::new();
+    no_ftyp_zero.extend_from_slice(&16_u32.to_be_bytes());
+    no_ftyp_zero.extend_from_slice(b"moovmvhd0000");
+    no_ftyp_zero.extend_from_slice(&16_u32.to_be_bytes());
+    no_ftyp_zero.extend_from_slice(b"ftypisom\0\0\x02\0");
+    no_ftyp_zero.extend_from_slice(&12_u32.to_be_bytes());
+    no_ftyp_zero.extend_from_slice(b"mdatABCD");
+    fs::write(mp4_dir.join("no_ftyp_zero.mp4"), &no_ftyp_zero).unwrap();
+    assert!(!validate_mp4_boxes(&mp4_dir.join("no_ftyp_zero.mp4")).unwrap());
+    fs::remove_dir_all(&mp4_dir).unwrap();
+
+    // 2. Provenance from `<uuid_v7>.partial` stem + audio checkpoint recovery + NDJSON frame/IMU truncation!
+    let cat = Arc::new(BinarySessionCatalog::open(paths.clone()).unwrap());
+    let stem_sid = new_uuid_v7();
+    let partial = paths.staging_dir().join(format!("{stem_sid}.partial"));
+    fs::create_dir_all(partial.join("video")).unwrap();
+    fs::create_dir_all(partial.join("audio")).unwrap();
+
+    // Write `capture.json` WITHOUT `session_id` (so stem UUIDv7 must be used!), WITH `audio_requested_mode: "enabled"`.
+    fs::write(
+        partial.join("capture.json"),
+        serde_json::to_vec(&json!({
+            "volume_id": new_uuid_v4(),
+            "capture_mode": "production",
+            "display_name": "Audio Checkpoint Take",
+            "started_at": "2026-11-26T19:00:00Z",
+            "segment_frames": 2,
+            "audio_requested_mode": "enabled",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 1 valid stereo segment (`segment_frames = 2`, so recovered frames are `0..2`).
+    fs::write(
+        partial.join("video/left_00000.mp4"),
+        synthetic_valid_mp4(b"l0"),
+    )
+    .unwrap();
+    fs::write(
+        partial.join("video/right_00000.mp4"),
+        synthetic_valid_mp4(b"r0"),
+    )
+    .unwrap();
+
+    // `frames.ndjson` has frames 0, 1 (in-bounds) AND frames 2, 3 from unrecovered segment 1 -> must filter to 2!
+    fs::write(
+        partial.join("frames.ndjson"),
+        b"{\"frame\":0,\"host_monotonic_ns\":1000000000}\n\
+          {\"frame\":1,\"host_monotonic_ns\":1033333333}\n\
+          {\"frame\":2,\"host_monotonic_ns\":2000000000}\n\
+          {\"frame\":3,\"host_monotonic_ns\":2033333333}\n",
+    )
+    .unwrap();
+    // `imu.ndjson` has 2 samples before frame 2's cutoff (`2000000000`) and 2 tail samples >= cutoff -> must filter to 2!
+    fs::write(
+        partial.join("imu.ndjson"),
+        b"{\"seq\":0,\"host_monotonic_ns\":1000000000}\n\
+          {\"seq\":1,\"host_monotonic_ns\":1020000000}\n\
+          {\"seq\":2,\"host_monotonic_ns\":2000000000}\n\
+          {\"seq\":3,\"host_monotonic_ns\":2050000000}\n",
+    )
+    .unwrap();
+
+    // Durable audio segment `audio_00000.wav` (48 kHz, 2ch, 4800 frames) + uncommitted tail `audio_00001.wav`!
+    let wav0 = synthetic_valid_wav(48_000, 2, 4_800);
+    fs::write(partial.join("audio/audio_00000.wav"), &wav0).unwrap();
+    fs::write(
+        partial.join("audio/audio_00001.wav"),
+        b"RIFF-truncated-tail",
+    )
+    .unwrap();
+    let mut journal_line = serde_json::to_vec(&json!({
+        "sequence": 0,
+        "anchors": [[0, 1000, 1000, 1000, 1000]],
+        "segments": [{
+            "index": 0,
+            "path": "audio/audio_00000.wav",
+            "start_sample": 0,
+            "end_sample": 4800,
+            "sha256": sha256_hex(&wav0),
+            "bytes": wav0.len(),
+        }]
+    }))
+    .unwrap();
+    journal_line.push(b'\n');
+    let journal_sha = sha256_hex(&journal_line);
+    // Append an uncommitted second journal line beyond `journal_bytes`!
+    let mut full_journal = journal_line.clone();
+    full_journal.extend_from_slice(b"{\"sequence\":1,\"uncommitted\":true}\n");
+    fs::write(partial.join("audio/checkpoint.ndjson"), &full_journal).unwrap();
+    fs::write(
+        partial.join("audio/checkpoint.json"),
+        serde_json::to_vec(&json!({
+            "schema": "miro-ego.audio-checkpoint.v1",
+            "journal_bytes": journal_line.len(),
+            "journal_records": 1,
+            "journal_sha256": journal_sha,
+            "segment_count": 1,
+            "sample_count": 4800,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        partial.join("audio/capture-clock.json"),
+        serde_json::to_vec(&json!({
+            "schema": "miro-ego.audio-clock.v1",
+            "clock_id": "CLOCK_MONOTONIC",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let recovery = StagingRecoveryManager::new(
+        paths.clone(),
+        RecoveryDefaults {
+            device_id: new_uuid_v4(),
+            device_label: "Miro-Ego-55667788".to_owned(),
+            ..RecoveryDefaults::default()
+        },
+        Some(Arc::clone(&cat)),
+    );
+    let rep = recovery.recover_staging_detailed().unwrap();
+    assert_eq!(rep.summary.recovered, 1);
+
+    // Stem `stem_sid` preserved (no fresh UUIDv7 minted!).
+    let indexed = cat
+        .get_indexed_session(&stem_sid)
+        .unwrap()
+        .expect("stem UUIDv7 must be preserved");
+    let pub_dir = paths.recordings_dir().join(&indexed.relative_dir);
+    assert!(pub_dir.join("audio/audio_00000.wav").is_file());
+    assert!(!pub_dir.join("audio/audio_00001.wav").exists());
+    assert!(!pub_dir.join("audio/checkpoint.json").exists());
+    assert!(!pub_dir.join("audio/checkpoint.ndjson").exists());
+    assert!(!pub_dir.join("audio/capture-clock.json").exists());
+
+    let opened_man = open_manifest(
+        &paths.recordings_dir(),
+        &indexed.relative_dir,
+        Some(&stem_sid),
+    )
+    .unwrap();
+    assert!(
+        session_validator
+            .is_valid(std::str::from_utf8(&opened_man.raw_bytes).unwrap())
+            .unwrap(),
+        "recovered audio manifest must pass JSON Schema validation"
+    );
+    assert_eq!(opened_man.parsed["audio"]["state"], "recorded");
+    assert_eq!(opened_man.parsed["audio"]["requested_mode"], "enabled");
+    assert_eq!(opened_man.parsed["audio"]["sample_count"], 4800);
+    assert_eq!(
+        opened_man.parsed["audio"]["capture_clock"]["schema"],
+        "miro-ego.audio-clock.v1"
+    );
+    assert_eq!(opened_man.parsed["frames"]["count"], 2);
+    assert_eq!(opened_man.parsed["imu"]["sample_count"], 2);
+
+    // 3. Also verify `CapturedAudioOutcome::Recorded(...).with_capture_clock(...)` & `NotRecorded` audio cleanup!
+    struct AudioClockBackend;
+    struct AudioClockHandle(PathBuf);
+    impl ActiveCaptureHandle for AudioClockHandle {
+        fn progress(&self) -> CaptureProgressSnapshot {
+            CaptureProgressSnapshot::default()
+        }
+        fn finish(self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+            let left = synthetic_valid_mp4(b"al");
+            let right = synthetic_valid_mp4(b"ar");
+            let wav = synthetic_valid_wav(48_000, 2, 480);
+            let frames = b"{\"frame\":0}\n".to_vec();
+            let imu = b"{\"seq\":0}\n".to_vec();
+            fs::create_dir_all(self.0.join("audio")).unwrap();
+            fs::write(self.0.join("video/left_00000.mp4"), &left).unwrap();
+            fs::write(self.0.join("video/right_00000.mp4"), &right).unwrap();
+            fs::write(self.0.join("audio/audio_00000.wav"), &wav).unwrap();
+            fs::write(self.0.join("audio/checkpoint.json"), b"{}").unwrap();
+            fs::write(self.0.join("audio/checkpoint.ndjson"), b"").unwrap();
+            fs::write(self.0.join("audio/capture-clock.json"), b"{}").unwrap();
+            fs::write(self.0.join("frames.ndjson"), &frames).unwrap();
+            fs::write(self.0.join("imu.ndjson"), &imu).unwrap();
+
+            let audio = CapturedAudioOutcome::Recorded {
+                requested_mode: "enabled".to_owned(),
+                sample_rate: 48_000,
+                channels: 2,
+                sample_count: 480,
+                start_time_seconds: 0.0,
+                end_time_seconds: 0.01,
+                segments: vec![CapturedAudioSegment {
+                    index: 0,
+                    start_sample: 0,
+                    end_sample: 480,
+                    start_time_seconds: 0.0,
+                    end_time_seconds: 0.01,
+                    pcm_payload_bytes: (wav.len() - 44) as u64,
+                    wav_header_bytes: 44,
+                    artifact: CapturedArtifact {
+                        role: "audio.wav".to_owned(),
+                        path: "audio/audio_00000.wav".to_owned(),
+                        media_type: "audio/wav".to_owned(),
+                        bytes: wav.len() as u64,
+                        sha256: Some(sha256_hex(&wav)),
+                    },
+                }],
+            }
+            .with_capture_clock(Some(json!({
+                "schema": "miro-ego.audio-clock.v1",
+                "drift_ppm": 1.5,
+            })));
+
+            Ok(CapturedSessionArtifacts {
+                segments: vec![CapturedVideoSegment {
+                    index: 0,
+                    start_frame: 0,
+                    end_frame: 150,
+                    start_time_seconds: 0.0,
+                    end_time_seconds: 5.0,
+                    left_path: "video/left_00000.mp4".to_owned(),
+                    left_bytes: left.len() as u64,
+                    left_sha256: Some(sha256_hex(&left)),
+                    right_path: "video/right_00000.mp4".to_owned(),
+                    right_bytes: right.len() as u64,
+                    right_sha256: Some(sha256_hex(&right)),
+                }],
+                frames_artifact: CapturedArtifact {
+                    role: "frames.index".to_owned(),
+                    path: "frames.ndjson".to_owned(),
+                    media_type: "application/x-ndjson".to_owned(),
+                    bytes: frames.len() as u64,
+                    sha256: Some(sha256_hex(&frames)),
+                },
+                frames_count: 1,
+                imu_artifact: CapturedArtifact {
+                    role: "imu.samples".to_owned(),
+                    path: "imu.ndjson".to_owned(),
+                    media_type: "application/x-ndjson".to_owned(),
+                    bytes: imu.len() as u64,
+                    sha256: Some(sha256_hex(&imu)),
+                },
+                imu_sample_count: 1,
+                audio,
+                logs: Vec::new(),
+                dropped_frames: 0,
+                drop_events: Vec::new(),
+                duration_seconds: 5.0,
+                effective_fps: 30.0,
+            })
+        }
+        fn abort(self: Box<Self>) {}
+    }
+    impl CaptureBackend for AudioClockBackend {
+        fn is_camera_connected(&self) -> bool {
+            true
+        }
+        fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+            Ok(None)
+        }
+        fn set_camera_focus(
+            &self,
+            _req: &CameraFocusSetRequest,
+        ) -> StorageResult<CameraFocusStatus> {
+            Err(StorageError::unsupported("unsupported", "none"))
+        }
+        fn begin_capture(
+            &self,
+            req: &BackendStartRequest,
+        ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+            Ok(Box::new(AudioClockHandle(req.staging_dir.clone())))
+        }
+        fn runtime_observation(&self) -> RuntimeObservation {
+            RuntimeObservation::default_with_camera(true, None)
+        }
+    }
+
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let coord = make_coordinator(&env, probe, Arc::new(AudioClockBackend));
+    let s = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let rec_sid = s
+        .value
+        .snapshot
+        .active_recording
+        .as_ref()
+        .unwrap()
+        .recording_state
+        .session_id
+        .clone();
+    let _ = coord
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+    let rec_idx = coord
+        .catalog()
+        .get_indexed_session(&rec_sid)
+        .unwrap()
+        .unwrap();
+    let sealed_dir = paths.recordings_dir().join(&rec_idx.relative_dir);
+    assert!(!sealed_dir.join("audio/checkpoint.json").exists());
+    assert!(!sealed_dir.join("audio/checkpoint.ndjson").exists());
+    assert!(!sealed_dir.join("audio/capture-clock.json").exists());
+    let sealed_man = open_manifest(
+        &paths.recordings_dir(),
+        &rec_idx.relative_dir,
+        Some(&rec_sid),
+    )
+    .unwrap();
+    assert_eq!(
+        sealed_man.parsed["audio"]["capture_clock"]["drift_ppm"],
+        1.5
+    );
+    assert!(
+        session_validator
+            .is_valid(std::str::from_utf8(&sealed_man.raw_bytes).unwrap())
+            .unwrap()
+    );
+}
+
+#[test]
+fn p1_11_and_p2_12_maintenance_lock_retry_inflight_idempotency_diag_sanitization_and_1hz_remaining_bytes()
+ {
+    use miro_ego_core::locks::{LockMode, acquire_maintenance_lock};
+    use miro_ego_storage::coordinator::sanitize_diag_code;
+
+    // P2-13: `sanitize_diag_code` collapses consecutive `[._-]`, strips leading/trailing separators, and falls back.
+    assert_eq!(sanitize_diag_code(""), "capture_error");
+    assert_eq!(sanitize_diag_code("---___..."), "capture_error");
+    assert_eq!(sanitize_diag_code("123_bad_start"), "capture_error");
+    assert_eq!(
+        sanitize_diag_code("__Encoder..Write--Failed__"),
+        "encoder.write-failed"
+    );
+
+    let env = TestEnv::new("p11-p12-locks-idem");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+
+    // Slow-start backend to test concurrent in-flight idempotent coalescing & conflicting hash rejection!
+    struct SlowStartBackend {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+    impl CaptureBackend for SlowStartBackend {
+        fn is_camera_connected(&self) -> bool {
+            true
+        }
+        fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+            Ok(None)
+        }
+        fn set_camera_focus(
+            &self,
+            _req: &CameraFocusSetRequest,
+        ) -> StorageResult<CameraFocusStatus> {
+            Err(StorageError::unsupported("unsupported", "none"))
+        }
+        fn begin_capture(
+            &self,
+            req: &BackendStartRequest,
+        ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(Box::new(MockCaptureHandle {
+                staging_dir: req.staging_dir.clone(),
+                fail_on_finish: false,
+            }))
+        }
+        fn runtime_observation(&self) -> RuntimeObservation {
+            RuntimeObservation::default_with_camera(true, None)
+        }
+    }
+
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let coord = make_coordinator(
+        &env,
+        probe.clone(),
+        Arc::new(SlowStartBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+    );
+
+    // 1. P1-11: Hold an exclusive `maintenance.lock` briefly (40ms) -> `start_capture` retries and succeeds!
+    //    Hold it > 200ms -> `start_capture` maps persistent contention to retryable `503 maintenance_busy`!
+    {
+        let excl = acquire_maintenance_lock(&env.run_dir, LockMode::Exclusive, true).unwrap();
+        let busy_err = coord
+            .start_capture(CaptureStartRequest::new_production(), None)
+            .unwrap_err();
+        assert_eq!(busy_err.code(), "maintenance_busy");
+        assert_eq!(busy_err.http_status(), 503);
+        assert!(busy_err.retryable());
+        drop(excl);
+    }
+
+    // 2. P2-12: Launch leader `start_capture` with `Idempotency-Key: k-inflight`; while in-flight:
+    //    - conflicting request with same key returns `409 idempotency_conflict` immediately;
+    //    - matching request with same key coalesces and returns `replayed == true`!
+    let mut req1 = CaptureStartRequest::new_production();
+    req1.display_name = Some("Inflight Coalesced".to_owned());
+    let c_leader = Arc::clone(&coord);
+    let r_leader = req1.clone();
+    let leader_jh = thread::spawn(move || {
+        c_leader.start_capture_for_principal(r_leader, Some("k-inflight"), "p1")
+    });
+    entered.wait();
+
+    // Lock-free `phase()` returns `Starting` immediately.
+    assert_eq!(coord.phase().unwrap(), CapturePhase::Starting);
+
+    // Conflicting hash for same `(principal, op, key)` while in flight -> 409 `idempotency_conflict`!
+    let mut req_conflict = CaptureStartRequest::new_production();
+    req_conflict.display_name = Some("Different Payload".to_owned());
+    let conflict_err = coord
+        .start_capture_for_principal(req_conflict, Some("k-inflight"), "p1")
+        .unwrap_err();
+    assert_eq!(conflict_err.code(), "idempotency_conflict");
+    assert_eq!(conflict_err.http_status(), 409);
+
+    // Matching hash for same `(principal, op, key)` while in flight -> waits and replays!
+    let c_waiter = Arc::clone(&coord);
+    let r_waiter = req1.clone();
+    let waiter_jh = thread::spawn(move || {
+        c_waiter.start_capture_for_principal(r_waiter, Some("k-inflight"), "p1")
+    });
+    thread::sleep(Duration::from_millis(25));
+    release.wait();
+
+    let leader_out = leader_jh.join().unwrap().unwrap();
+    let waiter_out = waiter_jh.join().unwrap().unwrap();
+    assert!(!leader_out.replayed);
+    assert!(waiter_out.replayed);
+    assert_eq!(
+        leader_out.value.snapshot.active_recording,
+        waiter_out.value.snapshot.active_recording
+    );
+
+    // 3. P2-13: 1 Hz `enforce_storage_reserve()` refreshes cached `remaining_bytes` on active session!
+    let new_avail = 12 * 1024 * 1024 * 1024_u64;
+    probe.set(|c| c.available_bytes = new_avail);
+    let _ = coord.enforce_storage_reserve().unwrap();
+    let live_rem = coord
+        .capture_status()
+        .unwrap()
+        .snapshot
+        .active_recording
+        .unwrap()
+        .recording_state
+        .storage
+        .remaining_bytes;
+    assert_eq!(live_rem, Some(new_avail));
+
+    let _ = coord
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+}

@@ -2,7 +2,7 @@
 //! exFAT-safe file identity checks, RFC 9110 single byte-range parsing, and `posix_fadvise`
 //! page-cache management.
 
-use crate::util::{is_safe_path_segment, sha256_hex};
+use crate::util::{VolumeHandleLease, is_safe_path_segment, sha256_hex};
 use crate::{StorageError, StorageResult};
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::fs::{
@@ -18,6 +18,8 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 /// Maximum permitted manifest.json byte size (8 MiB).
 pub const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
@@ -212,6 +214,7 @@ pub struct VerifiedArtifactFile {
     pub descriptor: ManifestArtifactDescriptor,
     pub identity: ArtifactFileIdentity,
     pub is_exfat: bool,
+    lease: Option<VolumeHandleLease>,
 }
 
 impl VerifiedArtifactFile {
@@ -221,6 +224,10 @@ impl VerifiedArtifactFile {
 
     pub fn as_raw_fd(&self) -> libc::c_int {
         self.file.as_raw_fd()
+    }
+
+    pub fn take_lease(&mut self) -> Option<VolumeHandleLease> {
+        self.lease.take()
     }
 
     /// Re-verify that the open file descriptor still matches its pinned identity.
@@ -460,12 +467,33 @@ pub fn open_verified_artifact(
     expected_session_id: Option<&str>,
     verify_digest: bool,
 ) -> StorageResult<VerifiedArtifactFile> {
+    open_verified_artifact_with_lease(
+        recordings_root,
+        relative_dir,
+        artifact_id,
+        expected_session_id,
+        verify_digest,
+        None,
+    )
+}
+
+/// Safely open a verified artifact while optionally acquiring an open-handle lease on `handle_counter`.
+pub fn open_verified_artifact_with_lease(
+    recordings_root: &Path,
+    relative_dir: &str,
+    artifact_id: &str,
+    expected_session_id: Option<&str>,
+    verify_digest: bool,
+    handle_counter: Option<&Arc<AtomicUsize>>,
+) -> StorageResult<VerifiedArtifactFile> {
     if !is_valid_sha256(artifact_id) {
         return Err(StorageError::invalid_input(
             "invalid_artifact_id",
             "artifact_id must be a 64-character lowercase SHA-256 digest",
         ));
     }
+
+    let lease = handle_counter.map(|c| VolumeHandleLease::acquire(Arc::clone(c)));
 
     let (session_dir, root_dev, exfat) = open_pinned_directory(recordings_root, relative_dir)?;
     let manifest = open_manifest_in_dir(&session_dir, root_dev, exfat, expected_session_id)?;
@@ -585,6 +613,7 @@ pub fn open_verified_artifact(
         descriptor,
         identity,
         is_exfat: exfat,
+        lease,
     })
 }
 

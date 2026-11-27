@@ -232,6 +232,10 @@ pub trait VolumeManager: Send + Sync {
     fn paths(&self) -> &DataVolumePaths;
     fn inspect_volume(&self) -> StorageResult<VolumeInfo>;
     fn ensure_layout(&self) -> StorageResult<bool>;
+    fn is_volume_released(&self) -> bool {
+        false
+    }
+    fn set_volume_released(&self, _released: bool) {}
 }
 
 /// Binary index and query interface for sealed sessions under `/data/recordings/`.
@@ -251,7 +255,7 @@ pub trait RecoveryManager: Send + Sync {
 // Convenient top-level re-exports for downstream crates (`miro-ego-api`, `miro-ego-cli`).
 pub use artifact_io::{
     ByteRange, ManifestArtifactDescriptor, OpenedManifest, VerifiedArtifactFile, open_manifest,
-    open_verified_artifact, parse_single_byte_range,
+    open_verified_artifact, open_verified_artifact_with_lease, parse_single_byte_range,
 };
 pub use audit::{ApiAuditEvent, AuditConfig, AuditLogger, AuditWriteTarget, BoundedRingBuffer};
 pub use catalog::{
@@ -273,6 +277,7 @@ pub use logs::{LogFileEntry, LogList, LogStore, OpenedLogFile};
 pub use recovery::{
     DetailedRecoveryReport, RecoveryDefaults, RecoveryItemOutcome, StagingRecoveryManager,
 };
+pub use util::VolumeHandleLease;
 pub use volume::{
     CaptureStorageBudget, ExfatVolumeManager, FsCapacity, PosixVolumeProbe, ReserveStatus,
     VolumeAdmission, VolumeMetadata, VolumePolicy, VolumeProbe,

@@ -7,7 +7,7 @@
 use crate::artifact_io::{
     ArtifactFileIdentity, ByteRange, open_relative_regular_in_dir, parse_single_byte_range,
 };
-use crate::util::{now_rfc3339_utc, unix_secs_to_rfc3339_utc};
+use crate::util::{VolumeHandleLease, now_rfc3339_utc, unix_secs_to_rfc3339_utc};
 use crate::{StorageError, StorageResult};
 use miro_ego_core::ids::hex_encode;
 use miro_ego_core::paths::DataVolumePaths;
@@ -24,6 +24,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 pub const LOG_LIST_SCHEMA: &str = "miro-ego.log-list.v1";
 pub const DEFAULT_LOG_LIST_LIMIT: usize = 200;
@@ -63,6 +64,7 @@ pub struct OpenedLogFile {
     pub entry: LogFileEntry,
     pub identity: ArtifactFileIdentity,
     pub is_exfat: bool,
+    lease: Option<VolumeHandleLease>,
 }
 
 impl OpenedLogFile {
@@ -72,6 +74,10 @@ impl OpenedLogFile {
 
     pub fn as_raw_fd(&self) -> libc::c_int {
         self.file.as_raw_fd()
+    }
+
+    pub fn take_lease(&mut self) -> Option<VolumeHandleLease> {
+        self.lease.take()
     }
 
     /// Compute exact SHA-256 hex digest and quoted ETag over the pinned log descriptor.
@@ -208,6 +214,7 @@ type VolumeReadyFn = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct LogStore {
     paths: DataVolumePaths,
     volume_ready: VolumeReadyFn,
+    handle_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl LogStore {
@@ -215,7 +222,13 @@ impl LogStore {
         Self {
             paths,
             volume_ready,
+            handle_counter: None,
         }
+    }
+
+    pub fn with_handle_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.handle_counter = Some(counter);
+        self
     }
 
     /// List visible regular diagnostic logs under `/data/logs/`, newest `modified_at` first.
@@ -246,15 +259,49 @@ impl LogStore {
             });
         }
 
+        let mount_dir = open_directory_safe(self.paths.mountpoint()).map_err(|err| {
+            StorageError::Unavailable {
+                message: format!("recording volume mountpoint unavailable: {err}"),
+            }
+        })?;
+        let mount_dev = fstat(mount_dir.as_raw_fd())
+            .map_err(|err| StorageError::io("logs_stat_failed", "fstat volume mountpoint", err))?
+            .st_dev;
+
         let logs_root = self.paths.logs_dir();
-        let root_dir =
-            open_directory_safe(&logs_root).map_err(|err| StorageError::Unavailable {
-                message: format!("diagnostic logs directory unavailable: {err}"),
-            })?;
+        let root_dir = match open_directory_safe(&logs_root) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(LogList {
+                    schema: LOG_LIST_SCHEMA.to_owned(),
+                    volume_id,
+                    observed_at: now_rfc3339_utc(),
+                    items: Vec::new(),
+                    truncated: false,
+                });
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(StorageError::integrity(
+                    "unsafe_path",
+                    "diagnostic logs directory must not be a symlink",
+                ));
+            }
+            Err(err) => {
+                return Err(StorageError::Unavailable {
+                    message: format!("diagnostic logs directory unavailable: {err}"),
+                });
+            }
+        };
         let root_stat = fstat(root_dir.as_raw_fd()).map_err(|err| {
             StorageError::io("logs_stat_failed", "fstat diagnostic logs dir", err)
         })?;
         let root_dev = root_stat.st_dev;
+        if root_dev != mount_dev {
+            return Err(StorageError::integrity(
+                "cross_device_boundary",
+                "diagnostic logs directory crosses filesystem boundary",
+            ));
+        }
 
         let mut collected: Vec<(i128, LogFileEntry)> = Vec::new();
         let mut scanned = 0_usize;
@@ -298,14 +345,49 @@ impl LogStore {
         }
 
         let logs_root = self.paths.logs_dir();
-        let root_dir =
-            open_directory_safe(&logs_root).map_err(|err| StorageError::Unavailable {
-                message: format!("diagnostic logs directory unavailable: {err}"),
-            })?;
+        let mount_dir = open_directory_safe(self.paths.mountpoint()).map_err(|err| {
+            StorageError::Unavailable {
+                message: format!("recording volume mountpoint unavailable: {err}"),
+            }
+        })?;
+        let mount_dev = fstat(mount_dir.as_raw_fd())
+            .map_err(|err| StorageError::io("logs_stat_failed", "fstat volume mountpoint", err))?
+            .st_dev;
+
+        let root_dir = match open_directory_safe(&logs_root) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound {
+                    session_id: name.to_owned(),
+                });
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(StorageError::integrity(
+                    "unsafe_path",
+                    "diagnostic logs directory must not be a symlink",
+                ));
+            }
+            Err(err) => {
+                return Err(StorageError::Unavailable {
+                    message: format!("diagnostic logs directory unavailable: {err}"),
+                });
+            }
+        };
         let root_stat = fstat(root_dir.as_raw_fd())
             .map_err(|err| StorageError::io("logs_stat_failed", "fstat logs dir", err))?;
         let root_dev = root_stat.st_dev;
+        if root_dev != mount_dev {
+            return Err(StorageError::integrity(
+                "cross_device_boundary",
+                "diagnostic logs directory crosses filesystem boundary",
+            ));
+        }
         let is_exfat = is_exfat_or_msdos(root_dir.as_raw_fd()).unwrap_or(false);
+
+        let lease = self
+            .handle_counter
+            .as_ref()
+            .map(|c| VolumeHandleLease::acquire(Arc::clone(c)));
 
         let file = open_relative_regular_in_dir(&root_dir, root_dev, name)?;
         let st = fstat(file.as_raw_fd())
@@ -345,6 +427,7 @@ impl LogStore {
             entry,
             identity,
             is_exfat,
+            lease,
         })
     }
 }
@@ -443,15 +526,15 @@ fn scan_logs_recursive(
         if nlink != 1 || rel_path.len() > MAX_LOG_NAME_LEN {
             continue;
         }
+        let Ok(bytes) = u64::try_from(st.st_size) else {
+            continue;
+        };
+        *scanned += 1;
         if let Some(prefix) = filter_prefix {
             if !rel_path.starts_with(prefix) {
                 continue;
             }
         }
-        let Ok(bytes) = u64::try_from(st.st_size) else {
-            continue;
-        };
-        *scanned += 1;
         let mtime_ns = i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec);
         out.push((
             mtime_ns,

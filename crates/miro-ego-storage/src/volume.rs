@@ -3,7 +3,7 @@
 //! Strictly enforces that recordings, logs, and internal metadata live on the mounted
 //! exFAT recording volume (`/data`) and **never** fall back to the 20 GiB ext4 system disk.
 
-use crate::util::{now_rfc3339_utc, sweep_stale_atomic_temps};
+use crate::util::{VolumeHandleLease, now_rfc3339_utc, sweep_stale_atomic_temps};
 use crate::{StorageError, StorageResult, VOLUME_METADATA_SCHEMA, VolumeInfo, VolumeManager};
 use miro_ego_core::ids::{is_valid_uuid_v4, new_uuid_v4};
 use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL};
@@ -12,15 +12,17 @@ use miro_ego_core::sys::fs::{
     set_exfat_hidden, write_bytes_atomic,
 };
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+pub const DATA_VOLUME_UUID_ENV: &str = "MIRO_EGO_DATA_VOLUME_UUID";
+pub const DATA_VOLUME_PARTUUID_ENV: &str = "MIRO_EGO_DATA_VOLUME_PARTUUID";
 
 /// Default minimum free space reserved on `/data` before refusing new captures (2 GiB).
 pub const DEFAULT_MIN_AVAILABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -129,6 +131,31 @@ impl VolumePolicy {
         }
     }
 
+    /// Production policy populated with `MIRO_EGO_DATA_VOLUME_UUID` and
+    /// `MIRO_EGO_DATA_VOLUME_PARTUUID` environment overrides when set.
+    pub fn from_env_production() -> Self {
+        Self::production(DEFAULT_MIN_AVAILABLE_BYTES, DEFAULT_MIN_AVAILABLE_INODES)
+            .with_env_volume_identity()
+    }
+
+    /// Populate `expected_uuid` / `expected_partuuid` from `MIRO_EGO_DATA_VOLUME_{UUID,PARTUUID}`.
+    pub fn with_env_volume_identity(mut self) -> Self {
+        let env_uuid = std::env::var(DATA_VOLUME_UUID_ENV).ok();
+        let env_partuuid = std::env::var(DATA_VOLUME_PARTUUID_ENV).ok();
+        self.apply_volume_identity_overrides(env_uuid.as_deref(), env_partuuid.as_deref());
+        self
+    }
+
+    /// Apply optional trimmed `uuid` and `partuuid` identity expectations.
+    pub fn apply_volume_identity_overrides(&mut self, uuid: Option<&str>, partuuid: Option<&str>) {
+        if let Some(u) = uuid.map(str::trim).filter(|s| !s.is_empty()) {
+            self.expected_uuid = Some(u.to_owned());
+        }
+        if let Some(p) = partuuid.map(str::trim).filter(|s| !s.is_empty()) {
+            self.expected_partuuid = Some(p.to_owned());
+        }
+    }
+
     /// Hermetic policy for local directory testing (still enforces writability and reserves).
     pub fn relaxed_for_tests(minimum_available_bytes: u64) -> Self {
         Self {
@@ -186,7 +213,7 @@ impl VolumeProbe for PosixVolumeProbe {
         let available_inodes = if files == 0 { bavail } else { favail };
 
         let read_only = (vfs.f_flag & libc::ST_RDONLY) != 0;
-        let writable = !read_only && check_write_access(mountpoint);
+        let writable = !read_only && check_dir_fd_writable(dir.as_raw_fd());
         let (mounted, mount_identity) = inspect_mountinfo(mountpoint, st.st_dev, st.st_ino);
 
         Ok(FsCapacity {
@@ -257,36 +284,105 @@ fn fstatvfs_fd(fd: libc::c_int) -> io::Result<libc::statvfs> {
     }
 }
 
-fn check_write_access(path: &Path) -> bool {
-    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+fn check_dir_fd_writable(dir_fd: libc::c_int) -> bool {
+    if dir_fd < 0 {
         return false;
-    };
-    // SAFETY: `c_path` is a valid NUL-terminated path string.
-    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+    }
+    let dot = c".";
+    loop {
+        // SAFETY: `dir_fd` is a valid open directory fd and `dot` is NUL-terminated.
+        let rc = unsafe {
+            libc::faccessat(
+                dir_fd,
+                dot.as_ptr(),
+                libc::W_OK,
+                libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            // Fallback for kernels/libcs rejecting AT_EACCESS | AT_SYMLINK_NOFOLLOW on `.`.
+            loop {
+                // SAFETY: `dir_fd` is a valid open directory fd and `dot` is NUL-terminated.
+                let rc2 = unsafe { libc::faccessat(dir_fd, dot.as_ptr(), libc::W_OK, 0) };
+                if rc2 == 0 {
+                    return true;
+                }
+                let err2 = io::Error::last_os_error();
+                if err2.kind() != io::ErrorKind::Interrupted {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+pub(crate) fn linux_dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) as u32) | (((dev >> 32) as u32) & !0xfff)
+}
+
+pub(crate) fn linux_dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) as u32) | (((dev >> 12) as u32) & !0xff)
+}
+
+pub(crate) fn escape_mountinfo_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '\\' => out.push_str("\\134"),
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_mountinfo_for_target(
+    mountinfo_text: &str,
+    mountpoint_escaped: &str,
+    st_dev: u64,
+) -> Option<(bool, String)> {
+    let expected_maj_min = format!("{}:{}", linux_dev_major(st_dev), linux_dev_minor(st_dev));
+    let mut last_for_target: Option<(&str, &str)> = None;
+    for line in mountinfo_text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6 && fields[4] == mountpoint_escaped {
+            last_for_target = Some((fields[0], fields[2]));
+        }
+    }
+    if let Some((mount_id, maj_min)) = last_for_target {
+        if maj_min == expected_maj_min {
+            return Some((true, format!("mount:{mount_id}:{maj_min}")));
+        }
+        return Some((
+            false,
+            format!("mismatch:{mount_id}:{maj_min}:{expected_maj_min}"),
+        ));
+    }
+    None
 }
 
 fn inspect_mountinfo(mountpoint: &Path, st_dev: u64, st_ino: u64) -> (bool, String) {
     let canonical = fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_path_buf());
-    let target = canonical
-        .to_string_lossy()
-        .replace(' ', "\\040")
-        .replace('\t', "\\011");
+    let target = escape_mountinfo_path(&canonical.to_string_lossy());
     if let Ok(content) = fs::read_to_string("/proc/self/mountinfo") {
-        let mut matched: Option<String> = None;
-        for line in content.lines() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 6 && fields[4] == target {
-                matched = Some(format!("mount:{}:{}", fields[0], fields[2]));
-            }
-        }
-        if let Some(id) = matched {
-            return (true, id);
+        if let Some(found) = parse_mountinfo_for_target(&content, &target, st_dev) {
+            return found;
         }
     }
-    // Check parent st_dev difference as secondary mountpoint signal.
+    // Check parent st_dev difference as secondary mountpoint signal when not listed as mount target.
     let mounted = canonical
         .parent()
-        .and_then(|p| fs::metadata(p).ok())
+        .and_then(|p| fs::symlink_metadata(p).ok())
         .is_some_and(|parent_meta| parent_meta.dev() != st_dev);
     (mounted, format!("path:{st_dev}:{st_ino}"))
 }
@@ -297,6 +393,8 @@ pub struct ExfatVolumeManager {
     paths: DataVolumePaths,
     policy: VolumePolicy,
     probe: Arc<dyn VolumeProbe>,
+    released: Arc<AtomicBool>,
+    open_handles: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for ExfatVolumeManager {
@@ -304,17 +402,15 @@ impl std::fmt::Debug for ExfatVolumeManager {
         f.debug_struct("ExfatVolumeManager")
             .field("mountpoint", &self.paths.mountpoint())
             .field("policy", &self.policy)
+            .field("released", &self.is_volume_released())
+            .field("open_handles", &self.open_handle_count())
             .finish()
     }
 }
 
 impl ExfatVolumeManager {
     pub fn new(paths: DataVolumePaths, policy: VolumePolicy) -> Self {
-        Self {
-            paths,
-            policy,
-            probe: Arc::new(PosixVolumeProbe),
-        }
+        Self::with_probe(paths, policy, Arc::new(PosixVolumeProbe))
     }
 
     pub fn with_probe(
@@ -326,6 +422,8 @@ impl ExfatVolumeManager {
             paths,
             policy,
             probe,
+            released: Arc::new(AtomicBool::new(false)),
+            open_handles: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -333,10 +431,54 @@ impl ExfatVolumeManager {
         &self.policy
     }
 
-    /// Fast mount & write-availability check used by audit/receipt fallback paths so
-    /// unmounted `/data` NEVER falls back to writing on the root ext4 filesystem.
+    /// Whether the volume has been logically released for `SafeSwap` handoff.
+    pub fn is_volume_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// Mark or clear the `SafeSwap` volume-released state across all handles to this manager.
+    pub fn set_volume_released(&self, released: bool) {
+        self.released.store(released, Ordering::Release);
+    }
+
+    /// Shared atomic counter tracking open artifact/log/audit handles on `/data`.
+    pub fn handle_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.open_handles)
+    }
+
+    /// Number of currently tracked open handles on `/data`.
+    pub fn open_handle_count(&self) -> usize {
+        self.open_handles.load(Ordering::Acquire)
+    }
+
+    /// Acquire an RAII lease incrementing [`Self::open_handle_count`] until dropped.
+    pub fn acquire_handle_lease(&self) -> VolumeHandleLease {
+        VolumeHandleLease::acquire(Arc::clone(&self.open_handles))
+    }
+
+    /// Fast mount & write-availability check used by audit/receipt/log paths so:
+    /// 1) unmounted `/data` NEVER falls back to writing on the root ext4 filesystem, and
+    /// 2) a `SafeSwap`-released volume (`is_volume_released() == true`) reports `false`
+    ///    so zero new handles or writes touch `/data` after release.
     pub fn is_mounted_and_writable(&self) -> bool {
+        !self.is_volume_released() && self.inspect_capacity_checked().is_ok()
+    }
+
+    /// Raw physical mount & writability check ignoring [`Self::is_volume_released`],
+    /// used by supervisor polling to detect card swap or remount after `SafeSwap`.
+    pub fn is_raw_mounted_and_writable(&self) -> bool {
         self.inspect_capacity_checked().is_ok()
+    }
+
+    /// Probe raw volume capacity/mount identity (ignoring `released` and policy writability errors)
+    /// so supervisor loops can observe unmount -> remount transitions.
+    pub fn probe_raw_volume(&self) -> Option<FsCapacity> {
+        let mountpoint = self.paths.mountpoint();
+        let lstat = fs::symlink_metadata(mountpoint).ok()?;
+        if lstat.file_type().is_symlink() || !lstat.is_dir() {
+            return None;
+        }
+        self.probe.probe_volume(mountpoint).ok()
     }
 
     /// Read and validate `/data/.miro-ego/volume.json`.
@@ -457,26 +599,72 @@ impl ExfatVolumeManager {
     }
 
     /// Admit the recording volume, verifying mountpoint, exFAT policy, writability,
-    /// `volume.json` identity, and same-device `recordings/` boundary.
+    /// `volume.json` identity, and same-device non-symlink canonical subdirectories.
     pub fn admit(
         &self,
         previous_binding: Option<(&str, u64, &str, &str)>,
     ) -> StorageResult<VolumeAdmission> {
         let cap = self.inspect_capacity_checked()?;
+
+        let meta_path = self.paths.volume_metadata_file();
+        let meta_stat =
+            fs::symlink_metadata(&meta_path).map_err(|err| StorageError::VolumeInvalid {
+                message: format!("volume metadata unreadable or missing: {err}"),
+            })?;
+        if meta_stat.file_type().is_symlink() || !meta_stat.is_file() {
+            return Err(StorageError::VolumeInvalid {
+                message: "volume metadata must be a non-symlink regular file".to_owned(),
+            });
+        }
+        if meta_stat.dev() != cap.device_id {
+            return Err(StorageError::VolumeInvalid {
+                message: "volume metadata crosses filesystem boundary".to_owned(),
+            });
+        }
         let meta = self.read_metadata()?;
 
-        // Verify `recordings/` does not escape the volume via symlink or cross-device mount.
-        let recordings_dir = self.paths.recordings_dir();
-        if let Ok(rec_meta) = fs::symlink_metadata(&recordings_dir) {
-            if rec_meta.file_type().is_symlink() || !rec_meta.is_dir() {
-                return Err(StorageError::VolumeInvalid {
-                    message: "recordings directory must not be a symlink or file".to_owned(),
-                });
-            }
-            if rec_meta.dev() != cap.device_id {
-                return Err(StorageError::VolumeInvalid {
-                    message: "recordings directory crosses filesystem boundary".to_owned(),
-                });
+        // Verify all canonical subdirectories (`recordings/`, `logs/`, `updates/`, `.miro-ego/*`)
+        // do not escape the recording volume via symlinks or cross-device mounts.
+        let canonical_dirs = [
+            self.paths.recordings_dir(),
+            self.paths.logs_dir(),
+            self.paths.updates_dir(),
+            self.paths.hidden_meta_dir(),
+            self.paths.index_dir(),
+            self.paths.staging_dir(),
+            self.paths.quarantine_dir(),
+            self.paths.audit_dir(),
+            self.paths.receipts_dir(),
+            self.paths.telemetry_dir(),
+        ];
+        for dir in &canonical_dirs {
+            match fs::symlink_metadata(dir) {
+                Ok(dir_meta) => {
+                    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+                        return Err(StorageError::VolumeInvalid {
+                            message: format!(
+                                "canonical volume directory must not be a symlink or file: {}",
+                                dir.display()
+                            ),
+                        });
+                    }
+                    if dir_meta.dev() != cap.device_id {
+                        return Err(StorageError::VolumeInvalid {
+                            message: format!(
+                                "canonical volume directory crosses filesystem boundary: {}",
+                                dir.display()
+                            ),
+                        });
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(StorageError::io(
+                        "volume_dir_stat_failed",
+                        format!("stat canonical volume directory {}", dir.display()),
+                        err,
+                    ));
+                }
             }
         }
 
@@ -674,6 +862,14 @@ impl ExfatVolumeManager {
 impl VolumeManager for ExfatVolumeManager {
     fn paths(&self) -> &DataVolumePaths {
         &self.paths
+    }
+
+    fn is_volume_released(&self) -> bool {
+        ExfatVolumeManager::is_volume_released(self)
+    }
+
+    fn set_volume_released(&self, released: bool) {
+        ExfatVolumeManager::set_volume_released(self, released);
     }
 
     fn inspect_volume(&self) -> StorageResult<VolumeInfo> {
