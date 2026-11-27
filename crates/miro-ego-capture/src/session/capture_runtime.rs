@@ -2377,7 +2377,7 @@ mod tests {
             Arc::clone(&stream),
             Arc::new(LatestBuffer::new(30).unwrap()),
             1,
-            Duration::from_millis(20),
+            Duration::from_millis(80),
             None,
         )
         .unwrap();
@@ -2399,14 +2399,16 @@ mod tests {
         );
         assert!(runtime.worker.lock().unwrap().is_some());
 
+        // Prepare recording artifacts before restarting preview so process/disk setup never races the read timeout.
+        let rec = test_recording(&root, Arc::new(TestFailureSink::default()));
+
         // Calling start_preview() must reap the dead worker, restart stream, and clear terminal_error.
         runtime.start_preview().unwrap();
         let recovered_snap = runtime.snapshot().unwrap();
         assert!(recovered_snap.running);
         assert!(recovered_snap.terminal_error.is_none());
 
-        // Recording can now start on the recovered runtime before the next read timeout fires.
-        let rec = test_recording(&root, Arc::new(TestFailureSink::default()));
+        // Recording can now start immediately on the recovered runtime.
         let rec_snap = runtime
             .start_recording(RecordingTarget {
                 active_take: Arc::clone(&rec.active_take),

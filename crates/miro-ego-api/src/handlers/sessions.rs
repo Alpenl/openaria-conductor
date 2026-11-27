@@ -4,7 +4,7 @@
 use crate::backend::{CommandOutcome, IdempotentCommand, ListSessionsQuery};
 use crate::downloads::{
     DeleteBeginResult, DeleteReplayLookup, resolve_range_selection,
-    stream_download_body_with_session_lease,
+    stream_download_body_with_session_and_guard,
 };
 use crate::error::{ApiError, ApiResult, HEADER_MANIFEST_SHA256};
 use crate::handlers::{DownloadResponseMeta, build_download_response, parse_strict_query};
@@ -305,18 +305,29 @@ pub async fn session_artifact(
     let content_range = resolved
         .content_range
         .map(|r| r.content_range_header(representation.size));
+    let crate::downloads::OpenRepresentation {
+        content_type,
+        etag,
+        content_disposition,
+        source,
+        lease_guard,
+        ..
+    } = representation;
     let body = if head {
+        drop(source);
+        drop(lease_guard);
         drop(session_lease);
         drop(permit);
         Body::empty()
     } else {
-        stream_download_body_with_session_lease(
-            representation.source,
+        stream_download_body_with_session_and_guard(
+            source,
             resolved.offset,
             resolved.length,
             state.config.download_chunk_bytes,
             permit,
             Some(session_lease),
+            lease_guard,
         )
     };
 
@@ -324,11 +335,11 @@ pub async fn session_artifact(
         &ctx,
         DownloadResponseMeta {
             status,
-            content_type: &representation.content_type,
-            etag: &representation.etag,
+            content_type: &content_type,
+            etag: &etag,
             content_length: resolved.length,
             content_range,
-            content_disposition: representation.content_disposition.as_deref(),
+            content_disposition: content_disposition.as_deref(),
         },
         body,
     )

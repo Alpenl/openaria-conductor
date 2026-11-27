@@ -2925,3 +2925,412 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn safe_swap_stream_leases_drain_timeout_released_volume_gates_and_restart_delete_replay() {
+    let root = temp_test_dir("p05-p215-regression");
+    let data_dir = root.join("data");
+    let state_dir = root.join("state");
+    let run_dir = root.join("run");
+    for d in [&data_dir, &state_dir, &run_dir] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let _ = init_test_volume(&data_dir);
+    // Write an 8 MiB diagnostic log so HTTP streaming fills the 4-chunk channel and parks mid-stream!
+    fs::write(data_dir.join("logs/big.log"), vec![b'X'; 8 * 1024 * 1024]).unwrap();
+
+    let cfg = make_lab_device_config(&data_dir, &state_dir);
+    let mut opts1 = DaemonServeOptions::from_device_config(cfg.clone(), true);
+    opts1.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    opts1.network_socket = None;
+    opts1.deploy_socket = None;
+    opts1.run_dir = Some(run_dir.clone());
+
+    let bound1 = bind_daemon(opts1).await.unwrap();
+    let coord1 = Arc::clone(bound1.backend.coordinator());
+    let addr1 = bound1.server.local_addr();
+    let origin1 = format!("http://{addr1}");
+    let (sd_tx1, sd_rx1) = oneshot::channel::<()>();
+    let task1 = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound1, async {
+            let _ = sd_rx1.await;
+        })
+        .await
+    });
+
+    // Helper to record & seal one mock session and return `(session_id, manifest_sha, first_artifact_id)`.
+    async fn record_one_session(addr: SocketAddr, origin: &str) -> (String, String, String) {
+        let (sc, _, sb) = http_request(
+            addr,
+            Method::POST,
+            "/api/v1/capture/start",
+            &[
+                ("Content-Type", "application/json"),
+                ("Origin", origin),
+                ("Idempotency-Key", &new_uuid_v4()),
+            ],
+            Some(
+                serde_json::to_vec(&json!({
+                    "schema": "miro-ego.capture-start.v1",
+                    "mode": "production",
+                    "take": { "kind": "new" }
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(sc, 202);
+        let start_json: Value = serde_json::from_slice(&sb).unwrap();
+        let sid = start_json["snapshot"]["active_recording"]["recording_state"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (tc, _, _) = http_request(
+            addr,
+            Method::POST,
+            "/api/v1/capture/stop",
+            &[
+                ("Content-Type", "application/json"),
+                ("Origin", origin),
+                ("Idempotency-Key", &new_uuid_v4()),
+            ],
+            Some(
+                serde_json::to_vec(
+                    &json!({ "schema": "miro-ego.capture-stop.v1", "reason": "user" }),
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(tc, 202);
+        let (mc, mhdrs, mbody) = http_request(
+            addr,
+            Method::GET,
+            &format!("/api/v1/sessions/{sid}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(mc, 200);
+        let msha = mhdrs
+            .get("Miro-Ego-Manifest-SHA256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let mdoc: Value = serde_json::from_slice(&mbody).unwrap();
+        let aid = mdoc["video"]["segments"][0]["artifacts"]["left"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (sid, msha, aid)
+    }
+
+    let (sid_a, msha_a, _) = record_one_session(addr1, &origin1).await;
+    let (sid_b, _, aid_b) = record_one_session(addr1, &origin1).await;
+
+    // 1. Open a live paused HTTP stream to `/api/v1/logs/big.log` and verify `open_handle_count()`
+    //    increments by 1 (`base_handles + 1`) while the stream is open, dropping back to `base_handles` once closed!
+    let base_handles = coord1.open_handle_count();
+    {
+        let tcp = TcpStream::connect(addr1).await.unwrap();
+        let (mut sender, conn) = http1::handshake(TokioIo::new(tcp)).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/logs/big.log")
+            .header("Host", addr1.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            coord1.open_handle_count(),
+            base_handles + 1,
+            "VolumeHandleLease MUST stay held while HTTP log stream body is still open"
+        );
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body_bytes.len(), 8 * 1024 * 1024);
+        drop(sender);
+        conn_task.abort();
+    }
+    let drain_wait = Instant::now() + Duration::from_secs(2);
+    while coord1.open_handle_count() != base_handles && Instant::now() < drain_wait {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(coord1.open_handle_count(), base_handles);
+
+    // Also verify `open_session_artifact` holds a `VolumeHandleLease` across streaming and releases it on EOF:
+    let (art_code, _, art_bytes) = http_request(
+        addr1,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_b}/artifacts/{aid_b}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(art_code, 200);
+    assert!(!art_bytes.is_empty());
+    let drain_wait2 = Instant::now() + Duration::from_secs(2);
+    while coord1.open_handle_count() != base_handles && Instant::now() < drain_wait2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(coord1.open_handle_count(), base_handles);
+
+    // 2. Delete `sid_a` with a known `Idempotency-Key`, then restart the daemon and verify
+    //    `check_delete_sessions_idempotency` replays from persisted `ReceiptStore`!
+    let del_idem = new_uuid_v4();
+    let del_body = serde_json::to_vec(&json!({
+        "schema": "miro-ego.session-delete-request.v1",
+        "sessions": [{ "session_id": sid_a, "manifest_sha256": msha_a }]
+    }))
+    .unwrap();
+    let (del1_code, del1_hdrs, del1_resp) = http_request(
+        addr1,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin1),
+            ("Idempotency-Key", &del_idem),
+        ],
+        Some(del_body.clone()),
+    )
+    .await;
+    assert_eq!(del1_code, 200);
+    assert!(del1_hdrs.get("Idempotency-Replayed").is_none());
+
+    let _ = sd_tx1.send(());
+    task1.await.unwrap().unwrap();
+
+    // Start daemon #2 on the same `data_dir` & `state_dir` (fresh in-memory `ArtifactDeleteGate`).
+    let mut opts2 = DaemonServeOptions::from_device_config(cfg.clone(), true);
+    opts2.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    opts2.network_socket = None;
+    opts2.deploy_socket = None;
+    opts2.run_dir = Some(run_dir.clone());
+
+    let bound2 = bind_daemon(opts2).await.unwrap();
+    let coord2 = Arc::clone(bound2.backend.coordinator());
+    let vol2 = Arc::clone(bound2.backend.volume());
+    let addr2 = bound2.server.local_addr();
+    let origin2 = format!("http://{addr2}");
+    let (sd_tx2, sd_rx2) = oneshot::channel::<()>();
+    let task2 = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound2, async {
+            let _ = sd_rx2.await;
+        })
+        .await
+    });
+
+    // Replay `deleteSessions` after restart -> `200 OK` + `Idempotency-Replayed: true`!
+    let (del2_code, del2_hdrs, del2_resp) = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &del_idem),
+        ],
+        Some(del_body),
+    )
+    .await;
+    assert_eq!(del2_code, 200);
+    assert_eq!(
+        del2_hdrs
+            .get("Idempotency-Replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&del2_resp).unwrap(),
+        serde_json::from_slice::<Value>(&del1_resp).unwrap()
+    );
+
+    // 3. `SafeSwap` waits for a draining handle (80ms) -> `202` + `open_handle_count == 0`,
+    //    AND fails closed with `503 volume_busy` when a handle exceeds `safe_swap_drain_timeout`!
+    let _ = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.capture-start.v1",
+                "mode": "production",
+                "take": { "kind": "new" }
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    let transient_lease = coord2.acquire_open_handle_lease();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        drop(transient_lease);
+    });
+    let (drain_ok_code, _, _) = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(
+                &json!({ "schema": "miro-ego.capture-stop.v1", "reason": "safe_swap" }),
+            )
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(drain_ok_code, 202);
+    assert!(vol2.is_volume_released());
+
+    // 4. While `vol2.is_volume_released() == true`, ALL `/data` reads fail closed (`503 storage_unavailable`)!
+    let (m_rel_code, _, m_rel_body) = http_request(
+        addr2,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_b}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(m_rel_code, 503);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&m_rel_body).unwrap()["error"]["code"],
+        "storage_unavailable"
+    );
+
+    let (a_rel_code, _, a_rel_body) = http_request(
+        addr2,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_b}/artifacts/{aid_b}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(a_rel_code, 503);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&a_rel_body).unwrap()["error"]["code"],
+        "storage_unavailable"
+    );
+
+    let (l_rel_code, _, _) =
+        http_request(addr2, Method::GET, "/api/v1/logs/big.log", &[], None).await;
+    assert_eq!(l_rel_code, 503);
+
+    // Stage an update bundle and confirm `firmware/check?force=true` skips `/data/updates` while released!
+    let staged_commit = "c".repeat(40);
+    create_synthetic_release_bundle(
+        &data_dir.join("updates").join(&staged_commit),
+        "0.9.0",
+        &staged_commit,
+    );
+    let (fw_chk_code, _, fw_chk_body) = http_request(
+        addr2,
+        Method::GET,
+        "/api/v1/firmware/check?force=true",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(fw_chk_code, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fw_chk_body).unwrap()["has_update"],
+        false
+    );
+
+    let (_, _, dev_rel_body) = http_request(addr2, Method::GET, "/api/v1/device", &[], None).await;
+    let dev_rel: Value = serde_json::from_slice(&dev_rel_body).unwrap();
+    assert_eq!(
+        dev_rel["storage"]["volume_id"],
+        "00000000-0000-4000-8000-000000000000"
+    );
+    assert_eq!(
+        dev_rel["capabilities"]["calibration_capture"]["disabled_reason"],
+        "storage_unavailable"
+    );
+
+    // 5. Re-admit volume, configure a short `120ms` drain timeout, hold a stuck lease, and verify
+    //    `SafeSwap` fails closed with `503 volume_busy`, leaves `is_volume_released() == false`,
+    //    and emits NO `SafeSwapReceipt` while keeping the session sealed!
+    coord2.refresh_volume_admission().unwrap();
+    assert!(!vol2.is_volume_released());
+    coord2.set_safe_swap_drain_timeout(Duration::from_millis(120));
+
+    let (_, _, start_d_body) = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.capture-start.v1",
+                "mode": "production",
+                "take": { "kind": "new" }
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    let sid_d = serde_json::from_slice::<Value>(&start_d_body).unwrap()["snapshot"]
+        ["active_recording"]["recording_state"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let stuck_lease = coord2.acquire_open_handle_lease();
+    let (busy_swap_code, _, busy_swap_body) = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(
+                &json!({ "schema": "miro-ego.capture-stop.v1", "reason": "safe_swap" }),
+            )
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(busy_swap_code, 503);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&busy_swap_body).unwrap()["error"]["code"],
+        "volume_busy"
+    );
+    assert!(!vol2.is_volume_released());
+    let (no_ss_code, _, _) =
+        http_request(addr2, Method::GET, "/api/v1/capture/safe-swap", &[], None).await;
+    assert_eq!(no_ss_code, 404);
+    let (sealed_d_code, _, _) = http_request(
+        addr2,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_d}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(sealed_d_code, 200);
+    drop(stuck_lease);
+
+    let _ = sd_tx2.send(());
+    task2.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(&root);
+}

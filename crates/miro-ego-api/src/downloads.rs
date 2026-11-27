@@ -475,6 +475,7 @@ pub struct OpenRepresentation {
     pub size: u64,
     pub content_disposition: Option<String>,
     pub source: DownloadSource,
+    pub lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl OpenRepresentation {
@@ -490,6 +491,7 @@ impl OpenRepresentation {
             size,
             content_disposition: None,
             source: DownloadSource::Memory(bytes),
+            lease_guard: None,
         }
     }
 
@@ -505,11 +507,19 @@ impl OpenRepresentation {
             size,
             content_disposition: None,
             source: DownloadSource::File(Arc::new(file)),
+            lease_guard: None,
         }
     }
 
     pub fn with_content_disposition(mut self, value: impl Into<String>) -> Self {
         self.content_disposition = Some(value.into());
+        self
+    }
+
+    /// Attach an opaque RAII open-handle lease (e.g. `VolumeHandleLease`) held until HTTP
+    /// streaming finishes or the client disconnects.
+    pub fn with_lease_guard<T: Send + Sync + 'static>(mut self, guard: T) -> Self {
+        self.lease_guard = Some(Arc::new(guard));
         self
     }
 }
@@ -586,7 +596,38 @@ pub fn stream_download_body(
     chunk_bytes: usize,
     permit: OwnedSemaphorePermit,
 ) -> axum::body::Body {
-    stream_download_body_with_lease(source, offset, length, chunk_bytes, permit, None)
+    stream_download_body_inner(
+        source,
+        offset,
+        length,
+        chunk_bytes,
+        permit,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Build an async streaming `axum::body::Body` holding `permit` and an optional opaque
+/// backend open-handle lease guard until streaming finishes or the client disconnects.
+pub fn stream_download_body_with_guard(
+    source: DownloadSource,
+    offset: u64,
+    length: u64,
+    chunk_bytes: usize,
+    permit: OwnedSemaphorePermit,
+    lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> axum::body::Body {
+    stream_download_body_inner(
+        source,
+        offset,
+        length,
+        chunk_bytes,
+        permit,
+        None,
+        None,
+        lease_guard,
+    )
 }
 
 /// Build an async streaming `axum::body::Body` holding both `permit` and an optional
@@ -606,6 +647,7 @@ pub fn stream_download_body_with_lease(
         chunk_bytes,
         permit,
         delete_lease,
+        None,
         None,
     )
 }
@@ -628,9 +670,34 @@ pub fn stream_download_body_with_session_lease(
         permit,
         None,
         session_lease,
+        None,
     )
 }
 
+/// Build an async streaming `axum::body::Body` holding `permit`, `session_lease`, and an
+/// optional opaque backend open-handle lease guard until streaming finishes or disconnects.
+pub fn stream_download_body_with_session_and_guard(
+    source: DownloadSource,
+    offset: u64,
+    length: u64,
+    chunk_bytes: usize,
+    permit: OwnedSemaphorePermit,
+    session_lease: Option<SessionDownloadLease>,
+    lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> axum::body::Body {
+    stream_download_body_inner(
+        source,
+        offset,
+        length,
+        chunk_bytes,
+        permit,
+        None,
+        session_lease,
+        lease_guard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_download_body_inner(
     source: DownloadSource,
     offset: u64,
@@ -639,8 +706,11 @@ fn stream_download_body_inner(
     permit: OwnedSemaphorePermit,
     delete_lease: Option<OwnedRwLockReadGuard<()>>,
     session_lease: Option<SessionDownloadLease>,
+    lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 ) -> axum::body::Body {
     if length == 0 {
+        drop(source);
+        drop(lease_guard);
         drop(session_lease);
         drop(delete_lease);
         drop(permit);
@@ -654,6 +724,7 @@ fn stream_download_body_inner(
                 let _permit = permit;
                 let _delete_lease = delete_lease;
                 let _session_lease = session_lease;
+                let _lease_guard = lease_guard;
                 let mut pos = offset as usize;
                 let end = (offset.saturating_add(length) as usize).min(bytes.len());
                 while pos < end {
@@ -673,6 +744,7 @@ fn stream_download_body_inner(
                 let _permit = permit;
                 let _delete_lease = delete_lease;
                 let _session_lease = session_lease;
+                let _lease_guard = lease_guard;
                 if let (Ok(off_i64), Ok(len_i64)) = (i64::try_from(offset), i64::try_from(length)) {
                     let _ = fadvise_sequential(file.as_raw_fd(), off_i64, len_i64);
                 }

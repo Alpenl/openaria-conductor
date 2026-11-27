@@ -1,7 +1,7 @@
 //! Diagnostic log listing (`GET /api/v1/logs`) and traversal-proof Range streaming (`GET /api/v1/logs/{name}`).
 
 use crate::backend::ListLogsQuery;
-use crate::downloads::{resolve_range_selection, stream_download_body};
+use crate::downloads::{resolve_range_selection, stream_download_body_with_guard};
 use crate::error::ApiError;
 use crate::handlers::{DownloadResponseMeta, build_download_response, parse_strict_query};
 use crate::middleware::{GatewayState, HeaderExtract, RequestCtx, single_header};
@@ -158,12 +158,13 @@ pub async fn get_log_file(
     let content_range = resolved
         .content_range
         .map(|r| r.content_range_header(representation.size));
-    let body = stream_download_body(
+    let body = stream_download_body_with_guard(
         representation.source,
         resolved.offset,
         resolved.length,
         state.config.download_chunk_bytes,
         permit,
+        representation.lease_guard,
     );
 
     build_download_response(

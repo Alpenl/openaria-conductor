@@ -43,7 +43,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -1728,6 +1728,7 @@ pub struct CaptureCoordinator {
     audit_logger: Mutex<Option<Arc<AuditLogger>>>,
     release_hooks: Mutex<Vec<SafeSwapReleaseHook>>,
     audio_requested_mode: Mutex<String>,
+    safe_swap_drain_timeout_ms: AtomicU64,
     state: Mutex<CoordinatorState>,
     phase_cv: Condvar,
 }
@@ -1782,6 +1783,7 @@ impl CaptureCoordinator {
             audit_logger: Mutex::new(None),
             release_hooks: Mutex::new(Vec::new()),
             audio_requested_mode: Mutex::new("device_default".to_owned()),
+            safe_swap_drain_timeout_ms: AtomicU64::new(5_000),
             state: Mutex::new(CoordinatorState {
                 phase: CapturePhase::Idle,
                 phase_atomic,
@@ -1824,6 +1826,13 @@ impl CaptureCoordinator {
         if let Ok(mut guard) = self.release_hooks.lock() {
             guard.push(hook);
         }
+    }
+
+    /// Override the maximum time `StopReason::SafeSwap` waits for in-flight `VolumeHandleLease`s
+    /// to drain to `0` before failing closed with `503 volume_busy` (default `5s`).
+    pub fn set_safe_swap_drain_timeout(&self, timeout: Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.safe_swap_drain_timeout_ms.store(ms, Ordering::Release);
     }
 
     /// Configure the default `audio_requested_mode` (`"device_default" | "disabled" | "enabled"`)
@@ -3612,17 +3621,68 @@ impl CaptureCoordinator {
         };
         drop(released_lock);
 
-        if req.reason == StopReason::SafeSwap {
-            self.close_all_volume_handles_for_safe_swap();
-        }
-
-        let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
-        let (final_snapshot, done_rev, released_ctx) = {
+        let released_ctx = {
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            let released = guard.active.take();
+            guard.active.take()
+        };
+        drop(released_ctx);
+
+        if req.reason == StopReason::SafeSwap {
+            // Block new `/data` opens immediately and close active audit/log handles, then
+            // wait boundedly for any in-flight HTTP download `VolumeHandleLease`s to drain to 0.
+            self.volume.set_volume_released(true);
+            self.close_all_volume_handles_for_safe_swap();
+            let drain_budget =
+                Duration::from_millis(self.safe_swap_drain_timeout_ms.load(Ordering::Acquire));
+            let drain_deadline = Instant::now() + drain_budget;
+            while self.open_handle_count() > 0 && Instant::now() < drain_deadline {
+                thread::sleep(Duration::from_millis(10));
+                self.close_all_volume_handles_for_safe_swap();
+            }
+            let remaining = self.open_handle_count();
+            if remaining > 0 {
+                // Fail closed without emitting a schema-invalid (`open_handle_count > 0`) or
+                // false safe-swap receipt; restore volume availability and settle phase to Idle
+                // (the session itself is already durably sealed in `catalog`).
+                self.volume.set_volume_released(false);
+                let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
+                let (idle_snap, idle_rev) = {
+                    let mut guard = self.state.lock().map_err(|_| {
+                        StorageError::Core(CoreError::poisoned("coordinator_state"))
+                    })?;
+                    guard.volume_released = false;
+                    guard.released_mount_signature = None;
+                    guard.saw_unmount_since_release = false;
+                    guard.transition(CapturePhase::Idle)?;
+                    self.phase_cv.notify_all();
+                    let snap = self.build_status_snapshot_locked(&guard, runtime_json);
+                    (snap, guard.source_revision)
+                };
+                self.events.emit(
+                    &authority_epoch,
+                    idle_rev,
+                    CaptureEventType::Snapshot,
+                    None,
+                    serde_json::to_value(&idle_snap.snapshot).unwrap_or(Value::Null),
+                );
+                return Err(StorageError::service_unavailable(
+                    "volume_busy",
+                    format!(
+                        "cannot release volume for safe swap: {remaining} open file handle(s) did not drain within timeout"
+                    ),
+                ));
+            }
+        }
+
+        let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
+        let (final_snapshot, done_rev) = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
             if req.reason == StopReason::SafeSwap {
                 guard.volume_released = true;
                 guard.released_mount_signature = Some((
@@ -3635,15 +3695,12 @@ impl CaptureCoordinator {
             guard.transition(CapturePhase::Idle)?;
             self.phase_cv.notify_all();
             let snap = self.build_status_snapshot_locked(&guard, runtime_json);
-            (snap, guard.source_revision, released)
+            (snap, guard.source_revision)
         };
-        drop(released_ctx);
 
         let wrapped = Some(final_snapshot);
 
         let safe_swap_receipt = if req.reason == StopReason::SafeSwap {
-            self.close_all_volume_handles_for_safe_swap();
-            let open_handles = u32::try_from(self.open_handle_count()).unwrap_or(u32::MAX);
             let receipt = SafeSwapReceipt {
                 schema: SAFE_SWAP_RECEIPT_SCHEMA.to_owned(),
                 session_id: session_id.clone(),
@@ -3654,12 +3711,10 @@ impl CaptureCoordinator {
                 sealed_at: sealed.sealed_at.clone(),
                 released_at: now_rfc3339_utc(),
                 release_state: "device-released".to_owned(),
-                open_handle_count: open_handles,
+                open_handle_count: 0,
             };
             let idem_json = serde_json::to_value(&wrapped).unwrap_or(Value::Null);
             let idem_tuple = idempotency_key.map(|k| (principal_id, k, req_hash, idem_json));
-            // Persist BOTH `stop_capture` idempotency and `safe_swap` receipt BEFORE setting
-            // `volume.set_volume_released(true)` so zero writes occur on `/data` after release!
             self.receipts
                 .commit_safe_swap_bundle(idem_tuple, receipt.clone(), admission_writable);
             self.volume.set_volume_released(true);
@@ -3701,6 +3756,34 @@ impl CaptureCoordinator {
         }
 
         Ok(wrapped)
+    }
+
+    /// Read-only lookup of a previously persisted `delete_sessions` idempotency receipt
+    /// (e.g. across daemon restarts) without mutating coordinator state or acquiring delete locks.
+    pub fn lookup_delete_sessions_idempotency(
+        &self,
+        req: &DeleteSessionsRequest,
+        idempotency_key: &str,
+        principal_id: &str,
+    ) -> StorageResult<Option<DeleteSessionsResult>> {
+        validate_idempotency_key(idempotency_key)?;
+        let volume_writable_hint = self.volume.is_mounted_and_writable();
+        let req_hash = request_fingerprint(req)?;
+        let Some(cached) = self.receipts.lookup_idempotency(
+            principal_id,
+            "delete_sessions",
+            idempotency_key,
+            &req_hash,
+            volume_writable_hint,
+        )?
+        else {
+            return Ok(None);
+        };
+        let result: DeleteSessionsResult =
+            serde_json::from_value(cached).map_err(|e| StorageError::Catalog {
+                message: format!("corrupt cached delete receipt: {e}"),
+            })?;
+        Ok(Some(result))
     }
 
     /// Batch-delete explicitly selected sealed recordings with idempotency, digest preflight,

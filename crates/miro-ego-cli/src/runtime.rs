@@ -2802,9 +2802,18 @@ impl GatewayBackend for ProductionGatewayBackend {
         let net_health_client = self.network_health_client.clone();
 
         run_blocking(move || {
-            let vol_info = volume.inspect_volume().ok();
-            let vol_meta = volume.read_metadata().ok();
-            let writable = volume.is_mounted_and_writable();
+            let released = volume.is_volume_released();
+            let vol_info = if released {
+                None
+            } else {
+                volume.inspect_volume().ok()
+            };
+            let vol_meta = if released {
+                None
+            } else {
+                volume.read_metadata().ok()
+            };
+            let writable = !released && volume.is_mounted_and_writable();
             let volume_id = vol_meta
                 .map(|m| m.volume_id)
                 .unwrap_or_else(|| "00000000-0000-4000-8000-000000000000".to_owned());
@@ -3084,9 +3093,15 @@ impl GatewayBackend for ProductionGatewayBackend {
 
     async fn open_session_manifest(&self, session_id: &str) -> ApiResult<RawManifest> {
         let catalog = Arc::clone(&self.catalog);
+        let volume = Arc::clone(&self.volume);
         let recordings_root = self.volume.paths().recordings_dir();
         let sid = session_id.to_owned();
         run_blocking(move || {
+            if volume.is_volume_released() {
+                return Err(ApiError::storage_unavailable(
+                    "recording volume has been released for safe swap",
+                ));
+            }
             let indexed = catalog
                 .get_indexed_session(&sid)
                 .map_err(map_storage_error)?
@@ -3141,10 +3156,16 @@ impl GatewayBackend for ProductionGatewayBackend {
     ) -> ApiResult<OpenRepresentation> {
         let catalog = Arc::clone(&self.catalog);
         let coordinator = Arc::clone(&self.coordinator);
+        let volume = Arc::clone(&self.volume);
         let recordings_root = self.volume.paths().recordings_dir();
         let sid = session_id.to_owned();
         let aid = artifact_id.to_owned();
         run_blocking(move || {
+            if volume.is_volume_released() {
+                return Err(ApiError::storage_unavailable(
+                    "recording volume has been released for safe swap",
+                ));
+            }
             let indexed = catalog
                 .get_indexed_session(&sid)
                 .map_err(map_storage_error)?
@@ -3170,7 +3191,7 @@ impl GatewayBackend for ProductionGatewayBackend {
                 return Err(ApiError::session_not_verified("stale"));
             }
             let counter = coordinator.open_handle_counter();
-            let verified = open_verified_artifact_with_lease(
+            let mut verified = open_verified_artifact_with_lease(
                 &recordings_root,
                 &indexed.relative_dir,
                 &aid,
@@ -3179,15 +3200,47 @@ impl GatewayBackend for ProductionGatewayBackend {
                 Some(&counter),
             )
             .map_err(map_storage_error)?;
+            let lease = verified.take_lease();
             let cloned_file = verified.file().try_clone().map_err(|err| {
                 ApiError::provider_failure(format!("clone verified artifact descriptor: {err}"))
             })?;
-            Ok(OpenRepresentation::from_file(
+            let mut repr = OpenRepresentation::from_file(
                 verified.descriptor.media_type.clone(),
                 verified.descriptor.etag(),
                 cloned_file,
                 verified.descriptor.bytes,
-            ))
+            );
+            if let Some(l) = lease {
+                repr = repr.with_lease_guard(l);
+            }
+            Ok(repr)
+        })
+        .await
+    }
+
+    async fn check_delete_sessions_idempotency(
+        &self,
+        cmd: &IdempotentCommand,
+    ) -> ApiResult<Option<CommandOutcome>> {
+        let req: DeleteSessionsRequest = serde_json::from_value(cmd.body.clone())
+            .map_err(|err| ApiError::bad_request(format!("invalid delete request: {err}")))?;
+        let coordinator = Arc::clone(&self.coordinator);
+        let key = cmd.idempotency_key.clone();
+        let principal_id = cmd.principal_id.clone();
+        run_blocking(move || {
+            let Some(replayed) = coordinator
+                .lookup_delete_sessions_idempotency(&req, &key, &principal_id)
+                .map_err(map_storage_error)?
+            else {
+                return Ok(None);
+            };
+            let body = serde_json::to_value(&replayed).map_err(|err| {
+                ApiError::internal(
+                    "serialize_failed",
+                    format!("serialize delete result: {err}"),
+                )
+            })?;
+            Ok(Some(CommandOutcome::ok(body, true)))
         })
         .await
     }
@@ -3217,7 +3270,11 @@ impl GatewayBackend for ProductionGatewayBackend {
         let logs = Arc::clone(&self.logs);
         let volume = Arc::clone(&self.volume);
         run_blocking(move || {
-            let volume_id = volume.read_metadata().ok().map(|m| m.volume_id);
+            let volume_id = if volume.is_volume_released() {
+                None
+            } else {
+                volume.read_metadata().ok().map(|m| m.volume_id)
+            };
             let list = logs
                 .list_logs(query.prefix.as_deref(), Some(query.limit), volume_id)
                 .map_err(map_storage_error)?;
@@ -3230,12 +3287,20 @@ impl GatewayBackend for ProductionGatewayBackend {
 
     async fn open_log_file(&self, name: &str) -> ApiResult<OpenRepresentation> {
         let logs = Arc::clone(&self.logs);
+        let volume = Arc::clone(&self.volume);
+        let coordinator = Arc::clone(&self.coordinator);
         let logs_dir = self.volume.paths().logs_dir();
         let etag_cache = Arc::clone(&self.log_etag_cache);
         let log_name = name.to_owned();
         run_blocking(move || {
+            if volume.is_volume_released() || !volume.is_mounted_and_writable() {
+                return Err(ApiError::storage_unavailable(
+                    "diagnostic logs are unavailable while storage volume is unmounted or released",
+                ));
+            }
             let _opened = logs.open_log(&log_name).map_err(map_storage_error)?;
-            open_safe_log_file_with_cache(&logs_dir, &log_name, &etag_cache)
+            let repr = open_safe_log_file_with_cache(&logs_dir, &log_name, &etag_cache)?;
+            Ok(repr.with_lease_guard(coordinator.acquire_open_handle_lease()))
         })
         .await
     }
@@ -3922,6 +3987,7 @@ impl GatewayBackend for ProductionGatewayBackend {
         }
 
         let now = now_unix_secs();
+        let volume = Arc::clone(&self.volume);
         let updates_dir = self.volume.paths().updates_dir();
         let deploy_client = self.deploy_status_client.clone();
         let release_manager = Arc::clone(&self.release_manager);
@@ -3942,9 +4008,13 @@ impl GatewayBackend for ProductionGatewayBackend {
                 .as_ref()
                 .and_then(|d| d.current.clone())
                 .unwrap_or_else(|| fallback_commit.clone());
-            let packages = DefaultOfflinePackageHook
-                .discover_packages(&updates_dir)
-                .unwrap_or_default();
+            let packages = if !volume.is_volume_released() && volume.is_mounted_and_writable() {
+                DefaultOfflinePackageHook
+                    .discover_packages(&updates_dir)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let next_pkg = packages
                 .into_iter()
                 .find(|pkg| pkg.commit != current_commit)
@@ -4030,12 +4100,18 @@ impl GatewayBackend for ProductionGatewayBackend {
             .with_error_code_header());
         };
 
+        let volume = Arc::clone(&self.volume);
         let staged_bundle = self.volume.paths().updates_dir().join(&commit);
         let commit_for_task = commit.clone();
         let principal_for_rpc = cmd.principal_id.clone();
         let idem_for_rpc = cmd.idempotency_key.clone();
         let req_hash = hex_encode(Sha256::digest(&cmd.canonical_body).as_slice());
         let (task, rpc_replayed) = run_blocking(move || {
+            if volume.is_volume_released() || !volume.is_mounted_and_writable() {
+                return Err(ApiError::storage_unavailable(
+                    "recording volume is unavailable or released for safe swap",
+                ));
+            }
             let meta = match fs::symlink_metadata(&staged_bundle) {
                 Ok(m) => m,
                 Err(_) => {
