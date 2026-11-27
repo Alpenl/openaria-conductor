@@ -6,21 +6,22 @@
 //! bounded idempotency & task state to `<state_root>/firmware-task.json`, enforcing
 //! `allowed_updates_root` (`/data/updates`), and supporting clean idle auto-exit.
 
-use crate::bundle::{validate_commit_sha, verify_bundle_dir};
-use crate::manager::{DeploymentStatus, ReleaseManager};
+use crate::bundle::{validate_commit_sha, verify_bundle_manifest};
+use crate::manager::{DeploymentStatus, HeldDeployLocks, ReleaseManager};
 use crate::{DeployError, DeployResult};
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
-use miro_ego_core::locks::{FlockGuard, LockMode, acquire_flock, acquire_maintenance_lock};
+use miro_ego_core::locks::{LockMode, acquire_flock, acquire_maintenance_lock};
 use miro_ego_core::sys::fs::{read_bounded_json, write_bytes_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -295,7 +296,6 @@ struct ActiveConnDropGuard {
 impl Drop for ActiveConnDropGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
-        self.coord.bump_activity();
         self.coord.idle_cv.notify_all();
     }
 }
@@ -364,7 +364,6 @@ impl DeployTaskCoordinator {
     }
 
     fn status(&self) -> DeployResult<DeployControlStatus> {
-        self.bump_activity();
         let deployment = self.manager.status()?;
         let task = self
             .state
@@ -416,7 +415,7 @@ impl DeployTaskCoordinator {
         Ok(snapshot)
     }
 
-    fn acquire_task_locks(&self) -> DeployResult<(FlockGuard, FlockGuard)> {
+    fn acquire_task_locks(&self) -> DeployResult<HeldDeployLocks> {
         fs::create_dir_all(&self.manager.paths().run_dir).map_err(|err| DeployError::Failed {
             message: format!(
                 "failed creating run dir {}: {err}",
@@ -442,7 +441,7 @@ impl DeployTaskCoordinator {
                     },
                     other => DeployError::Core(other),
                 })?;
-        Ok((deploy, maint))
+        Ok(HeldDeployLocks::new(deploy, maint))
     }
 
     fn check_idempotency_replay(
@@ -501,7 +500,10 @@ impl DeployTaskCoordinator {
         }
         let locks = self.acquire_task_locks()?;
 
-        let verified = verify_bundle_dir(&bundle_dir)?;
+        // Fast synchronous preflight (`bundle.json` + Ed25519 `bundle.json.sig` + file sizes +
+        // 64B ELF headers); heavy payload copy & SHA-256 verification execute once in background
+        // `stage_release`!
+        let verified = verify_bundle_manifest(&bundle_dir)?;
         self.manager.offline_hook().pre_install_verify(&verified)?;
         if verified.commit() != expected_commit {
             return Err(DeployError::InvalidBundle {
@@ -597,11 +599,11 @@ impl DeployTaskCoordinator {
         self: &Arc<Self>,
         initial_task: FirmwareTaskSnapshot,
         idem_meta: Option<(String, String)>,
-        locks: (FlockGuard, FlockGuard),
+        locks: HeldDeployLocks,
         op: F,
     ) -> DeployResult<FirmwareTaskSnapshot>
     where
-        F: FnOnce(&ReleaseManager, &(FlockGuard, FlockGuard)) -> DeployResult<DeploymentStatus>
+        F: FnOnce(&ReleaseManager, &mut HeldDeployLocks) -> DeployResult<DeploymentStatus>
             + Send
             + 'static,
     {
@@ -655,7 +657,7 @@ impl DeployTaskCoordinator {
         let spawn_res = thread::Builder::new()
             .name("miro-ego-deploy-tx".to_owned())
             .spawn(move || {
-                let held_locks = locks;
+                let mut held_locks = locks;
                 let mut active_guard = ActiveTaskDropGuard {
                     coord: Arc::clone(&coord),
                     task_id: task_id.clone(),
@@ -663,14 +665,20 @@ impl DeployTaskCoordinator {
                 };
 
                 {
-                    let guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    if !guard.response_flushed {
-                        let _ = coord
+                    let mut guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    while !guard.response_flushed {
+                        let (next, wait_res) = coord
                             .flushed_cv
-                            .wait_timeout(guard, Duration::from_millis(50));
+                            .wait_timeout(guard, Duration::from_secs(2))
+                            .unwrap_or_else(PoisonError::into_inner);
+                        guard = next;
+                        if wait_res.timed_out() {
+                            break;
+                        }
                     }
                 }
 
+                coord.bump_activity();
                 let running_persisted = {
                     let mut guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(cur) = guard.latest_task.as_mut() {
@@ -701,7 +709,7 @@ impl DeployTaskCoordinator {
                 };
                 let _ = coord.persist_task_state(&running_persisted);
 
-                let outcome = op(&coord.manager, &held_locks);
+                let outcome = op(&coord.manager, &mut held_locks);
                 drop(held_locks);
                 let finished_at = unix_now_secs();
 
@@ -992,7 +1000,10 @@ impl DeployRpcServer {
         }
 
         match Self::from_listener(listener, Some(path.clone()), manager, config) {
-            Ok(srv) => Ok(srv),
+            Ok(srv) => {
+                let _ = send_systemd_notify("READY=1\n");
+                Ok(srv)
+            }
             Err(err) => {
                 let _ = fs::remove_file(&path);
                 Err(err)
@@ -1027,72 +1038,131 @@ impl DeployRpcServer {
             .name("miro-ego-deploy-rpc".to_owned())
             .spawn(move || {
                 let mut handles: Vec<JoinHandle<()>> = Vec::new();
+                let spawn_accepted =
+                    |stream: UnixStream,
+                     handles: &mut Vec<JoinHandle<()>>,
+                     workers_loop: &Arc<AtomicUsize>,
+                     coord_loop: &Arc<DeployTaskCoordinator>,
+                     mutation_lock: &Arc<Mutex<()>>,
+                     config: &DeployRpcServerConfig| {
+                        let current = workers_loop.load(Ordering::Acquire);
+                        if current >= config.max_concurrent_connections {
+                            let busy = DeployRpcResponse::error(
+                                "deployment_busy",
+                                "deploy-control server is busy",
+                                None,
+                                true,
+                            );
+                            let _ = write_framed_response(
+                                stream,
+                                &busy,
+                                config.max_line_bytes,
+                                Duration::from_millis(200),
+                            );
+                            return;
+                        }
+                        workers_loop.fetch_add(1, Ordering::AcqRel);
+                        let guard = ActiveConnDropGuard {
+                            counter: Arc::clone(workers_loop),
+                            coord: Arc::clone(coord_loop),
+                        };
+                        let coord = Arc::clone(coord_loop);
+                        let mlock = Arc::clone(mutation_lock);
+                        let cfg = config.clone();
+                        if let Ok(handle) = thread::Builder::new()
+                            .name("miro-ego-deploy-conn".to_owned())
+                            .spawn(move || {
+                                let _conn_guard = guard;
+                                handle_connection(stream, &coord, &mlock, &cfg);
+                            })
+                        {
+                            handles.push(handle);
+                        }
+                    };
+
                 while !stop_loop.load(Ordering::Acquire) {
                     handles.retain(|h| !h.is_finished());
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            coord_loop.bump_activity();
-                            let current = workers_loop.load(Ordering::Acquire);
-                            if current >= config.max_concurrent_connections {
-                                let busy = DeployRpcResponse::error(
-                                    "deployment_busy",
-                                    "deploy-control server is busy",
-                                    None,
-                                    true,
-                                );
-                                let _ = write_framed_response(
-                                    stream,
-                                    &busy,
-                                    config.max_line_bytes,
-                                    Duration::from_millis(200),
-                                );
-                                continue;
-                            }
-                            workers_loop.fetch_add(1, Ordering::AcqRel);
-                            let guard = ActiveConnDropGuard {
-                                counter: Arc::clone(&workers_loop),
-                                coord: Arc::clone(&coord_loop),
-                            };
-                            let coord = Arc::clone(&coord_loop);
-                            let mlock = Arc::clone(&mutation_lock);
-                            let cfg = config.clone();
-                            if let Ok(handle) = thread::Builder::new()
-                                .name("miro-ego-deploy-conn".to_owned())
-                                .spawn(move || {
-                                    let _conn_guard = guard;
-                                    handle_connection(stream, &coord, &mlock, &cfg);
-                                })
-                            {
-                                handles.push(handle);
-                            }
+                            spawn_accepted(
+                                stream,
+                                &mut handles,
+                                &workers_loop,
+                                &coord_loop,
+                                &mutation_lock,
+                                &config,
+                            );
                         }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            let mut poll_wait = Duration::from_millis(20);
                             if let Some(idle_limit) = config.idle_timeout {
-                                if workers_loop.load(Ordering::Acquire) == 0
-                                    && !coord_loop.is_active()
-                                {
+                                if coord_loop.is_active() {
+                                    coord_loop.bump_activity();
+                                } else if workers_loop.load(Ordering::Acquire) == 0 {
                                     let last_ns =
                                         coord_loop.last_activity_mono_ns.load(Ordering::Acquire);
-                                    let elapsed_ns = monotonic_now_ns().saturating_sub(last_ns);
-                                    if Duration::from_nanos(elapsed_ns) >= idle_limit {
-                                        idle_exited_loop.store(true, Ordering::Release);
-                                        stop_loop.store(true, Ordering::Release);
-                                        coord_loop.idle_cv.notify_all();
-                                        break;
+                                    let elapsed = Duration::from_nanos(
+                                        monotonic_now_ns().saturating_sub(last_ns),
+                                    );
+                                    if elapsed >= idle_limit {
+                                        // Close TOCTOU window: re-attempt `accept()` immediately
+                                        // before committing idle exit so a client that queued a
+                                        // connection right as the deadline elapsed is served!
+                                        match listener.accept() {
+                                            Ok((stream, _)) => {
+                                                spawn_accepted(
+                                                    stream,
+                                                    &mut handles,
+                                                    &workers_loop,
+                                                    &coord_loop,
+                                                    &mutation_lock,
+                                                    &config,
+                                                );
+                                                continue;
+                                            }
+                                            Err(recheck)
+                                                if recheck.kind() == ErrorKind::WouldBlock =>
+                                            {
+                                                if workers_loop.load(Ordering::Acquire) == 0
+                                                    && !coord_loop.is_active()
+                                                {
+                                                    idle_exited_loop.store(true, Ordering::Release);
+                                                    stop_loop.store(true, Ordering::Release);
+                                                    coord_loop.idle_cv.notify_all();
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    } else {
+                                        poll_wait = poll_wait.min(
+                                            idle_limit
+                                                .saturating_sub(elapsed)
+                                                .max(Duration::from_millis(1)),
+                                        );
                                     }
-                                } else {
-                                    coord_loop.bump_activity();
                                 }
                             }
-                            thread::sleep(Duration::from_millis(10));
+                            poll_listener_readable(listener.as_raw_fd(), poll_wait);
                         }
                         Err(_) => {
                             if stop_loop.load(Ordering::Acquire) {
                                 break;
                             }
-                            thread::sleep(Duration::from_millis(20));
+                            poll_listener_readable(listener.as_raw_fd(), Duration::from_millis(20));
                         }
                     }
+                }
+                // Drain any connections already queued in the kernel accept backlog before exit.
+                while let Ok((stream, _)) = listener.accept() {
+                    spawn_accepted(
+                        stream,
+                        &mut handles,
+                        &workers_loop,
+                        &coord_loop,
+                        &mutation_lock,
+                        &config,
+                    );
                 }
                 for handle in handles {
                     let _ = handle.join();
@@ -1126,7 +1196,7 @@ impl DeployRpcServer {
         self.idle_exited.load(Ordering::Acquire)
     }
 
-    /// Return monotonic duration elapsed since the last RPC request or active firmware task.
+    /// Return monotonic duration elapsed since the last mutating RPC or active firmware task.
     pub fn idle_elapsed(&self) -> Duration {
         if !self.is_idle() {
             return Duration::ZERO;
@@ -1146,16 +1216,28 @@ impl DeployRpcServer {
         stop: &AtomicBool,
     ) -> DeployResult<()> {
         while !stop.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire) {
-            if self.is_idle() {
-                if self.idle_elapsed() >= idle_timeout {
-                    self.idle_exited.store(true, Ordering::Release);
-                    self.stop.store(true, Ordering::Release);
-                    break;
-                }
-            } else {
+            if self.coordinator.is_active() {
                 self.coordinator.bump_activity();
+            } else if self.is_idle() && self.idle_elapsed() >= idle_timeout {
+                self.idle_exited.store(true, Ordering::Release);
+                self.stop.store(true, Ordering::Release);
+                self.coordinator.idle_cv.notify_all();
+                break;
             }
-            thread::sleep(Duration::from_millis(25));
+            let wait_for = if self.is_idle() {
+                idle_timeout
+                    .saturating_sub(self.idle_elapsed())
+                    .min(Duration::from_millis(25))
+                    .max(Duration::from_millis(1))
+            } else {
+                Duration::from_millis(25)
+            };
+            let guard = self
+                .coordinator
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let _ = self.coordinator.idle_cv.wait_timeout(guard, wait_for);
         }
         Ok(())
     }
@@ -1234,7 +1316,10 @@ fn handle_connection(
         config.max_line_bytes,
         config.write_timeout,
     );
-    if response.ok && matches!(response.operation.as_deref(), Some("install" | "rollback")) {
+    if matches!(
+        response.operation.as_deref(),
+        Some("install" | "update" | "rollback")
+    ) {
         coordinator.notify_response_flushed();
     }
 }
@@ -1324,14 +1409,14 @@ fn dispatch_raw_payload(
             200,
             json!({
                 "ok": true,
-                "operations": ["status", "install", "rollback"],
+                "operations": ["status", "install", "update", "rollback"],
             }),
         ),
         "status" => match coordinator.status() {
             Ok(st) => serialize_ok("status", 200, &st, None),
             Err(err) => error_from_deploy_error(op, &err),
         },
-        "install" => {
+        "install" | "update" => {
             let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(body) = &request.body else {
                 return DeployRpcResponse::error(
@@ -1388,7 +1473,7 @@ fn dispatch_raw_payload(
                 activate,
                 idem_meta,
             ) {
-                Ok(out) => serialize_ok("install", 202, &out.task, Some(out.replayed)),
+                Ok(out) => serialize_ok(op, 202, &out.task, Some(out.replayed)),
                 Err(err) => error_from_deploy_error(op, &err),
             }
         }
@@ -1561,6 +1646,7 @@ impl DeployRpcClient {
             .map_err(|err| DeployError::Failed {
                 message: format!("failed writing deploy RPC request: {err}"),
             })?;
+        let _ = stream.shutdown(std::net::Shutdown::Write);
 
         let raw_line = match read_ndjson_line(&mut stream, self.max_line_bytes, self.timeout) {
             Ok(Some(line)) => line,
@@ -1814,6 +1900,8 @@ fn write_framed_response(
             message: format!("failed writing deploy RPC response: {err}"),
         })?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
+    // Drain any unread client bytes in nonblocking mode after half-closing the write side so
+    // closing the AF_UNIX socket never triggers ECONNRESET while keeping RPC latency sub-ms.
     if stream.set_nonblocking(true).is_ok() {
         let mut discard = [0u8; 4096];
         let mut drained = 0usize;
@@ -1825,6 +1913,52 @@ fn write_framed_response(
         }
     }
     Ok(())
+}
+
+/// Send an `sd_notify`-compatible datagram (e.g. `"READY=1\n"`) to `notify_socket`, supporting
+/// both filesystem paths and Linux abstract namespace (`@...`) sockets with zero external crates.
+pub fn send_systemd_notify_to(notify_socket: &OsStr, state: &str) -> bool {
+    let bytes = notify_socket.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return false;
+    };
+    if let Some(abstract_name) = bytes.strip_prefix(b"@") {
+        if abstract_name.is_empty() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name) {
+                return sock.send_to_addr(state.as_bytes(), &addr).is_ok();
+            }
+        }
+        return false;
+    }
+    sock.send_to(state.as_bytes(), Path::new(notify_socket))
+        .is_ok()
+}
+
+/// Send an `sd_notify` datagram over `NOTIFY_SOCKET` when set in the process environment.
+pub fn send_systemd_notify(state: &str) -> bool {
+    let Some(notify_socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return false;
+    };
+    send_systemd_notify_to(&notify_socket, state)
+}
+
+fn poll_listener_readable(fd: libc::c_int, timeout: Duration) {
+    let timeout_ms = i32::try_from(timeout.as_millis().min(1000)).unwrap_or(20);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a valid stack `pollfd` referencing an open `UnixListener` fd.
+    let _ = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
 }
 
 fn unix_now_secs() -> u64 {
@@ -2110,7 +2244,77 @@ mod tests {
             .unwrap();
         assert!(replay_after_restart.replayed);
 
-        // Verify wait_for_idle_or_exit exits cleanly after idle_timeout!
+        // Verify wait_for_idle_or_exit exits cleanly after idle_timeout EVEN WHILE status/health
+        // RPCs are continuously polled!
+        let server3_sock = paths.run_dir.join("idle-poll.sock");
+        let server3 = DeployRpcServer::bind(
+            &server3_sock,
+            Arc::clone(&mgr),
+            DeployRpcServerConfig::default()
+                .with_allowed_updates_root(&updates_dir)
+                .with_idle_timeout(Some(Duration::from_millis(120))),
+        )
+        .unwrap();
+        let poll_client = DeployRpcClient::new(&server3_sock);
+        let start_poll = Instant::now();
+        while !server3.has_exited_idle() && start_poll.elapsed() < Duration::from_secs(2) {
+            let _ = poll_client.status();
+            let _ = poll_client.health();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            server3.has_exited_idle(),
+            "read-only status/health polling must NOT prevent idle auto-exit"
+        );
+        server3.shutdown();
+
+        // Verify sd_notify READY=1\n over UnixDatagram + single-pass background SHA-256 rejection:
+        let notify_sock_path = root.join("notify.sock");
+        let notify_rx = UnixDatagram::bind(&notify_sock_path).unwrap();
+        notify_rx
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(send_systemd_notify_to(
+            notify_sock_path.as_os_str(),
+            "READY=1\n"
+        ));
+        let mut nbuf = [0u8; 32];
+        let n_ready = notify_rx.recv(&mut nbuf).unwrap();
+        assert_eq!(&nbuf[..n_ready], b"READY=1\n");
+
+        // Corrupt a single payload byte inside an otherwise size-valid, ELF-valid signed bundle:
+        // fast preflight returns 202 Accepted immediately, and background single-pass staging
+        // catches the SHA-256 mismatch and marks the task Failed without touching current!
+        let commit_bad_sha = "3".repeat(40);
+        let b_bad = updates_dir.join("v3-bad-sha");
+        build_valid_bundle(&b_bad, "0.3.2", &commit_bad_sha, &[]);
+        let mut bin_bytes = fs::read(b_bad.join("bin/miro-ego-encoder")).unwrap();
+        bin_bytes[90] ^= 0x55;
+        fs::write(b_bad.join("bin/miro-ego-encoder"), &bin_bytes).unwrap();
+
+        let server4_sock = paths.run_dir.join("single-pass.sock");
+        let server4 = DeployRpcServer::bind(
+            &server4_sock,
+            Arc::clone(&mgr),
+            DeployRpcServerConfig::default().with_allowed_updates_root(&updates_dir),
+        )
+        .unwrap();
+        let client4 = DeployRpcClient::new(&server4_sock);
+        let accepted_bad = client4.install(&b_bad, &commit_bad_sha, true).unwrap();
+        assert_eq!(accepted_bad.status, FirmwareTaskStatus::Accepted);
+        let settled_bad = server4
+            .wait_for_idle(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled_bad.status, FirmwareTaskStatus::Failed);
+        assert!(settled_bad.message.contains("SHA-256 mismatch"));
+        assert_eq!(
+            client4.status().unwrap().deployment.current.as_deref(),
+            Some(commit_v1.as_str())
+        );
+        server4.shutdown();
+
+        // Verify wait_for_idle_or_exit on server2:
         let stop_flag = AtomicBool::new(false);
         server2
             .wait_for_idle_or_exit(Duration::from_millis(80), &stop_flag)

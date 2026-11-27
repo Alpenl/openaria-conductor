@@ -22,11 +22,12 @@ use crate::util::{
     sha256_hex, sweep_stale_atomic_temps,
 };
 use crate::{
-    CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION, CatalogEntry, SessionCatalog, SessionState,
-    StorageError, StorageResult,
+    CATALOG_BINARY_FORMAT_VERSION, CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION, CATALOG_WAL_MAGIC,
+    CatalogEntry, SessionCatalog, SessionState, StorageError, StorageResult,
 };
 use miro_ego_core::CoreError;
 use miro_ego_core::ids::{is_valid_sha256, is_valid_uuid_v4, is_valid_uuid_v7, new_uuid_v4};
+use miro_ego_core::locks::{FlockGuard, LockMode, acquire_flock};
 use miro_ego_core::paths::DataVolumePaths;
 use miro_ego_core::sys::fs::{
     fstat, fstatat_nofollow, is_exfat_or_msdos, open_directory_safe, openat_retry,
@@ -36,10 +37,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
 pub const SESSION_LIST_SCHEMA: &str = "miro-ego.session-list.v1";
@@ -48,7 +51,12 @@ pub const DEFAULT_PAGE_LIMIT: usize = 50;
 pub const MAX_PAGE_LIMIT: usize = 200;
 /// Hard cap for `/data/.miro-ego/index/catalog.bin` (16 MiB).
 pub const MAX_CATALOG_BIN_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CATALOG_WAL_BYTES: usize = 8 * 1024 * 1024;
 const CATALOG_HEADER_BYTES: usize = 20;
+const WAL_COMPACT_THRESHOLD: usize = 64;
+const WAL_OP_ADMIT: u8 = 1;
+const WAL_OP_SET_VERIFICATION: u8 = 2;
+const WAL_OP_FORGET_PATHS: u8 = 3;
 
 /// Device identity snapshot copied verbatim from a sealed manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +249,8 @@ pub struct CatalogIndex {
     catalog_revision: String,
     by_id: HashMap<String, IndexedSession>,
     by_path: HashMap<String, String>,
+    started_at_ns: HashMap<String, Option<i128>>,
+    sorted_ids: Vec<String>,
     diagnostics_by_path: BTreeMap<String, SessionDiscoveryDiagnostic>,
 }
 
@@ -251,7 +261,43 @@ impl CatalogIndex {
         idx
     }
 
+    fn rebuild_sorted_cache(&mut self) {
+        self.started_at_ns
+            .retain(|sid, _| self.by_id.contains_key(sid));
+        for (sid, entry) in &self.by_id {
+            self.started_at_ns
+                .entry(sid.clone())
+                .or_insert_with(|| parse_rfc3339_utc_nanos(&entry.started_at));
+        }
+        let mut ids: Vec<String> = self.by_id.keys().cloned().collect();
+        ids.sort_by(|a_id, b_id| {
+            let a_utc = self.started_at_ns.get(a_id).copied().flatten();
+            let b_utc = self.started_at_ns.get(b_id).copied().flatten();
+            match (b_utc, a_utc) {
+                (Some(bn), Some(an)) => bn.cmp(&an),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => {
+                    let a_str = self
+                        .by_id
+                        .get(a_id)
+                        .map(|e| e.started_at.as_str())
+                        .unwrap_or("");
+                    let b_str = self
+                        .by_id
+                        .get(b_id)
+                        .map(|e| e.started_at.as_str())
+                        .unwrap_or("");
+                    b_str.cmp(a_str)
+                }
+            }
+            .then_with(|| b_id.cmp(a_id))
+        });
+        self.sorted_ids = ids;
+    }
+
     fn recompute_revision(&mut self) {
+        self.rebuild_sorted_cache();
         let sorted_items = self.sorted_sessions();
         let sorted_diags: Vec<&SessionDiscoveryDiagnostic> =
             self.diagnostics_by_path.values().collect();
@@ -270,9 +316,18 @@ impl CatalogIndex {
     }
 
     fn sorted_sessions(&self) -> Vec<&IndexedSession> {
+        if self.sorted_ids.len() == self.by_id.len() {
+            let mut out = Vec::with_capacity(self.sorted_ids.len());
+            for sid in &self.sorted_ids {
+                if let Some(entry) = self.by_id.get(sid) {
+                    out.push(entry);
+                }
+            }
+            if out.len() == self.by_id.len() {
+                return out;
+            }
+        }
         let mut items: Vec<&IndexedSession> = self.by_id.values().collect();
-        // Deterministic newest-first ordering by parsed UTC instant, falling back to
-        // lexical started_at, then session_id descending.
         items.sort_by(|a, b| {
             let a_utc = parse_rfc3339_utc_nanos(&a.started_at);
             let b_utc = parse_rfc3339_utc_nanos(&b.started_at);
@@ -308,6 +363,8 @@ impl CatalogIndex {
             catalog_revision: String::new(),
             by_id: HashMap::with_capacity(payload.entries.len()),
             by_path: HashMap::with_capacity(payload.entries.len()),
+            started_at_ns: HashMap::with_capacity(payload.entries.len()),
+            sorted_ids: Vec::with_capacity(payload.entries.len()),
             diagnostics_by_path: BTreeMap::new(),
         };
         for entry in payload.entries {
@@ -412,30 +469,43 @@ struct PageCursorToken {
     include_recovery: bool,
 }
 
-/// High-speed in-memory session catalog backed by `/data/.miro-ego/index/catalog.bin`.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+enum WalMutation {
+    Admit(IndexedSession),
+    SetVerification {
+        session_id: String,
+        verification: Option<GatewayVerification>,
+    },
+    ForgetPaths(Vec<String>),
+}
+
+/// High-speed in-memory session catalog backed by `/data/.miro-ego/index/catalog.bin`
+/// (`MEGOCAT1` compact binary v2) and append-only `/data/.miro-ego/index/catalog.wal`.
 pub struct BinarySessionCatalog {
     paths: DataVolumePaths,
     write_lock: Mutex<()>,
+    wal_ops: AtomicUsize,
     index: RwLock<CatalogIndex>,
 }
 
 impl BinarySessionCatalog {
-    /// Open the catalog: loads `catalog.bin` when valid and reconciles it against
-    /// `/data/recordings/` (pruning ghost entries, sweeping leftover control markers,
-    /// indexing newly discovered sessions, and backfilling missing verifications), or
-    /// automatically rebuilds if `catalog.bin` is missing or corrupt.
-    ///
-    /// If persisting `catalog.bin` fails due to `EROFS`, `ENOSPC`, or an unavailable
-    /// `.miro-ego/index` directory, commits the reconciled/rebuilt index in memory and succeeds.
+    /// Open the catalog: loads `catalog.bin` (+ `catalog.wal`) when valid and reconciles it
+    /// against `/data/recordings/`, or automatically rebuilds if `catalog.bin` is missing or corrupt.
     pub fn open(paths: DataVolumePaths) -> StorageResult<Self> {
-        let _ = sweep_stale_atomic_temps(&paths.index_dir());
         let catalog = Self {
             paths,
             write_lock: Mutex::new(()),
+            wal_ops: AtomicUsize::new(0),
             index: RwLock::new(CatalogIndex::new_empty()),
         };
-        match catalog.load_snapshot_from_disk() {
-            Ok(loaded) => {
+        let _flock = catalog.try_acquire_index_flock(LockMode::Exclusive);
+        let _ = sweep_stale_atomic_temps(&catalog.paths.index_dir());
+        let loaded_res = catalog.load_snapshot_and_wal_from_disk(true);
+        drop(_flock);
+        match loaded_res {
+            Ok((loaded, wal_count)) => {
+                catalog.wal_ops.store(wal_count, Ordering::Release);
                 {
                     let mut guard = catalog
                         .index
@@ -447,9 +517,93 @@ impl BinarySessionCatalog {
                 Ok(catalog)
             }
             Err(_) => {
-                // Missing or corrupt catalog.bin -> auto-rebuild cleanly from recordings/.
                 if catalog.paths.recordings_dir().is_dir() {
                     let _ = catalog.rebuild_index()?;
+                }
+                Ok(catalog)
+            }
+        }
+    }
+
+    /// Fast startup open: when `/data/.miro-ego/index/mount-clean.marker` is present, no
+    /// `.partial` staging or interrupted `deleting/` directories exist, and `catalog.bin`
+    /// (+ `catalog.wal`) decodes cleanly, binds the index in $O(N)$ without walking the entire
+    /// `/data/recordings/` filesystem tree. Returns `(catalog, skipped_full_scan)`.
+    pub fn open_fast_if_clean(paths: DataVolumePaths) -> StorageResult<(Self, bool)> {
+        let is_clean_hint = paths.mount_clean_marker_file().is_file()
+            && !dir_has_entries(&paths.staging_dir(), Some(".partial"))
+            && !dir_has_entries(&paths.deleting_dir(), None);
+        if is_clean_hint {
+            let catalog = Self {
+                paths: paths.clone(),
+                write_lock: Mutex::new(()),
+                wal_ops: AtomicUsize::new(0),
+                index: RwLock::new(CatalogIndex::new_empty()),
+            };
+            let _flock = catalog.try_acquire_index_flock(LockMode::Shared);
+            if let Ok((loaded, wal_count)) = catalog.load_snapshot_and_wal_from_disk(false) {
+                drop(_flock);
+                catalog.wal_ops.store(wal_count, Ordering::Release);
+                let wrote = if let Ok(mut guard) = catalog.index.write() {
+                    *guard = loaded;
+                    true
+                } else {
+                    false
+                };
+                if wrote {
+                    return Ok((catalog, true));
+                }
+            }
+        }
+        let catalog = Self::open(paths)?;
+        Ok((catalog, false))
+    }
+
+    /// Strictly read-only catalog open for CLI `miro-ego status`: never sweeps temp files,
+    /// never mutates `catalog.bin`/`catalog.wal`, and never contends destructively with a live daemon.
+    pub fn open_read_only(paths: DataVolumePaths) -> StorageResult<Self> {
+        let catalog = Self {
+            paths,
+            write_lock: Mutex::new(()),
+            wal_ops: AtomicUsize::new(0),
+            index: RwLock::new(CatalogIndex::new_empty()),
+        };
+        let _flock = catalog.try_acquire_index_flock(LockMode::Shared);
+        match catalog.load_snapshot_and_wal_from_disk(false) {
+            Ok((loaded, wal_count)) => {
+                catalog.wal_ops.store(wal_count, Ordering::Release);
+                {
+                    let mut guard = catalog
+                        .index
+                        .write()
+                        .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+                    *guard = loaded;
+                }
+                Ok(catalog)
+            }
+            Err(_) => {
+                let recordings_root = catalog.paths.recordings_dir();
+                if recordings_root.is_dir() {
+                    let (sessions, diags) = scan_recordings_tree(&recordings_root, None)?;
+                    let mut staged = CatalogIndex::new_empty();
+                    for (rel, diag) in diags {
+                        staged.diagnostics_by_path.insert(rel, diag);
+                    }
+                    for session in sessions {
+                        if !staged.by_id.contains_key(&session.session_id) {
+                            staged
+                                .by_path
+                                .insert(session.relative_dir.clone(), session.session_id.clone());
+                            staged.by_id.insert(session.session_id.clone(), session);
+                        }
+                    }
+                    staged.recompute_revision();
+                    {
+                        let mut guard = catalog.index.write().map_err(|_| {
+                            StorageError::Core(CoreError::poisoned("catalog_index"))
+                        })?;
+                        *guard = staged;
+                    }
                 }
                 Ok(catalog)
             }
@@ -461,8 +615,59 @@ impl BinarySessionCatalog {
         Self {
             paths,
             write_lock: Mutex::new(()),
+            wal_ops: AtomicUsize::new(0),
             index: RwLock::new(CatalogIndex::new_empty()),
         }
+    }
+
+    /// Clear `mount-clean.marker` before mutating `/data/recordings/` or `/data/.miro-ego/staging/`.
+    pub fn mark_mount_dirty(&self) {
+        let _ = fs::remove_file(self.paths.mount_clean_marker_file());
+    }
+
+    /// Compact any pending `catalog.wal` operations into `catalog.bin` and record `mount-clean.marker`
+    /// on graceful daemon shutdown when no staging/deleting work remains.
+    pub fn mark_mount_clean(&self) {
+        let _ = self.compact();
+        if self.paths.index_dir().is_dir()
+            && !dir_has_entries(&self.paths.staging_dir(), Some(".partial"))
+            && !dir_has_entries(&self.paths.deleting_dir(), None)
+        {
+            let _ = write_bytes_atomic(
+                &self.paths.mount_clean_marker_file(),
+                b"clean\n",
+                0o640,
+                true,
+            );
+        }
+    }
+
+    /// Compact `catalog.bin` + `catalog.wal` into a single fresh `MEGOCAT1` v2 snapshot.
+    pub fn compact(&self) -> StorageResult<()> {
+        let _persist_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let _flock = self.try_acquire_index_flock(LockMode::Exclusive);
+        let payload = {
+            let guard = self
+                .index
+                .read()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+            guard.to_payload()
+        };
+        let bytes = encode_catalog_binary(&payload)?;
+        self.write_snapshot_and_clear_wal(&bytes)?;
+        Ok(())
+    }
+
+    fn try_acquire_index_flock(&self, mode: LockMode) -> Option<FlockGuard> {
+        let index_dir = self.paths.index_dir();
+        if !index_dir.is_dir() {
+            return None;
+        }
+        let nonblocking = matches!(mode, LockMode::Shared);
+        acquire_flock(self.paths.catalog_lock_file(), mode, nonblocking).ok()
     }
 
     pub fn paths(&self) -> &DataVolumePaths {
@@ -533,34 +738,36 @@ impl BinarySessionCatalog {
     /// Rejects duplicate `session_id` pointing to a different `relative_dir` to protect
     /// catalog integrity, and persists `catalog.bin` on disk before committing into RAM.
     pub fn admit_indexed_session(&self, entry: IndexedSession) -> StorageResult<()> {
+        validate_indexed_session_record(&entry)?;
         self.mutate_and_persist(|staged| {
-            if let Some(existing) = staged.by_id.get(&entry.session_id) {
-                if existing.relative_dir != entry.relative_dir {
-                    return Err(StorageError::conflict(
-                        "duplicate_session_id",
-                        format!(
-                            "session_id {} already indexed at another path",
-                            entry.session_id
-                        ),
-                    ));
-                }
+            if let Some(existing) = staged.by_id.get(&entry.session_id)
+                && existing.relative_dir != entry.relative_dir
+            {
+                return Err(StorageError::conflict(
+                    "duplicate_session_id",
+                    format!(
+                        "session_id {} already indexed at another path",
+                        entry.session_id
+                    ),
+                ));
             }
-            if let Some(existing_id) = staged.by_path.get(&entry.relative_dir) {
-                if existing_id != &entry.session_id {
-                    return Err(StorageError::conflict(
-                        "duplicate_session_path",
-                        "directory path already belongs to another session_id",
-                    ));
-                }
+            if let Some(existing_id) = staged.by_path.get(&entry.relative_dir)
+                && existing_id != &entry.session_id
+            {
+                return Err(StorageError::conflict(
+                    "duplicate_session_path",
+                    "directory path already belongs to another session_id",
+                ));
             }
 
+            let wal_op = WalMutation::Admit(entry.clone());
             staged.diagnostics_by_path.remove(&entry.relative_dir);
             staged
                 .by_path
                 .insert(entry.relative_dir.clone(), entry.session_id.clone());
             staged.by_id.insert(entry.session_id.clone(), entry);
             staged.bump_revision();
-            Ok(((), true))
+            Ok(((), Some(wal_op)))
         })
     }
 
@@ -653,29 +860,52 @@ impl BinarySessionCatalog {
     ) -> StorageResult<bool> {
         self.mutate_and_persist(|staged| {
             let Some(entry) = staged.by_id.get_mut(session_id) else {
-                return Ok((false, false));
+                return Ok((false, None));
             };
-            entry.verification = verification;
+            entry.verification = verification.clone();
             staged.bump_revision();
-            Ok((true, true))
+            Ok((
+                true,
+                Some(WalMutation::SetVerification {
+                    session_id: session_id.to_owned(),
+                    verification,
+                }),
+            ))
         })
     }
 
     /// Remove any indexed session or discovery diagnostic associated with `relative_dir`,
-    /// monotonically bumping `catalog_revision` and persisting `catalog.bin`.
+    /// monotonically bumping `catalog_revision` and appending an $O(1)$ WAL record.
     pub fn forget_path(&self, relative_dir: &str) -> StorageResult<bool> {
+        let removed = self.forget_paths(&[relative_dir.to_owned()])?;
+        Ok(removed > 0)
+    }
+
+    /// Batch-remove multiple session `relative_dir` paths in a single revision bump and
+    /// single WAL append ($O(1)$ disk syncs instead of $O(N^2)$ full-catalog rewrites).
+    pub fn forget_paths(&self, relative_dirs: &[String]) -> StorageResult<usize> {
+        if relative_dirs.is_empty() {
+            return Ok(0);
+        }
         self.mutate_and_persist(|staged| {
-            let removed_id = staged.by_path.remove(relative_dir);
-            let removed_entry = removed_id
-                .as_ref()
-                .and_then(|sid| staged.by_id.remove(sid))
-                .is_some();
-            let removed_diag = staged.diagnostics_by_path.remove(relative_dir).is_some();
-            if !removed_entry && !removed_diag {
-                return Ok((false, false));
+            let mut removed_paths = Vec::new();
+            for rel in relative_dirs {
+                let removed_id = staged.by_path.remove(rel.as_str());
+                let removed_entry = removed_id
+                    .as_ref()
+                    .and_then(|sid| staged.by_id.remove(sid))
+                    .is_some();
+                let removed_diag = staged.diagnostics_by_path.remove(rel.as_str()).is_some();
+                if removed_entry || removed_diag {
+                    removed_paths.push(rel.clone());
+                }
             }
+            if removed_paths.is_empty() {
+                return Ok((0, None));
+            }
+            let count = removed_paths.len();
             staged.bump_revision();
-            Ok((true, true))
+            Ok((count, Some(WalMutation::ForgetPaths(removed_paths))))
         })
     }
 
@@ -784,12 +1014,13 @@ impl BinarySessionCatalog {
 
     fn mutate_and_persist<T, F>(&self, mutator: F) -> StorageResult<T>
     where
-        F: FnOnce(&mut CatalogIndex) -> StorageResult<(T, bool)>,
+        F: FnOnce(&mut CatalogIndex) -> StorageResult<(T, Option<WalMutation>)>,
     {
         let _persist_guard = self
             .write_lock
             .lock()
             .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let _flock = self.try_acquire_index_flock(LockMode::Exclusive);
         let mut staged = {
             let guard = self
                 .index
@@ -797,12 +1028,21 @@ impl BinarySessionCatalog {
                 .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
             guard.clone()
         };
-        let (out, changed) = mutator(&mut staged)?;
-        if !changed {
+        let (out, wal_op_opt) = mutator(&mut staged)?;
+        let Some(wal_op) = wal_op_opt else {
             return Ok(out);
+        };
+
+        let cur_wal_ops = self.wal_ops.load(Ordering::Acquire);
+        let can_append_wal =
+            cur_wal_ops < WAL_COMPACT_THRESHOLD && self.paths.catalog_file().is_file();
+        if can_append_wal && self.append_wal_mutation(&wal_op).is_ok() {
+            self.wal_ops.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
+            self.write_snapshot_and_clear_wal(&snapshot_bytes)?;
         }
-        let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
-        self.write_snapshot_bytes(&snapshot_bytes)?;
+
         let mut guard = self
             .index
             .write()
@@ -811,7 +1051,10 @@ impl BinarySessionCatalog {
         Ok(out)
     }
 
-    fn load_snapshot_from_disk(&self) -> StorageResult<CatalogIndex> {
+    fn load_snapshot_and_wal_from_disk(
+        &self,
+        repair_torn_wal: bool,
+    ) -> StorageResult<(CatalogIndex, usize)> {
         let path = self.paths.catalog_file();
         let raw = read_bounded_bytes(&path, MAX_CATALOG_BIN_BYTES).map_err(|err| {
             StorageError::Catalog {
@@ -819,13 +1062,50 @@ impl BinarySessionCatalog {
             }
         })?;
         let payload = decode_catalog_binary(&raw)?;
-        CatalogIndex::from_payload(payload)
+        let mut idx = CatalogIndex::from_payload(payload)?;
+        let wal_replayed =
+            replay_catalog_wal(&self.paths.catalog_wal_file(), &mut idx, repair_torn_wal)?;
+        Ok((idx, wal_replayed))
     }
 
-    fn write_snapshot_bytes(&self, bytes: &[u8]) -> StorageResult<()> {
+    fn append_wal_mutation(&self, op: &WalMutation) -> StorageResult<()> {
+        let wal_path = self.paths.catalog_wal_file();
+        let frame = encode_wal_frame(op)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .mode(0o640)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&wal_path)
+            .map_err(|err| StorageError::io("catalog_wal_open", "open catalog.wal", err))?;
+        let st = fstat(file.as_raw_fd())
+            .map_err(|err| StorageError::io("catalog_wal_stat", "fstat catalog.wal", err))?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageError::Catalog {
+                message: "catalog.wal is not a regular file".to_owned(),
+            });
+        }
+        let cur_len = u64::try_from(st.st_size).unwrap_or(0);
+        if cur_len as usize + frame.len() + CATALOG_WAL_MAGIC.len() > MAX_CATALOG_WAL_BYTES {
+            return Err(StorageError::Catalog {
+                message: "catalog.wal exceeded compaction size threshold".to_owned(),
+            });
+        }
+        if cur_len == 0 {
+            file.write_all(&CATALOG_WAL_MAGIC)
+                .map_err(|err| StorageError::io("catalog_wal_write", "write wal magic", err))?;
+        }
+        file.write_all(&frame)
+            .map_err(|err| StorageError::io("catalog_wal_write", "append wal frame", err))?;
+        file.sync_data()
+            .map_err(|err| StorageError::io("catalog_wal_sync", "fdatasync catalog.wal", err))?;
+        Ok(())
+    }
+
+    fn write_snapshot_and_clear_wal(&self, bytes: &[u8]) -> StorageResult<()> {
         let index_dir = self.paths.index_dir();
         if !index_dir.is_dir() {
-            // Only create `index/` if parent `.miro-ego/` already exists on the mounted volume.
             if !self.paths.hidden_meta_dir().is_dir() {
                 return Err(StorageError::Unavailable {
                     message: "volume hidden metadata directory does not exist".to_owned(),
@@ -837,13 +1117,17 @@ impl BinarySessionCatalog {
         }
         write_bytes_atomic(&self.paths.catalog_file(), bytes, 0o640, true).map_err(|err| {
             StorageError::io("catalog_write_failed", "write catalog.bin atomically", err)
-        })
+        })?;
+        let _ = fs::remove_file(self.paths.catalog_wal_file());
+        self.wal_ops.store(0, Ordering::Release);
+        Ok(())
     }
     fn scan_and_commit_from_disk(&self, force_bump: bool) -> StorageResult<usize> {
         let _persist_guard = self
             .write_lock
             .lock()
             .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let _flock = self.try_acquire_index_flock(LockMode::Exclusive);
         let current = {
             let guard = self
                 .index
@@ -922,15 +1206,17 @@ impl BinarySessionCatalog {
             catalog_revision: String::new(),
             by_id,
             by_path,
+            started_at_ns: HashMap::new(),
+            sorted_ids: Vec::new(),
             diagnostics_by_path,
         };
         staged.recompute_revision();
 
         let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
-        if let Err(err) = self.write_snapshot_bytes(&snapshot_bytes) {
-            if !is_persist_ignorable_on_rebuild(&err) {
-                return Err(err);
-            }
+        if let Err(err) = self.write_snapshot_and_clear_wal(&snapshot_bytes)
+            && !is_persist_ignorable_on_rebuild(&err)
+        {
+            return Err(err);
         }
 
         let mut guard = self
@@ -984,11 +1270,12 @@ impl SessionCatalog for BinarySessionCatalog {
     fn remove_session(&self, session_id: &str) -> StorageResult<bool> {
         self.mutate_and_persist(|staged| {
             let Some(removed) = staged.by_id.remove(session_id) else {
-                return Ok((false, false));
+                return Ok((false, None));
             };
-            staged.by_path.remove(&removed.relative_dir);
+            let rel = removed.relative_dir.clone();
+            staged.by_path.remove(&rel);
             staged.bump_revision();
-            Ok((true, true))
+            Ok((true, Some(WalMutation::ForgetPaths(vec![rel]))))
         })
     }
 
@@ -997,32 +1284,48 @@ impl SessionCatalog for BinarySessionCatalog {
     }
 }
 
-/// Encode a `CatalogSnapshotPayload` into the framed `MEGOCAT1` binary format with CRC32.
+fn dir_has_entries(dir: &Path, required_suffix: Option<&str>) -> bool {
+    let Ok(it) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in it.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return true;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if required_suffix.is_none_or(|sfx| name.ends_with(sfx)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Encode a `CatalogSnapshotPayload` into the framed `MEGOCAT1` compact binary v2 format with CRC32.
 fn encode_catalog_binary(payload: &CatalogSnapshotPayload) -> StorageResult<Vec<u8>> {
-    let json_bytes = serde_json::to_vec(payload).map_err(|err| StorageError::Catalog {
-        message: format!("serialize catalog payload failed: {err}"),
-    })?;
-    let total_len = CATALOG_HEADER_BYTES.saturating_add(json_bytes.len());
+    let body_bytes = encode_binary_payload_v2(payload)?;
+    let total_len = CATALOG_HEADER_BYTES.saturating_add(body_bytes.len());
     if total_len > MAX_CATALOG_BIN_BYTES {
         return Err(StorageError::Catalog {
             message: "catalog snapshot exceeds maximum 16 MiB size".to_owned(),
         });
     }
-    let payload_len = u32::try_from(json_bytes.len()).map_err(|_| StorageError::Catalog {
+    let payload_len = u32::try_from(body_bytes.len()).map_err(|_| StorageError::Catalog {
         message: "catalog payload length overflow".to_owned(),
     })?;
-    let crc = crc32_ieee(&json_bytes);
+    let crc = crc32_ieee(&body_bytes);
 
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&CATALOG_BINARY_MAGIC);
-    out.extend_from_slice(&CATALOG_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&CATALOG_BINARY_FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&payload_len.to_le_bytes());
-    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(&body_bytes);
     Ok(out)
 }
 
-/// Decode and strictly verify a `MEGOCAT1` binary catalog file (magic, version, length, CRC32).
+/// Decode and strictly verify a `MEGOCAT1` binary catalog file (`v1` JSON or `v2` compact binary).
 fn decode_catalog_binary(raw: &[u8]) -> StorageResult<CatalogSnapshotPayload> {
     if raw.len() < CATALOG_HEADER_BYTES {
         return Err(StorageError::Catalog {
@@ -1035,11 +1338,6 @@ fn decode_catalog_binary(raw: &[u8]) -> StorageResult<CatalogSnapshotPayload> {
         });
     }
     let version = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-    if version != CATALOG_FORMAT_VERSION {
-        return Err(StorageError::Catalog {
-            message: format!("unsupported catalog.bin format version {version}"),
-        });
-    }
     let expected_crc = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
     let declared_len = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
     let payload_slice = &raw[CATALOG_HEADER_BYTES..];
@@ -1054,9 +1352,519 @@ fn decode_catalog_binary(raw: &[u8]) -> StorageResult<CatalogSnapshotPayload> {
             message: "catalog.bin CRC32 checksum mismatch".to_owned(),
         });
     }
-    serde_json::from_slice(payload_slice).map_err(|err| StorageError::Catalog {
-        message: format!("catalog.bin payload decode failed: {err}"),
+    match version {
+        v if v == CATALOG_FORMAT_VERSION => {
+            serde_json::from_slice(payload_slice).map_err(|err| StorageError::Catalog {
+                message: format!("catalog.bin v1 payload decode failed: {err}"),
+            })
+        }
+        v if v == CATALOG_BINARY_FORMAT_VERSION => decode_binary_payload_v2(payload_slice),
+        other => Err(StorageError::Catalog {
+            message: format!("unsupported catalog.bin format version {other}"),
+        }),
+    }
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) -> StorageResult<()> {
+    let len = u32::try_from(s.len()).map_err(|_| StorageError::Catalog {
+        message: "catalog string exceeds u32 length".to_owned(),
+    })?;
+    put_u32(out, len);
+    out.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+fn put_opt_str(out: &mut Vec<u8>, opt: Option<&str>) -> StorageResult<()> {
+    match opt {
+        Some(s) => {
+            out.push(1);
+            put_str(out, s)
+        }
+        None => {
+            out.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn encode_verification_v2(
+    out: &mut Vec<u8>,
+    ver: Option<&GatewayVerification>,
+) -> StorageResult<()> {
+    let Some(v) = ver else {
+        out.push(0);
+        return Ok(());
+    };
+    out.push(1);
+    put_str(out, &v.actor)?;
+    put_str(out, &v.validator.name)?;
+    put_str(out, &v.validator.version)?;
+    put_str(out, &v.validator.build_sha256)?;
+    put_str(out, &v.manifest_sha256)?;
+    put_str(out, &v.verified_at)?;
+    put_str(out, &v.verdict)?;
+    let dlen = u32::try_from(v.diagnostics.len()).map_err(|_| StorageError::Catalog {
+        message: "verification diagnostics count overflow".to_owned(),
+    })?;
+    put_u32(out, dlen);
+    for d in &v.diagnostics {
+        put_str(out, &d.code)?;
+        put_str(out, &d.summary)?;
+    }
+    Ok(())
+}
+
+fn encode_indexed_session_v2(out: &mut Vec<u8>, e: &IndexedSession) -> StorageResult<()> {
+    put_str(out, &e.session_id)?;
+    put_str(out, &e.take_id)?;
+    put_u64(out, e.take_sequence);
+    put_opt_str(out, e.continuation_of.as_deref())?;
+    put_str(out, &e.display_name)?;
+    put_str(out, &e.device.device_id)?;
+    put_str(out, &e.device.device_label)?;
+    put_str(out, &e.relative_dir)?;
+    put_str(out, &e.started_at)?;
+    put_str(out, &e.ended_at)?;
+    out.extend_from_slice(&e.duration_seconds.to_bits().to_le_bytes());
+    put_u64(out, e.total_bytes);
+    put_str(out, &e.manifest_sha256)?;
+    let state_tag = match e.state {
+        SessionState::Sealed => 0_u8,
+        SessionState::Staging => 1_u8,
+        SessionState::Quarantined => 2_u8,
+    };
+    out.push(state_tag);
+    out.push(u8::from(e.recovered_prefix));
+    encode_verification_v2(out, e.verification.as_ref())
+}
+
+fn encode_binary_payload_v2(payload: &CatalogSnapshotPayload) -> StorageResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(256 + payload.entries.len() * 320);
+    put_u64(&mut out, payload.revision_seq);
+    let ec = u32::try_from(payload.entries.len()).map_err(|_| StorageError::Catalog {
+        message: "catalog entries count overflow".to_owned(),
+    })?;
+    put_u32(&mut out, ec);
+    for entry in &payload.entries {
+        encode_indexed_session_v2(&mut out, entry)?;
+    }
+    let dc = u32::try_from(payload.diagnostics.len()).map_err(|_| StorageError::Catalog {
+        message: "catalog diagnostics count overflow".to_owned(),
+    })?;
+    put_u32(&mut out, dc);
+    for diag in &payload.diagnostics {
+        put_str(&mut out, &diag.relative_dir)?;
+        put_str(&mut out, &diag.diagnostic.quarantine_id)?;
+        let code_tag = match diag.diagnostic.code {
+            DiscoveryDiagnosticCode::ManifestUnreadable => 0_u8,
+            DiscoveryDiagnosticCode::UnsupportedSchema => 1_u8,
+            DiscoveryDiagnosticCode::ManifestInvalid => 2_u8,
+            DiscoveryDiagnosticCode::ManifestNotSealed => 3_u8,
+        };
+        out.push(code_tag);
+        put_str(&mut out, &diag.diagnostic.observed_at)?;
+        put_str(&mut out, &diag.diagnostic.message)?;
+    }
+    Ok(out)
+}
+
+struct BinCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BinCursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> StorageResult<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| StorageError::Catalog {
+                message: "binary catalog cursor overflow".to_owned(),
+            })?;
+        let slice = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| StorageError::Catalog {
+                message: "binary catalog unexpectedly truncated".to_owned(),
+            })?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> StorageResult<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> StorageResult<u32> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn u64(&mut self) -> StorageResult<u64> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn str(&mut self) -> StorageResult<String> {
+        let len = self.u32()? as usize;
+        if len > 1024 * 1024 {
+            return Err(StorageError::Catalog {
+                message: "binary catalog string exceeds 1 MiB".to_owned(),
+            });
+        }
+        let raw = self.take(len)?;
+        std::str::from_utf8(raw)
+            .map(str::to_owned)
+            .map_err(|_| StorageError::Catalog {
+                message: "invalid UTF-8 in binary catalog".to_owned(),
+            })
+    }
+
+    fn opt_str(&mut self) -> StorageResult<Option<String>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.str().map(Some),
+            _ => Err(StorageError::Catalog {
+                message: "invalid option tag in binary catalog".to_owned(),
+            }),
+        }
+    }
+}
+
+fn decode_verification_v2(cur: &mut BinCursor<'_>) -> StorageResult<Option<GatewayVerification>> {
+    match cur.u8()? {
+        0 => Ok(None),
+        1 => {
+            let actor = cur.str()?;
+            let name = cur.str()?;
+            let version = cur.str()?;
+            let build_sha256 = cur.str()?;
+            let manifest_sha256 = cur.str()?;
+            let verified_at = cur.str()?;
+            let verdict = cur.str()?;
+            let dcount = cur.u32()? as usize;
+            if dcount > 4096 {
+                return Err(StorageError::Catalog {
+                    message: "excessive verification diagnostics in binary catalog".to_owned(),
+                });
+            }
+            let mut diagnostics = Vec::with_capacity(dcount.min(64));
+            for _ in 0..dcount {
+                diagnostics.push(GatewayVerificationDiagnostic {
+                    code: cur.str()?,
+                    summary: cur.str()?,
+                });
+            }
+            Ok(Some(GatewayVerification {
+                actor,
+                validator: GatewayValidatorInfo {
+                    name,
+                    version,
+                    build_sha256,
+                },
+                manifest_sha256,
+                verified_at,
+                verdict,
+                diagnostics,
+            }))
+        }
+        _ => Err(StorageError::Catalog {
+            message: "invalid verification tag in binary catalog".to_owned(),
+        }),
+    }
+}
+
+fn decode_indexed_session_v2(cur: &mut BinCursor<'_>) -> StorageResult<IndexedSession> {
+    let session_id = cur.str()?;
+    let take_id = cur.str()?;
+    let take_sequence = cur.u64()?;
+    let continuation_of = cur.opt_str()?;
+    let display_name = cur.str()?;
+    let device_id = cur.str()?;
+    let device_label = cur.str()?;
+    let relative_dir = cur.str()?;
+    let started_at = cur.str()?;
+    let ended_at = cur.str()?;
+    let duration_seconds = f64::from_bits(cur.u64()?);
+    let total_bytes = cur.u64()?;
+    let manifest_sha256 = cur.str()?;
+    let state = match cur.u8()? {
+        0 => SessionState::Sealed,
+        1 => SessionState::Staging,
+        2 => SessionState::Quarantined,
+        _ => {
+            return Err(StorageError::Catalog {
+                message: "invalid session state tag in binary catalog".to_owned(),
+            });
+        }
+    };
+    let recovered_prefix = match cur.u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StorageError::Catalog {
+                message: "invalid bool tag in binary catalog".to_owned(),
+            });
+        }
+    };
+    let verification = decode_verification_v2(cur)?;
+    Ok(IndexedSession {
+        session_id,
+        take_id,
+        take_sequence,
+        continuation_of,
+        display_name,
+        device: SessionDeviceIdentity {
+            device_id,
+            device_label,
+        },
+        relative_dir,
+        started_at,
+        ended_at,
+        duration_seconds,
+        total_bytes,
+        manifest_sha256,
+        state,
+        recovered_prefix,
+        verification,
     })
+}
+
+fn decode_binary_payload_v2(raw: &[u8]) -> StorageResult<CatalogSnapshotPayload> {
+    let mut cur = BinCursor::new(raw);
+    let revision_seq = cur.u64()?;
+    let ecount = cur.u32()? as usize;
+    if ecount > 200_000 {
+        return Err(StorageError::Catalog {
+            message: "binary catalog entry count exceeds sanity limit".to_owned(),
+        });
+    }
+    let mut entries = Vec::with_capacity(ecount.min(1024));
+    for _ in 0..ecount {
+        entries.push(decode_indexed_session_v2(&mut cur)?);
+    }
+    let dcount = cur.u32()? as usize;
+    if dcount > 200_000 {
+        return Err(StorageError::Catalog {
+            message: "binary catalog diagnostic count exceeds sanity limit".to_owned(),
+        });
+    }
+    let mut diagnostics = Vec::with_capacity(dcount.min(256));
+    for _ in 0..dcount {
+        let relative_dir = cur.str()?;
+        let quarantine_id = cur.str()?;
+        let code = match cur.u8()? {
+            0 => DiscoveryDiagnosticCode::ManifestUnreadable,
+            1 => DiscoveryDiagnosticCode::UnsupportedSchema,
+            2 => DiscoveryDiagnosticCode::ManifestInvalid,
+            3 => DiscoveryDiagnosticCode::ManifestNotSealed,
+            _ => {
+                return Err(StorageError::Catalog {
+                    message: "invalid diagnostic code tag in binary catalog".to_owned(),
+                });
+            }
+        };
+        let observed_at = cur.str()?;
+        let message = cur.str()?;
+        diagnostics.push(DiagnosticRecord {
+            relative_dir,
+            diagnostic: SessionDiscoveryDiagnostic {
+                quarantine_id,
+                code,
+                observed_at,
+                message,
+            },
+        });
+    }
+    if cur.pos != raw.len() {
+        return Err(StorageError::Catalog {
+            message: "trailing bytes in binary v2 catalog payload".to_owned(),
+        });
+    }
+    Ok(CatalogSnapshotPayload {
+        revision_seq,
+        entries,
+        diagnostics,
+    })
+}
+
+fn encode_wal_frame(op: &WalMutation) -> StorageResult<Vec<u8>> {
+    let (tag, body) = match op {
+        WalMutation::Admit(entry) => {
+            let mut b = Vec::with_capacity(320);
+            encode_indexed_session_v2(&mut b, entry)?;
+            (WAL_OP_ADMIT, b)
+        }
+        WalMutation::SetVerification {
+            session_id,
+            verification,
+        } => {
+            let mut b = Vec::with_capacity(256);
+            put_str(&mut b, session_id)?;
+            encode_verification_v2(&mut b, verification.as_ref())?;
+            (WAL_OP_SET_VERIFICATION, b)
+        }
+        WalMutation::ForgetPaths(paths) => {
+            let mut b = Vec::with_capacity(64 * paths.len());
+            let cnt = u32::try_from(paths.len()).map_err(|_| StorageError::Catalog {
+                message: "wal forget batch overflow".to_owned(),
+            })?;
+            put_u32(&mut b, cnt);
+            for p in paths {
+                put_str(&mut b, p)?;
+            }
+            (WAL_OP_FORGET_PATHS, b)
+        }
+    };
+    let len = u32::try_from(body.len()).map_err(|_| StorageError::Catalog {
+        message: "wal frame length overflow".to_owned(),
+    })?;
+    let crc = crc32_ieee(&body);
+    let mut frame = Vec::with_capacity(9 + body.len());
+    frame.push(tag);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+fn replay_catalog_wal(
+    wal_path: &Path,
+    idx: &mut CatalogIndex,
+    repair_torn_tail: bool,
+) -> StorageResult<usize> {
+    let raw = match read_bounded_bytes(wal_path, MAX_CATALOG_WAL_BYTES) {
+        Ok(b) => b,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Ok(0),
+    };
+    if raw.len() < CATALOG_WAL_MAGIC.len() || raw[0..8] != CATALOG_WAL_MAGIC {
+        if repair_torn_tail {
+            let _ = fs::remove_file(wal_path);
+        }
+        return Ok(0);
+    }
+
+    let mut offset = CATALOG_WAL_MAGIC.len();
+    let mut applied = 0_usize;
+    while offset < raw.len() {
+        if raw.len() - offset < 9 {
+            break;
+        }
+        let tag = raw[offset];
+        let body_len = u32::from_le_bytes([
+            raw[offset + 1],
+            raw[offset + 2],
+            raw[offset + 3],
+            raw[offset + 4],
+        ]) as usize;
+        let expected_crc = u32::from_le_bytes([
+            raw[offset + 5],
+            raw[offset + 6],
+            raw[offset + 7],
+            raw[offset + 8],
+        ]);
+        let Some(frame_end) = (offset + 9).checked_add(body_len) else {
+            break;
+        };
+        let Some(body) = raw.get(offset + 9..frame_end) else {
+            break;
+        };
+        if crc32_ieee(body) != expected_crc {
+            break;
+        }
+        let mut cur = BinCursor::new(body);
+        let apply_ok = match tag {
+            WAL_OP_ADMIT => match decode_indexed_session_v2(&mut cur) {
+                Ok(entry)
+                    if cur.pos == body.len() && validate_indexed_session_record(&entry).is_ok() =>
+                {
+                    idx.diagnostics_by_path.remove(&entry.relative_dir);
+                    idx.by_path
+                        .insert(entry.relative_dir.clone(), entry.session_id.clone());
+                    idx.by_id.insert(entry.session_id.clone(), entry);
+                    idx.revision_seq = idx.revision_seq.saturating_add(1);
+                    true
+                }
+                _ => false,
+            },
+            WAL_OP_SET_VERIFICATION => match (cur.str(), decode_verification_v2(&mut cur)) {
+                (Ok(sid), Ok(ver)) if cur.pos == body.len() => {
+                    if let Some(existing) = idx.by_id.get_mut(&sid) {
+                        existing.verification = ver;
+                        idx.revision_seq = idx.revision_seq.saturating_add(1);
+                    }
+                    true
+                }
+                _ => false,
+            },
+            WAL_OP_FORGET_PATHS => match cur.u32() {
+                Ok(cnt) if (cnt as usize) <= 10_000 => {
+                    let mut paths = Vec::with_capacity((cnt as usize).min(256));
+                    let mut ok = true;
+                    for _ in 0..cnt {
+                        match cur.str() {
+                            Ok(s) => paths.push(s),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && cur.pos == body.len() {
+                        for rel in paths {
+                            if let Some(sid) = idx.by_path.remove(&rel) {
+                                idx.by_id.remove(&sid);
+                            }
+                            idx.diagnostics_by_path.remove(&rel);
+                        }
+                        idx.revision_seq = idx.revision_seq.saturating_add(1);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !apply_ok {
+            break;
+        }
+        offset = frame_end;
+        applied += 1;
+    }
+
+    if repair_torn_tail
+        && offset < raw.len()
+        && let Ok(file) = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(wal_path)
+        && let Ok(off) = libc::off_t::try_from(offset)
+    {
+        // SAFETY: `file` is a valid open regular descriptor and `off` is within bounds.
+        let _ = unsafe { libc::ftruncate(file.as_raw_fd(), off) };
+        let _ = file.sync_data();
+    }
+    if applied > 0 {
+        idx.recompute_revision();
+    }
+    Ok(applied)
 }
 
 fn encode_cursor(token: &PageCursorToken) -> StorageResult<String> {

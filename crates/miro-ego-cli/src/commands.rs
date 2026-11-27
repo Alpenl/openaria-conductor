@@ -18,7 +18,6 @@ use crate::runtime::{
 };
 use miro_ego_api::API_V1_PREFIX;
 use miro_ego_capture::audio;
-use miro_ego_capture::session::schema_validation::SchemaValidator;
 use miro_ego_capture::session::shm_ring::SHM_VERSION;
 use miro_ego_core::config::{
     AudioConfig, CameraConfig, DEVICE_CONFIG_SCHEMA, DeviceConfig, DeviceIdentity, ExposureSetting,
@@ -30,6 +29,7 @@ use miro_ego_core::paths::{
     DataVolumePaths, RECORDING_MOUNTPOINT, RECORDING_VOLUME_LABEL, SYSTEM_CONFIG_DIR,
     SYSTEM_ENCODER_BIN, SYSTEM_INSTALL_ROOT, SYSTEM_RUN_DIR, SYSTEM_STATE_DIR,
 };
+use miro_ego_core::schema_validation::SchemaValidator;
 use miro_ego_core::sys::fs::{read_bounded_bytes, set_exfat_hidden, write_bytes_atomic};
 use miro_ego_deploy::{
     DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcClient, DeployRpcServer,
@@ -1090,6 +1090,7 @@ fn load_or_build_serve_config(args: &ServeArgs) -> Result<DeviceConfig, String> 
             fps: 60,
             frame_decimation: 2,
             exposure_time_absolute: Some(ExposureSetting::default()),
+            calibration_file: None,
         },
         storage: StorageConfig {
             mountpoint,
@@ -1739,7 +1740,7 @@ fn run_status(
     let vol_mgr = ExfatVolumeManager::new(paths.clone(), VolumePolicy::relaxed_for_tests(0));
     let volume_info = vol_mgr.inspect_volume().ok();
     let volume_writable = vol_mgr.is_mounted_and_writable();
-    let session_count = BinarySessionCatalog::open(paths)
+    let session_count = BinarySessionCatalog::open_read_only(paths)
         .ok()
         .and_then(|c| c.list_sessions().ok())
         .map(|s| s.len());

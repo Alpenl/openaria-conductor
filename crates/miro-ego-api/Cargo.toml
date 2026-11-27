@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "matched-path", "json"] }
@@ -30,4 +34,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1", "server"] }
+miro-ego-api = { path = ".", features = ["test-support"] }
 rcgen = "0.13"

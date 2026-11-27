@@ -4,7 +4,7 @@ use libloading::Library;
 use miro_ego_core::sys::dynlib;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const SND_PCM_STREAM_CAPTURE: c_int = 1;
 const SND_PCM_NONBLOCK: c_int = 0x0001;
@@ -51,6 +51,7 @@ type SndPcmHwParamsApply = unsafe extern "C" fn(*mut SndPcm, *mut SndPcmHwParams
 type SndPcmHwParamsFree = unsafe extern "C" fn(*mut SndPcmHwParams);
 type SndPcmPrepare = unsafe extern "C" fn(*mut SndPcm) -> c_int;
 type SndPcmReadi = unsafe extern "C" fn(*mut SndPcm, *mut c_void, SndPcmUframes) -> SndPcmSframes;
+type SndPcmWait = unsafe extern "C" fn(*mut SndPcm, c_int) -> c_int;
 type SndPcmDrop = unsafe extern "C" fn(*mut SndPcm) -> c_int;
 type SndStrError = unsafe extern "C" fn(c_int) -> *const c_char;
 type SwMalloc = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
@@ -87,6 +88,7 @@ struct Alsa {
     snd_pcm_hw_params_free: SndPcmHwParamsFree,
     snd_pcm_prepare: SndPcmPrepare,
     snd_pcm_readi: SndPcmReadi,
+    snd_pcm_wait: SndPcmWait,
     snd_pcm_drop: SndPcmDrop,
     snd_strerror: SndStrError,
 }
@@ -95,6 +97,9 @@ unsafe impl Send for Alsa {}
 unsafe impl Sync for Alsa {}
 
 static ALSA_CACHE: OnceLock<Arc<Alsa>> = OnceLock::new();
+/// Serialize `snd_pcm_open` / `snd_pcm_close` across threads because `alsa-lib`'s global
+/// configuration tree (`snd_config`) is not thread-safe.
+static ALSA_OPEN_CLOSE_LOCK: Mutex<()> = Mutex::new(());
 
 impl Alsa {
     fn cached() -> Result<Arc<Self>, AudioError> {
@@ -153,6 +158,7 @@ impl Alsa {
                 snd_pcm_hw_params_free: load_alsa(&library, b"snd_pcm_hw_params_free\0")?,
                 snd_pcm_prepare: load_alsa(&library, b"snd_pcm_prepare\0")?,
                 snd_pcm_readi: load_alsa(&library, b"snd_pcm_readi\0")?,
+                snd_pcm_wait: load_alsa(&library, b"snd_pcm_wait\0")?,
                 snd_pcm_drop: load_alsa(&library, b"snd_pcm_drop\0")?,
                 snd_strerror: load_alsa(&library, b"snd_strerror\0")?,
                 _library: library,
@@ -196,14 +202,20 @@ impl Pcm {
         let device = CString::new(config.device.as_str())
             .map_err(|_| AudioError::new("invalid_argument", "audio device contains NUL"))?;
         let mut handle: *mut SndPcm = std::ptr::null_mut();
-        // SAFETY: handle points to writable storage, device is NUL-terminated.
-        let result = unsafe {
-            (alsa.snd_pcm_open)(
-                &mut handle,
-                device.as_ptr(),
-                SND_PCM_STREAM_CAPTURE,
-                SND_PCM_NONBLOCK,
-            )
+        let result = {
+            let _open_guard = ALSA_OPEN_CLOSE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: handle points to writable storage, device is NUL-terminated, and
+            // global alsa-lib config access is serialized by ALSA_OPEN_CLOSE_LOCK.
+            unsafe {
+                (alsa.snd_pcm_open)(
+                    &mut handle,
+                    device.as_ptr(),
+                    SND_PCM_STREAM_CAPTURE,
+                    SND_PCM_NONBLOCK,
+                )
+            }
         };
         if result < 0 {
             return Err(alsa.error("audio_unavailable", "snd_pcm_open", result));
@@ -435,6 +447,29 @@ impl Pcm {
         Ok(outcome)
     }
 
+    pub fn wait(&mut self, timeout_ms: u32) -> Result<bool, AudioError> {
+        if self.handle.is_null() {
+            return Err(AudioError::new(
+                "invalid_state",
+                "ALSA PCM handle is closed",
+            ));
+        }
+        let ms = c_int::try_from(timeout_ms).unwrap_or(c_int::MAX).max(1);
+        // SAFETY: `self.handle` is a valid open PCM handle owned by `self`.
+        let result = unsafe { (self.alsa.snd_pcm_wait)(self.handle, ms) };
+        if result > 0 {
+            return Ok(true);
+        }
+        if result == 0 || result == -libc::EINTR || result == -libc::EAGAIN {
+            return Ok(false);
+        }
+        Err(self.alsa.error(
+            "audio_failed",
+            "snd_pcm_wait: capture continuity lost",
+            result,
+        ))
+    }
+
     pub fn clock_anchor(&self, read_frames: u64) -> Result<(u64, u64), AudioError> {
         if self.handle.is_null() {
             return Err(AudioError::new(
@@ -484,7 +519,12 @@ impl Pcm {
         let handle = self.handle;
         self.handle = std::ptr::null_mut();
         let drop_result = unsafe { (self.alsa.snd_pcm_drop)(handle) };
-        let close_result = unsafe { (self.alsa.snd_pcm_close)(handle) };
+        let close_result = {
+            let _close_guard = ALSA_OPEN_CLOSE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unsafe { (self.alsa.snd_pcm_close)(handle) }
+        };
         if close_result < 0 {
             return Err(self
                 .alsa

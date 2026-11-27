@@ -98,6 +98,7 @@ pub struct GatewayServerConfig {
     pub request_header_timeout: Duration,
     pub request_body_timeout: Duration,
     pub keep_alive_idle_timeout: Duration,
+    pub write_stall_timeout: Duration,
     pub max_connections: usize,
     pub runtime: GatewayRuntimeConfig,
     pub shutdown_drain_timeout: Duration,
@@ -113,6 +114,7 @@ impl GatewayServerConfig {
             request_header_timeout: Duration::from_secs(30),
             request_body_timeout: DEFAULT_REQUEST_BODY_TIMEOUT,
             keep_alive_idle_timeout: Duration::from_secs(15),
+            write_stall_timeout: Duration::from_secs(30),
             max_connections: 64,
             runtime: GatewayRuntimeConfig::default(),
             shutdown_drain_timeout: Duration::from_secs(5),
@@ -137,6 +139,7 @@ pub struct GatewayServer {
     tls_handshake_timeout: Duration,
     request_header_timeout: Duration,
     keep_alive_idle_timeout: Duration,
+    write_stall_timeout: Duration,
     max_connections: usize,
     shutdown_drain_timeout: Duration,
 }
@@ -184,6 +187,7 @@ impl GatewayServer {
             keep_alive_idle_timeout: config
                 .keep_alive_idle_timeout
                 .max(Duration::from_millis(50)),
+            write_stall_timeout: config.write_stall_timeout.max(Duration::from_millis(20)),
             max_connections: config.max_connections.max(1),
             shutdown_drain_timeout: config
                 .shutdown_drain_timeout
@@ -229,6 +233,7 @@ impl GatewayServer {
                         }
                     };
                     let _ = stream.set_nodelay(true);
+                    configure_tcp_keepalive(&stream);
 
                     // Enforce strict bounded max concurrent connections without starving accept loop.
                     let Ok(permit) = Arc::clone(&conn_semaphore).try_acquire_owned() else {
@@ -241,6 +246,7 @@ impl GatewayServer {
                     let tls_timeout = self.tls_handshake_timeout;
                     let header_timeout = self.request_header_timeout;
                     let idle_timeout = self.keep_alive_idle_timeout;
+                    let write_stall_timeout = self.write_stall_timeout;
                     let drain_timeout = self.shutdown_drain_timeout;
                     let mut conn_shutdown_rx = shutdown_rx.clone();
 
@@ -260,6 +266,7 @@ impl GatewayServer {
                                 router,
                                 header_timeout,
                                 idle_timeout,
+                                write_stall_timeout,
                                 drain_timeout,
                                 &mut conn_shutdown_rx,
                             )
@@ -270,6 +277,7 @@ impl GatewayServer {
                                 router,
                                 header_timeout,
                                 idle_timeout,
+                                write_stall_timeout,
                                 drain_timeout,
                                 &mut conn_shutdown_rx,
                             )
@@ -295,6 +303,51 @@ impl GatewayServer {
         Ok(())
     }
 }
+
+#[cfg(unix)]
+fn configure_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let enable: libc::c_int = 1;
+    let keepidle: libc::c_int = 15;
+    let keepintvl: libc::c_int = 5;
+    let keepcnt: libc::c_int = 3;
+    // SAFETY: `fd` is a valid open TCP socket descriptor owned by `stream`, and each `c_int`
+    // option value matches the kernel `setsockopt` ABI for `SOL_SOCKET` / `IPPROTO_TCP`.
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            std::ptr::from_ref(&enable).cast(),
+            std::mem::size_of_val(&enable) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            std::ptr::from_ref(&keepidle).cast(),
+            std::mem::size_of_val(&keepidle) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            std::ptr::from_ref(&keepintvl).cast(),
+            std::mem::size_of_val(&keepintvl) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            std::ptr::from_ref(&keepcnt).cast(),
+            std::mem::size_of_val(&keepcnt) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_tcp_keepalive(_stream: &tokio::net::TcpStream) {}
 
 struct ConnectionIdleTracker {
     active_count: AtomicUsize,
@@ -390,19 +443,28 @@ impl HyperService<hyper::Request<Incoming>> for TrackedRouterService {
 struct IdleTimeoutIo<IO> {
     io: IO,
     idle_timeout: Duration,
+    write_stall_timeout: Duration,
     tracker: Arc<ConnectionIdleTracker>,
     observed_epoch: u64,
     sleep: Pin<Box<tokio::time::Sleep>>,
+    write_stall_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<IO> IdleTimeoutIo<IO> {
-    fn new(io: IO, idle_timeout: Duration, tracker: Arc<ConnectionIdleTracker>) -> Self {
+    fn new(
+        io: IO,
+        idle_timeout: Duration,
+        write_stall_timeout: Duration,
+        tracker: Arc<ConnectionIdleTracker>,
+    ) -> Self {
         Self {
             io,
             idle_timeout,
+            write_stall_timeout,
             tracker,
             observed_epoch: 0,
             sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            write_stall_sleep: None,
         }
     }
 }
@@ -459,21 +521,61 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<IO> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
-        let poll = Pin::new(&mut this.io).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = poll
-            && n > 0
-        {
-            let ep = this.tracker.idle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            this.observed_epoch = ep;
-            this.sleep
-                .as_mut()
-                .reset(tokio::time::Instant::now() + this.idle_timeout);
+        match Pin::new(&mut this.io).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    this.write_stall_sleep = None;
+                    let ep = this.tracker.idle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                    this.observed_epoch = ep;
+                    this.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.idle_timeout);
+                }
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => {
+                this.write_stall_sleep = None;
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => {
+                let stall_timeout = this.write_stall_timeout;
+                let stall_sleep = this
+                    .write_stall_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
+                if stall_sleep.as_mut().poll(cx).is_ready() {
+                    this.write_stall_sleep = None;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP response write stalled",
+                    )));
+                }
+                Poll::Pending
+            }
         }
-        poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Ready(res) => {
+                this.write_stall_sleep = None;
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                let stall_timeout = this.write_stall_timeout;
+                let stall_sleep = this
+                    .write_stall_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
+                if stall_sleep.as_mut().poll(cx).is_ready() {
+                    this.write_stall_sleep = None;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP response flush stalled",
+                    )));
+                }
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -486,13 +588,15 @@ async fn serve_http1_stream<IO>(
     router: Router,
     header_timeout: Duration,
     idle_timeout: Duration,
+    write_stall_timeout: Duration,
     drain_timeout: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let tracker = ConnectionIdleTracker::new();
-    let tracked_io = IdleTimeoutIo::new(io, idle_timeout, Arc::clone(&tracker));
+    let tracked_io =
+        IdleTimeoutIo::new(io, idle_timeout, write_stall_timeout, Arc::clone(&tracker));
     let service = TrackedRouterService { router, tracker };
     let mut builder = http1::Builder::new();
     builder.timer(TokioTimer::new());

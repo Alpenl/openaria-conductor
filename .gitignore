@@ -13,3 +13,4 @@ test-results/
 /tmp/
 target/
 dist-*/
+csrc/miro-ego-encoder/tests/build/

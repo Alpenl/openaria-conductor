@@ -18,13 +18,17 @@ pub async fn list_logs(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "listLogs", None) {
-        return *resp;
-    }
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
+    let principal = match ctx.authorize_read_headers(&state, &parts.headers, "listLogs", None) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "listLogs", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let mut prefix: Option<String> = None;
     let mut limit: usize = 200;
@@ -32,6 +36,13 @@ pub async fn list_logs(
         match k.as_str() {
             "prefix" => {
                 if !is_valid_log_prefix(&v) {
+                    ctx.audit(
+                        &state,
+                        "listLogs",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request(
                         "invalid diagnostic log prefix filter",
                     ));
@@ -41,6 +52,13 @@ pub async fn list_logs(
             "limit" => {
                 let parsed = v.parse::<usize>().ok().filter(|&n| (1..=500).contains(&n));
                 let Some(n) = parsed else {
+                    ctx.audit(
+                        &state,
+                        "listLogs",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request(
                         "limit must be an integer in 1..=500",
                     ));
@@ -48,10 +66,20 @@ pub async fn list_logs(
                 limit = n;
             }
             _ => {
+                ctx.audit(
+                    &state,
+                    "listLogs",
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
                 return ctx
                     .error_response(ApiError::bad_request("unexpected query parameter on /logs"));
             }
         }
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "listLogs", None, &principal) {
+        return *resp;
     }
     match state
         .backend

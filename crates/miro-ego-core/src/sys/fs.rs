@@ -265,19 +265,64 @@ pub fn open_create_exclusive(path: &Path, mode: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Flush directory metadata to disk (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`),
-/// tolerating filesystems (such as exFAT/FAT) whose directory `fsync` returns
-/// `EINVAL`, `ENOSYS`, or `EOPNOTSUPP`.
-pub fn fsync_directory(path: &Path) -> io::Result<()> {
-    let dir = open_directory_safe(path)?;
-    if let Err(error) = dir.sync_all() {
-        let exfat_dir_sync_unsupported = matches!(
-            error.raw_os_error(),
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EBADF)
-        );
-        if !(exfat_dir_sync_unsupported && is_exfat_or_msdos(dir.as_raw_fd()).unwrap_or(false)) {
+/// Flush the filesystem containing `fd` (`syncfs`), used as a durable fallback when
+/// directory `fsync` returns `EINVAL`/`EOPNOTSUPP` on Linux exFAT / FAT mounts.
+pub fn syncfs_fd(fd: RawFd) -> io::Result<()> {
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    loop {
+        // SAFETY: `syncfs` takes a single open file descriptor and has no memory arguments.
+        if unsafe { libc::syncfs(fd) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+    }
+}
+
+fn finish_directory_sync<F, G>(sync_err: io::Error, check_exfat: F, run_syncfs: G) -> io::Result<()>
+where
+    F: FnOnce() -> bool,
+    G: FnOnce() -> io::Result<()>,
+{
+    let exfat_dir_sync_unsupported = matches!(
+        sync_err.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EBADF)
+    );
+    if exfat_dir_sync_unsupported && check_exfat() {
+        return match run_syncfs() {
+            Ok(()) => Ok(()),
+            Err(fs_err)
+                if matches!(
+                    fs_err.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(fs_err) => Err(fs_err),
+        };
+    }
+    Err(sync_err)
+}
+
+/// Flush directory metadata to disk (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`).
+///
+/// When `fsync` on a directory descriptor returns `EINVAL`, `ENOSYS`, or `EOPNOTSUPP`
+/// on Linux exFAT / FAT filesystems, falls back to `syncfs(dir_fd)` so directory-entry
+/// renames and creations are actually committed to the backing block device.
+pub fn fsync_directory(path: &Path) -> io::Result<()> {
+    let dir = open_directory_safe(path)?;
+    let fd = dir.as_raw_fd();
+    if let Err(error) = dir.sync_all() {
+        finish_directory_sync(
+            error,
+            || is_exfat_or_msdos(fd).unwrap_or(false),
+            || syncfs_fd(fd),
+        )?;
     }
     Ok(())
 }
@@ -1089,5 +1134,40 @@ mod tests {
         assert!(status.success());
         assert!(root.join("bare-settings.json").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_sync_exfat_fallback_invokes_syncfs_and_propagates_io_errors() {
+        use std::sync::atomic::AtomicBool;
+
+        let called = AtomicBool::new(false);
+        finish_directory_sync(
+            io::Error::from_raw_os_error(libc::EINVAL),
+            || true,
+            || {
+                called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(called.load(Ordering::SeqCst));
+
+        // Non-exFAT EINVAL still fails closed without masking real directory errors.
+        let non_exfat = finish_directory_sync(
+            io::Error::from_raw_os_error(libc::EINVAL),
+            || false,
+            || Ok(()),
+        );
+        assert!(non_exfat.is_err());
+
+        // Underlying EIO during syncfs on exFAT is surfaced instead of swallowed.
+        let eio = finish_directory_sync(
+            io::Error::from_raw_os_error(libc::EINVAL),
+            || true,
+            || Err(io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert_eq!(eio.unwrap_err().raw_os_error(), Some(libc::EIO));
+
+        assert_eq!(syncfs_fd(-1).unwrap_err().raw_os_error(), Some(libc::EBADF));
     }
 }

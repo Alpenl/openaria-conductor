@@ -3,8 +3,8 @@
 
 use crate::backend::{CommandOutcome, IdempotentCommand, ListSessionsQuery};
 use crate::downloads::{
-    DeleteBeginResult, DeleteReplayLookup, resolve_range_selection,
-    stream_download_body_with_session_and_guard,
+    DeleteBeginResult, DeleteReplayLookup, DownloadSource, resolve_range_selection,
+    stream_download_body, stream_download_body_with_session_and_guard,
 };
 use crate::error::{ApiError, ApiResult, HEADER_MANIFEST_SHA256};
 use crate::handlers::{DownloadResponseMeta, build_download_response, parse_strict_query};
@@ -27,13 +27,17 @@ pub async fn list_sessions(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "listSessions", None) {
-        return *resp;
-    }
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
+    let principal = match ctx.authorize_read_headers(&state, &parts.headers, "listSessions", None) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "listSessions", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let mut cursor: Option<String> = None;
     let mut limit: usize = 50;
@@ -43,6 +47,13 @@ pub async fn list_sessions(
         match k.as_str() {
             "cursor" => {
                 if v.is_empty() {
+                    ctx.audit(
+                        &state,
+                        "listSessions",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request("cursor must not be empty"));
                 }
                 cursor = Some(v);
@@ -50,6 +61,13 @@ pub async fn list_sessions(
             "limit" => {
                 let parsed = v.parse::<usize>().ok().filter(|&n| (1..=200).contains(&n));
                 let Some(n) = parsed else {
+                    ctx.audit(
+                        &state,
+                        "listSessions",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request(
                         "limit must be an integer in 1..=200",
                     ));
@@ -58,16 +76,33 @@ pub async fn list_sessions(
             }
             "take_id" => {
                 if !is_valid_uuid_v7(&v) {
+                    ctx.audit(
+                        &state,
+                        "listSessions",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request("take_id must be a UUIDv7"));
                 }
                 take_id = Some(v);
             }
             _ => {
+                ctx.audit(
+                    &state,
+                    "listSessions",
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
                 return ctx.error_response(ApiError::bad_request(
                     "unexpected query parameter on /sessions",
                 ));
             }
         }
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "listSessions", None, &principal) {
+        return *resp;
     }
 
     let include_recovery = parts
@@ -127,7 +162,7 @@ pub async fn get_session_manifest(
     {
         return *resp;
     }
-    let Ok(_permit) = Arc::clone(&state.download_semaphore).try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&state.download_semaphore).try_acquire_owned() else {
         return ctx.error_response(ApiError::download_capacity_exhausted());
     };
     let manifest = match state.backend.open_session_manifest(&session_id).await {
@@ -144,14 +179,24 @@ pub async fn get_session_manifest(
         .header(HEADER_MANIFEST_SHA256, manifest.sha256.as_str())
         .header(header::CACHE_CONTROL, "no-store");
     builder = ctx.apply_common_headers(builder, &[]);
-    builder
-        .body(Body::from(manifest.bytes))
-        .unwrap_or_else(|_| {
-            ctx.error_response(ApiError::internal(
-                "response_build_failed",
-                "failed to build manifest response",
-            ))
-        })
+    let body = if ctx.is_head {
+        drop(permit);
+        Body::empty()
+    } else {
+        stream_download_body(
+            DownloadSource::Memory(manifest.bytes),
+            0,
+            len as u64,
+            state.config.download_chunk_bytes,
+            permit,
+        )
+    };
+    builder.body(body).unwrap_or_else(|_| {
+        ctx.error_response(ApiError::internal(
+            "response_build_failed",
+            "failed to build manifest response",
+        ))
+    })
 }
 
 /// `GET /api/v1/sessions/{session_id}/unsuccessful-outcome` (`getRetainedUnsuccessfulSessionOutcome`)

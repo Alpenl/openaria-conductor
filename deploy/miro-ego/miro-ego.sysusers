@@ -1,4 +1,10 @@
 u miro-ego - "Miro-Ego stereo capture service" /var/lib/miro-ego
+g vpu - -
+g jpu - -
+g vps - -
 m miro-ego audio
 m miro-ego video
 m miro-ego misc
+m miro-ego vpu
+m miro-ego jpu
+m miro-ego vps

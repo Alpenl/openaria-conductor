@@ -163,10 +163,14 @@ pub fn mjpeg_stream_body(
     axum::body::Body::from_stream(PreviewByteStream(out_rx))
 }
 
+const MAX_H264_GOP_FRAGMENTS: usize = 120;
+const PREVIEW_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Low-bandwidth H.264 fragmented MP4 (`video/mp4`) or Annex-B (`video/h264`) preview hub.
 pub struct H264PreviewHub {
     content_type: String,
     init_segment: RwLock<Option<Arc<Bytes>>>,
+    gop_fragments: std::sync::Mutex<Vec<Arc<Bytes>>>,
     last_hints: std::sync::Mutex<(Option<u32>, Option<u32>)>,
     tx: broadcast::Sender<Arc<Bytes>>,
 }
@@ -185,6 +189,7 @@ impl H264PreviewHub {
         Self {
             content_type: content_type.into(),
             init_segment: RwLock::new(None),
+            gop_fragments: std::sync::Mutex::new(Vec::new()),
             last_hints: std::sync::Mutex::new((None, None)),
             tx,
         }
@@ -218,21 +223,27 @@ impl H264PreviewHub {
     /// Store or update the initialization segment (e.g. fMP4 `ftyp+moov` or SPS/PPS header).
     pub async fn set_init_segment(&self, segment: Bytes) {
         let mut guard = self.init_segment.write().await;
-        *guard = if segment.is_empty() {
-            None
+        if segment.is_empty() {
+            *guard = None;
+            if let Ok(mut gop) = self.gop_fragments.lock() {
+                gop.clear();
+            }
         } else {
-            Some(Arc::new(segment))
-        };
+            *guard = Some(Arc::new(segment));
+        }
     }
 
     /// Synchronously set the initialization segment (for setup/tests).
     pub fn set_init_segment_blocking(&self, segment: Bytes) {
         if let Ok(mut guard) = self.init_segment.try_write() {
-            *guard = if segment.is_empty() {
-                None
+            if segment.is_empty() {
+                *guard = None;
+                if let Ok(mut gop) = self.gop_fragments.lock() {
+                    gop.clear();
+                }
             } else {
-                Some(Arc::new(segment))
-            };
+                *guard = Some(Arc::new(segment));
+            }
         }
     }
 
@@ -240,22 +251,92 @@ impl H264PreviewHub {
         self.init_segment.read().await.clone()
     }
 
+    /// Broadcast an IDR-keyframe H.264 media fragment, resetting the cached current-GOP buffer
+    /// so late-joining viewers immediately begin decoding from this keyframe.
+    pub fn publish_keyframe_fragment(&self, fragment: Bytes) -> usize {
+        self.publish_fragment_inner(fragment, true)
+    }
+
     /// Broadcast one H.264 media fragment (`moof+mdat` or Annex-B frame) zero-copy across viewers.
+    /// Automatically detects Annex-B IDR/SPS keyframes to reset the current-GOP cache.
     pub fn publish_fragment(&self, fragment: Bytes) -> usize {
+        let is_idr = is_annex_b_idr_or_sps(&fragment);
+        self.publish_fragment_inner(fragment, is_idr)
+    }
+
+    fn publish_fragment_inner(&self, fragment: Bytes, is_keyframe: bool) -> usize {
         if fragment.is_empty() {
             return 0;
         }
-        self.tx.send(Arc::new(fragment)).unwrap_or(0)
+        let arc = Arc::new(fragment);
+        if let Ok(mut gop) = self.gop_fragments.lock() {
+            if is_keyframe {
+                gop.clear();
+                gop.push(Arc::clone(&arc));
+            } else if !gop.is_empty() && gop.len() < MAX_H264_GOP_FRAGMENTS {
+                gop.push(Arc::clone(&arc));
+            }
+            return self.tx.send(arc).unwrap_or(0);
+        }
+        self.tx.send(arc).unwrap_or(0)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Bytes>> {
         self.tx.subscribe()
     }
+
+    /// Atomically snapshot the cached current-GOP fragments (starting from the latest IDR keyframe)
+    /// and subscribe to subsequent live fragments without dropping or duplicating boundary frames.
+    pub fn subscribe_with_gop(&self) -> (Vec<Arc<Bytes>>, broadcast::Receiver<Arc<Bytes>>) {
+        if let Ok(gop) = self.gop_fragments.lock() {
+            let rx = self.tx.subscribe();
+            return (gop.clone(), rx);
+        }
+        (Vec::new(), self.tx.subscribe())
+    }
+}
+
+fn is_annex_b_idr_or_sps(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            if buf[i + 2] == 1 {
+                let nal_type = buf[i + 3] & 0x1f;
+                if matches!(nal_type, 5 | 7) {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+            if i + 4 < buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
+                let nal_type = buf[i + 4] & 0x1f;
+                if matches!(nal_type, 5 | 7) {
+                    return true;
+                }
+                i += 5;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Build an async streaming `axum::body::Body` for `GET /api/v1/preview/h264`.
 pub fn h264_stream_body(
     init_segment: Option<Arc<Bytes>>,
+    rx: broadcast::Receiver<Arc<Bytes>>,
+    permit: OwnedSemaphorePermit,
+    shutdown_rx: watch::Receiver<bool>,
+) -> axum::body::Body {
+    h264_stream_body_with_gop(init_segment, Vec::new(), rx, permit, shutdown_rx)
+}
+
+/// Build an async streaming `axum::body::Body` for `GET /api/v1/preview/h264`, replaying
+/// `gop_fragments` (from the latest IDR keyframe) immediately after `init_segment` before live frames.
+pub fn h264_stream_body_with_gop(
+    init_segment: Option<Arc<Bytes>>,
+    gop_fragments: Vec<Arc<Bytes>>,
     mut rx: broadcast::Receiver<Arc<Bytes>>,
     permit: OwnedSemaphorePermit,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -268,8 +349,20 @@ pub fn h264_stream_body(
             tokio::select! {
                 biased;
                 _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
-                res = tx.send(Ok(chunk)) => {
-                    if res.is_err() {
+                res = tokio::time::timeout(PREVIEW_SEND_STALL_TIMEOUT, tx.send(Ok(chunk))) => {
+                    if !matches!(res, Ok(Ok(()))) {
+                        return;
+                    }
+                }
+            }
+        }
+        for gop_frag in gop_fragments {
+            let chunk = (*gop_frag).clone();
+            tokio::select! {
+                biased;
+                _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
+                res = tokio::time::timeout(PREVIEW_SEND_STALL_TIMEOUT, tx.send(Ok(chunk))) => {
+                    if !matches!(res, Ok(Ok(()))) {
                         return;
                     }
                 }
@@ -287,8 +380,8 @@ pub fn h264_stream_body(
                             tokio::select! {
                                 biased;
                                 _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
-                                res = tx.send(Ok(chunk)) => {
-                                    if res.is_err() {
+                                res = tokio::time::timeout(PREVIEW_SEND_STALL_TIMEOUT, tx.send(Ok(chunk))) => {
+                                    if !matches!(res, Ok(Ok(()))) {
                                         return;
                                     }
                                 }

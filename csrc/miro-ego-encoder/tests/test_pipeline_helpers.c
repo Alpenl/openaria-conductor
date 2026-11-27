@@ -323,7 +323,22 @@ static void test_mp4_v0_and_colorimetry(void)
             write_file_bytes(path, file_buf, mdat_len + moov_len);
 
             char reason[128] = {0};
-            assert(miro_ego_mp4_extend_durations(path, 30, reason, sizeof(reason)) == 0);
+            int hash_fd = open(path, O_RDWR | O_CLOEXEC);
+            assert(hash_fd >= 0);
+            miro_ego_sha256_ctx_t inc_ctx;
+            unsigned long long inc_bytes = 0;
+            assert(miro_ego_mp4_extend_durations_and_hash_fd(
+                       hash_fd, 30, NULL, 0, &inc_ctx, &inc_bytes, reason, sizeof(reason)) == 0);
+            uint8_t inc_digest[MIRO_EGO_SHA256_DIGEST_LEN];
+            char inc_hex[MIRO_EGO_SHA256_HEX_LEN] = {0};
+            miro_ego_sha256_final(&inc_ctx, inc_digest);
+            miro_ego_sha256_to_hex(inc_digest, inc_hex);
+            char full_hex[MIRO_EGO_SHA256_HEX_LEN] = {0};
+            unsigned long long full_bytes = 0;
+            assert(miro_ego_sha256_fd(hash_fd, full_hex, &full_bytes) == 0);
+            close(hash_fd);
+            assert(inc_bytes == full_bytes);
+            assert(strcmp(inc_hex, full_hex) == 0);
 
             uint8_t actual[1024];
             size_t got = read_file_bytes(path, actual, sizeof(actual));

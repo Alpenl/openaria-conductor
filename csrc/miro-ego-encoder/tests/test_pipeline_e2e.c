@@ -561,6 +561,148 @@ static void test_pipeline_exact_boundary_and_zero_frame_lazy_open(void)
     cleanup_dir(zero_dir);
 }
 
+static void test_pipeline_vbr_config_and_transient_backpressure(void)
+{
+    /* 1. Verify H.264 & H.265 VBR rate-control population + transient JPU/VPU
+     *    dequeue_input_buffer timeout recovery + exact segment SHA-256 match. */
+    for (int hevc = 0; hevc <= 1; hevc += 1) {
+        char dir[] = "/tmp/miro_ego_vbr_bp_XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+
+        mock_hobot_config_t mock = {
+            .sbs_width = 64,
+            .height = 32,
+            .intra_period = 3,
+            .transient_jpu_input_timeouts = 5,
+            .transient_vpu_input_timeouts = 7,
+        };
+        mock_hobot_reset(&mock);
+
+        miro_ego_pipeline_config_t cfg = {
+            .sbs_width = 64,
+            .height = 32,
+            .fps = 30,
+            .bitrate_kbps = 12288,
+            .hevc = hevc,
+            .rate_control = 1, /* VBR */
+            .intra_period = 3,
+            .min_qp = 18,
+            .max_qp = 36,
+            .intra_qp = 21,
+            .initial_qp = 24,
+            .vbv_ms = 2500,
+            .segment_frames = 3,
+            .out_dir = dir,
+            .path_prefix = "video/",
+        };
+
+        seg_collector_t col = {0};
+        miro_ego_pipeline_t *pipeline = NULL;
+        char err[256] = {0};
+        assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline,
+                                      err, sizeof(err)) == 0);
+
+        for (int eye = 0; eye < 2; eye += 1) {
+            mc_video_codec_enc_params_t enc_p;
+            mock_hobot_last_enc_params(eye, &enc_p);
+            if (!hevc) {
+                assert(enc_p.rc_params.mode == MC_AV_RC_MODE_H264VBR);
+                const mc_rate_control_vbr_t *v = &enc_p.rc_params.h264_vbr_params;
+                assert(v->frame_rate == 30u);
+                assert(v->bit_rate == 12288u);
+                assert(v->max_bit_rate == 12288u);
+                assert(v->intra_period == 3u);
+                assert(v->intra_qp == 21u);
+                assert(v->initial_rc_qp == 24);
+                assert(v->vbv_buf_size == 2500);
+                assert(v->min_qp_I == 18u && v->min_qp_P == 18u && v->min_qp_B == 18u);
+                assert(v->max_qp_I == 36u && v->max_qp_P == 36u && v->max_qp_B == 36u);
+                assert(v->qp_map_enable == 0);
+            } else {
+                assert(enc_p.rc_params.mode == MC_AV_RC_MODE_H265VBR);
+                const mc_rate_control_vbr_t *v = &enc_p.rc_params.h265_vbr_params;
+                assert(v->frame_rate == 30u);
+                assert(v->bit_rate == 12288u);
+                assert(v->max_bit_rate == 12288u);
+                assert(v->intra_period == 3u);
+                assert(v->intra_qp == 21u);
+                assert(v->initial_rc_qp == 24);
+                assert(v->vbv_buf_size == 2500);
+                assert(v->min_qp_I == 18u && v->min_qp_P == 18u && v->min_qp_B == 18u);
+                assert(v->max_qp_I == 36u && v->max_qp_P == 36u && v->max_qp_B == 36u);
+                assert(v->qp_map_enable == 0);
+            }
+        }
+
+        uint8_t fake_jpeg[64];
+        memset(fake_jpeg, 0xd8, sizeof(fake_jpeg));
+        for (int i = 0; i < 6; i += 1) {
+            fake_jpeg[0] = (uint8_t)i;
+            assert(miro_ego_pipeline_submit(pipeline, fake_jpeg, sizeof(fake_jpeg), 50) == 0);
+        }
+        assert(miro_ego_pipeline_finish(pipeline) == 0);
+        assert(!miro_ego_pipeline_failed(pipeline));
+        assert(mock_hobot_jpu_timeout_injections() == 5ULL);
+        assert(mock_hobot_vpu_timeout_injections() == 7ULL);
+
+        miro_ego_pipeline_stats_t st;
+        miro_ego_pipeline_stats(pipeline, &st);
+        assert(st.submitted == 6ULL && st.decoded == 6ULL);
+        assert(st.encoded[0] == 6ULL && st.encoded[1] == 6ULL);
+        assert(st.drop_decoder_input == 0ULL && st.drop_encoder_input == 0ULL);
+        miro_ego_pipeline_close(pipeline);
+
+        assert(col.count == 2);
+        for (int i = 0; i < 2; i += 1) {
+            char abs_l[512], abs_r[512];
+            snprintf(abs_l, sizeof(abs_l), "%s/left_%05d.mp4", dir, i);
+            snprintf(abs_r, sizeof(abs_r), "%s/right_%05d.mp4", dir, i);
+            verify_file_sha256(abs_l, col.segs[i].left_bytes, col.segs[i].left_sha256);
+            verify_file_sha256(abs_r, col.segs[i].right_bytes, col.segs[i].right_sha256);
+        }
+        cleanup_dir(dir);
+    }
+
+    /* 2. Continuous stall exceeding input_stall_timeout_ms fails cleanly without hanging. */
+    char stall_dir[] = "/tmp/miro_ego_stall_ceil_XXXXXX";
+    assert(mkdtemp(stall_dir) != NULL);
+    mock_hobot_config_t perm_mock = {
+        .sbs_width = 64,
+        .height = 32,
+        .intra_period = 3,
+        .permanent_input_timeout = 1,
+    };
+    mock_hobot_reset(&perm_mock);
+
+    miro_ego_pipeline_config_t stall_cfg = {
+        .sbs_width = 64,
+        .height = 32,
+        .fps = 30,
+        .bitrate_kbps = 4096,
+        .hevc = 0,
+        .rate_control = 1,
+        .intra_period = 3,
+        .min_qp = 18,
+        .max_qp = 40,
+        .intra_qp = 22,
+        .initial_qp = 24,
+        .vbv_ms = 2000,
+        .segment_frames = 3,
+        .out_dir = stall_dir,
+        .path_prefix = "video/",
+        .input_stall_timeout_ms = 25,
+    };
+    miro_ego_pipeline_t *stall_pipe = NULL;
+    char err[256] = {0};
+    assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, &stall_pipe, err, sizeof(err)) == 0);
+    uint8_t fake_jpeg[32] = {0xff, 0xd8, 0xff, 0xd9};
+    assert(miro_ego_pipeline_submit(stall_pipe, fake_jpeg, sizeof(fake_jpeg), 10) == -1);
+    assert(miro_ego_pipeline_failed(stall_pipe));
+    assert(strstr(miro_ego_pipeline_error(stall_pipe), "decoder_input_dequeue_failed") != NULL);
+    miro_ego_pipeline_close(stall_pipe);
+    cleanup_dir(stall_dir);
+}
+
 int main(void)
 {
     test_pipeline_multi_segment(0, NULL);
@@ -575,6 +717,7 @@ int main(void)
     assert(g_custom_destroy_calls == 1);
 
     test_pipeline_exact_boundary_and_zero_frame_lazy_open();
+    test_pipeline_vbr_config_and_transient_backpressure();
     test_pipeline_failure_modes();
     test_cli_shm_end_to_end();
     test_cli_stdin_fallback();

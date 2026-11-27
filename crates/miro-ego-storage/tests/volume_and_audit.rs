@@ -1,5 +1,5 @@
-use miro_ego_capture::session::schema_validation::SchemaValidator;
 use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL};
+use miro_ego_core::schema_validation::SchemaValidator;
 use miro_ego_storage::audit::{ApiAuditEvent, AuditConfig, AuditLogger, AuditWriteTarget};
 use miro_ego_storage::volume::{ExfatVolumeManager, FsCapacity, VolumePolicy, VolumeProbe};
 use miro_ego_storage::{VOLUME_METADATA_SCHEMA, VolumeManager};
@@ -200,6 +200,7 @@ fn audit_logger_rotates_bounded_generations_and_validates_against_schema() {
             max_file_bytes: 600,
             max_generations: 2,
             fallback_ring_bytes: 8 * 1024,
+            ..AuditConfig::default()
         },
         Arc::new(|| true),
     );
@@ -243,6 +244,7 @@ fn audit_logger_falls_back_to_ram_ring_when_unmounted_with_zero_disk_writes_then
             max_file_bytes: 16 * 1024,
             max_generations: 2,
             fallback_ring_bytes: 4096,
+            ..AuditConfig::default()
         },
         Arc::new(move || mounted_flag.load(Ordering::Acquire)),
     );
@@ -421,6 +423,7 @@ fn audit_logger_repairs_partial_tail_line_on_reopen_and_skips_truncated_fallback
             max_generations: 2,
             // 1024-byte ring so an >1024-byte serialized JSON entry produces `{"truncated":true}`.
             fallback_ring_bytes: 1024,
+            ..AuditConfig::default()
         },
         Arc::new(move || mounted_flag.load(Ordering::Acquire)),
     );
@@ -524,6 +527,7 @@ fn audit_logger_validates_recorded_at_resets_fd_on_error_and_peeks_front_batch_o
             max_file_bytes: 16 * 1024,
             max_generations: 2,
             fallback_ring_bytes: 16 * 1024,
+            ..AuditConfig::default()
         },
         Arc::new(move || writable_flag.load(Ordering::Acquire)),
     )

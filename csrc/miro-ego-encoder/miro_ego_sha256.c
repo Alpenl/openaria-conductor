@@ -173,6 +173,35 @@ void miro_ego_sha256_to_hex(const uint8_t digest[MIRO_EGO_SHA256_DIGEST_LEN],
     hex_out[64] = '\0';
 }
 
+int miro_ego_sha256_update_fd_range(miro_ego_sha256_ctx_t *ctx, int fd,
+                                    off_t offset, uint64_t length,
+                                    void *buf, size_t buf_len)
+{
+    if (ctx == NULL || fd < 0 || offset < 0 || buf == NULL || buf_len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t remaining = length;
+    while (remaining > 0) {
+        size_t want = remaining < (uint64_t)buf_len ? (size_t)remaining : buf_len;
+        ssize_t got = pread(fd, buf, want, offset);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (got == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        miro_ego_sha256_update(ctx, buf, (size_t)got);
+        offset += got;
+        remaining -= (uint64_t)got;
+    }
+    return 0;
+}
+
 int miro_ego_sha256_fd_with_buf(int fd, void *buf, size_t buf_len,
                                 char hex_out[MIRO_EGO_SHA256_HEX_LEN],
                                 unsigned long long *bytes_out)

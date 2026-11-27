@@ -47,7 +47,7 @@ jobs:
         run: |
           MIRO_EGO_GIT_COMMIT="$(git rev-parse HEAD)"
           export MIRO_EGO_GIT_COMMIT
-          cargo build --release -p miro-ego-cli
+          cargo build --locked --release -p miro-ego-cli
           build_info="$(./target/release/miro-ego --version)"
           echo "$build_info"
           expected_version="$(uv run --extra dev python scripts/release_version.py)"

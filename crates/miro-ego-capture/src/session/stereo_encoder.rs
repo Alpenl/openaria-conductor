@@ -30,6 +30,12 @@ const MAX_ENCODER_BITRATE_KBPS: u64 = 100_000;
 const MAX_ENCODER_SEGMENT_FRAMES: u64 = 1_000_000;
 const MAX_ENCODER_INTRA_PERIOD: u64 = 300;
 const MAX_ENCODER_VBV_MS: u64 = 3_000;
+const DEFAULT_MIN_QP: u8 = 20;
+const DEFAULT_MAX_QP: u8 = 51;
+const DEFAULT_INTRA_QP: u8 = 22;
+const DEFAULT_INITIAL_QP: u8 = 24;
+const MIN_MJPEG_SLOT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DEFAULT_MJPEG_SLOT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncoderEventError {
@@ -46,22 +52,7 @@ impl EncoderEventError {
     }
 }
 
-/// Completed stereo MP4 segment reported by `miro-ego-encoder` on `stdout`.
-///
-/// Includes optional streaming `left_sha256` / `right_sha256` digests computed while
-/// pages are hot in cache so session sealing skips rereading the MP4 segments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentEvent {
-    pub index: u64,
-    pub start_frame: u64,
-    pub end_frame: u64,
-    pub left_path: String,
-    pub left_bytes: u64,
-    pub left_sha256: Option<String>,
-    pub right_path: String,
-    pub right_bytes: u64,
-    pub right_sha256: Option<String>,
-}
+pub use miro_ego_core::media_types::SegmentEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderEvent {
@@ -304,21 +295,26 @@ impl EncoderAbortHandle {
     }
 }
 
-/// Minimum SHM slot capacity (bytes) matching the C encoder's JPU bitstream buffer size
-/// `((width * height * 3 / 2 + 0x3ff) & !0x3ff)`.
+/// Minimum SHM slot capacity (bytes) sized for compressed stereo MJPEG payloads:
+/// page-aligned `(width * height)` clamped to `2 MiB ..= 8 MiB`.
 pub fn min_shm_slot_capacity(width: u64, height: u64) -> Result<usize, EncoderProcessError> {
+    if width == 0 || height == 0 {
+        return Err(EncoderProcessError::new(
+            "invalid_argument",
+            "encoder frame dimensions must be positive",
+        ));
+    }
     let pixels = width.checked_mul(height).ok_or_else(|| {
         EncoderProcessError::new("invalid_argument", "encoder frame dimensions overflow")
     })?;
-    let yuv420_bytes = pixels
-        .checked_mul(3)
-        .map(|v| v / 2)
-        .and_then(|v| v.checked_add(0x3ff))
-        .map(|v| v & !0x3ff)
+    let page_aligned = pixels
+        .checked_add(0xfff)
+        .map(|v| v & !0xfff)
         .ok_or_else(|| {
             EncoderProcessError::new("invalid_argument", "encoder frame buffer size overflow")
         })?;
-    usize::try_from(yuv420_bytes).map_err(|_| {
+    let sized = page_aligned.clamp(MIN_MJPEG_SLOT_BYTES, MAX_DEFAULT_MJPEG_SLOT_BYTES);
+    usize::try_from(sized).map_err(|_| {
         EncoderProcessError::new(
             "invalid_argument",
             "encoder frame buffer size exceeds usize",
@@ -328,12 +324,16 @@ pub fn min_shm_slot_capacity(width: u64, height: u64) -> Result<usize, EncoderPr
 
 pub struct EncoderProcess {
     executable: PathBuf,
+    base_args: Vec<String>,
     args: Vec<String>,
     fps: u64,
     segment_frames: u64,
+    base_intra_period: Option<u64>,
     intra_period: Option<u64>,
     min_qp: Option<u8>,
     max_qp: Option<u8>,
+    intra_qp: Option<u8>,
+    initial_qp: Option<u8>,
     transport_mode: EncoderTransport,
     shared: Arc<SharedProcess>,
     child: Option<Child>,
@@ -394,29 +394,34 @@ impl EncoderProcess {
                 ));
             }
         }
+        let base_args = vec![
+            "--out-dir".to_owned(),
+            config.out_dir.to_string_lossy().into_owned(),
+            "--path-prefix".to_owned(),
+            config.path_prefix.to_owned(),
+            "--width".to_owned(),
+            config.width.to_string(),
+            "--height".to_owned(),
+            config.height.to_string(),
+            "--fps".to_owned(),
+            config.fps.to_string(),
+            "--bitrate-kbps".to_owned(),
+            config.bitrate_kbps.to_string(),
+            "--segment-frames".to_owned(),
+            config.segment_frames.to_string(),
+        ];
         Ok(Self {
             executable: config.executable.to_path_buf(),
-            args: vec![
-                "--out-dir".to_owned(),
-                config.out_dir.to_string_lossy().into_owned(),
-                "--path-prefix".to_owned(),
-                config.path_prefix.to_owned(),
-                "--width".to_owned(),
-                config.width.to_string(),
-                "--height".to_owned(),
-                config.height.to_string(),
-                "--fps".to_owned(),
-                config.fps.to_string(),
-                "--bitrate-kbps".to_owned(),
-                config.bitrate_kbps.to_string(),
-                "--segment-frames".to_owned(),
-                config.segment_frames.to_string(),
-            ],
+            args: base_args.clone(),
+            base_args,
             fps: config.fps,
             segment_frames: config.segment_frames,
+            base_intra_period: None,
             intra_period: None,
             min_qp: None,
             max_qp: None,
+            intra_qp: None,
+            initial_qp: None,
             transport_mode,
             shared: Arc::new(SharedProcess::new()),
             child: None,
@@ -439,11 +444,17 @@ impl EncoderProcess {
             ));
         }
         let mut proc = Self::with_transport(config, transport_mode)?;
+        proc.base_intra_period = Some(intra_period);
         proc.intra_period = Some(intra_period);
         proc.validate_segment_gop()?;
-        proc.args.push("--intra-period".to_owned());
-        proc.args.push(intra_period.to_string());
+        proc.base_args.push("--intra-period".to_owned());
+        proc.base_args.push(intra_period.to_string());
+        proc.args = proc.base_args.clone();
         Ok(proc)
+    }
+
+    fn validate_qp_bounds(&self) -> Result<(), EncoderProcessError> {
+        validate_effective_qp_bounds(self.min_qp, self.max_qp, self.intra_qp, self.initial_qp)
     }
 
     fn validate_segment_gop(&self) -> Result<(), EncoderProcessError> {
@@ -480,6 +491,8 @@ impl EncoderProcess {
             ));
         }
         self.validate_segment_gop()?;
+        self.validate_qp_bounds()?;
+        self.submitted = 0;
         self.shared.aborted.store(false, Ordering::Release);
         if let Ok(mut pgid) = self.shared.live_pgid.lock() {
             *pgid = None;
@@ -638,10 +651,16 @@ impl EncoderProcess {
                 "invalid encoder settings",
             ));
         }
-        let mut next_intra_period = self.intra_period;
+        // Start from constructor defaults so reconfiguring never retains stale overrides or
+        // duplicate CLI flags from an earlier `configure()` call.
+        let mut next_intra_period = self.base_intra_period;
         let mut saw_intra_period = false;
-        let mut next_min_qp = self.min_qp;
-        let mut next_max_qp = self.max_qp;
+        let mut next_min_qp: Option<u8> = None;
+        let mut next_max_qp: Option<u8> = None;
+        let mut next_intra_qp: Option<u8> = None;
+        let mut next_initial_qp: Option<u8> = None;
+        let mut overrides: Vec<(String, String)> = Vec::with_capacity(args.len() / 2);
+
         for pair in args.chunks_exact(2) {
             let flag = pair[0].as_str();
             let value = pair[1].as_str();
@@ -689,10 +708,12 @@ impl EncoderProcess {
                             "qp setting must be in 0..=51",
                         ));
                     }
-                    if flag == "--min-qp" {
-                        next_min_qp = Some(qp);
-                    } else if flag == "--max-qp" {
-                        next_max_qp = Some(qp);
+                    match flag {
+                        "--min-qp" => next_min_qp = Some(qp),
+                        "--max-qp" => next_max_qp = Some(qp),
+                        "--intra-qp" => next_intra_qp = Some(qp),
+                        "--initial-qp" => next_initial_qp = Some(qp),
+                        _ => unreachable!(),
                     }
                 }
                 "--intra-period" => {
@@ -726,14 +747,16 @@ impl EncoderProcess {
                     ));
                 }
             }
+            if let Some(existing) = overrides.iter_mut().find(|(k, _)| k == flag) {
+                existing.1 = value.to_owned();
+            } else {
+                overrides.push((flag.to_owned(), value.to_owned()));
+            }
         }
-        if next_min_qp.unwrap_or(20) > next_max_qp.unwrap_or(51) {
-            return Err(EncoderProcessError::new(
-                "invalid_argument",
-                "min-qp must not exceed max-qp",
-            ));
-        }
-        if saw_intra_period {
+
+        validate_effective_qp_bounds(next_min_qp, next_max_qp, next_intra_qp, next_initial_qp)?;
+
+        if saw_intra_period || next_intra_period.is_some() {
             let effective_gop = next_intra_period.filter(|&p| p > 0).unwrap_or(self.fps);
             if self.segment_frames > 0
                 && (effective_gop == 0 || self.segment_frames % effective_gop != 0)
@@ -747,10 +770,33 @@ impl EncoderProcess {
                 ));
             }
         }
+
+        let mut merged_args = Vec::with_capacity(self.base_args.len() + overrides.len() * 2);
+        for base_pair in self.base_args.chunks_exact(2) {
+            if !overrides.iter().any(|(flag, _)| flag == &base_pair[0]) {
+                merged_args.push(base_pair[0].clone());
+                merged_args.push(base_pair[1].clone());
+            }
+        }
+        for (flag, value) in overrides {
+            merged_args.push(flag);
+            merged_args.push(value);
+        }
+
         self.intra_period = next_intra_period;
         self.min_qp = next_min_qp;
         self.max_qp = next_max_qp;
-        self.args.extend_from_slice(args);
+        self.intra_qp = next_intra_qp;
+        self.initial_qp = next_initial_qp;
+        self.args = merged_args;
+        self.submitted = 0;
+        self.shared.aborted.store(false, Ordering::Release);
+        if let Ok(mut pgid) = self.shared.live_pgid.lock() {
+            *pgid = None;
+        }
+        if let Ok(mut state) = self.shared.state.lock() {
+            *state = ProcessState::new();
+        }
         Ok(())
     }
 
@@ -926,18 +972,23 @@ impl EncoderProcess {
     }
 
     pub fn abort(&mut self) {
+        self.abort_with_timeout(ABORT_WAIT_TIMEOUT);
+    }
+
+    fn abort_with_timeout(&mut self, wait_timeout: Duration) {
         if let Some(ActiveTransport::ShmRing(ring)) = self.active_transport.as_ref() {
             let _ = ring.signal_eof();
         }
         self.shared.signal_abort();
         let mut child_reaped = true;
         if let Some(mut child) = self.child.take() {
-            match wait_child_and_clear_pgid(&mut child, &self.shared.live_pgid, ABORT_WAIT_TIMEOUT)
-            {
+            match wait_child_and_clear_pgid(&mut child, &self.shared.live_pgid, wait_timeout) {
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
-                    // Uninterruptible kernel D-state child cannot be waited forever on close.
+                    // Uninterruptible kernel D-state child cannot be waited forever on close;
+                    // hand `child` to a detached background reaper so zombie PIDs never leak.
                     child_reaped = false;
+                    spawn_detached_child_reaper(child, Arc::clone(&self.shared));
                 }
             }
         }
@@ -1073,14 +1124,94 @@ impl Drop for EncoderProcess {
     }
 }
 
+fn validate_effective_qp_bounds(
+    min_qp: Option<u8>,
+    max_qp: Option<u8>,
+    intra_qp: Option<u8>,
+    initial_qp: Option<u8>,
+) -> Result<(), EncoderProcessError> {
+    let eff_min = min_qp.unwrap_or(DEFAULT_MIN_QP);
+    let eff_max = max_qp.unwrap_or(DEFAULT_MAX_QP);
+    let eff_intra = intra_qp.unwrap_or(DEFAULT_INTRA_QP);
+    let eff_initial = initial_qp.unwrap_or(DEFAULT_INITIAL_QP);
+    if eff_min > eff_max {
+        return Err(EncoderProcessError::new(
+            "invalid_argument",
+            "min-qp must not exceed max-qp",
+        ));
+    }
+    if !(eff_min..=eff_max).contains(&eff_intra) {
+        return Err(EncoderProcessError::new(
+            "invalid_argument",
+            format!(
+                "intra-qp ({eff_intra}) must be within min-qp..=max-qp ({eff_min}..={eff_max})"
+            ),
+        ));
+    }
+    if !(eff_min..=eff_max).contains(&eff_initial) {
+        return Err(EncoderProcessError::new(
+            "invalid_argument",
+            format!(
+                "initial-qp ({eff_initial}) must be within min-qp..=max-qp ({eff_min}..={eff_max})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_detached_child_reaper(mut child: Child, shared: Arc<SharedProcess>) {
+    let _ = thread::Builder::new()
+        .name("encoder-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+            if let Ok(mut pgid_guard) = shared.live_pgid.lock() {
+                *pgid_guard = None;
+            }
+        });
+}
+
 fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     limit: usize,
 ) -> Result<Option<Vec<u8>>, EncoderProcessError> {
+    let max_read = (limit as u64).saturating_add(1);
     let mut line = Vec::new();
     loop {
-        let available = match reader.fill_buf() {
-            Ok(buf) => buf,
+        let remaining = max_read.saturating_sub(line.len() as u64);
+        match reader.by_ref().take(remaining).read_until(b'\n', &mut line) {
+            Ok(0) => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                if line.len() > limit {
+                    return Err(EncoderProcessError::new(
+                        "encoder_failed",
+                        "encoder stdout line exceeds maximum length",
+                    ));
+                }
+                return Ok(Some(line));
+            }
+            Ok(_) => {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    if line.len() > limit {
+                        return Err(EncoderProcessError::new(
+                            "encoder_failed",
+                            "encoder stdout line exceeds maximum length",
+                        ));
+                    }
+                    return Ok(Some(line));
+                }
+                if line.len() > limit {
+                    return Err(EncoderProcessError::new(
+                        "encoder_failed",
+                        "encoder stdout line exceeds maximum length",
+                    ));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 return Err(EncoderProcessError::new(
@@ -1088,33 +1219,7 @@ fn read_bounded_line<R: BufRead>(
                     format!("encoder event stream error: {error}"),
                 ));
             }
-        };
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(line));
         }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            if line.len() + pos > limit {
-                return Err(EncoderProcessError::new(
-                    "encoder_failed",
-                    "encoder stdout line exceeds maximum length",
-                ));
-            }
-            line.extend_from_slice(&available[..pos]);
-            reader.consume(pos + 1);
-            return Ok(Some(line));
-        }
-        let consumed = available.len();
-        if line.len() + consumed > limit {
-            return Err(EncoderProcessError::new(
-                "encoder_failed",
-                "encoder stdout line exceeds maximum length",
-            ));
-        }
-        line.extend_from_slice(available);
-        reader.consume(consumed);
     }
 }
 
@@ -1162,14 +1267,20 @@ fn read_events(stdout: std::process::ChildStdout, shared: Arc<SharedProcess>) {
     }
 }
 
-fn read_stderr(mut stderr: std::process::ChildStderr, shared: Arc<SharedProcess>) {
-    let mut buffer = [0_u8; 1024];
+fn read_stderr(stderr: std::process::ChildStderr, shared: Arc<SharedProcess>) {
+    let mut reader = BufReader::with_capacity(MAX_STDERR_BYTES, stderr);
+    let mut chunk = Vec::with_capacity(1024);
     loop {
-        match stderr.read(&mut buffer) {
+        chunk.clear();
+        match reader
+            .by_ref()
+            .take(MAX_EVENT_LINE_BYTES as u64)
+            .read_until(b'\n', &mut chunk)
+        {
             Ok(0) => break,
-            Ok(read) => {
+            Ok(_) => {
                 if let Ok(mut state) = shared.state.lock() {
-                    state.append_stderr(&buffer[..read]);
+                    state.append_stderr(&chunk);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1656,7 +1767,7 @@ mod tests {
             },
             EncoderTransport::ShmRing(ShmRingConfig {
                 slot_count: 4,
-                slot_capacity: 4096,
+                slot_capacity: 2 * 1024 * 1024,
             }),
         )
         .unwrap();
@@ -1865,7 +1976,7 @@ mod tests {
             },
             EncoderTransport::ShmRing(ShmRingConfig {
                 slot_count: 4,
-                slot_capacity: 4096,
+                slot_capacity: 2 * 1024 * 1024,
             }),
         )
         .unwrap();
@@ -1909,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn shm_slot_capacity_validates_against_4k_dimensions_and_accepts_8mib_default() {
+    fn shm_slot_capacity_validates_mjpeg_sizing_and_accepts_4mib_default() {
         let cfg = || EncoderConfig {
             out_dir: std::path::Path::new("/unused"),
             executable: std::path::Path::new("/unused/helper"),
@@ -1920,14 +2031,24 @@ mod tests {
             segment_frames: 150,
             path_prefix: "video/",
         };
+        let min_sbs = super::min_shm_slot_capacity(3840, 1080).unwrap();
+        assert_eq!(min_sbs, 4_149_248);
+        assert_eq!(
+            super::min_shm_slot_capacity(64, 32).unwrap(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            super::min_shm_slot_capacity(7680, 2160).unwrap(),
+            8 * 1024 * 1024
+        );
         let err = match EncoderProcess::with_transport(
             cfg(),
             EncoderTransport::ShmRing(ShmRingConfig {
                 slot_count: 8,
-                slot_capacity: 4 * 1024 * 1024,
+                slot_capacity: 2 * 1024 * 1024,
             }),
         ) {
-            Ok(_) => panic!("expected 4 MiB slot_capacity to be rejected for 3840x1080"),
+            Ok(_) => panic!("expected 2 MiB slot_capacity to be rejected for 3840x1080"),
             Err(err) => err,
         };
         assert_eq!(err.code, "invalid_shm_config");
@@ -1935,9 +2056,9 @@ mod tests {
     }
 
     #[test]
-    fn configure_rejects_inverted_qp_bounds_and_finish_timeout_preserves_causal_error() {
+    fn configure_validates_all_qp_bounds_clears_stale_state_and_reaper_prevents_zombies() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
         let mut enc = EncoderProcess::new(EncoderConfig {
             out_dir: std::path::Path::new("/unused"),
@@ -1950,6 +2071,7 @@ mod tests {
             path_prefix: "video/",
         })
         .unwrap();
+        // Inverted min > max rejected
         assert_eq!(
             enc.configure(&[
                 "--min-qp".to_owned(),
@@ -1961,14 +2083,104 @@ mod tests {
             .code,
             "invalid_argument"
         );
-        enc.configure(&["--min-qp".to_owned(), "35".to_owned()])
-            .unwrap();
+        // Raising min-qp above default intra_qp (22) / initial_qp (24) without updating them is rejected
         assert_eq!(
-            enc.configure(&["--max-qp".to_owned(), "30".to_owned()])
+            enc.configure(&["--min-qp".to_owned(), "35".to_owned()])
                 .unwrap_err()
                 .code,
             "invalid_argument"
         );
+        // Explicit intra-qp outside min..=max is rejected
+        assert_eq!(
+            enc.configure(&[
+                "--min-qp".to_owned(),
+                "20".to_owned(),
+                "--max-qp".to_owned(),
+                "35".to_owned(),
+                "--intra-qp".to_owned(),
+                "18".to_owned(),
+                "--initial-qp".to_owned(),
+                "24".to_owned(),
+            ])
+            .unwrap_err()
+            .code,
+            "invalid_argument"
+        );
+        // Explicit initial-qp outside min..=max is rejected
+        assert_eq!(
+            enc.configure(&[
+                "--min-qp".to_owned(),
+                "20".to_owned(),
+                "--max-qp".to_owned(),
+                "35".to_owned(),
+                "--intra-qp".to_owned(),
+                "22".to_owned(),
+                "--initial-qp".to_owned(),
+                "40".to_owned(),
+            ])
+            .unwrap_err()
+            .code,
+            "invalid_argument"
+        );
+
+        // Valid high-QP set succeeds, and subsequent reconfigure clears stale QP/args/failure state!
+        enc.configure(&[
+            "--min-qp".to_owned(),
+            "35".to_owned(),
+            "--max-qp".to_owned(),
+            "45".to_owned(),
+            "--intra-qp".to_owned(),
+            "36".to_owned(),
+            "--initial-qp".to_owned(),
+            "38".to_owned(),
+            "--bitrate-kbps".to_owned(),
+            "16000".to_owned(),
+        ])
+        .unwrap();
+        super::handle_event(
+            &enc.shared,
+            br#"{"event":"error","code":"stale_err","message":"stale"}"#,
+        )
+        .unwrap();
+        assert!(enc.failure().is_some());
+        enc.submitted = 12;
+
+        // Reconfigure back to codec=hevc: clears stale min_qp=35, deduplicates --bitrate-kbps, and resets state
+        enc.configure(&["--codec".to_owned(), "hevc".to_owned()])
+            .unwrap();
+        assert!(enc.failure().is_none());
+        assert_eq!(enc.submitted_frames(), 0);
+        assert_eq!(enc.min_qp, None);
+        assert_eq!(
+            enc.args
+                .iter()
+                .filter(|a| a.as_str() == "--bitrate-kbps")
+                .count(),
+            1
+        );
+
+        // Verify detached background reaper reaps child if wait times out during abort
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.15")
+            .spawn()
+            .unwrap();
+        let child_pid = child.id() as i32;
+        enc.shared.live_pgid.lock().unwrap().replace(child_pid);
+        assert!(
+            super::wait_child_and_clear_pgid(&mut child, &enc.shared.live_pgid, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        super::spawn_detached_child_reaper(child, std::sync::Arc::clone(&enc.shared));
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while enc.shared.live_pgid.lock().unwrap().is_some() {
+            assert!(
+                Instant::now() < reap_deadline,
+                "detached encoder reaper failed to reap child and clear live_pgid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

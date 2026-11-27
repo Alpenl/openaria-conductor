@@ -4,6 +4,7 @@
 use crate::backend::GatewayBackend;
 use crate::downloads::{ArtifactDeleteGate, LogEtagCache};
 use crate::error::{ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE};
+use crate::idempotency::IdempotencyCoalescer;
 use crate::security::{
     AuditEvent, Principal, SecurityPolicy, SecurityProfile, is_allowed_gateway_host,
     is_same_gateway_origin, is_valid_idempotency_key,
@@ -64,6 +65,7 @@ pub struct GatewayState {
     pub allowed_hosts: Arc<HashSet<String>>,
     pub download_semaphore: Arc<Semaphore>,
     pub artifact_delete_gate: Arc<ArtifactDeleteGate>,
+    pub idempotency_coalescer: Arc<IdempotencyCoalescer>,
     pub log_etag_cache: Arc<LogEtagCache>,
     pub sse_semaphore: Arc<Semaphore>,
     pub preview_semaphore: Arc<Semaphore>,
@@ -91,6 +93,7 @@ impl GatewayState {
             allowed_hosts: Arc::new(allowed_hosts),
             download_semaphore: Arc::new(Semaphore::new(max_downloads)),
             artifact_delete_gate: Arc::new(ArtifactDeleteGate::new()),
+            idempotency_coalescer: Arc::new(IdempotencyCoalescer::default()),
             log_etag_cache: Arc::new(LogEtagCache::default()),
             sse_semaphore: Arc::new(Semaphore::new(max_sse)),
             preview_semaphore: Arc::new(Semaphore::new(max_preview)),
@@ -167,11 +170,31 @@ impl RequestCtx {
             resource_id.map(str::to_owned),
             outcome,
         );
-        if state.backend.record_audit(event).is_err() {
-            self.audit_failed = true;
-            return false;
+        match state.backend.record_audit_durable(event) {
+            Ok(true) => true,
+            Ok(false) => {
+                self.audit_failed = true;
+                true
+            }
+            Err(_) => {
+                self.audit_failed = true;
+                false
+            }
         }
-        true
+    }
+
+    /// Record the fail-closed `"allowed"` audit event after request parameters/body pass validation.
+    pub fn record_allowed(
+        &mut self,
+        state: &GatewayState,
+        operation_id: &str,
+        resource_id: Option<&str>,
+        principal: &Principal,
+    ) -> Result<(), Box<Response<Body>>> {
+        if !self.audit(state, operation_id, resource_id, "allowed", Some(principal)) {
+            return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
+        }
+        Ok(())
     }
 
     /// Authorize a read operation (`Host`, `Origin`, `Authorization`, permission, and fail-closed audit).
@@ -185,6 +208,18 @@ impl RequestCtx {
         self.authorize_inner(state, headers, operation_id, resource_id, true)
     }
 
+    /// Authorize read headers (`Host`, `Origin`, `Authorization`, permission) BEFORE validating
+    /// query/header syntax so malformed requests emit `"invalid_request"` instead of `"allowed"`.
+    pub fn authorize_read_headers(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+        resource_id: Option<&str>,
+    ) -> Result<Principal, Box<Response<Body>>> {
+        self.authorize_inner(state, headers, operation_id, resource_id, false)
+    }
+
     /// Authorize a write operation (`Host`, `Origin`, `Authorization`, permission, `X-CSRF-Token`,
     /// and fail-closed audit).
     pub fn authorize_write(
@@ -194,6 +229,44 @@ impl RequestCtx {
         operation_id: &str,
     ) -> Result<Principal, Box<Response<Body>>> {
         self.authorize_write_inner(state, headers, operation_id, true, true)
+    }
+
+    /// Authorize write headers (`Host`, `Origin`, `Authorization`, permission, `X-CSRF-Token`)
+    /// BEFORE reading and validating the JSON body.
+    pub fn authorize_write_headers(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+    ) -> Result<Principal, Box<Response<Body>>> {
+        self.authorize_write_inner(state, headers, operation_id, true, false)
+    }
+
+    /// Authorize idempotent command headers (`Host`, `Origin`, `Authorization`, permission,
+    /// `X-CSRF-Token`, `Idempotency-Key`) BEFORE reading and validating the JSON body.
+    pub fn authorize_command_headers(
+        &mut self,
+        state: &GatewayState,
+        headers: &HeaderMap,
+        operation_id: &str,
+    ) -> Result<(Principal, String), Box<Response<Body>>> {
+        let principal = self.authorize_write_inner(state, headers, operation_id, true, false)?;
+        let key = match single_header_str(headers, "idempotency-key") {
+            HeaderExtract::Single(key) if is_valid_idempotency_key(key) => key.to_owned(),
+            _ => {
+                self.audit(
+                    state,
+                    operation_id,
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
+                return Err(Box::new(self.error_response(ApiError::bad_request(
+                    "Idempotency-Key header is missing or invalid",
+                ))));
+            }
+        };
+        Ok((principal, key))
     }
 
     fn authorize_write_inner(
@@ -842,11 +915,15 @@ pub async fn gateway_framing_and_host_middleware(
     let method = request.method().clone();
     let version = request.version();
     let headers = request.headers();
-    let mut ctx = RequestCtx::new(&method, headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, headers, &state);
 
-    // 1. HTTP/1.1 requires Host header
-    if version == axum::http::Version::HTTP_11 && headers.get(header::HOST).is_none() {
-        return ctx.error_response(ApiError::bad_request("HTTP/1.1 request must include Host"));
+    // 1. HTTP/1.1 and HTTP/1.0 requests must include Host header
+    if matches!(
+        version,
+        axum::http::Version::HTTP_11 | axum::http::Version::HTTP_10
+    ) && headers.get(header::HOST).is_none()
+    {
+        return ctx.error_response(ApiError::bad_request("HTTP request must include Host"));
     }
 
     // 2. Host anti-DNS-rebinding check on ALL requests (including OPTIONS / unknown paths)

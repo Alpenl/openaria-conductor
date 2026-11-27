@@ -6,7 +6,7 @@
 //!   - `0..8`: `magic: [u8; 8] = *b"MEGO_SHM"`
 //!   - `8..12`: `version: u32 = 1`
 //!   - `12..16`: `slot_count: u32` (power of 2, `1..=256`, default `16`)
-//!   - `16..20`: `slot_capacity: u32` (default `8 MiB`)
+//!   - `16..20`: `slot_capacity: u32` (default `4 MiB`)
 //!   - `20..24`: `flags: AtomicU32` (`bit 0` = EOF/shutdown)
 //!   - `64..72`: `write_idx: AtomicU64` (producer monotonic)
 //!   - `128..136`: `read_idx: AtomicU64` (consumer monotonic)
@@ -37,7 +37,7 @@ pub const SHM_PAGE_ALIGN: usize = 4096;
 
 pub const DEFAULT_SLOT_COUNT: u32 = 16;
 pub const MAX_SLOT_COUNT: u32 = 256;
-pub const DEFAULT_SLOT_CAPACITY: u32 = 8 * 1024 * 1024;
+pub const DEFAULT_SLOT_CAPACITY: u32 = 4 * 1024 * 1024;
 pub const MAX_SLOT_CAPACITY: u32 = 64 * 1024 * 1024;
 
 /// Bit 0 of `ShmHeader::flags`: producer has reached EOF / shutdown.
@@ -255,9 +255,37 @@ impl MmapRegion {
         Ok(Self { ptr, len })
     }
 
-    fn header(&self) -> &ShmHeader {
-        // SAFETY: `self.len >= SHM_HEADER_BYTES` and mmap returns page-aligned memory.
-        unsafe { &*self.ptr.as_ptr().cast::<ShmHeader>() }
+    fn header_ptr(&self) -> *mut ShmHeader {
+        self.ptr.as_ptr().cast::<ShmHeader>()
+    }
+
+    fn flags_atomic(&self) -> &AtomicU32 {
+        let hdr_ptr = self.header_ptr();
+        // SAFETY: `self.len >= SHM_HEADER_BYTES`, `mmap` returns page-aligned memory,
+        // and `flags` is accessed exclusively through atomic operations without creating
+        // a `&ShmHeader` reference across cross-process mutable fields.
+        unsafe { &*std::ptr::addr_of!((*hdr_ptr).flags) }
+    }
+
+    fn write_idx_atomic(&self) -> &AtomicU64 {
+        let hdr_ptr = self.header_ptr();
+        // SAFETY: `self.len >= SHM_HEADER_BYTES`, `mmap` returns page-aligned memory,
+        // and `write_idx` is a 64-byte-aligned `AtomicU64` accessed only via atomics.
+        unsafe { &*std::ptr::addr_of!((*hdr_ptr).write_idx) }
+    }
+
+    fn read_idx_atomic(&self) -> &AtomicU64 {
+        let hdr_ptr = self.header_ptr();
+        // SAFETY: `self.len >= SHM_HEADER_BYTES`, `mmap` returns page-aligned memory,
+        // and `read_idx` is a 64-byte-aligned `AtomicU64` accessed only via atomics.
+        unsafe { &*std::ptr::addr_of!((*hdr_ptr).read_idx) }
+    }
+
+    fn dropped_frames_atomic(&self) -> &AtomicU64 {
+        let hdr_ptr = self.header_ptr();
+        // SAFETY: `self.len >= SHM_HEADER_BYTES`, `mmap` returns page-aligned memory,
+        // and `dropped_frames` is a 64-byte-aligned `AtomicU64` accessed only via atomics.
+        unsafe { &*std::ptr::addr_of!((*hdr_ptr).dropped_frames) }
     }
 
     fn slot_ptr(&self, slot_index: u32) -> *mut ShmSlotDescriptor {
@@ -303,18 +331,34 @@ impl ShmRingProducer {
         let region = MmapRegion::map(shm_fd.as_raw_fd(), layout.total_bytes)?;
 
         // Initialize header and pre-populate descriptor data_offsets before consumer attaches.
-        // SAFETY: Exclusive owner during initialization before spawning/sharing fds.
+        // SAFETY: Exclusive owner during initialization before spawning/sharing fds; all writes
+        // go through field raw pointers (`addr_of_mut!`) without materializing `&mut ShmHeader`.
         unsafe {
-            let hdr_ptr = region.ptr.as_ptr().cast::<ShmHeader>();
+            let hdr_ptr = region.header_ptr();
             std::ptr::write_bytes(region.ptr.as_ptr(), 0, layout.data_region_offset);
-            (*hdr_ptr).magic = SHM_MAGIC;
-            (*hdr_ptr).version = SHM_VERSION;
-            (*hdr_ptr).slot_count = layout.slot_count;
-            (*hdr_ptr).slot_capacity = layout.slot_capacity;
-            (*hdr_ptr).flags = AtomicU32::new(0);
-            (*hdr_ptr).write_idx = AtomicU64::new(0);
-            (*hdr_ptr).read_idx = AtomicU64::new(0);
-            (*hdr_ptr).dropped_frames = AtomicU64::new(0);
+            std::ptr::write(std::ptr::addr_of_mut!((*hdr_ptr).magic), SHM_MAGIC);
+            std::ptr::write(std::ptr::addr_of_mut!((*hdr_ptr).version), SHM_VERSION);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*hdr_ptr).slot_count),
+                layout.slot_count,
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*hdr_ptr).slot_capacity),
+                layout.slot_capacity,
+            );
+            std::ptr::write(std::ptr::addr_of_mut!((*hdr_ptr).flags), AtomicU32::new(0));
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*hdr_ptr).write_idx),
+                AtomicU64::new(0),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*hdr_ptr).read_idx),
+                AtomicU64::new(0),
+            );
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*hdr_ptr).dropped_frames),
+                AtomicU64::new(0),
+            );
 
             for slot in 0..layout.slot_count {
                 let data_offset = layout.slot_data_offset(slot).ok_or_else(|| {
@@ -360,23 +404,38 @@ impl ShmRingProducer {
     }
 
     pub fn write_idx(&self) -> u64 {
-        self.region.header().write_idx.load(Ordering::Acquire)
+        self.region.write_idx_atomic().load(Ordering::Acquire)
     }
 
     pub fn read_idx(&self) -> u64 {
-        self.region.header().read_idx.load(Ordering::Acquire)
+        self.region.read_idx_atomic().load(Ordering::Acquire)
     }
 
     pub fn dropped_frames(&self) -> u64 {
-        self.region.header().dropped_frames.load(Ordering::Acquire)
+        self.region.dropped_frames_atomic().load(Ordering::Acquire)
     }
 
     pub fn record_dropped_frame(&self) -> u64 {
         self.region
-            .header()
-            .dropped_frames
+            .dropped_frames_atomic()
             .fetch_add(1, Ordering::AcqRel)
             + 1
+    }
+
+    /// Try to push one frame without blocking; if the ring is full, atomically increments
+    /// `dropped_frames` in the SHM header and returns `PushStatus::Full`.
+    pub fn try_push_or_drop(
+        &mut self,
+        frame_seq: u64,
+        monotonic_ns: u64,
+        flags: u32,
+        payload: &[u8],
+    ) -> Result<PushStatus, ShmRingError> {
+        let status = self.try_push(frame_seq, monotonic_ns, flags, payload)?;
+        if status == PushStatus::Full {
+            self.record_dropped_frame();
+        }
+        Ok(status)
     }
 
     /// Try to push one frame without blocking. Returns `PushStatus::Full` when all slots are in use.
@@ -406,16 +465,15 @@ impl ShmRingProducer {
             ));
         }
 
-        let header = self.region.header();
-        if (header.flags.load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
+        if (self.region.flags_atomic().load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
             return Err(ShmRingError::new(
                 "shm_eof",
                 "cannot push frame after EOF has been signaled",
             ));
         }
 
-        let write_idx = header.write_idx.load(Ordering::Relaxed);
-        let read_idx = header.read_idx.load(Ordering::Acquire);
+        let write_idx = self.region.write_idx_atomic().load(Ordering::Relaxed);
+        let read_idx = self.region.read_idx_atomic().load(Ordering::Acquire);
         if write_idx < read_idx || (write_idx - read_idx) > u64::from(self.layout.slot_count) {
             return Err(ShmRingError::new(
                 "shm_corrupt",
@@ -458,7 +516,9 @@ impl ShmRingProducer {
         }
 
         let next_write_idx = write_idx.wrapping_add(1);
-        header.write_idx.store(next_write_idx, Ordering::Release);
+        self.region
+            .write_idx_atomic()
+            .store(next_write_idx, Ordering::Release);
         signal_eventfd(self.kick_fd.as_raw_fd())?;
         Ok(PushStatus::Pushed {
             write_idx: next_write_idx,
@@ -529,8 +589,19 @@ impl ShmRingProducer {
                 PushStatus::Pushed { write_idx, .. } => return Ok(write_idx),
                 PushStatus::Full => {
                     check(true)?;
+                    // Only touch `done_fd` when the ring is actually full: drain any accumulated
+                    // completion notifications first and re-check `read_idx` before blocking in
+                    // `poll()` so non-full steady-state pushes never pay `done_fd` syscalls and
+                    // stale eventfd counts never cause an extra spin iteration or lost wakeup.
+                    drain_eventfd(self.done_fd.as_raw_fd())?;
+                    if let PushStatus::Pushed { write_idx, .. } =
+                        self.try_push(frame_seq, monotonic_ns, flags, payload)?
+                    {
+                        return Ok(write_idx);
+                    }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        self.record_dropped_frame();
                         return Err(ShmRingError::new(
                             "shm_backpressure_timeout",
                             "timed out waiting for encoder to free a SHM slot",
@@ -553,8 +624,7 @@ impl ShmRingProducer {
     /// Mark EOF in `header.flags` (`SHM_FLAG_EOF`) and wake the consumer via `kick_fd`.
     pub fn signal_eof(&self) -> Result<(), ShmRingError> {
         self.region
-            .header()
-            .flags
+            .flags_atomic()
             .fetch_or(SHM_FLAG_EOF, Ordering::Release);
         signal_eventfd(self.kick_fd.as_raw_fd())
     }
@@ -596,19 +666,29 @@ impl ShmRingConsumer {
             ));
         }
 
-        // First map header to inspect and validate dimensions.
+        // First map header to inspect and validate dimensions via raw field pointers.
         let header_map = MmapRegion::map(shm_fd.as_raw_fd(), SHM_HEADER_BYTES)?;
-        let header = header_map.header();
-        if header.magic != SHM_MAGIC {
+        let hdr_ptr = header_map.header_ptr();
+        // SAFETY: `header_map.len == SHM_HEADER_BYTES`, and immutable header fields
+        // (`magic`, `version`, `slot_count`, `slot_capacity`) are written prior to attach.
+        let (magic, version, slot_count, slot_capacity) = unsafe {
+            (
+                std::ptr::read(std::ptr::addr_of!((*hdr_ptr).magic)),
+                std::ptr::read(std::ptr::addr_of!((*hdr_ptr).version)),
+                std::ptr::read(std::ptr::addr_of!((*hdr_ptr).slot_count)),
+                std::ptr::read(std::ptr::addr_of!((*hdr_ptr).slot_capacity)),
+            )
+        };
+        if magic != SHM_MAGIC {
             return Err(ShmRingError::new("shm_invalid", "invalid MEGO_SHM magic"));
         }
-        if header.version != SHM_VERSION {
+        if version != SHM_VERSION {
             return Err(ShmRingError::new(
                 "shm_invalid",
-                format!("unsupported MEGO_SHM version {}", header.version),
+                format!("unsupported MEGO_SHM version {version}"),
             ));
         }
-        let layout = ShmLayout::compute(header.slot_count, header.slot_capacity)?;
+        let layout = ShmLayout::compute(slot_count, slot_capacity)?;
         drop(header_map);
 
         if file_size < layout.total_bytes {
@@ -622,9 +702,8 @@ impl ShmRingConsumer {
         }
 
         let region = MmapRegion::map(shm_fd.as_raw_fd(), layout.total_bytes)?;
-        let hdr = region.header();
-        let read_idx = hdr.read_idx.load(Ordering::Acquire);
-        let write_idx = hdr.write_idx.load(Ordering::Acquire);
+        let read_idx = region.read_idx_atomic().load(Ordering::Acquire);
+        let write_idx = region.write_idx_atomic().load(Ordering::Acquire);
         if write_idx < read_idx || (write_idx - read_idx) > u64::from(layout.slot_count) {
             return Err(ShmRingError::new(
                 "shm_invalid",
@@ -646,9 +725,8 @@ impl ShmRingConsumer {
 
     /// Try to consume one frame without blocking.
     pub fn try_pop(&mut self) -> Result<PopStatus, ShmRingError> {
-        let header = self.region.header();
-        let read_idx = header.read_idx.load(Ordering::Relaxed);
-        let mut write_idx = header.write_idx.load(Ordering::Acquire);
+        let read_idx = self.region.read_idx_atomic().load(Ordering::Relaxed);
+        let mut write_idx = self.region.write_idx_atomic().load(Ordering::Acquire);
         if write_idx < read_idx || (write_idx - read_idx) > u64::from(self.layout.slot_count) {
             return Err(ShmRingError::new(
                 "shm_corrupt",
@@ -656,10 +734,10 @@ impl ShmRingConsumer {
             ));
         }
         if read_idx == write_idx {
-            if (header.flags.load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
+            if (self.region.flags_atomic().load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
                 // Re-check write_idx after observing EOF so a final frame pushed right before
                 // signal_eof() is never lost.
-                write_idx = header.write_idx.load(Ordering::Acquire);
+                write_idx = self.region.write_idx_atomic().load(Ordering::Acquire);
                 if write_idx < read_idx
                     || (write_idx - read_idx) > u64::from(self.layout.slot_count)
                 {
@@ -715,8 +793,8 @@ impl ShmRingConsumer {
             }
         }
 
-        header
-            .read_idx
+        self.region
+            .read_idx_atomic()
             .store(read_idx.wrapping_add(1), Ordering::Release);
         signal_eventfd(self.done_fd.as_raw_fd())?;
 
@@ -982,11 +1060,18 @@ mod tests {
                 PushStatus::Pushed { .. }
             ));
         }
-        // 5th push hits full-ring backpressure
+        // 5th push hits full-ring backpressure and tracks dropped_frames on timeout / try_push_or_drop
+        assert_eq!(producer.dropped_frames(), 0);
         assert_eq!(
             producer.try_push(4, 1004, 0, b"blocked").unwrap(),
             PushStatus::Full
         );
+        assert_eq!(producer.dropped_frames(), 0);
+        assert_eq!(
+            producer.try_push_or_drop(4, 1004, 0, b"blocked").unwrap(),
+            PushStatus::Full
+        );
+        assert_eq!(producer.dropped_frames(), 1);
         assert_eq!(
             producer
                 .push_wait(4, 1004, 0, b"blocked", Duration::from_millis(20))
@@ -994,6 +1079,7 @@ mod tests {
                 .code,
             "shm_backpressure_timeout"
         );
+        assert_eq!(producer.dropped_frames(), 2);
 
         // Reject oversized payload
         assert_eq!(
@@ -1104,8 +1190,7 @@ mod tests {
         }
         producer
             .region
-            .header()
-            .write_idx
+            .write_idx_atomic()
             .store(1, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
 
@@ -1120,19 +1205,18 @@ mod tests {
         // Corrupt write_idx > read_idx + slot_count is rejected as shm_corrupt (not treated as Full)
         producer
             .region
-            .header()
-            .write_idx
+            .write_idx_atomic()
             .store(99, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
-        assert_eq!(DEFAULT_SLOT_CAPACITY, 8 * 1024 * 1024);
+        assert_eq!(DEFAULT_SLOT_CAPACITY, 4 * 1024 * 1024);
         assert!(producer.shm_raw_fd() >= 3);
         assert!(producer.kick_raw_fd() >= 3);
         assert!(producer.done_raw_fd() >= 3);
 
         // Corrupt magic and verify new attach fails
         unsafe {
-            let hdr = producer.region.ptr.as_ptr().cast::<ShmHeader>();
-            (*hdr).magic = *b"BADMAGIC";
+            let hdr = producer.region.header_ptr();
+            std::ptr::write(std::ptr::addr_of_mut!((*hdr).magic), *b"BADMAGIC");
         }
         let (shm2, kick2, done2) = producer.clone_consumer_fds().unwrap();
         assert_eq!(
@@ -1200,8 +1284,7 @@ mod tests {
         }
         producer
             .region
-            .header()
-            .write_idx
+            .write_idx_atomic()
             .store(1, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
 
@@ -1216,11 +1299,10 @@ mod tests {
         // Corrupt write_idx > read_idx + slot_count is rejected as shm_corrupt (not treated as Full)
         producer
             .region
-            .header()
-            .write_idx
+            .write_idx_atomic()
             .store(99, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
-        assert_eq!(DEFAULT_SLOT_CAPACITY, 8 * 1024 * 1024);
+        assert_eq!(DEFAULT_SLOT_CAPACITY, 4 * 1024 * 1024);
         assert!(producer.shm_raw_fd() >= 3);
         assert!(producer.kick_raw_fd() >= 3);
         assert!(producer.done_raw_fd() >= 3);

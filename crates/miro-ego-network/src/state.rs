@@ -1,4 +1,4 @@
-//! Fixed-size bounded persistent network state store (`/var/lib/miro-ego/network-state.json`).
+//! Fixed-size bounded persistent network state store (`/var/lib/miro-ego-network/state.json`).
 //!
 //! Enforces atomic writes, strict secret-key redaction, and a hard cap of `MAX_RETAINED_RECEIPTS`
 //! (64 entries) so the 20 GiB system disk never experiences unbounded growth.
@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const DEFAULT_NETWORK_STATE_FILE: &str = "/var/lib/miro-ego/network-state.json";
+pub const DEFAULT_NETWORK_STATE_FILE: &str = "/var/lib/miro-ego-network/state.json";
 pub const NETWORK_STATE_SCHEMA: &str = "miro-ego.network-state.v1";
 pub const NETWORK_TRANSACTION_SCHEMA: &str = "miro-ego.network-transaction.v1";
 pub const NETWORK_RECEIPT_SCHEMA: &str = "miro-ego.network-transaction-receipt.v1";
@@ -146,6 +146,16 @@ pub enum TransactionOperation {
     Apply,
     Retry,
     Forget,
+}
+
+impl TransactionOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Retry => "retry",
+            Self::Forget => "forget",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,10 +449,25 @@ pub fn contains_forbidden_secret_key(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Compute idempotency scope key `sha256(principal_id + '\0' + idempotency_key)`.
+/// Compute legacy idempotency scope key `sha256(principal_id + '\0' + idempotency_key)`.
 pub fn receipt_scope(principal_id: &str, idempotency_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(principal_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(idempotency_key.as_bytes());
+    hex_encode(hasher.finalize().as_slice())
+}
+
+/// Compute operation-scoped idempotency key `sha256(principal_id + '\0' + operation + '\0' + idempotency_key)`.
+pub fn receipt_scope_for_operation(
+    principal_id: &str,
+    operation: TransactionOperation,
+    idempotency_key: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(principal_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(operation.as_str().as_bytes());
     hasher.update([0u8]);
     hasher.update(idempotency_key.as_bytes());
     hex_encode(hasher.finalize().as_slice())
@@ -656,6 +681,120 @@ impl NetworkStateStore {
         Ok((state.authority_epoch.clone(), state.source_revision))
     }
 
+    /// Record an operational boot-time rescue AP failover when a previously verified `wifi-client`
+    /// router is transiently unreachable at startup, WITHOUT clobbering `persisted.verified = true`.
+    pub fn record_startup_rescue_preserving_verified(
+        &self,
+        rescued: bool,
+        updated_at: String,
+    ) -> NetworkResult<()> {
+        let mut state = self.lock_state()?;
+        let mut next = state.clone();
+        next.source_revision = next.source_revision.saturating_add(1);
+        let (status, stage, recovery_action) = if rescued {
+            (
+                TransactionStatus::Rescued,
+                TransactionStage::Rescued,
+                RecoveryAction::ReconnectRescueAp,
+            )
+        } else {
+            (
+                TransactionStatus::Failed,
+                TransactionStage::Failed,
+                RecoveryAction::ServiceRequired,
+            )
+        };
+        let tx = NetworkTransaction {
+            schema: NETWORK_TRANSACTION_SCHEMA.to_owned(),
+            authority_epoch: next.authority_epoch.clone(),
+            source_revision: next.source_revision,
+            transaction_id: new_uuid_v7(),
+            operation: TransactionOperation::Apply,
+            status,
+            stage,
+            desired: next.desired.clone(),
+            accepted_at: updated_at.clone(),
+            updated_at,
+            deadline: None,
+            recovery_action,
+            rescue: RescueMetadata {
+                ap_validated: rescued,
+                ..RescueMetadata::default()
+            },
+            error: Some(TransactionError {
+                code: "dhcp_timeout".to_owned(),
+                message: "verified Wi-Fi router unreachable at startup; rescue hotspot active"
+                    .to_owned(),
+                retryable: true,
+            }),
+        };
+        next.transaction.latest = Some(tx);
+        next.validate()?;
+        persist_state_atomic(&self.path, &next)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// Clear a transient boot-time `Rescued` marker once a verified `wifi-client` reconnects on
+    /// startup so `watchdog_mode` resumes normal `wifi-client` monitoring.
+    pub fn record_startup_wifi_recovered(&self, updated_at: String) -> NetworkResult<()> {
+        let mut state = self.lock_state()?;
+        let mut next = state.clone();
+        next.source_revision = next.source_revision.saturating_add(1);
+        let tx = NetworkTransaction {
+            schema: NETWORK_TRANSACTION_SCHEMA.to_owned(),
+            authority_epoch: next.authority_epoch.clone(),
+            source_revision: next.source_revision,
+            transaction_id: new_uuid_v7(),
+            operation: TransactionOperation::Apply,
+            status: TransactionStatus::Committed,
+            stage: TransactionStage::Committed,
+            desired: next.desired.clone(),
+            accepted_at: updated_at.clone(),
+            updated_at,
+            deadline: None,
+            recovery_action: RecoveryAction::ReconnectTargetLan,
+            rescue: RescueMetadata {
+                ap_validated: true,
+                ..RescueMetadata::default()
+            },
+            error: None,
+        };
+        next.transaction.latest = Some(tx);
+        next.validate()?;
+        persist_state_atomic(&self.path, &next)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// Check for an existing operation-scoped idempotent receipt without mutating state.
+    pub fn replay_receipt_for_operation(
+        &self,
+        principal_id: &str,
+        operation: TransactionOperation,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+    ) -> NetworkResult<Option<TransactionReceipt>> {
+        let scope = receipt_scope_for_operation(principal_id, operation, idempotency_key);
+        let legacy_scope = receipt_scope(principal_id, idempotency_key);
+        let state = self.lock_state()?;
+        if let Some(entry) = state.receipts.iter().find(|r| {
+            r.scope == scope
+                || (r.scope == legacy_scope && r.receipt.transaction.operation == operation)
+        }) {
+            if entry.request_fingerprint != request_fingerprint {
+                return Err(NetworkError::Invalid {
+                    message: format!(
+                        "idempotency_conflict: idempotency key already used for another request (transaction_id={})",
+                        entry.receipt.transaction.transaction_id
+                    ),
+                });
+            }
+            return Ok(Some(entry.receipt.clone()));
+        }
+        Ok(None)
+    }
+
     /// Check for an existing idempotent receipt without mutating state.
     pub fn replay_receipt(
         &self,
@@ -663,19 +802,12 @@ impl NetworkStateStore {
         idempotency_key: &str,
         request_fingerprint: &str,
     ) -> NetworkResult<Option<TransactionReceipt>> {
-        let scope = receipt_scope(principal_id, idempotency_key);
-        let state = self.lock_state()?;
-        if let Some(entry) = state.receipts.iter().find(|r| r.scope == scope) {
-            if entry.request_fingerprint != request_fingerprint {
-                return Err(NetworkError::Invalid {
-                    message:
-                        "idempotency_conflict: idempotency key already used for another request"
-                            .to_owned(),
-                });
-            }
-            return Ok(Some(entry.receipt.clone()));
-        }
-        Ok(None)
+        self.replay_receipt_for_operation(
+            principal_id,
+            TransactionOperation::Apply,
+            idempotency_key,
+            request_fingerprint,
+        )
     }
 
     /// Accept a new transaction or replay an identical idempotent request.
@@ -691,15 +823,20 @@ impl NetworkStateStore {
         publish_desired: bool,
         retained_candidate: Option<RetainedCandidate>,
     ) -> NetworkResult<AcceptOutcome> {
-        let scope = receipt_scope(principal_id, idempotency_key);
+        let scope = receipt_scope_for_operation(principal_id, operation, idempotency_key);
+        let legacy_scope = receipt_scope(principal_id, idempotency_key);
         let mut state = self.lock_state()?;
 
-        if let Some(existing) = state.receipts.iter().find(|r| r.scope == scope) {
+        if let Some(existing) = state.receipts.iter().find(|r| {
+            r.scope == scope
+                || (r.scope == legacy_scope && r.receipt.transaction.operation == operation)
+        }) {
             if existing.request_fingerprint != request_fingerprint {
                 return Err(NetworkError::Invalid {
-                    message:
-                        "idempotency_conflict: idempotency key already used for another request"
-                            .to_owned(),
+                    message: format!(
+                        "idempotency_conflict: idempotency key already used for another request (transaction_id={})",
+                        existing.receipt.transaction.transaction_id
+                    ),
                 });
             }
             return Ok(AcceptOutcome {

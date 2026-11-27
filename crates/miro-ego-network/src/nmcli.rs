@@ -259,46 +259,52 @@ impl StaticIpv4Config {
 
     pub fn validate(&self) -> NetworkResult<()> {
         let addr: Ipv4Addr = self.address.parse().map_err(|_| NetworkError::Invalid {
-            message: format!("invalid static IPv4 address: {}", self.address),
+            message: format!(
+                "invalid_static_ipv4: invalid static IPv4 address: {}",
+                self.address
+            ),
         })?;
         if !is_usable_ipv4(addr) {
             return Err(NetworkError::Invalid {
-                message: format!("unusable static IPv4 address: {}", self.address),
+                message: format!(
+                    "invalid_static_ipv4: unusable static IPv4 address: {}",
+                    self.address
+                ),
             });
         }
         if !(1..=32).contains(&self.prefix_length) {
             return Err(NetworkError::Invalid {
-                message: "prefix_length must be in 1..=32".to_owned(),
+                message: "invalid_static_ipv4: prefix_length must be in 1..=32".to_owned(),
             });
         }
         if let Some(gw) = &self.gateway {
             let gw_addr: Ipv4Addr = gw.parse().map_err(|_| NetworkError::Invalid {
-                message: format!("invalid static IPv4 gateway: {gw}"),
+                message: format!("invalid_static_ipv4: invalid static IPv4 gateway: {gw}"),
             })?;
             if !is_usable_ipv4(gw_addr) || gw_addr == addr {
                 return Err(NetworkError::Invalid {
-                    message: format!("unusable static IPv4 gateway: {gw}"),
+                    message: format!("invalid_static_ipv4: unusable static IPv4 gateway: {gw}"),
                 });
             }
         }
         if self.dns.len() > 3 {
             return Err(NetworkError::Invalid {
-                message: "at most 3 DNS servers are supported".to_owned(),
+                message: "invalid_static_ipv4: at most 3 DNS servers are supported".to_owned(),
             });
         }
         let mut seen = HashSet::new();
         for server in &self.dns {
             let ip: Ipv4Addr = server.parse().map_err(|_| NetworkError::Invalid {
-                message: format!("invalid DNS IPv4 address: {server}"),
+                message: format!("invalid_static_ipv4: invalid DNS IPv4 address: {server}"),
             })?;
             if !is_usable_ipv4(ip) {
                 return Err(NetworkError::Invalid {
-                    message: format!("unusable DNS IPv4 address: {server}"),
+                    message: format!("invalid_static_ipv4: unusable DNS IPv4 address: {server}"),
                 });
             }
             if !seen.insert(ip) {
                 return Err(NetworkError::Invalid {
-                    message: format!("duplicate DNS IPv4 address: {server}"),
+                    message: format!("invalid_static_ipv4: duplicate DNS IPv4 address: {server}"),
                 });
             }
         }
@@ -355,12 +361,16 @@ impl ProfileSpec {
                 validate_wifi_ssid(ssid)?;
                 match (security, psk) {
                     (WifiSecurity::Open, Some(_)) => Err(NetworkError::Invalid {
-                        message: "open Wi-Fi network must not include a passphrase".to_owned(),
+                        message:
+                            "security_mismatch: open Wi-Fi network must not include a passphrase"
+                                .to_owned(),
                     }),
                     (WifiSecurity::Open, None) => Ok(()),
                     (_, Some(pass)) => validate_wifi_psk(pass),
                     (_, None) => Err(NetworkError::Invalid {
-                        message: "protected Wi-Fi network requires a passphrase".to_owned(),
+                        message:
+                            "missing_credential_ref: protected Wi-Fi network requires a passphrase"
+                                .to_owned(),
                     }),
                 }
             }
@@ -407,9 +417,16 @@ pub fn managed_profile_name(mode_slug: &str, seed: &str) -> String {
 /// Validate a Wi-Fi SSID (1..=32 UTF-8 bytes, no ASCII control chars).
 pub fn validate_wifi_ssid(ssid: &str) -> NetworkResult<()> {
     let len = ssid.len();
-    if !(1..=32).contains(&len) || ssid.bytes().any(|b| b < 0x20 || b == 0x7f) {
+    if len > 32 {
         return Err(NetworkError::Invalid {
-            message: "Wi-Fi SSID must be 1..=32 UTF-8 bytes without control characters".to_owned(),
+            message:
+                "ssid_too_long: Wi-Fi SSID must be 1..=32 UTF-8 bytes without control characters"
+                    .to_owned(),
+        });
+    }
+    if len == 0 || ssid.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(NetworkError::Invalid {
+            message: "invalid_network_desired_state: Wi-Fi SSID must be 1..=32 UTF-8 bytes without control characters".to_owned(),
         });
     }
     Ok(())
@@ -772,8 +789,9 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
     }
 }
 
-/// Rewrite only `autoconnect=false` inside `[connection]` while preserving PSK and all other settings.
-fn rewrite_autoconnect_false(content: &str) -> String {
+/// Rewrite only `autoconnect=<enabled>` inside `[connection]` while preserving PSK and all other settings.
+fn rewrite_autoconnect(content: &str, enabled: bool) -> String {
+    let target_val = if enabled { "true" } else { "false" };
     let mut in_connection = false;
     let mut replaced = false;
     let mut out = String::with_capacity(content.len() + 24);
@@ -782,7 +800,7 @@ fn rewrite_autoconnect_false(content: &str) -> String {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if in_connection && !replaced {
-                out.push_str("autoconnect=false\n");
+                out.push_str(&format!("autoconnect={target_val}\n"));
                 replaced = true;
             }
             in_connection = trimmed == "[connection]";
@@ -791,9 +809,9 @@ fn rewrite_autoconnect_false(content: &str) -> String {
         }
         if in_connection && trimmed.starts_with("autoconnect=") {
             if line.ends_with('\n') {
-                out.push_str("autoconnect=false\n");
+                out.push_str(&format!("autoconnect={target_val}\n"));
             } else {
-                out.push_str("autoconnect=false");
+                out.push_str(&format!("autoconnect={target_val}"));
             }
             replaced = true;
         } else {
@@ -804,9 +822,14 @@ fn rewrite_autoconnect_false(content: &str) -> String {
         if !out.ends_with('\n') && !out.is_empty() {
             out.push('\n');
         }
-        out.push_str("autoconnect=false\n");
+        out.push_str(&format!("autoconnect={target_val}\n"));
     }
     out
+}
+
+/// Rewrite only `autoconnect=false` inside `[connection]` while preserving PSK and all other settings.
+fn rewrite_autoconnect_false(content: &str) -> String {
+    rewrite_autoconnect(content, false)
 }
 
 /// Split an `nmcli --terse --escape yes` line respecting `\` escapes.
@@ -1136,7 +1159,7 @@ impl NmcliBackend {
                 "ifname",
                 &self.wifi_interface,
                 "--rescan",
-                "yes",
+                "auto",
             ],
             DEFAULT_NMCLI_TIMEOUT,
         )?;
@@ -1285,6 +1308,42 @@ impl NmcliBackend {
             ProfileSpec::EthernetDhcp | ProfileSpec::EthernetStatic(_)
         ) {
             let _ = self.write_profile_inner(profile_name, spec, Some(true))?;
+        }
+        Ok(())
+    }
+
+    /// Promote a verified `WifiClient` profile to `autoconnect=true` across reboots via
+    /// `nmcli connection modify <profile> connection.autoconnect yes` while preserving any
+    /// stored keyfile passphrase on disk.
+    pub fn promote_wifi_client_autoconnect(&self, profile_name: &str) -> NetworkResult<()> {
+        let path = self.profile_path(profile_name);
+        if path.is_file() {
+            let previous = fs::read_to_string(&path).map_err(|err| NetworkError::Backend {
+                message: format!("cannot read Wi-Fi profile {}: {err}", path.display()),
+            })?;
+            let updated = rewrite_autoconnect(&previous, true);
+            if updated != previous {
+                self.atomic_update_with_rollback(&path, &previous, &updated)?;
+            }
+        }
+        let out = self.runner.run(
+            "nmcli",
+            &[
+                "connection",
+                "modify",
+                profile_name,
+                "connection.autoconnect",
+                "yes",
+            ],
+            Duration::from_secs(10),
+        )?;
+        if out.exit_code != 0 {
+            return Err(NetworkError::Backend {
+                message: format!(
+                    "autoconnect_promote_failed: {profile_name}: {}",
+                    out.stderr.trim()
+                ),
+            });
         }
         Ok(())
     }

@@ -692,12 +692,12 @@ async fn static_asset_or_not_found(
                 get_only_headers,
             ),
             _ => {
-                let ctx = RequestCtx::new(&method, &headers, &state.security);
+                let ctx = RequestCtx::new_with_state(&method, &headers, &state);
                 ctx.error_response(ApiError::method_not_allowed("GET, HEAD, OPTIONS"))
             }
         };
     }
 
-    let ctx = RequestCtx::new(&method, &headers, &state.security);
+    let ctx = RequestCtx::new_with_state(&method, &headers, &state);
     ctx.error_response(ApiError::not_found("endpoint not found"))
 }

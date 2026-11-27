@@ -4,6 +4,7 @@
 use crate::backend::IdempotentCommand;
 use crate::error::ApiError;
 use crate::handlers::truncate_untrusted_field;
+use crate::idempotency::NETWORK_MUTATION_SCOPE;
 use crate::middleware::{
     GatewayState, HeaderExtract, RequestCtx, read_strict_json_object_with_timeout,
     single_header_str,
@@ -24,7 +25,7 @@ pub async fn get_network_status(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getNetworkStatus", None) {
         return *resp;
     }
@@ -40,7 +41,7 @@ pub async fn scan_networks(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "scanNetworks", None) {
         return *resp;
     }
@@ -56,25 +57,53 @@ pub async fn stream_network_events(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "streamNetworkEvents", None) {
-        return *resp;
-    }
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
+    let principal =
+        match ctx.authorize_read_headers(&state, &parts.headers, "streamNetworkEvents", None) {
+            Ok(p) => p,
+            Err(resp) => return *resp,
+        };
     if parts.uri.query().is_some_and(|q| !q.is_empty()) {
+        ctx.audit(
+            &state,
+            "streamNetworkEvents",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::bad_request(
             "SSE endpoint does not accept query parameters",
         ));
     }
     let cursor = match single_header_str(&parts.headers, "last-event-id") {
         HeaderExtract::Multiple => {
+            ctx.audit(
+                &state,
+                "streamNetworkEvents",
+                None,
+                "invalid_request",
+                Some(&principal),
+            );
             return ctx.error_response(ApiError::bad_request("Last-Event-ID may appear only once"));
         }
         HeaderExtract::Missing => None,
         HeaderExtract::Single(raw) => match parse_last_event_id(Some(raw)) {
             Ok(c) => c,
-            Err(err) => return ctx.error_response(err),
+            Err(err) => {
+                ctx.audit(
+                    &state,
+                    "streamNetworkEvents",
+                    None,
+                    &err.code,
+                    Some(&principal),
+                );
+                return ctx.error_response(err);
+            }
         },
     };
+    if let Err(resp) = ctx.record_allowed(&state, "streamNetworkEvents", None, &principal) {
+        return *resp;
+    }
     let Ok(permit) = Arc::clone(&state.sse_semaphore).try_acquire_owned() else {
         return ctx.error_response(ApiError::stream_capacity_exhausted());
     };
@@ -132,11 +161,14 @@ pub async fn create_network_credential(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let principal =
-        match ctx.authorize_write(&state, &parts.headers, "createNetworkCredentialReference") {
-            Ok(p) => p,
-            Err(resp) => return *resp,
-        };
+    let principal = match ctx.authorize_write_headers(
+        &state,
+        &parts.headers,
+        "createNetworkCredentialReference",
+    ) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let (json, _) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -145,12 +177,35 @@ pub async fn create_network_credential(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(
+                &state,
+                "createNetworkCredentialReference",
+                None,
+                &err.code,
+                Some(&principal),
+            );
+            return ctx.error_response(err);
+        }
     };
     let passphrase = match validate_credential_request_body(&json) {
         Ok(p) => p,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(
+                &state,
+                "createNetworkCredentialReference",
+                None,
+                &err.code,
+                Some(&principal),
+            );
+            return ctx.error_response(err);
+        }
     };
+    if let Err(resp) =
+        ctx.record_allowed(&state, "createNetworkCredentialReference", None, &principal)
+    {
+        return *resp;
+    }
     match state
         .backend
         .create_network_credential(principal.principal_id(), passphrase)
@@ -194,7 +249,7 @@ pub async fn apply_network_desired_state(
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
-        match ctx.authorize_command(&state, &parts.headers, "applyNetworkDesiredState") {
+        match ctx.authorize_command_headers(&state, &parts.headers, "applyNetworkDesiredState") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
@@ -206,18 +261,50 @@ pub async fn apply_network_desired_state(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(
+                &state,
+                "applyNetworkDesiredState",
+                None,
+                &err.code,
+                Some(&principal),
+            );
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_network_apply_body(&json) {
+        ctx.audit(
+            &state,
+            "applyNetworkDesiredState",
+            None,
+            &err.code,
+            Some(&principal),
+        );
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "applyNetworkDesiredState", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.apply_network_desired_state(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            NETWORK_MUTATION_SCOPE,
+            "applyNetworkDesiredState",
+            &key,
+            &canonical,
+            || async move { backend.apply_network_desired_state(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
@@ -242,7 +329,7 @@ pub async fn retry_network_transaction(
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
-        match ctx.authorize_command(&state, &parts.headers, "retryNetworkTransaction") {
+        match ctx.authorize_command_headers(&state, &parts.headers, "retryNetworkTransaction") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
@@ -254,18 +341,50 @@ pub async fn retry_network_transaction(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(
+                &state,
+                "retryNetworkTransaction",
+                None,
+                &err.code,
+                Some(&principal),
+            );
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_network_retry_body(&json) {
+        ctx.audit(
+            &state,
+            "retryNetworkTransaction",
+            None,
+            &err.code,
+            Some(&principal),
+        );
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "retryNetworkTransaction", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.retry_network_transaction(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            NETWORK_MUTATION_SCOPE,
+            "retryNetworkTransaction",
+            &key,
+            &canonical,
+            || async move { backend.retry_network_transaction(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
@@ -290,7 +409,7 @@ pub async fn forget_network_client_profile(
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
-        match ctx.authorize_command(&state, &parts.headers, "forgetNetworkClientProfile") {
+        match ctx.authorize_command_headers(&state, &parts.headers, "forgetNetworkClientProfile") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
@@ -302,18 +421,50 @@ pub async fn forget_network_client_profile(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(
+                &state,
+                "forgetNetworkClientProfile",
+                None,
+                &err.code,
+                Some(&principal),
+            );
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_network_forget_body(&json) {
+        ctx.audit(
+            &state,
+            "forgetNetworkClientProfile",
+            None,
+            &err.code,
+            Some(&principal),
+        );
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "forgetNetworkClientProfile", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.forget_network_client_profile(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            NETWORK_MUTATION_SCOPE,
+            "forgetNetworkClientProfile",
+            &key,
+            &canonical,
+            || async move { backend.forget_network_client_profile(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]

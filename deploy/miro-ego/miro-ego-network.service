@@ -14,9 +14,9 @@ SupplementaryGroups=miro-ego
 Environment=MIRO_EGO_NETWORK_STATE_DIR=/var/lib/miro-ego-network
 Environment=MIRO_EGO_NETWORK_OPERATION_LOCK_PATH=/run/miro-ego/network-operation.lock
 Environment=RUST_LOG=info
-ExecStart=/opt/miro-ego/current/bin/miro-ego network-control serve
+ExecStart=/opt/miro-ego/current/bin/miro-ego network-control serve --state /var/lib/miro-ego-network/state.json
 LimitCORE=0
-StandardInput=socket
+StandardInput=null
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=miro-ego-network

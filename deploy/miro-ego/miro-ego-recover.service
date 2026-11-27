@@ -5,6 +5,7 @@ Before=miro-ego-data-volume.service miro-ego-network.service miro-ego.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=root
 Group=root
 Environment=RUST_LOG=info

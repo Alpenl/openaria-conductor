@@ -6,6 +6,10 @@
 
 typedef int32_t hb_s32;
 
+#ifndef HB_MEDIA_ERR_WAIT_TIME
+#define HB_MEDIA_ERR_WAIT_TIME (-268435443)
+#endif
+
 enum {
     MEDIA_CODEC_ID_MJPEG = 1,
     MEDIA_CODEC_ID_H264 = 2,
@@ -58,8 +62,18 @@ typedef struct {
 
 typedef struct {
     uint32_t frame_rate;
+    uint32_t bit_rate;
+    uint32_t max_bit_rate;
     uint32_t intra_period;
     uint32_t intra_qp;
+    int initial_rc_qp;
+    int vbv_buf_size;
+    uint32_t min_qp_I;
+    uint32_t min_qp_P;
+    uint32_t min_qp_B;
+    uint32_t max_qp_I;
+    uint32_t max_qp_P;
+    uint32_t max_qp_B;
     int qp_map_enable;
 } mc_rate_control_vbr_t;
 
@@ -182,5 +196,8 @@ hb_s32 hb_mm_mc_dequeue_output_buffer(
 hb_s32 hb_mm_mc_queue_output_buffer(
     media_codec_context_t *context, media_codec_buffer_t *buffer, int timeout_ms
 );
+
+int32_t hb_mem_invalidate_buf_with_vaddr(uint64_t virt_addr, uint64_t size);
+int32_t hb_mem_flush_buf_with_vaddr(uint64_t virt_addr, uint64_t size);
 
 #endif /* MIRO_EGO_STUB_HB_MEDIA_CODEC_H */

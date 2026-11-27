@@ -20,7 +20,12 @@ use thiserror::Error;
 
 /// Binary catalog header magic stored in `/data/.miro-ego/index/catalog.bin`.
 pub const CATALOG_BINARY_MAGIC: [u8; 8] = *b"MEGOCAT1";
+/// Legacy v1 JSON-payload framing version (retained for backward-compatible read migration).
 pub const CATALOG_FORMAT_VERSION: u32 = 1;
+/// Compact binary v2 framing version written by [`BinarySessionCatalog`].
+pub const CATALOG_BINARY_FORMAT_VERSION: u32 = 2;
+/// Append-only incremental catalog WAL magic stored in `/data/.miro-ego/index/catalog.wal`.
+pub const CATALOG_WAL_MAGIC: [u8; 8] = *b"MEGOWAL1";
 pub const VOLUME_METADATA_SCHEMA: &str = "miro-ego.volume.v1";
 
 #[derive(Debug, Error)]
@@ -48,6 +53,12 @@ pub enum StorageError {
 
     #[error("{code}: {message}")]
     Conflict { code: &'static str, message: String },
+
+    #[error("capture_busy ({state}): {message}")]
+    CaptureBusy {
+        state: CaptureBusyState,
+        message: String,
+    },
 
     #[error("{code}: {message}")]
     Unprocessable { code: &'static str, message: String },
@@ -102,6 +113,20 @@ impl StorageError {
         }
     }
 
+    pub fn capture_busy(state: CaptureBusyState, message: impl Into<String>) -> Self {
+        Self::CaptureBusy {
+            state,
+            message: message.into(),
+        }
+    }
+
+    pub fn busy_state(&self) -> Option<CaptureBusyState> {
+        match self {
+            Self::CaptureBusy { state, .. } => Some(*state),
+            _ => None,
+        }
+    }
+
     pub fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
         Self::Unprocessable {
             code,
@@ -146,6 +171,7 @@ impl StorageError {
             Self::NotFound { .. } => "not_found",
             Self::Catalog { .. } => "catalog_error",
             Self::CatalogChanged { .. } => "catalog_changed",
+            Self::CaptureBusy { .. } => "capture_busy",
             Self::InvalidInput { code, .. }
             | Self::Conflict { code, .. }
             | Self::Unprocessable { code, .. }
@@ -163,7 +189,10 @@ impl StorageError {
             Self::Unavailable { .. } | Self::ServiceUnavailable { .. } => 503,
             Self::VolumeInvalid { .. } | Self::Catalog { .. } | Self::Io { .. } => 500,
             Self::NotFound { .. } | Self::Unsupported { .. } => 404,
-            Self::CatalogChanged { .. } | Self::Conflict { .. } | Self::Integrity { .. } => 409,
+            Self::CatalogChanged { .. }
+            | Self::Conflict { .. }
+            | Self::CaptureBusy { .. }
+            | Self::Integrity { .. } => 409,
             Self::InvalidInput { .. } => 400,
             Self::Unprocessable { .. } => 422,
             Self::Locked { .. } => 423,
@@ -182,6 +211,7 @@ impl StorageError {
             Self::Unavailable { .. }
                 | Self::ServiceUnavailable { .. }
                 | Self::CatalogChanged { .. }
+                | Self::CaptureBusy { .. }
                 | Self::Locked { .. }
         )
     }
@@ -255,7 +285,8 @@ pub trait RecoveryManager: Send + Sync {
 // Convenient top-level re-exports for downstream crates (`miro-ego-api`, `miro-ego-cli`).
 pub use artifact_io::{
     ByteRange, ManifestArtifactDescriptor, OpenedManifest, VerifiedArtifactFile, open_manifest,
-    open_verified_artifact, open_verified_artifact_with_lease, parse_single_byte_range,
+    open_verified_artifact, open_verified_artifact_checked_with_lease,
+    open_verified_artifact_with_lease, parse_single_byte_range,
 };
 pub use audit::{ApiAuditEvent, AuditConfig, AuditLogger, AuditWriteTarget, BoundedRingBuffer};
 pub use catalog::{
@@ -264,11 +295,12 @@ pub use catalog::{
 };
 pub use coordinator::{
     ActiveCaptureHandle, BackendStartRequest, CameraFocusSetRequest, CameraFocusStatus,
-    CaptureBackend, CaptureCoordinator, CaptureEvent, CaptureEventBroadcaster, CaptureEventType,
-    CaptureMode, CapturePhase, CaptureProgressSnapshot, CaptureReadiness, CaptureStartRequest,
-    CaptureStatusSnapshot, CaptureStopRequest, CaptureTimerSetRequest, CaptureTimerSettings,
-    CaptureTimerStatus, CapturedArtifact, CapturedAudioOutcome, CapturedAudioSegment,
-    CapturedSessionArtifacts, CapturedVideoSegment, CoordinatorConfig, DeleteSessionTarget,
+    CaptureBackend, CaptureBusyState, CaptureCoordinator, CaptureEvent, CaptureEventBroadcaster,
+    CaptureEventType, CaptureMode, CapturePhase, CaptureProgressSnapshot, CaptureReadiness,
+    CaptureStartRequest, CaptureStatusSnapshot, CaptureStopRequest, CaptureTimerSetRequest,
+    CaptureTimerSettings, CaptureTimerStatus, CapturedArtifact, CapturedAudioOutcome,
+    CapturedAudioSegment, CapturedSessionArtifacts, CapturedVideoSegment, ClockSyncProbe,
+    ClockSyncSnapshot, ClockSyncSource, CoordinatorConfig, DeleteSessionTarget,
     DeleteSessionsRequest, DeleteSessionsResult, IdempotentOutcome, ReserveEnforcementOutcome,
     RetainedUnsuccessfulSessionResource, RuntimeObservation, SafeSwapReceipt,
     SafeSwapReceiptResource, StopReason, TakeRequest,
@@ -279,6 +311,6 @@ pub use recovery::{
 };
 pub use util::VolumeHandleLease;
 pub use volume::{
-    CaptureStorageBudget, ExfatVolumeManager, FsCapacity, PosixVolumeProbe, ReserveStatus,
-    VolumeAdmission, VolumeMetadata, VolumePolicy, VolumeProbe,
+    CaptureStorageBudget, ExfatVolumeManager, FsCapacity, PhysicalVolumeIdentity, PosixVolumeProbe,
+    ReserveStatus, VolumeAdmission, VolumeMetadata, VolumePolicy, VolumeProbe,
 };

@@ -144,6 +144,7 @@ fn make_lab_device_config(data_dir: &Path, state_dir: &Path) -> DeviceConfig {
             fps: 30,
             frame_decimation: 2,
             exposure_time_absolute: Some(ExposureSetting::default()),
+            calibration_file: None,
         },
         storage: StorageConfig {
             mountpoint: data_dir.to_path_buf(),
@@ -210,6 +211,21 @@ async fn http_request(
         .to_bytes()
         .to_vec();
     (status, headers, collected)
+}
+
+async fn wait_for_capture_idle(addr: SocketAddr) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let (code, _, body) =
+            http_request(addr, Method::GET, "/api/v1/capture/status", &[], None).await;
+        assert_eq!(code, 200);
+        let doc: Value = serde_json::from_slice(&body).expect("parse capture status");
+        if doc["snapshot"]["device_state"] == "idle" {
+            return doc;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for capture coordinator to reach idle state");
 }
 
 async fn https_request_full(
@@ -737,6 +753,7 @@ async fn supervisor_polls_mid_recording_failure_emits_sse_releases_locks_and_che
         encoding: cfg.recording.clone(),
         run_dir: Some(run_dir.clone()),
         timer_settings_path: Some(state_dir.join("capture-timer.json")),
+        ..CoordinatorConfig::default()
     };
     let coordinator = Arc::new(CaptureCoordinator::new(
         coord_cfg,
@@ -979,6 +996,7 @@ async fn supervisor_polls_mid_recording_failure_emits_sse_releases_locks_and_che
         "stop failed: {}",
         String::from_utf8_lossy(&stop_body)
     );
+    let _ = wait_for_capture_idle(addr).await;
 
     let sessions = catalog.list_sessions().unwrap();
     assert_eq!(sessions.len(), 1);
@@ -1281,7 +1299,16 @@ async fn customer_https_echoed_bearer_csrf_and_button_cli_gpio_mapping_and_fast_
 
     let start_act = tokio::task::spawn_blocking({
         let c = btn_client.clone();
-        move || c.toggle_capture()
+        move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let act = c.toggle_capture()?;
+                if act == CaptureToggleAction::Started || Instant::now() >= deadline {
+                    return Ok::<_, miro_ego_hw::HwError>(act);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     })
     .await
     .unwrap()
@@ -1940,6 +1967,7 @@ async fn network_observed_mapping_avahi_config_and_active_capture_lock_blocks_sc
     )
     .await;
     assert_eq!(stop_code, 202);
+    let _ = wait_for_capture_idle(addr).await;
 
     let (scan_ok_code, _, scan_ok_body) =
         http_request(addr, Method::GET, "/api/v1/network/scan", &[], None).await;
@@ -2143,6 +2171,7 @@ async fn openapi_error_and_degraded_schema_parity_for_sessions_network_and_unmou
     )
     .await;
     assert_eq!(stop_code, 202);
+    let _ = wait_for_capture_idle(addr).await;
 
     let sessions = catalog.list_sessions().unwrap();
     let sid = sessions[0].session_id.clone();
@@ -3003,6 +3032,7 @@ async fn safe_swap_stream_leases_drain_timeout_released_volume_gates_and_restart
         )
         .await;
         assert_eq!(tc, 202);
+        let _ = wait_for_capture_idle(addr).await;
         let (mc, mhdrs, mbody) = http_request(
             addr,
             Method::GET,

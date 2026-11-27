@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use std::ffi::CString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -150,6 +151,61 @@ impl Drop for ActiveRpcConnDropGuard {
     }
 }
 
+/// Dedicated scan worker isolation gate ensuring slow `nmcli device wifi list --rescan auto`
+/// scans cannot starve fast-path `status`, `health`, `watchdog_mode`, or `clock` RPCs.
+struct ScanRpcGate {
+    active_scans: AtomicUsize,
+    max_scan_slots: usize,
+    scan_mutex: Mutex<()>,
+}
+
+impl ScanRpcGate {
+    fn new(max_concurrent_connections: usize) -> Arc<Self> {
+        // Reserve at least half of connection worker slots for fast-path RPCs whenever possible.
+        let max_scan_slots = if max_concurrent_connections <= 1 {
+            1
+        } else {
+            (max_concurrent_connections / 2).max(1)
+        };
+        Arc::new(Self {
+            active_scans: AtomicUsize::new(0),
+            max_scan_slots,
+            scan_mutex: Mutex::new(()),
+        })
+    }
+
+    fn execute_scan(
+        &self,
+        controller: &AuthoritativeNetworkController,
+    ) -> NetworkResult<ScanResponse> {
+        let prev = self.active_scans.fetch_add(1, Ordering::AcqRel);
+        let _slot_guard = ActiveRpcConnDropGuard {
+            counter: Arc::new(AtomicUsize::new(0)),
+        };
+        if prev >= self.max_scan_slots {
+            self.active_scans.fetch_sub(1, Ordering::AcqRel);
+            return Err(NetworkError::Busy {
+                message: "controller_busy: Wi-Fi scan worker slots are saturated".to_owned(),
+            });
+        }
+        struct ScanSlotGuard<'a>(&'a AtomicUsize);
+        impl Drop for ScanSlotGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _active_guard = ScanSlotGuard(&self.active_scans);
+        // Note: `NmcliBackend::scan_wifi` coalesces concurrent scan callers via `ScanFlight`,
+        // while `scan_mutex` isolates non-coalesced scan setup/teardown onto a dedicated lock
+        // completely separate from `mutation_lock` and fast-path RPCs (`status`, `health`, `clock`).
+        let _scan_guard = self
+            .scan_mutex
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        controller.scan()
+    }
+}
+
 /// Bounded framed-JSON Unix domain socket server exposing [`AuthoritativeNetworkController`].
 pub struct NetworkRpcServer {
     socket_path: Option<PathBuf>,
@@ -259,6 +315,7 @@ impl NetworkRpcServer {
         let stop = Arc::new(AtomicBool::new(false));
         let active_workers = Arc::new(AtomicUsize::new(0));
         let mutation_lock = Arc::new(Mutex::new(()));
+        let scan_gate = ScanRpcGate::new(config.max_concurrent_connections);
 
         let stop_loop = Arc::clone(&stop);
         let workers_loop = Arc::clone(&active_workers);
@@ -292,25 +349,26 @@ impl NetworkRpcServer {
                             };
                             let ctrl = Arc::clone(&controller);
                             let mlock = Arc::clone(&mutation_lock);
+                            let sgate = Arc::clone(&scan_gate);
                             let cfg = config.clone();
                             if let Ok(handle) = thread::Builder::new()
                                 .name("miro-ego-net-conn".to_owned())
                                 .spawn(move || {
                                     let _guard = conn_guard;
-                                    handle_connection(stream, &ctrl, &mlock, &cfg);
+                                    handle_connection(stream, &ctrl, &mlock, Some(&sgate), &cfg);
                                 })
                             {
                                 handles.push(handle);
                             }
                         }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
+                            poll_listener_readable(listener.as_raw_fd(), Duration::from_millis(20));
                         }
                         Err(_) => {
                             if stop_loop.load(Ordering::Acquire) {
                                 break;
                             }
-                            thread::sleep(Duration::from_millis(20));
+                            poll_listener_readable(listener.as_raw_fd(), Duration::from_millis(20));
                         }
                     }
                 }
@@ -381,10 +439,22 @@ fn best_effort_chown_miro_ego_nofollow(path: &Path) {
     }
 }
 
+fn poll_listener_readable(fd: libc::c_int, timeout: Duration) {
+    let timeout_ms = i32::try_from(timeout.as_millis().min(1000)).unwrap_or(20);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a valid stack `pollfd` referencing an open `UnixListener` fd.
+    let _ = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+}
+
 fn handle_connection(
     mut stream: UnixStream,
     controller: &AuthoritativeNetworkController,
     mutation_lock: &Mutex<()>,
+    scan_gate: Option<&ScanRpcGate>,
     config: &RpcServerConfig,
 ) {
     let _ = stream.set_nonblocking(false);
@@ -393,7 +463,9 @@ fn handle_connection(
 
     let response = match read_ndjson_line(&mut stream, config.max_line_bytes, config.read_timeout) {
         Ok(None) => return, // clean empty EOF
-        Ok(Some(line)) => dispatch_raw_payload(&line, controller, mutation_lock),
+        Ok(Some(line)) => {
+            dispatch_raw_payload_with_scan_gate(&line, controller, mutation_lock, scan_gate)
+        }
         Err(FrameReadError::TooLarge) => RpcResponse::error(
             "request_too_large",
             "network-control request exceeded max line bytes",
@@ -421,6 +493,15 @@ pub fn dispatch_raw_payload(
     controller: &AuthoritativeNetworkController,
     mutation_lock: &Mutex<()>,
 ) -> RpcResponse {
+    dispatch_raw_payload_with_scan_gate(raw_line, controller, mutation_lock, None)
+}
+
+fn dispatch_raw_payload_with_scan_gate(
+    raw_line: &[u8],
+    controller: &AuthoritativeNetworkController,
+    mutation_lock: &Mutex<()>,
+    scan_gate: Option<&ScanRpcGate>,
+) -> RpcResponse {
     let value: Value = match serde_json::from_slice(raw_line) {
         Ok(v) => v,
         Err(_) => {
@@ -447,7 +528,7 @@ pub fn dispatch_raw_payload(
             None,
             false,
         );
-    }
+    };
     let Some(operation) = obj
         .get("operation")
         .and_then(Value::as_str)
@@ -478,14 +559,28 @@ pub fn dispatch_raw_payload(
         }
     };
 
-    if matches!(
-        operation.as_str(),
-        "health" | "status" | "watchdog_mode" | "scan" | "clock.status" | "notify_response_flushed"
-    ) {
-        execute_operation(&request, controller)
-    } else {
-        let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        execute_operation(&request, controller)
+    match operation.as_str() {
+        "scan" => {
+            let scan_res = match scan_gate {
+                Some(gate) => gate.execute_scan(controller),
+                None => controller.scan(),
+            };
+            match scan_res {
+                Ok(scan) => serialize_ok("scan", 200, &scan, None),
+                Err(err) => error_from_network_error("scan", &err),
+            }
+        }
+        "health"
+        | "status"
+        | "watchdog_mode"
+        | "clock.status"
+        | "clock.sync"
+        | "create_credential"
+        | "notify_response_flushed" => execute_operation(&request, controller),
+        _ => {
+            let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            execute_operation(&request, controller)
+        }
     }
 }
 
@@ -546,6 +641,14 @@ fn execute_operation(
             }
         }
         "create_credential" => {
+            let Some(principal) = request.principal_id.as_deref().filter(|s| !s.is_empty()) else {
+                return RpcResponse::error(
+                    "request_invalid",
+                    "create_credential requires principal_id",
+                    Some(op),
+                    false,
+                );
+            };
             let Some(body) = &request.body else {
                 return RpcResponse::error("request_invalid", "missing body", Some(op), false);
             };
@@ -557,7 +660,7 @@ fn execute_operation(
                     false,
                 );
             };
-            match controller.create_credential(passphrase) {
+            match controller.create_credential_for_principal(principal, passphrase) {
                 Ok(receipt) => serialize_ok("create_credential", 201, &receipt, None),
                 Err(err) => error_from_network_error(op, &err),
             }
@@ -576,12 +679,42 @@ fn execute_operation(
                 );
             };
             let desired_val = body.get("desired").unwrap_or(body);
+            if let Some(mode_str) = desired_val.get("mode").and_then(Value::as_str) {
+                if !matches!(
+                    mode_str,
+                    "hotspot" | "wifi-client" | "ethernet-dhcp" | "ethernet-static"
+                ) {
+                    return RpcResponse::error(
+                        "unsupported_mode",
+                        format!("unsupported_mode: unsupported network mode '{mode_str}'"),
+                        Some(op),
+                        false,
+                    );
+                }
+            }
+            if let Some(sec_str) = desired_val
+                .get("wifi_client")
+                .and_then(|w| w.get("security"))
+                .and_then(Value::as_str)
+            {
+                if !matches!(
+                    sec_str,
+                    "open" | "wpa2-personal" | "wpa3-personal" | "wpa2-wpa3-personal"
+                ) {
+                    return RpcResponse::error(
+                        "security_mismatch",
+                        format!("security_mismatch: unsupported Wi-Fi security '{sec_str}'"),
+                        Some(op),
+                        false,
+                    );
+                }
+            }
             let desired: ApplyDesiredState = match serde_json::from_value(desired_val.clone()) {
                 Ok(d) => d,
                 Err(err) => {
                     return RpcResponse::error(
-                        "request_invalid",
-                        format!("invalid desired state: {err}"),
+                        "invalid_network_desired_state",
+                        format!("invalid_network_desired_state: invalid desired state: {err}"),
                         Some(op),
                         false,
                     );
@@ -668,39 +801,17 @@ fn serialize_ok<T: Serialize>(
 fn error_from_network_error(op: &str, error: &NetworkError) -> RpcResponse {
     match error {
         NetworkError::Busy { message } => {
-            let code = if message.contains("capture_active") {
-                "capture_active"
-            } else if message.contains("credential_store_full") {
-                "credential_store_full"
-            } else {
-                "controller_busy"
-            };
+            let code = error.error_code().unwrap_or("controller_busy");
             RpcResponse::error(code, message.clone(), Some(op), true)
         }
         NetworkError::Invalid { message } => {
-            let code = if message.contains("idempotency_conflict") {
-                "idempotency_conflict"
-            } else if message.contains("transaction_not_found") {
-                "transaction_not_found"
-            } else if message.contains("transaction_not_retryable") {
-                "transaction_not_retryable"
-            } else if message.contains("invalid_network_desired_state") {
-                "invalid_network_desired_state"
-            } else if message.contains("credential_ref_expired") {
-                "credential_ref_expired"
-            } else if message.contains("credential_ref_invalid") {
-                "credential_ref_invalid"
-            } else {
-                "request_invalid"
-            };
+            let code = error.error_code().unwrap_or("request_invalid");
             RpcResponse::error(code, message.clone(), Some(op), false)
         }
-        NetworkError::Backend { message } => RpcResponse::error(
-            "network_manager_unavailable",
-            message.clone(),
-            Some(op),
-            true,
-        ),
+        NetworkError::Backend { message } => {
+            let code = error.error_code().unwrap_or("network_manager_unavailable");
+            RpcResponse::error(code, message.clone(), Some(op), true)
+        }
         NetworkError::Core(core_err) => {
             RpcResponse::error(core_err.code(), core_err.to_string(), Some(op), true)
         }
@@ -909,6 +1020,7 @@ impl NetworkRpcClient {
             .map_err(|err| NetworkError::Backend {
                 message: format!("failed to write RPC request: {err}"),
             })?;
+        let _ = stream.shutdown(std::net::Shutdown::Write);
 
         let raw_line = match read_ndjson_line(&mut stream, self.max_line_bytes, self.timeout) {
             Ok(Some(line)) => line,
@@ -1138,7 +1250,14 @@ fn extract_body(resp: RpcResponse) -> NetworkResult<Value> {
             | "transaction_not_retryable"
             | "invalid_network_desired_state"
             | "credential_ref_expired"
-            | "credential_ref_invalid" => Err(NetworkError::Invalid { message: formatted }),
+            | "credential_ref_not_allowed"
+            | "credential_ref_already_used"
+            | "credential_ref_invalid"
+            | "missing_credential_ref"
+            | "security_mismatch"
+            | "ssid_too_long"
+            | "invalid_static_ipv4"
+            | "unsupported_mode" => Err(NetworkError::Invalid { message: formatted }),
             _ => Err(NetworkError::Backend { message: formatted }),
         };
     }
@@ -1470,6 +1589,150 @@ mod tests {
             assert!(!parsed.ok);
             assert_eq!(parsed.error.unwrap().code, "request_timeout");
         }
+
+        server.shutdown();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fast_path_status_health_and_clock_respond_under_5ms_during_slow_wifi_scan() {
+        struct SlowScanRunner {
+            scan_started: Arc<AtomicBool>,
+        }
+        impl CommandRunner for SlowScanRunner {
+            fn run(
+                &self,
+                _program: &str,
+                args: &[&str],
+                _timeout: Duration,
+            ) -> NetworkResult<CommandOutput> {
+                if args.contains(&"wifi")
+                    && args.contains(&"list")
+                    && args.windows(2).any(|w| w == ["--rescan", "auto"])
+                {
+                    self.scan_started.store(true, Ordering::Release);
+                    thread::sleep(Duration::from_millis(350));
+                    return Ok(CommandOutput {
+                        exit_code: 0,
+                        stdout: "SlowNet:WPA2:80\n".to_owned(),
+                        stderr: String::new(),
+                    });
+                }
+                if args.contains(&"device") && args.contains(&"show") {
+                    return Ok(CommandOutput {
+                        exit_code: 0,
+                        stdout: "GENERAL.STATE:100 (connected)\nGENERAL.CONNECTION:miro-ego-hotspot-rescue-000000000000\nIP4.ADDRESS[1]:10.42.0.1/24\n"
+                            .to_owned(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(CommandOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let dir = temp_dir("scan-isolation");
+        let sock = dir.join("network-control.sock");
+        let scan_started = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(SlowScanRunner {
+            scan_started: Arc::clone(&scan_started),
+        });
+        let mock_clock = Arc::new(MockSystemClockBackend::new(
+            new_uuid_v4(),
+            10_000,
+            5_000_000_000,
+        ));
+        let backend = NmcliBackend::new(runner, dir.join("profiles"), "wlan0", "eth0");
+        let state = NetworkStateStore::open_or_init(dir.join("state.json")).unwrap();
+        let ctrl = Arc::new(
+            AuthoritativeNetworkController::new(
+                backend,
+                state,
+                ControllerConfig::new("rdk-x5-scan-iso", dir.join("run"))
+                    .with_clock_backend(mock_clock),
+            )
+            .unwrap(),
+        );
+        let server = NetworkRpcServer::bind(&sock, ctrl, RpcServerConfig::default()).unwrap();
+        let client = NetworkRpcClient::new(&sock);
+
+        // Warm up socket path once before measuring latency under contention.
+        let _ = client.health().unwrap();
+
+        let scan_client = client.clone();
+        let scan_handle = thread::spawn(move || scan_client.scan().unwrap());
+        while !scan_started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        let t_health = Instant::now();
+        let _ = client.health().unwrap();
+        let health_elapsed = t_health.elapsed();
+
+        let t_status = Instant::now();
+        let _ = client.status().unwrap();
+        let status_elapsed = t_status.elapsed();
+
+        let t_clock = Instant::now();
+        let _ = client.clock_status().unwrap();
+        let clock_elapsed = t_clock.elapsed();
+
+        assert!(
+            health_elapsed < Duration::from_millis(5),
+            "health RPC took {health_elapsed:?} during active Wi-Fi scan"
+        );
+        assert!(
+            status_elapsed < Duration::from_millis(5),
+            "status RPC took {status_elapsed:?} during active Wi-Fi scan"
+        );
+        assert!(
+            clock_elapsed < Duration::from_millis(5),
+            "clock.status RPC took {clock_elapsed:?} during active Wi-Fi scan"
+        );
+
+        let scan_res = scan_handle.join().unwrap();
+        assert_eq!(scan_res.networks.len(), 1);
+
+        // Also verify principal-bound credential & canonical error codes over RPC:
+        let cred = client
+            .create_credential("principal-a", "valid-psk-9999")
+            .unwrap();
+        let wrong_principal_err = client
+            .apply(
+                "principal-b",
+                "idem-wrong-p",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "SlowNet".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred.credential_ref),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            wrong_principal_err.error_code(),
+            Some("credential_ref_not_allowed")
+        );
+
+        let unsupported_resp = client
+            .send(&RpcRequest {
+                schema: CONTROL_REQUEST_SCHEMA.to_owned(),
+                operation: "apply".to_owned(),
+                principal_id: Some("principal-a".to_owned()),
+                idempotency_key: Some("idem-unsup".to_owned()),
+                body: Some(json!({ "desired": { "mode": "ad-hoc-mesh" } })),
+            })
+            .unwrap();
+        assert_eq!(
+            unsupported_resp.error.as_ref().map(|e| e.code.as_str()),
+            Some("unsupported_mode")
+        );
 
         server.shutdown();
         fs::remove_dir_all(dir).unwrap();

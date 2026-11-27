@@ -56,6 +56,7 @@ pub struct ActiveTakeWriter {
     frames_written: u64,
     bytes_written: u64,
     dropped_frames: u64,
+    corrupt_frames_dropped: u64,
     drop_events: Vec<ActiveDropEvent>,
     pending_frame: Option<u64>,
     closed: bool,
@@ -75,10 +76,38 @@ impl ActiveTakeWriter {
             frames_written: 0,
             bytes_written: 0,
             dropped_frames: 0,
+            corrupt_frames_dropped: 0,
             drop_events: Vec::new(),
             pending_frame: None,
             closed: false,
         })
+    }
+
+    pub fn corrupt_frames_dropped(&self) -> u64 {
+        self.corrupt_frames_dropped
+    }
+
+    pub fn record_corrupt_drops(
+        &mut self,
+        dropped: u64,
+        at_time_seconds: f64,
+    ) -> Result<(), ActiveTakeError> {
+        self.ensure_open()?;
+        if dropped == 0 {
+            return Ok(());
+        }
+        let next_corrupt = self
+            .corrupt_frames_dropped
+            .checked_add(dropped)
+            .ok_or_else(|| {
+                ActiveTakeError::new(
+                    "counter_overflow",
+                    "active take corrupt frame drop count overflow",
+                )
+            })?;
+        self.record_recovered_drops(dropped, at_time_seconds)?;
+        self.corrupt_frames_dropped = next_corrupt;
+        Ok(())
     }
 
     pub fn record_recovered_drops(

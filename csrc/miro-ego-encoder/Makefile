@@ -10,6 +10,11 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -Werror -std=gnu11 -I/usr/include
 LDFLAGS ?= -L/usr/hobot/lib -Wl,-rpath,/usr/hobot/lib
 LDLIBS ?= -lmultimedia -lpthread
+ifneq ($(strip $(HB_SDK_ROOT)),)
+CFLAGS += -DHB_SDK_ROOT -I$(HB_SDK_ROOT)/include
+LDFLAGS += -L$(HB_SDK_ROOT)/lib -Wl,-rpath,$(HB_SDK_ROOT)/lib
+LDLIBS += -lhbmem
+endif
 DESTDIR ?= .
 
 HOST_CFLAGS ?= -O2 -g -Wall -Wextra -Werror -std=gnu11
@@ -71,8 +76,8 @@ $(BUILD_DIR)/test_sha256: tests/test_sha256.c miro_ego_sha256.c miro_ego_sha256.
 $(BUILD_DIR)/test_shm_ring: tests/test_shm_ring.c miro_ego_shm_ring.c miro_ego_shm_ring.h | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_shm_ring.c miro_ego_shm_ring.c
 
-$(BUILD_DIR)/test_pipeline_helpers: tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_split.h miro_ego_mp4_meta.h miro_ego_cli_common.h miro_ego_packet_queue.h | $(BUILD_DIR)
-	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c
+$(BUILD_DIR)/test_pipeline_helpers: tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_sha256.c miro_ego_split.h miro_ego_mp4_meta.h miro_ego_sha256.h miro_ego_cli_common.h miro_ego_packet_queue.h | $(BUILD_DIR)
+	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_sha256.c
 
 $(BUILD_DIR)/test_pipeline_e2e: tests/test_pipeline_e2e.c tests/mock_hobot_sdk.c tests/mock_hobot_sdk.h miro_ego_stereo_pipeline.c miro_ego_sha256.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_shm_ring.c $(HDRS) $(STUB_INCLUDE)/hb_media_codec.h $(STUB_INCLUDE)/hb_media_muxer.h $(MOCK_ENCODER) | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I$(STUB_INCLUDE) -I. -Itests -pthread -o $@ \

@@ -13,7 +13,6 @@ use http::{HeaderMap, Method, Request};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use miro_ego_capture::session::schema_validation::SchemaValidator;
 use miro_ego_cli::DEVICE_SESSION_V1_SCHEMA;
 use miro_ego_cli::runtime::{
     CaptureModeKind, DaemonServeOptions, ShmEncoderCaptureBackend, bind_daemon,
@@ -25,6 +24,7 @@ use miro_ego_core::config::{
 };
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
 use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL};
+use miro_ego_core::schema_validation::SchemaValidator;
 use miro_ego_core::sys::fs::write_bytes_atomic;
 use miro_ego_deploy::{
     BUNDLE_SIGNATURE_FILENAME, ReleaseManagerPaths, default_release_signing_seed,
@@ -138,6 +138,7 @@ fn make_lab_device_config(data_dir: &Path, state_dir: &Path) -> DeviceConfig {
             fps: 30,
             frame_decimation: 1,
             exposure_time_absolute: Some(ExposureSetting::default()),
+            calibration_file: None,
         },
         storage: StorageConfig {
             mountpoint: data_dir.to_path_buf(),
@@ -311,6 +312,21 @@ async fn https_request(
         .to_bytes()
         .to_vec();
     (status, body)
+}
+
+async fn wait_for_capture_idle(addr: SocketAddr) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let (code, _, body) =
+            http_request(addr, Method::GET, "/api/v1/capture/status", &[], None).await;
+        assert_eq!(code, 200);
+        let doc: Value = serde_json::from_slice(&body).expect("parse capture status");
+        if doc["snapshot"]["device_state"] == "idle" {
+            return doc;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for capture coordinator to reach idle state");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -525,7 +541,16 @@ async fn full_stack_live_http_e2e_with_real_c_shm_encoder_and_network_rpc() {
         String::from_utf8_lossy(&body)
     );
     let stop_doc: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(stop_doc["snapshot"]["device_state"], "idle");
+    assert!(
+        matches!(
+            stop_doc["snapshot"]["device_state"].as_str(),
+            Some("finalizing" | "verifying" | "idle")
+        ),
+        "unexpected stop device_state: {}",
+        stop_doc["snapshot"]["device_state"]
+    );
+    let idle_doc = wait_for_capture_idle(addr).await;
+    assert_eq!(idle_doc["snapshot"]["device_state"], "idle");
 
     // Verify catalog.bin exists with MEGOCAT1 magic and session published under recordings/YYYY-MM-DD/HH-MM-SS/
     let catalog_bin_bytes =
@@ -1355,6 +1380,7 @@ async fn mock_serve_default_run_dir_allows_non_root_capture_start_and_stop() {
         "mock capture stop failed: {}",
         String::from_utf8_lossy(&body)
     );
+    let _ = wait_for_capture_idle(addr).await;
 
     let (code, _, body) = http_request(addr, Method::GET, "/api/v1/sessions", &[], None).await;
     assert_eq!(code, 200);
@@ -1366,5 +1392,335 @@ async fn mock_serve_default_run_dir_allows_non_root_capture_start_and_stop() {
         .await
         .expect("join mock daemon")
         .expect("clean mock daemon exit");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wave5_embedded_console_clock_guard_provenance_async_stop_network_busy_and_clean_mount() {
+    let root = temp_test_dir("wave5-e2e");
+    let data_dir = root.join("data");
+    let system_dir = root.join("system-state");
+    let net_dir = root.join("net");
+    let run_dir = root.join("run");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&system_dir).unwrap();
+    fs::create_dir_all(&net_dir).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+
+    let _volume_id = init_test_volume(&data_dir);
+    let cal_path = root.join("calibration.json");
+    let cal_bytes = br#"{"schema":"miro-ego.camera-calibration.v1","baseline_m":0.063}"#;
+    fs::write(&cal_path, cal_bytes).unwrap();
+
+    let mut device_cfg = make_lab_device_config(&data_dir, &system_dir);
+    device_cfg.camera.calibration_file = Some(cal_path);
+
+    let (net_sock, net_server) = spawn_test_network_rpc(&net_dir, &device_cfg.device.device_id);
+
+    let mut options = DaemonServeOptions::from_device_config(device_cfg.clone(), true);
+    options.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    options.network_socket = Some(net_sock);
+    options.relaxed_volume = true;
+    options.run_dir = Some(run_dir.clone());
+    options.require_clock_sync = true;
+    options.mock_finish_delay = Duration::from_millis(250);
+
+    let bound = bind_daemon(options).await.expect("bind wave5 daemon");
+    let addr = bound.server.local_addr();
+    let origin = format!("http://{addr}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let daemon_task = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 1. Embedded Web Console assets (`/`, `/app.js`, `/styles.css`) match `web/assets.json`!
+    let assets_manifest: Value = serde_json::from_str(include_str!("../web/assets.json")).unwrap();
+    for entry in assets_manifest["files"].as_array().unwrap() {
+        let asset_name = entry["path"].as_str().unwrap();
+        let req_path = if asset_name == "index.html" {
+            "/".to_owned()
+        } else {
+            format!("/{asset_name}")
+        };
+        let (c_code, c_hdrs, c_body) = http_request(addr, Method::GET, &req_path, &[], None).await;
+        assert_eq!(c_code, 200, "GET {req_path} failed");
+        assert_eq!(c_body.len() as u64, entry["bytes"].as_u64().unwrap());
+        let expected_sha = entry["sha256"].as_str().unwrap();
+        assert_eq!(sha256_hex(&c_body), expected_sha);
+        assert_eq!(
+            c_hdrs.get("etag").and_then(|v| v.to_str().ok()),
+            Some(format!("\"{expected_sha}\"").as_str())
+        );
+        assert!(
+            c_hdrs
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|csp| csp.contains("default-src 'self'")),
+            "missing strict CSP on {req_path}"
+        );
+    }
+
+    // 2. Boot-scoped clock guard rejects `startCapture` (`409 clock_unsynchronized`) before sync!
+    let start_payload = serde_json::to_vec(&json!({
+        "schema": "miro-ego.capture-start.v1",
+        "mode": "production",
+        "display_name": "Wave 5 Clock Guarded Take",
+        "take": { "kind": "new" }
+    }))
+    .unwrap();
+    let (unsync_code, unsync_hdrs, unsync_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(start_payload.clone()),
+    )
+    .await;
+    assert_eq!(
+        unsync_code,
+        409,
+        "expected 409 clock_unsynchronized, got {}: {}",
+        unsync_code,
+        String::from_utf8_lossy(&unsync_body)
+    );
+    assert_eq!(
+        unsync_hdrs
+            .get("miro-ego-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("clock_unsynchronized")
+    );
+
+    // Synchronize clock via `/api/v1/clock` + `/api/v1/clock/sync`:
+    let (clk_code, _, clk_body) = http_request(addr, Method::GET, "/api/v1/clock", &[], None).await;
+    assert_eq!(clk_code, 200);
+    let clk_doc: Value = serde_json::from_slice(&clk_body).unwrap();
+    let challenge = clk_doc["challenge"].as_str().expect("clock challenge");
+    let (sync_code, _, sync_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/clock/sync",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.clock-sync-request.v1",
+                "challenge": challenge,
+                "unix_time_ms": 1_764_200_000_000_u64
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(sync_code, 200);
+    let sync_doc: Value = serde_json::from_slice(&sync_body).unwrap();
+    assert_eq!(sync_doc["applied"], true);
+    assert!(
+        net_dir.join("net-run/clock-state.json").is_file(),
+        "clock-state.json must be persisted in controller run_dir, never state_root"
+    );
+    assert!(
+        fs::read_dir(&system_dir).unwrap().next().is_none(),
+        "system_dir must remain completely untouched"
+    );
+
+    // 3. `startCapture` now succeeds (`202 Accepted`)!
+    let (start_code, _, start_resp_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(start_payload),
+    )
+    .await;
+    assert_eq!(start_code, 202);
+    let started_doc: Value = serde_json::from_slice(&start_resp_body).unwrap();
+    let session_id = started_doc["snapshot"]["active_recording"]["recording_state"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 4. Network mutations during active capture return `503 network_mutation_unavailable` (`reason: "capture_active"`)!
+    let (cred_busy_code, cred_busy_hdrs, cred_busy_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/network/credentials",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.network-credential-request.v1",
+                "passphrase": "validpassword123"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(cred_busy_code, 503);
+    assert_eq!(
+        cred_busy_hdrs
+            .get("miro-ego-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("network_mutation_unavailable")
+    );
+    let cred_err: Value = serde_json::from_slice(&cred_busy_body).unwrap();
+    assert_eq!(cred_err["error"]["code"], "network_mutation_unavailable");
+    assert_eq!(cred_err["error"]["details"]["reason"], "capture_active");
+
+    let (apply_busy_code, _, apply_busy_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "hotspot",
+                    "wifi_client": Value::Null,
+                    "ethernet": Value::Null
+                }
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(apply_busy_code, 503);
+    let apply_err: Value = serde_json::from_slice(&apply_busy_body).unwrap();
+    assert_eq!(apply_err["error"]["code"], "network_mutation_unavailable");
+    assert_eq!(apply_err["error"]["details"]["reason"], "capture_active");
+
+    // 5. Async `stopCapture` (`reason: "user"`) returns `202` immediately (`finalizing`) while 250ms drain runs in background!
+    let stop_t0 = std::time::Instant::now();
+    let (stop_code, _, stop_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.capture-stop.v1",
+                "reason": "user"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    let stop_latency = stop_t0.elapsed();
+    assert_eq!(stop_code, 202);
+    assert!(
+        stop_latency < Duration::from_millis(180),
+        "async stopCapture should return before 250ms mock drain, took {stop_latency:?}"
+    );
+    let stop_doc: Value = serde_json::from_slice(&stop_body).unwrap();
+    assert_eq!(
+        stop_doc["snapshot"]["device_state"], "finalizing",
+        "async stopCapture immediate snapshot must report finalizing"
+    );
+
+    let idle_doc = wait_for_capture_idle(addr).await;
+    assert_eq!(idle_doc["snapshot"]["device_state"], "idle");
+
+    // 6. Verify sealed manifest embeds BOTH `logs/clock-calibration.json` and `logs/camera-calibration.json`!
+    let (m_code, _, raw_manifest) = http_request(
+        addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{session_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(m_code, 200);
+    let validator = SchemaValidator::new(DEVICE_SESSION_V1_SCHEMA).expect("compile schema");
+    assert!(
+        validator
+            .is_valid(std::str::from_utf8(&raw_manifest).unwrap())
+            .unwrap()
+    );
+    let manifest_doc: Value = serde_json::from_slice(&raw_manifest).unwrap();
+    let logs_arr = manifest_doc["logs"]
+        .as_array()
+        .expect("manifest logs array");
+    let clock_log = logs_arr
+        .iter()
+        .find(|l| l["path"] == "logs/clock-calibration.json")
+        .expect("logs/clock-calibration.json must be embedded in sealed manifest");
+    let cam_cal_log = logs_arr
+        .iter()
+        .find(|l| l["path"] == "logs/camera-calibration.json")
+        .expect("logs/camera-calibration.json must be embedded in sealed manifest");
+    let cam_cal_sha = cam_cal_log["sha256"].as_str().unwrap();
+    let (cam_art_code, _, cam_art_bytes) = http_request(
+        addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{session_id}/artifacts/{cam_cal_sha}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(cam_art_code, 200);
+    assert_eq!(sha256_hex(&cam_art_bytes), cam_cal_sha);
+    let cam_cal_doc: Value = serde_json::from_slice(&cam_art_bytes).unwrap();
+    assert_eq!(cam_cal_doc["schema"], "miro-ego.camera-calibration.v1");
+    assert_eq!(cam_cal_doc["baseline_m"], 0.063);
+
+    let clock_sha = clock_log["sha256"].as_str().unwrap();
+    let (clk_art_code, _, clk_art_bytes) = http_request(
+        addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{session_id}/artifacts/{clock_sha}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(clk_art_code, 200);
+    let clk_cal_doc: Value = serde_json::from_slice(&clk_art_bytes).unwrap();
+    assert_eq!(clk_cal_doc["schema"], "miro-ego.clock-calibration.v1");
+    assert_eq!(clk_cal_doc["source"], "client");
+
+    // 7. Clean shutdown writes `.miro-ego/index/mount.clean` and `open_read_only` preserves it!
+    let _ = shutdown_tx.send(());
+    daemon_task
+        .await
+        .expect("join wave5 daemon")
+        .expect("clean wave5 daemon exit");
+    net_server.shutdown();
+
+    let clean_marker = DataVolumePaths::new(data_dir.clone()).mount_clean_marker_file();
+    assert!(
+        clean_marker.is_file(),
+        "clean daemon shutdown must persist mount-clean.marker"
+    );
+    let ro_cat =
+        BinarySessionCatalog::open_read_only(DataVolumePaths::new(data_dir.clone())).unwrap();
+    assert_eq!(
+        ro_cat
+            .list_sessions_page(Some(10), None, true, None)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(
+        clean_marker.is_file(),
+        "open_read_only must not consume mount.clean"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }

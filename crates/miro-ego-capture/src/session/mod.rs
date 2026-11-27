@@ -1,12 +1,7 @@
 pub mod active_take;
-pub mod audio_checkpoint;
 pub mod capture_runtime;
-pub mod catalog_admission;
-pub mod catalog_signature;
-pub mod frame_stream;
 pub mod recording;
 pub mod schema_validation;
 pub mod session_io;
-pub mod session_store;
 pub mod shm_ring;
 pub mod stereo_encoder;

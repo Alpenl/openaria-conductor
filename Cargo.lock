@@ -791,6 +791,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "miro-ego-api",
  "miro-ego-core",
  "rcgen",
  "rustls",
@@ -810,7 +811,6 @@ dependencies = [
 name = "miro-ego-capture"
 version = "0.3.0"
 dependencies = [
- "jsonschema",
  "libc",
  "libloading",
  "miro-ego-core",
@@ -851,6 +851,7 @@ dependencies = [
 name = "miro-ego-core"
 version = "0.3.0"
 dependencies = [
+ "jsonschema",
  "libc",
  "libloading",
  "serde",
@@ -909,7 +910,6 @@ name = "miro-ego-storage"
 version = "0.3.0"
 dependencies = [
  "libc",
- "miro-ego-capture",
  "miro-ego-core",
  "serde",
  "serde_json",

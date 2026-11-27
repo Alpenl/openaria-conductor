@@ -6,7 +6,7 @@
   "debounce_ms": 80,
   "cooldown_ms": 1000,
   "poll_ms": 20,
-  "request_timeout_ms": 5000,
+  "request_timeout_ms": 30000,
   "status_led": "ACT",
   "status_led_inverted": false
 }

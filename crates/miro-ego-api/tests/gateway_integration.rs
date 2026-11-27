@@ -4552,3 +4552,433 @@ async fn p2_17_and_p3_04_audit_hygiene_rfc9110_204_tokens_head_405_preview_and_f
     let _ = cnt_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), cnt_h).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wave4_inflight_idempotency_coalescing_degraded_audit_gop_replay_and_framing() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct SlowStartDegradedAuditBackend {
+        inner: MockGatewayBackend,
+        start_calls: Arc<AtomicUsize>,
+        degrade_audit: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayBackend for SlowStartDegradedAuditBackend {
+        async fn device_info(
+            &self,
+            sp: miro_ego_api::SecurityProfile,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.device_info(sp).await
+        }
+        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_status().await
+        }
+        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_snapshot_event().await
+        }
+        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_readiness().await
+        }
+        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.capture_safe_swap().await
+        }
+        async fn start_capture(
+            &self,
+            cmd: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            self.inner.start_capture(cmd).await
+        }
+        async fn stop_capture(
+            &self,
+            cmd: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.stop_capture(cmd).await
+        }
+        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_timer().await
+        }
+        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_capture_timer(e, d).await
+        }
+        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.camera_focus().await
+        }
+        async fn set_camera_focus(
+            &self,
+            cmd: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.set_camera_focus(cmd).await
+        }
+        async fn list_sessions(
+            &self,
+            q: miro_ego_api::ListSessionsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_sessions(q).await
+        }
+        async fn open_session_manifest(
+            &self,
+            sid: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> {
+            self.inner.open_session_manifest(sid).await
+        }
+        async fn retained_unsuccessful_outcome(
+            &self,
+            sid: &str,
+        ) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.retained_unsuccessful_outcome(sid).await
+        }
+        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> {
+            self.inner.artifact_io_busy_state().await
+        }
+        async fn open_session_artifact(
+            &self,
+            sid: &str,
+            aid: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_session_artifact(sid, aid).await
+        }
+        async fn delete_sessions(
+            &self,
+            cmd: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.delete_sessions(cmd).await
+        }
+        async fn list_logs(
+            &self,
+            q: miro_ego_api::ListLogsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_logs(q).await
+        }
+        async fn open_log_file(
+            &self,
+            name: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_log_file(name).await
+        }
+        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> {
+            self.inner.preview_mjpeg_hub()
+        }
+        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> {
+            self.inner.preview_h264_hub()
+        }
+        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> {
+            self.inner.capture_event_buffer()
+        }
+        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> {
+            self.inner.network_event_buffer()
+        }
+        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_status(p).await
+        }
+        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_inspect(p).await
+        }
+        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_sync(p, b).await
+        }
+        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.voice_status().await
+        }
+        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_voice_volume(v).await
+        }
+        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_status().await
+        }
+        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_scan().await
+        }
+        async fn create_network_credential(
+            &self,
+            p: &str,
+            pw: &str,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.create_network_credential(p, pw).await
+        }
+        async fn apply_network_desired_state(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.apply_network_desired_state(c).await
+        }
+        async fn retry_network_transaction(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.retry_network_transaction(c).await
+        }
+        async fn forget_network_client_profile(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.forget_network_client_profile(c).await
+        }
+        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_status().await
+        }
+        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_check(f).await
+        }
+        async fn firmware_update(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_update(c).await
+        }
+        async fn firmware_rollback(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_rollback(c).await
+        }
+        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> {
+            self.inner.record_audit(e)
+        }
+        fn record_audit_durable(
+            &self,
+            e: miro_ego_api::AuditEvent,
+        ) -> miro_ego_api::ApiResult<bool> {
+            self.inner.record_audit(e)?;
+            Ok(!self.degrade_audit.load(Ordering::Acquire))
+        }
+        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> {
+            self.inner.get_web_asset(n)
+        }
+    }
+
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let degrade_audit = Arc::new(AtomicBool::new(false));
+    let mock = MockGatewayBackend::with_options(true);
+    let h264_hub = mock.preview_h264_hub().unwrap();
+    h264_hub.set_init_segment_blocking(Bytes::from_static(b"INIT"));
+    // Publish GOP #1 (keyframe + P-frame), then GOP #2 (keyframe + P-frame) before viewer connects!
+    h264_hub.publish_keyframe_fragment(Bytes::from_static(b"GOP1_IDR"));
+    h264_hub.publish_fragment(Bytes::from_static(b"GOP1_P1"));
+    h264_hub.publish_keyframe_fragment(Bytes::from_static(b"GOP2_IDR"));
+    h264_hub.publish_fragment(Bytes::from_static(b"GOP2_P1"));
+
+    let backend: Arc<dyn GatewayBackend> = Arc::new(SlowStartDegradedAuditBackend {
+        inner: mock,
+        start_calls: Arc::clone(&start_calls),
+        degrade_audit: Arc::clone(&degrade_audit),
+    });
+    let cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
+    let srv = GatewayServer::bind(cfg, backend, Arc::new(SecurityPolicy::lab_default()))
+        .await
+        .unwrap();
+    let addr = srv.local_addr();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = srv
+            .serve_with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+
+    // 1. Concurrent in-flight Idempotency-Key coalescing: 2 identical requests + 1 mismatched body.
+    let body_same = Bytes::from(
+        json!({
+            "schema": "miro-ego.capture-start.v1",
+            "mode": "production",
+            "take": { "kind": "new" }
+        })
+        .to_string(),
+    );
+    let body_diff = Bytes::from(
+        json!({
+            "schema": "miro-ego.capture-start.v1",
+            "mode": "calibration",
+            "take": { "kind": "new" }
+        })
+        .to_string(),
+    );
+    let b1 = body_same.clone();
+    let b2 = body_same.clone();
+    let req1 = tokio::spawn(async move {
+        http_request(
+            addr,
+            Method::POST,
+            "/api/v1/capture/start",
+            &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "coalesce-start-1"),
+            ],
+            Some(b1),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let req2 = tokio::spawn(async move {
+        http_request(
+            addr,
+            Method::POST,
+            "/api/v1/capture/start",
+            &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "coalesce-start-1"),
+            ],
+            Some(b2),
+        )
+        .await
+    });
+    let (st_conflict, _, _) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "coalesce-start-1"),
+        ],
+        Some(body_diff),
+    )
+    .await;
+    assert_eq!(st_conflict, StatusCode::CONFLICT);
+
+    let (st1, h1, resp1) = req1.await.unwrap();
+    let (st2, h2, resp2) = req2.await.unwrap();
+    assert_eq!(st1, StatusCode::ACCEPTED);
+    assert_eq!(st2, StatusCode::ACCEPTED);
+    assert_eq!(resp1, resp2);
+    assert_eq!(
+        start_calls.load(Ordering::SeqCst),
+        1,
+        "concurrent in-flight duplicate must execute backend only once"
+    );
+    let replayed_cnt = [h1, h2]
+        .iter()
+        .filter(|h| h.get("Idempotency-Replayed").and_then(|v| v.to_str().ok()) == Some("true"))
+        .count();
+    assert_eq!(replayed_cnt, 1);
+
+    // 2. Degraded RAM-fallback audit surfaces `Miro-Ego-Audit-Status: unavailable` on 200 OK!
+    degrade_audit.store(true, Ordering::Release);
+    let (st_dev, h_dev, _) = http_request(
+        addr,
+        Method::GET,
+        "/api/v1/device",
+        &[
+            ("Host", &format!("[fe80::1%wlan0]:{}", addr.port())),
+            (
+                "Origin",
+                &format!("http://[fe80::1%25wlan0]:{}", addr.port()),
+            ),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_dev, StatusCode::OK);
+    assert_eq!(
+        h_dev
+            .get("Miro-Ego-Audit-Status")
+            .and_then(|v| v.to_str().ok()),
+        Some("unavailable")
+    );
+    assert_eq!(
+        h_dev
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("http://[fe80::1%25wlan0]:{}", addr.port()).as_str())
+    );
+    degrade_audit.store(false, Ordering::Release);
+
+    // 3. Late-joining H.264 preview viewer immediately receives `INIT` + `GOP2_IDR` + `GOP2_P1` (skipping GOP1)!
+    let mut tcp_prev = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let prev_req = format!(
+        "GET /api/v1/preview/h264 HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+        addr.port()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp_prev, prev_req.as_bytes())
+        .await
+        .unwrap();
+    let mut prev_buf = vec![0_u8; 4096];
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(n)) = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut tcp_prev, &mut prev_buf),
+        )
+        .await
+        else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        collected.extend_from_slice(&prev_buf[..n]);
+        if collected.windows(7).any(|w| w == b"GOP2_P1") {
+            break;
+        }
+    }
+    drop(tcp_prev);
+    assert!(collected.windows(4).any(|w| w == b"INIT"));
+    assert!(collected.windows(8).any(|w| w == b"GOP2_IDR"));
+    assert!(collected.windows(7).any(|w| w == b"GOP2_P1"));
+    assert!(
+        !collected.windows(8).any(|w| w == b"GOP1_IDR"),
+        "stale pre-IDR GOP must not be replayed"
+    );
+
+    // 4. HTTP/1.0 request without Host header is rejected with 400 Bad Request!
+    let mut tcp_h10 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp_h10, b"GET /api/v1/device HTTP/1.0\r\n\r\n")
+        .await
+        .unwrap();
+    let mut h10_resp = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut tcp_h10, &mut h10_resp)
+        .await
+        .unwrap();
+    let h10_text = String::from_utf8_lossy(&h10_resp);
+    assert!(
+        h10_text.starts_with("HTTP/1.0 400") || h10_text.starts_with("HTTP/1.1 400"),
+        "unexpected HTTP/1.0 response: {h10_text}"
+    );
+
+    // 5. NetworkEventReplayBuffer resyncs with snapshot when transaction source_revision has a gap!
+    let net_buf = miro_ego_api::NetworkEventReplayBuffer::new(16);
+    let epoch = miro_ego_core::ids::new_uuid_v4();
+    let tx1 = miro_ego_core::ids::new_uuid_v7();
+    let tx2 = miro_ego_core::ids::new_uuid_v7();
+    let mk_net = |rev: u64, tx_id: &str| {
+        json!({
+            "schema": "miro-ego.network-status.v1",
+            "authority_epoch": epoch,
+            "source_revision": rev,
+            "observed_at": "2026-11-27T10:00:00Z",
+            "saved": true,
+            "verified": true,
+            "desired": { "mode": "hotspot", "wifi_client": null, "ethernet": null },
+            "observed": { "mode": "hotspot" },
+            "transaction": {
+                "current": {
+                    "transaction_id": tx_id,
+                    "authority_epoch": epoch,
+                    "source_revision": rev,
+                    "updated_at": "2026-11-27T10:00:00Z",
+                    "phase": "applying"
+                },
+                "latest": null
+            },
+            "mutation_capability": { "allowed": true },
+            "concurrency_capability": { "allowed": true }
+        })
+    };
+    let c1 = net_buf.observe(mk_net(1, &tx1)).unwrap().unwrap();
+    let _ = net_buf.observe(mk_net(2, &tx1)).unwrap().unwrap();
+    // Jump from rev 2 -> rev 5 (missed rev 3 & 4):
+    let _ = net_buf.observe(mk_net(5, &tx2)).unwrap().unwrap();
+    let replayed_gap = net_buf
+        .replay_or_snapshot(Some(miro_ego_api::EventCursor::Exact(c1)), mk_net(5, &tx2))
+        .unwrap();
+    assert_eq!(replayed_gap.len(), 2);
+    assert_eq!(replayed_gap[0].event_type, "transaction");
+    assert_eq!(replayed_gap[1].event_type, "snapshot");
+    assert_eq!(replayed_gap[1].source_event["source_revision"], 5);
+
+    let _ = stop_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), srv_handle).await;
+}

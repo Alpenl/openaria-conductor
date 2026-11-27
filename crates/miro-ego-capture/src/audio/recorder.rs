@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const START_TIMEOUT_JOIN_WAIT: Duration = Duration::from_millis(200);
-const READ_IDLE_SLEEP: Duration = Duration::from_millis(2);
+const ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_WAIT_TIMEOUT_MS: u32 = 20;
 const MAX_CLOCK_OBSERVATIONS: usize = 65_536;
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ pub struct Recorder {
     lifecycle: Mutex<Lifecycle>,
     lifecycle_changed: Condvar,
     stop: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
     progress: Arc<AudioProgress>,
 }
 
@@ -93,6 +95,7 @@ impl Recorder {
             }),
             lifecycle_changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
+            aborted: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AudioProgress::default()),
         })
     }
@@ -113,15 +116,18 @@ impl Recorder {
             lifecycle.abort_requested = false;
         }
         self.stop.store(false, Ordering::Release);
+        self.aborted.store(false, Ordering::Release);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::channel();
         let config = self.config.clone();
         let stop = Arc::clone(&self.stop);
+        let aborted = Arc::clone(&self.aborted);
         let progress = Arc::clone(&self.progress);
         let worker = match thread::Builder::new()
             .name("audio-capture".to_owned())
             .spawn(move || {
-                let result = start_and_capture(config, stop, Arc::clone(&progress), ready_tx);
+                let result =
+                    start_and_capture(config, stop, aborted, Arc::clone(&progress), ready_tx);
                 if let Err(error) = &result {
                     progress.fail(error.clone());
                 }
@@ -152,11 +158,12 @@ impl Recorder {
                     AudioError::new("native_audio_poisoned", "audio mutex is poisoned")
                 })?;
                 if lifecycle.state != State::Starting || lifecycle.abort_requested {
+                    self.aborted.store(true, Ordering::Release);
                     self.stop.store(true, Ordering::Release);
                     lifecycle.state = State::Aborted;
                     self.lifecycle_changed.notify_all();
                     drop(lifecycle);
-                    let _ = worker.join();
+                    join_worker_bounded(worker, Some(done_rx), ABORT_JOIN_TIMEOUT);
                     return Err(AudioError::new(
                         "invalid_state",
                         "native audio recorder was stopped during start",
@@ -390,34 +397,53 @@ impl Recorder {
     }
 
     pub fn abort(&self) {
+        self.abort_with_timeout(ABORT_JOIN_TIMEOUT);
+    }
+
+    fn abort_with_timeout(&self, join_timeout: Duration) {
+        self.aborted.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
-        let worker = match self.lifecycle.lock() {
+        let deadline = Instant::now() + join_timeout;
+        let (done, worker) = match self.lifecycle.lock() {
             Ok(mut lifecycle) => {
                 lifecycle.abort_requested = true;
                 while matches!(lifecycle.state, State::Starting | State::Stopping) {
-                    lifecycle = match self.lifecycle_changed.wait(lifecycle) {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match self.lifecycle_changed.wait_timeout(lifecycle, remaining) {
+                        Ok((guard, res)) => {
+                            lifecycle = guard;
+                            if res.timed_out() {
+                                break;
+                            }
+                        }
+                        Err(poisoned) => {
+                            lifecycle = poisoned.into_inner().0;
+                        }
+                    }
                 }
-                lifecycle.done = None;
+                let done = lifecycle.done.take();
                 if !matches!(lifecycle.state, State::Stopped | State::Closed) {
                     lifecycle.state = State::Aborted;
                 }
                 let worker = lifecycle.worker.take();
                 self.lifecycle_changed.notify_all();
-                worker
+                (done, worker)
             }
             Err(poisoned) => {
                 let mut lifecycle = poisoned.into_inner();
                 lifecycle.abort_requested = true;
-                lifecycle.done = None;
-                lifecycle.worker.take()
+                let done = lifecycle.done.take();
+                let worker = lifecycle.worker.take();
+                (done, worker)
             }
         };
         if let Some(worker) = worker {
             if worker.thread().id() != thread::current().id() {
-                let _ = worker.join();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                join_worker_bounded(worker, done, remaining);
             }
         }
     }
@@ -437,9 +463,46 @@ impl Drop for Recorder {
     }
 }
 
+fn join_worker_bounded(
+    worker: JoinHandle<()>,
+    done: Option<Receiver<Result<AudioRecordingResult, AudioError>>>,
+    timeout: Duration,
+) {
+    let finished = if worker.is_finished() {
+        true
+    } else if let Some(done_rx) = done {
+        match done_rx.recv_timeout(timeout) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => worker.is_finished(),
+        }
+    } else {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if worker.is_finished() {
+                break true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    };
+    if finished {
+        let _ = worker.join();
+    } else {
+        let _ = thread::Builder::new()
+            .name("audio-reaper".to_owned())
+            .spawn(move || {
+                let _ = worker.join();
+            });
+    }
+}
+
 fn start_and_capture(
     config: RecorderConfig,
     stop: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
     progress: Arc<AudioProgress>,
     ready: mpsc::SyncSender<Result<(), AudioError>>,
 ) -> Result<AudioRecordingResult, AudioError> {
@@ -564,6 +627,8 @@ fn start_and_capture(
             )
         })
     };
+    let pcm_period_ns =
+        pcm.period_frames.saturating_mul(1_000_000_000) / u64::from(config.sample_rate_hz.max(1));
     let mut last_read_started = std::time::Instant::now();
     let mut max_read_gap_ns = 0_u64;
     let captured = (|| {
@@ -593,7 +658,8 @@ fn start_and_capture(
                 ReadOutcome::Frames(frames) => {
                     sample_count += frames;
                     buffered_frames += frames;
-                    let (observed_anchor, _) = clock::observe_anchor(
+                    let (observed_anchor, _) = clock::observe_anchor_with_period(
+                        pcm_period_ns,
                         || {
                             let (position, timestamp) = pcm.clock_anchor(sample_count)?;
                             let before_raw = clock_ns(libc::CLOCK_MONOTONIC_RAW)?;
@@ -609,7 +675,7 @@ fn start_and_capture(
                         },
                     )?;
                     let anchor = clock::retain_same_point(last_anchor, observed_anchor);
-                    let mapped_mono = clock::mapped_ns(&anchor)
+                    let mapped_mono = clock::mapped_ns_with_period(&anchor, pcm_period_ns)
                         .map_err(|message| AudioError::new("audio_failed", message))?;
                     let [position, timestamp, observed_mono, before_raw, after_raw] = anchor;
                     let timestamp_due = timestamp >= next_observation_ns;
@@ -660,7 +726,17 @@ fn start_and_capture(
                         })?;
                     }
                 }
-                ReadOutcome::Again => thread::sleep(READ_IDLE_SLEEP),
+                ReadOutcome::Again => {
+                    let _ = pcm.wait(READ_WAIT_TIMEOUT_MS).map_err(|error| {
+                        AudioError::new(
+                            error.code,
+                            format!(
+                                "{}; read_gap_ns={read_gap_ns}; buffer_frames={}",
+                                error.message, pcm.buffer_frames
+                            ),
+                        )
+                    })?;
+                }
             }
         }
         if buffered_frames > 0 {
@@ -753,7 +829,7 @@ fn start_and_capture(
         "period_frames": pcm.period_frames,
         "buffer_frames": pcm.buffer_frames,
     });
-    if !config.session_root.as_os_str().is_empty() {
+    if !aborted.load(Ordering::Acquire) && !config.session_root.as_os_str().is_empty() {
         let audio_dir = config.session_root.join("audio");
         if std::fs::create_dir_all(&audio_dir).is_ok() {
             let diagnostic_path = audio_dir.join("capture-clock.json");
@@ -846,10 +922,15 @@ fn capture_clock(
         hardware_frames.1,
     )
     .map_err(|message| AudioError::new("audio_failed", message))?;
+    let period_ns =
+        hardware_frames.0.saturating_mul(1_000_000_000) / u64::from(config.sample_rate_hz.max(1));
+    let lifetime_margin = clock::max_htimestamp_age_ns(period_ns) as f64;
     let sample_start = model.start_ns;
     let sample_end = model.end_ns;
     let residual = model.residual_ns;
-    if sample_start < started as f64 - 20_000_000.0 || sample_end > stopped as f64 + 20_000_000.0 {
+    if sample_start < started as f64 - lifetime_margin
+        || sample_end > stopped as f64 + lifetime_margin
+    {
         return Err(AudioError::new(
             "audio_failed",
             "sample clock outside capture lifetime",
@@ -1014,6 +1095,27 @@ mod tests {
         assert!(exited_rx.try_recv().is_ok());
         assert_eq!(recorder.lifecycle.lock().unwrap().state, State::Aborted);
         assert!(recorder.lifecycle.lock().unwrap().worker.is_none());
+
+        // Wedged worker during abort_with_timeout detaches cleanly within bounded latency
+        // and sets aborted=true so capture-clock.json is skipped.
+        let wedged_rec = Recorder::new(root.to_str().unwrap(), "test", 48000, 2, 5.0).unwrap();
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let (_w_done_tx, w_done_rx) = mpsc::channel();
+        let wedged_worker = std::thread::spawn(move || {
+            let _ = unblock_rx.recv_timeout(Duration::from_secs(5));
+        });
+        {
+            let mut lifecycle = wedged_rec.lifecycle.lock().unwrap();
+            lifecycle.state = State::Running;
+            lifecycle.done = Some(w_done_rx);
+            lifecycle.worker = Some(wedged_worker);
+        }
+        let abort_started = Instant::now();
+        wedged_rec.abort_with_timeout(Duration::from_millis(25));
+        assert!(abort_started.elapsed() < Duration::from_millis(500));
+        assert!(wedged_rec.aborted.load(Ordering::Acquire));
+        assert!(!root.join("audio/capture-clock.json").exists());
+        let _ = unblock_tx.send(());
         let _ = std::fs::remove_dir_all(root);
     }
 

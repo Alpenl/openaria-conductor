@@ -24,7 +24,7 @@ pub async fn serve_web_asset(
     headers: HeaderMap,
     asset_name: &str,
 ) -> Response<Body> {
-    let ctx = RequestCtx::new(&method, &headers, &state.security);
+    let ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let Some(asset) = state.backend.get_web_asset(asset_name) else {
         return ctx.error_response(ApiError::not_found("resource not found"));
     };
@@ -59,7 +59,7 @@ pub async fn get_device(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getDevice", None) {
         return *resp;
     }
@@ -75,7 +75,7 @@ pub async fn get_voice(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getVoice", None) {
         return *resp;
     }
@@ -92,9 +92,10 @@ pub async fn set_voice_volume(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    if let Err(resp) = ctx.authorize_write(&state, &parts.headers, "setVoiceVolume") {
-        return *resp;
-    }
+    let principal = match ctx.authorize_write_headers(&state, &parts.headers, "setVoiceVolume") {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let (json, _) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -103,12 +104,21 @@ pub async fn set_voice_volume(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "setVoiceVolume", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let volume = match validate_voice_set_body(&json) {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "setVoiceVolume", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
+    if let Err(resp) = ctx.record_allowed(&state, "setVoiceVolume", None, &principal) {
+        return *resp;
+    }
     match state.backend.set_voice_volume(volume).await {
         Ok(resp_body) => ctx.json_response(StatusCode::OK, &resp_body, &[]),
         Err(err) => ctx.error_response(err),
@@ -134,7 +144,7 @@ fn validate_voice_set_body(body: &Value) -> Result<u8, ApiError> {
         return Err(ApiError::bad_request(
             "volume must be an integer in 0..=100",
         ));
-    }
+    };
     Ok(vol as u8)
 }
 
@@ -144,7 +154,7 @@ pub async fn get_device_clock(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let principal = match ctx.authorize_read(&state, &headers, "getDeviceClock", None) {
         Ok(p) => p,
         Err(resp) => return *resp,
@@ -161,7 +171,7 @@ pub async fn inspect_device_clock(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let principal = match ctx.authorize_read(&state, &headers, "inspectDeviceClock", None) {
         Ok(p) => p,
         Err(resp) => return *resp,
@@ -179,7 +189,7 @@ pub async fn sync_device_clock(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let principal = match ctx.authorize_write(&state, &parts.headers, "syncDeviceClock") {
+    let principal = match ctx.authorize_write_headers(&state, &parts.headers, "syncDeviceClock") {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -191,10 +201,17 @@ pub async fn sync_device_clock(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "syncDeviceClock", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_clock_sync_body(&json) {
+        ctx.audit(&state, "syncDeviceClock", None, &err.code, Some(&principal));
         return ctx.error_response(err);
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "syncDeviceClock", None, &principal) {
+        return *resp;
     }
     match state
         .backend
@@ -286,16 +303,28 @@ pub async fn firmware_check(
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "checkFirmware", None) {
-        return *resp;
-    }
+    let principal = match ctx.authorize_read_headers(&state, &parts.headers, "checkFirmware", None)
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "checkFirmware", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let mut force = false;
     for (k, v) in query {
         if k != "force" {
+            ctx.audit(
+                &state,
+                "checkFirmware",
+                None,
+                "invalid_request",
+                Some(&principal),
+            );
             return ctx.error_response(ApiError::bad_request(
                 "unexpected query parameter on /firmware/check",
             ));
@@ -304,11 +333,21 @@ pub async fn firmware_check(
             "true" => force = true,
             "false" => force = false,
             _ => {
+                ctx.audit(
+                    &state,
+                    "checkFirmware",
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
                 return ctx.error_response(ApiError::bad_request(
                     "force query parameter must be true or false",
                 ));
             }
         }
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "checkFirmware", None, &principal) {
+        return *resp;
     }
     let Ok(_permit) = tokio::time::timeout(
         Duration::from_millis(100),
@@ -355,7 +394,7 @@ async fn firmware_mutation(
     };
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let (principal, key) = match ctx.authorize_command(&state, &parts.headers, op_id) {
+    let (principal, key) = match ctx.authorize_command_headers(&state, &parts.headers, op_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -367,33 +406,55 @@ async fn firmware_mutation(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, op_id, None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_firmware_commit_body(&json) {
+        ctx.audit(&state, op_id, None, &err.code, Some(&principal));
         return ctx.error_response(err);
     }
-    let Ok(_permit) = tokio::time::timeout(
-        Duration::from_millis(100),
-        state.firmware_semaphore.acquire(),
-    )
-    .await
-    else {
-        return ctx.error_response(
-            ApiError::service_unavailable("firmware_busy", "firmware control channel is busy")
-                .with_header("Retry-After", "1"),
-        );
-    };
+    if let Err(resp) = ctx.record_allowed(&state, op_id, None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    let res = if rollback {
-        state.backend.firmware_rollback(cmd).await
-    } else {
-        state.backend.firmware_update(cmd).await
-    };
+    let state_exec = Arc::clone(&state);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            op_id,
+            op_id,
+            &key,
+            &canonical,
+            || async move {
+                let Ok(_permit) = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    state_exec.firmware_semaphore.acquire(),
+                )
+                .await
+                else {
+                    return Err(ApiError::service_unavailable(
+                        "firmware_busy",
+                        "firmware control channel is busy",
+                    )
+                    .with_header("Retry-After", "1"));
+                };
+                if rollback {
+                    state_exec.backend.firmware_rollback(cmd).await
+                } else {
+                    state_exec.backend.firmware_update(cmd).await
+                }
+            },
+        )
+        .await;
     match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {

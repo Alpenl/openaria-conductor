@@ -116,7 +116,7 @@ jobs:
           fi
           unset MIRO_EGO_RELEASE_SIGNING_SEED_HEX
           export MIRO_EGO_GIT_COMMIT="${MIRO_EGO_COMMIT}"
-          cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.28 -p miro-ego-cli
+          cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu.2.28 -p miro-ego-cli
 
       - name: Cross-compile C miro-ego-encoder for aarch64-unknown-linux-gnu
         run: |
@@ -129,6 +129,10 @@ jobs:
             csrc/miro-ego-encoder/miro_ego_split.c
             csrc/miro-ego-encoder/miro_ego_mp4_meta.c
           )
+          if [[ -n "${HB_SDK_ROOT:-}" && -z "${HOBOT_SDK_INCLUDE:-}" && -z "${HOBOT_SDK_LIB:-}" ]]; then
+            HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/include"
+            HOBOT_SDK_LIB="${HB_SDK_ROOT}/lib"
+          fi
           if [[ -n "${HOBOT_SDK_INCLUDE:-}" && -n "${HOBOT_SDK_LIB:-}" && -f "${HOBOT_SDK_LIB}/libmultimedia.so" ]]; then
             echo "Linking miro-ego-encoder against RDK X5 Hobot SDK"
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
@@ -144,14 +148,14 @@ jobs:
             } >> "$GITHUB_ENV"
           else
             if [[ "${GITHUB_REF_TYPE:-}" == "tag" || "${GITHUB_REF:-}" == refs/tags/v* ]]; then
-              echo "::error::Refusing to build release tag ${GITHUB_REF:-unknown} against mock_hobot_sdk.c: HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so are required for hardware release bundles." >&2
+              echo "::error::Refusing to build release tag ${GITHUB_REF:-unknown} against mock_hobot_sdk.c: HB_SDK_ROOT (or HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so) is required for hardware release bundles." >&2
               exit 1
             fi
-            if [[ -n "${HOBOT_SDK_INCLUDE:-}" || -n "${HOBOT_SDK_LIB:-}" ]]; then
-              echo "::error::Partial or invalid Hobot SDK paths supplied (expected HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so)." >&2
+            if [[ -n "${HB_SDK_ROOT:-}" || -n "${HOBOT_SDK_INCLUDE:-}" || -n "${HOBOT_SDK_LIB:-}" ]]; then
+              echo "::error::Partial or invalid Hobot SDK paths supplied (expected HB_SDK_ROOT or HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB/libmultimedia.so)." >&2
               exit 1
             fi
-            echo "Building non-release CI smoke miro-ego-encoder against mock_hobot_sdk.c (-mock-sdk)"
+            echo "Building non-release CI smoke miro-ego-encoder against mock_hobot_sdk.c (--allow-mock-encoder)"
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
               -Icsrc/miro-ego-encoder/tests/stubs -Icsrc/miro-ego-encoder -Icsrc/miro-ego-encoder/tests \
               "${SRCS[@]}" csrc/miro-ego-encoder/tests/mock_hobot_sdk.c \
@@ -159,8 +163,8 @@ jobs:
               -o dist-aarch64/miro-ego-encoder
             {
               echo "MIRO_EGO_MOCK_SDK=1"
-              echo "MIRO_EGO_ARCHIVE_NAME=miro-ego-rdk-x5-bundle-mock-sdk.tar"
-              echo "MIRO_EGO_ARTIFACT_NAME=miro-ego-rdk-x5-${GITHUB_SHA}-mock-sdk"
+              echo "MIRO_EGO_ARCHIVE_NAME=rdk-x5-ci-mock-smoke-bundle.tar"
+              echo "MIRO_EGO_ARTIFACT_NAME=rdk-x5-ci-mock-smoke-bundle"
             } >> "$GITHUB_ENV"
           fi
 
@@ -190,6 +194,10 @@ jobs:
           else
             unset MIRO_EGO_RELEASE_SIGNING_SEED_HEX
           fi
+          bundle_args=()
+          if [[ "${MIRO_EGO_MOCK_SDK}" == "1" ]]; then
+            bundle_args+=(--allow-mock-encoder)
+          fi
           uv run --extra dev python scripts/build_rdk_x5_bundle.py \
             --miro-ego-bin target/aarch64-unknown-linux-gnu/release/miro-ego \
             --encoder-bin dist-aarch64/miro-ego-encoder \
@@ -197,6 +205,7 @@ jobs:
             --archive "dist-rdk-x5/${MIRO_EGO_ARCHIVE_NAME}" \
             --version "$MIRO_EGO_VERSION" \
             --commit "$MIRO_EGO_COMMIT" \
+            "${bundle_args[@]}" \
             "${signing_args[@]}"
           if [[ "${MIRO_EGO_MOCK_SDK}" == "1" ]]; then
             cat > dist-rdk-x5/MOCK_SDK_WARNING.txt <<'EOF'

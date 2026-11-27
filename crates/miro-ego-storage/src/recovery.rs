@@ -7,7 +7,7 @@ use crate::util::{
     readable_date_time_from_rfc3339, sha256_hex, sweep_stale_atomic_temps,
 };
 use crate::{RecoveryManager, RecoveryReport, StorageError, StorageResult};
-use miro_ego_capture::session::session_io::hash_file;
+use miro_ego_core::artifact_verify::hash_file;
 use miro_ego_core::config::{RecordingEncoding, VideoCodec};
 use miro_ego_core::ids::{is_valid_uuid_v4, is_valid_uuid_v7, new_uuid_v4, new_uuid_v7};
 use miro_ego_core::paths::DataVolumePaths;
@@ -142,6 +142,7 @@ impl StagingRecoveryManager {
         ] {
             let _ = sweep_stale_atomic_temps(&sweep_dir);
         }
+        sweep_interrupted_deletions(&self.paths);
 
         let staging_dir = self.paths.staging_dir();
         if !staging_dir.is_dir() {
@@ -290,9 +291,15 @@ impl StagingRecoveryManager {
         let meta = load_partial_metadata(partial_path, &self.paths, &self.defaults);
         let segment_frames = meta.segment_frames.max(1);
         let effective_fps = (meta.sensor_fps / f64::from(meta.frame_decimation.max(1))).max(1.0);
-        let segment_secs = segment_frames as f64 / effective_fps;
-        let duration_seconds = (valid_pairs.len() as f64) * segment_secs;
-        let max_recovered_frames = (valid_pairs.len() as u64).saturating_mul(segment_frames);
+        let mut planned_segment_frames: Vec<u64> = Vec::with_capacity(valid_pairs.len());
+        let mut total_video_frames = 0_u64;
+        for pair in &valid_pairs {
+            let seg_len = pair.sample_count.unwrap_or(segment_frames).max(1);
+            planned_segment_frames.push(seg_len);
+            total_video_frames = total_video_frames.saturating_add(seg_len);
+        }
+        let duration_seconds = (total_video_frames as f64) / effective_fps;
+        let max_recovered_frames = total_video_frames;
         let max_recovered_segments = valid_pairs.len() as u64;
 
         let frames_path = partial_path.join("frames.ndjson");
@@ -325,6 +332,7 @@ impl StagingRecoveryManager {
         })?;
 
         let mut video_segments_json = Vec::with_capacity(valid_pairs.len());
+        let mut running_frame = 0_u64;
         for (idx, pair) in valid_pairs.iter().enumerate() {
             let left_rel = format!("video/{}", pair.left_name);
             let right_rel = format!("video/{}", pair.right_name);
@@ -340,10 +348,21 @@ impl StagingRecoveryManager {
                     format!("{right_rel}: {}", err.message),
                 )
             })?;
-            let start_frame = (idx as u64) * segment_frames;
-            let end_frame = start_frame + segment_frames;
-            let start_t = (idx as f64) * segment_secs;
-            let end_t = ((idx + 1) as f64) * segment_secs;
+            let seg_len = planned_segment_frames[idx];
+            let start_frame = running_frame;
+            let raw_end_frame = start_frame.saturating_add(seg_len);
+            let end_frame = if idx + 1 == valid_pairs.len()
+                && frames_count > start_frame
+                && frames_count < raw_end_frame
+                && pair.sample_count.is_none()
+            {
+                frames_count
+            } else {
+                raw_end_frame
+            };
+            running_frame = end_frame;
+            let start_t = (start_frame as f64) / effective_fps;
+            let end_t = ((end_frame as f64) / effective_fps).max(start_t + (1.0 / effective_fps));
             video_segments_json.push(json!({
                 "index": idx as u64,
                 "start_frame": start_frame,
@@ -837,6 +856,48 @@ pub fn build_manifest_encoding_json(encoding: &RecordingEncoding, profile: &str)
 struct VerifiedStereoPair {
     left_name: String,
     right_name: String,
+    sample_count: Option<u64>,
+}
+
+/// Remove any half-unlinked session directories inside `/data/.miro-ego/deleting/` left behind
+/// if power failed after atomic trash staging during `deleteSessions`.
+pub fn sweep_interrupted_deletions(paths: &DataVolumePaths) {
+    let deleting_dir = paths.deleting_dir();
+    let Ok(del_meta) = fs::symlink_metadata(&deleting_dir) else {
+        return;
+    };
+    if del_meta.file_type().is_symlink() || !del_meta.is_dir() {
+        return;
+    }
+    let Ok(meta_stat) = fs::symlink_metadata(paths.hidden_meta_dir()) else {
+        return;
+    };
+    if del_meta.dev() != meta_stat.dev() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&deleting_dir) else {
+        return;
+    };
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Ok(st) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if st.dev() != del_meta.dev() || st.file_type().is_symlink() {
+            continue;
+        }
+        if st.is_dir() {
+            if fs::remove_dir_all(&p).is_ok() {
+                removed_any = true;
+            }
+        } else if st.is_file() && fs::remove_file(&p).is_ok() {
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        let _ = fsync_directory(&deleting_dir);
+    }
 }
 
 fn find_contiguous_valid_stereo_pairs(video_dir: &Path) -> StorageResult<Vec<VerifiedStereoPair>> {
@@ -849,104 +910,228 @@ fn find_contiguous_valid_stereo_pairs(video_dir: &Path) -> StorageResult<Vec<Ver
         let right_name = format!("right_{idx:05}.mp4");
         let left_path = video_dir.join(&left_name);
         let right_path = video_dir.join(&right_name);
-        let left_ok = validate_mp4_boxes(&left_path).unwrap_or(false);
-        let right_ok = validate_mp4_boxes(&right_path).unwrap_or(false);
-        if !left_ok || !right_ok {
+        let left_info = inspect_mp4_segment(&left_path).ok().flatten();
+        let right_info = inspect_mp4_segment(&right_path).ok().flatten();
+        let (Some(l_samples), Some(r_samples)) = (left_info, right_info) else {
+            break;
+        };
+        if l_samples != r_samples {
             break;
         }
         pairs.push(VerifiedStereoPair {
             left_name,
             right_name,
+            sample_count: l_samples,
         });
     }
     Ok(pairs)
 }
 
 /// Fast structural ISO-BMFF (MP4) box walk verifying `ftyp` at offset 0, non-empty `mdat`,
-/// and finalized `moov` boxes are intact while rejecting unverified `size32 == 0` open tails.
+/// finalized `moov`, and (when `trak/mdia/minf/stbl/stsz` is present) non-zero `stsz` sample count.
 pub fn validate_mp4_boxes(path: &Path) -> StorageResult<bool> {
+    Ok(inspect_mp4_segment(path)?.is_some())
+}
+
+fn inspect_mp4_segment(path: &Path) -> StorageResult<Option<Option<u64>>> {
     let mut file = match open_readonly_safe(path) {
         Ok(f) => f,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     let st = fstat(file.as_raw_fd())
         .map_err(|err| StorageError::io("mp4_stat_failed", "fstat mp4 segment", err))?;
     if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-        return Ok(false);
+        return Ok(None);
     }
     let Ok(file_size) = u64::try_from(st.st_size) else {
-        return Ok(false);
+        return Ok(None);
     };
     if file_size < 32 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut offset = 0_u64;
     let mut saw_ftyp_at_zero = false;
     let mut saw_non_empty_mdat = false;
     let mut saw_moov = false;
+    let mut stsz_samples: Option<u64> = None;
+    let mut saw_trak = false;
     let mut box_count = 0_usize;
 
     while offset < file_size {
         box_count += 1;
         if box_count > 4096 || file_size - offset < 8 {
-            return Ok(false);
+            return Ok(None);
         }
-        let mut header = [0_u8; 8];
-        if read_exact_at(&mut file, offset, &mut header).is_err() {
-            return Ok(false);
-        }
-        let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        let box_type = &header[4..8];
-
-        let (box_size, header_len) = if size32 == 0 {
-            // Unfinalized open-ended box (`size32 == 0` to EOF) is rejected for crash recovery.
-            return Ok(false);
-        } else if size32 == 1 {
-            if file_size - offset < 16 {
-                return Ok(false);
-            }
-            let mut ext = [0_u8; 8];
-            if read_exact_at(&mut file, offset + 8, &mut ext).is_err() {
-                return Ok(false);
-            }
-            let ext_size = u64::from_be_bytes(ext);
-            if ext_size < 16 {
-                return Ok(false);
-            }
-            (ext_size, 16_u64)
-        } else {
-            let s = u64::from(size32);
-            if s < 8 {
-                return Ok(false);
-            }
-            (s, 8_u64)
+        let Some((box_type, box_size, header_len)) =
+            read_mp4_box_header(&mut file, offset, file_size)
+        else {
+            return Ok(None);
         };
 
         if offset == 0 {
-            if box_type != b"ftyp" || box_size < 16 {
-                return Ok(false);
+            if &box_type != b"ftyp" || box_size < 16 {
+                return Ok(None);
             }
             saw_ftyp_at_zero = true;
         }
 
-        if offset
-            .checked_add(box_size)
-            .is_none_or(|end| end > file_size)
-        {
-            return Ok(false);
-        }
-
-        if box_type == b"mdat" && box_size > header_len {
+        if &box_type == b"mdat" && box_size > header_len {
             saw_non_empty_mdat = true;
-        } else if box_type == b"moov" && box_size > header_len {
+        } else if &box_type == b"moov" && box_size > header_len {
             saw_moov = true;
+            let moov_start = offset + header_len;
+            let moov_end = offset + box_size;
+            match parse_moov_stsz_samples(&mut file, moov_start, moov_end) {
+                MoovStszOutcome::Invalid => return Ok(None),
+                MoovStszOutcome::NoTrak => {}
+                MoovStszOutcome::Samples(count) => {
+                    saw_trak = true;
+                    stsz_samples = Some(count);
+                }
+            }
         }
 
         offset += box_size;
     }
 
-    Ok(offset == file_size && saw_ftyp_at_zero && saw_non_empty_mdat && saw_moov)
+    if offset != file_size || !saw_ftyp_at_zero || !saw_non_empty_mdat || !saw_moov {
+        return Ok(None);
+    }
+    if saw_trak && stsz_samples.unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    Ok(Some(stsz_samples))
+}
+
+enum MoovStszOutcome {
+    NoTrak,
+    Samples(u64),
+    Invalid,
+}
+
+fn read_mp4_box_header(
+    file: &mut File,
+    offset: u64,
+    limit_end: u64,
+) -> Option<([u8; 4], u64, u64)> {
+    if limit_end.saturating_sub(offset) < 8 {
+        return None;
+    }
+    let mut header = [0_u8; 8];
+    read_exact_at(file, offset, &mut header).ok()?;
+    let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let box_type = [header[4], header[5], header[6], header[7]];
+    let (box_size, header_len) = if size32 == 0 {
+        return None;
+    } else if size32 == 1 {
+        if limit_end.saturating_sub(offset) < 16 {
+            return None;
+        }
+        let mut ext = [0_u8; 8];
+        read_exact_at(file, offset + 8, &mut ext).ok()?;
+        let ext_size = u64::from_be_bytes(ext);
+        if ext_size < 16 {
+            return None;
+        }
+        (ext_size, 16_u64)
+    } else {
+        let s = u64::from(size32);
+        if s < 8 {
+            return None;
+        }
+        (s, 8_u64)
+    };
+    if offset
+        .checked_add(box_size)
+        .is_none_or(|end| end > limit_end)
+    {
+        return None;
+    }
+    Some((box_type, box_size, header_len))
+}
+
+fn parse_moov_stsz_samples(file: &mut File, start: u64, end: u64) -> MoovStszOutcome {
+    let mut cursor = start;
+    let mut saw_trak = false;
+    let mut found_samples: Option<u64> = None;
+    let mut guard = 0_usize;
+    while cursor < end {
+        guard += 1;
+        if guard > 1024 {
+            return MoovStszOutcome::Invalid;
+        }
+        let Some((btype, bsize, hlen)) = read_mp4_box_header(file, cursor, end) else {
+            return MoovStszOutcome::Invalid;
+        };
+        if &btype == b"trak" {
+            saw_trak = true;
+            if let Some(samples) = find_stsz_in_container(file, cursor + hlen, cursor + bsize, 0) {
+                if samples == 0 {
+                    return MoovStszOutcome::Invalid;
+                }
+                found_samples = Some(samples);
+            } else {
+                return MoovStszOutcome::Invalid;
+            }
+        }
+        cursor += bsize;
+    }
+    if !saw_trak {
+        MoovStszOutcome::NoTrak
+    } else if let Some(n) = found_samples {
+        MoovStszOutcome::Samples(n)
+    } else {
+        MoovStszOutcome::Invalid
+    }
+}
+
+fn find_stsz_in_container(file: &mut File, start: u64, end: u64, depth: usize) -> Option<u64> {
+    if depth > 6 {
+        return None;
+    }
+    let mut cursor = start;
+    let mut guard = 0_usize;
+    while cursor < end {
+        guard += 1;
+        if guard > 1024 {
+            return None;
+        }
+        let (btype, bsize, hlen) = read_mp4_box_header(file, cursor, end)?;
+        let payload_start = cursor + hlen;
+        let payload_end = cursor + bsize;
+        if matches!(&btype, b"mdia" | b"minf" | b"stbl") {
+            if let Some(n) = find_stsz_in_container(file, payload_start, payload_end, depth + 1) {
+                return Some(n);
+            }
+        } else if &btype == b"stsz" {
+            let payload_len = payload_end.saturating_sub(payload_start);
+            if payload_len < 12 {
+                return None;
+            }
+            let mut stsz_hdr = [0_u8; 12];
+            read_exact_at(file, payload_start, &mut stsz_hdr).ok()?;
+            let sample_size =
+                u32::from_be_bytes([stsz_hdr[4], stsz_hdr[5], stsz_hdr[6], stsz_hdr[7]]);
+            let sample_count = u64::from(u32::from_be_bytes([
+                stsz_hdr[8],
+                stsz_hdr[9],
+                stsz_hdr[10],
+                stsz_hdr[11],
+            ]));
+            if sample_count == 0 {
+                return None;
+            }
+            if sample_size == 0
+                && payload_len < 12_u64.saturating_add(sample_count.saturating_mul(4))
+            {
+                return None;
+            }
+            return Some(sample_count);
+        }
+        cursor += bsize;
+    }
+    None
 }
 
 fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {

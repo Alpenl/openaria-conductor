@@ -116,12 +116,23 @@ class FactoryRecoveryTests(unittest.TestCase):
         ):
             self.assertTrue(device.allowed(ok_path))
 
-        # Voice bounds and enabled preservation checks.
+        # Voice bounds and enabled preservation checks (default enabled=True matches miro-ego-hw).
         legacy_vol_only = factory_profile(voice_volume=50, voice_enabled=None)
         device.validate(legacy_vol_only)
         self.assertEqual(
             device.voice_settings_payload(legacy_vol_only),
+            {"schema": "miro-ego.voice-settings.v1", "enabled": True, "volume": 50},
+        )
+        disabled_voice = factory_profile(voice_volume=50, voice_enabled=False)
+        device.validate(disabled_voice)
+        self.assertEqual(
+            device.voice_settings_payload(disabled_voice),
             {"schema": "miro-ego.voice-settings.v1", "enabled": False, "volume": 50},
+        )
+        omitted_voice = {k: v for k, v in factory_profile().items() if k != "voice"}
+        self.assertEqual(
+            device.voice_settings_payload(omitted_voice),
+            {"schema": "miro-ego.voice-settings.v1", "enabled": True, "volume": 80},
         )
         enabled_voice = factory_profile(voice_volume=75, voice_enabled=True)
         device.validate(enabled_voice)
@@ -384,6 +395,29 @@ class FactoryRecoveryTests(unittest.TestCase):
                     version="0.3.0",
                     commit="4" * 40,
                 )
+
+            # Reject mock-SDK encoder binary unless --allow-mock-encoder is explicitly enabled.
+            mock_enc_bin = tmp / "miro-ego-encoder-mock"
+            mock_enc_bin.write_bytes(aarch64_elf_stub(payload=b"mock-hobot-sdk: initialize\x00"))
+            with self.assertRaisesRegex(ValueError, "--allow-mock-encoder"):
+                build_bundle(
+                    miro_ego_bin=miro_bin,
+                    encoder_bin=mock_enc_bin,
+                    output=tmp / "rejected-mock-bundle",
+                    version="0.3.0",
+                    commit="5" * 40,
+                )
+            mock_archive = tmp / "allowed-mock-bundle.tar"
+            build_bundle(
+                miro_ego_bin=miro_bin,
+                encoder_bin=mock_enc_bin,
+                output=tmp / "allowed-mock-bundle",
+                archive=mock_archive,
+                version="0.3.0",
+                commit="5" * 40,
+                allow_mock_encoder=True,
+            )
+            provision.require_native_bundle(mock_archive)
 
     def test_native_bundle_validation_checks_aarch64_elf_and_exfat_support(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

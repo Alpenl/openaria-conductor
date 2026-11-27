@@ -169,8 +169,24 @@ impl DataVolumePaths {
         self.index_dir().join("catalog.bin")
     }
 
+    pub fn catalog_wal_file(&self) -> PathBuf {
+        self.index_dir().join("catalog.wal")
+    }
+
+    pub fn catalog_lock_file(&self) -> PathBuf {
+        self.index_dir().join("catalog.lock")
+    }
+
+    pub fn mount_clean_marker_file(&self) -> PathBuf {
+        self.index_dir().join("mount-clean.marker")
+    }
+
     pub fn staging_dir(&self) -> PathBuf {
         self.hidden_meta_dir().join("staging")
+    }
+
+    pub fn deleting_dir(&self) -> PathBuf {
+        self.hidden_meta_dir().join("deleting")
     }
 
     pub fn quarantine_dir(&self) -> PathBuf {

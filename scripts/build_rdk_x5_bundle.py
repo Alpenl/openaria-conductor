@@ -28,8 +28,13 @@ from scripts.release_version import project_version  # noqa: E402
 
 BUNDLE_SCHEMA = "miro-ego.rdk-x5-bundle.v1"
 BUNDLE_SIG_DOMAIN = b"miro-ego.rdk-x5-bundle-sig.v1\n"
-DEFAULT_SIGNING_SEED_MATERIAL = b"miro-ego-0.3.0-default-release-signing-seed"
+DEFAULT_RELEASE_SIGNING_SEED_LABEL = b"miro-ego-0.3.0-default-release-signing-seed"
+DEFAULT_SIGNING_SEED_MATERIAL = DEFAULT_RELEASE_SIGNING_SEED_LABEL
 TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
+AARCH64_RUST_TARGET = "aarch64-unknown-linux-gnu"
+AARCH64_ZIG_RUST_TARGET = "aarch64-unknown-linux-gnu.2.28"
+AARCH64_ZIG_CC_TARGET = "aarch64-linux-gnu.2.28"
+MOCK_ENCODER_MARKER = b"mock-hobot-sdk:"
 REQUIRED_BINARIES = ("bin/miro-ego", "bin/miro-ego-encoder")
 REQUIRED_DEPLOY_ASSETS = ("miro-ego-data-volume", "miro-ego-data-volume.service")
 REQUIRED_VOICE_ASSETS = (
@@ -38,6 +43,14 @@ REQUIRED_VOICE_ASSETS = (
     "recording_stopped.wav",
     "storage_low.wav",
     "error_alert.wav",
+)
+ENCODER_C_SOURCES = (
+    "miro_ego_stereo_encoder.c",
+    "miro_ego_stereo_pipeline.c",
+    "miro_ego_shm_ring.c",
+    "miro_ego_sha256.c",
+    "miro_ego_split.c",
+    "miro_ego_mp4_meta.c",
 )
 MAX_BUNDLE_FILES = 256
 MAX_BINARY_BYTES = 256 * 1024 * 1024
@@ -103,6 +116,20 @@ def sha256_file(path: Path) -> tuple[int, str, bytes]:
             hasher.update(chunk)
             total += len(chunk)
     return total, hasher.hexdigest(), bytes(header)
+
+
+def _file_contains_bytes(path: Path, needle: bytes) -> bool:
+    if not needle:
+        return False
+    overlap = len(needle) - 1
+    tail = b""
+    with path.open("rb") as src:
+        while chunk := src.read(64 * 1024):
+            window = tail + chunk
+            if needle in window:
+                return True
+            tail = window[-overlap:] if overlap > 0 else b""
+    return False
 
 
 def validate_aarch64_elf64(header: bytes, label: str) -> None:
@@ -196,6 +223,164 @@ def _resolve_commit(commit: str | None) -> str:
     return resolved
 
 
+def resolve_hobot_sdk_paths(
+    hb_sdk_root: Path | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> tuple[Path, Path] | None:
+    """Resolve ``(include_dir, lib_dir)`` for ``libmultimedia.so`` from ``HB_SDK_ROOT`` or env."""
+    env = os.environ if environ is None else environ
+    explicit_inc = env.get("HOBOT_SDK_INCLUDE", "").strip()
+    explicit_lib = env.get("HOBOT_SDK_LIB", "").strip()
+    if explicit_inc or explicit_lib:
+        if not (explicit_inc and explicit_lib):
+            raise ValueError(
+                "Both HOBOT_SDK_INCLUDE and HOBOT_SDK_LIB must be set when overriding Hobot SDK"
+            )
+        inc_path = Path(explicit_inc)
+        lib_path = Path(explicit_lib)
+        if not inc_path.is_dir() or not (lib_path / "libmultimedia.so").is_file():
+            raise ValueError(
+                f"Invalid Hobot SDK paths: expected directory {inc_path} and "
+                f"{lib_path / 'libmultimedia.so'}"
+            )
+        return inc_path, lib_path
+
+    sdk_root = hb_sdk_root
+    if sdk_root is None:
+        raw_root = env.get("HB_SDK_ROOT", "").strip()
+        if raw_root:
+            sdk_root = Path(raw_root)
+    if sdk_root is None:
+        return None
+
+    for inc_rel, lib_rel in (
+        ("include", "lib"),
+        ("usr/include", "usr/hobot/lib"),
+        ("usr/hobot/include", "usr/hobot/lib"),
+    ):
+        inc_candidate = sdk_root / inc_rel
+        lib_candidate = sdk_root / lib_rel
+        if inc_candidate.is_dir() and (lib_candidate / "libmultimedia.so").is_file():
+            return inc_candidate, lib_candidate
+
+    raise ValueError(
+        f"HB_SDK_ROOT ({sdk_root}) is missing Hobot multimedia headers or libmultimedia.so"
+    )
+
+
+def compile_miro_ego_binary(
+    *,
+    commit: str,
+    public_key_hex: str | None = None,
+    workspace_root: Path = ROOT,
+) -> Path:
+    """Compile AArch64 ``miro-ego`` with ``cargo --locked``."""
+    cargo_bin = shutil.which("cargo")
+    if cargo_bin is None:
+        raise ValueError("cargo is required to compile miro-ego when --miro-ego-bin is omitted")
+    env = dict(os.environ)
+    env["MIRO_EGO_GIT_COMMIT"] = commit
+    env.pop("MIRO_EGO_RELEASE_SIGNING_SEED_HEX", None)
+    if public_key_hex:
+        env["MIRO_EGO_RELEASE_PUBLIC_KEY_HEX"] = public_key_hex
+
+    if shutil.which("cargo-zigbuild") is not None:
+        cmd = [
+            cargo_bin,
+            "zigbuild",
+            "--locked",
+            "--release",
+            "--target",
+            AARCH64_ZIG_RUST_TARGET,
+            "-p",
+            "miro-ego-cli",
+        ]
+    else:
+        cmd = [
+            cargo_bin,
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            AARCH64_RUST_TARGET,
+            "-p",
+            "miro-ego-cli",
+        ]
+    subprocess.run(cmd, cwd=workspace_root, env=env, check=True)
+    built = workspace_root / "target" / AARCH64_RUST_TARGET / "release" / "miro-ego"
+    if not built.is_file():
+        raise ValueError(f"Expected compiled miro-ego binary at {built}")
+    return built
+
+
+def compile_encoder_binary(
+    output_bin: Path,
+    *,
+    hb_sdk_root: Path | None = None,
+    allow_mock_encoder: bool = False,
+    workspace_root: Path = ROOT,
+) -> Path:
+    """Compile AArch64 ``miro-ego-encoder``, requiring real Hobot SDK unless explicitly mocked."""
+    sdk_paths = resolve_hobot_sdk_paths(hb_sdk_root)
+    if sdk_paths is None and not allow_mock_encoder:
+        raise ValueError(
+            "Refusing to compile miro-ego-encoder without Hobot SDK: set HB_SDK_ROOT "
+            "(or HOBOT_SDK_INCLUDE + HOBOT_SDK_LIB), pass prebuilt --encoder-bin, "
+            "or pass --allow-mock-encoder for CI smoke builds"
+        )
+
+    csrc_dir = workspace_root / "csrc" / "miro-ego-encoder"
+    sources = [str(csrc_dir / name) for name in ENCODER_C_SOURCES]
+
+    if zig_bin := shutil.which("zig"):
+        cc_prefix = [zig_bin, "cc", "-target", AARCH64_ZIG_CC_TARGET]
+    elif aarch64_gcc := shutil.which("aarch64-linux-gnu-gcc"):
+        cc_prefix = [aarch64_gcc]
+    else:
+        raise ValueError(
+            "zig or aarch64-linux-gnu-gcc is required to cross-compile miro-ego-encoder"
+        )
+
+    output_bin.parent.mkdir(parents=True, exist_ok=True)
+    common_flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-std=gnu11"]
+    if sdk_paths is not None:
+        inc_dir, lib_dir = sdk_paths
+        cmd = [
+            *cc_prefix,
+            *common_flags,
+            f"-I{inc_dir}",
+            f"-I{csrc_dir}",
+            *sources,
+            f"-L{lib_dir}",
+            "-Wl,-rpath,/usr/hobot/lib",
+            f"-Wl,-rpath-link,{lib_dir}",
+            "-lmultimedia",
+            "-lpthread",
+            "-o",
+            str(output_bin),
+        ]
+    else:
+        stubs_dir = csrc_dir / "tests" / "stubs"
+        tests_dir = csrc_dir / "tests"
+        mock_src = tests_dir / "mock_hobot_sdk.c"
+        cmd = [
+            *cc_prefix,
+            *common_flags,
+            f"-I{stubs_dir}",
+            f"-I{csrc_dir}",
+            f"-I{tests_dir}",
+            *sources,
+            str(mock_src),
+            "-lpthread",
+            "-o",
+            str(output_bin),
+        ]
+
+    subprocess.run(cmd, cwd=workspace_root, check=True)
+    return output_bin
+
+
 def _is_executable_asset(path: Path) -> bool:
     with path.open("rb") as src:
         return src.read(2) == b"#!"
@@ -260,11 +445,22 @@ def build_bundle(
     voice_dir: Path = ROOT / "share" / "voice",
     archive: Path | None = None,
     signing_seed_hex: str | None = None,
+    allow_mock_encoder: bool = False,
 ) -> dict[str, Any]:
     """Assemble a verified pure-native Miro-Ego RDK X5 bundle directory (and optional tar)."""
     _validate_version(version)
     commit = _resolve_commit(commit)
     signing_seed = resolve_signing_seed(signing_seed_hex)
+
+    resolved_miro = miro_ego_bin.resolve()
+    resolved_encoder = encoder_bin.resolve()
+    if resolved_encoder.is_symlink() or not resolved_encoder.is_file():
+        raise ValueError(f"Expected a regular non-symlink file: {resolved_encoder}")
+    if not allow_mock_encoder and _file_contains_bytes(resolved_encoder, MOCK_ENCODER_MARKER):
+        raise ValueError(
+            "Refusing to package mock-SDK miro-ego-encoder into a hardware bundle "
+            "(pass --allow-mock-encoder only for non-production CI smoke bundles)"
+        )
 
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -280,8 +476,8 @@ def build_bundle(
         raise ValueError(f"Voice assets directory does not exist: {voice_dir}")
 
     binary_sources = {
-        "bin/miro-ego": miro_ego_bin.resolve(),
-        "bin/miro-ego-encoder": encoder_bin.resolve(),
+        "bin/miro-ego": resolved_miro,
+        "bin/miro-ego-encoder": resolved_encoder,
     }
 
     binaries: list[dict[str, Any]] = []
@@ -433,15 +629,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--miro-ego-bin",
-        required=True,
         type=Path,
-        help="Path to AArch64 ELF64 miro-ego binary",
+        help=(
+            "Path to prebuilt AArch64 ELF64 miro-ego binary "
+            "(compiles with cargo --locked if omitted)"
+        ),
     )
     parser.add_argument(
         "--encoder-bin",
-        required=True,
         type=Path,
-        help="Path to AArch64 ELF64 miro-ego-encoder binary",
+        help=(
+            "Path to prebuilt AArch64 ELF64 miro-ego-encoder binary "
+            "(compiles from csrc/miro-ego-encoder against HB_SDK_ROOT if omitted)"
+        ),
+    )
+    parser.add_argument(
+        "--hb-sdk-root",
+        type=Path,
+        help=(
+            "Optional Hobot SDK sysroot containing include/ and lib/libmultimedia.so "
+            "(or HB_SDK_ROOT)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-mock-encoder",
+        action="store_true",
+        help=(
+            "Explicitly permit building or packaging a non-production mock_hobot_sdk.c "
+            "miro-ego-encoder binary for CI smoke verification"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -485,17 +701,34 @@ def main(argv: list[str] | None = None) -> int:
 
     version = args.version if args.version is not None else project_version()
     commit = _resolve_commit(args.commit)
-    summary = build_bundle(
-        miro_ego_bin=args.miro_ego_bin,
-        encoder_bin=args.encoder_bin,
-        output=args.output,
-        version=version,
-        commit=commit,
-        deploy_dir=args.deploy_dir,
-        voice_dir=args.voice_dir,
-        archive=args.archive,
-        signing_seed_hex=args.signing_seed_hex,
-    )
+    seed = resolve_signing_seed(args.signing_seed_hex)
+    _, pub_hex = sign_manifest_bytes(b"", seed)
+
+    with tempfile.TemporaryDirectory(prefix="miro-ego-bundle-compile-") as tmp_build:
+        miro_bin = args.miro_ego_bin
+        if miro_bin is None:
+            miro_bin = compile_miro_ego_binary(commit=commit, public_key_hex=pub_hex)
+
+        encoder_bin = args.encoder_bin
+        if encoder_bin is None:
+            encoder_bin = compile_encoder_binary(
+                Path(tmp_build) / "miro-ego-encoder",
+                hb_sdk_root=args.hb_sdk_root,
+                allow_mock_encoder=args.allow_mock_encoder,
+            )
+
+        summary = build_bundle(
+            miro_ego_bin=miro_bin,
+            encoder_bin=encoder_bin,
+            output=args.output,
+            version=version,
+            commit=commit,
+            deploy_dir=args.deploy_dir,
+            voice_dir=args.voice_dir,
+            archive=args.archive,
+            signing_seed_hex=args.signing_seed_hex,
+            allow_mock_encoder=args.allow_mock_encoder,
+        )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0
 

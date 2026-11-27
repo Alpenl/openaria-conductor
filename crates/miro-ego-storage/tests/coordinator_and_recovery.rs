@@ -1,6 +1,6 @@
-use miro_ego_capture::session::schema_validation::SchemaValidator;
 use miro_ego_core::ids::{new_uuid_v4, new_uuid_v7};
 use miro_ego_core::paths::DataVolumePaths;
+use miro_ego_core::schema_validation::SchemaValidator;
 use miro_ego_storage::artifact_io::open_manifest;
 use miro_ego_storage::catalog::BinarySessionCatalog;
 use miro_ego_storage::coordinator::{
@@ -78,7 +78,8 @@ fn synthetic_valid_mp4(tag: &[u8]) -> Vec<u8> {
     // moov box (16 bytes)
     out.extend_from_slice(&16_u32.to_be_bytes());
     out.extend_from_slice(b"moov");
-    out.extend_from_slice(b"mvhd0000");
+    out.extend_from_slice(&8_u32.to_be_bytes());
+    out.extend_from_slice(b"mvhd");
     out
 }
 
@@ -2605,4 +2606,508 @@ fn p1_11_and_p2_12_maintenance_lock_retry_inflight_idempotency_diag_sanitization
     let _ = coord
         .stop_capture(CaptureStopRequest::user(), None)
         .unwrap();
+}
+
+#[test]
+fn wave3_catalog_v1_to_v2_migration_wal_batch_forget_readonly_and_clean_marker() {
+    use miro_ego_storage::catalog::IndexedSession;
+    use miro_ego_storage::util::crc32_ieee;
+    use miro_ego_storage::{
+        CATALOG_BINARY_FORMAT_VERSION, CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION,
+        CATALOG_WAL_MAGIC, CatalogEntry, SessionState,
+    };
+
+    let env = TestEnv::new("w3-catalog-wal");
+    let paths = env.paths();
+    let _ = paths.ensure_layout().unwrap();
+
+    // 1. Create a real sealed session directory + manual MEGOCAT1 v1 JSON payload on disk.
+    let sid_v1 = new_uuid_v7();
+    let rel_v1 = "2026-11-27/10-00-00";
+    let dir_v1 = paths.recordings_dir().join(rel_v1);
+    fs::create_dir_all(dir_v1.join("video")).unwrap();
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let backend = Arc::new(MockBackend::new());
+    let seed_coord = make_coordinator(&env, probe, backend);
+    let started = seed_coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let seeded_sid = started
+        .value
+        .snapshot
+        .active_recording
+        .unwrap()
+        .recording_state
+        .session_id;
+    let _ = seed_coord
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+    let seeded_entry = seed_coord
+        .catalog()
+        .get_indexed_session(&seeded_sid)
+        .unwrap()
+        .unwrap();
+    drop(seed_coord);
+    let _ = fs::remove_dir_all(&dir_v1);
+    let _ = sid_v1;
+
+    // Overwrite catalog.bin with a v1 JSON frame and remove catalog.wal.
+    let _ = fs::remove_file(paths.catalog_wal_file());
+    let v1_json = serde_json::to_vec(&json!({
+        "revision_seq": 7_u64,
+        "entries": [seeded_entry],
+        "diagnostics": [],
+    }))
+    .unwrap();
+    let mut v1_raw = Vec::new();
+    v1_raw.extend_from_slice(&CATALOG_BINARY_MAGIC);
+    v1_raw.extend_from_slice(&CATALOG_FORMAT_VERSION.to_le_bytes());
+    v1_raw.extend_from_slice(&crc32_ieee(&v1_json).to_le_bytes());
+    v1_raw.extend_from_slice(&(v1_json.len() as u32).to_le_bytes());
+    v1_raw.extend_from_slice(&v1_json);
+    fs::write(paths.catalog_file(), &v1_raw).unwrap();
+
+    // Open catalog -> transparently reads v1 JSON; compact() upgrades on-disk header to v2!
+    let cat = BinarySessionCatalog::open(paths.clone()).unwrap();
+    assert!(cat.get_indexed_session(&seeded_sid).unwrap().is_some());
+    cat.compact().unwrap();
+    let upgraded_raw = fs::read(paths.catalog_file()).unwrap();
+    assert_eq!(&upgraded_raw[0..8], &CATALOG_BINARY_MAGIC);
+    assert_eq!(
+        u32::from_le_bytes(upgraded_raw[8..12].try_into().unwrap()),
+        CATALOG_BINARY_FORMAT_VERSION
+    );
+
+    // 2. Admit 50 sessions -> appends to MEGOWAL1 WAL; batch `forget_paths` removes all 50 in 1 rev bump!
+    let mut batch_rels = Vec::with_capacity(50);
+    for i in 0..50_u32 {
+        let sid = new_uuid_v7();
+        let rel = format!("2026-11-27/11-{:02}-{:02}", i / 60, i % 60);
+        cat.admit_indexed_session(IndexedSession::from_basic_entry(CatalogEntry {
+            session_id: sid,
+            display_name: format!("Batch {i}"),
+            relative_dir: rel.clone(),
+            started_at: format!("2026-11-27T11:{:02}:{:02}Z", i / 60, i % 60),
+            duration_seconds: 1.0,
+            total_bytes: 128,
+            manifest_sha256: "a".repeat(64),
+            state: SessionState::Sealed,
+        }))
+        .unwrap();
+        batch_rels.push(rel);
+    }
+    let wal_bytes = fs::read(paths.catalog_wal_file()).unwrap();
+    assert_eq!(&wal_bytes[0..8], &CATALOG_WAL_MAGIC);
+
+    // Read-only open sees both snapshot + WAL entries without mutating files or sweeping temps.
+    let stray_tmp = paths.index_dir().join("catalog.bin.tmp.readonly-check");
+    fs::write(&stray_tmp, b"keep").unwrap();
+    let ro_cat = BinarySessionCatalog::open_read_only(paths.clone()).unwrap();
+    assert_eq!(ro_cat.list_sessions().unwrap().len(), 51);
+    assert!(
+        stray_tmp.is_file(),
+        "open_read_only must never unlink temp files"
+    );
+    fs::remove_file(&stray_tmp).unwrap();
+
+    let seq_before_forget = cat.revision_seq().unwrap();
+    let removed = cat.forget_paths(&batch_rels).unwrap();
+    assert_eq!(removed, 50);
+    assert_eq!(cat.revision_seq().unwrap(), seq_before_forget + 1);
+    assert_eq!(cat.list_sessions().unwrap().len(), 1);
+
+    // 3. Clean-mount marker skips full filesystem scan on clean startup.
+    cat.mark_mount_clean();
+    assert!(paths.mount_clean_marker_file().is_file());
+    let (fast_cat, skipped_scan) = BinarySessionCatalog::open_fast_if_clean(paths.clone()).unwrap();
+    assert!(skipped_scan);
+    assert_eq!(fast_cat.list_sessions().unwrap().len(), 1);
+    fast_cat.mark_mount_dirty();
+    assert!(!paths.mount_clean_marker_file().exists());
+    let (_, skipped_dirty) = BinarySessionCatalog::open_fast_if_clean(paths).unwrap();
+    assert!(!skipped_dirty);
+}
+
+#[test]
+fn wave3_trash_staged_delete_crash_replay_idle_safe_swap_and_audit_idle_eviction() {
+    use miro_ego_storage::audit::{ApiAuditEvent, AuditConfig, AuditLogger};
+
+    let env = TestEnv::new("w3-del-swap-audit");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let backend = Arc::new(MockBackend::new());
+    let coord = make_coordinator(&env, probe.clone(), Arc::clone(&backend));
+
+    let vol_for_audit = Arc::clone(coord.volume());
+    let audit = Arc::new(AuditLogger::new(
+        env.paths(),
+        AuditConfig {
+            idle_close_after: Duration::from_millis(25),
+            ..AuditConfig::default()
+        },
+        Arc::new(move || vol_for_audit.is_mounted_and_writable()),
+    ));
+    coord.set_audit_logger(Arc::clone(&audit));
+
+    // 1. AuditLogger closes idle descriptor automatically on 1 Hz supervisor tick.
+    let _ = audit
+        .record(&ApiAuditEvent::new(
+            "req-1",
+            None,
+            "getDevice",
+            None,
+            "allowed",
+        ))
+        .unwrap();
+    assert!(audit.has_open_file());
+    thread::sleep(Duration::from_millis(40));
+    let _ = coord.enforce_storage_reserve().unwrap();
+    assert!(
+        !audit.has_open_file(),
+        "idle AuditLogger handle must auto-close on reserve supervisor tick"
+    );
+
+    // Record two sessions (`sid1`, `sid2`).
+    let s1 = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid1 = s1
+        .value
+        .snapshot
+        .active_recording
+        .unwrap()
+        .recording_state
+        .session_id;
+    let _ = coord
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+    let s2 = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid2 = s2
+        .value
+        .snapshot
+        .active_recording
+        .unwrap()
+        .recording_state
+        .session_id;
+    let _ = coord
+        .stop_capture(CaptureStopRequest::user(), None)
+        .unwrap();
+
+    // 2. `Idle`-state `SafeSwap` returns `None` (`204`), releases volume, and persists receipt for latest session!
+    let idle_swap = coord
+        .stop_capture(CaptureStopRequest::safe_swap(), Some("idle-swap-key"))
+        .unwrap();
+    assert!(idle_swap.value.is_none());
+    assert!(coord.volume().is_volume_released());
+    let receipt = coord
+        .safe_swap_receipt()
+        .unwrap()
+        .expect("Idle SafeSwap must emit SafeSwapReceipt for latest sealed session")
+        .receipt;
+    assert_eq!(receipt.session_id, sid2);
+    assert_eq!(receipt.open_handle_count, 0);
+    coord.refresh_volume_admission().unwrap();
+
+    // 3. Simulate mid-batch delete crash (`sid2` moved into `.miro-ego/deleting/<sid2>`, `sid1` still in
+    //    `recordings/`, and `pending_delete` persisted in `coordinator-receipts.json`).
+    let e1 = coord.catalog().get_indexed_session(&sid1).unwrap().unwrap();
+    let e2 = coord.catalog().get_indexed_session(&sid2).unwrap().unwrap();
+    let del_req = DeleteSessionsRequest {
+        schema: SESSION_DELETE_REQUEST_SCHEMA.to_owned(),
+        sessions: vec![
+            DeleteSessionTarget {
+                session_id: sid1.clone(),
+                manifest_sha256: e1.manifest_sha256.clone(),
+            },
+            DeleteSessionTarget {
+                session_id: sid2.clone(),
+                manifest_sha256: e2.manifest_sha256.clone(),
+            },
+        ],
+    };
+    let req_hash = sha256_hex(&serde_json::to_vec(&del_req).unwrap());
+    fs::create_dir_all(env.paths().deleting_dir()).unwrap();
+    fs::rename(
+        env.paths().recordings_dir().join(&e2.relative_dir),
+        env.paths().deleting_dir().join(&sid2),
+    )
+    .unwrap();
+    let receipts_path = env.paths().receipts_dir().join("coordinator-receipts.json");
+    let mut raw_receipts: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipts_path).unwrap()).unwrap();
+    raw_receipts["pending_delete"] = json!({
+        "principal_id": "op-crash",
+        "key": "crash-del-key",
+        "request_hash": req_hash,
+        "targets": [[sid2, e2.relative_dir], [sid1, e1.relative_dir]],
+        "recorded_at": "2026-11-27T12:00:00Z",
+    });
+    fs::write(&receipts_path, serde_json::to_vec(&raw_receipts).unwrap()).unwrap();
+    drop(coord);
+
+    // Boot fresh coordinator + run startup recovery -> completes interrupted delete & replays 200 OK!
+    let coord_recovered = make_coordinator(&env, probe, backend);
+    let _ = coord_recovered.recover_on_startup().unwrap();
+    assert!(
+        coord_recovered
+            .catalog()
+            .list_sessions()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read_dir(env.paths().deleting_dir()).unwrap().count(), 0);
+
+    let replayed = coord_recovered
+        .delete_sessions_for_principal(del_req, "crash-del-key", "op-crash")
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.value.deleted_session_ids, vec![sid2, sid1]);
+}
+
+fn synthetic_mp4_with_stsz(sample_count: u32) -> Vec<u8> {
+    fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let len = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(len as usize);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(fourcc);
+        out.extend_from_slice(payload);
+        out
+    }
+    let mut stsz_body = Vec::new();
+    stsz_body.extend_from_slice(&0_u32.to_be_bytes()); // version + flags
+    stsz_body.extend_from_slice(&64_u32.to_be_bytes()); // constant sample_size = 64
+    stsz_body.extend_from_slice(&sample_count.to_be_bytes());
+    let stsz = mp4_box(b"stsz", &stsz_body);
+    let stbl = mp4_box(b"stbl", &stsz);
+    let minf = mp4_box(b"minf", &stbl);
+    let mdia = mp4_box(b"mdia", &minf);
+    let trak = mp4_box(b"trak", &mdia);
+    let moov = mp4_box(b"moov", &trak);
+
+    let mut out = mp4_box(b"ftyp", b"isom\0\0\x02\0");
+    out.extend_from_slice(&mp4_box(b"mdat", b"encoded-samples"));
+    out.extend_from_slice(&moov);
+    out
+}
+
+#[test]
+fn wave3_clock_guard_provenance_logs_async_stop_stsz_validation_and_recovery_backoff() {
+    use miro_ego_storage::coordinator::{ClockSyncProbe, ClockSyncSnapshot, ClockSyncSource};
+
+    struct TestClockProbe {
+        synced: AtomicBool,
+    }
+    impl ClockSyncProbe for TestClockProbe {
+        fn snapshot(&self) -> ClockSyncSnapshot {
+            let is_synced = self.synced.load(Ordering::Acquire);
+            ClockSyncSnapshot {
+                boot_id: "11111111-2222-4333-8444-555555555555".to_owned(),
+                source: if is_synced {
+                    ClockSyncSource::Client
+                } else {
+                    ClockSyncSource::Unsynchronized
+                },
+                unix_time_ms: 1_764_200_000_000,
+                monotonic_ns: 9_000_000_000,
+                synchronized_at_ms: is_synced.then_some(1_764_200_000_000),
+            }
+        }
+    }
+
+    struct DelayedFinishBackend;
+    struct DelayedFinishHandle(PathBuf);
+    impl ActiveCaptureHandle for DelayedFinishHandle {
+        fn progress(&self) -> CaptureProgressSnapshot {
+            CaptureProgressSnapshot {
+                elapsed_seconds: 1.0,
+                captured_frames: 30,
+                bytes_written: 512,
+            }
+        }
+        fn finish(self: Box<Self>, reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+            thread::sleep(Duration::from_millis(120));
+            Box::new(MockCaptureHandle {
+                staging_dir: self.0,
+                fail_on_finish: false,
+            })
+            .finish(reason)
+        }
+        fn abort(self: Box<Self>) {}
+    }
+    impl CaptureBackend for DelayedFinishBackend {
+        fn is_camera_connected(&self) -> bool {
+            true
+        }
+        fn camera_focus(&self) -> StorageResult<Option<CameraFocusStatus>> {
+            Ok(None)
+        }
+        fn set_camera_focus(&self, _: &CameraFocusSetRequest) -> StorageResult<CameraFocusStatus> {
+            Err(StorageError::unsupported("camera_focus_unsupported", "n/a"))
+        }
+        fn begin_capture(
+            &self,
+            req: &BackendStartRequest,
+        ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
+            Ok(Box::new(DelayedFinishHandle(req.staging_dir.clone())))
+        }
+        fn runtime_observation(&self) -> RuntimeObservation {
+            RuntimeObservation::default_with_camera(true, None)
+        }
+    }
+
+    let env = TestEnv::new("w3-clock-async-stsz");
+    let cal_file = env.run_dir.join("camera-calibration.json");
+    fs::write(
+        &cal_file,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "miro-ego.calibration.v1",
+            "baseline_meters": 0.063
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let mut policy = VolumePolicy::production(1024 * 1024 * 1024, 100);
+    policy.system_state_root = Some(env.root.clone());
+    let vol = Arc::new(ExfatVolumeManager::with_probe(
+        env.paths(),
+        policy,
+        Arc::new(probe),
+    ));
+    let _ = vol.ensure_layout().unwrap();
+    let cat = Arc::new(BinarySessionCatalog::open(env.paths()).unwrap());
+    let clock_probe = Arc::new(TestClockProbe {
+        synced: AtomicBool::new(false),
+    });
+    let cfg = CoordinatorConfig {
+        device_id: new_uuid_v4(),
+        device_label: "Miro-Ego-87654321".to_owned(),
+        hardware_fingerprint: format!("sha256:{}", "f".repeat(64)),
+        run_dir: Some(env.run_dir.clone()),
+        require_clock_sync: true,
+        calibration_file: Some(cal_file),
+        ..CoordinatorConfig::default()
+    };
+    let coord = Arc::new(
+        CaptureCoordinator::new(cfg, vol, Arc::clone(&cat), Arc::new(DelayedFinishBackend))
+            .with_clock_probe(Arc::clone(&clock_probe) as Arc<dyn ClockSyncProbe>),
+    );
+    let session_validator = load_schema("miro-ego-device-session-v1.schema.json");
+
+    // 1. Unsynchronized clock blocks readiness and startCapture (`409 clock_unsynchronized`).
+    let r_unsync = coord.capture_readiness().unwrap();
+    assert!(!r_unsync.allowed);
+    assert_eq!(r_unsync.code, "clock_unsynchronized");
+    let err_unsync = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap_err();
+    assert_eq!(err_unsync.code(), "clock_unsynchronized");
+    assert_eq!(err_unsync.http_status(), 409);
+
+    // 2. Synchronize clock -> startCapture succeeds; `begin_stop_capture_for_principal` returns
+    //    `202` (`finalizing`) immediately without waiting for the 120ms finish drain!
+    clock_probe.synced.store(true, Ordering::Release);
+    assert!(coord.capture_readiness().unwrap().allowed);
+    let started = coord
+        .start_capture(CaptureStartRequest::new_production(), None)
+        .unwrap();
+    let sid = started
+        .value
+        .snapshot
+        .active_recording
+        .unwrap()
+        .recording_state
+        .session_id;
+
+    let t0 = std::time::Instant::now();
+    let async_stop = coord
+        .begin_stop_capture_for_principal(CaptureStopRequest::user(), Some("async-stop-k"), "op1")
+        .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_millis(80),
+        "begin_stop_capture_for_principal must return 202 before 120ms finish completes"
+    );
+    assert_eq!(
+        async_stop.value.as_ref().unwrap().snapshot.device_state,
+        "finalizing"
+    );
+    assert_eq!(
+        coord.wait_until_not_busy(Duration::from_secs(3)).unwrap(),
+        CapturePhase::Idle
+    );
+
+    let indexed = cat.get_indexed_session(&sid).unwrap().unwrap();
+    let opened = open_manifest(
+        &env.paths().recordings_dir(),
+        &indexed.relative_dir,
+        Some(&sid),
+    )
+    .unwrap();
+    assert!(
+        session_validator
+            .is_valid(std::str::from_utf8(&opened.raw_bytes).unwrap())
+            .unwrap()
+    );
+    let roles: Vec<&str> = opened.parsed["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["role"].as_str())
+        .collect();
+    assert!(roles.contains(&"log.clock-calibration"));
+    assert!(roles.contains(&"log.camera-calibration"));
+
+    // 3. Recovery MP4 `stsz` validation: mismatched left(3) vs right(2) is quarantined; matching(2,2) recovers!
+    let bad_sid = new_uuid_v7();
+    let bad_dir = env.paths().staging_dir().join(format!("{bad_sid}.partial"));
+    fs::create_dir_all(bad_dir.join("video")).unwrap();
+    fs::write(
+        bad_dir.join("video/left_00000.mp4"),
+        synthetic_mp4_with_stsz(3),
+    )
+    .unwrap();
+    fs::write(
+        bad_dir.join("video/right_00000.mp4"),
+        synthetic_mp4_with_stsz(2),
+    )
+    .unwrap();
+
+    let good_sid = new_uuid_v7();
+    let good_dir = env
+        .paths()
+        .staging_dir()
+        .join(format!("{good_sid}.partial"));
+    fs::create_dir_all(good_dir.join("video")).unwrap();
+    fs::write(
+        good_dir.join("video/left_00000.mp4"),
+        synthetic_mp4_with_stsz(2),
+    )
+    .unwrap();
+    fs::write(
+        good_dir.join("video/right_00000.mp4"),
+        synthetic_mp4_with_stsz(2),
+    )
+    .unwrap();
+    fs::write(
+        good_dir.join("frames.ndjson"),
+        b"{\"frame\":0}\n{\"frame\":1}\n{\"frame\":2}\n",
+    )
+    .unwrap();
+    fs::write(good_dir.join("imu.ndjson"), b"{\"seq\":0}\n").unwrap();
+
+    let rep = coord.recover_on_startup().unwrap();
+    assert_eq!(rep.recovered, 1);
+    assert_eq!(rep.quarantined, 1);
+    assert!(cat.get_indexed_session(&bad_sid).unwrap().is_none());
+    let good_idx = cat.get_indexed_session(&good_sid).unwrap().unwrap();
+    let good_man = open_manifest(
+        &env.paths().recordings_dir(),
+        &good_idx.relative_dir,
+        Some(&good_sid),
+    )
+    .unwrap();
+    assert_eq!(good_man.parsed["video"]["segments"][0]["end_frame"], 2);
+    assert_eq!(good_man.parsed["frames"]["count"], 2);
 }

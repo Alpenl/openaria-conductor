@@ -21,6 +21,7 @@ const KNOWN_IMU_SELECTOR: u8 = 1;
 const SAMPLES_PER_PACKET: usize = 2;
 const DEVICE_TIMESTAMP_MODULUS: u64 = 1 << 24;
 const DEFAULT_STALE_POLL: Duration = Duration::from_millis(1);
+const DEFAULT_HALF_SAMPLE_PERIOD_NS: u64 = 1_250_000;
 const XU_GUID_BYTES: [u8; 16] = [
     0x2c, 0xf4, 0xc2, 0xd5, 0x08, 0x18, 0x9f, 0x4d, 0xbe, 0x56, 0x75, 0x3e, 0x27, 0x1c, 0x92, 0x44,
 ];
@@ -157,6 +158,12 @@ struct IoState {
     synchronizer: TimeSynchronizer,
     packet_sequence: u64,
     sample_sequence: u64,
+    last_device_ticks: Option<u64>,
+    min_positive_tick_delta: Option<u64>,
+    nominal_packet_ticks: Option<u64>,
+    observed_tick_deltas: usize,
+    last_packet_monotonic_ns: Option<u64>,
+    last_sample_monotonic_ns: Option<u64>,
 }
 
 impl Collector {
@@ -183,17 +190,12 @@ impl Collector {
             None => discover_uvc_xu_unit(device)?,
         };
         let fd = open_device(device)?;
-        let mut io = IoState {
-            fd: Some(fd),
+        let mut io = IoState::new(
+            Some(fd),
             unit,
             selector,
-            stale_poll_interval: stale_poll_interval.unwrap_or(DEFAULT_STALE_POLL),
-            last_payload: None,
-            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
-            synchronizer: TimeSynchronizer::default(),
-            packet_sequence: 0,
-            sample_sequence: 0,
-        };
+            stale_poll_interval.unwrap_or(DEFAULT_STALE_POLL),
+        );
         if let Err(error) = io.verify_packet_length() {
             io.close();
             return Err(error);
@@ -267,17 +269,12 @@ impl Collector {
     #[cfg(test)]
     pub(crate) fn test_with_fd(fd: Option<RawFd>) -> Self {
         Self {
-            io: Mutex::new(IoState {
+            io: Mutex::new(IoState::new(
                 fd,
-                unit: KNOWN_IMU_UNIT,
-                selector: KNOWN_IMU_SELECTOR,
-                stale_poll_interval: Duration::from_millis(1),
-                last_payload: None,
-                unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
-                synchronizer: TimeSynchronizer::default(),
-                packet_sequence: 0,
-                sample_sequence: 0,
-            }),
+                KNOWN_IMU_UNIT,
+                KNOWN_IMU_SELECTOR,
+                Duration::from_millis(1),
+            )),
             latest_observation: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
@@ -294,6 +291,25 @@ impl Drop for Collector {
 }
 
 impl IoState {
+    fn new(fd: Option<RawFd>, unit: u8, selector: u8, stale_poll_interval: Duration) -> Self {
+        Self {
+            fd,
+            unit,
+            selector,
+            stale_poll_interval,
+            last_payload: None,
+            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
+            synchronizer: TimeSynchronizer::default(),
+            packet_sequence: 0,
+            sample_sequence: 0,
+            last_device_ticks: None,
+            min_positive_tick_delta: None,
+            nominal_packet_ticks: None,
+            observed_tick_deltas: 0,
+            last_packet_monotonic_ns: None,
+            last_sample_monotonic_ns: None,
+        }
+    }
     fn verify_packet_length(&mut self) -> Result<(), ImuError> {
         let payload = self.query(UVC_GET_LEN, 2, "xu_query_failed")?;
         if payload.len() != 2 {
@@ -329,10 +345,64 @@ impl IoState {
             packet_read.host_read_start_ns,
             packet_read.host_read_end_ns,
         )?;
-        let host_ns = midpoint_ns(packet_read.host_read_start_ns, packet_read.host_read_end_ns);
+
+        let mut dropped_samples = 0_u64;
+        if let Some(prev_ticks) = self.last_device_ticks {
+            let tick_delta = device_ticks.saturating_sub(prev_ticks);
+            if tick_delta > 0 {
+                if let Some(nominal) = self.nominal_packet_ticks
+                    && nominal > 0
+                {
+                    if u128::from(tick_delta) * 2 > u128::from(nominal) * 3 {
+                        let rounded_packets = (u128::from(tick_delta) * 2 + u128::from(nominal))
+                            / (u128::from(nominal) * 2);
+                        let missed_packets = u64::try_from(rounded_packets.saturating_sub(1))
+                            .unwrap_or(u64::MAX)
+                            .max(1);
+                        dropped_samples = missed_packets.saturating_mul(SAMPLES_PER_PACKET as u64);
+                    } else if tick_delta < nominal {
+                        self.nominal_packet_ticks = Some(tick_delta);
+                    }
+                }
+                self.min_positive_tick_delta = Some(
+                    self.min_positive_tick_delta
+                        .map_or(tick_delta, |cur| cur.min(tick_delta)),
+                );
+                self.observed_tick_deltas = self.observed_tick_deltas.saturating_add(1);
+                if self.nominal_packet_ticks.is_none() && self.observed_tick_deltas >= 2 {
+                    self.nominal_packet_ticks = self.min_positive_tick_delta;
+                }
+            }
+        }
+        self.last_device_ticks = Some(device_ticks);
+
+        let packet_mono_ns =
+            midpoint_ns(packet_read.host_read_start_ns, packet_read.host_read_end_ns);
+        let half_sample_period_ns = self
+            .last_packet_monotonic_ns
+            .and_then(|prev| packet_mono_ns.checked_sub(prev))
+            .map(|packet_dt| (packet_dt / (SAMPLES_PER_PACKET as u64 * 2)).max(1))
+            .unwrap_or(DEFAULT_HALF_SAMPLE_PERIOD_NS)
+            .min(DEFAULT_HALF_SAMPLE_PERIOD_NS * 4);
+        let raw_sample0_ns = packet_mono_ns.saturating_sub(half_sample_period_ns);
+        let min_sample0_ns = match self.last_sample_monotonic_ns {
+            Some(prev) => prev.saturating_add(1),
+            None => 1.min(packet_mono_ns),
+        };
+        let max_sample0_ns = packet_mono_ns.saturating_sub(1);
+        let sample0_mono_ns = if min_sample0_ns <= max_sample0_ns {
+            raw_sample0_ns.clamp(min_sample0_ns, max_sample0_ns)
+        } else {
+            packet_mono_ns
+        };
+        let sample_mono = [sample0_mono_ns, packet_mono_ns];
+        self.last_packet_monotonic_ns = Some(packet_mono_ns);
+        self.last_sample_monotonic_ns = Some(packet_mono_ns);
+
         let packet_sequence = self.packet_sequence;
         let first_sequence = self.sample_sequence;
         let samples = packet.samples.map(|raw| {
+            let idx = usize::from(raw.sample_index);
             let sequence = first_sequence + u64::from(raw.sample_index);
             ImuSample {
                 sequence,
@@ -342,7 +412,7 @@ impl IoState {
                 device_ticks,
                 host_read_start_ns: packet_read.host_read_start_ns,
                 host_read_end_ns: packet_read.host_read_end_ns,
-                host_monotonic_ns: host_ns,
+                host_monotonic_ns: sample_mono.get(idx).copied().unwrap_or(packet_mono_ns),
                 accelerometer: raw.accelerometer,
                 gyroscope: raw.gyroscope,
                 sync_offset_ns: estimate.offset_ns,
@@ -354,7 +424,7 @@ impl IoState {
         self.sample_sequence += SAMPLES_PER_PACKET as u64;
         Ok(ImuObservation {
             samples,
-            dropped_samples: 0,
+            dropped_samples,
         })
     }
 
@@ -943,17 +1013,7 @@ mod tests {
 
     #[test]
     fn same_frame_updates_survive_filter_clock_and_observation() {
-        let mut state = IoState {
-            fd: None,
-            unit: 3,
-            selector: 1,
-            stale_poll_interval: Duration::from_millis(1),
-            last_payload: None,
-            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
-            synchronizer: TimeSynchronizer::default(),
-            packet_sequence: 0,
-            sample_sequence: 0,
-        };
+        let mut state = IoState::new(None, 3, 1, Duration::from_millis(1));
         let mut samples = Vec::new();
         let mut last_observation = None;
         for (index, (frame, seed)) in [(0xFF_FFFF, -6), (0xFF_FFFF, -5), (0, -4), (3, -3)]
@@ -972,6 +1032,9 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(observation.dropped_samples, 0);
+            assert!(
+                observation.samples[0].host_monotonic_ns < observation.samples[1].host_monotonic_ns
+            );
             assert_eq!(observation.samples[0].packet_sequence, index as u64);
             assert_eq!(observation.samples[0].accelerometer.x, seed);
             assert_eq!(observation.samples[1].gyroscope.z, seed + 11);
@@ -982,6 +1045,12 @@ mod tests {
             samples.extend(observation.samples.clone());
             last_observation = Some(observation);
         }
+        assert!(
+            samples
+                .windows(2)
+                .all(|w| w[0].host_monotonic_ns < w[1].host_monotonic_ns),
+            "expected strictly increasing intra- and inter-packet host_monotonic_ns"
+        );
         assert_eq!(
             samples
                 .iter()
@@ -995,18 +1064,33 @@ mod tests {
     }
 
     #[test]
+    fn dropped_samples_detected_when_device_ticks_exceed_one_point_five_nominal() {
+        let mut state = IoState::new(None, 3, 1, Duration::from_millis(1));
+        for (idx, ticks) in [1_000_u32, 2_000, 3_000, 4_400, 6_000, 9_000]
+            .into_iter()
+            .enumerate()
+        {
+            let start = 2_000_000_000 + (idx as u64) * 5_000_000;
+            let obs = state
+                .observe_packet(PacketRead {
+                    payload: packet(ticks, idx as i16),
+                    host_read_start_ns: start,
+                    host_read_end_ns: start + 200_000,
+                })
+                .unwrap();
+            let expected_drops = match ticks {
+                6_000 => 2, // delta=1600 > 1.5*1000 -> 1 missed packet = 2 samples
+                9_000 => 4, // delta=3000 > 1.5*1000 -> 2 missed packets = 4 samples
+                _ => 0,     // delta=1400 <= 1.5*1000 -> jitter tolerated
+            };
+            assert_eq!(obs.dropped_samples, expected_drops, "at ticks={ticks}");
+            assert!(obs.samples[0].host_monotonic_ns < obs.samples[1].host_monotonic_ns);
+        }
+    }
+
+    #[test]
     fn latest_observation_and_close_never_block_on_io_lock() {
-        let mut io = IoState {
-            fd: None,
-            unit: 3,
-            selector: 1,
-            stale_poll_interval: Duration::from_millis(1),
-            last_payload: None,
-            unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
-            synchronizer: TimeSynchronizer::default(),
-            packet_sequence: 0,
-            sample_sequence: 0,
-        };
+        let mut io = IoState::new(None, 3, 1, Duration::from_millis(1));
         let obs = io
             .observe_packet(PacketRead {
                 payload: packet(10, 1),
@@ -1160,17 +1244,7 @@ mod tests {
     #[test]
     fn collector_read_preserves_io_on_retryable_error_and_closes_on_fatal() {
         let collector = Collector {
-            io: Mutex::new(IoState {
-                fd: None,
-                unit: 3,
-                selector: 1,
-                stale_poll_interval: Duration::from_millis(1),
-                last_payload: None,
-                unwrapper: TimestampUnwrapper::new(DEVICE_TIMESTAMP_MODULUS),
-                synchronizer: TimeSynchronizer::default(),
-                packet_sequence: 0,
-                sample_sequence: 0,
-            }),
+            io: Mutex::new(IoState::new(None, 3, 1, Duration::from_millis(1))),
             latest_observation: Mutex::new(None),
             stop: AtomicBool::new(false),
         };

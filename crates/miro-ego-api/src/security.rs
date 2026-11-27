@@ -379,9 +379,8 @@ impl SecurityPolicy {
         }
     }
 
-    /// Verify `X-CSRF-Token` in constant time against either an explicit configured `csrf_token`
-    /// or (in `customer` profile per `docs/miro-ego-v1-api-migration.md:195`) the caller's own
-    /// authenticated bearer token.
+    /// Verify `X-CSRF-Token` in constant time against an explicit configured `csrf_token`, or
+    /// when `csrf_token` is not configured (`None`), against the caller's own authenticated bearer token.
     pub fn verify_csrf_for_caller(
         &self,
         candidate: Option<&str>,
@@ -394,15 +393,13 @@ impl SecurityPolicy {
             return false;
         }
         let actual_digest = sha256_digest_bytes(actual.as_bytes());
-        let matches_configured = self
-            .csrf_token_digest
-            .as_ref()
-            .is_some_and(|expected_digest| bool::from(actual_digest.ct_eq(expected_digest)));
-        let matches_bearer = authenticated_bearer.is_some_and(|bearer| {
+        if let Some(expected_digest) = &self.csrf_token_digest {
+            return bool::from(actual_digest.ct_eq(expected_digest));
+        }
+        authenticated_bearer.is_some_and(|bearer| {
             let bearer_digest = sha256_digest_bytes(bearer.as_bytes());
             bool::from(actual_digest.ct_eq(&bearer_digest))
-        });
-        matches_configured | matches_bearer
+        })
     }
 }
 
@@ -453,9 +450,30 @@ fn is_valid_port(port: &str) -> bool {
         && port.parse::<u16>().is_ok_and(|p| p >= 1)
 }
 
-/// Extract normalized lowercase hostname from a single HTTP `Host` header.
-pub fn extract_host_hostname(host_header: &str) -> Option<String> {
-    let raw = host_header.trim();
+fn parse_ipv6_with_optional_zone(addr: &str) -> Option<Ipv6Addr> {
+    let (ip_part, has_zone) = match addr.split_once('%') {
+        Some((ip_s, zone_raw)) => {
+            let zone = zone_raw.strip_prefix("25").unwrap_or(zone_raw);
+            let valid_zone = (1..=16).contains(&zone.len())
+                && zone
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+            if !valid_zone {
+                return None;
+            }
+            (ip_s, true)
+        }
+        None => (addr, false),
+    };
+    let ip: Ipv6Addr = ip_part.parse().ok()?;
+    if has_zone && (ip.segments()[0] & 0xffc0) != 0xfe80 {
+        return None;
+    }
+    Some(ip)
+}
+
+fn extract_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
+    let raw = authority.trim();
     if raw.is_empty()
         || raw
             .bytes()
@@ -467,28 +485,36 @@ pub fn extract_host_hostname(host_header: &str) -> Option<String> {
         let end = after_open.find(']')?;
         let addr = &after_open[..end];
         let rest = &after_open[end + 1..];
-        if !rest.is_empty() {
-            let port = rest.strip_prefix(':')?;
-            if !is_valid_port(port) {
+        let port = if rest.is_empty() {
+            None
+        } else {
+            let p_str = rest.strip_prefix(':')?;
+            if !is_valid_port(p_str) {
                 return None;
             }
-        }
-        let ip: Ipv6Addr = addr.parse().ok()?;
-        return Some(ip.to_string().to_ascii_lowercase());
+            p_str.parse::<u16>().ok()
+        };
+        let ip = parse_ipv6_with_optional_zone(addr)?;
+        return Some((ip.to_string().to_ascii_lowercase(), port));
     }
-    let hostname = if let Some((host_part, port_part)) = raw.split_once(':') {
+    let (hostname, port) = if let Some((host_part, port_part)) = raw.split_once(':') {
         if !is_valid_port(port_part) {
             return None;
         }
-        host_part
+        (host_part, port_part.parse::<u16>().ok())
     } else {
-        raw
+        (raw, None)
     };
     let normalized = hostname.trim_end_matches('.').to_ascii_lowercase();
     if normalized.is_empty() {
         return None;
     }
-    Some(normalized)
+    Some((normalized, port))
+}
+
+/// Extract normalized lowercase hostname from a single HTTP `Host` header.
+pub fn extract_host_hostname(host_header: &str) -> Option<String> {
+    extract_host_and_port(host_header).map(|(host, _)| host)
 }
 
 /// Build the normalized `Host` allowlist from the server's listen address and configured hosts.
@@ -508,7 +534,7 @@ where
             if !is_unspecified_ip(&norm) {
                 hosts.insert(norm);
             }
-        } else if let Ok(v6) = trimmed_listen.parse::<Ipv6Addr>()
+        } else if let Some(v6) = parse_ipv6_with_optional_zone(trimmed_listen)
             && !v6.is_unspecified()
         {
             hosts.insert(v6.to_string().to_ascii_lowercase());
@@ -520,7 +546,7 @@ where
             if !is_unspecified_ip(&extracted) {
                 hosts.insert(extracted);
             }
-        } else if let Ok(v6) = text.parse::<Ipv6Addr>()
+        } else if let Some(v6) = parse_ipv6_with_optional_zone(text)
             && !v6.is_unspecified()
         {
             hosts.insert(v6.to_string().to_ascii_lowercase());
@@ -608,7 +634,16 @@ pub fn is_same_gateway_origin(
     {
         return false;
     }
-    rest.eq_ignore_ascii_case(host_header.trim())
+    if rest.eq_ignore_ascii_case(host_header.trim()) {
+        return true;
+    }
+    match (
+        extract_host_and_port(rest),
+        extract_host_and_port(host_header),
+    ) {
+        (Some(orig_hp), Some(host_hp)) => orig_hp == host_hp,
+        _ => false,
+    }
 }
 
 /// Format current UTC wall-clock timestamp in RFC 3339 format (`YYYY-MM-DDTHH:MM:SSZ`).
@@ -656,10 +691,20 @@ mod tests {
         assert!(is_allowed_gateway_host("localhost:8080", &allowed));
         assert!(is_allowed_gateway_host("127.0.0.1:8080", &allowed));
         assert!(is_allowed_gateway_host("[::1]:8080", &allowed));
+        assert!(is_allowed_gateway_host("[fe80::1%wlan0]:8080", &allowed));
+        assert!(is_allowed_gateway_host("[fe80::1%25wlan0]:8080", &allowed));
+        assert!(is_same_gateway_origin(
+            "http://[fe80::1%25wlan0]:8080",
+            "[fe80::1%wlan0]:8080",
+            "http",
+            &allowed,
+        ));
         assert!(is_allowed_gateway_host("10.42.0.1:443", &allowed));
         assert!(is_allowed_gateway_host("192.168.1.42", &allowed));
         assert!(is_allowed_gateway_host("miro-ego.local:8443", &allowed));
 
+        assert!(!is_allowed_gateway_host("[::1%wlan0]:8080", &allowed));
+        assert!(!is_allowed_gateway_host("[fe80::1%]:8080", &allowed));
         assert!(!is_allowed_gateway_host("0.0.0.0:8080", &allowed));
         assert!(!is_allowed_gateway_host("[::]:8080", &allowed));
         assert!(!is_allowed_gateway_host("evil.example.com", &allowed));
@@ -714,8 +759,9 @@ mod tests {
         assert!(policy.authenticate(Some("Basic abc")).is_none());
         assert!(policy.authenticate(None).is_none());
         assert!(policy.verify_csrf(Some("csrf-token-1")));
+        assert!(policy.verify_csrf_for_caller(Some("csrf-token-1"), Some("super-secret-token-02")));
         assert!(
-            policy.verify_csrf_for_caller(
+            !policy.verify_csrf_for_caller(
                 Some("super-secret-token-02"),
                 Some("super-secret-token-02"),
             )

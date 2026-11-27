@@ -5,14 +5,15 @@ Wants=miro-ego-recover.service
 After=local-fs.target systemd-tmpfiles-setup.service miro-ego-recover.service miro-ego-deploy.socket
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 Group=root
 SupplementaryGroups=miro-ego
 Environment=RUST_LOG=info
 ExecStart=/opt/miro-ego/current/bin/miro-ego deploy serve-rpc
 LimitCORE=0
-StandardInput=socket
+StandardInput=null
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=miro-ego-deploy
@@ -21,6 +22,10 @@ RestartSec=2s
 TimeoutStopSec=90s
 UMask=0022
 PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=-/opt/miro-ego -/etc/miro-ego -/var/lib/miro-ego -/var/lib/miro-ego-network -/etc/systemd/system -/etc/avahi/services -/run/miro-ego
+ReadWritePaths=-/usr/lib/systemd/system -/usr/lib/sysusers.d -/usr/lib/tmpfiles.d -/usr/local/sbin -/etc/udev/rules.d -/etc/NetworkManager/conf.d -/etc/modprobe.d -/etc/default -/etc/logrotate.d -/etc/apt/apt.conf.d -/etc/systemd/journald.conf.d -/etc/systemd/system.conf.d -/etc/systemd/coredump.conf.d
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

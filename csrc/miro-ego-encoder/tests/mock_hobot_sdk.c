@@ -25,11 +25,47 @@ static mock_hobot_config_t g_cfg = {
     .emit_stdout_noise = 1,
 };
 
+static pthread_mutex_t g_mock_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_enc_index = 0;
+static mc_video_codec_enc_params_t g_last_enc_params[2];
+static int g_jpu_timeouts_left = 0;
+static int g_vpu_timeouts_left = 0;
+static atomic_ullong g_jpu_timeouts_injected = 0;
+static atomic_ullong g_vpu_timeouts_injected = 0;
+
 void mock_hobot_reset(const mock_hobot_config_t *cfg)
 {
+    pthread_mutex_lock(&g_mock_lock);
     if (cfg != NULL) {
         g_cfg = *cfg;
     }
+    g_enc_index = 0;
+    memset(g_last_enc_params, 0, sizeof(g_last_enc_params));
+    g_jpu_timeouts_left = g_cfg.transient_jpu_input_timeouts;
+    g_vpu_timeouts_left = g_cfg.transient_vpu_input_timeouts;
+    atomic_store(&g_jpu_timeouts_injected, 0ULL);
+    atomic_store(&g_vpu_timeouts_injected, 0ULL);
+    pthread_mutex_unlock(&g_mock_lock);
+}
+
+void mock_hobot_last_enc_params(int eye, mc_video_codec_enc_params_t *out)
+{
+    if (out == NULL || eye < 0 || eye >= 2) {
+        return;
+    }
+    pthread_mutex_lock(&g_mock_lock);
+    *out = g_last_enc_params[eye];
+    pthread_mutex_unlock(&g_mock_lock);
+}
+
+unsigned long long mock_hobot_jpu_timeout_injections(void)
+{
+    return atomic_load(&g_jpu_timeouts_injected);
+}
+
+unsigned long long mock_hobot_vpu_timeout_injections(void)
+{
+    return atomic_load(&g_vpu_timeouts_injected);
 }
 
 typedef struct {
@@ -235,15 +271,43 @@ hb_s32 hb_mm_mc_configure(media_codec_context_t *context)
         return -EINVAL;
     }
     if (mc->is_encoder) {
+        pthread_mutex_lock(&g_mock_lock);
+        if (g_enc_index < 2) {
+            g_last_enc_params[g_enc_index++] = context->video_enc_params;
+        }
+        pthread_mutex_unlock(&g_mock_lock);
         mc->width = context->video_enc_params.width;
         mc->height = context->video_enc_params.height;
         mc->intra_period = g_cfg.intra_period > 0 ? g_cfg.intra_period : 3;
-        if (context->codec_id == MEDIA_CODEC_ID_H264 &&
-            context->video_enc_params.rc_params.h264_cbr_params.intra_period > 0) {
-            mc->intra_period = (int)context->video_enc_params.rc_params.h264_cbr_params.intra_period;
-        } else if (context->codec_id == MEDIA_CODEC_ID_H265 &&
-                   context->video_enc_params.rc_params.h265_cbr_params.intra_period > 0) {
-            mc->intra_period = (int)context->video_enc_params.rc_params.h265_cbr_params.intra_period;
+        uint32_t cfg_period = 0;
+        switch (context->video_enc_params.rc_params.mode) {
+        case MC_AV_RC_MODE_H264CBR:
+            cfg_period = context->video_enc_params.rc_params.h264_cbr_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H264VBR:
+            cfg_period = context->video_enc_params.rc_params.h264_vbr_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H264FIXQP:
+            cfg_period = context->video_enc_params.rc_params.h264_fixqp_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H264AVBR:
+            cfg_period = context->video_enc_params.rc_params.h264_avbr_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H265CBR:
+            cfg_period = context->video_enc_params.rc_params.h265_cbr_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H265VBR:
+            cfg_period = context->video_enc_params.rc_params.h265_vbr_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H265FIXQP:
+            cfg_period = context->video_enc_params.rc_params.h265_fixqp_params.intra_period;
+            break;
+        case MC_AV_RC_MODE_H265AVBR:
+            cfg_period = context->video_enc_params.rc_params.h265_avbr_params.intra_period;
+            break;
+        }
+        if (cfg_period > 0) {
+            mc->intra_period = (int)cfg_period;
         }
         mc->in_buf_size = (size_t)mc->width * (size_t)mc->height * 3u / 2u;
         mc->out_buf_size = 4096u;
@@ -309,6 +373,24 @@ hb_s32 hb_mm_mc_dequeue_input_buffer(media_codec_context_t *context,
     if (mc == NULL || buffer == NULL) {
         return -EINVAL;
     }
+    pthread_mutex_lock(&g_mock_lock);
+    if (g_cfg.permanent_input_timeout) {
+        pthread_mutex_unlock(&g_mock_lock);
+        return HB_MEDIA_ERR_WAIT_TIME;
+    }
+    if (!mc->is_encoder && g_jpu_timeouts_left > 0) {
+        g_jpu_timeouts_left -= 1;
+        pthread_mutex_unlock(&g_mock_lock);
+        atomic_fetch_add(&g_jpu_timeouts_injected, 1ULL);
+        return (g_jpu_timeouts_left & 1) ? HB_MEDIA_ERR_WAIT_TIME : -ETIMEDOUT;
+    }
+    if (mc->is_encoder && g_vpu_timeouts_left > 0) {
+        g_vpu_timeouts_left -= 1;
+        pthread_mutex_unlock(&g_mock_lock);
+        atomic_fetch_add(&g_vpu_timeouts_injected, 1ULL);
+        return (g_vpu_timeouts_left & 1) ? HB_MEDIA_ERR_WAIT_TIME : -ETIMEDOUT;
+    }
+    pthread_mutex_unlock(&g_mock_lock);
     if (!mc->is_encoder) {
         buffer->type = MC_VIDEO_STREAM_BUFFER;
         buffer->vstream_buf.vir_ptr = mc->in_buf;
@@ -534,4 +616,14 @@ int hb_mm_mx_stop(media_muxer_context_t *context)
     free(mx);
     context->instance_handle = NULL;
     return ret;
+}
+
+int32_t hb_mem_invalidate_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
+{
+    return (virt_addr == 0ULL || size == 0ULL) ? -EINVAL : 0;
+}
+
+int32_t hb_mem_flush_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
+{
+    return (virt_addr == 0ULL || size == 0ULL) ? -EINVAL : 0;
 }

@@ -46,6 +46,18 @@
 #define SHM_POLL_INTERVAL_MS 100
 
 static FILE *event_stream = NULL;
+static volatile sig_atomic_t g_stop_requested = 0;
+static _Atomic(miro_ego_pipeline_t *) g_active_pipeline = NULL;
+
+static void handle_stop_signal(int signum)
+{
+    (void)signum;
+    g_stop_requested = 1;
+    miro_ego_pipeline_t *active = atomic_load_explicit(&g_active_pipeline, memory_order_acquire);
+    if (active != NULL) {
+        miro_ego_pipeline_request_stop(active);
+    }
+}
 
 static FILE *event_output(void)
 {
@@ -218,6 +230,12 @@ static void usage(const char *program)
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
 
     miro_ego_pipeline_config_t config = {
         .sbs_width = 3840,
@@ -344,6 +362,10 @@ int main(int argc, char **argv)
         emit_error_event("pipeline_open_failed", error);
         return 3;
     }
+    atomic_store_explicit(&g_active_pipeline, pipeline, memory_order_release);
+    if (g_stop_requested) {
+        miro_ego_pipeline_request_stop(pipeline);
+    }
     emit("{\"event\":\"ready\"}");
 
     const char *failure_code = NULL;
@@ -352,6 +374,9 @@ int main(int argc, char **argv)
 
     if (use_shm) {
         for (;;) {
+            if (g_stop_requested) {
+                break;
+            }
             if (miro_ego_pipeline_failed(pipeline)) {
                 failure_code = "pipeline_failed";
                 break;
@@ -402,6 +427,9 @@ int main(int argc, char **argv)
             return 4;
         }
         for (;;) {
+            if (g_stop_requested) {
+                break;
+            }
             uint32_t header[2];
             input_result_t input_result = read_exact(header, sizeof(header));
             if (input_result == INPUT_EOF) {
@@ -476,6 +504,7 @@ int main(int argc, char **argv)
     emit_stats("done", &stats, dropped);
 
     free(payload);
+    atomic_store_explicit(&g_active_pipeline, NULL, memory_order_release);
     miro_ego_pipeline_close(pipeline);
     if (use_shm) {
         miro_ego_shm_ring_detach(&shm_ring);

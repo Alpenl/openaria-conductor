@@ -19,14 +19,16 @@ pub use bundle::{
     StoreLayer, TARGET_PLATFORM, VerifiedBundle, copy_and_verify_safe, default_release_public_key,
     default_release_signing_seed, hash_file_safe, is_allowed_bundle_asset_path,
     sign_bundle_manifest_with_seed, validate_aarch64_elf64_header, validate_bundle_relative_path,
-    validate_commit_sha, verify_bundle_dir, verify_bundle_dir_with_key,
+    validate_commit_sha, verify_bundle_dir, verify_bundle_dir_with_key, verify_bundle_manifest,
+    verify_bundle_manifest_with_key,
 };
 pub use manager::{
     ACTIVATION_FAILURE_SCHEMA, ActivationFailureRecord, AssetSpec, BoundedSystemctlRunner,
     DEPLOYMENT_ASSETS, DEPLOYMENT_LOCK_NAME, DeploymentStatus, HealthChecker,
-    INSTALL_TRANSACTION_SCHEMA, InstallTransaction, InstalledReleaseMetadata,
-    LocalHttpHealthChecker, RELEASE_METADATA_SCHEMA, RealSystemctlRunner, ReleaseManager,
-    ReleaseManagerPaths, SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
+    INSTALL_TRANSACTION_SCHEMA, INSTALLED_ASSETS_SCHEMA, InstallTransaction,
+    InstalledAssetsManifest, InstalledReleaseMetadata, LocalHttpHealthChecker,
+    RELEASE_METADATA_SCHEMA, RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths,
+    SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
 };
 pub use rpc::{
     DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_CLIENT_TIMEOUT, DEFAULT_DEPLOY_IDLE_TIMEOUT,
@@ -34,7 +36,7 @@ pub use rpc::{
     DeployMutationOutcome, DeployRpcClient, DeployRpcConfig, DeployRpcErrorBody, DeployRpcRequest,
     DeployRpcResponse, DeployRpcServer, DeployRpcServerConfig, FIRMWARE_TASK_STATE_SCHEMA,
     FirmwareTaskAction, FirmwareTaskSnapshot, FirmwareTaskStatus, MAX_DEPLOY_IDEMPOTENCY_ENTRIES,
-    MAX_DEPLOY_RPC_LINE_BYTES,
+    MAX_DEPLOY_RPC_LINE_BYTES, send_systemd_notify, send_systemd_notify_to,
 };
 
 pub const FIRMWARE_STATUS_SCHEMA: &str = "miro-ego.firmware-status.v1";

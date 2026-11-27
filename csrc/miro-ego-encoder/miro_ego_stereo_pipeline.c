@@ -22,12 +22,27 @@
 #include "hb_media_codec.h"
 #include "hb_media_muxer.h"
 
+#if defined(HB_SDK_ROOT) && !defined(MIRO_EGO_STUB_HB_MEDIA_CODEC_H)
+#include "hb_mem_mgr.h"
+#elif !defined(MIRO_EGO_STUB_HB_MEDIA_CODEC_H)
+extern int32_t hb_mem_invalidate_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
+    __attribute__((weak));
+extern int32_t hb_mem_flush_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
+    __attribute__((weak));
+#endif
+
+#ifndef HB_MEDIA_ERR_WAIT_TIME
+#define HB_MEDIA_ERR_WAIT_TIME (-268435443)
+#endif
+
 #define DECODER_INPUT_TIMEOUT_MS 200
 #define DECODER_OUTPUT_TIMEOUT_MS 200
 #define DECODER_DRAIN_POLLS 25 /* 5s without output after input stops */
-#define ENCODER_INPUT_TIMEOUT_MS 1000
+#define ENCODER_INPUT_TIMEOUT_MS 200
 #define ENCODER_OUTPUT_TIMEOUT_MS 200
 #define ENCODER_DRAIN_POLLS 25 /* 5s ceiling on a stuck VPU drain */
+#define DEFAULT_INPUT_STALL_TIMEOUT_MS 5000 /* 5s continuous input backpressure ceiling */
+#define INPUT_RETRY_MIN_BACKOFF_NS 2000000ULL /* 2ms sleep floor when SDK returns immediately */
 #define ERROR_LEN 256
 #define PATH_LEN 512
 #define MUX_QUEUE_BYTES (64u * 1024u * 1024u) /* per eye, compressed packets */
@@ -48,6 +63,9 @@ typedef struct segment {
     unsigned long long start_frame;
     unsigned long long end_frame;
     unsigned long long finalize_ns;
+    miro_ego_sha256_ctx_t sha256_ctx;
+    unsigned long long sealed_bytes;
+    int sha256_ready;
 } segment_t;
 
 typedef struct {
@@ -88,7 +106,8 @@ struct miro_ego_pipeline {
     void *split_ctx;
     int split_ops_initialized;
 
-    /* Reusable 256 KiB page-aligned read buffer for hot page-cache SHA-256 sealing. */
+    /* Reusable 256 KiB page-aligned read buffers for closer and committer threads. */
+    void *closer_io_buf;
     void *seal_io_buf;
 
     media_codec_context_t decoder;
@@ -145,8 +164,9 @@ struct miro_ego_pipeline {
     atomic_ullong drop_encoder_input;
     atomic_ullong drop_decoder_output;
 
-    atomic_int stopping;   /* no more frames will be submitted */
-    atomic_int split_done; /* the split thread fed the encoders everything */
+    atomic_int stopping;        /* no more frames will be submitted */
+    atomic_int abort_requested; /* immediate signal/abort stop */
+    atomic_int split_done;      /* the split thread fed the encoders everything */
     atomic_int failed;
     pthread_mutex_t error_lock;
     char error[ERROR_LEN];
@@ -276,8 +296,16 @@ static int configure_encoder(media_codec_context_t *context,
 } while (0)
 #define SET_VBR(member) do { \
     params->rc_params.member.frame_rate = (uint32_t)config->fps; \
+    params->rc_params.member.bit_rate = (uint32_t)config->bitrate_kbps; \
+    params->rc_params.member.max_bit_rate = (uint32_t)config->bitrate_kbps; \
     params->rc_params.member.intra_period = period; \
     params->rc_params.member.intra_qp = (uint32_t)config->intra_qp; \
+    params->rc_params.member.initial_rc_qp = config->initial_qp; \
+    params->rc_params.member.vbv_buf_size = config->vbv_ms; \
+    params->rc_params.member.min_qp_I = params->rc_params.member.min_qp_P = \
+        params->rc_params.member.min_qp_B = (uint32_t)config->min_qp; \
+    params->rc_params.member.max_qp_I = params->rc_params.member.max_qp_P = \
+        params->rc_params.member.max_qp_B = (uint32_t)config->max_qp; \
     params->rc_params.member.qp_map_enable = 0; \
 } while (0)
 #define SET_FIXQP(member) do { \
@@ -360,6 +388,7 @@ static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
     segment->eye = eye->eye;
     segment->index = index;
     segment->start_frame = start_frame;
+    miro_ego_sha256_init(&segment->sha256_ctx);
 
     int rel_len = snprintf(segment->relative, sizeof(segment->relative), "%s%s_%05d.mp4",
                            pipeline->config.path_prefix, EYE_NAMES[eye->eye], index);
@@ -546,35 +575,34 @@ static int segment_finalize(miro_ego_pipeline_t *pipeline, segment_t *segment)
         return 0;
     }
     char reason[128] = {0};
-    if (miro_ego_mp4_extend_durations_fd(segment->seal_fd, pipeline->config.fps,
-                                         reason, sizeof(reason)) != 0) {
+    if (miro_ego_mp4_extend_durations_and_hash_fd(segment->seal_fd, pipeline->config.fps,
+                                                  pipeline->closer_io_buf,
+                                                  MIRO_EGO_SHA256_IO_BUF_SIZE,
+                                                  &segment->sha256_ctx,
+                                                  &segment->sealed_bytes,
+                                                  reason, sizeof(reason)) != 0) {
         close_seal_fd(segment);
         fail(pipeline, "segment_seal_failed: %s duration fixup: %s",
              segment->relative, reason);
         return 0;
     }
+    segment->sha256_ready = 1;
     return 1;
 }
 
 static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
 {
     /*
-     * Reuse segment->seal_fd opened before byte 0 so fsync() observes any
-     * asynchronous page-cache writeback failure via f_wb_err, compute SHA-256
-     * while pages are hot, fsync() for durability, and evict clean pages via
-     * posix_fadvise(POSIX_FADV_DONTNEED).
+     * Reuse segment->seal_fd opened before byte 0 so fdatasync() observes any
+     * asynchronous page-cache writeback failure via f_wb_err, finalize the
+     * incremental SHA-256 populated during MP4 finalize, fdatasync() for
+     * durability, and evict clean pages via posix_fadvise(POSIX_FADV_DONTNEED).
      */
     int fd = segment->seal_fd;
     segment->seal_fd = -1;
     if (fd < 0) {
         fail(pipeline, "segment_seal_failed: missing descriptor for %s",
              segment->relative);
-        return;
-    }
-    if (lseek(fd, 0, SEEK_SET) < 0) {
-        fail(pipeline, "segment_seal_failed: lseek %s: %s",
-             segment->relative, strerror(errno));
-        close(fd);
         return;
     }
     struct stat metadata;
@@ -589,16 +617,23 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
 
     char sha256_hex[MIRO_EGO_SHA256_HEX_LEN] = {0};
     unsigned long long hashed_bytes = 0;
-    int hash_ret = pipeline->seal_io_buf != NULL
-                       ? miro_ego_sha256_fd_with_buf(fd, pipeline->seal_io_buf,
-                                                     MIRO_EGO_SHA256_IO_BUF_SIZE,
-                                                     sha256_hex, &hashed_bytes)
-                       : miro_ego_sha256_fd(fd, sha256_hex, &hashed_bytes);
-    if (hash_ret != 0) {
-        fail(pipeline, "segment_seal_failed: sha256 %s: %s",
-             segment->relative, strerror(errno));
-        close(fd);
-        return;
+    if (segment->sha256_ready) {
+        uint8_t digest[MIRO_EGO_SHA256_DIGEST_LEN];
+        miro_ego_sha256_final(&segment->sha256_ctx, digest);
+        miro_ego_sha256_to_hex(digest, sha256_hex);
+        hashed_bytes = segment->sealed_bytes;
+    } else {
+        int hash_ret = pipeline->seal_io_buf != NULL
+                           ? miro_ego_sha256_fd_with_buf(fd, pipeline->seal_io_buf,
+                                                         MIRO_EGO_SHA256_IO_BUF_SIZE,
+                                                         sha256_hex, &hashed_bytes)
+                           : miro_ego_sha256_fd(fd, sha256_hex, &hashed_bytes);
+        if (hash_ret != 0) {
+            fail(pipeline, "segment_seal_failed: sha256 %s: %s",
+                 segment->relative, strerror(errno));
+            close(fd);
+            return;
+        }
     }
     if (hashed_bytes != bytes) {
         fail(pipeline, "segment_seal_failed: size_mismatch %s: stat=%llu hashed=%llu",
@@ -608,8 +643,13 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
     }
     int sync_ret;
     do {
-        sync_ret = fsync(fd);
+        sync_ret = fdatasync(fd);
     } while (sync_ret < 0 && errno == EINTR);
+    if (sync_ret < 0 && (errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP)) {
+        do {
+            sync_ret = fsync(fd);
+        } while (sync_ret < 0 && errno == EINTR);
+    }
     if (sync_ret != 0) {
         fail(pipeline, "segment_seal_failed: sync %s: %s",
              segment->relative, strerror(errno));
@@ -728,6 +768,151 @@ static void observe_max(atomic_ullong *counter, unsigned long long elapsed)
 {
     unsigned long long previous = atomic_load(counter);
     while (previous < elapsed && !atomic_compare_exchange_weak(counter, &previous, elapsed)) {
+    }
+}
+
+static int is_transient_dequeue_timeout(int ret)
+{
+    return ret == HB_MEDIA_ERR_WAIT_TIME ||
+           ret == -ETIMEDOUT ||
+           ret == -EAGAIN ||
+           ret == -EBUSY;
+}
+
+static void sleep_ns(unsigned long long ns)
+{
+    if (ns == 0ULL) {
+        return;
+    }
+    struct timespec req = {
+        .tv_sec = (time_t)(ns / 1000000000ULL),
+        .tv_nsec = (long)(ns % 1000000000ULL),
+    };
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+    }
+}
+
+static int dequeue_input_with_retry(miro_ego_pipeline_t *pipeline,
+                                    media_codec_context_t *codec,
+                                    media_codec_buffer_t *buffer,
+                                    int slice_timeout_ms,
+                                    int respect_stopping)
+{
+    const int stall_ms = pipeline->config.input_stall_timeout_ms > 0
+                             ? pipeline->config.input_stall_timeout_ms
+                             : DEFAULT_INPUT_STALL_TIMEOUT_MS;
+    const unsigned long long stall_ceiling_ns = (unsigned long long)stall_ms * 1000000ULL;
+    const unsigned long long started_ns = monotonic_time_ns();
+    int poll_ms = slice_timeout_ms > 0 ? slice_timeout_ms : DECODER_INPUT_TIMEOUT_MS;
+    if (poll_ms > stall_ms) {
+        poll_ms = stall_ms;
+    }
+
+    for (;;) {
+        const unsigned long long call_started_ns = monotonic_time_ns();
+        memset(buffer, 0, sizeof(*buffer));
+        buffer->type = codec->encoder ? MC_VIDEO_FRAME_BUFFER : MC_VIDEO_STREAM_BUFFER;
+        int ret = hb_mm_mc_dequeue_input_buffer(codec, buffer, poll_ms);
+        if (ret == 0) {
+            return 0;
+        }
+        if (!is_transient_dequeue_timeout(ret)) {
+            return ret;
+        }
+        if (atomic_load(&pipeline->failed) != 0 ||
+            atomic_load(&pipeline->abort_requested) != 0 ||
+            (respect_stopping && atomic_load(&pipeline->stopping) != 0)) {
+            return ret;
+        }
+        const unsigned long long now_ns = monotonic_time_ns();
+        if (now_ns >= started_ns && (now_ns - started_ns) >= stall_ceiling_ns) {
+            return ret;
+        }
+        if (now_ns >= call_started_ns && (now_ns - call_started_ns) < INPUT_RETRY_MIN_BACKOFF_NS) {
+            sleep_ns(INPUT_RETRY_MIN_BACKOFF_NS - (now_ns - call_started_ns));
+        }
+    }
+}
+
+static void ion_invalidate_range(const uint8_t *ptr, uint64_t size)
+{
+    if (ptr == NULL || size == 0ULL) {
+        return;
+    }
+#if defined(HB_SDK_ROOT)
+    (void)hb_mem_invalidate_buf_with_vaddr((uint64_t)(uintptr_t)ptr, size);
+#elif !defined(MIRO_EGO_STUB_HB_MEDIA_CODEC_H)
+    if (hb_mem_invalidate_buf_with_vaddr != NULL) {
+        (void)hb_mem_invalidate_buf_with_vaddr((uint64_t)(uintptr_t)ptr, size);
+    }
+#else
+    (void)ptr;
+    (void)size;
+#endif
+}
+
+static void ion_flush_range(const uint8_t *ptr, uint64_t size)
+{
+    if (ptr == NULL || size == 0ULL) {
+        return;
+    }
+#if defined(HB_SDK_ROOT)
+    (void)hb_mem_flush_buf_with_vaddr((uint64_t)(uintptr_t)ptr, size);
+#elif !defined(MIRO_EGO_STUB_HB_MEDIA_CODEC_H)
+    if (hb_mem_flush_buf_with_vaddr != NULL) {
+        (void)hb_mem_flush_buf_with_vaddr((uint64_t)(uintptr_t)ptr, size);
+    }
+#else
+    (void)ptr;
+    (void)size;
+#endif
+}
+
+static void ion_invalidate_nv12_frame(const media_codec_buffer_t *frame)
+{
+    if (frame == NULL || frame->vframe_buf.size == 0u ||
+        frame->vframe_buf.vir_ptr[0] == NULL) {
+        return;
+    }
+    const int stride = frame->vframe_buf.stride > 0
+                           ? frame->vframe_buf.stride
+                           : frame->vframe_buf.width;
+    const int height = frame->vframe_buf.height;
+    if (stride <= 0 || height <= 0) {
+        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], frame->vframe_buf.size);
+        return;
+    }
+    const uint64_t y_bytes = (uint64_t)stride * (uint64_t)height;
+    const uint64_t uv_bytes = (uint64_t)stride * (uint64_t)(height / 2);
+    if (frame->vframe_buf.vir_ptr[1] == frame->vframe_buf.vir_ptr[0] + y_bytes) {
+        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], y_bytes + uv_bytes);
+    } else {
+        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], y_bytes);
+        ion_invalidate_range(frame->vframe_buf.vir_ptr[1], uv_bytes);
+    }
+}
+
+static void ion_flush_nv12_frame(const media_codec_buffer_t *frame)
+{
+    if (frame == NULL || frame->vframe_buf.size == 0u ||
+        frame->vframe_buf.vir_ptr[0] == NULL) {
+        return;
+    }
+    const int stride = frame->vframe_buf.stride > 0
+                           ? frame->vframe_buf.stride
+                           : frame->vframe_buf.width;
+    const int height = frame->vframe_buf.height;
+    if (stride <= 0 || height <= 0) {
+        ion_flush_range(frame->vframe_buf.vir_ptr[0], frame->vframe_buf.size);
+        return;
+    }
+    const uint64_t y_bytes = (uint64_t)stride * (uint64_t)height;
+    const uint64_t uv_bytes = (uint64_t)stride * (uint64_t)(height / 2);
+    if (frame->vframe_buf.vir_ptr[1] == frame->vframe_buf.vir_ptr[0] + y_bytes) {
+        ion_flush_range(frame->vframe_buf.vir_ptr[0], y_bytes + uv_bytes);
+    } else {
+        ion_flush_range(frame->vframe_buf.vir_ptr[0], y_bytes);
+        ion_flush_range(frame->vframe_buf.vir_ptr[1], uv_bytes);
     }
 }
 
@@ -937,14 +1122,13 @@ static void *split_thread_main(void *argument)
             hb_mm_mc_queue_output_buffer(&pipeline->decoder, &frame, 0);
             break;
         }
+        ion_invalidate_nv12_frame(&frame);
         atomic_fetch_add(&pipeline->decoded, 1ULL);
 
         for (int eye = 0; eye < MIRO_EGO_EYES; eye += 1) {
             media_codec_buffer_t input;
-            memset(&input, 0, sizeof(input));
-            input.type = MC_VIDEO_FRAME_BUFFER;
-            ret = hb_mm_mc_dequeue_input_buffer(&pipeline->eyes[eye].codec, &input,
-                                                ENCODER_INPUT_TIMEOUT_MS);
+            ret = dequeue_input_with_retry(pipeline, &pipeline->eyes[eye].codec, &input,
+                                           ENCODER_INPUT_TIMEOUT_MS, 0);
             if (ret != 0) {
                 atomic_fetch_add(&pipeline->drop_encoder_input, 1ULL);
                 fail(pipeline, "encoder_input_dequeue_failed: eye=%s ret=%d timeout_ms=%d",
@@ -965,6 +1149,7 @@ static void *split_thread_main(void *argument)
                                             ENCODER_INPUT_TIMEOUT_MS);
                 break;
             }
+            ion_flush_nv12_frame(&input);
             ret = hb_mm_mc_queue_input_buffer(&pipeline->eyes[eye].codec, &input,
                                               ENCODER_INPUT_TIMEOUT_MS);
             if (ret != 0) {
@@ -1005,6 +1190,7 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
         config->intra_qp < config->min_qp || config->intra_qp > config->max_qp ||
         config->initial_qp < config->min_qp || config->initial_qp > config->max_qp ||
         config->vbv_ms < 1 || config->vbv_ms > 3000 ||
+        config->input_stall_timeout_ms < 0 || config->input_stall_timeout_ms > 60000 ||
         (config->segment_frames > 0 && config->segment_frames %
          (config->intra_period > 0 ? config->intra_period : config->fps) != 0)) {
         if (error != NULL && error_len > 0) {
@@ -1039,10 +1225,12 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
         }
         goto open_failed;
     }
-    if (posix_memalign(&pipeline->seal_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
+    if (posix_memalign(&pipeline->closer_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
+                       MIRO_EGO_SHA256_IO_BUF_SIZE) != 0 ||
+        pipeline->closer_io_buf == NULL ||
+        posix_memalign(&pipeline->seal_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
                        MIRO_EGO_SHA256_IO_BUF_SIZE) != 0 ||
         pipeline->seal_io_buf == NULL) {
-        pipeline->seal_io_buf = NULL;
         if (error != NULL && error_len > 0) {
             snprintf(error, error_len, "out_of_memory");
         }
@@ -1192,10 +1380,8 @@ int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char 
     }
 
     media_codec_buffer_t input;
-    memset(&input, 0, sizeof(input));
-    input.type = MC_VIDEO_STREAM_BUFFER;
     const int timeout = timeout_ms > 0 ? timeout_ms : DECODER_INPUT_TIMEOUT_MS;
-    int ret = hb_mm_mc_dequeue_input_buffer(&pipeline->decoder, &input, timeout);
+    int ret = dequeue_input_with_retry(pipeline, &pipeline->decoder, &input, timeout, 1);
     if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         fail(pipeline, "decoder_input_dequeue_failed: ret=%d timeout_ms=%d bytes=%zu",
@@ -1215,6 +1401,7 @@ int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char 
     input.vstream_buf.size = (uint32_t)length;
     input.vstream_buf.stream_end = 0;
     memcpy(input.vstream_buf.vir_ptr, jpeg, length);
+    ion_flush_range(input.vstream_buf.vir_ptr, (uint64_t)length);
     ret = hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
     if (ret != 0) {
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
@@ -1318,6 +1505,7 @@ void miro_ego_pipeline_close(miro_ego_pipeline_t *pipeline)
     if (pipeline->finish_lock_initialized) {
         pthread_mutex_destroy(&pipeline->finish_lock);
     }
+    free(pipeline->closer_io_buf);
     free(pipeline->seal_io_buf);
     free(pipeline->out_dir_owned);
     free(pipeline->path_prefix_owned);
@@ -1379,4 +1567,13 @@ const char *miro_ego_pipeline_error(const miro_ego_pipeline_t *pipeline)
     memcpy(error, pipeline->error, sizeof(error));
     pthread_mutex_unlock(&mutable_pipeline->error_lock);
     return error;
+}
+
+void miro_ego_pipeline_request_stop(miro_ego_pipeline_t *pipeline)
+{
+    if (pipeline == NULL) {
+        return;
+    }
+    atomic_store(&pipeline->stopping, 1);
+    atomic_store(&pipeline->abort_requested, 1);
 }

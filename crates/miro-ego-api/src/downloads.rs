@@ -740,7 +740,7 @@ fn stream_download_body_inner(
         }
         DownloadSource::File(file) => {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _delete_lease = delete_lease;
                 let _session_lease = session_lease;
@@ -756,89 +756,60 @@ fn stream_download_body_inner(
                         return;
                     }
                     let want = (remaining.min(chunk_size as u64)) as usize;
-                    let file_clone = Arc::clone(&file);
-                    let read_offset = cursor;
-                    let cur_evicted_until = evicted_until;
-                    let read_result =
-                        tokio::task::spawn_blocking(move || -> io::Result<(Bytes, u64)> {
-                            let off_t = libc::off_t::try_from(read_offset).map_err(|_| {
-                                io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
-                            })?;
-                            let mut buf = vec![0_u8; want];
-                            let mut filled = 0;
-                            while filled < want {
-                                let cur_off = off_t
-                                    .checked_add(libc::off_t::try_from(filled).map_err(|_| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidInput,
-                                            "file offset overflow",
-                                        )
-                                    })?)
-                                    .ok_or_else(|| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidInput,
-                                            "file offset overflow",
-                                        )
-                                    })?;
-                                let n = pread_retry(
-                                    file_clone.as_raw_fd(),
-                                    &mut buf[filled..want],
-                                    cur_off,
-                                )?;
-                                if n == 0 {
-                                    break;
-                                }
-                                filled += n;
-                            }
-                            let new_cursor = read_offset.saturating_add(filled as u64);
-                            let mut next_evicted = cur_evicted_until;
-                            if filled > 0
-                                && let Some((adv_off, adv_len, updated_evicted)) =
-                                    compute_page_aligned_dontneed(
-                                        cur_evicted_until,
-                                        new_cursor,
-                                        false,
-                                    )
-                            {
-                                let _ = fadvise_dontneed(file_clone.as_raw_fd(), adv_off, adv_len);
-                                next_evicted = updated_evicted;
-                            }
-                            buf.truncate(filled);
-                            Ok((Bytes::from(buf), next_evicted))
-                        })
-                        .await;
-
-                    match read_result {
-                        Ok(Ok((chunk, next_evicted))) => {
-                            if chunk.is_empty() {
-                                let _ = tx
-                                    .send(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "file truncated during download stream",
-                                    )))
-                                    .await;
-                                return;
-                            }
-                            evicted_until = next_evicted;
-                            let n = chunk.len() as u64;
-                            cursor = cursor.saturating_add(n);
-                            remaining = remaining.saturating_sub(n);
-                            if tx.send(Ok(chunk)).await.is_err() {
+                    let off_t = match libc::off_t::try_from(cursor) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "file offset overflow",
+                            )));
+                            return;
+                        }
+                    };
+                    let mut buf = vec![0_u8; want];
+                    let mut filled = 0;
+                    while filled < want {
+                        let Some(cur_off) = libc::off_t::try_from(filled)
+                            .ok()
+                            .and_then(|f| off_t.checked_add(f))
+                        else {
+                            let _ = tx.blocking_send(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "file offset overflow",
+                            )));
+                            return;
+                        };
+                        match pread_retry(file.as_raw_fd(), &mut buf[filled..want], cur_off) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(err) => {
+                                let _ = tx.blocking_send(Err(err));
                                 return;
                             }
                         }
-                        Ok(Err(err)) => {
-                            let _ = tx.send(Err(err)).await;
-                            return;
-                        }
-                        Err(join_err) => {
-                            let _ = tx
-                                .send(Err(io::Error::other(format!(
-                                    "blocking file reader failed: {join_err}"
-                                ))))
-                                .await;
-                            return;
-                        }
+                    }
+                    if filled == 0 {
+                        let _ = tx.blocking_send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "file truncated during download stream",
+                        )));
+                        return;
+                    }
+                    buf.truncate(filled);
+                    let n = filled as u64;
+                    let new_cursor = cursor.saturating_add(n);
+                    let next_remaining = remaining.saturating_sub(n);
+                    let reached_eof = next_remaining == 0;
+                    if let Some((adv_off, adv_len, updated_evicted)) =
+                        compute_page_aligned_dontneed(evicted_until, new_cursor, reached_eof)
+                    {
+                        let _ = fadvise_dontneed(file.as_raw_fd(), adv_off, adv_len);
+                        evicted_until = updated_evicted;
+                    }
+                    cursor = new_cursor;
+                    remaining = next_remaining;
+                    if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
+                        return;
                     }
                 }
             });

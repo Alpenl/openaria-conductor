@@ -18,8 +18,21 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Linux `<linux/fs.h>` `FS_IOC_GETFSLABEL = _IOR(0x94, 49, char[256])`.
+const FS_IOC_GETFSLABEL: libc::Ioctl = 0x8100_9431_u32 as libc::Ioctl;
+const MOUNTINFO_CACHE_TTL: Duration = Duration::from_millis(500);
+
+/// Kernel / block-layer physical filesystem identity observed independently of `volume.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhysicalVolumeIdentity {
+    pub label: Option<String>,
+    pub uuid: Option<String>,
+    pub partuuid: Option<String>,
+}
 
 pub const DATA_VOLUME_UUID_ENV: &str = "MIRO_EGO_DATA_VOLUME_UUID";
 pub const DATA_VOLUME_PARTUUID_ENV: &str = "MIRO_EGO_DATA_VOLUME_PARTUUID";
@@ -182,6 +195,13 @@ impl Default for VolumePolicy {
 pub trait VolumeProbe: Send + Sync {
     fn probe_volume(&self, mountpoint: &Path) -> io::Result<FsCapacity>;
     fn probe_system(&self, state_root: &Path) -> io::Result<(u64, u64)>;
+    fn probe_physical_identity(
+        &self,
+        _mountpoint: &Path,
+        _device_id: u64,
+    ) -> PhysicalVolumeIdentity {
+        PhysicalVolumeIdentity::default()
+    }
 }
 
 /// Real POSIX/Linux filesystem probe using `statvfs`, `fstatfs`, `/proc/self/mountinfo`,
@@ -243,6 +263,111 @@ impl VolumeProbe for PosixVolumeProbe {
         let available_inodes = if files == 0 { bavail } else { favail };
         Ok((frsize.saturating_mul(bavail), available_inodes))
     }
+
+    fn probe_physical_identity(&self, mountpoint: &Path, device_id: u64) -> PhysicalVolumeIdentity {
+        probe_linux_physical_identity(mountpoint, device_id)
+    }
+}
+
+fn probe_fs_label_ioctl(mountpoint: &Path) -> Option<String> {
+    let dir = open_directory_safe(mountpoint).ok()?;
+    let mut raw = [0_u8; 256];
+    // SAFETY: `raw` is a writable 256-byte stack buffer matching `FS_IOC_GETFSLABEL`.
+    let rc = unsafe { libc::ioctl(dir.as_raw_fd(), FS_IOC_GETFSLABEL, raw.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let text = std::str::from_utf8(&raw[..nul_pos]).ok()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn decode_udev_hex_escapes(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && bytes[i + 1] == b'x'
+            && bytes[i + 2].is_ascii_hexdigit()
+            && bytes[i + 3].is_ascii_hexdigit()
+            && let Ok(hex_str) = std::str::from_utf8(&bytes[i + 2..i + 4])
+            && let Ok(val) = u8::from_str_radix(hex_str, 16)
+        {
+            out.push(val);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn scan_dev_disk_by_dir(by_dir: &Path, device_id: u64) -> Option<String> {
+    let entries = fs::read_dir(by_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Follow symlink to block node and compare `st_rdev` with the mounted filesystem's `st_dev`.
+        if let Ok(meta) = fs::metadata(&path)
+            && meta.rdev() == device_id
+            && let Some(name) = entry.file_name().to_str()
+        {
+            let decoded = decode_udev_hex_escapes(name);
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn probe_linux_physical_identity(mountpoint: &Path, device_id: u64) -> PhysicalVolumeIdentity {
+    let mut out = PhysicalVolumeIdentity {
+        label: probe_fs_label_ioctl(mountpoint),
+        uuid: None,
+        partuuid: None,
+    };
+    let maj = linux_dev_major(device_id);
+    let min = linux_dev_minor(device_id);
+    if maj == 0 && min == 0 {
+        return out;
+    }
+
+    let udev_path = PathBuf::from(format!("/run/udev/data/b{maj}:{min}"));
+    if let Ok(text) = fs::read_to_string(udev_path) {
+        for line in text.lines() {
+            if let Some(val) = line.strip_prefix("E:ID_FS_LABEL=") {
+                if out.label.is_none() && !val.trim().is_empty() {
+                    out.label = Some(val.trim().to_owned());
+                }
+            } else if let Some(val) = line.strip_prefix("E:ID_FS_UUID=") {
+                if !val.trim().is_empty() {
+                    out.uuid = Some(val.trim().to_owned());
+                }
+            } else if let Some(val) = line.strip_prefix("E:ID_PART_ENTRY_UUID=")
+                && !val.trim().is_empty()
+            {
+                out.partuuid = Some(val.trim().to_owned());
+            }
+        }
+    }
+
+    if out.label.is_none() {
+        out.label = scan_dev_disk_by_dir(Path::new("/dev/disk/by-label"), device_id);
+    }
+    if out.uuid.is_none() {
+        out.uuid = scan_dev_disk_by_dir(Path::new("/dev/disk/by-uuid"), device_id);
+    }
+    if out.partuuid.is_none() {
+        out.partuuid = scan_dev_disk_by_dir(Path::new("/dev/disk/by-partuuid"), device_id);
+    }
+    out
 }
 
 fn is_exfat_strict(fd: libc::c_int) -> io::Result<bool> {
@@ -371,20 +496,43 @@ pub(crate) fn parse_mountinfo_for_target(
     None
 }
 
+type MountinfoCacheKey = (PathBuf, u64, u64);
+type MountinfoCacheEntry = (MountinfoCacheKey, Instant, (bool, String));
+
+fn mountinfo_cache() -> &'static Mutex<Option<MountinfoCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<MountinfoCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 fn inspect_mountinfo(mountpoint: &Path, st_dev: u64, st_ino: u64) -> (bool, String) {
+    let key = (mountpoint.to_path_buf(), st_dev, st_ino);
+    if let Ok(guard) = mountinfo_cache().lock()
+        && let Some((ref cached_key, cached_at, ref cached_val)) = *guard
+        && cached_key == &key
+        && cached_at.elapsed() < MOUNTINFO_CACHE_TTL
+    {
+        return cached_val.clone();
+    }
+
     let canonical = fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_path_buf());
     let target = escape_mountinfo_path(&canonical.to_string_lossy());
-    if let Ok(content) = fs::read_to_string("/proc/self/mountinfo") {
-        if let Some(found) = parse_mountinfo_for_target(&content, &target, st_dev) {
-            return found;
-        }
+    let computed = if let Ok(content) = fs::read_to_string("/proc/self/mountinfo")
+        && let Some(found) = parse_mountinfo_for_target(&content, &target, st_dev)
+    {
+        found
+    } else {
+        // Check parent st_dev difference as secondary mountpoint signal when not listed as mount target.
+        let mounted = canonical
+            .parent()
+            .and_then(|p| fs::symlink_metadata(p).ok())
+            .is_some_and(|parent_meta| parent_meta.dev() != st_dev);
+        (mounted, format!("path:{st_dev}:{st_ino}"))
+    };
+
+    if let Ok(mut guard) = mountinfo_cache().lock() {
+        *guard = Some((key, Instant::now(), computed.clone()));
     }
-    // Check parent st_dev difference as secondary mountpoint signal when not listed as mount target.
-    let mounted = canonical
-        .parent()
-        .and_then(|p| fs::symlink_metadata(p).ok())
-        .is_some_and(|parent_meta| parent_meta.dev() != st_dev);
-    (mounted, format!("path:{st_dev}:{st_ino}"))
+    computed
 }
 
 /// Concrete exFAT-only `MIRO-EGO` volume manager and reserve monitor.
@@ -492,9 +640,47 @@ impl ExfatVolumeManager {
         Ok(meta)
     }
 
+    fn verify_physical_identity(&self, device_id: u64) -> StorageResult<PhysicalVolumeIdentity> {
+        let phys = self
+            .probe
+            .probe_physical_identity(self.paths.mountpoint(), device_id);
+        if let Some(ref obs_label) = phys.label
+            && obs_label != &self.policy.expected_label
+        {
+            return Err(StorageError::VolumeInvalid {
+                message: format!(
+                    "physical filesystem label '{obs_label}' does not match expected '{}'",
+                    self.policy.expected_label
+                ),
+            });
+        }
+        if let (Some(exp_uuid), Some(obs_uuid)) = (&self.policy.expected_uuid, &phys.uuid)
+            && !obs_uuid.eq_ignore_ascii_case(exp_uuid)
+        {
+            return Err(StorageError::VolumeInvalid {
+                message: format!(
+                    "physical filesystem UUID '{obs_uuid}' does not match expected '{exp_uuid}'"
+                ),
+            });
+        }
+        if let (Some(exp_partuuid), Some(obs_partuuid)) =
+            (&self.policy.expected_partuuid, &phys.partuuid)
+            && !obs_partuuid.eq_ignore_ascii_case(exp_partuuid)
+        {
+            return Err(StorageError::VolumeInvalid {
+                message: format!(
+                    "physical partition PARTUUID '{obs_partuuid}' does not match expected '{exp_partuuid}'"
+                ),
+            });
+        }
+        Ok(phys)
+    }
+
     /// Ensure `/data/.miro-ego/volume.json` exists with a valid UUIDv4 `volume_id`,
     /// returning `(metadata, created_new)`.
     pub fn ensure_metadata(&self) -> StorageResult<(VolumeMetadata, bool)> {
+        let cap = self.inspect_capacity_checked()?;
+        let phys = self.verify_physical_identity(cap.device_id)?;
         let meta_path = self.paths.volume_metadata_file();
         match fs::symlink_metadata(&meta_path) {
             Ok(meta) => {
@@ -511,12 +697,16 @@ impl ExfatVolumeManager {
                     })?;
                 validate_volume_metadata_base(&existing, &self.policy.expected_label)?;
                 let mut backfilled = false;
-                if existing.uuid.is_none() && self.policy.expected_uuid.is_some() {
-                    existing.uuid = self.policy.expected_uuid.clone();
+                let fill_uuid = phys.uuid.or_else(|| self.policy.expected_uuid.clone());
+                if existing.uuid.is_none() && fill_uuid.is_some() {
+                    existing.uuid = fill_uuid;
                     backfilled = true;
                 }
-                if existing.partuuid.is_none() && self.policy.expected_partuuid.is_some() {
-                    existing.partuuid = self.policy.expected_partuuid.clone();
+                let fill_partuuid = phys
+                    .partuuid
+                    .or_else(|| self.policy.expected_partuuid.clone());
+                if existing.partuuid.is_none() && fill_partuuid.is_some() {
+                    existing.partuuid = fill_partuuid;
                     backfilled = true;
                 }
                 validate_volume_metadata(&existing, &self.policy)?;
@@ -539,8 +729,10 @@ impl ExfatVolumeManager {
                     volume_id: new_uuid_v4(),
                     label: self.policy.expected_label.clone(),
                     initialized_at: Some(now_rfc3339_utc()),
-                    uuid: self.policy.expected_uuid.clone(),
-                    partuuid: self.policy.expected_partuuid.clone(),
+                    uuid: phys.uuid.or_else(|| self.policy.expected_uuid.clone()),
+                    partuuid: phys
+                        .partuuid
+                        .or_else(|| self.policy.expected_partuuid.clone()),
                 };
                 let mut bytes = serde_json::to_vec_pretty(&created).map_err(|e| {
                     StorageError::VolumeInvalid {
@@ -605,6 +797,7 @@ impl ExfatVolumeManager {
         previous_binding: Option<(&str, u64, &str, &str)>,
     ) -> StorageResult<VolumeAdmission> {
         let cap = self.inspect_capacity_checked()?;
+        let phys = self.verify_physical_identity(cap.device_id)?;
 
         let meta_path = self.paths.volume_metadata_file();
         let meta_stat =
@@ -687,10 +880,12 @@ impl ExfatVolumeManager {
             label: meta.label,
             uuid: meta
                 .uuid
+                .or(phys.uuid)
                 .or_else(|| self.policy.expected_uuid.clone())
                 .unwrap_or_default(),
             partuuid: meta
                 .partuuid
+                .or(phys.partuuid)
                 .or_else(|| self.policy.expected_partuuid.clone())
                 .unwrap_or_default(),
             device_id: cap.device_id,
@@ -904,6 +1099,7 @@ impl VolumeManager for ExfatVolumeManager {
 
     fn ensure_layout(&self) -> StorageResult<bool> {
         let cap = self.inspect_capacity_checked()?;
+        let _ = self.verify_physical_identity(cap.device_id)?;
         let dirs = [
             self.paths.recordings_dir(),
             self.paths.logs_dir(),

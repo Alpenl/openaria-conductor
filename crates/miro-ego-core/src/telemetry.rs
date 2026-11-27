@@ -53,8 +53,11 @@ pub struct RingStats {
     pub next_seq: u64,
 }
 
+const STORED_ENTRY_OVERHEAD_BYTES: usize = 64;
+
 struct StoredEntry {
     entry: TelemetryEntry,
+    serialized_line: String,
     approx_bytes: usize,
 }
 
@@ -128,17 +131,6 @@ impl BoundedRingLog {
             event,
             payload,
         };
-        let pre_approx = estimate_entry_bytes(&entry);
-        let mut was_truncated = false;
-        if pre_approx > self.max_bytes {
-            entry.target.truncate(trunc_target_end);
-            entry.event.truncate(trunc_event_end);
-            entry.payload = serde_json::json!({
-                "truncated": true,
-                "original_bytes": pre_approx,
-            });
-            was_truncated = true;
-        }
 
         let mut guard = self
             .state
@@ -148,8 +140,11 @@ impl BoundedRingLog {
         guard.next_seq = guard.next_seq.saturating_add(1);
         entry.seq = seq;
 
-        let mut approx_bytes = estimate_entry_bytes(&entry);
-        if approx_bytes > self.max_bytes && !was_truncated {
+        let mut serialized_line = serialize_entry_line(&entry)?;
+        let mut approx_bytes = serialized_line
+            .len()
+            .saturating_add(STORED_ENTRY_OVERHEAD_BYTES);
+        if approx_bytes > self.max_bytes {
             entry
                 .target
                 .truncate(trunc_target_end.min(entry.target.len()));
@@ -158,7 +153,10 @@ impl BoundedRingLog {
                 "truncated": true,
                 "original_bytes": approx_bytes,
             });
-            approx_bytes = estimate_entry_bytes(&entry);
+            serialized_line = serialize_entry_line(&entry)?;
+            approx_bytes = serialized_line
+                .len()
+                .saturating_add(STORED_ENTRY_OVERHEAD_BYTES);
         }
         if approx_bytes > self.max_bytes {
             guard.dropped_entries = guard.dropped_entries.saturating_add(1);
@@ -180,6 +178,7 @@ impl BoundedRingLog {
         guard.used_bytes += approx_bytes;
         guard.entries.push_back(StoredEntry {
             entry,
+            serialized_line,
             approx_bytes,
         });
         Ok(seq)
@@ -244,8 +243,18 @@ impl BoundedRingLog {
             CoreError::invalid_input("telemetry_flush_failed", "telemetry path contains NUL byte")
         })?;
 
-        let entries = self.snapshot()?;
-        let Some(last_seq) = entries.last().map(|entry| entry.seq) else {
+        let lines: Vec<(u64, String)> = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| CoreError::poisoned("telemetry_ring"))?;
+            guard
+                .entries
+                .iter()
+                .map(|s| (s.entry.seq, s.serialized_line.clone()))
+                .collect()
+        };
+        let Some(&(last_seq, _)) = lines.last() else {
             return Ok(0);
         };
 
@@ -285,10 +294,8 @@ impl BoundedRingLog {
             let mut file = open_create_exclusive(&temp_path, 0o640).map_err(|err| {
                 CoreError::io("telemetry_flush_failed", "create telemetry dump", err)
             })?;
-            for entry in &entries {
-                let line = serde_json::to_vec(entry)
-                    .map_err(|err| CoreError::invalid_input("telemetry_encode", err.to_string()))?;
-                file.write_all(&line)
+            for (_, line) in &lines {
+                file.write_all(line.as_bytes())
                     .and_then(|()| file.write_all(b"\n"))
                     .map_err(|err| {
                         CoreError::io("telemetry_flush_failed", "write telemetry dump", err)
@@ -360,7 +367,7 @@ impl BoundedRingLog {
                 break;
             }
         }
-        Ok(entries.len())
+        Ok(lines.len())
     }
 }
 
@@ -370,9 +377,9 @@ impl Default for BoundedRingLog {
     }
 }
 
-fn estimate_entry_bytes(entry: &TelemetryEntry) -> usize {
-    let serialized = serde_json::to_vec(entry).map(|v| v.len()).unwrap_or(128);
-    serialized.saturating_add(64)
+fn serialize_entry_line(entry: &TelemetryEntry) -> CoreResult<String> {
+    serde_json::to_string(entry)
+        .map_err(|err| CoreError::invalid_input("telemetry_encode", err.to_string()))
 }
 
 #[cfg(test)]

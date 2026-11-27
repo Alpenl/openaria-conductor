@@ -3,19 +3,19 @@
 
 pub mod clock;
 pub mod controller;
+pub mod error;
 pub mod mdns;
 pub mod nmcli;
 pub mod rpc;
 pub mod state;
 
-use miro_ego_core::CoreError;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 pub use clock::{
     CLOCK_STATE_FILENAME, CLOCK_STATE_SCHEMA, ClockStatusSnapshot, LinuxSystemClockBackend,
     MockSystemClockBackend, PersistedClockState, SystemClockBackend,
 };
+pub use error::{NetworkError, NetworkResult};
 
 pub use controller::{
     ApplyDesiredState, ApplyWifiClient, AuthoritativeNetworkController, ControllerConfig,
@@ -52,23 +52,6 @@ pub use state::{
 pub const MDNS_SERVICE_TYPE: &str = "_miro-ego._tcp";
 pub const HOTSPOT_SSID_PREFIX: &str = "MiroEgo-";
 pub const NETWORK_STATUS_SCHEMA: &str = "miro-ego.network-status.v1";
-
-#[derive(Debug, Error)]
-pub enum NetworkError {
-    #[error("network busy: {message}")]
-    Busy { message: String },
-
-    #[error("network validation error: {message}")]
-    Invalid { message: String },
-
-    #[error("network backend failed: {message}")]
-    Backend { message: String },
-
-    #[error(transparent)]
-    Core(#[from] CoreError),
-}
-
-pub type NetworkResult<T> = Result<T, NetworkError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

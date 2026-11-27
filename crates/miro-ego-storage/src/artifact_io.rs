@@ -486,6 +486,28 @@ pub fn open_verified_artifact_with_lease(
     verify_digest: bool,
     handle_counter: Option<&Arc<AtomicUsize>>,
 ) -> StorageResult<VerifiedArtifactFile> {
+    open_verified_artifact_checked_with_lease(
+        recordings_root,
+        relative_dir,
+        artifact_id,
+        expected_session_id,
+        None,
+        verify_digest,
+        handle_counter,
+    )
+}
+
+/// Safely open a verified artifact while optionally checking `expected_manifest_sha256`
+/// against the single read of `manifest.json` and acquiring an open-handle lease on `handle_counter`.
+pub fn open_verified_artifact_checked_with_lease(
+    recordings_root: &Path,
+    relative_dir: &str,
+    artifact_id: &str,
+    expected_session_id: Option<&str>,
+    expected_manifest_sha256: Option<&str>,
+    verify_digest: bool,
+    handle_counter: Option<&Arc<AtomicUsize>>,
+) -> StorageResult<VerifiedArtifactFile> {
     if !is_valid_sha256(artifact_id) {
         return Err(StorageError::invalid_input(
             "invalid_artifact_id",
@@ -497,6 +519,14 @@ pub fn open_verified_artifact_with_lease(
 
     let (session_dir, root_dev, exfat) = open_pinned_directory(recordings_root, relative_dir)?;
     let manifest = open_manifest_in_dir(&session_dir, root_dev, exfat, expected_session_id)?;
+    if let Some(expected_sha) = expected_manifest_sha256 {
+        if manifest.sha256 != expected_sha {
+            return Err(StorageError::integrity(
+                "manifest_sha256_mismatch",
+                "manifest.json sha256 does not match catalog record",
+            ));
+        }
+    }
     let descriptors = extract_manifest_artifacts(&manifest.parsed)?;
     let descriptor = descriptors
         .into_iter()

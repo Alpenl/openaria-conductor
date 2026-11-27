@@ -13,6 +13,8 @@
 
 #include <stddef.h>
 
+#include "miro_ego_sha256.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +41,17 @@ int miro_ego_mp4_fix_color(unsigned char *moov, size_t moov_size,
  */
 int miro_ego_mp4_extend_durations_fd(int fd, int fps,
                                      char *reason, size_t reason_len);
+
+/*
+ * Extends MP4 durations + colorimetry on `fd` and incrementally populates
+ * `sha_ctx` over `[0 .. moov_offset)` + in-memory patched `moov` + any trailing
+ * boxes without re-reading the patched `moov` from disk.
+ */
+int miro_ego_mp4_extend_durations_and_hash_fd(int fd, int fps,
+                                              void *io_buf, size_t io_buf_len,
+                                              miro_ego_sha256_ctx_t *sha_ctx,
+                                              unsigned long long *bytes_out,
+                                              char *reason, size_t reason_len);
 
 /*
  * Path wrapper around miro_ego_mp4_extend_durations_fd opening path with

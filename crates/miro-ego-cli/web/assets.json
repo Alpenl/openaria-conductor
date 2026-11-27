@@ -1,0 +1,31 @@
+{
+  "schema": "miro-ego.web-assets.v1",
+  "name": "miro-ego-web",
+  "version": "0.3.0",
+  "compatibility": {
+    "device_api": {
+      "required_major": 1
+    }
+  },
+  "total_bytes": 377781,
+  "files": [
+    {
+      "path": "app.js",
+      "bytes": 334587,
+      "sha256": "52020dc21fef6ff676fe611fb7db49ade47ad71d7001106ef0fac0c717522549",
+      "content_type": "application/javascript; charset=utf-8"
+    },
+    {
+      "path": "index.html",
+      "bytes": 490,
+      "sha256": "6fef333a49549615526ee85f2571b38448181914808ad46a54bec720f19d2253",
+      "content_type": "text/html; charset=utf-8"
+    },
+    {
+      "path": "styles.css",
+      "bytes": 42704,
+      "sha256": "4dc5ad6a8c18bc87bb90eb16d112496c7733c39f0862e18d90b6a447134a9cfc",
+      "content_type": "text/css; charset=utf-8"
+    }
+  ]
+}

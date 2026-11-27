@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* Encoder metadata reports only I/P/B, not IDR. Inspect Annex B NAL headers
@@ -285,8 +286,11 @@ int miro_ego_mp4_fix_color(unsigned char *moov, size_t moov_size,
  * The samples themselves are complete, so extend the four duration fields by
  * exactly one frame interval.
  */
-int miro_ego_mp4_extend_durations_fd(int fd, int fps,
-                                     char *reason, size_t reason_len)
+int miro_ego_mp4_extend_durations_and_hash_fd(int fd, int fps,
+                                              void *io_buf, size_t io_buf_len,
+                                              miro_ego_sha256_ctx_t *sha_ctx,
+                                              unsigned long long *bytes_out,
+                                              char *reason, size_t reason_len)
 {
     if (fd < 0 || fps <= 0) {
         if (reason != NULL && reason_len > 0) {
@@ -500,8 +504,75 @@ int miro_ego_mp4_extend_durations_fd(int fd, int fps,
         result = -1;
     }
 
+    if (result == 0 && sha_ctx != NULL) {
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+            (uint64_t)moov_offset + (uint64_t)moov_size > (uint64_t)st.st_size) {
+            if (reason != NULL && reason_len > 0) {
+                snprintf(reason, reason_len, "fstat failed during incremental hash");
+            }
+            result = -1;
+        } else {
+            void *owned_buf = NULL;
+            void *hash_buf = io_buf;
+            size_t hash_buf_len = io_buf_len;
+            if (hash_buf == NULL || hash_buf_len == 0) {
+                hash_buf_len = MIRO_EGO_SHA256_IO_BUF_SIZE;
+                if (posix_memalign(&owned_buf, MIRO_EGO_SHA256_IO_ALIGN, hash_buf_len) != 0 ||
+                    owned_buf == NULL) {
+                    owned_buf = NULL;
+                    if (reason != NULL && reason_len > 0) {
+                        snprintf(reason, reason_len, "out of memory");
+                    }
+                    result = -1;
+                } else {
+                    hash_buf = owned_buf;
+                }
+            }
+            if (result == 0) {
+                miro_ego_sha256_init(sha_ctx);
+                if (moov_offset > 0 &&
+                    miro_ego_sha256_update_fd_range(sha_ctx, fd, 0, (uint64_t)moov_offset,
+                                                    hash_buf, hash_buf_len) != 0) {
+                    if (reason != NULL && reason_len > 0) {
+                        snprintf(reason, reason_len, "prefix hash read failed: %s",
+                                 strerror(errno));
+                    }
+                    result = -1;
+                }
+                if (result == 0) {
+                    /* Feed patched moov directly from memory without re-reading from disk. */
+                    miro_ego_sha256_update(sha_ctx, moov, moov_size);
+                    const uint64_t after_moov = (uint64_t)moov_offset + (uint64_t)moov_size;
+                    const uint64_t tail_bytes = (uint64_t)st.st_size - after_moov;
+                    if (tail_bytes > 0 &&
+                        miro_ego_sha256_update_fd_range(sha_ctx, fd, (off_t)after_moov,
+                                                        tail_bytes, hash_buf, hash_buf_len) != 0) {
+                        if (reason != NULL && reason_len > 0) {
+                            snprintf(reason, reason_len, "tail hash read failed: %s",
+                                     strerror(errno));
+                        }
+                        result = -1;
+                    }
+                }
+                if (result == 0 && bytes_out != NULL) {
+                    *bytes_out = (unsigned long long)st.st_size;
+                }
+            }
+            free(owned_buf);
+        }
+    }
+
     free(moov);
     return result;
+}
+
+int miro_ego_mp4_extend_durations_fd(int fd, int fps,
+                                     char *reason, size_t reason_len)
+{
+    return miro_ego_mp4_extend_durations_and_hash_fd(fd, fps, NULL, 0, NULL, NULL,
+                                                     reason, reason_len);
 }
 
 int miro_ego_mp4_extend_durations(const char *path, int fps,

@@ -3,7 +3,13 @@
 //! The last three values bracket one clock-domain observation; no NTP
 //! correction is removed from the video/IMU timeline.
 
+use std::time::Duration;
+
 pub type Anchor = [u64; 5];
+
+pub const MAX_SYSCALL_JITTER_NS: u64 = 5_000_000;
+pub const MIN_HTIMESTAMP_WINDOW_NS: u64 = 100_000_000;
+pub const BRIDGE_RETRY_SLEEP: Duration = Duration::from_millis(2);
 
 /// Retain one host observation for each ALSA hardware timestamp. USB reads can
 /// observe the same ALSA `htimestamp` again (with the same or a further-advanced
@@ -22,36 +28,58 @@ pub struct Model {
     pub residual_ns: f64,
 }
 
+pub fn max_htimestamp_age_ns(period_ns: u64) -> u64 {
+    period_ns.saturating_mul(4).max(MIN_HTIMESTAMP_WINDOW_NS)
+}
+
 pub fn mapped_ns(anchor: &Anchor) -> Result<u64, String> {
+    mapped_ns_with_period(anchor, 0)
+}
+
+pub fn mapped_ns_with_period(anchor: &Anchor, period_ns: u64) -> Result<u64, String> {
     let [position, raw, mono, before, after] = *anchor;
+    let max_age_ns = max_htimestamp_age_ns(period_ns);
     if position == 0
         || raw == 0
         || mono == 0
-        || raw > before
         || before > after
-        || after - before > 1_000_000
-        || after - raw > 20_000_000
+        || raw > after
+        || after - before > MAX_SYSCALL_JITTER_NS
+        || before.saturating_sub(raw) > max_age_ns
     {
         return Err("audio clock bridge is stale or uncertain".into());
     }
     let midpoint = before + (after - before) / 2;
-    // raw <= midpoint, so subtract the elapsed raw time without overflow.
-    mono.checked_sub(midpoint - raw)
+    let mapped = if midpoint >= raw {
+        mono.checked_sub(midpoint - raw)
+    } else {
+        mono.checked_add(raw - midpoint)
+    };
+    mapped
         .filter(|value| *value > 0)
         .ok_or_else(|| "invalid mapped audio clock".into())
 }
 
 /// A delayed clock observation is not itself evidence of lost PCM. Refresh the
-/// ALSA position/timestamp together with the host bracket, at most three times.
-/// Invalid clocks and ALSA errors still fail immediately. Every rejected row is
-/// reported before returning or retrying; continuity is checked independently.
+/// ALSA position/timestamp together with the host bracket, at most three times
+/// with a 2 ms backoff between attempts. Invalid clocks and ALSA errors fail
+/// immediately. Every rejected row is reported before returning or retrying.
 pub fn observe_anchor(
+    sample: impl FnMut() -> Result<Anchor, crate::audio::AudioError>,
+    rejected: impl FnMut(Anchor),
+) -> Result<(Anchor, u64), crate::audio::AudioError> {
+    observe_anchor_with_period(0, sample, rejected)
+}
+
+pub fn observe_anchor_with_period(
+    period_ns: u64,
     mut sample: impl FnMut() -> Result<Anchor, crate::audio::AudioError>,
     mut rejected: impl FnMut(Anchor),
 ) -> Result<(Anchor, u64), crate::audio::AudioError> {
+    let max_age_ns = max_htimestamp_age_ns(period_ns);
     for attempt in 1..=3 {
         let anchor = sample()?;
-        match mapped_ns(&anchor) {
+        match mapped_ns_with_period(&anchor, period_ns) {
             Ok(mapped) => return Ok((anchor, mapped)),
             Err(message) => {
                 rejected(anchor);
@@ -59,15 +87,17 @@ pub fn observe_anchor(
                 let retryable = position > 0
                     && raw > 0
                     && mono > 0
-                    && raw <= before
                     && before <= after
-                    && (after - before > 1_000_000 || after - raw > 20_000_000);
+                    && raw <= after
+                    && (after - before > MAX_SYSCALL_JITTER_NS
+                        || before.saturating_sub(raw) > max_age_ns);
                 if !retryable || attempt == 3 {
                     return Err(crate::audio::AudioError::new(
                         "audio_failed",
                         format!("{message}; attempt={attempt}; anchor={anchor:?}"),
                     ));
                 }
+                std::thread::sleep(BRIDGE_RETRY_SLEEP);
             }
         }
     }
@@ -95,9 +125,10 @@ pub fn evaluate(
     if anchors.is_empty() || rate == 0 || samples == 0 || period == 0 || period > buffer {
         return Err("invalid raw audio clock domain".into());
     }
+    let period_ns = period.saturating_mul(1_000_000_000) / u64::from(rate);
     let points = anchors
         .iter()
-        .map(|anchor| mapped_ns(anchor).map(|mono| [anchor[0], mono]))
+        .map(|anchor| mapped_ns_with_period(anchor, period_ns).map(|mono| [anchor[0], mono]))
         .collect::<Result<Vec<_>, _>>()?;
     if anchors.len() == 1 {
         let only = anchors[0];
@@ -223,11 +254,19 @@ mod tests {
             assert!(evaluate(&anchors, 48000, 600 * 48000, 1024, 8192).is_err());
         }
         let mut anchors = fixture();
-        anchors[100][4] += 2_000_000;
+        anchors[100][4] += MAX_SYSCALL_JITTER_NS + 1_000_000;
         assert!(evaluate(&anchors, 48000, 600 * 48000, 1024, 8192).is_err());
         let mut anchors = fixture();
         anchors.drain(100..110);
         assert!(evaluate(&anchors, 48000, 600 * 48000, 1024, 8192).is_err());
+
+        // Hardware period interrupt ~21.3ms prior to host syscall bracket must be accepted!
+        let period_ns = 1024_u64 * 1_000_000_000 / 48_000; // ~21.333ms
+        let mut normal_period_lag = fixture()[0];
+        for value in &mut normal_period_lag[2..] {
+            *value += 25_000_000;
+        }
+        assert!(mapped_ns_with_period(&normal_period_lag, period_ns).is_ok());
     }
 
     #[test]
@@ -236,19 +275,21 @@ mod tests {
             let good = fixture()[1];
             let mut delayed = fixture()[0];
             if wide_bracket {
-                delayed[4] += 2_000_000;
+                delayed[4] += MAX_SYSCALL_JITTER_NS + 1_000_000;
             } else {
                 for value in &mut delayed[2..] {
-                    *value += 30_000_000;
+                    *value += MIN_HTIMESTAMP_WINDOW_NS + 20_000_000;
                 }
             }
             let mut observations = [delayed, good].into_iter();
             let mut rejected = Vec::new();
+            let started = std::time::Instant::now();
             let (actual, mapped) = observe_anchor(
                 || Ok(observations.next().expect("unexpected sampling")),
                 |row| rejected.push(row),
             )
             .unwrap();
+            assert!(started.elapsed() >= Duration::from_millis(1));
             assert_eq!(actual, good);
             assert_eq!(mapped, mapped_ns(&good).unwrap());
             assert_eq!(rejected, [delayed]);
@@ -258,9 +299,10 @@ mod tests {
     #[test]
     fn persistent_observation_delay_is_bounded_and_retains_last_row() {
         let mut delayed = fixture()[0];
-        delayed[4] += 2_000_000;
+        delayed[4] += MAX_SYSCALL_JITTER_NS + 1_000_000;
         let mut calls = 0;
         let mut rejected = Vec::new();
+        let started = std::time::Instant::now();
         let error = observe_anchor(
             || {
                 calls += 1;
@@ -269,6 +311,7 @@ mod tests {
             |row| rejected.push(row),
         )
         .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(3));
         assert_eq!(calls, 3);
         assert_eq!(rejected, [delayed; 3]);
         assert!(error.message.contains("attempt=3"));

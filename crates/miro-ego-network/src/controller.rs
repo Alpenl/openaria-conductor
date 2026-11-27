@@ -109,7 +109,8 @@ pub struct CredentialReceipt {
 }
 
 struct StoredCredential {
-    passphrase: String,
+    owner_principal: Option<String>,
+    passphrase: Option<String>,
     expires_at: Instant,
 }
 
@@ -129,22 +130,60 @@ impl EphemeralCredentialStore {
     }
 
     pub fn issue(&self, passphrase: &str) -> NetworkResult<CredentialReceipt> {
+        self.issue_inner(None, passphrase)
+    }
+
+    /// Issue a principal-bound single-use `credential_ref` that can only be consumed by
+    /// `principal_id`.
+    pub fn issue_for_principal(
+        &self,
+        principal_id: &str,
+        passphrase: &str,
+    ) -> NetworkResult<CredentialReceipt> {
+        let valid_principal = (1..=128).contains(&principal_id.len())
+            && principal_id.bytes().all(|b| (0x21..=0x7E).contains(&b));
+        if !valid_principal {
+            return Err(NetworkError::Invalid {
+                message: "request_invalid: principal_id must be 1..=128 visible ASCII characters"
+                    .to_owned(),
+            });
+        }
+        self.issue_inner(Some(principal_id.to_owned()), passphrase)
+    }
+
+    fn issue_inner(
+        &self,
+        owner_principal: Option<String>,
+        passphrase: &str,
+    ) -> NetworkResult<CredentialReceipt> {
         validate_wifi_psk(passphrase)?;
         let now_inst = Instant::now();
         let mut map = self.entries.lock().map_err(|_| NetworkError::Backend {
             message: "credential store mutex poisoned".to_owned(),
         })?;
         map.retain(|_, v| v.expires_at > now_inst);
-        if map.len() >= MAX_CREDENTIAL_STORE_ENTRIES {
+        let unconsumed_count = map.values().filter(|v| v.passphrase.is_some()).count();
+        if unconsumed_count >= MAX_CREDENTIAL_STORE_ENTRIES {
             return Err(NetworkError::Busy {
                 message: "credential_store_full: too many pending credentials".to_owned(),
             });
+        }
+        if map.len() >= MAX_CREDENTIAL_STORE_ENTRIES.saturating_mul(2) {
+            if let Some(oldest_used_key) = map
+                .iter()
+                .filter(|(_, v)| v.passphrase.is_none())
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_used_key);
+            }
         }
         let credential_ref = format!("cred-{}", new_uuid_v4().replace('-', ""));
         map.insert(
             credential_ref.clone(),
             StoredCredential {
-                passphrase: passphrase.to_owned(),
+                owner_principal,
+                passphrase: Some(passphrase.to_owned()),
                 expires_at: now_inst + self.ttl,
             },
         );
@@ -162,24 +201,56 @@ impl EphemeralCredentialStore {
         })
     }
 
-    /// Consume a single-use credential reference.
+    /// Consume an unscoped single-use credential reference.
     pub fn consume(&self, credential_ref: &str) -> NetworkResult<String> {
+        self.consume_inner(None, credential_ref)
+    }
+
+    /// Consume a single-use credential reference bound to `principal_id`.
+    pub fn consume_for_principal(
+        &self,
+        principal_id: &str,
+        credential_ref: &str,
+    ) -> NetworkResult<String> {
+        self.consume_inner(Some(principal_id), credential_ref)
+    }
+
+    fn consume_inner(
+        &self,
+        principal_id: Option<&str>,
+        credential_ref: &str,
+    ) -> NetworkResult<String> {
         let now_inst = Instant::now();
         let mut map = self.entries.lock().map_err(|_| NetworkError::Backend {
             message: "credential store mutex poisoned".to_owned(),
         })?;
-        let Some(entry) = map.remove(credential_ref) else {
+        let Some(entry) = map.get_mut(credential_ref) else {
             return Err(NetworkError::Invalid {
-                message: "credential_ref_invalid: credential reference is unknown or consumed"
-                    .to_owned(),
+                message: "credential_ref_invalid: credential reference is unknown".to_owned(),
             });
         };
         if entry.expires_at <= now_inst {
+            map.remove(credential_ref);
             return Err(NetworkError::Invalid {
                 message: "credential_ref_expired: credential reference has expired".to_owned(),
             });
         }
-        Ok(entry.passphrase)
+        if let Some(owner) = &entry.owner_principal {
+            if principal_id != Some(owner.as_str()) {
+                return Err(NetworkError::Invalid {
+                    message:
+                        "credential_ref_not_allowed: credential reference belongs to another principal"
+                            .to_owned(),
+                });
+            }
+        }
+        let Some(passphrase) = entry.passphrase.take() else {
+            return Err(NetworkError::Invalid {
+                message: "credential_ref_already_used: credential reference was already consumed"
+                    .to_owned(),
+            });
+        };
+        Ok(passphrase)
     }
 
     pub fn clear(&self) {
@@ -519,7 +590,7 @@ impl AuthoritativeNetworkController {
         match full.desired.mode {
             DesiredMode::Hotspot => self.core.activate_rescue_hotspot_locked(),
             DesiredMode::WifiClient => {
-                if !latest_unhealthy {
+                if full.verified || !latest_unhealthy {
                     if let (Some(lkg_profile), Some(wifi)) =
                         (&full.lkg_wifi_profile, &full.desired.wifi_client)
                     {
@@ -545,7 +616,25 @@ impl AuthoritativeNetworkController {
                                         .map(|_| ())
                                 });
                             if connected_ok.is_ok() {
+                                let _ = self
+                                    .core
+                                    .backend
+                                    .promote_wifi_client_autoconnect(lkg_profile);
+                                if full.verified && latest_unhealthy {
+                                    let _ = self
+                                        .core
+                                        .state
+                                        .record_startup_wifi_recovered(utc_now_iso8601());
+                                }
                                 return Ok(());
+                            }
+                            if full.verified {
+                                let rescue_res = self.core.activate_rescue_hotspot_locked();
+                                let _ = self.core.state.record_startup_rescue_preserving_verified(
+                                    rescue_res.is_ok(),
+                                    utc_now_iso8601(),
+                                );
+                                return rescue_res;
                             }
                         }
                     }
@@ -703,6 +792,17 @@ impl AuthoritativeNetworkController {
         self.core.credentials.issue(passphrase)
     }
 
+    /// Issue a principal-bound short-lived single-use opaque `credential_ref` for a Wi-Fi passphrase.
+    pub fn create_credential_for_principal(
+        &self,
+        principal_id: &str,
+        passphrase: &str,
+    ) -> NetworkResult<CredentialReceipt> {
+        self.core
+            .credentials
+            .issue_for_principal(principal_id, passphrase)
+    }
+
     /// Return the authoritative controller status projection, including live `observed` link state
     /// and canonical `rescue_ssid`.
     pub fn controller_status(&self) -> NetworkResult<ControllerStatus> {
@@ -782,11 +882,12 @@ impl AuthoritativeNetworkController {
         validate_principal_and_key(principal_id, idempotency_key)?;
         let fingerprint = compute_request_fingerprint("apply", desired_input)?;
 
-        if let Some(receipt) =
-            self.core
-                .state
-                .replay_receipt(principal_id, idempotency_key, &fingerprint)?
-        {
+        if let Some(receipt) = self.core.state.replay_receipt_for_operation(
+            principal_id,
+            TransactionOperation::Apply,
+            idempotency_key,
+            &fingerprint,
+        )? {
             let final_status = self
                 .core
                 .state
@@ -813,7 +914,8 @@ impl AuthoritativeNetworkController {
             });
         }
 
-        let (normalized_desired, maybe_spec) = self.core.resolve_apply_spec(desired_input)?;
+        let (normalized_desired, maybe_spec) =
+            self.core.resolve_apply_spec(principal_id, desired_input)?;
         let candidate_profile = maybe_spec.as_ref().map(|spec| {
             managed_profile_name(
                 spec.mode_slug(),
@@ -891,11 +993,12 @@ impl AuthoritativeNetworkController {
         validate_principal_and_key(principal_id, idempotency_key)?;
         let fingerprint = compute_request_fingerprint("retry", &source_transaction_id)?;
 
-        if let Some(receipt) =
-            self.core
-                .state
-                .replay_receipt(principal_id, idempotency_key, &fingerprint)?
-        {
+        if let Some(receipt) = self.core.state.replay_receipt_for_operation(
+            principal_id,
+            TransactionOperation::Retry,
+            idempotency_key,
+            &fingerprint,
+        )? {
             let final_status = self
                 .core
                 .state
@@ -988,11 +1091,12 @@ impl AuthoritativeNetworkController {
         validate_principal_and_key(principal_id, idempotency_key)?;
         let fingerprint = compute_request_fingerprint("forget", &serde_json::json!({}))?;
 
-        if let Some(receipt) =
-            self.core
-                .state
-                .replay_receipt(principal_id, idempotency_key, &fingerprint)?
-        {
+        if let Some(receipt) = self.core.state.replay_receipt_for_operation(
+            principal_id,
+            TransactionOperation::Forget,
+            idempotency_key,
+            &fingerprint,
+        )? {
             let final_status = self
                 .core
                 .state
@@ -1505,6 +1609,12 @@ impl ControllerCore {
                 },
             )?;
             let _ = self.backend.verify_activated_profile(profile_name, spec)?;
+            if is_wifi_client {
+                self.backend.promote_wifi_client_autoconnect(profile_name)?;
+            } else {
+                self.backend
+                    .promote_profile_autoconnect(profile_name, spec)?;
+            }
             Ok(())
         })();
 
@@ -1517,8 +1627,6 @@ impl ControllerCore {
                     self.state
                         .set_lkg_profile(true, Some(profile_name.to_owned()))?;
                 } else {
-                    self.backend
-                        .promote_profile_autoconnect(profile_name, spec)?;
                     let _ = self
                         .backend
                         .disconnect_device(self.backend.wifi_interface());
@@ -1666,6 +1774,7 @@ impl ControllerCore {
 
     fn resolve_apply_spec(
         &self,
+        principal_id: &str,
         input: &ApplyDesiredState,
     ) -> NetworkResult<(DesiredState, Option<ProfileSpec>)> {
         match input.mode {
@@ -1673,7 +1782,9 @@ impl ControllerCore {
             DesiredMode::WifiClient => {
                 let Some(wifi) = &input.wifi_client else {
                     return Err(NetworkError::Invalid {
-                        message: "wifi-client mode requires wifi_client object".to_owned(),
+                        message:
+                            "invalid_network_desired_state: wifi-client mode requires wifi_client object"
+                                .to_owned(),
                     });
                 };
                 validate_wifi_ssid(&wifi.ssid)?;
@@ -1681,7 +1792,9 @@ impl ControllerCore {
                     WifiSecurity::Open => {
                         if wifi.credential_ref.is_some() {
                             return Err(NetworkError::Invalid {
-                                message: "open Wi-Fi must not include credential_ref".to_owned(),
+                                message:
+                                    "security_mismatch: open Wi-Fi must not include credential_ref"
+                                        .to_owned(),
                             });
                         }
                         (None, CredentialState::Absent)
@@ -1689,10 +1802,14 @@ impl ControllerCore {
                     _ => {
                         let Some(cred_ref) = wifi.credential_ref.as_deref() else {
                             return Err(NetworkError::Invalid {
-                                message: "protected Wi-Fi requires credential_ref".to_owned(),
+                                message:
+                                    "missing_credential_ref: protected Wi-Fi requires credential_ref"
+                                        .to_owned(),
                             });
                         };
-                        let passphrase = self.credentials.consume(cred_ref)?;
+                        let passphrase = self
+                            .credentials
+                            .consume_for_principal(principal_id, cred_ref)?;
                         (Some(passphrase), CredentialState::Stored)
                     }
                 };
@@ -1712,17 +1829,21 @@ impl ControllerCore {
             DesiredMode::EthernetStatic => {
                 let Some(eth) = &input.ethernet else {
                     return Err(NetworkError::Invalid {
-                        message: "ethernet-static requires ethernet object".to_owned(),
+                        message: "invalid_static_ipv4: ethernet-static requires ethernet object"
+                            .to_owned(),
                     });
                 };
                 if eth.addressing != EthernetAddressing::Static {
                     return Err(NetworkError::Invalid {
-                        message: "ethernet-static requires addressing=static".to_owned(),
+                        message: "invalid_static_ipv4: ethernet-static requires addressing=static"
+                            .to_owned(),
                     });
-                }
+                };
                 let Some(static_cfg) = eth.static_ipv4.clone() else {
                     return Err(NetworkError::Invalid {
-                        message: "ethernet-static requires static_ipv4 configuration".to_owned(),
+                        message:
+                            "invalid_static_ipv4: ethernet-static requires static_ipv4 configuration"
+                                .to_owned(),
                     });
                 };
                 static_cfg.validate()?;
@@ -1822,7 +1943,9 @@ fn validate_apply_input_shape(input: &ApplyDesiredState) -> NetworkResult<()> {
         DesiredMode::WifiClient => {
             let Some(wifi) = &input.wifi_client else {
                 return Err(NetworkError::Invalid {
-                    message: "wifi-client mode requires wifi_client object".to_owned(),
+                    message:
+                        "invalid_network_desired_state: wifi-client mode requires wifi_client object"
+                            .to_owned(),
                 });
             };
             validate_wifi_ssid(&wifi.ssid)?;
@@ -1830,14 +1953,18 @@ fn validate_apply_input_shape(input: &ApplyDesiredState) -> NetworkResult<()> {
                 WifiSecurity::Open => {
                     if wifi.credential_ref.is_some() {
                         return Err(NetworkError::Invalid {
-                            message: "open Wi-Fi must not include credential_ref".to_owned(),
+                            message:
+                                "security_mismatch: open Wi-Fi must not include credential_ref"
+                                    .to_owned(),
                         });
                     }
                 }
                 _ => {
                     if wifi.credential_ref.as_deref().is_none_or(str::is_empty) {
                         return Err(NetworkError::Invalid {
-                            message: "protected Wi-Fi requires credential_ref".to_owned(),
+                            message:
+                                "missing_credential_ref: protected Wi-Fi requires credential_ref"
+                                    .to_owned(),
                         });
                     }
                 }
@@ -1848,17 +1975,21 @@ fn validate_apply_input_shape(input: &ApplyDesiredState) -> NetworkResult<()> {
         DesiredMode::EthernetStatic => {
             let Some(eth) = &input.ethernet else {
                 return Err(NetworkError::Invalid {
-                    message: "ethernet-static requires ethernet object".to_owned(),
+                    message: "invalid_static_ipv4: ethernet-static requires ethernet object"
+                        .to_owned(),
                 });
             };
             if eth.addressing != EthernetAddressing::Static {
                 return Err(NetworkError::Invalid {
-                    message: "ethernet-static requires addressing=static".to_owned(),
+                    message: "invalid_static_ipv4: ethernet-static requires addressing=static"
+                        .to_owned(),
                 });
-            }
+            };
             let Some(static_cfg) = &eth.static_ipv4 else {
                 return Err(NetworkError::Invalid {
-                    message: "ethernet-static requires static_ipv4 configuration".to_owned(),
+                    message:
+                        "invalid_static_ipv4: ethernet-static requires static_ipv4 configuration"
+                            .to_owned(),
                 });
             };
             static_cfg.validate()
@@ -1908,7 +2039,7 @@ impl NetworkController for AuthoritativeNetworkController {
         };
         let cred_ref = if security.requires_credential() {
             Some(
-                self.create_credential(&credentials.passphrase)?
+                self.create_credential_for_principal("local-controller", &credentials.passphrase)?
                     .credential_ref,
             )
         } else {
@@ -2664,8 +2795,33 @@ mod tests {
         let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Committed);
 
-        // Simulate reboot in WifiClient mode when upstream router is down -> falls back to rescue AP,
-        // marks verified=false, and defers wifi-watchdog!
+        // Simulate reboot in WifiClient mode when upstream router is transiently down ->
+        // activates rescue AP operationally (Rescued) WITHOUT clobbering persisted.verified=true,
+        // defers wifi-watchdog while rescue AP is active, and reconnects cleanly on a later boot!
+        let lkg_wifi_prof = ctrl
+            .state_store()
+            .full_state()
+            .unwrap()
+            .lkg_wifi_profile
+            .unwrap();
+        let wifi_keyfile = fs::read_to_string(ctrl.backend().profile_path(&lkg_wifi_prof)).unwrap();
+        assert!(
+            wifi_keyfile.contains("autoconnect=true"),
+            "verified WifiClient profile must be promoted to autoconnect=true"
+        );
+        assert!(
+            mock.inner.lock().unwrap().calls.iter().any(|c| {
+                c == &[
+                    "connection".to_owned(),
+                    "modify".to_owned(),
+                    lkg_wifi_prof.clone(),
+                    "connection.autoconnect".to_owned(),
+                    "yes".to_owned(),
+                ]
+            }),
+            "verified WifiClient commit must run nmcli connection modify <profile> connection.autoconnect yes"
+        );
+
         drop(ctrl);
         let mock_down = MockNmcli::new(true);
         let backend2 = NmcliBackend::new(mock_down, root.join("profiles"), "wlan0", "eth0");
@@ -2675,8 +2831,126 @@ mod tests {
         cfg2.avahi_dir = Some(root.join("missing-etc-avahi-services"));
         let ctrl2 = AuthoritativeNetworkController::new(backend2, state2, cfg2).unwrap();
         assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
-        assert!(!ctrl2.controller_status().unwrap().verified);
+        let st2 = ctrl2.controller_status().unwrap();
+        assert!(
+            st2.verified,
+            "transient router outage at boot must NOT clobber persisted.verified=true"
+        );
+        assert_eq!(
+            st2.transaction.latest.as_ref().map(|t| t.status),
+            Some(TransactionStatus::Rescued)
+        );
         assert_eq!(ctrl2.watchdog_mode().unwrap(), WatchdogMode::Defer);
+
+        // Next boot when router comes back online -> reconnects automatically without rescue lock-in!
+        drop(ctrl2);
+        let mock_up_again = MockNmcli::new(false);
+        let backend3 = NmcliBackend::new(mock_up_again, root.join("profiles"), "wlan0", "eth0");
+        let state3 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let ctrl3 = AuthoritativeNetworkController::new(
+            backend3,
+            state3,
+            ControllerConfig::new("rdk-x5-crash", root.join("run")),
+        )
+        .unwrap();
+        assert_eq!(ctrl3.status().unwrap().mode, crate::NetworkMode::Station);
+        assert!(ctrl3.controller_status().unwrap().verified);
+        assert_eq!(ctrl3.watchdog_mode().unwrap(), WatchdogMode::WifiClient);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enforces_principal_bound_credentials_and_operation_scoped_idempotency() {
+        let root = temp_root("principal-idem");
+        let mock = MockNmcli::new(false);
+        let backend = NmcliBackend::new(mock, root.join("profiles"), "wlan0", "eth0");
+        let state = NetworkStateStore::open_or_init(root.join("network-state.json")).unwrap();
+        let cfg =
+            ControllerConfig::new("rdk-x5-sec", root.join("run")).with_synchronous_mutations(true);
+        let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
+
+        let cred = ctrl
+            .create_credential_for_principal("alice", "alice-secret-psk")
+            .unwrap();
+
+        // Different principal cannot consume alice's credential_ref, and alice's ref stays valid!
+        let hijack_err = ctrl
+            .apply(
+                "bob",
+                "shared-idem-key",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "LabWiFi".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred.credential_ref.clone()),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(hijack_err.error_code(), Some("credential_ref_not_allowed"));
+
+        // Alice consumes her credential_ref successfully.
+        let alice_apply = ctrl
+            .apply(
+                "alice",
+                "shared-idem-key",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "LabWiFi".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred.credential_ref.clone()),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(alice_apply.final_status, TransactionStatus::Committed);
+
+        // Reusing the already-consumed credential_ref under a new idempotency key returns credential_ref_already_used!
+        let reuse_err = ctrl
+            .apply(
+                "alice",
+                "second-idem-key",
+                &ApplyDesiredState {
+                    mode: DesiredMode::WifiClient,
+                    wifi_client: Some(ApplyWifiClient {
+                        ssid: "LabWiFi".to_owned(),
+                        security: WifiSecurity::Wpa2Personal,
+                        credential_ref: Some(cred.credential_ref),
+                    }),
+                    ethernet: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(reuse_err.error_code(), Some("credential_ref_already_used"));
+
+        // Same principal + same idempotency_key on a DIFFERENT operation (`forget` vs `apply`)
+        // does NOT collide because idempotency is scoped by (principal_id, operation, idempotency_key)!
+        let alice_forget = ctrl.forget("alice", "shared-idem-key").unwrap();
+        assert!(!alice_forget.replayed);
+        assert_eq!(alice_forget.final_status, TransactionStatus::Committed);
+
+        // Different principal using the same key on `apply` also does NOT collide!
+        let bob_apply = ctrl
+            .apply(
+                "bob",
+                "shared-idem-key",
+                &ApplyDesiredState {
+                    mode: DesiredMode::EthernetDhcp,
+                    wifi_client: None,
+                    ethernet: Some(DesiredEthernet {
+                        addressing: EthernetAddressing::Dhcp,
+                        static_ipv4: None,
+                    }),
+                },
+            )
+            .unwrap();
+        assert!(!bob_apply.replayed);
+        assert_eq!(bob_apply.final_status, TransactionStatus::Committed);
 
         fs::remove_dir_all(root).unwrap();
     }

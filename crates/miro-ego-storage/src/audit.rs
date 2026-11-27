@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_ENOSPC_BACKOFF: Duration = Duration::from_millis(250);
+const DEFAULT_IDLE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const API_AUDIT_EVENT_SCHEMA: &str = "miro-ego.api-audit-event.v1";
 pub const AUDIT_LOG_FILENAME: &str = "api-audit.ndjson";
@@ -136,6 +137,7 @@ pub struct AuditConfig {
     pub max_file_bytes: u64,
     pub max_generations: usize,
     pub fallback_ring_bytes: usize,
+    pub idle_close_after: Duration,
 }
 
 impl Default for AuditConfig {
@@ -144,6 +146,7 @@ impl Default for AuditConfig {
             max_file_bytes: DEFAULT_AUDIT_MAX_FILE_BYTES,
             max_generations: DEFAULT_AUDIT_MAX_GENERATIONS,
             fallback_ring_bytes: MAX_RING_BYTES,
+            idle_close_after: DEFAULT_IDLE_HANDLE_TIMEOUT,
         }
     }
 }
@@ -332,8 +335,9 @@ impl AuditFallbackRing {
 }
 
 struct AuditDiskState {
-    active_file: Option<File>,
+    active_file: Option<io::BufWriter<File>>,
     active_bytes: u64,
+    last_write_at: Option<Instant>,
     enospc_backoff_until: Option<Instant>,
 }
 
@@ -342,6 +346,7 @@ pub struct AuditLogger {
     paths: DataVolumePaths,
     config: AuditConfig,
     enospc_backoff: Duration,
+    idle_handle_timeout: Duration,
     volume_ready: VolumeReadyFn,
     disk: Mutex<AuditDiskState>,
     fallback: AuditFallbackRing,
@@ -358,16 +363,25 @@ impl AuditLogger {
                 max_file_bytes: clamped_file_bytes,
                 max_generations: clamped_gens,
                 fallback_ring_bytes: fallback.max_bytes(),
+                idle_close_after: config.idle_close_after,
             },
             enospc_backoff: DEFAULT_ENOSPC_BACKOFF,
+            idle_handle_timeout: config.idle_close_after,
             volume_ready,
             disk: Mutex::new(AuditDiskState {
                 active_file: None,
                 active_bytes: 0,
+                last_write_at: None,
                 enospc_backoff_until: None,
             }),
             fallback,
         }
+    }
+
+    /// Override the idle duration after which `evict_idle_handle` closes the active descriptor.
+    pub fn with_idle_handle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_handle_timeout = timeout;
+        self
     }
 
     /// Override the retry backoff duration after an `ENOSPC` / `EDQUOT` write failure.
@@ -392,11 +406,38 @@ impl AuditLogger {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(mut file) = guard.active_file.take() {
-            let _ = file.flush();
-            let _ = file.sync_all();
+        if let Some(mut writer) = guard.active_file.take() {
+            let _ = writer.flush();
+            if let Ok(file) = writer.into_inner() {
+                let _ = file.sync_all();
+            }
         }
         guard.active_bytes = 0;
+        guard.last_write_at = None;
+    }
+
+    /// Close the active `/data` audit file descriptor if it has been idle for `>= idle_handle_timeout`,
+    /// preventing indefinite open descriptor retention across idle periods.
+    pub fn evict_idle_handle(&self) -> bool {
+        let mut guard = match self.disk.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let expired = guard
+            .last_write_at
+            .is_some_and(|last| last.elapsed() >= self.idle_handle_timeout);
+        if guard.active_file.is_some() && (expired || !(self.volume_ready)()) {
+            if let Some(mut writer) = guard.active_file.take() {
+                let _ = writer.flush();
+                if let Ok(file) = writer.into_inner() {
+                    let _ = file.sync_all();
+                }
+            }
+            guard.active_bytes = 0;
+            guard.last_write_at = None;
+            return true;
+        }
+        false
     }
 
     /// Return whether an active audit file descriptor is currently held open.
@@ -472,8 +513,11 @@ impl AuditLogger {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.active_file = None;
+        if let Some(mut writer) = guard.active_file.take() {
+            let _ = writer.flush();
+        }
         guard.active_bytes = 0;
+        guard.last_write_at = None;
         if clear_backoff {
             guard.enospc_backoff_until = None;
         }
@@ -482,6 +526,7 @@ impl AuditLogger {
     fn reset_disk_state_on_error(guard: &mut AuditDiskState, err: &io::Error, backoff: Duration) {
         guard.active_file = None;
         guard.active_bytes = 0;
+        guard.last_write_at = None;
         if matches!(err.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)) && !backoff.is_zero() {
             guard.enospc_backoff_until = Some(Instant::now() + backoff);
         }
@@ -574,7 +619,7 @@ impl AuditLogger {
 
             if guard.active_file.is_none() {
                 let (file, size) = open_active_audit_file(&self.active_log_path())?;
-                guard.active_file = Some(file);
+                guard.active_file = Some(io::BufWriter::with_capacity(16 * 1024, file));
                 guard.active_bytes = size;
             }
 
@@ -585,17 +630,20 @@ impl AuditLogger {
                 self.rotate_locked(guard, &audit_dir)?;
             }
 
-            let file = match guard.active_file.as_mut() {
-                Some(file) => file,
+            let writer = match guard.active_file.as_mut() {
+                Some(writer) => writer,
                 None => {
                     let (opened, size) = open_active_audit_file(&self.active_log_path())?;
                     guard.active_bytes = size;
-                    guard.active_file.insert(opened)
+                    guard
+                        .active_file
+                        .insert(io::BufWriter::with_capacity(16 * 1024, opened))
                 }
             };
-            file.write_all(line)?;
-            file.flush()?;
+            writer.write_all(line)?;
+            writer.flush()?;
             guard.active_bytes = guard.active_bytes.saturating_add(incoming);
+            guard.last_write_at = Some(Instant::now());
             Ok(())
         })();
         if let Err(ref err) = res {
@@ -605,8 +653,11 @@ impl AuditLogger {
     }
 
     fn rotate_locked(&self, guard: &mut AuditDiskState, audit_dir: &Path) -> io::Result<()> {
-        if let Some(file) = guard.active_file.take() {
-            let _ = file.sync_all();
+        if let Some(mut writer) = guard.active_file.take() {
+            let _ = writer.flush();
+            if let Ok(file) = writer.into_inner() {
+                let _ = file.sync_all();
+            }
         }
         guard.active_bytes = 0;
 
@@ -640,7 +691,7 @@ impl AuditLogger {
         let _ = fsync_directory(audit_dir);
 
         let (file, size) = open_active_audit_file(&self.active_log_path())?;
-        guard.active_file = Some(file);
+        guard.active_file = Some(io::BufWriter::with_capacity(16 * 1024, file));
         guard.active_bytes = size;
         Ok(())
     }

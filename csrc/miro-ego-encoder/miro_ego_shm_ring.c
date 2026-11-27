@@ -468,6 +468,8 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
             if ((write_idx - check_read) < (uint64_t)ring->slot_count) {
                 continue;
             }
+            atomic_fetch_add_explicit(&ring->header->dropped_frames, 1ULL,
+                                      memory_order_relaxed);
             return MIRO_EGO_SHM_TIMEOUT;
         }
     }

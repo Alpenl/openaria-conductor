@@ -670,6 +670,19 @@ impl NetworkEventReplayBuffer {
     }
 }
 
+fn network_pair_is_contiguous(previous: &Value, current: &Value) -> bool {
+    if current.get("type").and_then(Value::as_str) == Some("snapshot") {
+        return true;
+    }
+    source_pair_is_contiguous(previous, current)
+}
+
+fn network_slice_is_contiguous(events: &[&BufferedEvent]) -> bool {
+    events
+        .windows(2)
+        .all(|pair| network_pair_is_contiguous(&pair[0].source_event, &pair[1].source_event))
+}
+
 fn network_replay_after_locked(replay: &ReplayInner, cursor: u64) -> Option<Vec<SseEvent>> {
     if let Some(anchor) = replay.resync_anchors.get(&cursor) {
         if replay.events.is_empty() {
@@ -686,11 +699,18 @@ fn network_replay_after_locked(replay: &ReplayInner, cursor: u64) -> Option<Vec<
             return None;
         }
         let start = usize::try_from(anchor.next_publish_index - oldest_index).ok()?;
+        let slice: Vec<&BufferedEvent> = replay.events.iter().skip(start).collect();
+        if slice.is_empty() {
+            return Some(Vec::new());
+        }
+        if !network_pair_is_contiguous(&anchor.source_event, &slice[0].source_event)
+            || !network_slice_is_contiguous(&slice)
+        {
+            return None;
+        }
         return Some(
-            replay
-                .events
-                .iter()
-                .skip(start)
+            slice
+                .into_iter()
                 .map(|ev| SseEvent {
                     delivery_id: ev.delivery_id,
                     schema: NETWORK_EVENT_SCHEMA,
@@ -709,11 +729,16 @@ fn network_replay_after_locked(replay: &ReplayInner, cursor: u64) -> Option<Vec<
         .events
         .iter()
         .position(|item| item.delivery_id == cursor)?;
+    let tail: Vec<&BufferedEvent> = replay.events.iter().skip(idx).collect();
+    if tail.len() <= 1 {
+        return Some(Vec::new());
+    }
+    if !network_slice_is_contiguous(&tail) {
+        return None;
+    }
     Some(
-        replay
-            .events
-            .iter()
-            .skip(idx + 1)
+        tail.into_iter()
+            .skip(1)
             .map(|ev| SseEvent {
                 delivery_id: ev.delivery_id,
                 schema: NETWORK_EVENT_SCHEMA,
@@ -801,10 +826,6 @@ fn observe_network_locked(guard: &mut NetworkReplayInner, status: Value) -> ApiR
     if matches!(relation, NetworkRelation::Same | NetworkRelation::Stale) {
         return Ok(None);
     }
-    let force_snapshot = matches!(
-        relation,
-        NetworkRelation::NewAuthority | NetworkRelation::Projection
-    );
     let authority = status
         .get("authority_epoch")
         .and_then(Value::as_str)
@@ -831,6 +852,18 @@ fn observe_network_locked(guard: &mut NetworkReplayInner, status: Value) -> ApiR
             ApiError::internal("invalid_source_state", "network status missing observed_at")
         })?
         .to_owned();
+
+    let skipped_revision = matches!(relation, NetworkRelation::New)
+        && guard
+            .last_status
+            .as_ref()
+            .and_then(|last| last.get("source_revision"))
+            .and_then(Value::as_u64)
+            .is_some_and(|last_rev| last_rev.checked_add(1) != Some(source_revision));
+    let force_snapshot = matches!(
+        relation,
+        NetworkRelation::NewAuthority | NetworkRelation::Projection
+    ) || skipped_revision;
 
     let matching_tx = if !force_snapshot {
         status

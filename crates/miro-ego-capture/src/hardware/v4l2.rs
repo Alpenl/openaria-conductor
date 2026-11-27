@@ -1,6 +1,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("V4L2 ioctl ABI layouts require 64-bit pointer width");
 
+use miro_ego_core::config::ExposureSetting;
 use miro_ego_core::sys::clock;
 use std::ffi::{CString, c_ulong, c_void};
 use std::io;
@@ -8,6 +9,8 @@ use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+pub const MAX_CONSECUTIVE_BAD_FRAMES: u32 = 30;
 
 #[cfg(target_pointer_width = "64")]
 mod abi {
@@ -45,6 +48,7 @@ mod abi {
     pub(super) const QUERY_CONTROL: c_ulong = ioc(IOC_READ | IOC_WRITE, 36, 68);
     pub(super) const CTRL_TYPE_INTEGER: u32 = 1;
     pub(super) const CTRL_TYPE_BOOLEAN: u32 = 2;
+    pub(super) const CTRL_TYPE_MENU: u32 = 3;
     pub(super) const CTRL_FLAG_DISABLED: u32 = 0x0000_0001;
     pub(super) const CTRL_CLASS_CAMERA: u32 = 0x009a_0000;
     pub(super) const CID_CAMERA_CLASS_BASE: u32 = CTRL_CLASS_CAMERA | 0x900;
@@ -259,14 +263,14 @@ impl V4l2Io for SystemIo {
     }
 }
 
-struct ControlDevice {
+pub struct ControlDevice {
     io: Arc<dyn V4l2Io>,
     fd: Option<RawFd>,
     close_on_drop: bool,
 }
 
 impl ControlDevice {
-    fn open(device: &str, open_error_code: &'static str) -> Result<Self, CaptureError> {
+    pub fn open(device: &str, open_error_code: &'static str) -> Result<Self, CaptureError> {
         Self::open_with_io(Arc::new(SystemIo), device, open_error_code)
     }
 
@@ -301,7 +305,7 @@ impl ControlDevice {
             .ok_or_else(|| CaptureError::new("invalid_state", "V4L2 control device is closed"))
     }
 
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         if let Some(fd) = self.fd.take() {
             if self.close_on_drop {
                 let _ = self.io.close(fd);
@@ -313,6 +317,15 @@ impl ControlDevice {
         &self,
         id: u32,
         expected_type: u32,
+    ) -> Result<Option<QueryControl>, CaptureError> {
+        self.query_control_types(id, &[expected_type], "camera_focus_query_failed")
+    }
+
+    fn query_control_types(
+        &self,
+        id: u32,
+        allowed_types: &[u32],
+        error_code: &'static str,
     ) -> Result<Option<QueryControl>, CaptureError> {
         let mut payload = [0; 68];
         write_u32(&mut payload, 0, id);
@@ -327,16 +340,12 @@ impl ControlDevice {
                 return Ok(None);
             }
             Err(error) => {
-                return Err(CaptureError::io(
-                    "camera_focus_query_failed",
-                    "VIDIOC_QUERYCTRL",
-                    error,
-                ));
+                return Err(CaptureError::io(error_code, "VIDIOC_QUERYCTRL", error));
             }
         }
         let control_type = read_u32(&payload, 4);
         let flags = read_u32(&payload, 56);
-        if flags & CTRL_FLAG_DISABLED != 0 || control_type != expected_type {
+        if flags & CTRL_FLAG_DISABLED != 0 || !allowed_types.contains(&control_type) {
             return Ok(None);
         }
         Ok(Some(QueryControl {
@@ -370,7 +379,7 @@ impl ControlDevice {
             .map_err(|error| CaptureError::io(error_code, "VIDIOC_S_CTRL", error))
     }
 
-    fn focus_status(&self) -> Result<Option<FocusStatus>, CaptureError> {
+    pub fn focus_status(&self) -> Result<Option<FocusStatus>, CaptureError> {
         let Some(focus) = self.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
             return Ok(None);
         };
@@ -392,11 +401,17 @@ impl ControlDevice {
         }))
     }
 
-    fn set_focus(
+    pub fn set_focus(
         &self,
         value: Option<i32>,
         auto_enabled: Option<bool>,
     ) -> Result<FocusStatus, CaptureError> {
+        if value.is_none() && auto_enabled.is_none() {
+            return Err(CaptureError::new(
+                "invalid_camera_focus",
+                "focus value or auto_enabled must be specified",
+            ));
+        }
         let Some(focus) = self.query_control(CID_FOCUS_ABSOLUTE, CTRL_TYPE_INTEGER)? else {
             return Err(CaptureError::new(
                 "camera_focus_unsupported",
@@ -424,22 +439,162 @@ impl ControlDevice {
                 "V4L2 device does not expose focus_auto",
             ));
         }
-        if let Some(enabled) = auto_enabled {
-            self.set_control(
-                CID_FOCUS_AUTO,
-                i32::from(enabled),
-                "camera_focus_set_failed",
-            )?;
-        }
-        if let Some(next) = value {
-            if auto.is_some() && auto_enabled != Some(false) {
-                self.set_control(CID_FOCUS_AUTO, 0, "camera_focus_set_failed")?;
+        match auto_enabled {
+            Some(true) => {
+                // Enable autofocus without writing CID_FOCUS_ABSOLUTE or resetting CID_FOCUS_AUTO.
+                self.set_control(CID_FOCUS_AUTO, 1, "camera_focus_set_failed")?;
             }
-            self.set_control(CID_FOCUS_ABSOLUTE, next, "camera_focus_set_failed")?;
+            Some(false) => {
+                // Disable autofocus first, then apply manual focus value if provided.
+                self.set_control(CID_FOCUS_AUTO, 0, "camera_focus_set_failed")?;
+                if let Some(next) = value {
+                    self.set_control(CID_FOCUS_ABSOLUTE, next, "camera_focus_set_failed")?;
+                }
+            }
+            None => {
+                if let Some(next) = value {
+                    if auto.is_some() {
+                        self.set_control(CID_FOCUS_AUTO, 0, "camera_focus_set_failed")?;
+                    }
+                    self.set_control(CID_FOCUS_ABSOLUTE, next, "camera_focus_set_failed")?;
+                }
+            }
         }
         self.focus_status()?.ok_or_else(|| {
             CaptureError::new("camera_focus_unsupported", "focus control disappeared")
         })
+    }
+
+    pub fn set_exposure(&self, exposure: &ExposureSetting) -> Result<ExposureConfig, CaptureError> {
+        match exposure {
+            ExposureSetting::Auto(mode) => {
+                if mode != "auto" {
+                    return Err(CaptureError::new(
+                        "invalid_argument",
+                        "auto exposure mode must be \"auto\"",
+                    ));
+                }
+                let auto_ctrl = self.query_control_types(
+                    CID_EXPOSURE_AUTO,
+                    &[CTRL_TYPE_MENU, CTRL_TYPE_INTEGER],
+                    "exposure_query_failed",
+                )?;
+                let mut candidates = Vec::with_capacity(4);
+                if let Some(ctrl) = auto_ctrl {
+                    if (ctrl.minimum..=ctrl.maximum).contains(&3) {
+                        candidates.push(3);
+                    }
+                    if ctrl.default_value != 1
+                        && (ctrl.minimum..=ctrl.maximum).contains(&ctrl.default_value)
+                        && !candidates.contains(&ctrl.default_value)
+                    {
+                        candidates.push(ctrl.default_value);
+                    }
+                    for fallback in [0, 2] {
+                        if (ctrl.minimum..=ctrl.maximum).contains(&fallback)
+                            && !candidates.contains(&fallback)
+                        {
+                            candidates.push(fallback);
+                        }
+                    }
+                    if candidates.is_empty() {
+                        candidates.push(3);
+                    }
+                } else {
+                    candidates.push(3);
+                    candidates.push(0);
+                }
+                let mut last_error = None;
+                for (idx, &candidate) in candidates.iter().enumerate() {
+                    let mut payload = [0; 8];
+                    write_u32(&mut payload, 0, CID_EXPOSURE_AUTO);
+                    write_i32(&mut payload, 4, candidate);
+                    match self.io.ioctl(self.fd()?, SET_CONTROL, &mut payload) {
+                        Ok(()) => {
+                            let actual =
+                                self.get_control(CID_EXPOSURE_AUTO, "exposure_get_failed")?;
+                            if actual != candidate {
+                                return Err(CaptureError::new(
+                                    "exposure_readback_failed",
+                                    format!("auto_exposure requested={candidate}, actual={actual}"),
+                                ));
+                            }
+                            return Ok(ExposureConfig {
+                                auto_exposure: actual,
+                                exposure_time_absolute: None,
+                            });
+                        }
+                        Err(error)
+                            if idx + 1 < candidates.len()
+                                && matches!(
+                                    error.raw_os_error(),
+                                    Some(libc::EINVAL) | Some(libc::ERANGE)
+                                ) =>
+                        {
+                            last_error = Some(CaptureError::io(
+                                "exposure_set_failed",
+                                "VIDIOC_S_CTRL",
+                                error,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(CaptureError::io(
+                                "exposure_set_failed",
+                                "VIDIOC_S_CTRL",
+                                error,
+                            ));
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    CaptureError::new("exposure_set_failed", "no supported auto exposure mode")
+                }))
+            }
+            ExposureSetting::Manual(raw_val) => {
+                let requested = i32::try_from(*raw_val)
+                    .ok()
+                    .filter(|&v| v >= 1)
+                    .ok_or_else(|| {
+                        CaptureError::new(
+                            "invalid_argument",
+                            "exposure_time_absolute must be a positive integer",
+                        )
+                    })?;
+                let abs_ctrl = self.query_control_types(
+                    CID_EXPOSURE_ABSOLUTE,
+                    &[CTRL_TYPE_INTEGER],
+                    "exposure_query_failed",
+                )?;
+                let (target, tolerance) = if let Some(ctrl) = abs_ctrl
+                    && ctrl.minimum <= ctrl.maximum
+                {
+                    let clamped = requested.clamp(ctrl.minimum, ctrl.maximum);
+                    let step = i64::from(ctrl.step.max(1));
+                    let aligned = i64::from(ctrl.minimum)
+                        + ((i64::from(clamped) - i64::from(ctrl.minimum)) / step) * step;
+                    let target_i32 = i32::try_from(aligned).unwrap_or(clamped);
+                    let quant_tolerance = ctrl.step.saturating_mul(2).max(2);
+                    (target_i32, quant_tolerance)
+                } else {
+                    (requested, 2)
+                };
+                self.set_and_verify_control("auto_exposure", CID_EXPOSURE_AUTO, 1)?;
+                self.set_control(CID_EXPOSURE_ABSOLUTE, target, "exposure_set_failed")?;
+                let actual = self.get_control(CID_EXPOSURE_ABSOLUTE, "exposure_get_failed")?;
+                if (i64::from(actual) - i64::from(target)).abs() > i64::from(tolerance) {
+                    return Err(CaptureError::new(
+                        "exposure_readback_failed",
+                        format!(
+                            "exposure_time_absolute target={target} (requested={requested}), actual={actual}, tolerance={tolerance}"
+                        ),
+                    ));
+                }
+                Ok(ExposureConfig {
+                    auto_exposure: 1,
+                    exposure_time_absolute: Some(actual),
+                })
+            }
+        }
     }
 
     fn configure_exposure(
@@ -447,40 +602,28 @@ impl ControlDevice {
         absolute: Option<i32>,
         auto: bool,
     ) -> Result<ExposureConfig, CaptureError> {
-        let auto_value = if auto {
+        if auto {
             if absolute.is_some() {
                 return Err(CaptureError::new(
                     "invalid_argument",
                     "auto exposure cannot be combined with exposure_time_absolute",
                 ));
             }
-            3
-        } else {
-            let Some(value) = absolute else {
-                return Err(CaptureError::new(
-                    "invalid_argument",
-                    "manual exposure requires exposure_time_absolute in 1..=100",
-                ));
-            };
-            if !(1..=100).contains(&value) {
-                return Err(CaptureError::new(
-                    "invalid_argument",
-                    "exposure_time_absolute must be in 1..=100",
-                ));
-            }
-            1
+            return self.set_exposure(&ExposureSetting::Auto("auto".to_owned()));
+        }
+        let Some(value) = absolute else {
+            return Err(CaptureError::new(
+                "invalid_argument",
+                "manual exposure requires exposure_time_absolute in 1..=100",
+            ));
         };
-        self.set_and_verify_control("auto_exposure", CID_EXPOSURE_AUTO, auto_value)?;
-        let exposure_time_absolute = if let Some(value) = absolute.filter(|_| !auto) {
-            self.set_and_verify_control("exposure_time_absolute", CID_EXPOSURE_ABSOLUTE, value)?;
-            Some(value)
-        } else {
-            None
-        };
-        Ok(ExposureConfig {
-            auto_exposure: auto_value,
-            exposure_time_absolute,
-        })
+        if !(1..=100).contains(&value) {
+            return Err(CaptureError::new(
+                "invalid_argument",
+                "exposure_time_absolute must be in 1..=100",
+            ));
+        }
+        self.set_exposure(&ExposureSetting::Manual(value as u32))
     }
 
     fn set_and_verify_control(&self, name: &str, id: u32, value: i32) -> Result<(), CaptureError> {
@@ -563,6 +706,14 @@ pub fn set_focus(
     control.set_focus(value, auto_enabled)
 }
 
+pub fn set_exposure(
+    device: &str,
+    exposure: &ExposureSetting,
+) -> Result<ExposureConfig, CaptureError> {
+    let control = ControlDevice::open(device, "open_failed")?;
+    control.set_exposure(exposure)
+}
+
 pub fn configure_exposure(
     device: &str,
     absolute: Option<i32>,
@@ -588,6 +739,8 @@ pub struct Capture {
     last_raw_sequence: Option<u32>,
     sequence_epoch: u64,
     last_timestamp_ns: Option<u64>,
+    consecutive_bad_frames: u32,
+    corrupt_frames_dropped: u64,
     pub last_buffer_flags: u32,
     pub last_dequeue_monotonic_ns: u64,
 }
@@ -650,6 +803,8 @@ impl Capture {
             last_raw_sequence: None,
             sequence_epoch: 0,
             last_timestamp_ns: None,
+            consecutive_bad_frames: 0,
+            corrupt_frames_dropped: 0,
             last_buffer_flags: 0,
             last_dequeue_monotonic_ns: 0,
         };
@@ -679,6 +834,18 @@ impl Capture {
         auto_enabled: Option<bool>,
     ) -> Result<FocusStatus, CaptureError> {
         ControlDevice::borrowed(Arc::clone(&self.io), self.fd()?).set_focus(value, auto_enabled)
+    }
+
+    pub fn set_exposure(&self, exposure: &ExposureSetting) -> Result<ExposureConfig, CaptureError> {
+        ControlDevice::borrowed(Arc::clone(&self.io), self.fd()?).set_exposure(exposure)
+    }
+
+    pub fn corrupt_frames_dropped(&self) -> u64 {
+        self.corrupt_frames_dropped
+    }
+
+    pub fn consecutive_bad_frames(&self) -> u32 {
+        self.consecutive_bad_frames
     }
 
     fn call(
@@ -835,6 +1002,7 @@ impl Capture {
         if let Some(last) = self.last_raw_sequence.take() {
             self.sequence_epoch = self.sequence_epoch.saturating_add(u64::from(last) + 1);
         }
+        self.consecutive_bad_frames = 0;
         for index in 0..self.buffers.len() {
             let mut payload = queue_payload(index as u32);
             self.call(QUEUE_BUFFER, &mut payload, "VIDIOC_QBUF")?;
@@ -963,24 +1131,45 @@ impl Capture {
             self.close();
             return Err(error);
         }
+        self.last_buffer_flags = flags;
+        let dequeue_mono = match self.io.monotonic_ns() {
+            Ok(ns) => ns,
+            Err(error) => {
+                let mut queue = queue_payload(index as u32);
+                let _ = self.call(QUEUE_BUFFER, &mut queue, "VIDIOC_QBUF");
+                self.close();
+                return Err(CaptureError::io("clock_failed", "clock_gettime", error));
+            }
+        };
+        self.last_dequeue_monotonic_ns = dequeue_mono;
+        if flags & BUF_FLAG_ERROR != 0 || bytes_used == 0 || bytes_used > self.buffers[index].len()
+        {
+            let reason = if flags & BUF_FLAG_ERROR != 0 {
+                "V4L2 marked the buffer damaged"
+            } else {
+                "invalid V4L2 payload length"
+            };
+            let mut queue = queue_payload(index as u32);
+            if let Err(error) = self.call(QUEUE_BUFFER, &mut queue, "VIDIOC_QBUF") {
+                self.close();
+                return Err(error);
+            }
+            self.corrupt_frames_dropped = self.corrupt_frames_dropped.saturating_add(1);
+            self.consecutive_bad_frames = self.consecutive_bad_frames.saturating_add(1);
+            if self.consecutive_bad_frames >= MAX_CONSECUTIVE_BAD_FRAMES {
+                self.close();
+                return Err(CaptureError::new(
+                    "bad_frame",
+                    format!(
+                        "{reason} ({} consecutive bad frames)",
+                        self.consecutive_bad_frames
+                    ),
+                ));
+            }
+            return Err(CaptureError::new("bad_frame", reason));
+        }
+
         let result = (|| {
-            self.last_buffer_flags = flags;
-            self.last_dequeue_monotonic_ns = self
-                .io
-                .monotonic_ns()
-                .map_err(|error| CaptureError::io("clock_failed", "clock_gettime", error))?;
-            if flags & BUF_FLAG_ERROR != 0 {
-                return Err(CaptureError::new(
-                    "bad_frame",
-                    "V4L2 marked the buffer damaged",
-                ));
-            }
-            if bytes_used == 0 || bytes_used > self.buffers[index].len() {
-                return Err(CaptureError::new(
-                    "bad_frame",
-                    "invalid V4L2 payload length",
-                ));
-            }
             let source_sequence = self.source_sequence(raw_sequence)?;
             let host_monotonic_ns = self.timestamp(&dequeue, flags)?;
             let payload = self.buffers[index].bytes(bytes_used)?;
@@ -993,6 +1182,8 @@ impl Capture {
         }
         if result.is_err() {
             self.close();
+        } else {
+            self.consecutive_bad_frames = 0;
         }
         result
     }
@@ -1044,6 +1235,14 @@ impl Capture {
         let io = Arc::new(tests::FakeIo::with_stream_on_error(
             fail_stream_on.then_some(libc::EIO),
         ));
+        Self::with_io(io, "/dev/video0", 3840, 1080, 60, "mjpg", 2)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fake_with_frames(
+        frames: Vec<(u32, u64, Vec<u8>, u32)>,
+    ) -> Result<Self, CaptureError> {
+        let io = Arc::new(tests::FakeIo::new(frames));
         Self::with_io(io, "/dev/video0", 3840, 1080, 60, "mjpg", 2)
     }
 
@@ -1566,13 +1765,23 @@ mod tests {
     }
 
     #[test]
-    fn frame_error_is_requeued_before_capture_closes() {
-        let io = Arc::new(FakeIo::new(vec![(
-            9,
-            1_000_000_000,
-            b"damaged".to_vec(),
-            BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_MONOTONIC,
-        )]));
+    fn frame_error_requeues_and_recovers_until_hard_fault_threshold() {
+        // 1. Single transient BUF_FLAG_ERROR requeues buffer, increments drop counter,
+        //    keeps capture open, and recovers cleanly on the next valid frame!
+        let io = Arc::new(FakeIo::new(vec![
+            (
+                9,
+                1_000_000_000,
+                b"damaged".to_vec(),
+                BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_MONOTONIC,
+            ),
+            (
+                10,
+                2_000_000_000,
+                b"recovered".to_vec(),
+                BUF_FLAG_TIMESTAMP_MONOTONIC,
+            ),
+        ]));
         let mut capture =
             Capture::with_io(io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
         capture.start().unwrap();
@@ -1580,14 +1789,98 @@ mod tests {
             capture.read(Duration::from_secs(1)).unwrap_err().code,
             "bad_frame"
         );
+        assert!(!capture.is_closed());
+        assert_eq!(capture.corrupt_frames_dropped(), 1);
+        assert_eq!(capture.consecutive_bad_frames(), 1);
+        assert_eq!(*io.closed.lock().unwrap(), 0);
+
+        let good = capture.read(Duration::from_secs(1)).unwrap();
+        assert_eq!(good.source_sequence, 10);
+        assert_eq!(capture.corrupt_frames_dropped(), 1);
+        assert_eq!(capture.consecutive_bad_frames(), 0);
+        capture.close();
         assert_eq!(*io.closed.lock().unwrap(), 1);
-        let calls = io.calls.lock().unwrap();
-        let dequeue = calls
-            .iter()
-            .position(|request| *request == DEQUEUE_BUFFER)
+
+        // 2. 30 consecutive BUF_FLAG_ERROR frames reach MAX_CONSECUTIVE_BAD_FRAMES and close stream.
+        let hard_fault_frames = (0..MAX_CONSECUTIVE_BAD_FRAMES)
+            .map(|seq| {
+                (
+                    seq,
+                    (u64::from(seq) + 1) * 10_000_000,
+                    b"damaged".to_vec(),
+                    BUF_FLAG_ERROR | BUF_FLAG_TIMESTAMP_MONOTONIC,
+                )
+            })
+            .collect::<Vec<_>>();
+        let fault_io = Arc::new(FakeIo::new(hard_fault_frames));
+        let mut fault_capture =
+            Capture::with_io(fault_io.clone(), "/dev/video0", 3840, 1080, 60, "mjpg", 2).unwrap();
+        fault_capture.start().unwrap();
+        for i in 1..MAX_CONSECUTIVE_BAD_FRAMES {
+            assert_eq!(
+                fault_capture.read(Duration::from_secs(1)).unwrap_err().code,
+                "bad_frame"
+            );
+            assert!(
+                !fault_capture.is_closed(),
+                "closed prematurely at frame {i}"
+            );
+        }
+        let terminal = fault_capture.read(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(terminal.code, "bad_frame");
+        assert!(terminal.message.contains("consecutive bad frames"));
+        assert!(fault_capture.is_closed());
+        assert_eq!(
+            fault_capture.corrupt_frames_dropped(),
+            u64::from(MAX_CONSECUTIVE_BAD_FRAMES)
+        );
+        assert_eq!(*fault_io.closed.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn set_focus_preserves_autofocus_without_overwriting_focus_absolute_and_set_exposure_quantizes()
+    {
+        let io = Arc::new(FakeIo {
+            focus_min: 10,
+            focus_max: 500,
+            ..FakeIo::new(vec![])
+        });
+        let control =
+            ControlDevice::open_with_io(io.clone(), "/dev/video0", "camera_focus_open_failed")
+                .unwrap();
+
+        // Enabling autofocus with Some(value) must NOT overwrite CID_FOCUS_AUTO=0 or CID_FOCUS_ABSOLUTE!
+        *io.auto_focus.lock().unwrap() = 0;
+        *io.focus.lock().unwrap() = 32;
+        let auto_status = control.set_focus(Some(200), Some(true)).unwrap();
+        assert_eq!(auto_status.auto_enabled, Some(true));
+        assert_eq!(auto_status.value, 32);
+        assert_eq!(auto_status.minimum, 10);
+        assert_eq!(auto_status.maximum, 500);
+
+        // Disabling autofocus with Some(v) sets CID_FOCUS_AUTO=0 first, then CID_FOCUS_ABSOLUTE=v!
+        io.calls.lock().unwrap().clear();
+        let manual_status = control.set_focus(Some(250), Some(false)).unwrap();
+        assert_eq!(manual_status.auto_enabled, Some(false));
+        assert_eq!(manual_status.value, 250);
+
+        // Sensor row-time quantization readback tolerance (target=50, actual=49 within tolerance=2)
+        let quantized_io = Arc::new(FakeIo {
+            exposure_readback_override: Some(49),
+            ..FakeIo::new(vec![])
+        });
+        let quantized_ctl =
+            ControlDevice::open_with_io(quantized_io, "/dev/video0", "open_failed").unwrap();
+        let exp = quantized_ctl
+            .set_exposure(&ExposureSetting::Manual(50))
             .unwrap();
-        assert_eq!(calls[dequeue + 1], QUEUE_BUFFER);
-        assert!(calls[dequeue + 2..].contains(&STREAM_OFF));
+        assert_eq!(
+            exp,
+            ExposureConfig {
+                auto_exposure: 1,
+                exposure_time_absolute: Some(49),
+            }
+        );
     }
 
     #[test]

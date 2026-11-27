@@ -5,6 +5,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CONSUMER_ACTIVE_WINDOW: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct Config {
     pub device: String,
@@ -18,6 +22,18 @@ pub struct Config {
 struct State {
     stop: bool,
     latest: Option<(Instant, ImuObservation)>,
+    last_consumer_read: Option<Instant>,
+}
+
+fn poll_interval_for_state(state: &State, now: Instant) -> Duration {
+    if state
+        .last_consumer_read
+        .is_some_and(|at| now.saturating_duration_since(at) <= CONSUMER_ACTIVE_WINDOW)
+    {
+        ACTIVE_POLL_INTERVAL
+    } else {
+        IDLE_POLL_INTERVAL
+    }
 }
 
 #[derive(Default)]
@@ -37,6 +53,7 @@ impl Preview {
         if let Ok(mut state) = self.state.0.lock() {
             state.stop = false;
             state.latest = None;
+            state.last_consumer_read = None;
         }
         let shared = Arc::clone(&self.state);
         if let Ok(handle) = thread::Builder::new()
@@ -56,16 +73,19 @@ impl Preview {
                             match collector.read(config.timeout.min(Duration::from_millis(200))) {
                                 Ok(observation) => {
                                     if let Ok(mut state) = shared.0.lock() {
+                                        let now = Instant::now();
                                         if !state.stop {
-                                            state.latest = Some((Instant::now(), observation));
+                                            state.latest = Some((now, observation));
                                         }
-                                        // UI preview needs at most 50 Hz. Release the USB
-                                        // control channel between polls; stop remains interruptible.
-                                        let _ = shared.1.wait_timeout_while(
-                                            state,
-                                            Duration::from_millis(20),
-                                            |s| !s.stop,
-                                        );
+                                        // Poll at 50 Hz while a UI/API consumer is reading and back
+                                        // off to 2 Hz when idle so USB EP0 control traffic stays minimal.
+                                        let wait_for = poll_interval_for_state(&state, now);
+                                        let _ = shared.1.wait_timeout_while(state, wait_for, |s| {
+                                            !s.stop
+                                                && !(wait_for == IDLE_POLL_INTERVAL
+                                                    && poll_interval_for_state(s, Instant::now())
+                                                        == ACTIVE_POLL_INTERVAL)
+                                        });
                                     }
                                 }
                                 Err(_) => break,
@@ -82,7 +102,7 @@ impl Preview {
                     }
                     let _ = shared
                         .1
-                        .wait_timeout_while(state, Duration::from_millis(500), |s| !s.stop);
+                        .wait_timeout_while(state, IDLE_POLL_INTERVAL, |s| !s.stop);
                 }
             })
         {
@@ -98,6 +118,7 @@ impl Preview {
         if let Ok(mut state) = self.state.0.lock() {
             state.stop = true;
             state.latest = None;
+            state.last_consumer_read = None;
             self.state.1.notify_all();
         }
         if let Some(worker) = worker.take() {
@@ -106,9 +127,18 @@ impl Preview {
     }
 
     pub fn latest(&self) -> Option<ImuObservation> {
-        let state = self.state.0.lock().ok()?;
+        let mut state = self.state.0.lock().ok()?;
+        if state.stop {
+            return None;
+        }
+        let now = Instant::now();
+        let was_idle = poll_interval_for_state(&state, now) == IDLE_POLL_INTERVAL;
+        state.last_consumer_read = Some(now);
+        if was_idle {
+            self.state.1.notify_all();
+        }
         let (at, observation) = state.latest.as_ref()?;
-        if state.stop || at.elapsed() > Duration::from_secs(2) {
+        if now.saturating_duration_since(*at) > Duration::from_secs(2) {
             None
         } else {
             Some(observation.clone())
@@ -154,7 +184,22 @@ mod tests {
             dropped_samples: 0,
         };
         preview.state.0.lock().unwrap().latest = Some((Instant::now(), observation.clone()));
+        assert_eq!(
+            poll_interval_for_state(&preview.state.0.lock().unwrap(), Instant::now()),
+            IDLE_POLL_INTERVAL
+        );
         assert_eq!(preview.latest(), Some(observation.clone()));
+        assert_eq!(
+            poll_interval_for_state(&preview.state.0.lock().unwrap(), Instant::now()),
+            ACTIVE_POLL_INTERVAL
+        );
+        assert_eq!(
+            poll_interval_for_state(
+                &preview.state.0.lock().unwrap(),
+                Instant::now() + CONSUMER_ACTIVE_WINDOW + Duration::from_millis(10)
+            ),
+            IDLE_POLL_INTERVAL
+        );
         preview.state.0.lock().unwrap().latest =
             Some((Instant::now() - Duration::from_secs(3), observation.clone()));
         assert!(preview.latest().is_none());

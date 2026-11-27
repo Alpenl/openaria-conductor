@@ -9,6 +9,7 @@ pub mod backend;
 pub mod downloads;
 pub mod error;
 pub mod handlers;
+pub mod idempotency;
 pub mod middleware;
 pub mod preview;
 pub mod range;
@@ -19,8 +20,11 @@ pub mod sse;
 
 pub use backend::{
     CommandOutcome, GatewayBackend, IdempotentCommand, ListLogsQuery, ListSessionsQuery,
-    MockArtifact, MockArtifactBacking, MockGatewayBackend, MockLogEntry, MockSession, RawManifest,
-    StaticAsset,
+    RawManifest, StaticAsset,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use backend::{
+    MockArtifact, MockArtifactBacking, MockGatewayBackend, MockLogEntry, MockSession,
 };
 pub use downloads::{
     ArtifactDeleteGate, DEFAULT_LOG_ETAG_CACHE_CAPACITY, DownloadSource, LogEtagCache,
@@ -32,9 +36,14 @@ pub use error::{
     API_ERROR_SCHEMA, ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE,
     HEADER_MANIFEST_SHA256, HEADER_WAIT_STATE,
 };
+pub use idempotency::{
+    DEFAULT_IDEMPOTENCY_CAPACITY, DEFAULT_IDEMPOTENCY_TTL, IdempotencyCoalescer,
+    NETWORK_MUTATION_SCOPE,
+};
 pub use middleware::{CORS_EXPOSE_HEADERS, GatewayRuntimeConfig, GatewayState, MAX_BODY_BYTES};
 pub use preview::{
     H264PreviewHub, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, MjpegPreviewHub, PreviewFrame,
+    h264_stream_body_with_gop,
 };
 pub use range::{
     ByteRange, UnsatisfiableRange, infer_log_media_type, is_valid_log_name, is_valid_log_prefix,

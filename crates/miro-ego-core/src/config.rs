@@ -64,6 +64,8 @@ pub struct CameraConfig {
     pub frame_decimation: u32,
     #[serde(default)]
     pub exposure_time_absolute: Option<ExposureSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_file: Option<PathBuf>,
 }
 
 fn default_frame_decimation() -> u32 {
@@ -437,6 +439,14 @@ impl DeviceConfig {
         if let Some(exposure) = &self.camera.exposure_time_absolute {
             exposure.validate()?;
         }
+        if let Some(cal_path) = &self.camera.calibration_file
+            && (!cal_path.is_absolute() || cal_path.as_os_str().is_empty())
+        {
+            return Err(CoreError::invalid_config(
+                "invalid_config",
+                "camera.calibration_file must be a non-empty absolute path when set",
+            ));
+        }
         if !is_valid_uuid_v4(&self.device.device_id) {
             return Err(CoreError::invalid_config(
                 "invalid_config",
@@ -736,6 +746,7 @@ mod tests {
                 fps: 60,
                 frame_decimation: 2,
                 exposure_time_absolute: Some(ExposureSetting::default()),
+                calibration_file: None,
             },
             storage: StorageConfig {
                 mountpoint: PathBuf::from("/data"),

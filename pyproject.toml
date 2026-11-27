@@ -1,11 +1,14 @@
 [project]
 name = "miro-ego-host"
 version = "0.3.0"
-description = "Miro-Ego 0.3.0 host-PC utilities (factory recovery, exFAT card exporter) and repository verification scripts"
+description = "Miro-Ego 0.3.0 host-PC utilities (factory recovery, exFAT card exporter, Spectacular calibration check) and repository verification scripts"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = []
+
+[project.scripts]
+miro-ego-spectacular-check = "miro_ego_host.spectacular.check_cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -25,6 +28,9 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.setuptools.packages.find]
+where = ["tools"]
 
 [tool.ruff]
 line-length = 100

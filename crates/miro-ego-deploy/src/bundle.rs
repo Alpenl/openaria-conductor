@@ -200,6 +200,7 @@ pub struct VerifiedBundle {
     pub manifest: BundleManifest,
     pub manifest_sha256: String,
     pub total_bytes: u64,
+    pub(crate) payloads_verified: bool,
 }
 
 impl VerifiedBundle {
@@ -209,6 +210,10 @@ impl VerifiedBundle {
 
     pub fn version(&self) -> &str {
         &self.manifest.version
+    }
+
+    pub fn payloads_verified(&self) -> bool {
+        self.payloads_verified
     }
 
     pub fn all_entries(&self) -> impl Iterator<Item = &BundleFileEntry> {
@@ -391,16 +396,19 @@ pub fn hash_file_safe(path: &Path) -> DeployResult<(u64, String, Vec<u8>)> {
     Ok((total, hex_encode(hasher.finalize().as_slice()), header))
 }
 
-/// Strictly verify a native Miro-Ego release bundle directory against the compiled-in trusted
-/// Ed25519 release public key (`bundle.json.sig`, `bundle.json`, binaries, and assets).
-pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
+/// Fast synchronous preflight verification of `bundle.json`, detached Ed25519 `bundle.json.sig`,
+/// non-symlink regular-file existence, declared byte sizes, and 64-byte AArch64 ELF64 binary
+/// headers against the compiled-in trusted release public key (deferring full-file SHA-256 reads
+/// to single-pass `stage_release` / `copy_and_verify_safe`).
+pub fn verify_bundle_manifest(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
     let trusted_pubkey = default_release_public_key();
-    verify_bundle_dir_with_key(bundle_dir, &trusted_pubkey)
+    verify_bundle_manifest_with_key(bundle_dir, &trusted_pubkey)
 }
 
-/// Strictly verify a native Miro-Ego release bundle directory against an explicit 32-byte
-/// Ed25519 `trusted_pubkey`.
-pub fn verify_bundle_dir_with_key(
+/// Fast synchronous preflight verification of `bundle.json`, detached Ed25519 `bundle.json.sig`,
+/// non-symlink regular-file existence, declared byte sizes, and 64-byte AArch64 ELF64 binary
+/// headers against an explicit 32-byte Ed25519 `trusted_pubkey`.
+pub fn verify_bundle_manifest_with_key(
     bundle_dir: &Path,
     trusted_pubkey: &[u8; 32],
 ) -> DeployResult<VerifiedBundle> {
@@ -492,7 +500,7 @@ pub fn verify_bundle_dir_with_key(
     let mut total_bytes: u64 = 0;
 
     for entry in &manifest.binaries {
-        verify_single_entry(bundle_dir, entry, true, &mut seen_paths, &mut total_bytes)?;
+        preflight_single_entry(bundle_dir, entry, true, &mut seen_paths, &mut total_bytes)?;
         seen_binaries.insert(entry.path.as_str());
     }
     for required in REQUIRED_BINARIES {
@@ -511,7 +519,7 @@ pub fn verify_bundle_dir_with_key(
                 ),
             });
         }
-        verify_single_entry(bundle_dir, entry, false, &mut seen_paths, &mut total_bytes)?;
+        preflight_single_entry(bundle_dir, entry, false, &mut seen_paths, &mut total_bytes)?;
     }
 
     Ok(VerifiedBundle {
@@ -519,7 +527,32 @@ pub fn verify_bundle_dir_with_key(
         manifest,
         manifest_sha256,
         total_bytes,
+        payloads_verified: false,
     })
+}
+
+/// Strictly verify a native Miro-Ego release bundle directory against the compiled-in trusted
+/// Ed25519 release public key (`bundle.json.sig`, `bundle.json`, binaries, and assets).
+pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
+    let trusted_pubkey = default_release_public_key();
+    verify_bundle_dir_with_key(bundle_dir, &trusted_pubkey)
+}
+
+/// Strictly verify a native Miro-Ego release bundle directory against an explicit 32-byte
+/// Ed25519 `trusted_pubkey`.
+pub fn verify_bundle_dir_with_key(
+    bundle_dir: &Path,
+    trusted_pubkey: &[u8; 32],
+) -> DeployResult<VerifiedBundle> {
+    let mut verified = verify_bundle_manifest_with_key(bundle_dir, trusted_pubkey)?;
+    for entry in &verified.manifest.binaries {
+        verify_entry_digest(bundle_dir, entry, true)?;
+    }
+    for entry in &verified.manifest.assets {
+        verify_entry_digest(bundle_dir, entry, false)?;
+    }
+    verified.payloads_verified = true;
+    Ok(verified)
 }
 
 /// Check whether a bundle asset relative path is in an allowed namespace:
@@ -689,7 +722,28 @@ pub fn copy_and_verify_safe(
     copy_res
 }
 
-fn verify_single_entry(
+fn read_prefix_safe(path: &Path, max_len: usize) -> DeployResult<Vec<u8>> {
+    let mut file = open_readonly_safe(path).map_err(|err| DeployError::InvalidBundle {
+        message: format!("cannot safely open {}: {err}", path.display()),
+    })?;
+    let mut out = vec![0u8; max_len];
+    let mut filled = 0usize;
+    while filled < max_len {
+        let n = file
+            .read(&mut out[filled..])
+            .map_err(|err| DeployError::InvalidBundle {
+                message: format!("failed reading {}: {err}", path.display()),
+            })?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
+fn preflight_single_entry(
     bundle_dir: &Path,
     entry: &BundleFileEntry,
     require_aarch64_elf: bool,
@@ -714,12 +768,16 @@ fn verify_single_entry(
     }
 
     let full_path = resolve_no_symlinks(bundle_dir, &rel)?;
-    let (actual_bytes, actual_sha256, header) = hash_file_safe(&full_path)?;
-    if actual_bytes != entry.bytes || actual_sha256 != entry.sha256 {
+    let meta = fs::symlink_metadata(&full_path).map_err(|err| DeployError::InvalidBundle {
+        message: format!("cannot stat bundle entry {}: {err}", full_path.display()),
+    })?;
+    if meta.len() != entry.bytes {
         return Err(DeployError::InvalidBundle {
             message: format!(
-                "digest or size mismatch for {} (expected {} bytes {}, got {} bytes {})",
-                entry.path, entry.bytes, entry.sha256, actual_bytes, actual_sha256
+                "size mismatch for {} (expected {} bytes, got {} bytes)",
+                entry.path,
+                entry.bytes,
+                meta.len()
             ),
         });
     }
@@ -730,12 +788,13 @@ fn verify_single_entry(
                 message: format!("binary entry must live under bin/: {}", entry.path),
             });
         }
+        let header = read_prefix_safe(&full_path, 64)?;
         validate_aarch64_elf64_header(&header, &entry.path)?;
     }
 
     *total_bytes =
         total_bytes
-            .checked_add(actual_bytes)
+            .checked_add(entry.bytes)
             .ok_or_else(|| DeployError::InvalidBundle {
                 message: "bundle total byte length overflow".to_owned(),
             })?;
@@ -746,6 +805,28 @@ fn verify_single_entry(
                 *total_bytes
             ),
         });
+    }
+    Ok(())
+}
+
+fn verify_entry_digest(
+    bundle_dir: &Path,
+    entry: &BundleFileEntry,
+    require_aarch64_elf: bool,
+) -> DeployResult<()> {
+    let rel = validate_bundle_relative_path(&entry.path)?;
+    let full_path = resolve_no_symlinks(bundle_dir, &rel)?;
+    let (actual_bytes, actual_sha256, header) = hash_file_safe(&full_path)?;
+    if actual_bytes != entry.bytes || actual_sha256 != entry.sha256 {
+        return Err(DeployError::InvalidBundle {
+            message: format!(
+                "digest or size mismatch for {} (expected {} bytes {}, got {} bytes {})",
+                entry.path, entry.bytes, entry.sha256, actual_bytes, actual_sha256
+            ),
+        });
+    }
+    if require_aarch64_elf {
+        validate_aarch64_elf64_header(&header, &entry.path)?;
     }
     Ok(())
 }

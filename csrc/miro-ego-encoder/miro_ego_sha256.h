@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,15 @@ void miro_ego_sha256_final(miro_ego_sha256_ctx_t *ctx,
                            uint8_t digest[MIRO_EGO_SHA256_DIGEST_LEN]);
 void miro_ego_sha256_to_hex(const uint8_t digest[MIRO_EGO_SHA256_DIGEST_LEN],
                             char hex_out[MIRO_EGO_SHA256_HEX_LEN]);
+
+/*
+ * Incrementally feeds exactly `length` bytes starting at `offset` from `fd`
+ * into an initialized `ctx` using `pread()` and caller-supplied `buf`.
+ * Does not modify `fd`'s seek offset. Returns 0 on success, -1 on short read or I/O error.
+ */
+int miro_ego_sha256_update_fd_range(miro_ego_sha256_ctx_t *ctx, int fd,
+                                    off_t offset, uint64_t length,
+                                    void *buf, size_t buf_len);
 
 /*
  * Hash an open file descriptor from offset 0 using pread() and a caller-supplied

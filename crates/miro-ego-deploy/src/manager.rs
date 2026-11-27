@@ -7,7 +7,7 @@
 
 use crate::bundle::{
     DefaultOfflinePackageHook, OfflinePackageHook, VerifiedBundle, copy_and_verify_safe,
-    validate_commit_sha, verify_bundle_dir,
+    validate_commit_sha, verify_bundle_dir, verify_bundle_manifest,
 };
 use crate::{
     DeployError, DeployResult, FIRMWARE_STATUS_SCHEMA, FirmwareManager, ReleaseInfo, UpdateStage,
@@ -40,10 +40,12 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 pub const RELEASE_METADATA_SCHEMA: &str = "miro-ego.installed-release.v1";
+pub const INSTALLED_ASSETS_SCHEMA: &str = "miro-ego.installed-assets.v1";
 pub const INSTALL_TRANSACTION_SCHEMA: &str = "miro-ego.install-transaction.v1";
 pub const ACTIVATION_FAILURE_SCHEMA: &str = "miro-ego.activation-failure.v1";
 pub const DEPLOYMENT_LOCK_NAME: &str = "deployment.lock";
 pub const MAX_DEPLOY_JSON_BYTES: usize = 64 * 1024;
+const INSTALLED_ASSETS_FILENAME: &str = "installed-assets.json";
 
 /// Deployment asset specification mapping `deploy/miro-ego/<source>` to `<system_root>/<dest>`
 /// with an explicit POSIX mode (immune to `UMask=0077`) and preservation flag.
@@ -749,6 +751,37 @@ pub struct InstalledReleaseMetadata {
     pub bundle_sha256: String,
 }
 
+/// Per-release ledger of non-preserved system/config relative paths installed into `system_root`
+/// (`/opt/miro-ego/releases/<commit>/installed-assets.json`) so rollback removes release-only
+/// unit drop-ins and configs cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledAssetsManifest {
+    pub schema: String,
+    pub installed_dest_paths: Vec<String>,
+}
+
+pub(crate) struct HeldDeployLocks {
+    _deploy: miro_ego_core::locks::FlockGuard,
+    maintenance: Option<miro_ego_core::locks::FlockGuard>,
+}
+
+impl HeldDeployLocks {
+    pub(crate) fn new(
+        deploy: miro_ego_core::locks::FlockGuard,
+        maintenance: miro_ego_core::locks::FlockGuard,
+    ) -> Self {
+        Self {
+            _deploy: deploy,
+            maintenance: Some(maintenance),
+        }
+    }
+
+    pub(crate) fn drop_maintenance(&mut self) {
+        self.maintenance = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionAction {
@@ -924,9 +957,9 @@ impl ReleaseManager {
     /// Transactionally install a verified native Miro-Ego release bundle with automatic
     /// rollback if activation health checks fail.
     pub fn install(&self, bundle_path: &Path, activate: bool) -> DeployResult<DeploymentStatus> {
-        let locks = self.acquire_exclusive_locks()?;
-        let verified = verify_bundle_dir(bundle_path)?;
-        self.install_verified_with_locks(&verified, activate, &locks)
+        let mut locks = self.acquire_exclusive_locks()?;
+        let preflight = verify_bundle_manifest(bundle_path)?;
+        self.install_verified_with_locks(&preflight, activate, &mut locks)
     }
 
     /// Transactionally install an already-verified [`VerifiedBundle`] without re-hashing the
@@ -936,18 +969,15 @@ impl ReleaseManager {
         verified: &VerifiedBundle,
         activate: bool,
     ) -> DeployResult<DeploymentStatus> {
-        let locks = self.acquire_exclusive_locks()?;
-        self.install_verified_with_locks(verified, activate, &locks)
+        let mut locks = self.acquire_exclusive_locks()?;
+        self.install_verified_with_locks(verified, activate, &mut locks)
     }
 
     pub(crate) fn install_verified_with_locks(
         &self,
         verified: &VerifiedBundle,
         activate: bool,
-        _locks: &(
-            miro_ego_core::locks::FlockGuard,
-            miro_ego_core::locks::FlockGuard,
-        ),
+        locks: &mut HeldDeployLocks,
     ) -> DeployResult<DeploymentStatus> {
         self.ensure_layout()?;
         let _ = self.recover_locked()?;
@@ -961,6 +991,19 @@ impl ReleaseManager {
         let replacing_live_commit = old_current.as_deref() == Some(new_commit.as_str())
             && self.paths.releases_dir().join(&new_commit).exists();
 
+        // Single-pass staging: when staging a distinct commit, copy & verify SHA-256 into
+        // `releases/<new_commit>` BEFORE quiescing live services so a corrupt payload never
+        // interrupts running services. When replacing the live commit in-place, verify payload
+        // digests before quiescing.
+        let staged_before_quiesce = if !replacing_live_commit {
+            Some(self.stage_release(verified)?)
+        } else {
+            if !verified.payloads_verified() {
+                let _ = verify_bundle_dir(&verified.root)?;
+            }
+            None
+        };
+
         // Quiesce running services BEFORE mutating/replacing any live release directory or unit!
         let quiesced =
             old_current.is_some() && (activate || release_changed || replacing_live_commit);
@@ -968,7 +1011,19 @@ impl ReleaseManager {
             self.quiesce_services()?;
         }
 
-        let release_dir = self.stage_release(verified)?;
+        let release_dir = match staged_before_quiesce {
+            Some(dir) => dir,
+            None => match self.stage_release(verified) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    if quiesced {
+                        locks.drop_maintenance();
+                        let _ = self.start_services(false);
+                    }
+                    return Err(err);
+                }
+            },
+        };
         let tx = InstallTransaction {
             schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
             transaction_id: new_uuid_v4(),
@@ -980,8 +1035,13 @@ impl ReleaseManager {
         };
         self.write_transaction(&tx)?;
 
+        let old_release_dir = old_current
+            .as_ref()
+            .filter(|&old| old != &new_commit)
+            .map(|old| self.paths.releases_dir().join(old));
+
         let switch_res = (|| -> DeployResult<()> {
-            self.install_assets_from_release(&release_dir)?;
+            self.sync_assets_between_releases(old_release_dir.as_deref(), &release_dir)?;
             self.systemctl.run_systemctl(&["daemon-reload"])?;
             self.bootstrap_system()?;
             if release_changed {
@@ -993,10 +1053,11 @@ impl ReleaseManager {
         if let Err(err) = switch_res {
             if let Some(old) = &old_current {
                 let old_dir = self.paths.releases_dir().join(old);
-                let _ = self.install_assets_from_release(&old_dir);
+                let _ = self.sync_assets_between_releases(Some(&release_dir), &old_dir);
             }
             let _ = self.revert_to_previous_links(old_current.as_deref(), old_previous.as_deref());
             if quiesced {
+                locks.drop_maintenance();
                 let _ = self.systemctl.run_systemctl(&["daemon-reload"]);
                 let _ = self.bootstrap_system();
                 let _ = self.start_services(false);
@@ -1009,6 +1070,11 @@ impl ReleaseManager {
         } else {
             old_previous.as_deref()
         };
+
+        // Drop `maintenance.lock` BEFORE starting services while STILL holding `deployment.lock`,
+        // so the newly started `miro-ego.service` daemon's `recover_on_startup()` never collides
+        // with `503 maintenance_busy`!
+        locks.drop_maintenance();
 
         if activate {
             self.activate_or_rollback(
@@ -1026,17 +1092,14 @@ impl ReleaseManager {
 
     /// Transactionally roll back `current` to `previous`, restoring previous release's unit assets.
     pub fn rollback(&self, activate: bool) -> DeployResult<DeploymentStatus> {
-        let locks = self.acquire_exclusive_locks()?;
-        self.rollback_with_locks(activate, &locks)
+        let mut locks = self.acquire_exclusive_locks()?;
+        self.rollback_with_locks(activate, &mut locks)
     }
 
     pub(crate) fn rollback_with_locks(
         &self,
         activate: bool,
-        _locks: &(
-            miro_ego_core::locks::FlockGuard,
-            miro_ego_core::locks::FlockGuard,
-        ),
+        locks: &mut HeldDeployLocks,
     ) -> DeployResult<DeploymentStatus> {
         self.ensure_layout()?;
         let _ = self.recover_locked()?;
@@ -1065,9 +1128,10 @@ impl ReleaseManager {
         };
         self.write_transaction(&tx)?;
 
+        let cur_dir = self.paths.releases_dir().join(&current);
         let prev_dir = self.paths.releases_dir().join(&previous);
         let switch_res = (|| -> DeployResult<()> {
-            self.install_assets_from_release(&prev_dir)?;
+            self.sync_assets_between_releases(Some(&cur_dir), &prev_dir)?;
             self.systemctl.run_systemctl(&["daemon-reload"])?;
             self.bootstrap_system()?;
             self.switch_current_for_transaction(&tx)?;
@@ -1075,14 +1139,17 @@ impl ReleaseManager {
         })();
 
         if let Err(err) = switch_res {
-            let cur_dir = self.paths.releases_dir().join(&current);
-            let _ = self.install_assets_from_release(&cur_dir);
+            let _ = self.sync_assets_between_releases(Some(&prev_dir), &cur_dir);
             let _ = self.revert_to_previous_links(Some(&current), Some(&previous));
+            locks.drop_maintenance();
             let _ = self.systemctl.run_systemctl(&["daemon-reload"]);
             let _ = self.bootstrap_system();
             let _ = self.start_services(false);
             return Err(err);
         }
+
+        // Drop `maintenance.lock` BEFORE starting services while STILL holding `deployment.lock`.
+        locks.drop_maintenance();
 
         let committed_previous = (current != previous).then_some(current.as_str());
         if activate {
@@ -1107,12 +1174,17 @@ impl ReleaseManager {
                 self.recover_locked()
             }
             Err(miro_ego_core::CoreError::LockBusy { .. }) if service_start => {
-                // During activation, a concurrent service start may observe deployment.lock held.
-                // Permit non-mutating check only when no transaction is pending and current is valid.
-                if fs::symlink_metadata(self.paths.transaction_file()).is_ok() {
-                    return Err(DeployError::Blocked {
-                        message: "deployment_busy: release transaction is uncommitted".to_owned(),
-                    });
+                // During activation (`start_services(true)`), `miro-ego-deploy` holds
+                // `deployment.lock` exclusively while `install-transaction.json` is in `Switched`
+                // state awaiting post-activation health verification. Delegate cleanly instead
+                // of fighting the active upgrade or prematurely rolling back!
+                if let Some(tx) = self.read_transaction()? {
+                    if tx.state != TransactionState::Switched {
+                        return Err(DeployError::Blocked {
+                            message: "deployment_busy: release transaction is uncommitted"
+                                .to_owned(),
+                        });
+                    }
                 }
                 let Some(current) = self.read_link_commit("current")? else {
                     return Err(DeployError::Blocked {
@@ -1134,8 +1206,18 @@ impl ReleaseManager {
     /// Uninstall Miro-Ego binaries and managed systemd/script assets while cleanly preserving
     /// `/etc/miro-ego/**`, `/var/lib/miro-ego/**`, and operator-owned config files.
     pub fn uninstall(&self) -> DeployResult<UninstallReport> {
-        let (_deploy_lock, _maint_lock) = self.acquire_exclusive_locks()?;
+        let _locks = self.acquire_exclusive_locks()?;
         self.deactivate_units(true)?;
+
+        let mut extra_tracked_assets = HashSet::new();
+        if let Ok(entries) = fs::read_dir(self.paths.releases_dir()) {
+            for entry in entries.filter_map(Result::ok) {
+                let rel_dir = entry.path();
+                for dest in self.collect_release_owned_assets(&rel_dir) {
+                    extra_tracked_assets.insert(dest);
+                }
+            }
+        }
 
         if fs::symlink_metadata(&self.paths.install_root)
             .map(|m| m.file_type().is_dir())
@@ -1151,6 +1233,7 @@ impl ReleaseManager {
         let _ = fs::remove_file(self.paths.transaction_file());
 
         let mut removed_assets = Vec::new();
+        let mut removed_set = HashSet::new();
         for asset in DEPLOYMENT_ASSETS {
             if asset.preserve_if_exists {
                 continue;
@@ -1160,7 +1243,24 @@ impl ReleaseManager {
                 fs::remove_file(&target).map_err(|err| DeployError::Failed {
                     message: format!("failed removing asset {}: {err}", target.display()),
                 })?;
+                self.cleanup_empty_dropin_parent(&target);
+                removed_set.insert(asset.dest_relative.to_owned());
                 removed_assets.push(asset.dest_relative.to_owned());
+            }
+        }
+        let mut sorted_extra: Vec<String> = extra_tracked_assets.into_iter().collect();
+        sorted_extra.sort();
+        for dest_rel in sorted_extra {
+            if removed_set.contains(&dest_rel) || is_preserved_dest_relative(&dest_rel) {
+                continue;
+            }
+            let target = self.paths.system_root.join(&dest_rel);
+            if fs::symlink_metadata(&target).is_ok() {
+                fs::remove_file(&target).map_err(|err| DeployError::Failed {
+                    message: format!("failed removing asset {}: {err}", target.display()),
+                })?;
+                self.cleanup_empty_dropin_parent(&target);
+                removed_assets.push(dest_rel);
             }
         }
         let _ = fs::remove_file(self.paths.run_dir.join("network-control.sock"));
@@ -1179,6 +1279,7 @@ impl ReleaseManager {
         self.ensure_service_ownership_if_root()?;
         let mut assets_restored = false;
         if let Some(tx) = self.read_transaction()? {
+            let new_dir = self.paths.releases_dir().join(&tx.new_current);
             match tx.action {
                 TransactionAction::Install => {
                     // An uncommitted `Install` transaction on disk (`Prepared` or `Switched`)
@@ -1187,7 +1288,7 @@ impl ReleaseManager {
                     if let Some(old) = &tx.old_current {
                         let old_dir = self.paths.releases_dir().join(old);
                         if self.release_is_complete(old) {
-                            self.install_assets_from_release(&old_dir)?;
+                            self.sync_assets_between_releases(Some(&new_dir), &old_dir)?;
                             assets_restored = true;
                             self.revert_to_previous_links(
                                 Some(old.as_str()),
@@ -1201,9 +1302,12 @@ impl ReleaseManager {
                     }
                 }
                 TransactionAction::Rollback => {
-                    let target_dir = self.paths.releases_dir().join(&tx.new_current);
+                    let old_dir = tx
+                        .old_current
+                        .as_ref()
+                        .map(|old| self.paths.releases_dir().join(old));
                     if self.release_is_complete(&tx.new_current) {
-                        self.install_assets_from_release(&target_dir)?;
+                        self.sync_assets_between_releases(old_dir.as_deref(), &new_dir)?;
                         assets_restored = true;
                         let next_prev = tx
                             .old_current
@@ -1212,9 +1316,9 @@ impl ReleaseManager {
                         self.switch_current_for_transaction(&tx)?;
                         self.finalize_verified_switch(&tx.new_current, next_prev)?;
                     } else if let Some(old) = &tx.old_current {
-                        let old_dir = self.paths.releases_dir().join(old);
+                        let fallback_old_dir = self.paths.releases_dir().join(old);
                         if self.release_is_complete(old) {
-                            self.install_assets_from_release(&old_dir)?;
+                            self.sync_assets_between_releases(Some(&new_dir), &fallback_old_dir)?;
                             assets_restored = true;
                         }
                         self.revert_to_previous_links(
@@ -1284,7 +1388,7 @@ impl ReleaseManager {
 
                 let rollback_result: DeployResult<()> = if let Some(old) = old_current {
                     if release_changed {
-                        self.restore_previous_release(old, old_previous)
+                        self.restore_previous_release(Some(new_current), old, old_previous)
                     } else {
                         let deact = self.deactivate_units(false);
                         let rev = self.revert_to_previous_links(Some(old), old_previous);
@@ -1292,6 +1396,14 @@ impl ReleaseManager {
                     }
                 } else {
                     let deact = self.deactivate_units(false);
+                    let failed_dir = self.paths.releases_dir().join(new_current);
+                    for rel_dest in self.collect_release_owned_assets(&failed_dir) {
+                        if !is_preserved_dest_relative(&rel_dest) {
+                            let target = self.paths.system_root.join(&rel_dest);
+                            let _ = fs::remove_file(&target);
+                            self.cleanup_empty_dropin_parent(&target);
+                        }
+                    }
                     let rev = self.revert_to_previous_links(None, old_previous);
                     deact.and(rev)
                 };
@@ -1320,12 +1432,14 @@ impl ReleaseManager {
 
     fn restore_previous_release(
         &self,
+        failed_current: Option<&str>,
         old_current: &str,
         old_previous: Option<&str>,
     ) -> DeployResult<()> {
         self.quiesce_services()?;
+        let failed_dir = failed_current.map(|c| self.paths.releases_dir().join(c));
         let old_dir = self.paths.releases_dir().join(old_current);
-        self.install_assets_from_release(&old_dir)?;
+        self.sync_assets_between_releases(failed_dir.as_deref(), &old_dir)?;
         self.revert_to_previous_links(Some(old_current), old_previous)?;
         self.systemctl.run_systemctl(&["daemon-reload"])?;
         self.bootstrap_system()?;
@@ -1339,6 +1453,9 @@ impl ReleaseManager {
         if final_dir.exists() && self.release_is_complete(verified.commit()) {
             if let Ok(meta) = self.read_release_metadata(verified.commit()) {
                 if meta.bundle_sha256 == verified.manifest_sha256 {
+                    if !verified.payloads_verified() {
+                        let _ = verify_bundle_dir(&verified.root)?;
+                    }
                     return Ok(final_dir);
                 }
             }
@@ -1427,55 +1544,267 @@ impl ReleaseManager {
         Ok(final_dir)
     }
 
-    /// Install systemd units and scripts from `<release>/deploy/miro-ego/` with explicit
-    /// `0755`/`0700`/`0644` permissions (immune to `UMask=0077`).
-    fn install_assets_from_release(&self, release_dir: &Path) -> DeployResult<()> {
-        let deploy_dir = release_dir.join("deploy/miro-ego");
-        if !deploy_dir.is_dir() {
-            return Ok(());
-        }
-        let customer_tls = self.is_customer_tls_configured();
+    /// Synchronize system/config assets when switching from `from_release_dir` to `to_release_dir`,
+    /// installing `to_release_dir` assets (including dynamic Avahi rendering when `device.json`
+    /// exists) and removing any non-preserved unit drop-ins or configs introduced only by
+    /// `from_release_dir`.
+    fn sync_assets_between_releases(
+        &self,
+        from_release_dir: Option<&Path>,
+        to_release_dir: &Path,
+    ) -> DeployResult<()> {
+        let from_assets = match from_release_dir {
+            Some(dir) => self.collect_release_owned_assets(dir),
+            None => HashSet::new(),
+        };
+        let to_installed = self.install_assets_from_release(to_release_dir)?;
+        let to_set: HashSet<String> = to_installed.into_iter().collect();
 
-        for asset in DEPLOYMENT_ASSETS {
-            let source_name = if asset.source_name == "miro-ego.avahi" && customer_tls {
-                let customer_candidate = deploy_dir.join("miro-ego-customer.avahi");
-                if customer_candidate.is_file() {
-                    "miro-ego-customer.avahi"
-                } else {
-                    asset.source_name
-                }
-            } else {
-                asset.source_name
-            };
-
-            let src_path = deploy_dir.join(source_name);
-            if !src_path.is_file() {
+        for stale_rel in from_assets {
+            if to_set.contains(&stale_rel) || is_preserved_dest_relative(&stale_rel) {
                 continue;
             }
-            let dest_path = self.paths.system_root.join(asset.dest_relative);
-            if asset.preserve_if_exists && fs::symlink_metadata(&dest_path).is_ok() {
-                continue;
+            let target = self.paths.system_root.join(&stale_rel);
+            if fs::symlink_metadata(&target).is_ok() {
+                fs::remove_file(&target).map_err(|err| DeployError::Failed {
+                    message: format!(
+                        "failed removing rolled-back release asset {}: {err}",
+                        target.display()
+                    ),
+                })?;
+                self.cleanup_empty_dropin_parent(&target);
             }
-
-            if let Some(parent) = dest_path.parent() {
-                let dir_mode = if parent == self.paths.system_root.join("etc/miro-ego") {
-                    0o750
-                } else {
-                    0o755
-                };
-                ensure_dir_tree_mode(parent, &self.paths.system_root, dir_mode)?;
-            }
-
-            let payload = fs::read(&src_path).map_err(|err| DeployError::Failed {
-                message: format!("failed reading release asset {source_name}: {err}"),
-            })?;
-            write_bytes_atomic(&dest_path, &payload, asset.mode, true).map_err(|err| {
-                DeployError::Failed {
-                    message: format!("failed installing asset {}: {err}", dest_path.display()),
-                }
-            })?;
         }
         Ok(())
+    }
+
+    fn cleanup_empty_dropin_parent(&self, removed_file: &Path) {
+        let Some(parent) = removed_file.parent() else {
+            return;
+        };
+        if parent == self.paths.system_root {
+            return;
+        }
+        let is_dropin_dir = parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with(".d"));
+        if is_dropin_dir {
+            let _ = fs::remove_dir(parent);
+        }
+        if let Some(grand) = parent.parent() {
+            let _ = fsync_directory(grand);
+        }
+    }
+
+    fn collect_release_owned_assets(&self, release_dir: &Path) -> HashSet<String> {
+        let mut owned = HashSet::new();
+        let ledger_path = release_dir.join(INSTALLED_ASSETS_FILENAME);
+        if let Ok(manifest) =
+            read_bounded_json::<InstalledAssetsManifest>(&ledger_path, MAX_DEPLOY_JSON_BYTES, 8)
+        {
+            if manifest.schema == INSTALLED_ASSETS_SCHEMA {
+                for rel in manifest.installed_dest_paths {
+                    if !is_preserved_dest_relative(&rel) {
+                        owned.insert(rel);
+                    }
+                }
+            }
+        }
+        for (_, dest_rel, preserve) in discover_release_asset_mappings(release_dir) {
+            if !preserve {
+                owned.insert(dest_rel);
+            }
+        }
+        owned
+    }
+
+    fn write_installed_assets_ledger(
+        &self,
+        release_dir: &Path,
+        installed_dest_paths: &[String],
+    ) -> DeployResult<()> {
+        if !release_dir.is_dir() {
+            return Ok(());
+        }
+        let ledger = InstalledAssetsManifest {
+            schema: INSTALLED_ASSETS_SCHEMA.to_owned(),
+            installed_dest_paths: installed_dest_paths.to_vec(),
+        };
+        let mut raw = serde_json::to_vec_pretty(&ledger).map_err(|err| DeployError::Failed {
+            message: format!("failed serializing {INSTALLED_ASSETS_FILENAME}: {err}"),
+        })?;
+        raw.push(b'\n');
+        write_bytes_atomic(
+            &release_dir.join(INSTALLED_ASSETS_FILENAME),
+            &raw,
+            0o644,
+            true,
+        )
+        .map_err(|err| DeployError::Failed {
+            message: format!("failed writing {INSTALLED_ASSETS_FILENAME}: {err}"),
+        })
+    }
+
+    /// Install systemd units, drop-ins, and scripts from `<release>/deploy/miro-ego/` with explicit
+    /// `0755`/`0700`/`0644` permissions (immune to `UMask=0077`), dynamically rendering
+    /// `/etc/avahi/services/miro-ego.service` when `device.json` exists in `config_root`.
+    fn install_assets_from_release(&self, release_dir: &Path) -> DeployResult<Vec<String>> {
+        let deploy_dir = release_dir.join("deploy/miro-ego");
+        let dynamic_avahi = self.render_dynamic_avahi_from_device_config();
+        let mut installed_dest_paths: Vec<String> = Vec::new();
+        let mut seen_dest: HashSet<String> = HashSet::new();
+
+        if deploy_dir.is_dir() {
+            let customer_tls = self.is_customer_tls_configured();
+
+            for asset in DEPLOYMENT_ASSETS {
+                if asset.source_name == "miro-ego.avahi" && dynamic_avahi.is_some() {
+                    continue;
+                }
+                let source_name = if asset.source_name == "miro-ego.avahi" && customer_tls {
+                    let customer_candidate = deploy_dir.join("miro-ego-customer.avahi");
+                    if customer_candidate.is_file() {
+                        "miro-ego-customer.avahi"
+                    } else {
+                        asset.source_name
+                    }
+                } else {
+                    asset.source_name
+                };
+
+                let src_path = deploy_dir.join(source_name);
+                if !src_path.is_file() {
+                    continue;
+                }
+                let dest_path = self.paths.system_root.join(asset.dest_relative);
+                if asset.preserve_if_exists && fs::symlink_metadata(&dest_path).is_ok() {
+                    continue;
+                }
+
+                self.write_system_asset(
+                    &dest_path,
+                    &fs::read(&src_path).map_err(|err| DeployError::Failed {
+                        message: format!("failed reading release asset {source_name}: {err}"),
+                    })?,
+                    asset.mode,
+                )?;
+
+                if !asset.preserve_if_exists && seen_dest.insert(asset.dest_relative.to_owned()) {
+                    installed_dest_paths.push(asset.dest_relative.to_owned());
+                }
+            }
+
+            // Also install any additional systemd drop-ins (`<unit>.d/<name>.conf`) or extra
+            // `miro-ego-*.{service,socket,timer,path,target}` units shipped in this release.
+            for (src_path, dest_rel, preserve) in discover_extra_release_assets(&deploy_dir) {
+                if seen_dest.contains(&dest_rel) {
+                    continue;
+                }
+                let dest_path = self.paths.system_root.join(&dest_rel);
+                if preserve && fs::symlink_metadata(&dest_path).is_ok() {
+                    continue;
+                }
+                let payload = fs::read(&src_path).map_err(|err| DeployError::Failed {
+                    message: format!(
+                        "failed reading extra release asset {}: {err}",
+                        src_path.display()
+                    ),
+                })?;
+                self.write_system_asset(&dest_path, &payload, 0o644)?;
+                if !preserve && seen_dest.insert(dest_rel.clone()) {
+                    installed_dest_paths.push(dest_rel);
+                }
+            }
+        }
+
+        if let Some(avahi_xml) = dynamic_avahi {
+            let avahi_rel = "etc/avahi/services/miro-ego.service";
+            let avahi_dest = self.paths.system_root.join(avahi_rel);
+            self.write_system_asset(&avahi_dest, &avahi_xml, 0o644)?;
+            if seen_dest.insert(avahi_rel.to_owned()) {
+                installed_dest_paths.push(avahi_rel.to_owned());
+            }
+        }
+
+        installed_dest_paths.sort();
+        let _ = self.write_installed_assets_ledger(release_dir, &installed_dest_paths);
+        Ok(installed_dest_paths)
+    }
+
+    fn write_system_asset(&self, dest_path: &Path, payload: &[u8], mode: u32) -> DeployResult<()> {
+        if let Some(parent) = dest_path.parent() {
+            let dir_mode = if parent == self.paths.system_root.join("etc/miro-ego") {
+                0o750
+            } else {
+                0o755
+            };
+            ensure_dir_tree_mode(parent, &self.paths.system_root, dir_mode)?;
+        }
+        write_bytes_atomic(dest_path, payload, mode, true).map_err(|err| DeployError::Failed {
+            message: format!("failed installing asset {}: {err}", dest_path.display()),
+        })
+    }
+
+    /// Dynamically render `/etc/avahi/services/miro-ego.service` when `device.json` exists in
+    /// `config_root`, using `device.device_label`, `listen.port`, and `_miro-ego._tcp` +
+    /// `_http._tcp` (or `_https._tcp` for customer TLS).
+    fn render_dynamic_avahi_from_device_config(&self) -> Option<Vec<u8>> {
+        let cfg_path = self.paths.config_root.join("device.json");
+        let val =
+            miro_ego_core::sys::fs::read_bounded_json_value(&cfg_path, MAX_DEPLOY_JSON_BYTES, 16)
+                .ok()?;
+        let obj = val.as_object()?;
+
+        let is_customer = obj
+            .get("security")
+            .and_then(|s| s.get("profile"))
+            .and_then(serde_json::Value::as_str)
+            == Some("customer");
+        let port = obj
+            .get("listen")
+            .and_then(|l| l.get("port"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p > 0)
+            .unwrap_or(8080);
+        let raw_label = obj
+            .get("device")
+            .and_then(|d| d.get("device_label"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty() && s.len() <= 63 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+            });
+
+        let (replace_wildcards, instance_name) = match raw_label {
+            Some(label) => ("no", avahi_xml_escape(label)),
+            None => ("yes", "Miro-Ego on %h".to_owned()),
+        };
+        let (scheme, alias_type) = if is_customer {
+            ("https", "_https._tcp")
+        } else {
+            ("http", "_http._tcp")
+        };
+
+        let xml = format!(
+            "<?xml version=\"1.0\" standalone='no'?>\n\
+             <!DOCTYPE service-group SYSTEM \"avahi-service.dtd\">\n\
+             <service-group>\n\
+             \x20 <name replace-wildcards=\"{replace_wildcards}\">{instance_name}</name>\n\
+             \x20 <service>\n\
+             \x20   <type>_miro-ego._tcp</type>\n\
+             \x20   <port>{port}</port>\n\
+             \x20   <txt-record>scheme={scheme}</txt-record>\n\
+             \x20   <txt-record>api=/api/v1/device</txt-record>\n\
+             \x20 </service>\n\
+             \x20 <service>\n\
+             \x20   <type>{alias_type}</type>\n\
+             \x20   <port>{port}</port>\n\
+             \x20 </service>\n\
+             </service-group>\n"
+        );
+        Some(xml.into_bytes())
     }
 
     fn is_customer_tls_configured(&self) -> bool {
@@ -1770,17 +2099,12 @@ impl ReleaseManager {
         Ok(())
     }
 
-    fn acquire_exclusive_locks(
-        &self,
-    ) -> DeployResult<(
-        miro_ego_core::locks::FlockGuard,
-        miro_ego_core::locks::FlockGuard,
-    )> {
+    fn acquire_exclusive_locks(&self) -> DeployResult<HeldDeployLocks> {
         let deploy = acquire_flock(self.paths.deployment_lock_file(), LockMode::Exclusive, true)
             .map_err(map_lock_err)?;
         let maint = acquire_maintenance_lock(&self.paths.run_dir, LockMode::Exclusive, true)
             .map_err(map_lock_err)?;
-        Ok((deploy, maint))
+        Ok(HeldDeployLocks::new(deploy, maint))
     }
 
     fn read_link_commit(&self, name: &str) -> DeployResult<Option<String>> {
@@ -2003,6 +2327,105 @@ impl FirmwareManager for ReleaseManager {
     }
 }
 
+fn is_preserved_dest_relative(dest_rel: &str) -> bool {
+    DEPLOYMENT_ASSETS
+        .iter()
+        .any(|a| a.dest_relative == dest_rel && a.preserve_if_exists)
+}
+
+fn discover_release_asset_mappings(release_dir: &Path) -> Vec<(PathBuf, String, bool)> {
+    let deploy_dir = release_dir.join("deploy/miro-ego");
+    if !deploy_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for asset in DEPLOYMENT_ASSETS {
+        let src = deploy_dir.join(asset.source_name);
+        let alt_avahi = asset.source_name == "miro-ego.avahi"
+            && deploy_dir.join("miro-ego-customer.avahi").is_file();
+        if src.is_file() || alt_avahi {
+            out.push((
+                src,
+                asset.dest_relative.to_owned(),
+                asset.preserve_if_exists,
+            ));
+        }
+    }
+    out.extend(discover_extra_release_assets(&deploy_dir));
+    out
+}
+
+fn discover_extra_release_assets(deploy_dir: &Path) -> Vec<(PathBuf, String, bool)> {
+    let known_sources: HashSet<&str> = DEPLOYMENT_ASSETS
+        .iter()
+        .map(|a| a.source_name)
+        .chain(std::iter::once("miro-ego-customer.avahi"))
+        .collect();
+    let mut extras = Vec::new();
+    let Ok(entries) = fs::read_dir(deploy_dir) else {
+        return extras;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.file_type().is_file() {
+            if known_sources.contains(name.as_str()) {
+                continue;
+            }
+            if name.starts_with("miro-ego-")
+                && [".service", ".socket", ".timer", ".path", ".target"]
+                    .iter()
+                    .any(|ext| name.ends_with(ext))
+            {
+                extras.push((path, format!("usr/lib/systemd/system/{name}"), false));
+            }
+        } else if meta.file_type().is_dir() && name.ends_with(".d") && !name.contains('/') {
+            if let Ok(sub_entries) = fs::read_dir(&path) {
+                for sub in sub_entries.filter_map(Result::ok) {
+                    let sub_path = sub.path();
+                    let sub_name = sub.file_name().to_string_lossy().into_owned();
+                    let Ok(sub_meta) = fs::symlink_metadata(&sub_path) else {
+                        continue;
+                    };
+                    if !sub_meta.file_type().is_symlink()
+                        && sub_meta.file_type().is_file()
+                        && sub_name.ends_with(".conf")
+                        && !sub_name.contains('/')
+                    {
+                        extras.push((
+                            sub_path,
+                            format!("etc/systemd/system/{name}/{sub_name}"),
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    extras
+}
+
+fn avahi_xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn map_lock_err(err: miro_ego_core::CoreError) -> DeployError {
     match err {
         miro_ego_core::CoreError::LockBusy { message } => DeployError::Blocked { message },
@@ -2214,7 +2637,7 @@ mod tests {
         let btn_path = root.join("etc/miro-ego/button.json");
         fs::write(&btn_path, b"{\"enabled\":true,\"pin\":33,\"custom\":1}\n").unwrap();
 
-        // Build v2 bundle and make health check FAIL on v2 activation!
+        // Build v2 bundle (including a v2-only drop-in!) and make health check FAIL on v2 activation!
         let b2 = root.join("bundles/v2");
         build_valid_bundle(
             &b2,
@@ -2232,6 +2655,16 @@ mod tests {
                     b"{\"enabled\":true,\"pin\":37}\n",
                     false,
                 ),
+                (
+                    "miro-ego-idle-fstrim.conf",
+                    b"[Service]\nExecStart=\n",
+                    false,
+                ),
+                (
+                    "deploy/miro-ego/miro-ego.service.d/10-v2-only.conf",
+                    b"[Service]\nEnvironment=V2_ONLY=1\n",
+                    false,
+                ),
             ],
         );
         health.healthy.store(false, Ordering::SeqCst);
@@ -2241,7 +2674,8 @@ mod tests {
         assert!(err.to_string().contains("automatically rolled back"));
 
         // Current MUST be back on v1, previous MUST remain None (never point to failed v2!),
-        // v1's unit file restored, daemon-reload ran, activation failure recorded, and user button.json preserved!
+        // v1's unit file restored, v2-only drop-ins removed, daemon-reload ran, activation failure
+        // recorded, and user button.json preserved!
         let after = mgr.status().unwrap();
         assert_eq!(after.current.as_deref(), Some(commit_v1.as_str()));
         assert_eq!(after.previous, None);
@@ -2249,6 +2683,18 @@ mod tests {
         assert!(!after.transaction_pending);
         assert!(after.activation_failure.is_some());
         assert!(fs::read_to_string(&unit_path).unwrap().contains("v1"));
+        assert!(
+            !root
+                .join("etc/systemd/system/fstrim.service.d/50-miro-ego-idle.conf")
+                .exists(),
+            "v2-only canonical drop-in must be removed on rollback to v1"
+        );
+        assert!(
+            !root
+                .join("etc/systemd/system/miro-ego.service.d/10-v2-only.conf")
+                .exists(),
+            "v2-only extra unit drop-in must be removed on rollback to v1"
+        );
         assert!(
             fs::read_to_string(&btn_path)
                 .unwrap()
@@ -2488,6 +2934,7 @@ mod tests {
                 fps: 60,
                 frame_decimation: 2,
                 exposure_time_absolute: None,
+                calibration_file: None,
             },
             storage: StorageConfig {
                 mountpoint: PathBuf::from("/data"),
@@ -2784,6 +3231,123 @@ mod tests {
         assert!(
             !paths.releases_dir().join(&commit_v2).exists(),
             "failed candidate v2 release directory must be pruned on rollback"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upgrade_drops_maintenance_lock_before_activation_and_recover_delegates_switched_tx() {
+        let (root, paths) = temp_env("no-self-conflict");
+        let paths_for_probe = paths.clone();
+
+        // Simulate real `miro-ego.service` startup inside `HealthChecker::check_health()`
+        // (`start_services(true)`):
+        // 1) `miro-ego-recover.service` runs `mgr_probe.recover(true)` while `deployment.lock` is
+        //    held AND `install-transaction.json` is in `TransactionState::Switched`!
+        // 2) `miro-ego.service` runs `recover_on_startup()` which acquires `maintenance.lock`
+        //    exclusively non-blocking (`acquire_maintenance_lock`)!
+        // 3) Concurrent deploy attempts MUST still be blocked by `deployment.lock`!
+        struct DaemonStartupSimHealth {
+            paths: ReleaseManagerPaths,
+        }
+        impl HealthChecker for DaemonStartupSimHealth {
+            fn check_health(&self) -> DeployResult<()> {
+                assert!(
+                    acquire_flock(self.paths.deployment_lock_file(), LockMode::Exclusive, true)
+                        .is_err(),
+                    "deployment.lock MUST remain held exclusively during start_services(true)"
+                );
+                let _maint =
+                    acquire_maintenance_lock(&self.paths.run_dir, LockMode::Exclusive, true)
+                        .expect("maintenance.lock MUST be dropped before start_services(true)");
+
+                let probe_mgr = ReleaseManager::new(
+                    self.paths.clone(),
+                    MockSystemctl::new(),
+                    Arc::new(ToggleHealth {
+                        healthy: AtomicBool::new(true),
+                    }),
+                );
+                let tx_on_disk = probe_mgr
+                    .read_transaction()
+                    .unwrap()
+                    .expect("Switched transaction should still be on disk during health check");
+                assert_eq!(tx_on_disk.state, TransactionState::Switched);
+
+                let rec = probe_mgr
+                    .recover(true)
+                    .expect("recover(service_start=true) must delegate cleanly on Switched + held deployment.lock");
+                assert!(rec.recovery_delegated);
+                Ok(())
+            }
+        }
+
+        fs::create_dir_all(&paths.config_root).unwrap();
+        fs::write(
+            paths.config_root.join("device.json"),
+            br#"{
+                "device": { "device_label": "Miro-Ego-Lab42" },
+                "listen": { "host": "0.0.0.0", "port": 9443 },
+                "security": { "profile": "customer" }
+            }"#,
+        )
+        .unwrap();
+
+        let mgr = ReleaseManager::new(
+            paths.clone(),
+            MockSystemctl::new(),
+            Arc::new(DaemonStartupSimHealth {
+                paths: paths_for_probe,
+            }),
+        );
+
+        let c1 = "1".repeat(40);
+        let c2 = "2".repeat(40);
+        let b1 = root.join("bundles/v1");
+        let b2 = root.join("bundles/v2");
+        build_valid_bundle(&b1, "0.3.0", &c1, &[]);
+        build_valid_bundle(
+            &b2,
+            "0.3.1",
+            &c2,
+            &[(
+                "deploy/miro-ego/miro-ego.service.d/20-v2.conf",
+                b"[Service]\nEnvironment=FOO=bar\n",
+                false,
+            )],
+        );
+
+        let st1 = mgr.install(&b1, true).unwrap();
+        assert_eq!(st1.current.as_deref(), Some(c1.as_str()));
+
+        // Verify dynamic Avahi rendering from device.json (`device_label`, `port`, `_https._tcp`).
+        let avahi_xml =
+            fs::read_to_string(root.join("etc/avahi/services/miro-ego.service")).unwrap();
+        assert!(
+            avahi_xml.contains("<name replace-wildcards=\"no\">Miro-Ego-Lab42</name>"),
+            "unexpected avahi XML: {avahi_xml}"
+        );
+        assert!(avahi_xml.contains("<port>9443</port>"));
+        assert!(avahi_xml.contains("<type>_miro-ego._tcp</type>"));
+        assert!(avahi_xml.contains("<type>_https._tcp</type>"));
+
+        // Live upgrade v1 -> v2 succeeds without maintenance.lock or recover(true) self-conflict!
+        let st2 = mgr.install(&b2, true).unwrap();
+        assert_eq!(st2.current.as_deref(), Some(c2.as_str()));
+        assert!(
+            root.join("etc/systemd/system/miro-ego.service.d/20-v2.conf")
+                .is_file()
+        );
+
+        // Live rollback v2 -> v1 also drops maintenance.lock before activation AND removes v2 drop-in!
+        let st_rb = mgr.rollback(true).unwrap();
+        assert_eq!(st_rb.current.as_deref(), Some(c1.as_str()));
+        assert!(
+            !root
+                .join("etc/systemd/system/miro-ego.service.d/20-v2.conf")
+                .exists(),
+            "explicit rollback must remove v2-only drop-in"
         );
 
         fs::remove_dir_all(root).unwrap();

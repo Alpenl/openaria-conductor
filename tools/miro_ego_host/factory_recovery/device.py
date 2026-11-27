@@ -24,7 +24,7 @@ SCHEMA = "miro-ego.factory-profile.v1"
 DEVICE_CONFIG_SCHEMA = "miro-ego.device-config.v1"
 VOICE_SETTINGS_SCHEMA = "miro-ego.voice-settings.v1"
 DEFAULT_VOICE_VOLUME = 80
-DEFAULT_VOICE_ENABLED = False
+DEFAULT_VOICE_ENABLED = True
 SERVICE_USER = "miro-ego"
 SERVICE_GROUP = "miro-ego"
 

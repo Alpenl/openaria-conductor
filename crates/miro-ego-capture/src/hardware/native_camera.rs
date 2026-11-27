@@ -1,11 +1,17 @@
 use crate::hardware::bounded::{self, Consumer, Producer};
+use crate::hardware::jpeg;
 use crate::hardware::turbojpeg::{TransformHandle, TurboJpegError};
-use crate::hardware::v4l2::{Capture, CaptureError, FocusStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::hardware::v4l2::{
+    Capture, CaptureError, ExposureConfig, FocusStatus, MAX_CONSECUTIVE_BAD_FRAMES,
+};
+use miro_ego_core::config::ExposureSetting;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+pub type DropCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 const PRODUCER_POLL: Duration = Duration::from_millis(50);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,6 +49,7 @@ pub struct Frame {
     pub source_sequence: u64,
     pub host_monotonic_ns: u64,
     pub application_dropped_before: u64,
+    pub corrupt_dropped_before: u64,
     pub producer_max_interval_ns: u64,
     pub producer_max_control_ns: u64,
     pub producer_max_read_ns: u64,
@@ -172,6 +179,10 @@ enum ControlCommand {
         auto_enabled: Option<bool>,
         response: Sender<Result<FocusStatus, CaptureError>>,
     },
+    SetExposure {
+        exposure: ExposureSetting,
+        response: Sender<Result<ExposureConfig, CaptureError>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +219,8 @@ pub struct Stream {
     consumer: Consumer<Frame>,
     controls: Sender<ControlCommand>,
     terminal_error: Arc<Mutex<Option<StreamError>>>,
+    corrupt_frames_dropped: Arc<AtomicU64>,
+    drop_callback: Arc<Mutex<Option<DropCallback>>>,
 }
 
 impl Stream {
@@ -215,7 +228,24 @@ impl Stream {
         self.consumer.queue_stats()
     }
 
+    pub fn corrupt_frames_dropped(&self) -> u64 {
+        self.corrupt_frames_dropped.load(Ordering::Acquire)
+    }
+
+    pub fn set_drop_callback(&self, callback: Option<DropCallback>) {
+        if let Ok(mut guard) = self.drop_callback.lock() {
+            *guard = callback;
+        }
+    }
+
     pub fn open(config: StreamConfig<'_>) -> Result<Self, StreamError> {
+        Self::open_with_exposure(config, None)
+    }
+
+    pub fn open_with_exposure(
+        config: StreamConfig<'_>,
+        exposure: Option<ExposureSetting>,
+    ) -> Result<Self, StreamError> {
         if config.queue_capacity == 0 {
             return Err(StreamError::new(
                 "invalid_argument",
@@ -230,6 +260,9 @@ impl Stream {
             config.encoding,
             config.buffer_count,
         )?;
+        if let Some(ref setting) = exposure {
+            capture.set_exposure(setting)?;
+        }
         let splitter = if config.split_eyes {
             Some(TransformHandle::open()?)
         } else {
@@ -280,6 +313,8 @@ impl Stream {
             consumer,
             controls: control_sender,
             terminal_error: Arc::new(Mutex::new(None)),
+            corrupt_frames_dropped: Arc::new(AtomicU64::new(0)),
+            drop_callback: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -311,6 +346,8 @@ impl Stream {
         let stop = Arc::clone(&self.stop);
         let producer = self.producer.clone();
         let terminal_error = Arc::clone(&self.terminal_error);
+        let corrupt_counter = Arc::clone(&self.corrupt_frames_dropped);
+        let drop_callback = Arc::clone(&self.drop_callback);
         let slot = Arc::new(Mutex::new(Some(resources)));
         let worker_slot = Arc::clone(&slot);
         let worker = thread::Builder::new()
@@ -327,7 +364,14 @@ impl Stream {
                         return None;
                     }
                 };
-                run_producer(&mut resources, &producer, &stop, &terminal_error);
+                run_producer(
+                    &mut resources,
+                    &producer,
+                    &stop,
+                    &terminal_error,
+                    &corrupt_counter,
+                    &drop_callback,
+                );
                 drain_pending_controls(&resources.controls);
                 producer.close();
                 Some(resources)
@@ -473,6 +517,50 @@ impl Stream {
         }
     }
 
+    pub fn set_exposure(&self, exposure: &ExposureSetting) -> Result<ExposureConfig, StreamError> {
+        let lifecycle = self.lifecycle.lock().map_err(|_| {
+            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
+        })?;
+        match lifecycle.state {
+            State::Open | State::Stopped => lifecycle
+                .resources
+                .as_ref()
+                .ok_or_else(|| {
+                    StreamError::new("invalid_state", "native camera resources are missing")
+                })?
+                .capture
+                .set_exposure(exposure)
+                .map_err(StreamError::from),
+            State::Running => {
+                let (response, result) = mpsc::channel();
+                self.controls
+                    .send(ControlCommand::SetExposure {
+                        exposure: exposure.clone(),
+                        response,
+                    })
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_failed",
+                            "native camera control channel is closed",
+                        )
+                    })?;
+                drop(lifecycle);
+                result
+                    .recv_timeout(CONTROL_TIMEOUT)
+                    .map_err(|_| {
+                        StreamError::new(
+                            "native_camera_control_timeout",
+                            "native camera exposure update timed out",
+                        )
+                    })?
+                    .map_err(StreamError::from)
+            }
+            State::Stopping | State::Closed => {
+                Err(StreamError::new("invalid_state", "native camera is closed"))
+            }
+        }
+    }
+
     pub fn stop(&self) -> Result<(), StreamError> {
         let worker = {
             let mut lifecycle = self.lifecycle.lock().map_err(|_| {
@@ -591,6 +679,8 @@ impl Stream {
             consumer,
             controls: control_sender,
             terminal_error: Arc::new(Mutex::new(None)),
+            corrupt_frames_dropped: Arc::new(AtomicU64::new(0)),
+            drop_callback: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -607,13 +697,30 @@ impl Drop for Stream {
     }
 }
 
+fn notify_corrupt_drop(
+    corrupt_counter: &AtomicU64,
+    drop_callback: &Mutex<Option<DropCallback>>,
+    dropped: u64,
+    host_monotonic_ns: u64,
+) {
+    corrupt_counter.fetch_add(dropped, Ordering::AcqRel);
+    let cb = drop_callback.lock().ok().and_then(|guard| guard.clone());
+    if let Some(cb) = cb {
+        cb(dropped, host_monotonic_ns);
+    }
+}
+
 fn run_producer(
     resources: &mut Resources,
     producer: &Producer<Frame>,
     stop: &AtomicBool,
     terminal_error: &Mutex<Option<StreamError>>,
+    corrupt_counter: &AtomicU64,
+    drop_callback: &Mutex<Option<DropCallback>>,
 ) {
     let mut pending_rejected = 0_u64;
+    let mut pending_corrupt_drops = 0_u64;
+    let mut consecutive_bad_frames = 0_u32;
     let mut previous_frame = Instant::now();
     let mut timings = [(0_u64, 0_u64, 0_u64); 64];
     let mut timing_index = 0;
@@ -631,9 +738,9 @@ fn run_producer(
                 return;
             }
         }
-        let frame = (|| {
-            let read_started = Instant::now();
-            let (source_sequence, host_monotonic_ns, raw_side_by_side) = resources
+        let read_started = Instant::now();
+        let read_res =
+            resources
                 .capture
                 .read_ready_with(|source_sequence, host_monotonic_ns, payload| {
                     // Own the V4L2 bytes before requeueing its buffer. Recording
@@ -643,49 +750,111 @@ fn run_producer(
                         host_monotonic_ns,
                         Arc::<[u8]>::from(payload),
                     ))
-                })?;
-            let now = Instant::now();
-            timings[timing_index] = (
-                now.duration_since(previous_frame).as_nanos() as u64,
-                control_ns,
-                read_started.elapsed().as_nanos() as u64,
-            );
-            timing_index = (timing_index + 1) % timings.len();
-            previous_frame = now;
-            let (left, right) = if let Some(splitter) = resources.splitter.as_mut() {
-                splitter
-                    .split_sbs(&raw_side_by_side, resources.width, resources.height)
-                    .map_err(|error| StreamError::new(error.code, error.message))?
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            Ok::<_, StreamError>(Frame {
-                buffer_flags: resources.capture.last_buffer_flags,
-                dequeue_monotonic_ns: resources.capture.last_dequeue_monotonic_ns,
-                source_sequence,
-                host_monotonic_ns,
-                application_dropped_before: pending_rejected,
-                producer_max_interval_ns: timings.iter().map(|value| value.0).max().unwrap_or(0),
-                producer_max_control_ns: timings.iter().map(|value| value.1).max().unwrap_or(0),
-                producer_max_read_ns: timings.iter().map(|value| value.2).max().unwrap_or(0),
-                left,
-                right,
-                raw_side_by_side,
-            })
-        })();
-        let frame = match frame {
-            Ok(frame) => frame,
+                });
+        let (source_sequence, host_monotonic_ns, raw_side_by_side) = match read_res {
+            Ok(tuple) => tuple,
+            Err(error) if error.code == "frame_timeout" => continue,
+            Err(error) if error.code == "bad_frame" => {
+                let ts = resources.capture.last_dequeue_monotonic_ns;
+                notify_corrupt_drop(corrupt_counter, drop_callback, 1, ts);
+                pending_corrupt_drops = pending_corrupt_drops.saturating_add(1);
+                consecutive_bad_frames = consecutive_bad_frames.saturating_add(1);
+                if resources.capture.is_closed()
+                    || consecutive_bad_frames >= MAX_CONSECUTIVE_BAD_FRAMES
+                {
+                    resources.capture.close();
+                    *terminal_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.into());
+                    return;
+                }
+                continue;
+            }
             Err(error) => {
                 resources.capture.close();
                 *terminal_error
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.into());
                 return;
             }
         };
+
+        // Validate complete MJPEG SOI..EOI framing before splitting or forwarding downstream.
+        if jpeg::ranges(&raw_side_by_side).is_empty() {
+            notify_corrupt_drop(corrupt_counter, drop_callback, 1, host_monotonic_ns);
+            pending_corrupt_drops = pending_corrupt_drops.saturating_add(1);
+            consecutive_bad_frames = consecutive_bad_frames.saturating_add(1);
+            if consecutive_bad_frames >= MAX_CONSECUTIVE_BAD_FRAMES {
+                resources.capture.close();
+                *terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StreamError::new(
+                    "bad_frame",
+                    format!(
+                        "camera produced {consecutive_bad_frames} consecutive truncated/corrupt MJPEG frames"
+                    ),
+                ));
+                return;
+            }
+            continue;
+        }
+
+        let split_res = if let Some(splitter) = resources.splitter.as_mut() {
+            splitter
+                .split_sbs(&raw_side_by_side, resources.width, resources.height)
+                .map_err(|error| StreamError::new(error.code, error.message))
+        } else {
+            Ok((Vec::new(), Vec::new()))
+        };
+        let (left, right) = match split_res {
+            Ok(pair) => pair,
+            Err(error) => {
+                notify_corrupt_drop(corrupt_counter, drop_callback, 1, host_monotonic_ns);
+                pending_corrupt_drops = pending_corrupt_drops.saturating_add(1);
+                consecutive_bad_frames = consecutive_bad_frames.saturating_add(1);
+                if consecutive_bad_frames >= MAX_CONSECUTIVE_BAD_FRAMES {
+                    resources.capture.close();
+                    *terminal_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                    return;
+                }
+                continue;
+            }
+        };
+
+        consecutive_bad_frames = 0;
+        let now = Instant::now();
+        timings[timing_index] = (
+            now.duration_since(previous_frame).as_nanos() as u64,
+            control_ns,
+            read_started.elapsed().as_nanos() as u64,
+        );
+        timing_index = (timing_index + 1) % timings.len();
+        previous_frame = now;
+        let frame = Frame {
+            buffer_flags: resources.capture.last_buffer_flags,
+            dequeue_monotonic_ns: resources.capture.last_dequeue_monotonic_ns,
+            source_sequence,
+            host_monotonic_ns,
+            application_dropped_before: pending_rejected,
+            corrupt_dropped_before: pending_corrupt_drops,
+            producer_max_interval_ns: timings.iter().map(|value| value.0).max().unwrap_or(0),
+            producer_max_control_ns: timings.iter().map(|value| value.1).max().unwrap_or(0),
+            producer_max_read_ns: timings.iter().map(|value| value.2).max().unwrap_or(0),
+            left,
+            right,
+            raw_side_by_side,
+        };
         match producer.try_push(frame) {
-            Ok(()) => pending_rejected = 0,
-            Err(frame) => pending_rejected = frame.application_dropped_before + 1,
+            Ok(()) => {
+                pending_rejected = 0;
+                pending_corrupt_drops = 0;
+            }
+            Err(frame) => {
+                pending_rejected = frame.application_dropped_before + 1;
+                pending_corrupt_drops = frame.corrupt_dropped_before;
+            }
         }
     }
 }
@@ -703,6 +872,9 @@ fn process_control_commands(resources: &Resources) {
             }) => {
                 let _ = response.send(resources.capture.set_focus(value, auto_enabled));
             }
+            Ok(ControlCommand::SetExposure { exposure, response }) => {
+                let _ = response.send(resources.capture.set_exposure(&exposure));
+            }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
         }
     }
@@ -716,6 +888,9 @@ fn drain_pending_controls(controls: &Receiver<ControlCommand>) {
                 let _ = response.send(Err(error));
             }
             ControlCommand::SetFocus { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            ControlCommand::SetExposure { response, .. } => {
                 let _ = response.send(Err(error));
             }
         }
@@ -842,5 +1017,50 @@ mod tests {
         let err_guard = stream.terminal_error.lock().unwrap();
         assert_eq!(err_guard.as_ref().unwrap().code, "device_disconnected");
         assert_eq!(err_guard.as_ref().unwrap().message, "usb camera unplugged");
+    }
+
+    #[test]
+    fn producer_recovers_from_transient_corrupt_mjpeg_and_exposes_drop_callback() {
+        use miro_ego_core::config::ExposureSetting;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let capture = crate::hardware::v4l2::Capture::test_fake_with_frames(vec![
+            (10, 1_000_000_000, b"\xff\xd8first\xff\xd9".to_vec(), 0x2000),
+            // Truncated MJPEG missing EOI: must be dropped, requeued, and counted!
+            (
+                11,
+                1_016_666_667,
+                b"\xff\xd8truncated-no-eoi".to_vec(),
+                0x2000,
+            ),
+            (12, 1_033_333_333, b"\xff\xd8third\xff\xd9".to_vec(), 0x2000),
+        ])
+        .unwrap();
+        let stream = super::Stream::from_parts(capture, None, 3840, 1080, 4).unwrap();
+
+        // Exposure control works cleanly through Stream::set_exposure before and during streaming.
+        let exp = stream.set_exposure(&ExposureSetting::Manual(45)).unwrap();
+        assert_eq!(exp.auto_exposure, 1);
+        assert_eq!(exp.exposure_time_absolute, Some(45));
+
+        let cb_drops = std::sync::Arc::new(AtomicU64::new(0));
+        let cb_drops_clone = std::sync::Arc::clone(&cb_drops);
+        stream.set_drop_callback(Some(std::sync::Arc::new(move |dropped, _ts| {
+            cb_drops_clone.fetch_add(dropped, Ordering::AcqRel);
+        })));
+
+        stream.start().unwrap();
+        let f1 = stream.read(Duration::from_secs(1)).unwrap();
+        assert_eq!(f1.source_sequence, 10);
+        assert_eq!(f1.corrupt_dropped_before, 0);
+
+        let f2 = stream.read(Duration::from_secs(1)).unwrap();
+        assert_eq!(f2.source_sequence, 12);
+        assert_eq!(f2.corrupt_dropped_before, 1);
+        assert_eq!(stream.corrupt_frames_dropped(), 1);
+        assert_eq!(cb_drops.load(Ordering::Acquire), 1);
+
+        stream.close().unwrap();
     }
 }

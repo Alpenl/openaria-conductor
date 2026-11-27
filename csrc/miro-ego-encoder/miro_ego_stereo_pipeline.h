@@ -44,6 +44,7 @@ typedef struct {
     const char *path_prefix; /* relative prefix reported back, e.g. "video/" */
     const miro_ego_split_ops_t *split_ops; /* NULL selects default CPU/NEON backend */
     miro_ego_preview_config_t preview;     /* optional preview hook for VSE backend */
+    int input_stall_timeout_ms;            /* 0 selects default 5000ms backpressure ceiling */
 } miro_ego_pipeline_config_t;
 
 typedef struct {
@@ -100,6 +101,9 @@ int miro_ego_pipeline_failed(const miro_ego_pipeline_t *pipeline);
 
 /* Non-empty once the pipeline has entered a failed state. */
 const char *miro_ego_pipeline_error(const miro_ego_pipeline_t *pipeline);
+
+/* Requests immediate stop of bounded input backpressure retry loops (signal-safe). */
+void miro_ego_pipeline_request_stop(miro_ego_pipeline_t *pipeline);
 
 #ifdef __cplusplus
 }

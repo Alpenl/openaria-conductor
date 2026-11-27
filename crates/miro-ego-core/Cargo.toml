@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+jsonschema.workspace = true
 libc.workspace = true
 libloading.workspace = true
 serde.workspace = true

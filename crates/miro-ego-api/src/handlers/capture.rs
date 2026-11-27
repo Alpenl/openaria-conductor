@@ -8,7 +8,7 @@ use crate::middleware::{
     GatewayState, HeaderExtract, RequestCtx, read_strict_json_object_with_timeout,
     single_header_str,
 };
-use crate::preview::{MJPEG_CONTENT_TYPE, h264_stream_body, mjpeg_stream_body};
+use crate::preview::{MJPEG_CONTENT_TYPE, h264_stream_body_with_gop, mjpeg_stream_body};
 use crate::sse::{EventCursor, capture_sse_body, parse_last_event_id};
 use axum::body::Body;
 use axum::extract::State;
@@ -24,7 +24,7 @@ pub async fn get_capture_status(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getCaptureStatus", None) {
         return *resp;
     }
@@ -40,7 +40,7 @@ pub async fn get_capture_readiness(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getCaptureReadiness", None) {
         return *resp;
     }
@@ -56,7 +56,7 @@ pub async fn get_safe_swap(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getCurrentSafeSwapReceipt", None) {
         return *resp;
     }
@@ -75,7 +75,7 @@ pub async fn get_capture_timer(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getCaptureTimer", None) {
         return *resp;
     }
@@ -92,9 +92,10 @@ pub async fn set_capture_timer(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    if let Err(resp) = ctx.authorize_write(&state, &parts.headers, "setCaptureTimer") {
-        return *resp;
-    }
+    let principal = match ctx.authorize_write_headers(&state, &parts.headers, "setCaptureTimer") {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let (json, _) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -103,12 +104,21 @@ pub async fn set_capture_timer(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "setCaptureTimer", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let (enabled, duration_seconds) = match validate_timer_set_body(&json) {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "setCaptureTimer", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
+    if let Err(resp) = ctx.record_allowed(&state, "setCaptureTimer", None, &principal) {
+        return *resp;
+    }
     match state
         .backend
         .set_capture_timer(enabled, duration_seconds)
@@ -153,10 +163,11 @@ pub async fn start_capture(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "startCapture") {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let (principal, key) =
+        match ctx.authorize_command_headers(&state, &parts.headers, "startCapture") {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
     let (json, canonical) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -165,18 +176,38 @@ pub async fn start_capture(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "startCapture", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_capture_start_body(&json) {
+        ctx.audit(&state, "startCapture", None, &err.code, Some(&principal));
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "startCapture", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.start_capture(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            "startCapture",
+            "startCapture",
+            &key,
+            &canonical,
+            || async move { backend.start_capture(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
@@ -264,10 +295,11 @@ pub async fn stop_capture(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "stopCapture") {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let (principal, key) =
+        match ctx.authorize_command_headers(&state, &parts.headers, "stopCapture") {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
     let (json, canonical) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -276,18 +308,38 @@ pub async fn stop_capture(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "stopCapture", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_capture_stop_body(&json) {
+        ctx.audit(&state, "stopCapture", None, &err.code, Some(&principal));
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "stopCapture", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.stop_capture(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            "stopCapture",
+            "stopCapture",
+            &key,
+            &canonical,
+            || async move { backend.stop_capture(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
@@ -330,7 +382,7 @@ pub async fn get_camera_focus(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &headers, "getCameraFocus", None) {
         return *resp;
     }
@@ -348,10 +400,11 @@ pub async fn set_camera_focus(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "setCameraFocus") {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let (principal, key) =
+        match ctx.authorize_command_headers(&state, &parts.headers, "setCameraFocus") {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
     let (json, canonical) = match read_strict_json_object_with_timeout(
         &parts.headers,
         body,
@@ -360,18 +413,38 @@ pub async fn set_camera_focus(
     .await
     {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "setCameraFocus", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     if let Err(err) = validate_camera_focus_body(&json) {
+        ctx.audit(&state, "setCameraFocus", None, &err.code, Some(&principal));
         return ctx.error_response(err);
     }
+    if let Err(resp) = ctx.record_allowed(&state, "setCameraFocus", None, &principal) {
+        return *resp;
+    }
+    let principal_id = principal.principal_id().to_owned();
     let cmd = IdempotentCommand {
-        principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        principal_id: principal_id.clone(),
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.set_camera_focus(cmd).await {
+    let backend = Arc::clone(&state.backend);
+    let res = state
+        .idempotency_coalescer
+        .execute(
+            &principal_id,
+            "setCameraFocus",
+            "setCameraFocus",
+            &key,
+            &canonical,
+            || async move { backend.set_camera_focus(cmd).await },
+        )
+        .await;
+    match res {
         Ok(outcome) => {
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
@@ -431,25 +504,53 @@ pub async fn stream_capture_events(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "streamCaptureEvents", None) {
-        return *resp;
-    }
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
+    let principal =
+        match ctx.authorize_read_headers(&state, &parts.headers, "streamCaptureEvents", None) {
+            Ok(p) => p,
+            Err(resp) => return *resp,
+        };
     if parts.uri.query().is_some_and(|q| !q.is_empty()) {
+        ctx.audit(
+            &state,
+            "streamCaptureEvents",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::bad_request(
             "SSE endpoint does not accept query parameters",
         ));
     }
     let cursor = match single_header_str(&parts.headers, "last-event-id") {
         HeaderExtract::Multiple => {
+            ctx.audit(
+                &state,
+                "streamCaptureEvents",
+                None,
+                "invalid_request",
+                Some(&principal),
+            );
             return ctx.error_response(ApiError::bad_request("Last-Event-ID may appear only once"));
         }
         HeaderExtract::Missing => None,
         HeaderExtract::Single(raw) => match parse_last_event_id(Some(raw)) {
             Ok(c) => c,
-            Err(err) => return ctx.error_response(err),
+            Err(err) => {
+                ctx.audit(
+                    &state,
+                    "streamCaptureEvents",
+                    None,
+                    &err.code,
+                    Some(&principal),
+                );
+                return ctx.error_response(err);
+            }
         },
     };
+    if let Err(resp) = ctx.record_allowed(&state, "streamCaptureEvents", None, &principal) {
+        return *resp;
+    }
     let Ok(permit) = Arc::clone(&state.sse_semaphore).try_acquire_owned() else {
         return ctx.error_response(ApiError::stream_capacity_exhausted());
     };
@@ -511,25 +612,46 @@ pub async fn get_preview(
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "getPreview", None) {
-        return *resp;
-    }
+    let principal = match ctx.authorize_read_headers(&state, &parts.headers, "getPreview", None) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "getPreview", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let mut fps: Option<u32> = None;
     for (k, v) in query {
         if k != "fps" {
+            ctx.audit(
+                &state,
+                "getPreview",
+                None,
+                "invalid_request",
+                Some(&principal),
+            );
             return ctx.error_response(ApiError::bad_request(
                 "unexpected query parameter on /preview",
             ));
         }
         let parsed = v.parse::<u32>().ok().filter(|&n| n >= 1);
         let Some(valid_fps) = parsed else {
+            ctx.audit(
+                &state,
+                "getPreview",
+                None,
+                "invalid_request",
+                Some(&principal),
+            );
             return ctx.error_response(ApiError::bad_request("fps must be a positive integer"));
         };
         fps = Some(valid_fps);
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "getPreview", None, &principal) {
+        return *resp;
     }
 
     // Acquire preview semaphore BEFORE calling `open_preview_mjpeg` so capacity-exhausted
@@ -595,12 +717,17 @@ pub async fn get_preview_h264(
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
     let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
-    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "getPreviewH264", None) {
-        return *resp;
-    }
+    let principal = match ctx.authorize_read_headers(&state, &parts.headers, "getPreviewH264", None)
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "getPreviewH264", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let mut fps: Option<u32> = None;
     let mut bitrate_kbps: Option<u32> = None;
@@ -608,6 +735,13 @@ pub async fn get_preview_h264(
         match k.as_str() {
             "fps" => {
                 let Some(parsed) = v.parse::<u32>().ok().filter(|n| (1..=60).contains(n)) else {
+                    ctx.audit(
+                        &state,
+                        "getPreviewH264",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx
                         .error_response(ApiError::bad_request("fps must be an integer in 1..=60"));
                 };
@@ -616,6 +750,13 @@ pub async fn get_preview_h264(
             "bitrate_kbps" => {
                 let Some(parsed) = v.parse::<u32>().ok().filter(|n| (256..=16_000).contains(n))
                 else {
+                    ctx.audit(
+                        &state,
+                        "getPreviewH264",
+                        None,
+                        "invalid_request",
+                        Some(&principal),
+                    );
                     return ctx.error_response(ApiError::bad_request(
                         "bitrate_kbps must be an integer in 256..=16000",
                     ));
@@ -623,11 +764,21 @@ pub async fn get_preview_h264(
                 bitrate_kbps = Some(parsed);
             }
             _ => {
+                ctx.audit(
+                    &state,
+                    "getPreviewH264",
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
                 return ctx.error_response(ApiError::bad_request(
                     "unexpected query parameter on /preview/h264",
                 ));
             }
         }
+    }
+    if let Err(resp) = ctx.record_allowed(&state, "getPreviewH264", None, &principal) {
+        return *resp;
     }
 
     // Acquire preview semaphore BEFORE calling `open_preview_h264`.
@@ -640,7 +791,7 @@ pub async fn get_preview_h264(
         Err(err) => return ctx.error_response(err),
     };
 
-    let rx = hub.subscribe();
+    let (gop_fragments, rx) = hub.subscribe_with_gop();
     let Some(init) = hub.init_segment().await else {
         return ctx.error_response(ApiError::preview_unavailable(
             "H.264 preview initialization segment is not available yet",
@@ -648,7 +799,13 @@ pub async fn get_preview_h264(
     };
     hub.record_stream_hints(fps, bitrate_kbps);
     let content_type = hub.content_type().to_owned();
-    let body = h264_stream_body(Some(init), rx, permit, state.subscribe_shutdown());
+    let body = h264_stream_body_with_gop(
+        Some(init),
+        gop_fragments,
+        rx,
+        permit,
+        state.subscribe_shutdown(),
+    );
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
