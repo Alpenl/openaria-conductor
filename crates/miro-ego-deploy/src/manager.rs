@@ -19,7 +19,7 @@ use miro_ego_core::paths::{
     SYSTEM_CONFIG_DIR, SYSTEM_INSTALL_ROOT, SYSTEM_RUN_DIR, SYSTEM_STATE_DIR,
 };
 use miro_ego_core::sys::fs::{
-    fsync_directory, read_bounded_bytes, read_bounded_json, write_bytes_atomic,
+    fsync_directory, open_directory_safe, read_bounded_bytes, read_bounded_json, write_bytes_atomic,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
@@ -528,6 +528,92 @@ pub struct LocalHttpHealthChecker {
     poll_interval: Duration,
     tls_config: Option<Arc<ClientConfig>>,
     bearer_token: Option<String>,
+    config_path: Option<PathBuf>,
+    fallback_addr: SocketAddr,
+}
+
+struct ResolvedProbeTarget {
+    addr: SocketAddr,
+    tls_config: Option<Arc<ClientConfig>>,
+    bearer_token: Option<String>,
+}
+
+fn resolve_probe_target_from_path(
+    config_path: &Path,
+    fallback_addr: SocketAddr,
+) -> DeployResult<ResolvedProbeTarget> {
+    match fs::symlink_metadata(config_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResolvedProbeTarget {
+                addr: fallback_addr,
+                tls_config: None,
+                bearer_token: None,
+            });
+        }
+        Err(err) => {
+            return Err(DeployError::Failed {
+                message: format!(
+                    "cannot inspect device config {}: {err}",
+                    config_path.display()
+                ),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    let cfg = load_device_config(config_path).map_err(|err| DeployError::Failed {
+        message: format!(
+            "failed loading device config {}: {err}",
+            config_path.display()
+        ),
+    })?;
+    let addr = loopback_addr_from_listen(&cfg.listen).unwrap_or(fallback_addr);
+    match cfg.security {
+        SecurityConfig::Lab { .. } => Ok(ResolvedProbeTarget {
+            addr,
+            tls_config: None,
+            bearer_token: None,
+        }),
+        SecurityConfig::Customer {
+            bearer_token_file,
+            tls_certificate_file,
+            ..
+        } => {
+            let raw_tok = read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| {
+                DeployError::Failed {
+                    message: format!(
+                        "failed reading customer bearer token {}: {err}",
+                        bearer_token_file.display()
+                    ),
+                }
+            })?;
+            let token = String::from_utf8(raw_tok)
+                .map_err(|_| DeployError::Failed {
+                    message: "customer bearer token is not valid UTF-8".to_owned(),
+                })?
+                .trim()
+                .to_owned();
+            if token.is_empty() {
+                return Err(DeployError::Failed {
+                    message: "customer bearer token file is empty".to_owned(),
+                });
+            }
+            let cert_pem = read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
+                DeployError::Failed {
+                    message: format!(
+                        "failed reading customer TLS certificate {}: {err}",
+                        tls_certificate_file.display()
+                    ),
+                }
+            })?;
+            let tls_cfg = build_pinned_tls_client_config(&cert_pem)?;
+            Ok(ResolvedProbeTarget {
+                addr,
+                tls_config: Some(tls_cfg),
+                bearer_token: Some(token),
+            })
+        }
+    }
 }
 
 impl LocalHttpHealthChecker {
@@ -538,6 +624,8 @@ impl LocalHttpHealthChecker {
             poll_interval: Duration::from_millis(250),
             tls_config: None,
             bearer_token: None,
+            config_path: None,
+            fallback_addr: addr,
         }
     }
 
@@ -549,97 +637,61 @@ impl LocalHttpHealthChecker {
     ) -> DeployResult<Self> {
         self.tls_config = Some(build_pinned_tls_client_config(cert_pem)?);
         self.bearer_token = bearer_token;
+        self.config_path = None;
         Ok(self)
     }
 
     /// Construct a health checker from `/etc/miro-ego/device.json` (handling custom `listen.port`
     /// and `security.profile == "customer"` HTTPS + Bearer token), falling back to plain HTTP on
-    /// `fallback_addr` when `config_path` does not exist yet.
+    /// `fallback_addr` when `config_path` does not exist yet, and dynamically reloading
+    /// `device.json`, TLS certificate, and Bearer token on every `check_health()` call.
     pub fn from_device_config_path(
         config_path: &Path,
         fallback_addr: SocketAddr,
         timeout: Duration,
     ) -> DeployResult<Self> {
-        match fs::symlink_metadata(config_path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::new(fallback_addr, timeout));
-            }
-            Err(err) => {
-                return Err(DeployError::Failed {
-                    message: format!(
-                        "cannot inspect device config {}: {err}",
-                        config_path.display()
-                    ),
-                });
-            }
-            Ok(_) => {}
-        }
+        let initial = resolve_probe_target_from_path(config_path, fallback_addr)?;
+        Ok(Self {
+            addr: initial.addr,
+            timeout,
+            poll_interval: Duration::from_millis(250),
+            tls_config: initial.tls_config,
+            bearer_token: initial.bearer_token,
+            config_path: Some(config_path.to_path_buf()),
+            fallback_addr,
+        })
+    }
 
-        let cfg = load_device_config(config_path).map_err(|err| DeployError::Failed {
-            message: format!(
-                "failed loading device config {}: {err}",
-                config_path.display()
-            ),
-        })?;
-        let addr = loopback_addr_from_listen(&cfg.listen).unwrap_or(fallback_addr);
-        let checker = Self::new(addr, timeout);
-        match cfg.security {
-            SecurityConfig::Lab { .. } => Ok(checker),
-            SecurityConfig::Customer {
-                bearer_token_file,
-                tls_certificate_file,
-                ..
-            } => {
-                let raw_tok = read_bounded_bytes(&bearer_token_file, 4096).map_err(|err| {
-                    DeployError::Failed {
-                        message: format!(
-                            "failed reading customer bearer token {}: {err}",
-                            bearer_token_file.display()
-                        ),
-                    }
-                })?;
-                let token = String::from_utf8(raw_tok)
-                    .map_err(|_| DeployError::Failed {
-                        message: "customer bearer token is not valid UTF-8".to_owned(),
-                    })?
-                    .trim()
-                    .to_owned();
-                if token.is_empty() {
-                    return Err(DeployError::Failed {
-                        message: "customer bearer token file is empty".to_owned(),
-                    });
-                }
-                let cert_pem =
-                    read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
-                        DeployError::Failed {
-                            message: format!(
-                                "failed reading customer TLS certificate {}: {err}",
-                                tls_certificate_file.display()
-                            ),
-                        }
-                    })?;
-                checker.with_tls_and_bearer(&cert_pem, Some(token))
-            }
+    fn current_target(&self) -> Result<ResolvedProbeTarget, String> {
+        if let Some(cfg_path) = &self.config_path {
+            resolve_probe_target_from_path(cfg_path, self.fallback_addr).map_err(|e| e.to_string())
+        } else {
+            Ok(ResolvedProbeTarget {
+                addr: self.addr,
+                tls_config: self.tls_config.clone(),
+                bearer_token: self.bearer_token.clone(),
+            })
         }
     }
 
     fn probe_once(&self) -> Result<(), String> {
-        let tcp = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2))
+        let target = self.current_target()?;
+        let tcp = TcpStream::connect_timeout(&target.addr, Duration::from_secs(2))
             .map_err(|e| e.to_string())?;
         let _ = tcp.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(2)));
 
-        let authority = format_authority_host(&self.addr);
+        let authority = format_authority_host(&target.addr);
         let mut req = format!(
             "GET /api/v1/device HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n"
         );
-        if let Some(tok) = &self.bearer_token {
+        if let Some(tok) = &target.bearer_token {
             req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
         }
         req.push_str("\r\n");
 
         let mut buf = [0u8; 256];
-        let n = if let Some(tls_cfg) = &self.tls_config {
+        let n = if let Some(tls_cfg) = &target.tls_config {
             let server_name = ServerName::try_from("localhost").map_err(|e| e.to_string())?;
             let conn = ClientConnection::new(Arc::clone(tls_cfg), server_name)
                 .map_err(|e| e.to_string())?;
@@ -792,6 +844,10 @@ impl ReleaseManagerPaths {
         self.state_root.join("activation-failure.json")
     }
 
+    pub fn firmware_task_file(&self) -> PathBuf {
+        self.state_root.join("firmware-task.json")
+    }
+
     pub fn deployment_lock_file(&self) -> PathBuf {
         self.run_dir.join(DEPLOYMENT_LOCK_NAME)
     }
@@ -868,12 +924,35 @@ impl ReleaseManager {
     /// Transactionally install a verified native Miro-Ego release bundle with automatic
     /// rollback if activation health checks fail.
     pub fn install(&self, bundle_path: &Path, activate: bool) -> DeployResult<DeploymentStatus> {
-        let (_deploy_lock, _maint_lock) = self.acquire_exclusive_locks()?;
+        let locks = self.acquire_exclusive_locks()?;
+        let verified = verify_bundle_dir(bundle_path)?;
+        self.install_verified_with_locks(&verified, activate, &locks)
+    }
+
+    /// Transactionally install an already-verified [`VerifiedBundle`] without re-hashing the
+    /// bundle files on disk.
+    pub fn install_verified(
+        &self,
+        verified: &VerifiedBundle,
+        activate: bool,
+    ) -> DeployResult<DeploymentStatus> {
+        let locks = self.acquire_exclusive_locks()?;
+        self.install_verified_with_locks(verified, activate, &locks)
+    }
+
+    pub(crate) fn install_verified_with_locks(
+        &self,
+        verified: &VerifiedBundle,
+        activate: bool,
+        _locks: &(
+            miro_ego_core::locks::FlockGuard,
+            miro_ego_core::locks::FlockGuard,
+        ),
+    ) -> DeployResult<DeploymentStatus> {
         self.ensure_layout()?;
         let _ = self.recover_locked()?;
 
-        let verified = verify_bundle_dir(bundle_path)?;
-        self.offline_hook.pre_install_verify(&verified)?;
+        self.offline_hook.pre_install_verify(verified)?;
 
         let old_current = self.read_link_commit("current")?;
         let old_previous = self.read_link_commit("previous")?;
@@ -889,7 +968,7 @@ impl ReleaseManager {
             self.quiesce_services()?;
         }
 
-        let release_dir = self.stage_release(&verified)?;
+        let release_dir = self.stage_release(verified)?;
         let tx = InstallTransaction {
             schema: INSTALL_TRANSACTION_SCHEMA.to_owned(),
             transaction_id: new_uuid_v4(),
@@ -947,7 +1026,18 @@ impl ReleaseManager {
 
     /// Transactionally roll back `current` to `previous`, restoring previous release's unit assets.
     pub fn rollback(&self, activate: bool) -> DeployResult<DeploymentStatus> {
-        let (_deploy_lock, _maint_lock) = self.acquire_exclusive_locks()?;
+        let locks = self.acquire_exclusive_locks()?;
+        self.rollback_with_locks(activate, &locks)
+    }
+
+    pub(crate) fn rollback_with_locks(
+        &self,
+        activate: bool,
+        _locks: &(
+            miro_ego_core::locks::FlockGuard,
+            miro_ego_core::locks::FlockGuard,
+        ),
+    ) -> DeployResult<DeploymentStatus> {
         self.ensure_layout()?;
         let _ = self.recover_locked()?;
 
@@ -1045,7 +1135,7 @@ impl ReleaseManager {
     /// `/etc/miro-ego/**`, `/var/lib/miro-ego/**`, and operator-owned config files.
     pub fn uninstall(&self) -> DeployResult<UninstallReport> {
         let (_deploy_lock, _maint_lock) = self.acquire_exclusive_locks()?;
-        self.deactivate_units()?;
+        self.deactivate_units(true)?;
 
         if fs::symlink_metadata(&self.paths.install_root)
             .map(|m| m.file_type().is_dir())
@@ -1086,6 +1176,7 @@ impl ReleaseManager {
     }
 
     fn recover_locked(&self) -> DeployResult<DeploymentStatus> {
+        self.ensure_service_ownership_if_root()?;
         let mut assets_restored = false;
         if let Some(tx) = self.read_transaction()? {
             match tx.action {
@@ -1195,12 +1286,12 @@ impl ReleaseManager {
                     if release_changed {
                         self.restore_previous_release(old, old_previous)
                     } else {
-                        let deact = self.deactivate_units();
+                        let deact = self.deactivate_units(false);
                         let rev = self.revert_to_previous_links(Some(old), old_previous);
                         deact.and(rev)
                     }
                 } else {
-                    let deact = self.deactivate_units();
+                    let deact = self.deactivate_units(false);
                     let rev = self.revert_to_previous_links(None, old_previous);
                     deact.and(rev)
                 };
@@ -1444,6 +1535,16 @@ impl ReleaseManager {
             (_, prev) => prev,
         };
         self.switch_symlink("previous", normalized_prev)?;
+
+        let mut keep = HashSet::new();
+        if let Some(cur) = old_current {
+            keep.insert(cur.to_owned());
+        }
+        if let Some(prev) = normalized_prev {
+            keep.insert(prev.to_owned());
+        }
+        self.prune_releases(&keep)?;
+
         let _ = fs::remove_file(self.paths.transaction_file());
         let _ = fsync_directory(&self.paths.state_root);
         Ok(())
@@ -1522,7 +1623,7 @@ impl ReleaseManager {
     fn ensure_service_ownership_if_root(&self) -> DeployResult<()> {
         create_dir_with_mode(&self.paths.config_root, 0o750)?;
         create_dir_with_mode(&self.paths.state_root, 0o750)?;
-        create_dir_with_mode(&self.paths.run_dir, 0o755)?;
+        create_dir_with_mode(&self.paths.run_dir, 0o750)?;
 
         if unsafe { libc::geteuid() } != 0 {
             return Ok(());
@@ -1544,7 +1645,7 @@ impl ReleaseManager {
             }
         }
         chown_path(&self.paths.state_root, uid, gid);
-        chown_path(&self.paths.run_dir, uid, gid);
+        chown_path(&self.paths.run_dir, 0, gid);
         Ok(())
     }
 
@@ -1553,20 +1654,42 @@ impl ReleaseManager {
     }
 
     fn quiesce_services(&self) -> DeployResult<()> {
-        if self.unit_exists(WATCHDOG_TIMER_UNIT)? {
-            self.systemctl
-                .run_systemctl(&["disable", "--now", WATCHDOG_TIMER_UNIT])?;
-        }
-        for unit in [
-            WATCHDOG_SERVICE_UNIT,
-            "miro-ego.service",
-            "miro-ego-network.socket",
-            NETWORK_SERVICE_UNIT,
-            RECOVER_UNIT,
-        ] {
-            if self.unit_exists(unit)? {
-                self.systemctl.run_systemctl(&["stop", unit])?;
+        let mut disabled_timer = false;
+        let mut stopped_units: Vec<&str> = Vec::new();
+
+        let res = (|| -> DeployResult<()> {
+            if self.unit_exists(WATCHDOG_TIMER_UNIT)? {
+                self.systemctl
+                    .run_systemctl(&["disable", "--now", WATCHDOG_TIMER_UNIT])?;
+                disabled_timer = true;
             }
+            for unit in [
+                WATCHDOG_SERVICE_UNIT,
+                "miro-ego.service",
+                "miro-ego-network.socket",
+                NETWORK_SERVICE_UNIT,
+            ] {
+                if self.unit_exists(unit)? {
+                    self.systemctl.run_systemctl(&["stop", unit])?;
+                    stopped_units.push(unit);
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = res {
+            for unit in stopped_units.into_iter().rev() {
+                if unit == WATCHDOG_SERVICE_UNIT {
+                    continue;
+                }
+                let _ = self.systemctl.run_systemctl(&["start", unit]);
+            }
+            if disabled_timer {
+                let _ = self
+                    .systemctl
+                    .run_systemctl(&["enable", "--now", WATCHDOG_TIMER_UNIT]);
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -1601,17 +1724,20 @@ impl ReleaseManager {
         Ok(())
     }
 
-    fn deactivate_units(&self) -> DeployResult<()> {
+    fn deactivate_units(&self, include_deploy_socket: bool) -> DeployResult<()> {
         for unit in [
             WATCHDOG_TIMER_UNIT,
             BUTTON_UNIT,
             "miro-ego.service",
             "miro-ego-network.socket",
-            DEPLOY_SOCKET_UNIT,
         ] {
             if self.unit_exists(unit)? {
                 self.systemctl.run_systemctl(&["disable", "--now", unit])?;
             }
+        }
+        if include_deploy_socket && self.unit_exists(DEPLOY_SOCKET_UNIT)? {
+            self.systemctl
+                .run_systemctl(&["disable", "--now", DEPLOY_SOCKET_UNIT])?;
         }
         for unit in [WATCHDOG_SERVICE_UNIT, NETWORK_SERVICE_UNIT, RECOVER_UNIT] {
             if self.unit_exists(unit)? {
@@ -1640,7 +1766,7 @@ impl ReleaseManager {
         create_dir_with_mode(&self.paths.releases_dir(), 0o755)?;
         create_dir_with_mode(&self.paths.config_root, 0o750)?;
         create_dir_with_mode(&self.paths.state_root, 0o750)?;
-        create_dir_with_mode(&self.paths.run_dir, 0o755)?;
+        create_dir_with_mode(&self.paths.run_dir, 0o750)?;
         Ok(())
     }
 
@@ -1908,7 +2034,13 @@ fn lookup_miro_ego_uid_gid() -> (Option<u32>, Option<u32>) {
 fn chown_path(path: &Path, uid: u32, gid: u32) {
     if let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) {
         unsafe {
-            let _ = libc::chown(path_c.as_ptr(), uid, gid);
+            let _ = libc::fchownat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                uid,
+                gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
         }
     }
 }
@@ -1917,9 +2049,14 @@ fn create_dir_with_mode(path: &Path, mode: u32) -> DeployResult<()> {
     fs::create_dir_all(path).map_err(|err| DeployError::Failed {
         message: format!("failed creating directory {}: {err}", path.display()),
     })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|err| DeployError::Failed {
-        message: format!("failed chmod directory {}: {err}", path.display()),
-    })
+    let dir_file = open_directory_safe(path).map_err(|err| DeployError::Failed {
+        message: format!("directory {} is unsafe or a symlink: {err}", path.display()),
+    })?;
+    dir_file
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|err| DeployError::Failed {
+            message: format!("failed chmod directory {}: {err}", path.display()),
+        })
 }
 
 /// Ensure every directory between `stop_root` and `dir` exists with explicit mode (immune to UMask).
@@ -2539,6 +2676,116 @@ mod tests {
 
         stop_srv.store(true, Ordering::Release);
         srv_handle.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quiesce_omits_recover_unit_restarts_on_partial_failure_prunes_failed_release_and_keeps_deploy_socket()
+     {
+        let (root, paths) = temp_env("p0-01-p1-22");
+        let fail_network_stop = Arc::new(AtomicBool::new(false));
+        let fail_flag = Arc::clone(&fail_network_stop);
+
+        struct SelectiveFailSystemctl {
+            commands: Mutex<Vec<Vec<String>>>,
+            fail_network_stop: Arc<AtomicBool>,
+        }
+        impl SystemctlRunner for SelectiveFailSystemctl {
+            fn run_systemctl(&self, args: &[&str]) -> DeployResult<()> {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push(args.iter().map(|s| (*s).to_owned()).collect());
+                if self.fail_network_stop.load(Ordering::SeqCst)
+                    && args == ["stop", NETWORK_SERVICE_UNIT]
+                {
+                    return Err(DeployError::Failed {
+                        message: "simulated systemctl stop failure".to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            fn unit_load_state(&self, _unit: &str) -> DeployResult<String> {
+                Ok("loaded".to_owned())
+            }
+        }
+
+        let sysctl = Arc::new(SelectiveFailSystemctl {
+            commands: Mutex::new(Vec::new()),
+            fail_network_stop: fail_flag,
+        });
+        let health = Arc::new(ToggleHealth {
+            healthy: AtomicBool::new(false),
+        });
+        let mgr = ReleaseManager::new(paths.clone(), sysctl.clone(), health.clone());
+
+        let commit_v1 = "1".repeat(40);
+        let commit_v2 = "2".repeat(40);
+        let b1 = root.join("bundles/v1");
+        let b2 = root.join("bundles/v2");
+        build_valid_bundle(&b1, "0.3.0", &commit_v1, &[]);
+        build_valid_bundle(&b2, "0.3.1", &commit_v2, &[]);
+
+        // First-install activation failure:
+        // 1) MUST prune failed candidate `releases/<commit_v1>` (no 512 MiB leak!)
+        // 2) MUST NOT disable `miro-ego-deploy.socket`!
+        assert!(mgr.install(&b1, true).is_err());
+        assert!(!paths.releases_dir().join(&commit_v1).exists());
+        {
+            let cmds = std::mem::take(&mut *sysctl.commands.lock().unwrap());
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|c| c == &["disable", "--now", DEPLOY_SOCKET_UNIT]),
+                "activate_or_rollback must never disable miro-ego-deploy.socket"
+            );
+        }
+
+        // Now succeed installing v1, verify run_dir mode is 0o750!
+        health.healthy.store(true, Ordering::SeqCst);
+        mgr.install(&b1, true).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&paths.run_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+
+        // Quiesce failure partway (after stopping miro-ego.service & network.socket) MUST:
+        // - never invoke `stop miro-ego-recover.service`
+        // - best-effort restart already-stopped units (`miro-ego-network.socket`, `miro-ego.service`)!
+        sysctl.commands.lock().unwrap().clear();
+        fail_network_stop.store(true, Ordering::SeqCst);
+        assert!(mgr.install(&b2, true).is_err());
+        {
+            let cmds = std::mem::take(&mut *sysctl.commands.lock().unwrap());
+            assert!(
+                !cmds.iter().any(|c| c == &["stop", RECOVER_UNIT]),
+                "quiesce_services must never stop miro-ego-recover.service"
+            );
+            assert!(
+                cmds.iter()
+                    .any(|c| c == &["start", "miro-ego-network.socket"])
+            );
+            assert!(cmds.iter().any(|c| c == &["start", "miro-ego.service"]));
+            assert!(
+                cmds.iter()
+                    .any(|c| c == &["enable", "--now", WATCHDOG_TIMER_UNIT])
+            );
+        }
+
+        // Upgrade v1 -> v2 failing health check MUST prune failed `releases/<commit_v2>`!
+        fail_network_stop.store(false, Ordering::SeqCst);
+        health.healthy.store(false, Ordering::SeqCst);
+        assert!(mgr.install(&b2, true).is_err());
+        assert!(paths.releases_dir().join(&commit_v1).exists());
+        assert!(
+            !paths.releases_dir().join(&commit_v2).exists(),
+            "failed candidate v2 release directory must be pruned on rollback"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }

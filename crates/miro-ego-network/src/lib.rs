@@ -1,6 +1,7 @@
 //! Wi-Fi hotspot/station management, privileged network control socket, bounded network
 //! state store, and mDNS service configuration (`_miro-ego._tcp`) for Miro-Ego.
 
+pub mod clock;
 pub mod controller;
 pub mod mdns;
 pub mod nmcli;
@@ -10,6 +11,11 @@ pub mod state;
 use miro_ego_core::CoreError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use clock::{
+    CLOCK_STATE_FILENAME, CLOCK_STATE_SCHEMA, ClockStatusSnapshot, LinuxSystemClockBackend,
+    MockSystemClockBackend, PersistedClockState, SystemClockBackend,
+};
 
 pub use controller::{
     ApplyDesiredState, ApplyWifiClient, AuthoritativeNetworkController, ControllerConfig,

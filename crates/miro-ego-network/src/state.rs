@@ -636,6 +636,19 @@ impl NetworkStateStore {
         persist_state_atomic(&self.path, &state)
     }
 
+    pub fn set_verified(&self, verified: bool) -> NetworkResult<()> {
+        let mut state = self.lock_state()?;
+        if state.verified == verified {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        next.verified = verified;
+        next.validate()?;
+        persist_state_atomic(&self.path, &next)?;
+        *state = next;
+        Ok(())
+    }
+
     pub fn bump_scan_revision(&self) -> NetworkResult<(String, u64)> {
         let mut state = self.lock_state()?;
         state.source_revision = state.source_revision.saturating_add(1);

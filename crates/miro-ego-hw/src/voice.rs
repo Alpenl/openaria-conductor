@@ -1,14 +1,17 @@
 //! Voice feedback controller with 0..=100 volume scaling, atomic settings persistence,
-//! and trait-abstracted `aplay` audio playback.
+//! non-blocking bounded background playback queue, and trait-abstracted `aplay` audio playback.
 
 use crate::{HwError, HwResult, VoiceCue, VoiceFeedback};
 use miro_ego_core::sys::fs::{read_bounded_bytes, read_bounded_json, write_bytes_atomic};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const VOICE_STATUS_SCHEMA: &str = "miro-ego.voice.v1";
@@ -17,6 +20,7 @@ pub const DEFAULT_VOICE_DEVICE: &str = "plughw:CARD=duplexaudio,DEV=0";
 pub const MAX_VOICE_SETTINGS_BYTES: usize = 8 * 1024;
 pub const MAX_WAV_ASSET_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PLAYBACK_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_QUEUED_VOICE_CUES: usize = 4;
 
 /// Public voice status matching OpenAPI `VoiceStatus` (`miro-ego.voice.v1`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,14 +305,49 @@ pub fn scale_pcm16_wav(wav_bytes: &[u8], volume: u8) -> HwResult<Vec<u8>> {
     Ok(out)
 }
 
-/// Thread-safe voice feedback controller with atomic settings persistence and trait-abstracted audio output.
-pub struct VoiceController {
+struct VoiceQueueState {
+    queue: VecDeque<(VoiceCue, u8)>,
+    playing: bool,
+    closed: bool,
+}
+
+struct VoiceWorkerShared {
     audio_device: String,
     assets_dir: PathBuf,
-    settings_path: PathBuf,
-    playback_timeout: Duration,
+    playback_timeout_ms: AtomicU64,
     player: Arc<dyn AudioPlayer>,
+    state: Mutex<VoiceQueueState>,
+    work_cv: Condvar,
+    idle_cv: Condvar,
+}
+
+fn execute_single_cue(shared: &VoiceWorkerShared, cue: VoiceCue, volume: u8) -> HwResult<()> {
+    let asset_path = shared.assets_dir.join(cue_asset_filename(cue));
+    let raw_wav = read_bounded_bytes(&asset_path, MAX_WAV_ASSET_BYTES).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            HwError::Unavailable {
+                message: format!("voice asset missing: {}", asset_path.display()),
+            }
+        } else {
+            HwError::Io {
+                message: format!("failed to read voice asset {}: {err}", asset_path.display()),
+            }
+        }
+    })?;
+    let scaled = scale_pcm16_wav(&raw_wav, volume)?;
+    let timeout = Duration::from_millis(shared.playback_timeout_ms.load(Ordering::Acquire).max(1));
+    shared
+        .player
+        .play_wav(&shared.audio_device, &scaled, timeout)
+}
+
+/// Thread-safe voice feedback controller with atomic settings persistence and non-blocking
+/// serialized background audio playback.
+pub struct VoiceController {
+    settings_path: PathBuf,
     settings: Mutex<VoiceSettings>,
+    shared: Arc<VoiceWorkerShared>,
+    worker_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl VoiceController {
@@ -344,19 +383,132 @@ impl VoiceController {
             }
         };
 
-        Ok(Self {
+        let shared = Arc::new(VoiceWorkerShared {
             audio_device: audio_device.into(),
             assets_dir: assets_dir.into(),
-            settings_path,
-            playback_timeout: DEFAULT_PLAYBACK_TIMEOUT,
+            playback_timeout_ms: AtomicU64::new(DEFAULT_PLAYBACK_TIMEOUT.as_millis() as u64),
             player,
+            state: Mutex::new(VoiceQueueState {
+                queue: VecDeque::with_capacity(MAX_QUEUED_VOICE_CUES),
+                playing: false,
+                closed: false,
+            }),
+            work_cv: Condvar::new(),
+            idle_cv: Condvar::new(),
+        });
+
+        let worker_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("miro-ego-voice".to_owned())
+            .spawn(move || {
+                loop {
+                    let next_item = {
+                        let mut guard = worker_shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        while guard.queue.is_empty() && !guard.closed {
+                            guard = worker_shared
+                                .work_cv
+                                .wait(guard)
+                                .unwrap_or_else(PoisonError::into_inner);
+                        }
+                        if guard.closed && guard.queue.is_empty() {
+                            break;
+                        }
+                        let item = guard.queue.pop_front();
+                        if item.is_some() {
+                            guard.playing = true;
+                        }
+                        item
+                    };
+
+                    if let Some((cue, vol)) = next_item {
+                        if let Err(err) = execute_single_cue(&worker_shared, cue, vol) {
+                            eprintln!("miro-ego-voice: playback warning for {cue:?}: {err}");
+                        }
+                        let mut guard = worker_shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        guard.playing = false;
+                        if guard.queue.is_empty() {
+                            worker_shared.idle_cv.notify_all();
+                        }
+                    }
+                }
+                let mut guard = worker_shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard.playing = false;
+                worker_shared.idle_cv.notify_all();
+            })
+            .map_err(|err| HwError::Io {
+                message: format!("failed to spawn voice worker thread: {err}"),
+            })?;
+
+        Ok(Self {
+            settings_path,
             settings: Mutex::new(settings),
+            shared,
+            worker_handle: Mutex::new(Some(handle)),
         })
     }
 
-    pub fn with_playback_timeout(mut self, timeout: Duration) -> Self {
-        self.playback_timeout = timeout;
+    pub fn with_playback_timeout(self, timeout: Duration) -> Self {
+        let ms = u64::try_from(timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.shared.playback_timeout_ms.store(ms, Ordering::Release);
         self
+    }
+
+    /// Wait up to `timeout` for all queued voice cues and any in-flight playback to finish.
+    pub fn flush(&self, timeout: Duration) -> HwResult<()> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while !guard.queue.is_empty() || guard.playing {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(HwError::Io {
+                    message: "timed out flushing voice cue queue".to_owned(),
+                });
+            }
+            let wait_dur = deadline.saturating_duration_since(now);
+            let (next, _) = self
+                .shared
+                .idle_cv
+                .wait_timeout(guard, wait_dur)
+                .unwrap_or_else(PoisonError::into_inner);
+            guard = next;
+        }
+        Ok(())
+    }
+
+    /// Drain queued cues and shut down the background voice playback thread cleanly.
+    pub fn close(&self) {
+        {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.closed = true;
+            self.shared.work_cv.notify_all();
+        }
+        let handle = self
+            .worker_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
     }
 
     pub fn status(&self) -> HwResult<VoiceStatus> {
@@ -397,6 +549,12 @@ impl VoiceController {
     }
 }
 
+impl Drop for VoiceController {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl VoiceFeedback for VoiceController {
     fn play_cue(&self, cue: VoiceCue) -> HwResult<()> {
         let (enabled, volume) = {
@@ -408,21 +566,29 @@ impl VoiceFeedback for VoiceController {
         if !enabled || volume == 0 {
             return Ok(());
         }
-        let asset_path = self.assets_dir.join(cue_asset_filename(cue));
-        let raw_wav = read_bounded_bytes(&asset_path, MAX_WAV_ASSET_BYTES).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                HwError::Unavailable {
-                    message: format!("voice asset missing: {}", asset_path.display()),
-                }
-            } else {
-                HwError::Io {
-                    message: format!("failed to read voice asset {}: {err}", asset_path.display()),
-                }
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.closed {
+            return Err(HwError::Unavailable {
+                message: "voice controller is closed".to_owned(),
+            });
+        }
+        if let Some((last_cue, last_vol)) = guard.queue.back_mut() {
+            if *last_cue == cue {
+                *last_vol = volume;
+                self.shared.work_cv.notify_one();
+                return Ok(());
             }
-        })?;
-        let scaled = scale_pcm16_wav(&raw_wav, volume)?;
-        self.player
-            .play_wav(&self.audio_device, &scaled, self.playback_timeout)
+        }
+        if guard.queue.len() >= MAX_QUEUED_VOICE_CUES {
+            let _ = guard.queue.pop_front();
+        }
+        guard.queue.push_back((cue, volume));
+        self.shared.work_cv.notify_one();
+        Ok(())
     }
 }
 
@@ -450,6 +616,7 @@ fn persist_voice_settings(path: &Path, settings: &VoiceSettings) -> HwResult<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_pcm16_wav(samples: &[i16]) -> Vec<u8> {
@@ -526,12 +693,14 @@ mod tests {
             }
         );
         ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        ctrl.flush(Duration::from_secs(2)).unwrap();
         assert_eq!(player.played.lock().unwrap().len(), 1);
         player.played.lock().unwrap().clear();
 
         // Explicit disable makes play_cue a no-op; set_volume(>0) re-enables automatically!
         ctrl.set_enabled(false).unwrap();
         ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        ctrl.flush(Duration::from_secs(2)).unwrap();
         assert!(player.played.lock().unwrap().is_empty());
 
         // Reject out-of-range volume > 100.
@@ -544,6 +713,7 @@ mod tests {
         assert_eq!(status.volume, 50);
 
         ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        ctrl.flush(Duration::from_secs(2)).unwrap();
         {
             let played = player.played.lock().unwrap();
             assert_eq!(played.len(), 1);
@@ -571,8 +741,81 @@ mod tests {
         assert!(!muted.enabled);
         assert_eq!(muted.volume, 0);
         reloaded.play_cue(VoiceCue::RecordingStarted).unwrap();
+        reloaded.flush(Duration::from_secs(2)).unwrap();
         assert_eq!(player.played.lock().unwrap().len(), 1);
 
+        drop(reloaded);
+        drop(ctrl);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn play_cue_enqueues_non_blocking_and_serializes_audio_playback() {
+        struct SlowSerialPlayer {
+            active: AtomicUsize,
+            max_concurrent: AtomicUsize,
+            total_played: AtomicUsize,
+        }
+        impl AudioPlayer for SlowSerialPlayer {
+            fn play_wav(
+                &self,
+                _device: &str,
+                _wav_bytes: &[u8],
+                _timeout: Duration,
+            ) -> HwResult<()> {
+                let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = self.max_concurrent.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(80));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.total_played.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "miro-ego-voice-async-{}-{unique}",
+            std::process::id()
+        ));
+        let assets = dir.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let wav = make_pcm16_wav(&[1000, -1000]);
+        for cue in [
+            VoiceCue::DeviceReady,
+            VoiceCue::RecordingStarted,
+            VoiceCue::RecordingStopped,
+        ] {
+            fs::write(assets.join(cue_asset_filename(cue)), &wav).unwrap();
+        }
+
+        let player = Arc::new(SlowSerialPlayer {
+            active: AtomicUsize::new(0),
+            max_concurrent: AtomicUsize::new(0),
+            total_played: AtomicUsize::new(0),
+        });
+        let ctrl = VoiceController::open(
+            DEFAULT_VOICE_DEVICE,
+            &assets,
+            dir.join("voice.json"),
+            player.clone(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        ctrl.play_cue(VoiceCue::DeviceReady).unwrap();
+        ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        ctrl.play_cue(VoiceCue::RecordingStopped).unwrap();
+        // Caller thread MUST NOT block waiting for the 3 × 80ms = 240ms playbacks!
+        assert!(started.elapsed() < Duration::from_millis(40));
+
+        ctrl.flush(Duration::from_secs(3)).unwrap();
+        assert_eq!(player.max_concurrent.load(Ordering::SeqCst), 1);
+        assert_eq!(player.total_played.load(Ordering::SeqCst), 3);
+
+        ctrl.close();
         fs::remove_dir_all(dir).unwrap();
     }
 

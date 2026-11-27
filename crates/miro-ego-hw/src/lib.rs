@@ -12,8 +12,9 @@ use thiserror::Error;
 
 pub use button::{
     BUTTON_CONFIG_SCHEMA, ButtonClassifier, ButtonConfig, ButtonMonitor, CaptureToggleAction,
-    CaptureToggleClient, DEFAULT_BUTTON_CONFIG_PATH, GpioButtonInput, GpioPin,
-    LocalHttpCaptureClient, RDK_X5_GPIO_PINS, SysfsGpioPin, rdk_x5_board_pin_to_soc_gpio,
+    CaptureToggleClient, CharDevGpioPin, DEFAULT_BUTTON_CONFIG_PATH, GpioButtonInput, GpioPin,
+    LocalHttpCaptureClient, PlatformGpioPin, RDK_X5_GPIO_PINS, SysfsGpioPin,
+    rdk_x5_board_pin_to_soc_gpio, rdk_x5_soc_gpio_to_bank_offset,
 };
 pub use indicator::{
     DEFAULT_LEDS_SYSFS_ROOT, LedIo, LedPattern, SysfsLedController, SysfsLedIo, pattern_for_state,
@@ -77,6 +78,8 @@ pub trait ButtonInput: Send + Sync {
     fn poll_event(&self, timeout_ms: u64) -> HwResult<Option<ButtonEvent>>;
 
     fn disarm(&self) {}
+
+    fn enable_single_press_mode(&self) {}
 }
 
 pub trait IndicatorController: Send + Sync {

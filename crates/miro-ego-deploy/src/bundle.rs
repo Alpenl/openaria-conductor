@@ -1,10 +1,14 @@
-//! Native Miro-Ego release bundle verification (`miro-ego.rdk-x5-bundle.v1`), AArch64 ELF64
-//! validation, SHA-256 manifest verification, path-traversal/symlink rejection, and Backlog-ready
-//! CAS store (`StoreLayer`) & `/data/updates/` offline package (`OfflinePackageHook`) traits.
+//! Native Miro-Ego release bundle verification (`miro-ego.rdk-x5-bundle.v1`), detached Ed25519
+//! manifest signature verification (`bundle.json.sig`), AArch64 ELF64 validation, SHA-256
+//! manifest verification, path-traversal/symlink rejection, and Backlog-ready CAS store
+//! (`StoreLayer`) & `/data/updates/` offline package (`OfflinePackageHook`) traits.
 
 use crate::{DeployError, DeployResult};
 use miro_ego_core::ids::{hex_encode, is_valid_sha256, new_uuid_v4};
-use miro_ego_core::sys::fs::{fsync_directory, open_readonly_safe, read_bounded_json};
+use miro_ego_core::sys::fs::{
+    fsync_directory, open_readonly_safe, parse_strict_json_value, read_bounded_bytes,
+};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -14,10 +18,16 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_SCHEMA: &str = "miro-ego.rdk-x5-bundle.v1";
+pub const BUNDLE_SIGNATURE_FILENAME: &str = "bundle.json.sig";
+pub const BUNDLE_SIGNATURE_DOMAIN: &[u8] = b"miro-ego.rdk-x5-bundle-sig.v1\n";
+pub const DEFAULT_RELEASE_SIGNING_SEED_LABEL: &[u8] =
+    b"miro-ego-0.3.0-default-release-signing-seed";
 pub const TARGET_PLATFORM: &str = "linux_aarch64_rdk_x5_v1";
 pub const REQUIRED_BINARIES: &[&str] = &["bin/miro-ego", "bin/miro-ego-encoder"];
 pub const MAX_MANIFEST_BYTES: usize = 128 * 1024;
+pub const MAX_SIGNATURE_FILE_BYTES: usize = 256;
 pub const MAX_BUNDLE_FILES: usize = 256;
+pub const MAX_UPDATES_DIR_ENTRIES: usize = 256;
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_TOTAL_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -27,6 +37,135 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
+
+const fn hex_nibble_const(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+const fn parse_compile_time_pubkey_hex(raw: Option<&str>) -> Option<[u8; 32]> {
+    let Some(s) = raw else {
+        return None;
+    };
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    if end - start != 64 {
+        panic!("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX must be exactly 64 hex characters");
+    }
+    let mut out = [0u8; 32];
+    let mut idx = 0;
+    while idx < 32 {
+        let Some(hi) = hex_nibble_const(bytes[start + idx * 2]) else {
+            panic!("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX contains non-hex character");
+        };
+        let Some(lo) = hex_nibble_const(bytes[start + idx * 2 + 1]) else {
+            panic!("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX contains non-hex character");
+        };
+        out[idx] = (hi << 4) | lo;
+        idx += 1;
+    }
+    Some(out)
+}
+
+const COMPILED_RELEASE_PUBLIC_KEY: Option<[u8; 32]> =
+    parse_compile_time_pubkey_hex(option_env!("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX"));
+
+/// Derive the default deterministic 32-byte Ed25519 signing seed used when
+/// `MIRO_EGO_RELEASE_PUBLIC_KEY_HEX` is not overridden at compile time.
+pub fn default_release_signing_seed() -> [u8; 32] {
+    let digest = Sha256::digest(DEFAULT_RELEASE_SIGNING_SEED_LABEL);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(digest.as_slice());
+    seed
+}
+
+/// Return the compiled-in 32-byte Ed25519 trusted release public key.
+///
+/// Honors compile-time `MIRO_EGO_RELEASE_PUBLIC_KEY_HEX` when set; otherwise derives the public
+/// key from `Sha256::digest(b"miro-ego-0.3.0-default-release-signing-seed")`.
+pub fn default_release_public_key() -> [u8; 32] {
+    if let Some(pinned) = COMPILED_RELEASE_PUBLIC_KEY {
+        return pinned;
+    }
+    let seed = default_release_signing_seed();
+    let mut pubkey = [0u8; 32];
+    if let Ok(kp) = Ed25519KeyPair::from_seed_unchecked(&seed) {
+        let raw = kp.public_key().as_ref();
+        if raw.len() == 32 {
+            pubkey.copy_from_slice(raw);
+        }
+    }
+    pubkey
+}
+
+/// Sign exact `bundle.json` manifest bytes under domain `b"miro-ego.rdk-x5-bundle-sig.v1\n"`
+/// using a 32-byte Ed25519 seed, returning the 128-character lowercase hex signature string.
+pub fn sign_bundle_manifest_with_seed(manifest_bytes: &[u8], seed: &[u8; 32]) -> String {
+    let mut msg = Vec::with_capacity(BUNDLE_SIGNATURE_DOMAIN.len() + manifest_bytes.len());
+    msg.extend_from_slice(BUNDLE_SIGNATURE_DOMAIN);
+    msg.extend_from_slice(manifest_bytes);
+    match Ed25519KeyPair::from_seed_unchecked(seed) {
+        Ok(kp) => {
+            let sig = kp.sign(&msg);
+            hex_encode(sig.as_ref())
+        }
+        Err(_) => String::new(),
+    }
+}
+
+fn decode_signature_hex_strict(raw_sig_file: &[u8]) -> DeployResult<[u8; 64]> {
+    let text = std::str::from_utf8(raw_sig_file).map_err(|_| DeployError::InvalidBundle {
+        message: "bundle.json.sig is not valid ASCII/UTF-8".to_owned(),
+    })?;
+    let trimmed = text.trim_end_matches([' ', '\t', '\r', '\n']);
+    if trimmed.len() != 128
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(DeployError::InvalidBundle {
+            message: "bundle.json.sig must contain exactly 128 lowercase hex characters".to_owned(),
+        });
+    }
+    let hex_bytes = trimmed.as_bytes();
+    let mut sig = [0u8; 64];
+    for (idx, slot) in sig.iter_mut().enumerate() {
+        let hi = match hex_bytes[idx * 2] {
+            b @ b'0'..=b'9' => b - b'0',
+            b @ b'a'..=b'f' => b - b'a' + 10,
+            _ => {
+                return Err(DeployError::InvalidBundle {
+                    message: "invalid hex digit in bundle.json.sig".to_owned(),
+                });
+            }
+        };
+        let lo = match hex_bytes[idx * 2 + 1] {
+            b @ b'0'..=b'9' => b - b'0',
+            b @ b'a'..=b'f' => b - b'a' + 10,
+            _ => {
+                return Err(DeployError::InvalidBundle {
+                    message: "invalid hex digit in bundle.json.sig".to_owned(),
+                });
+            }
+        };
+        *slot = (hi << 4) | lo;
+    }
+    Ok(sig)
+}
 
 /// Single verified file entry declared inside `bundle.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,8 +391,19 @@ pub fn hash_file_safe(path: &Path) -> DeployResult<(u64, String, Vec<u8>)> {
     Ok((total, hex_encode(hasher.finalize().as_slice()), header))
 }
 
-/// Strictly verify a native Miro-Ego release bundle directory (`bundle.json`, binaries, assets).
+/// Strictly verify a native Miro-Ego release bundle directory against the compiled-in trusted
+/// Ed25519 release public key (`bundle.json.sig`, `bundle.json`, binaries, and assets).
 pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
+    let trusted_pubkey = default_release_public_key();
+    verify_bundle_dir_with_key(bundle_dir, &trusted_pubkey)
+}
+
+/// Strictly verify a native Miro-Ego release bundle directory against an explicit 32-byte
+/// Ed25519 `trusted_pubkey`.
+pub fn verify_bundle_dir_with_key(
+    bundle_dir: &Path,
+    trusted_pubkey: &[u8; 32],
+) -> DeployResult<VerifiedBundle> {
     let root_meta = fs::symlink_metadata(bundle_dir).map_err(|err| DeployError::InvalidBundle {
         message: format!("bundle path unavailable {}: {err}", bundle_dir.display()),
     })?;
@@ -263,11 +413,42 @@ pub fn verify_bundle_dir(bundle_dir: &Path) -> DeployResult<VerifiedBundle> {
         });
     }
 
-    let manifest_path = bundle_dir.join("bundle.json");
-    let (_, manifest_sha256, _) = hash_file_safe(&manifest_path)?;
-    let manifest: BundleManifest = read_bounded_json(&manifest_path, MAX_MANIFEST_BYTES, 16)
-        .map_err(|err| DeployError::InvalidBundle {
+    // Verify detached Ed25519 signature (`bundle.json.sig`) and read `bundle.json` ONCE into memory.
+    let sig_path = resolve_no_symlinks(bundle_dir, Path::new(BUNDLE_SIGNATURE_FILENAME))?;
+    let sig_raw = read_bounded_bytes(&sig_path, MAX_SIGNATURE_FILE_BYTES).map_err(|err| {
+        DeployError::InvalidBundle {
+            message: format!("invalid or unreadable {BUNDLE_SIGNATURE_FILENAME}: {err}"),
+        }
+    })?;
+    let signature_bytes = decode_signature_hex_strict(&sig_raw)?;
+
+    let manifest_path = resolve_no_symlinks(bundle_dir, Path::new("bundle.json"))?;
+    let manifest_bytes = read_bounded_bytes(&manifest_path, MAX_MANIFEST_BYTES).map_err(|err| {
+        DeployError::InvalidBundle {
+            message: format!("invalid or unreadable bundle.json: {err}"),
+        }
+    })?;
+
+    let mut signed_message =
+        Vec::with_capacity(BUNDLE_SIGNATURE_DOMAIN.len() + manifest_bytes.len());
+    signed_message.extend_from_slice(BUNDLE_SIGNATURE_DOMAIN);
+    signed_message.extend_from_slice(&manifest_bytes);
+
+    let verifier = UnparsedPublicKey::new(&ED25519, trusted_pubkey);
+    verifier
+        .verify(&signed_message, &signature_bytes)
+        .map_err(|_| DeployError::InvalidBundle {
+            message: "bundle.json.sig Ed25519 signature verification failed".to_owned(),
+        })?;
+
+    let manifest_sha256 = hex_encode(Sha256::digest(&manifest_bytes).as_slice());
+    let manifest_val =
+        parse_strict_json_value(&manifest_bytes, 16).map_err(|err| DeployError::InvalidBundle {
             message: format!("invalid bundle.json: {err}"),
+        })?;
+    let manifest: BundleManifest =
+        serde_json::from_value(manifest_val).map_err(|err| DeployError::InvalidBundle {
+            message: format!("invalid bundle.json schema: {err}"),
         })?;
 
     if manifest.schema != BUNDLE_SCHEMA {
@@ -410,6 +591,7 @@ pub fn copy_and_verify_safe(
             .write(true)
             .create_new(true)
             .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&tmp_path)
             .map_err(|err| DeployError::Failed {
                 message: format!(
@@ -568,6 +750,26 @@ fn verify_single_entry(
     Ok(())
 }
 
+/// Parse a `major.minor.patch` numeric prefix (tolerating `v` prefix and `-pre`/`+build` suffixes)
+/// for deterministic semantic version ordering.
+fn parse_semver_triplet(version: &str) -> Option<(u64, u64, u64, bool)> {
+    let trimmed = version.trim().strip_prefix('v').unwrap_or(version.trim());
+    let without_build = trimmed.split('+').next().unwrap_or(trimmed);
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((c, pre)) => (c, !pre.is_empty()),
+        None => (without_build, false),
+    };
+    let mut parts = core.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    let patch: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    // Stable release (`!prerelease` -> `true`) ranks above pre-release of the same triplet.
+    Some((major, minor, patch, !prerelease))
+}
+
 // ---------------------------------------------------------------------------
 // Backlog-Ready Extension Traits (CAS Incremental Store & /data/updates/ Hooks)
 // ---------------------------------------------------------------------------
@@ -649,7 +851,10 @@ pub struct DefaultOfflinePackageHook;
 
 impl OfflinePackageHook for DefaultOfflinePackageHook {
     fn discover_packages(&self, updates_dir: &Path) -> DeployResult<Vec<OfflinePackageDescriptor>> {
-        if !updates_dir.is_dir() {
+        let Ok(meta) = fs::symlink_metadata(updates_dir) else {
+            return Ok(Vec::new());
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return Ok(Vec::new());
         }
         let entries = fs::read_dir(updates_dir).map_err(|err| DeployError::Failed {
@@ -658,11 +863,17 @@ impl OfflinePackageHook for DefaultOfflinePackageHook {
                 updates_dir.display()
             ),
         })?;
+        let mut candidate_paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .take(MAX_UPDATES_DIR_ENTRIES)
+            .map(|e| e.path())
+            .collect();
+        candidate_paths.sort();
+
         let mut found = Vec::new();
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
+        for path in candidate_paths {
             if fs::symlink_metadata(&path)
-                .map(|m| m.file_type().is_dir())
+                .map(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
                 .unwrap_or(false)
                 && path.join("bundle.json").is_file()
             {
@@ -676,7 +887,16 @@ impl OfflinePackageHook for DefaultOfflinePackageHook {
                 }
             }
         }
-        found.sort_by(|a, b| a.commit.cmp(&b.commit));
+        // Sort highest parsed semver `(major, minor, patch)` first so callers selecting the
+        // first non-current candidate get the newest release, breaking ties by commit SHA.
+        found.sort_by(|a, b| {
+            let sem_a = parse_semver_triplet(&a.version);
+            let sem_b = parse_semver_triplet(&b.version);
+            sem_b
+                .cmp(&sem_a)
+                .then_with(|| b.version.cmp(&a.version))
+                .then_with(|| a.commit.cmp(&b.commit))
+        });
         Ok(found)
     }
 
@@ -701,6 +921,15 @@ pub(crate) mod test_support {
         let copy_len = tag.len().min(64);
         buf[64..64 + copy_len].copy_from_slice(&tag[..copy_len]);
         buf
+    }
+
+    pub fn write_signed_manifest(dir: &Path, manifest: &BundleManifest) {
+        let mut raw = serde_json::to_vec_pretty(manifest).unwrap();
+        raw.push(b'\n');
+        let seed = default_release_signing_seed();
+        let sig_hex = sign_bundle_manifest_with_seed(&raw, &seed);
+        fs::write(dir.join("bundle.json"), &raw).unwrap();
+        fs::write(dir.join(BUNDLE_SIGNATURE_FILENAME), format!("{sig_hex}\n")).unwrap();
     }
 
     pub fn build_valid_bundle(
@@ -756,15 +985,14 @@ pub(crate) mod test_support {
             binaries,
             assets: asset_entries,
         };
-        let raw = serde_json::to_vec_pretty(&manifest).unwrap();
-        fs::write(dir.join("bundle.json"), raw).unwrap();
+        write_signed_manifest(dir, &manifest);
         manifest
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{build_valid_bundle, fake_aarch64_elf};
+    use super::test_support::{build_valid_bundle, fake_aarch64_elf, write_signed_manifest};
     use super::*;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -830,7 +1058,7 @@ mod tests {
         let root = temp_dir("rejects");
         let commit = "b".repeat(40);
 
-        // 1. x86_64 ELF binary (e_machine = 62) must be rejected.
+        // 1. x86_64 ELF binary (e_machine = 62) must be rejected even with valid signature.
         let x86_dir = root.join("x86");
         build_valid_bundle(&x86_dir, "0.3.0", &commit, &[]);
         let mut x86_bin = fake_aarch64_elf(b"x86");
@@ -840,7 +1068,7 @@ mod tests {
             serde_json::from_slice(&fs::read(x86_dir.join("bundle.json")).unwrap()).unwrap();
         m.binaries[0].sha256 = hex_encode(Sha256::digest(&x86_bin).as_slice());
         m.binaries[0].bytes = x86_bin.len() as u64;
-        fs::write(x86_dir.join("bundle.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        write_signed_manifest(&x86_dir, &m);
         assert!(verify_bundle_dir(&x86_dir).is_err());
 
         // 2. Tampered binary (SHA mismatch) must be rejected.
@@ -865,6 +1093,95 @@ mod tests {
         assert!(validate_bundle_relative_path("/bin/miro-ego").is_err());
         assert!(validate_bundle_relative_path("wheels/app-0.1-py3-none-any.whl").is_err());
         assert!(validate_bundle_relative_path("runtime/bin/python3").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enforces_detached_ed25519_signature_and_semver_package_sorting() {
+        let root = temp_dir("ed25519-sig");
+        let commit_1 = "1".repeat(40);
+        let commit_2 = "2".repeat(40);
+        let commit_10 = "0".repeat(40); // lexicographically smallest commit, highest semver 0.3.10!
+
+        let b_031 = root.join("pkg-0.3.1");
+        let b_032 = root.join("pkg-0.3.2");
+        let b_0310 = root.join("pkg-0.3.10");
+        build_valid_bundle(&b_031, "0.3.1", &commit_1, &[]);
+        build_valid_bundle(&b_032, "0.3.2", &commit_2, &[]);
+        build_valid_bundle(&b_0310, "0.3.10", &commit_10, &[]);
+
+        // Semver sorting puts 0.3.10 first, then 0.3.2, then 0.3.1 regardless of commit SHA!
+        let discovered = DefaultOfflinePackageHook.discover_packages(&root).unwrap();
+        let versions: Vec<&str> = discovered.iter().map(|d| d.version.as_str()).collect();
+        assert_eq!(versions, vec!["0.3.10", "0.3.2", "0.3.1"]);
+
+        // 1. Missing bundle.json.sig fails closed with InvalidBundle.
+        let unsigned_dir = root.join("unsigned");
+        build_valid_bundle(&unsigned_dir, "0.3.0", &commit_1, &[]);
+        fs::remove_file(unsigned_dir.join(BUNDLE_SIGNATURE_FILENAME)).unwrap();
+        assert!(matches!(
+            verify_bundle_dir(&unsigned_dir),
+            Err(DeployError::InvalidBundle { .. })
+        ));
+
+        // 2. Tampered bundle.json (trailing space added) fails signature verification.
+        let tampered_manifest = root.join("tampered-manifest");
+        build_valid_bundle(&tampered_manifest, "0.3.0", &commit_1, &[]);
+        let mut raw_json = fs::read(tampered_manifest.join("bundle.json")).unwrap();
+        raw_json.push(b' ');
+        fs::write(tampered_manifest.join("bundle.json"), raw_json).unwrap();
+        assert!(matches!(
+            verify_bundle_dir(&tampered_manifest),
+            Err(DeployError::InvalidBundle { .. })
+        ));
+
+        // 3. Wrong public key fails verify_bundle_dir_with_key; custom seed + matching pubkey succeeds!
+        let custom_dir = root.join("custom-key");
+        build_valid_bundle(&custom_dir, "0.3.5", &commit_1, &[]);
+        let alt_seed: [u8; 32] = Sha256::digest(b"alternate-release-seed").into();
+        let alt_kp = Ed25519KeyPair::from_seed_unchecked(&alt_seed).unwrap();
+        let mut alt_pub = [0u8; 32];
+        alt_pub.copy_from_slice(alt_kp.public_key().as_ref());
+
+        // Default-signed bundle rejected under alt_pub:
+        assert!(verify_bundle_dir_with_key(&custom_dir, &alt_pub).is_err());
+
+        // Re-sign under alt_seed -> accepted under alt_pub, rejected under default key!
+        let raw_custom = fs::read(custom_dir.join("bundle.json")).unwrap();
+        let alt_sig = sign_bundle_manifest_with_seed(&raw_custom, &alt_seed);
+        assert_eq!(alt_sig.len(), 128);
+        fs::write(
+            custom_dir.join(BUNDLE_SIGNATURE_FILENAME),
+            format!("{alt_sig}\n"),
+        )
+        .unwrap();
+        assert!(verify_bundle_dir_with_key(&custom_dir, &alt_pub).is_ok());
+        assert!(verify_bundle_dir(&custom_dir).is_err());
+
+        // 4. Symlinked or >256B or uppercase signature files are rejected.
+        let bad_sig_dir = root.join("bad-sig");
+        build_valid_bundle(&bad_sig_dir, "0.3.0", &commit_1, &[]);
+        let valid_sig = fs::read_to_string(bad_sig_dir.join(BUNDLE_SIGNATURE_FILENAME)).unwrap();
+        fs::write(
+            bad_sig_dir.join(BUNDLE_SIGNATURE_FILENAME),
+            valid_sig.to_ascii_uppercase(),
+        )
+        .unwrap();
+        assert!(verify_bundle_dir(&bad_sig_dir).is_err());
+
+        fs::write(
+            bad_sig_dir.join(BUNDLE_SIGNATURE_FILENAME),
+            format!("{}{}", valid_sig.trim(), " ".repeat(200)),
+        )
+        .unwrap();
+        assert!(verify_bundle_dir(&bad_sig_dir).is_err());
+
+        let ext_sig = root.join("external.sig");
+        fs::write(&ext_sig, &valid_sig).unwrap();
+        fs::remove_file(bad_sig_dir.join(BUNDLE_SIGNATURE_FILENAME)).unwrap();
+        symlink(&ext_sig, bad_sig_dir.join(BUNDLE_SIGNATURE_FILENAME)).unwrap();
+        assert!(verify_bundle_dir(&bad_sig_dir).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

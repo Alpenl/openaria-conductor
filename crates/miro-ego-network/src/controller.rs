@@ -1,6 +1,10 @@
 //! Authoritative network controller, transaction state machine, rescue hotspot failover,
 //! watchdog-mode evaluator, and ephemeral single-use Wi-Fi credential store.
 
+use crate::clock::{
+    ClockStatusSnapshot, LinuxSystemClockBackend, SystemClockBackend, evaluate_clock_status,
+    execute_clock_sync,
+};
 use crate::mdns::{AVAHI_SERVICE_FILENAME, AvahiServiceRecord, DEFAULT_MDNS_PORT, MdnsScheme};
 use crate::nmcli::{
     DEFAULT_ACTIVATION_WAIT_SECS, DEFAULT_HOTSPOT_IPV4_CIDR, NmcliBackend, ObservedNetworkState,
@@ -22,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -77,7 +81,7 @@ pub fn compute_watchdog_mode(snapshot: &StateSnapshot) -> WatchdogMode {
         DesiredMode::EthernetDhcp => WatchdogMode::EthernetDhcp,
         DesiredMode::EthernetStatic => WatchdogMode::EthernetStatic,
         DesiredMode::WifiClient => {
-            if snapshot.transaction.current.is_some() {
+            if !snapshot.verified || snapshot.transaction.current.is_some() {
                 return WatchdogMode::Defer;
             }
             if let Some(latest) = &snapshot.transaction.latest {
@@ -266,7 +270,7 @@ pub struct MutationOutcome {
 }
 
 /// Configuration for [`AuthoritativeNetworkController`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControllerConfig {
     pub device_id: String,
     pub run_dir: PathBuf,
@@ -276,6 +280,23 @@ pub struct ControllerConfig {
     pub activation_wait_secs: u64,
     pub mdns_hostname: Option<String>,
     pub synchronous_mutations: bool,
+    pub clock_backend: Option<Arc<dyn SystemClockBackend>>,
+}
+
+impl fmt::Debug for ControllerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControllerConfig")
+            .field("device_id", &self.device_id)
+            .field("run_dir", &self.run_dir)
+            .field("avahi_dir", &self.avahi_dir)
+            .field("mdns_port", &self.mdns_port)
+            .field("mdns_scheme", &self.mdns_scheme)
+            .field("activation_wait_secs", &self.activation_wait_secs)
+            .field("mdns_hostname", &self.mdns_hostname)
+            .field("synchronous_mutations", &self.synchronous_mutations)
+            .field("has_custom_clock_backend", &self.clock_backend.is_some())
+            .finish()
+    }
 }
 
 impl ControllerConfig {
@@ -289,6 +310,7 @@ impl ControllerConfig {
             activation_wait_secs: DEFAULT_ACTIVATION_WAIT_SECS,
             mdns_hostname: None,
             synchronous_mutations: false,
+            clock_backend: None,
         }
     }
 
@@ -301,6 +323,11 @@ impl ControllerConfig {
 
     pub fn with_mdns_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.mdns_hostname = Some(hostname.into());
+        self
+    }
+
+    pub fn with_clock_backend(mut self, backend: Arc<dyn SystemClockBackend>) -> Self {
+        self.clock_backend = Some(backend);
         self
     }
 }
@@ -350,9 +377,35 @@ struct ControllerCore {
     backend: NmcliBackend,
     state: NetworkStateStore,
     credentials: EphemeralCredentialStore,
+    clock: Arc<dyn SystemClockBackend>,
+    clock_lock: Mutex<()>,
     config: ControllerConfig,
     rescue_info: Mutex<Option<RescueHotspotInfo>>,
     worker: Arc<WorkerSync>,
+}
+
+struct NetworkWorkerDropGuard {
+    core: Arc<ControllerCore>,
+    completed_cleanly: bool,
+}
+
+impl Drop for NetworkWorkerDropGuard {
+    fn drop(&mut self) {
+        if !self.completed_cleanly {
+            let _ = self
+                .core
+                .state
+                .recover_interrupted_transaction(false, utc_now_iso8601());
+        }
+        let mut wguard = self
+            .core
+            .worker
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        wguard.active = false;
+        self.core.worker.idle_cv.notify_all();
+    }
 }
 
 /// Authoritative privileged network controller coordinating `nmcli`, bounded state,
@@ -365,13 +418,19 @@ impl AuthoritativeNetworkController {
     pub fn new(
         backend: NmcliBackend,
         state: NetworkStateStore,
-        config: ControllerConfig,
+        mut config: ControllerConfig,
     ) -> NetworkResult<Self> {
+        let clock = config
+            .clock_backend
+            .take()
+            .unwrap_or_else(|| Arc::new(LinuxSystemClockBackend::new()));
         let controller = Self {
             core: Arc::new(ControllerCore {
                 backend,
                 state,
                 credentials: EphemeralCredentialStore::new(DEFAULT_CREDENTIAL_TTL_SECS),
+                clock,
+                clock_lock: Mutex::new(()),
                 config,
                 rescue_info: Mutex::new(None),
                 worker: WorkerSync::new(),
@@ -393,6 +452,36 @@ impl AuthoritativeNetworkController {
         &self.core.state
     }
 
+    /// Inspect privileged OS clock status (`adjtimex`, `boot_id`, `<run_dir>/clock-state.json`).
+    pub fn clock_status(&self) -> NetworkResult<ClockStatusSnapshot> {
+        let _guard = self
+            .core
+            .clock_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        evaluate_clock_status(self.core.clock.as_ref(), &self.core.config.run_dir)
+    }
+
+    /// Synchronize OS wall clock via `clock_settime(CLOCK_REALTIME)` and persist boot-bound
+    /// calibration state under `<run_dir>/clock-state.json`.
+    pub fn clock_sync(
+        &self,
+        unix_time_ms: u64,
+        replace: bool,
+    ) -> NetworkResult<ClockStatusSnapshot> {
+        let _guard = self
+            .core
+            .clock_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        execute_clock_sync(
+            self.core.clock.as_ref(),
+            &self.core.config.run_dir,
+            unix_time_ms,
+            replace,
+        )
+    }
+
     /// Reconcile interrupted transactions and active NetworkManager links on startup.
     ///
     /// Executed under `network-operation.lock`:
@@ -400,12 +489,14 @@ impl AuthoritativeNetworkController {
     ///    terminal `Rescued` (after bringing up the rescue AP) or `Failed` (`current = None`).
     /// 2. Otherwise reconciles links to match `state.desired.mode`:
     ///    - `WifiClient`: activates `lkg_wifi_profile` when verified/available, falling back
-    ///      automatically to the rescue hotspot if absent, rescued/failed, or unreachable.
+    ///      automatically to the rescue hotspot (marking `verified = false`) if absent,
+    ///      rescued/failed, or unreachable.
     ///    - `Hotspot`: ensures the rescue hotspot is active on `wlan0`.
-    ///    - `EthernetDhcp` / `EthernetStatic`: activates `lkg_ethernet_profile` if present.
+    ///    - `EthernetDhcp` / `EthernetStatic`: activates `lkg_ethernet_profile` if healthy and
+    ///      present, falling back automatically to the rescue hotspot if missing or unreachable.
     pub fn reconcile_startup(&self) -> NetworkResult<()> {
         let _lock = self.core.acquire_op_lock()?;
-        let info = self.core.ensure_rescue_hotspot_locked(true)?;
+        let _info = self.core.ensure_rescue_hotspot_locked(true)?;
         let full = self.core.state.full_state()?;
 
         if full.transaction.current.is_some() {
@@ -418,90 +509,123 @@ impl AuthoritativeNetworkController {
             return rescue_res;
         }
 
+        let latest_unhealthy = full.transaction.latest.as_ref().is_some_and(|tx| {
+            matches!(
+                tx.status,
+                TransactionStatus::Rescued | TransactionStatus::Failed
+            )
+        });
+
         match full.desired.mode {
             DesiredMode::Hotspot => self.core.activate_rescue_hotspot_locked(),
             DesiredMode::WifiClient => {
-                let latest_unhealthy = full.transaction.latest.as_ref().is_some_and(|tx| {
-                    matches!(
-                        tx.status,
-                        TransactionStatus::Rescued | TransactionStatus::Failed
-                    )
-                });
-                if latest_unhealthy {
-                    return self.core.activate_rescue_hotspot_locked();
-                }
-
-                if let (Some(lkg_profile), Some(wifi)) =
-                    (&full.lkg_wifi_profile, &full.desired.wifi_client)
-                {
-                    if self.core.backend.profile_path(lkg_profile).is_file() {
-                        let spec = ProfileSpec::WifiClient {
-                            ssid: wifi.ssid.clone(),
-                            security: wifi.security,
-                            psk: None,
-                        };
-                        let connected_ok = self
-                            .core
-                            .backend
-                            .activate_connection(
-                                lkg_profile,
-                                self.core.backend.wifi_interface(),
-                                self.core.config.activation_wait_secs,
-                                true,
-                            )
-                            .and_then(|()| {
-                                self.core
-                                    .backend
-                                    .verify_activated_profile(lkg_profile, &spec)
-                                    .map(|_| ())
-                            });
-                        if connected_ok.is_ok() {
-                            return Ok(());
+                if !latest_unhealthy {
+                    if let (Some(lkg_profile), Some(wifi)) =
+                        (&full.lkg_wifi_profile, &full.desired.wifi_client)
+                    {
+                        if self.core.backend.profile_path(lkg_profile).is_file() {
+                            let spec = ProfileSpec::WifiClient {
+                                ssid: wifi.ssid.clone(),
+                                security: wifi.security,
+                                psk: None,
+                            };
+                            let connected_ok = self
+                                .core
+                                .backend
+                                .activate_connection(
+                                    lkg_profile,
+                                    self.core.backend.wifi_interface(),
+                                    self.core.config.activation_wait_secs,
+                                    true,
+                                )
+                                .and_then(|()| {
+                                    self.core
+                                        .backend
+                                        .verify_activated_profile(lkg_profile, &spec)
+                                        .map(|_| ())
+                                });
+                            if connected_ok.is_ok() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
+                let _ = self.core.state.set_verified(false);
                 self.core.activate_rescue_hotspot_locked()
             }
             DesiredMode::EthernetDhcp => {
-                if let Some(lkg_eth) = &full.lkg_ethernet_profile {
-                    if self.core.backend.profile_path(lkg_eth).is_file() {
-                        self.core.backend.activate_connection(
-                            lkg_eth,
-                            self.core.backend.ethernet_interface(),
-                            self.core.config.activation_wait_secs,
-                            false,
-                        )?;
-                        let _ = self
-                            .core
-                            .backend
-                            .verify_activated_profile(lkg_eth, &ProfileSpec::EthernetDhcp)?;
+                if !latest_unhealthy {
+                    if let Some(lkg_eth) = &full.lkg_ethernet_profile {
+                        if self.core.backend.profile_path(lkg_eth).is_file() {
+                            let connected_ok = self
+                                .core
+                                .backend
+                                .activate_connection(
+                                    lkg_eth,
+                                    self.core.backend.ethernet_interface(),
+                                    self.core.config.activation_wait_secs,
+                                    false,
+                                )
+                                .and_then(|()| {
+                                    self.core
+                                        .backend
+                                        .verify_activated_profile(
+                                            lkg_eth,
+                                            &ProfileSpec::EthernetDhcp,
+                                        )
+                                        .map(|_| ())
+                                });
+                            if connected_ok.is_ok() {
+                                let _ = self
+                                    .core
+                                    .backend
+                                    .disconnect_device(self.core.backend.wifi_interface());
+                                return Ok(());
+                            }
+                        }
                     }
                 }
-                let _ = info;
-                Ok(())
+                let _ = self.core.state.set_verified(false);
+                self.core.activate_rescue_hotspot_locked()
             }
             DesiredMode::EthernetStatic => {
-                if let (Some(lkg_eth), Some(cfg)) = (
-                    &full.lkg_ethernet_profile,
-                    full.desired
-                        .ethernet
-                        .as_ref()
-                        .and_then(|e| e.static_ipv4.clone()),
-                ) {
-                    if self.core.backend.profile_path(lkg_eth).is_file() {
-                        self.core.backend.activate_connection(
-                            lkg_eth,
-                            self.core.backend.ethernet_interface(),
-                            self.core.config.activation_wait_secs,
-                            false,
-                        )?;
-                        let _ = self
-                            .core
-                            .backend
-                            .verify_activated_profile(lkg_eth, &ProfileSpec::EthernetStatic(cfg))?;
+                if !latest_unhealthy {
+                    if let (Some(lkg_eth), Some(cfg)) = (
+                        &full.lkg_ethernet_profile,
+                        full.desired
+                            .ethernet
+                            .as_ref()
+                            .and_then(|e| e.static_ipv4.clone()),
+                    ) {
+                        if self.core.backend.profile_path(lkg_eth).is_file() {
+                            let spec = ProfileSpec::EthernetStatic(cfg);
+                            let connected_ok = self
+                                .core
+                                .backend
+                                .activate_connection(
+                                    lkg_eth,
+                                    self.core.backend.ethernet_interface(),
+                                    self.core.config.activation_wait_secs,
+                                    false,
+                                )
+                                .and_then(|()| {
+                                    self.core
+                                        .backend
+                                        .verify_activated_profile(lkg_eth, &spec)
+                                        .map(|_| ())
+                                });
+                            if connected_ok.is_ok() {
+                                let _ = self
+                                    .core
+                                    .backend
+                                    .disconnect_device(self.core.backend.wifi_interface());
+                                return Ok(());
+                            }
+                        }
                     }
                 }
-                Ok(())
+                let _ = self.core.state.set_verified(false);
+                self.core.activate_rescue_hotspot_locked()
             }
         }
     }
@@ -619,7 +743,11 @@ impl AuthoritativeNetworkController {
     /// Return the `watchdog-mode` decision for `miro-ego-wifi-watchdog`.
     pub fn watchdog_mode(&self) -> NetworkResult<WatchdogMode> {
         let snap = self.core.state.snapshot()?;
-        Ok(compute_watchdog_mode(&snap))
+        let mode = compute_watchdog_mode(&snap);
+        if mode == WatchdogMode::WifiClient && self.core.is_rescue_hotspot_active_on_wlan() {
+            return Ok(WatchdogMode::Defer);
+        }
+        Ok(mode)
     }
 
     /// Scan Wi-Fi networks while holding a shared `network-operation.lock` across the scan,
@@ -693,9 +821,10 @@ impl AuthoritativeNetworkController {
             )
         });
 
-        // Write candidate profile before accepting the transaction so validation errors fail fast.
+        // Stage candidate profile with autoconnect=false before accepting the transaction so
+        // validation errors fail fast and unverified Ethernet candidates never auto-activate.
         if let (Some(profile), Some(spec)) = (&candidate_profile, &maybe_spec) {
-            self.core.backend.write_profile(profile, spec)?;
+            self.core.backend.write_profile_staged(profile, spec)?;
             if let Err(err) = self.core.write_avahi_if_configured() {
                 let _ = self.core.backend.delete_connection(profile);
                 return Err(err);
@@ -954,21 +1083,27 @@ impl AuthoritativeNetworkController {
             .name("miro-ego-net-tx".to_owned())
             .spawn(move || {
                 let _held_lock = lock_guard;
-                // Wait briefly (up to 30ms) for the RPC server to flush the 202 Accepted reply
-                // before tearing down wlan0 AP, with a bounded timeout so non-RPC callers never hang.
-                if let Ok(wguard) = core_clone.worker.state.lock() {
+                let mut worker_guard = NetworkWorkerDropGuard {
+                    core: Arc::clone(&core_clone),
+                    completed_cleanly: false,
+                };
+                // Wait up to 500ms for the HTTP gateway to flush the 202 Accepted reply over
+                // wlan0 before tearing down the AP (woken early by `notify_response_flushed`).
+                {
+                    let wguard = core_clone
+                        .worker
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     if !wguard.response_flushed {
                         let _ = core_clone
                             .worker
                             .response_flushed_cv
-                            .wait_timeout(wguard, Duration::from_millis(30));
+                            .wait_timeout(wguard, Duration::from_millis(500));
                     }
                 }
                 let _ = core_clone.run_task(task);
-                if let Ok(mut wguard) = core_clone.worker.state.lock() {
-                    wguard.active = false;
-                    core_clone.worker.idle_cv.notify_all();
-                }
+                worker_guard.completed_cleanly = true;
             });
 
         match spawn_res {
@@ -1016,8 +1151,28 @@ impl Drop for AuthoritativeNetworkController {
 
 impl ControllerCore {
     fn is_busy(&self) -> NetworkResult<bool> {
-        let worker_busy = self.worker.state.lock().map(|g| g.active).unwrap_or(false);
+        let worker_busy = self
+            .worker
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active;
         Ok(worker_busy || self.state.has_active_transaction()?)
+    }
+
+    fn is_rescue_hotspot_active_on_wlan(&self) -> bool {
+        let Ok(wlan) = self.backend.inspect_device(self.backend.wifi_interface()) else {
+            return false;
+        };
+        wlan.connected
+            && (wlan
+                .connection
+                .as_deref()
+                .is_some_and(|c| c.contains("hotspot"))
+                || wlan
+                    .ipv4_addresses
+                    .iter()
+                    .any(|a| a == DEFAULT_HOTSPOT_IPV4_CIDR))
     }
 
     fn ensure_rescue_hotspot_locked(
@@ -1362,6 +1517,11 @@ impl ControllerCore {
                     self.state
                         .set_lkg_profile(true, Some(profile_name.to_owned()))?;
                 } else {
+                    self.backend
+                        .promote_profile_autoconnect(profile_name, spec)?;
+                    let _ = self
+                        .backend
+                        .disconnect_device(self.backend.wifi_interface());
                     if let Some(existing_wifi) = self
                         .state
                         .full_state()
@@ -1429,6 +1589,20 @@ impl ControllerCore {
         );
 
         let rescued = self.activate_rescue_hotspot_locked().is_ok();
+        let mut keep = HashSet::new();
+        if let Ok(full) = self.state.full_state() {
+            if let Some(lkg_wifi) = full.lkg_wifi_profile {
+                keep.insert(lkg_wifi);
+            }
+            if let Some(lkg_eth) = full.lkg_ethernet_profile {
+                keep.insert(lkg_eth);
+            }
+        }
+        if let Some(ref cand) = retained {
+            keep.insert(cand.profile_name.clone());
+        }
+        let _ = self.backend.prune_managed_profiles(&keep);
+
         let (status, stage, recovery_action) = if rescued {
             (
                 TransactionStatus::Rescued,
@@ -1584,13 +1758,62 @@ impl ControllerCore {
     }
 
     fn write_avahi_if_configured(&self) -> NetworkResult<()> {
-        if let Some(dir) = &self.config.avahi_dir {
-            let record =
-                AvahiServiceRecord::standard(self.config.mdns_port, self.config.mdns_scheme);
-            record.write_atomic(&dir.join(AVAHI_SERVICE_FILENAME))?;
+        let Some(dir) = &self.config.avahi_dir else {
+            return Ok(());
+        };
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    eprintln!(
+                        "miro-ego-network: skipping Avahi write because {} is not a directory",
+                        dir.display()
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) if is_skippable_avahi_io_error(&err) => {
+                eprintln!(
+                    "miro-ego-network: skipping Avahi write at {} ({err})",
+                    dir.display()
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(NetworkError::Backend {
+                    message: format!("failed to inspect Avahi directory {}: {err}", dir.display()),
+                });
+            }
         }
-        Ok(())
+
+        let record = AvahiServiceRecord::standard(self.config.mdns_port, self.config.mdns_scheme);
+        let xml = record.render_xml()?;
+        let target = dir.join(AVAHI_SERVICE_FILENAME);
+        match miro_ego_core::sys::fs::write_bytes_atomic(&target, xml.as_bytes(), 0o644, true) {
+            Ok(()) => Ok(()),
+            Err(err) if is_skippable_avahi_io_error(&err) => {
+                eprintln!(
+                    "miro-ego-network: skipping Avahi write at {} ({err})",
+                    target.display()
+                );
+                Ok(())
+            }
+            Err(err) => Err(NetworkError::Backend {
+                message: format!("failed to write Avahi service {}: {err}", target.display()),
+            }),
+        }
     }
+}
+
+fn is_skippable_avahi_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::ReadOnlyFilesystem
+    ) || matches!(
+        err.raw_os_error(),
+        Some(libc::ENOENT | libc::EACCES | libc::EPERM | libc::EROFS)
+    )
 }
 
 fn validate_apply_input_shape(input: &ApplyDesiredState) -> NetworkResult<()> {
@@ -2441,18 +2664,96 @@ mod tests {
         let settled = ctrl.wait_for_idle(Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(settled.status, TransactionStatus::Committed);
 
-        // Simulate reboot in WifiClient mode when upstream router is down -> falls back to rescue AP!
+        // Simulate reboot in WifiClient mode when upstream router is down -> falls back to rescue AP,
+        // marks verified=false, and defers wifi-watchdog!
         drop(ctrl);
         let mock_down = MockNmcli::new(true);
         let backend2 = NmcliBackend::new(mock_down, root.join("profiles"), "wlan0", "eth0");
         let state2 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let mut cfg2 = ControllerConfig::new("rdk-x5-crash", root.join("run"));
+        // Non-existent Avahi directory must gracefully skip without failing startup!
+        cfg2.avahi_dir = Some(root.join("missing-etc-avahi-services"));
+        let ctrl2 = AuthoritativeNetworkController::new(backend2, state2, cfg2).unwrap();
+        assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
+        assert!(!ctrl2.controller_status().unwrap().verified);
+        assert_eq!(ctrl2.watchdog_mode().unwrap(), WatchdogMode::Defer);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ethernet_stages_autoconnect_false_disconnects_wlan_on_commit_and_falls_back_on_boot() {
+        let root = temp_root("eth-stage-boot");
+        let state_path = root.join("network-state.json");
+        let mock = MockNmcli::new(true);
+        let backend = NmcliBackend::new(mock.clone(), root.join("profiles"), "wlan0", "eth0");
+        let state = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let cfg = ControllerConfig::new("rdk-x5-eth-boot", root.join("run"))
+            .with_synchronous_mutations(true);
+        let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
+
+        // 1. Failed EthernetDhcp apply leaves retained candidate with autoconnect=false!
+        let failed = ctrl
+            .apply(
+                "client-eth",
+                "idem-eth-fail",
+                &ApplyDesiredState {
+                    mode: DesiredMode::EthernetDhcp,
+                    wifi_client: None,
+                    ethernet: Some(DesiredEthernet {
+                        addressing: EthernetAddressing::Dhcp,
+                        static_ipv4: None,
+                    }),
+                },
+            )
+            .unwrap();
+        assert_eq!(failed.final_status, TransactionStatus::Rescued);
+        let retained_prof = ctrl
+            .state_store()
+            .full_state()
+            .unwrap()
+            .retained_candidate
+            .unwrap()
+            .profile_name;
+        let staged_txt = fs::read_to_string(ctrl.backend().profile_path(&retained_prof)).unwrap();
+        assert!(
+            staged_txt.contains("autoconnect=false"),
+            "unverified Ethernet candidate must remain autoconnect=false"
+        );
+
+        // 2. Retry succeeds -> promotes Ethernet profile to autoconnect=true and disconnects wlan0!
+        mock.inner.lock().unwrap().fail_client_activation = false;
+        let retried = ctrl
+            .retry(
+                "client-eth",
+                "idem-eth-retry",
+                &failed.receipt.transaction.transaction_id,
+            )
+            .unwrap();
+        assert_eq!(retried.final_status, TransactionStatus::Committed);
+        let promoted_txt = fs::read_to_string(ctrl.backend().profile_path(&retained_prof)).unwrap();
+        assert!(
+            promoted_txt.contains("autoconnect=true"),
+            "verified Ethernet LKG profile must be promoted to autoconnect=true"
+        );
+        assert!(
+            mock.inner.lock().unwrap().active_wlan_profile.is_none(),
+            "committing Ethernet mode must disconnect wlan0"
+        );
+
+        // 3. Reboot with eth0 cable unplugged -> reconcile_startup falls back to rescue hotspot!
+        drop(ctrl);
+        let mock_unplugged = MockNmcli::new(true);
+        let backend2 = NmcliBackend::new(mock_unplugged, root.join("profiles"), "wlan0", "eth0");
+        let state2 = NetworkStateStore::open_or_init(&state_path).unwrap();
         let ctrl2 = AuthoritativeNetworkController::new(
             backend2,
             state2,
-            ControllerConfig::new("rdk-x5-crash", root.join("run")),
+            ControllerConfig::new("rdk-x5-eth-boot", root.join("run")),
         )
         .unwrap();
         assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
+        assert!(!ctrl2.controller_status().unwrap().verified);
 
         fs::remove_dir_all(root).unwrap();
     }

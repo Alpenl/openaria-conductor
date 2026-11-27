@@ -2,35 +2,46 @@
 //!
 //! Enables the unprivileged `miro-ego.service` API daemon (`User=miro-ego`, `NoNewPrivileges=yes`)
 //! to trigger real privileged root `ReleaseManager` A/B updates and rollbacks while tracking
-//! `FirmwareTaskSnapshot` progress (`accepted` -> `running` -> `succeeded` / `failed`).
+//! `FirmwareTaskSnapshot` progress (`accepted` -> `running` -> `succeeded` / `failed`), persisting
+//! bounded idempotency & task state to `<state_root>/firmware-task.json`, enforcing
+//! `allowed_updates_root` (`/data/updates`), and supporting clean idle auto-exit.
 
 use crate::bundle::{validate_commit_sha, verify_bundle_dir};
 use crate::manager::{DeploymentStatus, ReleaseManager};
 use crate::{DeployError, DeployResult};
-use miro_ego_core::ids::new_uuid_v4;
-use miro_ego_core::locks::{LockMode, acquire_flock, acquire_maintenance_lock};
+use miro_ego_core::ids::{hex_encode, new_uuid_v4};
+use miro_ego_core::locks::{FlockGuard, LockMode, acquire_flock, acquire_maintenance_lock};
+use miro_ego_core::sys::fs::{read_bounded_json, write_bytes_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_DEPLOY_SOCKET_PATH: &str = "/run/miro-ego/deploy-control.sock";
+pub const DEFAULT_ALLOWED_UPDATES_ROOT: &str = "/data/updates";
 pub const DEPLOY_REQUEST_SCHEMA: &str = "miro-ego.deploy-control-request.v1";
 pub const DEPLOY_RESPONSE_SCHEMA: &str = "miro-ego.deploy-control-response.v1";
+pub const FIRMWARE_TASK_STATE_SCHEMA: &str = "miro-ego.firmware-task-state.v1";
 pub const MAX_DEPLOY_RPC_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_DEPLOY_TASK_STATE_BYTES: usize = 256 * 1024;
+pub const MAX_DEPLOY_IDEMPOTENCY_ENTRIES: usize = 256;
 pub const DEFAULT_DEPLOY_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DEPLOY_SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DEPLOY_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_DEPLOY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_DEPLOY_MAX_CONNS: usize = 8;
+
+static DEPLOY_UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Firmware task action matching OpenAPI `FirmwareTask.action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +79,13 @@ pub struct FirmwareTaskSnapshot {
     pub finished_at: Option<u64>,
 }
 
+/// Outcome of an idempotent `install` or `rollback` RPC request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployMutationOutcome {
+    pub task: FirmwareTaskSnapshot,
+    pub replayed: bool,
+}
+
 /// Combined deployment + task status returned by `DeployRpcClient::status()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployControlStatus {
@@ -80,6 +98,12 @@ pub struct DeployControlStatus {
 pub struct DeployRpcRequest {
     pub schema: String,
     pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
 }
@@ -103,6 +127,8 @@ pub struct DeployRpcResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<DeployRpcErrorBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
@@ -116,6 +142,7 @@ impl DeployRpcResponse {
             operation: Some(operation.to_owned()),
             status: Some(status),
             body: Some(body),
+            replayed: None,
             error: None,
             retryable: None,
         }
@@ -133,6 +160,7 @@ impl DeployRpcResponse {
             operation: operation.map(str::to_owned),
             status: None,
             body: None,
+            replayed: None,
             error: Some(DeployRpcErrorBody {
                 code: code.into(),
                 message: message.into(),
@@ -149,7 +177,12 @@ pub struct DeployRpcServerConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub max_concurrent_connections: usize,
+    pub allowed_updates_root: PathBuf,
+    pub idle_timeout: Option<Duration>,
 }
+
+/// Alias matching [`DeployRpcServerConfig`].
+pub type DeployRpcConfig = DeployRpcServerConfig;
 
 impl Default for DeployRpcServerConfig {
     fn default() -> Self {
@@ -158,6 +191,46 @@ impl Default for DeployRpcServerConfig {
             read_timeout: DEFAULT_DEPLOY_SERVER_READ_TIMEOUT,
             write_timeout: DEFAULT_DEPLOY_SERVER_WRITE_TIMEOUT,
             max_concurrent_connections: DEFAULT_DEPLOY_MAX_CONNS,
+            allowed_updates_root: PathBuf::from(DEFAULT_ALLOWED_UPDATES_ROOT),
+            idle_timeout: None,
+        }
+    }
+}
+
+impl DeployRpcServerConfig {
+    pub fn with_allowed_updates_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.allowed_updates_root = root.into();
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedDeployIdempotencyEntry {
+    scope: String,
+    request_hash: String,
+    recorded_at: u64,
+    task: FirmwareTaskSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedFirmwareTaskState {
+    schema: String,
+    latest_task: Option<FirmwareTaskSnapshot>,
+    #[serde(default)]
+    idempotency: Vec<PersistedDeployIdempotencyEntry>,
+}
+
+impl Default for PersistedFirmwareTaskState {
+    fn default() -> Self {
+        Self {
+            schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+            latest_task: None,
+            idempotency: Vec::new(),
         }
     }
 }
@@ -166,49 +239,146 @@ struct TaskState {
     active: bool,
     response_flushed: bool,
     latest_task: Option<FirmwareTaskSnapshot>,
+    idempotency: Vec<PersistedDeployIdempotencyEntry>,
     worker_handle: Option<JoinHandle<()>>,
+}
+
+struct ActiveTaskDropGuard {
+    coord: Arc<DeployTaskCoordinator>,
+    task_id: String,
+    completed_cleanly: bool,
+}
+
+impl Drop for ActiveTaskDropGuard {
+    fn drop(&mut self) {
+        if self.completed_cleanly {
+            return;
+        }
+        let finished_at = unix_now_secs();
+        let mut guard = self
+            .coord
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(cur) = guard.latest_task.as_mut() {
+            if cur.id == self.task_id && !cur.status.is_terminal() {
+                cur.status = FirmwareTaskStatus::Failed;
+                cur.message = "deploy worker terminated unexpectedly".to_owned();
+                cur.finished_at = Some(finished_at);
+            }
+        }
+        if let Some(snapshot) = guard.latest_task.clone() {
+            for entry in &mut guard.idempotency {
+                if entry.task.id == snapshot.id {
+                    entry.task = snapshot.clone();
+                }
+            }
+        }
+        guard.active = false;
+        let persisted = PersistedFirmwareTaskState {
+            schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+            latest_task: guard.latest_task.clone(),
+            idempotency: guard.idempotency.clone(),
+        };
+        drop(guard);
+        let _ = self.coord.persist_task_state(&persisted);
+        self.coord.bump_activity();
+        self.coord.idle_cv.notify_all();
+    }
+}
+
+struct ActiveConnDropGuard {
+    counter: Arc<AtomicUsize>,
+    coord: Arc<DeployTaskCoordinator>,
+}
+
+impl Drop for ActiveConnDropGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+        self.coord.bump_activity();
+        self.coord.idle_cv.notify_all();
+    }
 }
 
 struct DeployTaskCoordinator {
     manager: Arc<ReleaseManager>,
+    allowed_updates_root: PathBuf,
     state: Mutex<TaskState>,
     idle_cv: Condvar,
     flushed_cv: Condvar,
+    last_activity_mono_ns: AtomicU64,
 }
 
 impl DeployTaskCoordinator {
-    fn new(manager: Arc<ReleaseManager>) -> Arc<Self> {
+    fn new(manager: Arc<ReleaseManager>, allowed_updates_root: PathBuf) -> Arc<Self> {
+        let initial = load_initial_task_state(&manager);
+        let now_ns = monotonic_now_ns();
         Arc::new(Self {
             manager,
+            allowed_updates_root,
             state: Mutex::new(TaskState {
                 active: false,
                 response_flushed: false,
-                latest_task: None,
+                latest_task: initial.latest_task,
+                idempotency: initial.idempotency,
                 worker_handle: None,
             }),
             idle_cv: Condvar::new(),
             flushed_cv: Condvar::new(),
+            last_activity_mono_ns: AtomicU64::new(now_ns),
         })
     }
 
+    fn task_state_path(&self) -> PathBuf {
+        self.manager.paths().firmware_task_file()
+    }
+
+    fn persist_task_state(&self, state: &PersistedFirmwareTaskState) -> DeployResult<()> {
+        let path = self.task_state_path();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
+                    message: format!("failed creating state dir {}: {err}", parent.display()),
+                })?;
+            }
+        }
+        let mut raw = serde_json::to_vec_pretty(state).map_err(|err| DeployError::Failed {
+            message: format!("failed serializing firmware-task.json: {err}"),
+        })?;
+        raw.push(b'\n');
+        write_bytes_atomic(&path, &raw, 0o600, true).map_err(|err| DeployError::Failed {
+            message: format!("failed writing {}: {err}", path.display()),
+        })
+    }
+
+    fn bump_activity(&self) {
+        self.last_activity_mono_ns
+            .store(monotonic_now_ns(), Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active
+    }
+
     fn status(&self) -> DeployResult<DeployControlStatus> {
+        self.bump_activity();
         let deployment = self.manager.status()?;
         let task = self
             .state
             .lock()
-            .map_err(|_| DeployError::Failed {
-                message: "deploy task mutex poisoned".to_owned(),
-            })?
+            .unwrap_or_else(PoisonError::into_inner)
             .latest_task
             .clone();
         Ok(DeployControlStatus { deployment, task })
     }
 
     fn notify_response_flushed(&self) {
-        if let Ok(mut guard) = self.state.lock() {
-            guard.response_flushed = true;
-            self.flushed_cv.notify_all();
-        }
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.response_flushed = true;
+        self.flushed_cv.notify_all();
     }
 
     fn wait_for_idle(&self, timeout: Duration) -> DeployResult<Option<FirmwareTaskSnapshot>> {
@@ -216,9 +386,7 @@ impl DeployTaskCoordinator {
         let deadline = Instant::now() + timeout;
         let mut join_target = None;
         let snapshot = {
-            let mut guard = self.state.lock().map_err(|_| DeployError::Failed {
-                message: "deploy task mutex poisoned".to_owned(),
-            })?;
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             while guard.active {
                 let now = Instant::now();
                 if now >= deadline {
@@ -227,11 +395,10 @@ impl DeployTaskCoordinator {
                     });
                 }
                 let wait_dur = deadline.saturating_duration_since(now);
-                let (next, _) = self.idle_cv.wait_timeout(guard, wait_dur).map_err(|_| {
-                    DeployError::Failed {
-                        message: "deploy task condvar poisoned".to_owned(),
-                    }
-                })?;
+                let (next, _) = self
+                    .idle_cv
+                    .wait_timeout(guard, wait_dur)
+                    .unwrap_or_else(PoisonError::into_inner);
                 guard = next;
             }
             if guard
@@ -249,14 +416,14 @@ impl DeployTaskCoordinator {
         Ok(snapshot)
     }
 
-    fn probe_locks_available(&self) -> DeployResult<()> {
+    fn acquire_task_locks(&self) -> DeployResult<(FlockGuard, FlockGuard)> {
         fs::create_dir_all(&self.manager.paths().run_dir).map_err(|err| DeployError::Failed {
             message: format!(
                 "failed creating run dir {}: {err}",
                 self.manager.paths().run_dir.display()
             ),
         })?;
-        let _deploy = acquire_flock(
+        let deploy = acquire_flock(
             self.manager.paths().deployment_lock_file(),
             LockMode::Exclusive,
             true,
@@ -267,7 +434,7 @@ impl DeployTaskCoordinator {
             },
             other => DeployError::Core(other),
         })?;
-        let _maint =
+        let maint =
             acquire_maintenance_lock(&self.manager.paths().run_dir, LockMode::Exclusive, true)
                 .map_err(|err| match err {
                     miro_ego_core::CoreError::LockBusy { message } => DeployError::Blocked {
@@ -275,7 +442,32 @@ impl DeployTaskCoordinator {
                     },
                     other => DeployError::Core(other),
                 })?;
-        Ok(())
+        Ok((deploy, maint))
+    }
+
+    fn check_idempotency_replay(
+        &self,
+        scope: &str,
+        request_hash: &str,
+    ) -> DeployResult<Option<FirmwareTaskSnapshot>> {
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = guard.idempotency.iter().find(|e| e.scope == scope) {
+            if entry.request_hash != request_hash {
+                return Err(DeployError::Blocked {
+                    message:
+                        "idempotency_conflict: idempotency_key reused with different firmware payload"
+                            .to_owned(),
+                });
+            }
+            let current = guard
+                .latest_task
+                .as_ref()
+                .filter(|t| t.id == entry.task.id)
+                .cloned()
+                .unwrap_or_else(|| entry.task.clone());
+            return Ok(Some(current));
+        }
+        Ok(None)
     }
 
     fn start_install(
@@ -283,19 +475,31 @@ impl DeployTaskCoordinator {
         bundle_dir: PathBuf,
         expected_commit: String,
         activate: bool,
-    ) -> DeployResult<FirmwareTaskSnapshot> {
+        idem_meta: Option<(String, String)>,
+    ) -> DeployResult<DeployMutationOutcome> {
+        self.bump_activity();
         validate_commit_sha(&expected_commit)?;
+
+        if let Some((ref scope, ref req_hash)) = idem_meta {
+            if let Some(replayed_task) = self.check_idempotency_replay(scope, req_hash)? {
+                return Ok(DeployMutationOutcome {
+                    task: replayed_task,
+                    replayed: true,
+                });
+            }
+        }
+
+        validate_bundle_under_updates_root(&self.allowed_updates_root, &bundle_dir)?;
+
         {
-            let guard = self.state.lock().map_err(|_| DeployError::Failed {
-                message: "deploy task mutex poisoned".to_owned(),
-            })?;
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if guard.active {
                 return Err(DeployError::Blocked {
                     message: "deployment_busy: another firmware task is already active".to_owned(),
                 });
             }
         }
-        self.probe_locks_available()?;
+        let locks = self.acquire_task_locks()?;
 
         let verified = verify_bundle_dir(&bundle_dir)?;
         self.manager.offline_hook().pre_install_verify(&verified)?;
@@ -318,26 +522,42 @@ impl DeployTaskCoordinator {
             finished_at: None,
         };
 
-        self.spawn_worker(task, move |mgr| mgr.install(&bundle_dir, activate))
+        let started = self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
+            mgr.install_verified_with_locks(&verified, activate, held_locks)
+        })?;
+        Ok(DeployMutationOutcome {
+            task: started,
+            replayed: false,
+        })
     }
 
     fn start_rollback(
         self: &Arc<Self>,
         expected_previous: String,
         activate: bool,
-    ) -> DeployResult<FirmwareTaskSnapshot> {
+        idem_meta: Option<(String, String)>,
+    ) -> DeployResult<DeployMutationOutcome> {
+        self.bump_activity();
         validate_commit_sha(&expected_previous)?;
+
+        if let Some((ref scope, ref req_hash)) = idem_meta {
+            if let Some(replayed_task) = self.check_idempotency_replay(scope, req_hash)? {
+                return Ok(DeployMutationOutcome {
+                    task: replayed_task,
+                    replayed: true,
+                });
+            }
+        }
+
         {
-            let guard = self.state.lock().map_err(|_| DeployError::Failed {
-                message: "deploy task mutex poisoned".to_owned(),
-            })?;
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if guard.active {
                 return Err(DeployError::Blocked {
                     message: "deployment_busy: another firmware task is already active".to_owned(),
                 });
             }
         }
-        self.probe_locks_available()?;
+        let locks = self.acquire_task_locks()?;
 
         let current_status = self.manager.status()?;
         if !current_status.installed {
@@ -364,21 +584,41 @@ impl DeployTaskCoordinator {
             finished_at: None,
         };
 
-        self.spawn_worker(task, move |mgr| mgr.rollback(activate))
+        let started = self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
+            mgr.rollback_with_locks(activate, held_locks)
+        })?;
+        Ok(DeployMutationOutcome {
+            task: started,
+            replayed: false,
+        })
     }
 
     fn spawn_worker<F>(
         self: &Arc<Self>,
         initial_task: FirmwareTaskSnapshot,
+        idem_meta: Option<(String, String)>,
+        locks: (FlockGuard, FlockGuard),
         op: F,
     ) -> DeployResult<FirmwareTaskSnapshot>
     where
-        F: FnOnce(&ReleaseManager) -> DeployResult<DeploymentStatus> + Send + 'static,
+        F: FnOnce(&ReleaseManager, &(FlockGuard, FlockGuard)) -> DeployResult<DeploymentStatus>
+            + Send
+            + 'static,
     {
-        let prev_handle = {
-            let mut guard = self.state.lock().map_err(|_| DeployError::Failed {
-                message: "deploy task mutex poisoned".to_owned(),
-            })?;
+        let (prev_handle, to_persist) = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((ref scope, ref req_hash)) = idem_meta {
+                if let Some(existing) = guard.idempotency.iter().find(|e| &e.scope == scope) {
+                    if &existing.request_hash != req_hash {
+                        return Err(DeployError::Blocked {
+                            message:
+                                "idempotency_conflict: idempotency_key reused with different firmware payload"
+                                    .to_owned(),
+                        });
+                    }
+                    return Ok(existing.task.clone());
+                }
+            }
             if guard.active {
                 return Err(DeployError::Blocked {
                     message: "deployment_busy: another firmware task is already active".to_owned(),
@@ -387,25 +627,52 @@ impl DeployTaskCoordinator {
             guard.active = true;
             guard.response_flushed = false;
             guard.latest_task = Some(initial_task.clone());
-            guard.worker_handle.take()
+            if let Some((scope, request_hash)) = idem_meta {
+                while guard.idempotency.len() >= MAX_DEPLOY_IDEMPOTENCY_ENTRIES {
+                    guard.idempotency.remove(0);
+                }
+                guard.idempotency.push(PersistedDeployIdempotencyEntry {
+                    scope,
+                    request_hash,
+                    recorded_at: initial_task.started_at,
+                    task: initial_task.clone(),
+                });
+            }
+            let persisted = PersistedFirmwareTaskState {
+                schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+                latest_task: guard.latest_task.clone(),
+                idempotency: guard.idempotency.clone(),
+            };
+            (guard.worker_handle.take(), persisted)
         };
         if let Some(h) = prev_handle {
             let _ = h.join();
         }
+        let _ = self.persist_task_state(&to_persist);
 
         let coord = Arc::clone(self);
         let task_id = initial_task.id.clone();
         let spawn_res = thread::Builder::new()
             .name("miro-ego-deploy-tx".to_owned())
             .spawn(move || {
-                if let Ok(guard) = coord.state.lock() {
+                let held_locks = locks;
+                let mut active_guard = ActiveTaskDropGuard {
+                    coord: Arc::clone(&coord),
+                    task_id: task_id.clone(),
+                    completed_cleanly: false,
+                };
+
+                {
+                    let guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
                     if !guard.response_flushed {
                         let _ = coord
                             .flushed_cv
-                            .wait_timeout(guard, Duration::from_millis(30));
+                            .wait_timeout(guard, Duration::from_millis(50));
                     }
                 }
-                if let Ok(mut guard) = coord.state.lock() {
+
+                let running_persisted = {
+                    let mut guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(cur) = guard.latest_task.as_mut() {
                         if cur.id == task_id {
                             cur.status = FirmwareTaskStatus::Running;
@@ -419,12 +686,27 @@ impl DeployTaskCoordinator {
                             };
                         }
                     }
-                }
+                    if let Some(snap) = guard.latest_task.clone() {
+                        for entry in &mut guard.idempotency {
+                            if entry.task.id == snap.id {
+                                entry.task = snap.clone();
+                            }
+                        }
+                    }
+                    PersistedFirmwareTaskState {
+                        schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+                        latest_task: guard.latest_task.clone(),
+                        idempotency: guard.idempotency.clone(),
+                    }
+                };
+                let _ = coord.persist_task_state(&running_persisted);
 
-                let outcome = op(&coord.manager);
+                let outcome = op(&coord.manager, &held_locks);
+                drop(held_locks);
                 let finished_at = unix_now_secs();
 
-                if let Ok(mut guard) = coord.state.lock() {
+                let final_persisted = {
+                    let mut guard = coord.state.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(cur) = guard.latest_task.as_mut() {
                         if cur.id == task_id {
                             match outcome {
@@ -444,28 +726,56 @@ impl DeployTaskCoordinator {
                             }
                         }
                     }
+                    if let Some(snap) = guard.latest_task.clone() {
+                        for entry in &mut guard.idempotency {
+                            if entry.task.id == snap.id {
+                                entry.task = snap.clone();
+                            }
+                        }
+                    }
                     guard.active = false;
-                    coord.idle_cv.notify_all();
-                }
+                    PersistedFirmwareTaskState {
+                        schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+                        latest_task: guard.latest_task.clone(),
+                        idempotency: guard.idempotency.clone(),
+                    }
+                };
+                let _ = coord.persist_task_state(&final_persisted);
+                active_guard.completed_cleanly = true;
+                coord.bump_activity();
+                coord.idle_cv.notify_all();
             });
 
         match spawn_res {
             Ok(handle) => {
-                if let Ok(mut guard) = self.state.lock() {
-                    guard.worker_handle = Some(handle);
-                }
+                let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                guard.worker_handle = Some(handle);
                 Ok(initial_task)
             }
             Err(err) => {
-                if let Ok(mut guard) = self.state.lock() {
+                let persisted = {
+                    let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                     guard.active = false;
                     if let Some(cur) = guard.latest_task.as_mut() {
                         cur.status = FirmwareTaskStatus::Failed;
                         cur.message = format!("failed spawning deploy worker: {err}");
                         cur.finished_at = Some(unix_now_secs());
                     }
+                    if let Some(snap) = guard.latest_task.clone() {
+                        for entry in &mut guard.idempotency {
+                            if entry.task.id == snap.id {
+                                entry.task = snap.clone();
+                            }
+                        }
+                    }
                     self.idle_cv.notify_all();
-                }
+                    PersistedFirmwareTaskState {
+                        schema: FIRMWARE_TASK_STATE_SCHEMA.to_owned(),
+                        latest_task: guard.latest_task.clone(),
+                        idempotency: guard.idempotency.clone(),
+                    }
+                };
+                let _ = self.persist_task_state(&persisted);
                 Err(DeployError::Failed {
                     message: format!("failed to spawn deploy worker thread: {err}"),
                 })
@@ -474,10 +784,130 @@ impl DeployTaskCoordinator {
     }
 }
 
+fn load_initial_task_state(manager: &ReleaseManager) -> PersistedFirmwareTaskState {
+    let path = manager.paths().firmware_task_file();
+    let Ok(mut loaded) =
+        read_bounded_json::<PersistedFirmwareTaskState>(&path, MAX_DEPLOY_TASK_STATE_BYTES, 16)
+    else {
+        return PersistedFirmwareTaskState::default();
+    };
+    if loaded.schema != FIRMWARE_TASK_STATE_SCHEMA {
+        return PersistedFirmwareTaskState::default();
+    }
+    let mut dirty = false;
+    if loaded.idempotency.len() > MAX_DEPLOY_IDEMPOTENCY_ENTRIES {
+        let excess = loaded.idempotency.len() - MAX_DEPLOY_IDEMPOTENCY_ENTRIES;
+        loaded.idempotency.drain(0..excess);
+        dirty = true;
+    }
+    if let Some(cur) = loaded.latest_task.as_mut() {
+        if !cur.status.is_terminal() {
+            cur.status = FirmwareTaskStatus::Failed;
+            cur.message = "firmware task interrupted by deploy controller restart".to_owned();
+            cur.finished_at = Some(unix_now_secs());
+            for entry in &mut loaded.idempotency {
+                if entry.task.id == cur.id {
+                    entry.task = cur.clone();
+                }
+            }
+            dirty = true;
+        }
+    }
+    if dirty {
+        if let Ok(mut raw) = serde_json::to_vec_pretty(&loaded) {
+            raw.push(b'\n');
+            let _ = write_bytes_atomic(&path, &raw, 0o600, true);
+        }
+    }
+    loaded
+}
+
+/// Verify that `allowed_updates_root` and `bundle_dir` are normalized absolute paths with zero
+/// symlinks along any path component, and that `bundle_dir` resides directly inside
+/// `allowed_updates_root`.
+pub fn validate_bundle_under_updates_root(
+    allowed_updates_root: &Path,
+    bundle_dir: &Path,
+) -> DeployResult<()> {
+    let root_components = collect_strict_absolute_components(allowed_updates_root, "updates_root")?;
+    let bundle_components = collect_strict_absolute_components(bundle_dir, "bundle_dir")?;
+
+    if bundle_components.len() != root_components.len() + 1
+        || bundle_components[..root_components.len()] != root_components[..]
+    {
+        return Err(DeployError::InvalidBundle {
+            message: format!(
+                "bundle_dir {} must reside directly inside allowed updates root {}",
+                bundle_dir.display(),
+                allowed_updates_root.display()
+            ),
+        });
+    }
+
+    let mut cur = PathBuf::from("/");
+    let root_dir_meta = fs::symlink_metadata(&cur).map_err(|err| DeployError::InvalidBundle {
+        message: format!("cannot stat /: {err}"),
+    })?;
+    if root_dir_meta.file_type().is_symlink() || !root_dir_meta.file_type().is_dir() {
+        return Err(DeployError::InvalidBundle {
+            message: "root path / is not a directory".to_owned(),
+        });
+    }
+
+    for seg in &bundle_components {
+        cur.push(seg);
+        let meta = fs::symlink_metadata(&cur).map_err(|err| DeployError::InvalidBundle {
+            message: format!("bundle path component unavailable {}: {err}", cur.display()),
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(DeployError::InvalidBundle {
+                message: format!("symlink rejected along bundle path: {}", cur.display()),
+            });
+        }
+        if !meta.file_type().is_dir() {
+            return Err(DeployError::InvalidBundle {
+                message: format!(
+                    "bundle path component is not a directory: {}",
+                    cur.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_strict_absolute_components<'a>(
+    path: &'a Path,
+    label: &str,
+) -> DeployResult<Vec<&'a std::ffi::OsStr>> {
+    if !path.is_absolute() {
+        return Err(DeployError::InvalidBundle {
+            message: format!("{label} must be an absolute path: {}", path.display()),
+        });
+    }
+    let mut normals = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => {}
+            Component::Normal(seg) if !seg.is_empty() => normals.push(seg),
+            _ => {
+                return Err(DeployError::InvalidBundle {
+                    message: format!(
+                        "{label} contains forbidden traversal or non-normal component: {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(normals)
+}
+
 /// Bounded framed-JSON Unix domain socket server exposing privileged [`ReleaseManager`] operations.
 pub struct DeployRpcServer {
     socket_path: Option<PathBuf>,
     stop: Arc<AtomicBool>,
+    idle_exited: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     active_workers: Arc<AtomicUsize>,
     coordinator: Arc<DeployTaskCoordinator>,
@@ -485,7 +915,7 @@ pub struct DeployRpcServer {
 
 impl DeployRpcServer {
     /// Bind a new Unix domain socket at `socket_path` (mode `0660`, group `miro-ego` when root)
-    /// and start serving privileged deployment requests.
+    /// under a restrictive `umask` (`0o077`) and start serving privileged deployment requests.
     pub fn bind(
         socket_path: impl Into<PathBuf>,
         manager: Arc<ReleaseManager>,
@@ -497,27 +927,77 @@ impl DeployRpcServer {
                 fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
                     message: format!("failed to create socket dir {}: {err}", parent.display()),
                 })?;
+                if let Ok(pmeta) = fs::symlink_metadata(parent) {
+                    if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+                        return Err(DeployError::Failed {
+                            message: format!(
+                                "socket parent {} must be a real directory, not a symlink",
+                                parent.display()
+                            ),
+                        });
+                    }
+                }
             }
         }
-        if fs::symlink_metadata(&path).is_ok() {
+        if let Ok(existing) = fs::symlink_metadata(&path) {
+            if existing.file_type().is_dir() {
+                return Err(DeployError::Failed {
+                    message: format!(
+                        "refusing to unlink directory at socket path {}",
+                        path.display()
+                    ),
+                });
+            }
             let _ = fs::remove_file(&path);
         }
-        let listener = UnixListener::bind(&path).map_err(|err| DeployError::Failed {
-            message: format!(
-                "failed to bind deploy Unix socket {}: {err}",
-                path.display()
-            ),
-        })?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).map_err(|err| {
-            DeployError::Failed {
+
+        let listener = {
+            let _umask_lock = DEPLOY_UMASK_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let prev_mask = unsafe { libc::umask(0o077) };
+            let bind_res = UnixListener::bind(&path);
+            unsafe {
+                libc::umask(prev_mask);
+            }
+            bind_res.map_err(|err| DeployError::Failed {
                 message: format!(
-                    "failed to chmod deploy Unix socket {}: {err}",
+                    "failed to bind deploy Unix socket {}: {err}",
                     path.display()
                 ),
+            })?
+        };
+
+        let setup_res = (|| -> DeployResult<()> {
+            let meta = fs::symlink_metadata(&path).map_err(|err| DeployError::Failed {
+                message: format!(
+                    "failed to stat bound deploy socket {}: {err}",
+                    path.display()
+                ),
+            })?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+                return Err(DeployError::Failed {
+                    message: format!("bound deploy path {} is not a Unix socket", path.display()),
+                });
             }
-        })?;
-        best_effort_chgrp_miro_ego(&path);
-        Self::from_listener(listener, Some(path), manager, config)
+            best_effort_chgrp_miro_ego(&path);
+            chmod_socket_nofollow(&path, 0o660)?;
+            Ok(())
+        })();
+
+        if let Err(err) = setup_res {
+            drop(listener);
+            let _ = fs::remove_file(&path);
+            return Err(err);
+        }
+
+        match Self::from_listener(listener, Some(path.clone()), manager, config) {
+            Ok(srv) => Ok(srv),
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                Err(err)
+            }
+        }
     }
 
     /// Start serving on an already-bound (or systemd socket-activated) `UnixListener`.
@@ -534,11 +1014,13 @@ impl DeployRpcServer {
             })?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let idle_exited = Arc::new(AtomicBool::new(false));
         let active_workers = Arc::new(AtomicUsize::new(0));
-        let coordinator = DeployTaskCoordinator::new(manager);
+        let coordinator = DeployTaskCoordinator::new(manager, config.allowed_updates_root.clone());
         let mutation_lock = Arc::new(Mutex::new(()));
 
         let stop_loop = Arc::clone(&stop);
+        let idle_exited_loop = Arc::clone(&idle_exited);
         let workers_loop = Arc::clone(&active_workers);
         let coord_loop = Arc::clone(&coordinator);
         let accept_thread = thread::Builder::new()
@@ -549,6 +1031,7 @@ impl DeployRpcServer {
                     handles.retain(|h| !h.is_finished());
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            coord_loop.bump_activity();
                             let current = workers_loop.load(Ordering::Acquire);
                             if current >= config.max_concurrent_connections {
                                 let busy = DeployRpcResponse::error(
@@ -566,23 +1049,41 @@ impl DeployRpcServer {
                                 continue;
                             }
                             workers_loop.fetch_add(1, Ordering::AcqRel);
+                            let guard = ActiveConnDropGuard {
+                                counter: Arc::clone(&workers_loop),
+                                coord: Arc::clone(&coord_loop),
+                            };
                             let coord = Arc::clone(&coord_loop);
                             let mlock = Arc::clone(&mutation_lock);
                             let cfg = config.clone();
-                            let counter = Arc::clone(&workers_loop);
                             if let Ok(handle) = thread::Builder::new()
                                 .name("miro-ego-deploy-conn".to_owned())
                                 .spawn(move || {
+                                    let _conn_guard = guard;
                                     handle_connection(stream, &coord, &mlock, &cfg);
-                                    counter.fetch_sub(1, Ordering::AcqRel);
                                 })
                             {
                                 handles.push(handle);
-                            } else {
-                                workers_loop.fetch_sub(1, Ordering::AcqRel);
                             }
                         }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            if let Some(idle_limit) = config.idle_timeout {
+                                if workers_loop.load(Ordering::Acquire) == 0
+                                    && !coord_loop.is_active()
+                                {
+                                    let last_ns =
+                                        coord_loop.last_activity_mono_ns.load(Ordering::Acquire);
+                                    let elapsed_ns = monotonic_now_ns().saturating_sub(last_ns);
+                                    if Duration::from_nanos(elapsed_ns) >= idle_limit {
+                                        idle_exited_loop.store(true, Ordering::Release);
+                                        stop_loop.store(true, Ordering::Release);
+                                        coord_loop.idle_cv.notify_all();
+                                        break;
+                                    }
+                                } else {
+                                    coord_loop.bump_activity();
+                                }
+                            }
                             thread::sleep(Duration::from_millis(10));
                         }
                         Err(_) => {
@@ -604,6 +1105,7 @@ impl DeployRpcServer {
         Ok(Self {
             socket_path,
             stop,
+            idle_exited,
             accept_thread: Some(accept_thread),
             active_workers,
             coordinator,
@@ -612,6 +1114,50 @@ impl DeployRpcServer {
 
     pub fn active_workers(&self) -> usize {
         self.active_workers.load(Ordering::Acquire)
+    }
+
+    /// Return `true` when zero RPC connections and zero firmware update/rollback tasks are active.
+    pub fn is_idle(&self) -> bool {
+        self.active_workers() == 0 && !self.coordinator.is_active()
+    }
+
+    /// Return `true` if the server auto-stopped after reaching its configured `idle_timeout`.
+    pub fn has_exited_idle(&self) -> bool {
+        self.idle_exited.load(Ordering::Acquire)
+    }
+
+    /// Return monotonic duration elapsed since the last RPC request or active firmware task.
+    pub fn idle_elapsed(&self) -> Duration {
+        if !self.is_idle() {
+            return Duration::ZERO;
+        }
+        let last_ns = self
+            .coordinator
+            .last_activity_mono_ns
+            .load(Ordering::Acquire);
+        Duration::from_nanos(monotonic_now_ns().saturating_sub(last_ns))
+    }
+
+    /// Block until `stop` becomes `true` OR the server has been continuously idle (`active_workers == 0`
+    /// and no running firmware task) for at least `idle_timeout`.
+    pub fn wait_for_idle_or_exit(
+        &self,
+        idle_timeout: Duration,
+        stop: &AtomicBool,
+    ) -> DeployResult<()> {
+        while !stop.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire) {
+            if self.is_idle() {
+                if self.idle_elapsed() >= idle_timeout {
+                    self.idle_exited.store(true, Ordering::Release);
+                    self.stop.store(true, Ordering::Release);
+                    break;
+                }
+            } else {
+                self.coordinator.bump_activity();
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
     }
 
     /// Wait until any in-flight asynchronous update/rollback worker completes.
@@ -634,8 +1180,9 @@ impl DeployRpcServer {
             .coordinator
             .state
             .lock()
-            .ok()
-            .and_then(|mut g| g.worker_handle.take());
+            .unwrap_or_else(PoisonError::into_inner)
+            .worker_handle
+            .take();
         if let Some(th) = task_handle {
             let _ = th.join();
         }
@@ -692,6 +1239,59 @@ fn handle_connection(
     }
 }
 
+fn extract_idempotency_meta(
+    op: &str,
+    request: &DeployRpcRequest,
+    fallback_payload: &Value,
+) -> DeployResult<Option<(String, String)>> {
+    let body = request.body.as_ref();
+    let idem_key = request.idempotency_key.as_deref().or_else(|| {
+        body.and_then(|b| b.get("idempotency_key"))
+            .and_then(Value::as_str)
+    });
+    let Some(key) = idem_key else {
+        return Ok(None);
+    };
+    if key.is_empty() || key.len() > 128 || key.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        return Err(DeployError::InvalidBundle {
+            message: "request_invalid: idempotency_key must be 1..=128 visible ASCII chars"
+                .to_owned(),
+        });
+    }
+    let principal = request
+        .principal_id
+        .as_deref()
+        .or_else(|| {
+            body.and_then(|b| b.get("principal_id"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("default");
+    let explicit_hash = request.request_hash.as_deref().or_else(|| {
+        body.and_then(|b| b.get("request_hash"))
+            .and_then(Value::as_str)
+    });
+    let req_hash = match explicit_hash {
+        Some(h) if !h.is_empty() && h.len() <= 128 => h.to_owned(),
+        Some(_) => {
+            return Err(DeployError::InvalidBundle {
+                message: "request_invalid: invalid request_hash".to_owned(),
+            });
+        }
+        None => {
+            let bytes = serde_json::to_vec(fallback_payload).unwrap_or_default();
+            hex_encode(Sha256::digest(&bytes).as_slice())
+        }
+    };
+    let mut scope_hasher = Sha256::new();
+    scope_hasher.update(op.as_bytes());
+    scope_hasher.update([0u8]);
+    scope_hasher.update(principal.as_bytes());
+    scope_hasher.update([0u8]);
+    scope_hasher.update(key.as_bytes());
+    let scope = hex_encode(scope_hasher.finalize().as_slice());
+    Ok(Some((scope, req_hash)))
+}
+
 fn dispatch_raw_payload(
     raw_line: &[u8],
     coordinator: &Arc<DeployTaskCoordinator>,
@@ -728,18 +1328,11 @@ fn dispatch_raw_payload(
             }),
         ),
         "status" => match coordinator.status() {
-            Ok(st) => serialize_ok("status", 200, &st),
+            Ok(st) => serialize_ok("status", 200, &st, None),
             Err(err) => error_from_deploy_error(op, &err),
         },
         "install" => {
-            let Ok(_guard) = mutation_lock.lock() else {
-                return DeployRpcResponse::error(
-                    "deploy_failure",
-                    "mutation lock poisoned",
-                    Some(op),
-                    true,
-                );
-            };
+            let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(body) = &request.body else {
                 return DeployRpcResponse::error(
                     "request_invalid",
@@ -777,20 +1370,30 @@ fn dispatch_raw_payload(
                     false,
                 );
             }
-            match coordinator.start_install(bundle_path, expected_commit.to_owned(), activate) {
-                Ok(task) => serialize_ok("install", 202, &task),
+            let idem_meta = match extract_idempotency_meta(
+                "install",
+                &request,
+                &json!({
+                    "bundle_dir": bundle_dir_str,
+                    "expected_commit": expected_commit,
+                    "activate": activate,
+                }),
+            ) {
+                Ok(m) => m,
+                Err(err) => return error_from_deploy_error(op, &err),
+            };
+            match coordinator.start_install(
+                bundle_path,
+                expected_commit.to_owned(),
+                activate,
+                idem_meta,
+            ) {
+                Ok(out) => serialize_ok("install", 202, &out.task, Some(out.replayed)),
                 Err(err) => error_from_deploy_error(op, &err),
             }
         }
         "rollback" => {
-            let Ok(_guard) = mutation_lock.lock() else {
-                return DeployRpcResponse::error(
-                    "deploy_failure",
-                    "mutation lock poisoned",
-                    Some(op),
-                    true,
-                );
-            };
+            let _guard = mutation_lock.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(body) = &request.body else {
                 return DeployRpcResponse::error(
                     "request_invalid",
@@ -812,8 +1415,19 @@ fn dispatch_raw_payload(
                 .get("activate")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            match coordinator.start_rollback(expected_previous.to_owned(), activate) {
-                Ok(task) => serialize_ok("rollback", 202, &task),
+            let idem_meta = match extract_idempotency_meta(
+                "rollback",
+                &request,
+                &json!({
+                    "expected_previous": expected_previous,
+                    "activate": activate,
+                }),
+            ) {
+                Ok(m) => m,
+                Err(err) => return error_from_deploy_error(op, &err),
+            };
+            match coordinator.start_rollback(expected_previous.to_owned(), activate, idem_meta) {
+                Ok(out) => serialize_ok("rollback", 202, &out.task, Some(out.replayed)),
                 Err(err) => error_from_deploy_error(op, &err),
             }
         }
@@ -826,9 +1440,18 @@ fn dispatch_raw_payload(
     }
 }
 
-fn serialize_ok<T: Serialize>(op: &str, status: u16, value: &T) -> DeployRpcResponse {
+fn serialize_ok<T: Serialize>(
+    op: &str,
+    status: u16,
+    value: &T,
+    replayed: Option<bool>,
+) -> DeployRpcResponse {
     match serde_json::to_value(value) {
-        Ok(body) => DeployRpcResponse::ok(op, status, body),
+        Ok(body) => {
+            let mut resp = DeployRpcResponse::ok(op, status, body);
+            resp.replayed = replayed;
+            resp
+        }
         Err(err) => DeployRpcResponse::error(
             "deploy_failure",
             format!("failed to serialize response: {err}"),
@@ -843,20 +1466,24 @@ fn error_from_deploy_error(op: &str, err: &DeployError) -> DeployRpcResponse {
         DeployError::InvalidBundle { message } => {
             let code = if message.contains("commit_mismatch") {
                 "commit_mismatch"
+            } else if message.contains("request_invalid") {
+                "request_invalid"
             } else {
                 "invalid_bundle"
             };
             DeployRpcResponse::error(code, message.clone(), Some(op), false)
         }
         DeployError::Blocked { message } => {
-            let code = if message.contains("rollback_unavailable") {
+            let code = if message.contains("idempotency_conflict") {
+                "idempotency_conflict"
+            } else if message.contains("rollback_unavailable") {
                 "rollback_unavailable"
             } else if message.contains("maintenance_busy") {
                 "maintenance_busy"
             } else {
                 "deployment_busy"
             };
-            let retryable = code != "rollback_unavailable";
+            let retryable = !matches!(code, "rollback_unavailable" | "idempotency_conflict");
             DeployRpcResponse::error(code, message.clone(), Some(op), retryable)
         }
         DeployError::Failed { message } => {
@@ -975,6 +1602,9 @@ impl DeployRpcClient {
         let resp = self.send(&DeployRpcRequest {
             schema: DEPLOY_REQUEST_SCHEMA.to_owned(),
             operation: "health".to_owned(),
+            principal_id: None,
+            idempotency_key: None,
+            request_hash: None,
             body: None,
         })?;
         decode_body(resp)
@@ -984,6 +1614,9 @@ impl DeployRpcClient {
         let resp = self.send(&DeployRpcRequest {
             schema: DEPLOY_REQUEST_SCHEMA.to_owned(),
             operation: "status".to_owned(),
+            principal_id: None,
+            idempotency_key: None,
+            request_hash: None,
             body: None,
         })?;
         decode_body(resp)
@@ -995,16 +1628,34 @@ impl DeployRpcClient {
         expected_commit: &str,
         activate: bool,
     ) -> DeployResult<FirmwareTaskSnapshot> {
+        self.install_idempotent(bundle_dir, expected_commit, activate, None, None, None)
+            .map(|out| out.task)
+    }
+
+    pub fn install_idempotent(
+        &self,
+        bundle_dir: &Path,
+        expected_commit: &str,
+        activate: bool,
+        principal_id: Option<&str>,
+        idempotency_key: Option<&str>,
+        request_hash: Option<&str>,
+    ) -> DeployResult<DeployMutationOutcome> {
         let resp = self.send(&DeployRpcRequest {
             schema: DEPLOY_REQUEST_SCHEMA.to_owned(),
             operation: "install".to_owned(),
+            principal_id: principal_id.map(str::to_owned),
+            idempotency_key: idempotency_key.map(str::to_owned),
+            request_hash: request_hash.map(str::to_owned),
             body: Some(json!({
                 "bundle_dir": bundle_dir.to_string_lossy(),
                 "expected_commit": expected_commit,
                 "activate": activate,
             })),
         })?;
-        decode_body(resp)
+        let replayed = resp.replayed.unwrap_or(false);
+        let task = decode_body(resp)?;
+        Ok(DeployMutationOutcome { task, replayed })
     }
 
     pub fn rollback(
@@ -1012,15 +1663,32 @@ impl DeployRpcClient {
         expected_previous: &str,
         activate: bool,
     ) -> DeployResult<FirmwareTaskSnapshot> {
+        self.rollback_idempotent(expected_previous, activate, None, None, None)
+            .map(|out| out.task)
+    }
+
+    pub fn rollback_idempotent(
+        &self,
+        expected_previous: &str,
+        activate: bool,
+        principal_id: Option<&str>,
+        idempotency_key: Option<&str>,
+        request_hash: Option<&str>,
+    ) -> DeployResult<DeployMutationOutcome> {
         let resp = self.send(&DeployRpcRequest {
             schema: DEPLOY_REQUEST_SCHEMA.to_owned(),
             operation: "rollback".to_owned(),
+            principal_id: principal_id.map(str::to_owned),
+            idempotency_key: idempotency_key.map(str::to_owned),
+            request_hash: request_hash.map(str::to_owned),
             body: Some(json!({
                 "expected_previous": expected_previous,
                 "activate": activate,
             })),
         })?;
-        decode_body(resp)
+        let replayed = resp.replayed.unwrap_or(false);
+        let task = decode_body(resp)?;
+        Ok(DeployMutationOutcome { task, replayed })
     }
 }
 
@@ -1040,9 +1708,10 @@ fn extract_body(resp: DeployRpcResponse) -> DeployResult<Value> {
             "invalid_bundle" | "commit_mismatch" | "request_invalid" | "operation_invalid" => {
                 Err(DeployError::InvalidBundle { message: formatted })
             }
-            "deployment_busy" | "maintenance_busy" | "rollback_unavailable" => {
-                Err(DeployError::Blocked { message: formatted })
-            }
+            "deployment_busy"
+            | "maintenance_busy"
+            | "rollback_unavailable"
+            | "idempotency_conflict" => Err(DeployError::Blocked { message: formatted }),
             _ => Err(DeployError::Failed { message: formatted }),
         };
     }
@@ -1064,34 +1733,45 @@ enum FrameReadError {
     Invalid(String),
 }
 
-fn read_ndjson_line<R: Read>(
-    reader: &mut R,
+fn read_ndjson_line(
+    stream: &mut UnixStream,
     max_bytes: usize,
     timeout: Duration,
 ) -> Result<Option<Vec<u8>>, FrameReadError> {
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(max_bytes.min(4096));
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; 4096];
 
     loop {
-        if Instant::now() > deadline {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(FrameReadError::Timeout);
+        };
+        if remaining.is_zero() {
             return Err(FrameReadError::Timeout);
         }
-        match reader.read(&mut byte) {
+        let _ = stream.set_read_timeout(Some(remaining));
+
+        match stream.read(&mut chunk) {
             Ok(0) => {
                 if buf.is_empty() {
                     return Ok(None);
                 }
                 return Ok(Some(buf));
             }
-            Ok(_) => {
-                if byte[0] == b'\n' {
+            Ok(n) => {
+                let slice = &chunk[..n];
+                if let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
+                    if buf.len().saturating_add(nl_pos) > max_bytes {
+                        return Err(FrameReadError::TooLarge);
+                    }
+                    buf.extend_from_slice(&slice[..nl_pos]);
                     return Ok(Some(buf));
                 }
-                if buf.len() >= max_bytes {
+                if buf.len().saturating_add(n) > max_bytes {
                     return Err(FrameReadError::TooLarge);
                 }
-                buf.push(byte[0]);
+                buf.extend_from_slice(slice);
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
@@ -1153,8 +1833,32 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn monotonic_now_ns() -> u64 {
+    miro_ego_core::sys::clock::monotonic_ns().unwrap_or(0)
+}
+
 fn truncate_msg(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+fn chmod_socket_nofollow(path: &Path, mode: u32) -> DeployResult<()> {
+    let meta = fs::symlink_metadata(path).map_err(|err| DeployError::Failed {
+        message: format!(
+            "failed to stat deploy Unix socket {}: {err}",
+            path.display()
+        ),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(DeployError::Failed {
+            message: format!("symlink rejected at deploy Unix socket {}", path.display()),
+        });
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|err| DeployError::Failed {
+        message: format!(
+            "failed to chmod deploy Unix socket {}: {err}",
+            path.display()
+        ),
+    })
 }
 
 fn best_effort_chgrp_miro_ego(path: &Path) {
@@ -1171,7 +1875,13 @@ fn best_effort_chgrp_miro_ego(path: &Path) {
         let grp = libc::getgrnam(group_c.as_ptr());
         if !grp.is_null() {
             let gid = (*grp).gr_gid;
-            let _ = libc::chown(path_c.as_ptr(), u32::MAX, gid);
+            let _ = libc::fchownat(
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                u32::MAX,
+                gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
         }
     }
 }
@@ -1181,6 +1891,7 @@ mod tests {
     use super::*;
     use crate::bundle::test_support::build_valid_bundle;
     use crate::manager::{HealthChecker, ReleaseManagerPaths, SystemctlRunner};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1224,15 +1935,20 @@ mod tests {
     #[test]
     fn live_deploy_rpc_installs_v1_v2_and_rolls_back_asynchronously() {
         let (root, paths) = temp_env("roundtrip");
+        let updates_dir = root.join("updates");
+        fs::create_dir_all(&updates_dir).unwrap();
         let sock = paths.run_dir.join("deploy-control.sock");
         let mgr = Arc::new(ReleaseManager::new(
             paths.clone(),
             Arc::new(NoopSystemctl),
             Arc::new(OkHealth),
         ));
-        let server =
-            DeployRpcServer::bind(&sock, Arc::clone(&mgr), DeployRpcServerConfig::default())
-                .unwrap();
+        let cfg = DeployRpcServerConfig::default().with_allowed_updates_root(&updates_dir);
+        let server = DeployRpcServer::bind(&sock, Arc::clone(&mgr), cfg).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&sock).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
         let client = DeployRpcClient::new(&sock);
 
         let health = client.health().unwrap();
@@ -1240,8 +1956,8 @@ mod tests {
 
         let commit_v1 = "1".repeat(40);
         let commit_v2 = "2".repeat(40);
-        let b1 = root.join("updates/v1");
-        let b2 = root.join("updates/v2");
+        let b1 = updates_dir.join("v1");
+        let b2 = updates_dir.join("v2");
         build_valid_bundle(
             &b1,
             "0.3.0",
@@ -1255,19 +1971,74 @@ mod tests {
             &[("miro-ego.service", b"[Unit]\nDescription=v2\n", false)],
         );
 
+        // Bundle outside allowed_updates_root OR via symlink MUST be rejected!
+        let outside = root.join("outside-v1");
+        build_valid_bundle(&outside, "0.3.0", &commit_v1, &[]);
+        assert!(matches!(
+            client.install(&outside, &commit_v1, true),
+            Err(DeployError::InvalidBundle { .. })
+        ));
+        let sym_inside = updates_dir.join("sym-v1");
+        symlink(&outside, &sym_inside).unwrap();
+        assert!(matches!(
+            client.install(&sym_inside, &commit_v1, true),
+            Err(DeployError::InvalidBundle { .. })
+        ));
+
         // Commit mismatch fails upfront with InvalidBundle!
         let bad = client.install(&b1, &commit_v2, true).unwrap_err();
         assert!(matches!(bad, DeployError::InvalidBundle { .. }));
 
-        // Install v1
-        let t1 = client.install(&b1, &commit_v1, true).unwrap();
-        assert_eq!(t1.action, FirmwareTaskAction::Update);
-        assert_eq!(t1.status, FirmwareTaskStatus::Accepted);
+        // Install v1 with idempotency key + replay verification
+        let out1 = client
+            .install_idempotent(
+                &b1,
+                &commit_v1,
+                true,
+                Some("admin"),
+                Some("idem-v1"),
+                Some("hash-v1"),
+            )
+            .unwrap();
+        assert!(!out1.replayed);
+        assert_eq!(out1.task.action, FirmwareTaskAction::Update);
+        assert_eq!(out1.task.status, FirmwareTaskStatus::Accepted);
         let s1 = server
             .wait_for_idle(Duration::from_secs(5))
             .unwrap()
             .unwrap();
         assert_eq!(s1.status, FirmwareTaskStatus::Succeeded);
+
+        // Replaying same idempotency key + hash returns replayed=true & latest task state;
+        // reusing key with different hash fails with idempotency_conflict!
+        let replay1 = client
+            .install_idempotent(
+                &b1,
+                &commit_v1,
+                true,
+                Some("admin"),
+                Some("idem-v1"),
+                Some("hash-v1"),
+            )
+            .unwrap();
+        assert!(replay1.replayed);
+        assert_eq!(replay1.task.id, out1.task.id);
+        assert_eq!(replay1.task.status, FirmwareTaskStatus::Succeeded);
+
+        let conflict = client
+            .install_idempotent(
+                &b2,
+                &commit_v2,
+                true,
+                Some("admin"),
+                Some("idem-v1"),
+                Some("hash-different"),
+            )
+            .unwrap_err();
+        assert!(conflict.to_string().contains("idempotency_conflict"));
+
+        // Verify firmware-task.json persisted atomically under state_root!
+        assert!(paths.firmware_task_file().is_file());
 
         // Install v2
         let _ = client.install(&b2, &commit_v2, true).unwrap();
@@ -1311,8 +2082,42 @@ mod tests {
             Some("0.3.1")
         );
 
-        let _ = AtomicBool::new(false);
         server.shutdown();
+
+        // Restart server on same state_root: persisted task & idempotency survive restart!
+        let server2 = DeployRpcServer::bind(
+            &sock,
+            Arc::clone(&mgr),
+            DeployRpcServerConfig::default()
+                .with_allowed_updates_root(&updates_dir)
+                .with_idle_timeout(Some(Duration::from_millis(80))),
+        )
+        .unwrap();
+        let st_reloaded = client.status().unwrap();
+        assert_eq!(
+            st_reloaded.task.as_ref().map(|t| t.status),
+            Some(FirmwareTaskStatus::Succeeded)
+        );
+        let replay_after_restart = client
+            .install_idempotent(
+                &b1,
+                &commit_v1,
+                true,
+                Some("admin"),
+                Some("idem-v1"),
+                Some("hash-v1"),
+            )
+            .unwrap();
+        assert!(replay_after_restart.replayed);
+
+        // Verify wait_for_idle_or_exit exits cleanly after idle_timeout!
+        let stop_flag = AtomicBool::new(false);
+        server2
+            .wait_for_idle_or_exit(Duration::from_millis(80), &stop_flag)
+            .unwrap();
+        assert!(server2.has_exited_idle());
+        server2.shutdown();
+
         fs::remove_dir_all(root).unwrap();
     }
 }
