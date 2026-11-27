@@ -4,16 +4,20 @@
 //! event broadcasting.
 
 use crate::artifact_io::open_manifest;
+use crate::audit::AuditLogger;
 use crate::catalog::{
     BinarySessionCatalog, DEVICE_SESSION_SCHEMA, IndexedSession, SessionDeviceIdentity,
     parse_indexed_session_from_manifest,
 };
 use crate::recovery::{
     RecoveryDefaults, StagingRecoveryManager, build_manifest_encoding_json,
-    cleanup_empty_date_parent, publish_staging_directory, quarantine_session_directory,
-    remove_control_markers,
+    cleanup_empty_date_parent, is_transient_storage_error, publish_staging_directory,
+    quarantine_session_directory, remove_control_markers_with_logs,
 };
-use crate::util::{now_rfc3339_utc, sha256_hex, sweep_stale_atomic_temps};
+use crate::util::{
+    VolumeHandleLease, is_canonical_session_relative_dir, now_rfc3339_utc, sha256_hex,
+    sweep_stale_atomic_temps,
+};
 use crate::volume::{CaptureStorageBudget, ExfatVolumeManager, VolumeAdmission};
 use crate::{RecoveryManager, RecoveryReport, StorageError, StorageResult, VolumeManager};
 use miro_ego_capture::session::session_io::{
@@ -28,16 +32,22 @@ use miro_ego_core::ids::{
 use miro_ego_core::locks::{FlockGuard, LockMode, acquire_maintenance_lock};
 use miro_ego_core::paths::DataVolumePaths;
 use miro_ego_core::sys::clock::monotonic_ns;
-use miro_ego_core::sys::fs::{fsync_directory, read_bounded_json, write_bytes_atomic};
+use miro_ego_core::sys::fs::{
+    fstat, fsync_directory, open_directory_safe, read_bounded_json, write_bytes_atomic,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const CAPTURE_START_SCHEMA: &str = "miro-ego.capture-start.v1";
 pub const CAPTURE_STOP_SCHEMA: &str = "miro-ego.capture-stop.v1";
@@ -126,6 +136,32 @@ impl CapturePhase {
             Self::Deleting => "deleting",
             Self::Failed => "failed",
             Self::Closing => "closing",
+        }
+    }
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Starting => 1,
+            Self::Recording => 2,
+            Self::Stopping => 3,
+            Self::Recovering => 4,
+            Self::Deleting => 5,
+            Self::Failed => 6,
+            Self::Closing => 7,
+        }
+    }
+
+    const fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Idle,
+            1 => Self::Starting,
+            2 => Self::Recording,
+            3 => Self::Stopping,
+            4 => Self::Recovering,
+            5 => Self::Deleting,
+            6 => Self::Failed,
+            _ => Self::Closing,
         }
     }
 }
@@ -641,10 +677,64 @@ pub enum CapturedAudioOutcome {
         end_time_seconds: f64,
         segments: Vec<CapturedAudioSegment>,
     },
+    RecordedWithClock {
+        requested_mode: String,
+        sample_rate: u32,
+        channels: u16,
+        sample_count: u64,
+        start_time_seconds: f64,
+        end_time_seconds: f64,
+        segments: Vec<CapturedAudioSegment>,
+        capture_clock: Option<Value>,
+    },
     NotRecorded {
         requested_mode: String,
         reason: String,
     },
+}
+
+impl CapturedAudioOutcome {
+    /// Attach an optional `miro-ego.audio-clock.v1` `capture_clock` object to a recorded audio outcome.
+    pub fn with_capture_clock(self, capture_clock: Option<Value>) -> Self {
+        match self {
+            Self::Recorded {
+                requested_mode,
+                sample_rate,
+                channels,
+                sample_count,
+                start_time_seconds,
+                end_time_seconds,
+                segments,
+            }
+            | Self::RecordedWithClock {
+                requested_mode,
+                sample_rate,
+                channels,
+                sample_count,
+                start_time_seconds,
+                end_time_seconds,
+                segments,
+                ..
+            } => Self::RecordedWithClock {
+                requested_mode,
+                sample_rate,
+                channels,
+                sample_count,
+                start_time_seconds,
+                end_time_seconds,
+                segments,
+                capture_clock,
+            },
+            other => other,
+        }
+    }
+
+    pub fn capture_clock(&self) -> Option<&Value> {
+        match self {
+            Self::RecordedWithClock { capture_clock, .. } => capture_clock.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Frame drop event matching `miro-ego.device-session.v1#/$defs/dropEvent`.
@@ -830,6 +920,8 @@ struct IdempotencyRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedReceipts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume_id: Option<String>,
     idempotency: VecDeque<IdempotencyRecord>,
     safe_swap: Option<SafeSwapReceipt>,
     unsuccessful: VecDeque<RetainedUnsuccessfulSessionResource>,
@@ -838,6 +930,7 @@ struct PersistedReceipts {
 struct ReceiptStoreState {
     receipts: PersistedReceipts,
     loaded_from_disk: bool,
+    active_volume_id: Option<String>,
 }
 
 struct ReceiptStore {
@@ -846,23 +939,69 @@ struct ReceiptStore {
 }
 
 impl ReceiptStore {
-    fn open(paths: DataVolumePaths, volume_writable: bool) -> Self {
-        let (loaded, loaded_from_disk) = if volume_writable && paths.receipts_dir().is_dir() {
+    fn open(
+        paths: DataVolumePaths,
+        volume_writable: bool,
+        initial_volume_id: Option<&str>,
+    ) -> Self {
+        let (mut loaded, loaded_from_disk) = if volume_writable && paths.receipts_dir().is_dir() {
             let _ = sweep_stale_atomic_temps(&paths.receipts_dir());
             let file = paths.receipts_dir().join("coordinator-receipts.json");
             let data = read_bounded_json::<PersistedReceipts>(&file, MAX_RECEIPT_FILE_BYTES, 16)
                 .unwrap_or_default();
-            (data, true)
+            if let (Some(expected_vid), Some(disk_vid)) =
+                (initial_volume_id, data.volume_id.as_deref())
+            {
+                if disk_vid != expected_vid {
+                    (PersistedReceipts::default(), true)
+                } else {
+                    (data, true)
+                }
+            } else {
+                (data, true)
+            }
         } else {
             (PersistedReceipts::default(), false)
         };
+        if let Some(vid) = initial_volume_id {
+            loaded.volume_id = Some(vid.to_owned());
+        }
         Self {
             paths,
             state: Mutex::new(ReceiptStoreState {
                 receipts: loaded,
                 loaded_from_disk,
+                active_volume_id: initial_volume_id.map(str::to_owned),
             }),
         }
+    }
+
+    /// Bind the receipt store to `new_volume_id`: when a different volume/card is inserted,
+    /// isolate RAM state from the prior card and load the new card's `coordinator-receipts.json`.
+    fn bind_volume(&self, new_volume_id: Option<&str>, volume_writable: bool) {
+        let Some(vid) = new_volume_id else {
+            return;
+        };
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let switching_cards = guard
+            .active_volume_id
+            .as_deref()
+            .is_some_and(|prev| prev != vid);
+        if switching_cards {
+            guard.receipts = PersistedReceipts {
+                volume_id: Some(vid.to_owned()),
+                ..PersistedReceipts::default()
+            };
+            guard.loaded_from_disk = false;
+            guard.active_volume_id = Some(vid.to_owned());
+        } else if guard.active_volume_id.is_none() {
+            guard.active_volume_id = Some(vid.to_owned());
+            guard.receipts.volume_id = Some(vid.to_owned());
+        }
+        drop(guard);
+        self.ensure_loaded_from_disk(volume_writable);
     }
 
     /// Reload and merge on-disk `coordinator-receipts.json` when transitioning from an
@@ -889,36 +1028,49 @@ impl ReceiptStore {
 
         if let Ok(disk) = read_bounded_json::<PersistedReceipts>(&file, MAX_RECEIPT_FILE_BYTES, 16)
         {
-            // Merge older on-disk unsuccessful outcomes behind any newer in-RAM outcomes.
-            let mut merged_unsuccessful = disk.unsuccessful;
-            for mem_item in guard.receipts.unsuccessful.drain(..) {
-                let sid = mem_item.outcome.recording_state.session_id.clone();
-                merged_unsuccessful
-                    .retain(|existing| existing.outcome.recording_state.session_id != sid);
-                merged_unsuccessful.push_back(mem_item);
-            }
-            while merged_unsuccessful.len() > MAX_UNSUCCESSFUL_OUTCOMES {
-                merged_unsuccessful.pop_front();
-            }
-            guard.receipts.unsuccessful = merged_unsuccessful;
+            let same_volume = match (&guard.active_volume_id, &disk.volume_id) {
+                (Some(active_vid), Some(disk_vid)) => active_vid == disk_vid,
+                _ => true,
+            };
+            if same_volume {
+                if guard.active_volume_id.is_none() {
+                    guard.active_volume_id = disk.volume_id.clone();
+                }
+                if guard.receipts.volume_id.is_none() {
+                    guard.receipts.volume_id =
+                        guard.active_volume_id.clone().or(disk.volume_id.clone());
+                }
+                // Merge older on-disk unsuccessful outcomes behind any newer in-RAM outcomes.
+                let mut merged_unsuccessful = disk.unsuccessful;
+                for mem_item in guard.receipts.unsuccessful.drain(..) {
+                    let sid = mem_item.outcome.recording_state.session_id.clone();
+                    merged_unsuccessful
+                        .retain(|existing| existing.outcome.recording_state.session_id != sid);
+                    merged_unsuccessful.push_back(mem_item);
+                }
+                while merged_unsuccessful.len() > MAX_UNSUCCESSFUL_OUTCOMES {
+                    merged_unsuccessful.pop_front();
+                }
+                guard.receipts.unsuccessful = merged_unsuccessful;
 
-            // Merge older on-disk idempotency records behind any newer in-RAM records.
-            let mut merged_idem = disk.idempotency;
-            for mem_rec in guard.receipts.idempotency.drain(..) {
-                merged_idem.retain(|r| {
-                    !(r.principal_id == mem_rec.principal_id
-                        && r.operation == mem_rec.operation
-                        && r.key == mem_rec.key)
-                });
-                merged_idem.push_back(mem_rec);
-            }
-            while merged_idem.len() > MAX_IDEMPOTENCY_ENTRIES {
-                merged_idem.pop_front();
-            }
-            guard.receipts.idempotency = merged_idem;
+                // Merge older on-disk idempotency records behind any newer in-RAM records.
+                let mut merged_idem = disk.idempotency;
+                for mem_rec in guard.receipts.idempotency.drain(..) {
+                    merged_idem.retain(|r| {
+                        !(r.principal_id == mem_rec.principal_id
+                            && r.operation == mem_rec.operation
+                            && r.key == mem_rec.key)
+                    });
+                    merged_idem.push_back(mem_rec);
+                }
+                while merged_idem.len() > MAX_IDEMPOTENCY_ENTRIES {
+                    merged_idem.pop_front();
+                }
+                guard.receipts.idempotency = merged_idem;
 
-            if guard.receipts.safe_swap.is_none() {
-                guard.receipts.safe_swap = disk.safe_swap;
+                if guard.receipts.safe_swap.is_none() {
+                    guard.receipts.safe_swap = disk.safe_swap;
+                }
             }
         }
 
@@ -957,6 +1109,46 @@ impl ReceiptStore {
         Ok(None)
     }
 
+    fn insert_idempotency_locked(
+        receipts: &mut PersistedReceipts,
+        principal_id: &str,
+        operation: &str,
+        key: &str,
+        request_hash: &str,
+        response_json: Value,
+    ) {
+        receipts.idempotency.retain(|r| {
+            !(r.principal_id == principal_id && r.operation == operation && r.key == key)
+        });
+        if operation == "set_camera_focus" {
+            let focus_count = receipts
+                .idempotency
+                .iter()
+                .filter(|r| r.operation == "set_camera_focus")
+                .count();
+            if focus_count >= MAX_FOCUS_IDEMPOTENCY_ENTRIES {
+                if let Some(pos) = receipts
+                    .idempotency
+                    .iter()
+                    .position(|r| r.operation == "set_camera_focus")
+                {
+                    receipts.idempotency.remove(pos);
+                }
+            }
+        }
+        while receipts.idempotency.len() >= MAX_IDEMPOTENCY_ENTRIES {
+            receipts.idempotency.pop_front();
+        }
+        receipts.idempotency.push_back(IdempotencyRecord {
+            principal_id: principal_id.to_owned(),
+            key: key.to_owned(),
+            operation: operation.to_owned(),
+            request_hash: request_hash.to_owned(),
+            response_json,
+            recorded_at: now_rfc3339_utc(),
+        });
+    }
+
     fn store_idempotency(
         &self,
         principal_id: &str,
@@ -970,38 +1162,44 @@ impl ReceiptStore {
         let Ok(mut guard) = self.state.lock() else {
             return;
         };
-        guard.receipts.idempotency.retain(|r| {
-            !(r.principal_id == principal_id && r.operation == operation && r.key == key)
-        });
-        if operation == "set_camera_focus" {
-            let focus_count = guard
-                .receipts
-                .idempotency
-                .iter()
-                .filter(|r| r.operation == "set_camera_focus")
-                .count();
-            if focus_count >= MAX_FOCUS_IDEMPOTENCY_ENTRIES {
-                if let Some(pos) = guard
-                    .receipts
-                    .idempotency
-                    .iter()
-                    .position(|r| r.operation == "set_camera_focus")
-                {
-                    guard.receipts.idempotency.remove(pos);
-                }
-            }
-        }
-        while guard.receipts.idempotency.len() >= MAX_IDEMPOTENCY_ENTRIES {
-            guard.receipts.idempotency.pop_front();
-        }
-        guard.receipts.idempotency.push_back(IdempotencyRecord {
-            principal_id: principal_id.to_owned(),
-            key: key.to_owned(),
-            operation: operation.to_owned(),
-            request_hash: request_hash.to_owned(),
+        Self::insert_idempotency_locked(
+            &mut guard.receipts,
+            principal_id,
+            operation,
+            key,
+            request_hash,
             response_json,
-            recorded_at: now_rfc3339_utc(),
-        });
+        );
+        if volume_writable {
+            self.persist_locked(&mut guard.receipts);
+        }
+    }
+
+    /// Atomically persist both `safe_swap` and the optional `stop_capture` idempotency receipt
+    /// in a single write BEFORE the recording volume is marked `released = true`.
+    fn commit_safe_swap_bundle(
+        &self,
+        idem_entry: Option<(&str, &str, &str, Value)>,
+        receipt: SafeSwapReceipt,
+        volume_writable: bool,
+    ) {
+        self.ensure_loaded_from_disk(volume_writable);
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        guard.receipts.volume_id = Some(receipt.volume_id.clone());
+        guard.active_volume_id = Some(receipt.volume_id.clone());
+        guard.receipts.safe_swap = Some(receipt);
+        if let Some((principal_id, key, req_hash, response_json)) = idem_entry {
+            Self::insert_idempotency_locked(
+                &mut guard.receipts,
+                principal_id,
+                "stop_capture",
+                key,
+                req_hash,
+                response_json,
+            );
+        }
         if volume_writable {
             self.persist_locked(&mut guard.receipts);
         }
@@ -1099,6 +1297,253 @@ impl ReceiptStore {
             }
             return;
         }
+    }
+}
+
+// --- In-flight idempotency deduplication & conflict detection ---
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InFlightKey {
+    principal_id: String,
+    operation: &'static str,
+    key: String,
+}
+
+enum InFlightOutcome {
+    Running,
+    Succeeded(Value),
+    Failed(StorageError),
+}
+
+struct InFlightSlot {
+    request_hash: String,
+    outcome: Mutex<InFlightOutcome>,
+    cv: Condvar,
+}
+
+struct InFlightTracker {
+    entries: Mutex<HashMap<InFlightKey, Arc<InFlightSlot>>>,
+}
+
+enum InFlightRegistration<'a> {
+    Leader(InFlightLeaderGuard<'a>),
+    Replayed(Value),
+}
+
+struct InFlightLeaderGuard<'a> {
+    tracker: &'a InFlightTracker,
+    key: InFlightKey,
+    slot: Arc<InFlightSlot>,
+    completed: bool,
+}
+
+impl InFlightLeaderGuard<'_> {
+    fn succeed(mut self, response_json: Value) {
+        if let Ok(mut guard) = self.slot.outcome.lock() {
+            *guard = InFlightOutcome::Succeeded(response_json);
+        }
+        if let Ok(mut map) = self.tracker.entries.lock() {
+            map.remove(&self.key);
+        }
+        self.slot.cv.notify_all();
+        self.completed = true;
+    }
+
+    fn fail(mut self, err: &StorageError) {
+        if let Ok(mut guard) = self.slot.outcome.lock() {
+            *guard = InFlightOutcome::Failed(clone_storage_error(err));
+        }
+        if let Ok(mut map) = self.tracker.entries.lock() {
+            map.remove(&self.key);
+        }
+        self.slot.cv.notify_all();
+        self.completed = true;
+    }
+}
+
+impl Drop for InFlightLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(mut guard) = self.slot.outcome.lock() {
+                *guard = InFlightOutcome::Failed(StorageError::conflict(
+                    "idempotency_aborted",
+                    "in-flight idempotent command aborted before completion",
+                ));
+            }
+            if let Ok(mut map) = self.tracker.entries.lock() {
+                map.remove(&self.key);
+            }
+            self.slot.cv.notify_all();
+        }
+    }
+}
+
+impl InFlightTracker {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(
+        &self,
+        principal_id: &str,
+        operation: &'static str,
+        key: &str,
+        request_hash: &str,
+    ) -> StorageResult<InFlightRegistration<'_>> {
+        let map_key = InFlightKey {
+            principal_id: principal_id.to_owned(),
+            operation,
+            key: key.to_owned(),
+        };
+        let existing_slot = {
+            let mut map = self
+                .entries
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("inflight_idempotency")))?;
+            if let Some(existing) = map.get(&map_key) {
+                if existing.request_hash != request_hash {
+                    return Err(StorageError::conflict(
+                        "idempotency_conflict",
+                        "Idempotency-Key is currently in flight with different request parameters",
+                    ));
+                }
+                Some(Arc::clone(existing))
+            } else {
+                let slot = Arc::new(InFlightSlot {
+                    request_hash: request_hash.to_owned(),
+                    outcome: Mutex::new(InFlightOutcome::Running),
+                    cv: Condvar::new(),
+                });
+                map.insert(map_key.clone(), Arc::clone(&slot));
+                return Ok(InFlightRegistration::Leader(InFlightLeaderGuard {
+                    tracker: self,
+                    key: map_key,
+                    slot,
+                    completed: false,
+                }));
+            }
+        };
+
+        let Some(slot) = existing_slot else {
+            return Err(StorageError::conflict(
+                "idempotency_aborted",
+                "missing in-flight idempotency slot",
+            ));
+        };
+        let mut guard = slot
+            .outcome
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("inflight_slot")))?;
+        while matches!(*guard, InFlightOutcome::Running) {
+            let (next, wait_res) = slot
+                .cv
+                .wait_timeout(guard, Duration::from_secs(30))
+                .map_err(|_| StorageError::Core(CoreError::poisoned("inflight_slot")))?;
+            guard = next;
+            if wait_res.timed_out() && matches!(*guard, InFlightOutcome::Running) {
+                return Err(StorageError::conflict(
+                    "capture_busy",
+                    "timed out waiting for concurrent idempotent operation to finish",
+                ));
+            }
+        }
+        match &*guard {
+            InFlightOutcome::Succeeded(val) => Ok(InFlightRegistration::Replayed(val.clone())),
+            InFlightOutcome::Failed(err) => Err(clone_storage_error(err)),
+            InFlightOutcome::Running => Err(StorageError::conflict(
+                "capture_busy",
+                "concurrent idempotent operation is still running",
+            )),
+        }
+    }
+}
+
+fn clone_storage_error(err: &StorageError) -> StorageError {
+    match err {
+        StorageError::Unavailable { message } => StorageError::Unavailable {
+            message: message.clone(),
+        },
+        StorageError::ServiceUnavailable { code, message } => StorageError::ServiceUnavailable {
+            code,
+            message: message.clone(),
+        },
+        StorageError::VolumeInvalid { message } => StorageError::VolumeInvalid {
+            message: message.clone(),
+        },
+        StorageError::NotFound { session_id } => StorageError::NotFound {
+            session_id: session_id.clone(),
+        },
+        StorageError::Catalog { message } => StorageError::Catalog {
+            message: message.clone(),
+        },
+        StorageError::CatalogChanged { catalog_revision } => StorageError::CatalogChanged {
+            catalog_revision: catalog_revision.clone(),
+        },
+        StorageError::InvalidInput { code, message } => StorageError::InvalidInput {
+            code,
+            message: message.clone(),
+        },
+        StorageError::Conflict { code, message } => StorageError::Conflict {
+            code,
+            message: message.clone(),
+        },
+        StorageError::Unprocessable { code, message } => StorageError::Unprocessable {
+            code,
+            message: message.clone(),
+        },
+        StorageError::Locked { code, message } => StorageError::Locked {
+            code,
+            message: message.clone(),
+        },
+        StorageError::Unsupported { code, message } => StorageError::Unsupported {
+            code,
+            message: message.clone(),
+        },
+        StorageError::Integrity { code, message } => StorageError::Integrity {
+            code,
+            message: message.clone(),
+        },
+        StorageError::RangeNotSatisfiable { total_bytes } => StorageError::RangeNotSatisfiable {
+            total_bytes: *total_bytes,
+        },
+        StorageError::Io {
+            code,
+            context,
+            source,
+        } => StorageError::Io {
+            code,
+            context: context.clone(),
+            source: io::Error::new(source.kind(), source.to_string()),
+        },
+        StorageError::Core(core_err) => match core_err {
+            CoreError::InvalidInput { code, message } => {
+                StorageError::Core(CoreError::InvalidInput {
+                    code,
+                    message: message.clone(),
+                })
+            }
+            CoreError::InvalidConfig { code, message } => {
+                StorageError::Core(CoreError::InvalidConfig {
+                    code,
+                    message: message.clone(),
+                })
+            }
+            CoreError::LockBusy { message } => StorageError::Core(CoreError::LockBusy {
+                message: message.clone(),
+            }),
+            CoreError::Poisoned { resource } => StorageError::Core(CoreError::poisoned(resource)),
+            CoreError::Io {
+                code,
+                context,
+                source,
+            } => StorageError::Core(CoreError::Io {
+                code,
+                context: context.clone(),
+                source: io::Error::new(source.kind(), source.to_string()),
+            }),
+        },
     }
 }
 
@@ -1206,7 +1651,7 @@ struct ActiveSessionContext {
     timer_deadline_ns: Option<u64>,
     timer_duration_seconds: Option<u32>,
     handle: Option<Box<dyn ActiveCaptureHandle>>,
-    _maintenance_lock: Option<FlockGuard>,
+    _maintenance_lock: Option<Arc<FlockGuard>>,
 }
 
 impl ActiveSessionContext {
@@ -1228,10 +1673,14 @@ impl ActiveSessionContext {
 
 struct CoordinatorState {
     phase: CapturePhase,
+    phase_atomic: Arc<AtomicU8>,
     authority_epoch: String,
     source_revision: u64,
     admission: Option<VolumeAdmission>,
+    active_volume_id: Option<String>,
     volume_released: bool,
+    released_mount_signature: Option<(String, u64, String)>,
+    saw_unmount_since_release: bool,
     active: Option<ActiveSessionContext>,
     retained_unsuccessful: Option<CaptureSnapshotRecording>,
     timer_settings: CaptureTimerSettings,
@@ -1251,6 +1700,7 @@ impl CoordinatorState {
             ));
         }
         self.phase = next;
+        self.phase_atomic.store(next.to_u8(), Ordering::Release);
         self.source_revision = self.source_revision.saturating_add(1);
         Ok(())
     }
@@ -1261,6 +1711,8 @@ impl CoordinatorState {
     }
 }
 
+type SafeSwapReleaseHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Authoritative native Rust capture coordinator managing the capture FSM, volume reserve
 /// enforcement, zero-reread sealing, catalog admission, batch deletion, and events.
 pub struct CaptureCoordinator {
@@ -1269,7 +1721,13 @@ pub struct CaptureCoordinator {
     catalog: Arc<BinarySessionCatalog>,
     backend: Arc<dyn CaptureBackend>,
     receipts: ReceiptStore,
+    inflight: InFlightTracker,
     events: CaptureEventBroadcaster,
+    phase_atomic: Arc<AtomicU8>,
+    timer_write_lock: Mutex<()>,
+    audit_logger: Mutex<Option<Arc<AuditLogger>>>,
+    release_hooks: Mutex<Vec<SafeSwapReleaseHook>>,
+    audio_requested_mode: Mutex<String>,
     state: Mutex<CoordinatorState>,
     phase_cv: Condvar,
 }
@@ -1288,9 +1746,15 @@ impl CaptureCoordinator {
             .filter(|s| (1..=MAX_TIMER_DURATION_SECONDS).contains(&s.duration_seconds))
             .unwrap_or_default();
 
+        volume.set_volume_released(false);
         let admission = volume.admit(None).ok();
         let volume_writable = admission.as_ref().is_some_and(|a| a.writable);
-        let receipts = ReceiptStore::open(volume.paths().clone(), volume_writable);
+        let active_volume_id = admission.as_ref().map(|a| a.volume_id.clone());
+        let receipts = ReceiptStore::open(
+            volume.paths().clone(),
+            volume_writable,
+            active_volume_id.as_deref(),
+        );
 
         // Invalidate stale safe-swap receipt if it does not match the current mount generation.
         if let Ok(Some(existing_receipt)) = receipts.get_safe_swap(volume_writable) {
@@ -1303,25 +1767,119 @@ impl CaptureCoordinator {
             }
         }
 
+        let phase_atomic = Arc::new(AtomicU8::new(CapturePhase::Idle.to_u8()));
+
         Self {
             config,
             volume,
             catalog,
             backend,
             receipts,
+            inflight: InFlightTracker::new(),
             events: CaptureEventBroadcaster::new(),
+            phase_atomic: Arc::clone(&phase_atomic),
+            timer_write_lock: Mutex::new(()),
+            audit_logger: Mutex::new(None),
+            release_hooks: Mutex::new(Vec::new()),
+            audio_requested_mode: Mutex::new("device_default".to_owned()),
             state: Mutex::new(CoordinatorState {
                 phase: CapturePhase::Idle,
+                phase_atomic,
                 authority_epoch: new_uuid_v4(),
                 source_revision: 0,
                 admission,
+                active_volume_id,
                 volume_released: false,
+                released_mount_signature: None,
+                saw_unmount_since_release: false,
                 active: None,
                 retained_unsuccessful: None,
                 timer_settings,
                 last_failure_reason: None,
             }),
             phase_cv: Condvar::new(),
+        }
+    }
+
+    /// Register an [`AuditLogger`] whose active `/data/logs/audit` handle is flushed and closed
+    /// automatically before emitting a `SafeSwapReceipt`.
+    pub fn with_audit_logger(self, audit: Arc<AuditLogger>) -> Self {
+        self.set_audit_logger(audit);
+        self
+    }
+
+    pub fn set_audit_logger(&self, audit: Arc<AuditLogger>) {
+        if let Ok(mut guard) = self.audit_logger.lock() {
+            *guard = Some(audit);
+        }
+    }
+
+    /// Register an additional zero-handle release callback invoked during `StopReason::SafeSwap`.
+    pub fn with_safe_swap_release_hook(self, hook: SafeSwapReleaseHook) -> Self {
+        self.set_safe_swap_release_hook(hook);
+        self
+    }
+
+    pub fn set_safe_swap_release_hook(&self, hook: SafeSwapReleaseHook) {
+        if let Ok(mut guard) = self.release_hooks.lock() {
+            guard.push(hook);
+        }
+    }
+
+    /// Configure the default `audio_requested_mode` (`"device_default" | "disabled" | "enabled"`)
+    /// persisted into staging `capture.json` for crash recovery provenance.
+    pub fn with_audio_requested_mode(self, mode: impl Into<String>) -> Self {
+        self.set_audio_requested_mode(mode);
+        self
+    }
+
+    pub fn set_audio_requested_mode(&self, mode: impl Into<String>) {
+        let candidate = mode.into();
+        if matches!(
+            candidate.as_str(),
+            "device_default" | "disabled" | "enabled"
+        ) {
+            if let Ok(mut guard) = self.audio_requested_mode.lock() {
+                *guard = candidate;
+            }
+        }
+    }
+
+    /// Shared open-handle counter for tracking active artifact/log file descriptors on `/data`.
+    pub fn open_handle_counter(&self) -> Arc<AtomicUsize> {
+        self.volume.handle_counter()
+    }
+
+    /// Current number of open file handles tracked on `/data` (including `AuditLogger` if open).
+    pub fn open_handle_count(&self) -> usize {
+        let audit_open = self
+            .audit_logger
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| usize::from(a.has_open_file())))
+            .unwrap_or(0);
+        self.volume.open_handle_count().saturating_add(audit_open)
+    }
+
+    /// Acquire an RAII [`VolumeHandleLease`] on the recording volume.
+    pub fn acquire_open_handle_lease(&self) -> VolumeHandleLease {
+        self.volume.acquire_handle_lease()
+    }
+
+    fn close_all_volume_handles_for_safe_swap(&self) {
+        if let Ok(guard) = self.audit_logger.lock() {
+            if let Some(audit) = guard.as_ref() {
+                audit.close_active_file();
+            }
+        }
+        let hooks = self
+            .release_hooks
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook();
         }
     }
 
@@ -1341,16 +1899,38 @@ impl CaptureCoordinator {
         self.events.subscribe()
     }
 
+    /// Lock-free read of the current [`CapturePhase`] FSM state (`AtomicU8` mirror).
     pub fn phase(&self) -> StorageResult<CapturePhase> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-        Ok(guard.phase)
+        Ok(CapturePhase::from_u8(
+            self.phase_atomic.load(Ordering::Acquire),
+        ))
+    }
+
+    fn acquire_shared_maintenance_lock(&self) -> StorageResult<Option<Arc<FlockGuard>>> {
+        let Some(run_dir) = &self.config.run_dir else {
+            return Ok(None);
+        };
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            match acquire_maintenance_lock(run_dir, LockMode::Shared, true) {
+                Ok(lock) => return Ok(Some(Arc::new(lock))),
+                Err(CoreError::LockBusy { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Err(StorageError::service_unavailable(
+                            "maintenance_busy",
+                            "maintenance operation holds exclusive lock; retry shortly",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(other) => return Err(StorageError::from(other)),
+            }
+        }
     }
 
     /// Run crash prefix recovery on startup (`Idle -> Recovering -> Idle`).
     pub fn recover_on_startup(&self) -> StorageResult<RecoveryReport> {
+        let maintenance_lock = self.acquire_shared_maintenance_lock()?;
         {
             let mut guard = self
                 .state
@@ -1394,6 +1974,7 @@ impl CaptureCoordinator {
             self.phase_cv.notify_all();
             (guard.authority_epoch.clone(), guard.source_revision)
         };
+        drop(maintenance_lock);
 
         if let Ok(ref report) = result {
             if report.recovered > 0 || report.quarantined > 0 {
@@ -1423,17 +2004,29 @@ impl CaptureCoordinator {
 
     /// Explicitly recover the coordinator FSM from `Failed` back to `Idle` once faults clear.
     pub fn recover_from_failure(&self) -> StorageResult<CapturePhase> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-        if guard.phase != CapturePhase::Failed {
-            return Ok(guard.phase);
-        }
-        let prev_binding = if guard.volume_released {
+        let (phase_now, prev_adm, prev_vid, was_released) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase != CapturePhase::Failed {
+                return Ok(guard.phase);
+            }
+            (
+                guard.phase,
+                guard.admission.clone(),
+                guard.active_volume_id.clone(),
+                guard.volume_released,
+            )
+        };
+        let _ = phase_now;
+
+        // Perform volume admission I/O strictly outside `self.state.lock()`.
+        self.volume.set_volume_released(false);
+        let prev_binding = if was_released {
             None
         } else {
-            guard.admission.as_ref().map(|p| {
+            prev_adm.as_ref().map(|p| {
                 (
                     p.volume_id.as_str(),
                     p.device_id,
@@ -1444,36 +2037,82 @@ impl CaptureCoordinator {
         };
         let admitted = self.volume.admit(prev_binding).ok();
         let writable = admitted.as_ref().is_some_and(|a| a.writable);
-        guard.last_failure_reason = None;
-        guard.volume_released = false;
-        guard.admission = admitted;
-        guard.transition(CapturePhase::Idle)?;
-        self.phase_cv.notify_all();
-        drop(guard);
-        self.receipts.ensure_loaded_from_disk(writable);
+        let new_vid = admitted.as_ref().map(|a| a.volume_id.clone());
+        let volume_changed = match (&prev_vid, &new_vid) {
+            (Some(old_v), Some(new_v)) => old_v != new_v,
+            _ => false,
+        };
+        if let Some(ref vid) = new_vid {
+            self.receipts.bind_volume(Some(vid), writable);
+        } else {
+            self.receipts.ensure_loaded_from_disk(writable);
+        }
+        if admitted.is_some() {
+            let _ = self.catalog.reconcile();
+        }
+
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase != CapturePhase::Failed {
+                return Ok(guard.phase);
+            }
+            guard.last_failure_reason = None;
+            guard.volume_released = false;
+            guard.released_mount_signature = None;
+            guard.saw_unmount_since_release = false;
+            if volume_changed {
+                guard.retained_unsuccessful = None;
+            }
+            if new_vid.is_some() {
+                guard.active_volume_id = new_vid;
+            }
+            guard.admission = admitted.clone();
+            guard.transition(CapturePhase::Idle)?;
+            self.phase_cv.notify_all();
+        }
+
+        if writable {
+            let _ = self.recover_on_startup();
+        }
         Ok(CapturePhase::Idle)
     }
 
-    /// Re-admit a remounted or newly inserted volume, atomically invalidating any prior
-    /// safe-swap handoff receipt when the mount generation changes or was previously released.
+    /// Re-admit a remounted or newly inserted volume, isolating cross-card state, reconciling
+    /// the catalog, running crash recovery when recovering from a released/swapped/failed volume,
+    /// and atomically invalidating any prior safe-swap handoff receipt.
     pub fn refresh_volume_admission(&self) -> StorageResult<VolumeAdmission> {
-        let (prev, was_released) = {
+        self.reconcile_and_admit_volume(false)
+    }
+
+    fn reconcile_and_admit_volume(
+        &self,
+        run_recovery_always: bool,
+    ) -> StorageResult<VolumeAdmission> {
+        let (prev, prev_vid, was_released, was_failed) = {
             let guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase.is_busy() {
+            if guard.phase.is_busy() || guard.phase == CapturePhase::Closing {
                 return Err(StorageError::conflict(
                     "capture_busy",
                     "cannot refresh volume admission while capture is busy",
                 ));
             }
-            (guard.admission.clone(), guard.volume_released)
+            (
+                guard.admission.clone(),
+                guard.active_volume_id.clone(),
+                guard.volume_released,
+                guard.phase == CapturePhase::Failed,
+            )
         };
 
-        // Preserve generation_id across unchanged mounts, while always minting a fresh
-        // generation_id when re-admitting a volume that was released for safe swap.
-        let prev_binding = if was_released {
+        // Temporarily clear `released` to probe/admit; restore if admission fails.
+        self.volume.set_volume_released(false);
+        let prev_binding = if was_released || was_failed {
             None
         } else {
             prev.as_ref().map(|p| {
@@ -1485,24 +2124,85 @@ impl CaptureCoordinator {
                 )
             })
         };
-        let admitted = self.volume.admit(prev_binding)?;
-        self.receipts.ensure_loaded_from_disk(admitted.writable);
+        let admitted = match self.volume.admit(prev_binding) {
+            Ok(adm) => adm,
+            Err(err) => {
+                if was_released {
+                    self.volume.set_volume_released(true);
+                }
+                return Err(err);
+            }
+        };
 
-        let changed = was_released
+        let volume_changed = prev_vid
+            .as_deref()
+            .is_some_and(|old_vid| old_vid != admitted.volume_id);
+        self.receipts
+            .bind_volume(Some(&admitted.volume_id), admitted.writable);
+
+        let generation_changed = was_released
+            || was_failed
             || prev.as_ref().is_none_or(|p| {
                 p.volume_id != admitted.volume_id || p.generation_id != admitted.generation_id
             });
-        if changed {
+        if generation_changed {
             self.receipts.set_safe_swap(None, admitted.writable);
         }
+        if generation_changed || volume_changed {
+            let _ = self.catalog.reconcile();
+        }
 
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-        guard.admission = Some(admitted.clone());
-        guard.volume_released = false;
-        guard.bump_revision();
+        let (should_emit_snapshot, snap_info) = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase.is_busy() || guard.phase == CapturePhase::Closing {
+                return Err(StorageError::conflict(
+                    "capture_busy",
+                    "cannot commit volume admission while capture is busy",
+                ));
+            }
+            if volume_changed {
+                guard.retained_unsuccessful = None;
+            }
+            guard.active_volume_id = Some(admitted.volume_id.clone());
+            guard.admission = Some(admitted.clone());
+            guard.volume_released = false;
+            guard.released_mount_signature = None;
+            guard.saw_unmount_since_release = false;
+            guard.last_failure_reason = None;
+            if guard.phase == CapturePhase::Failed {
+                guard.transition(CapturePhase::Idle)?;
+                self.phase_cv.notify_all();
+                let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
+                let snap = self.build_status_snapshot_locked(&guard, runtime_json);
+                (
+                    true,
+                    Some((guard.authority_epoch.clone(), guard.source_revision, snap)),
+                )
+            } else {
+                guard.bump_revision();
+                (false, None)
+            }
+        };
+
+        if should_emit_snapshot {
+            if let Some((epoch, rev, snap)) = snap_info {
+                self.events.emit(
+                    &epoch,
+                    rev,
+                    CaptureEventType::Snapshot,
+                    None,
+                    serde_json::to_value(&snap.snapshot).unwrap_or(Value::Null),
+                );
+            }
+        }
+
+        if admitted.writable && (run_recovery_always || volume_changed || was_failed) {
+            let _ = self.recover_on_startup();
+        }
+
         Ok(admitted)
     }
 
@@ -1624,6 +2324,7 @@ impl CaptureCoordinator {
 
         let volume_writable = self.volume.is_mounted_and_writable();
         let req_hash = request_fingerprint(&req)?;
+        let mut inflight_guard = None;
         if let Some(key) = idempotency_key {
             validate_idempotency_key(key)?;
             if let Some(cached) = self.receipts.lookup_idempotency(
@@ -1642,58 +2343,108 @@ impl CaptureCoordinator {
                     replayed: true,
                 });
             }
+            match self
+                .inflight
+                .acquire(principal_id, "set_camera_focus", key, &req_hash)?
+            {
+                InFlightRegistration::Replayed(cached) => {
+                    let status: CameraFocusStatus =
+                        serde_json::from_value(cached).map_err(|err| StorageError::Catalog {
+                            message: format!("corrupt replayed focus receipt: {err}"),
+                        })?;
+                    return Ok(IdempotentOutcome {
+                        value: status,
+                        replayed: true,
+                    });
+                }
+                InFlightRegistration::Leader(leader) => {
+                    // Re-check persisted store after acquiring slot in case previous leader just committed.
+                    if let Some(cached) = self.receipts.lookup_idempotency(
+                        principal_id,
+                        "set_camera_focus",
+                        key,
+                        &req_hash,
+                        volume_writable,
+                    )? {
+                        let status: CameraFocusStatus = serde_json::from_value(cached.clone())
+                            .map_err(|err| StorageError::Catalog {
+                                message: format!("corrupt cached focus receipt: {err}"),
+                            })?;
+                        leader.succeed(cached);
+                        return Ok(IdempotentOutcome {
+                            value: status,
+                            replayed: true,
+                        });
+                    }
+                    inflight_guard = Some(leader);
+                }
+            }
         }
 
-        if !self.backend.is_camera_connected() {
-            return Err(StorageError::camera_not_connected(
-                "configured camera is not connected",
-            ));
-        }
-        let current = self.backend.camera_focus()?.ok_or_else(|| {
-            StorageError::unsupported(
-                "camera_focus_unsupported",
-                "camera does not expose focus_absolute control",
-            )
-        })?;
-
-        if let Some(val) = req.value {
-            if val < current.minimum || val > current.maximum {
-                return Err(StorageError::unprocessable(
-                    "invalid_camera_focus",
-                    format!(
-                        "focus value {val} outside allowed range {}..={}",
-                        current.minimum, current.maximum
-                    ),
+        let exec_res: StorageResult<CameraFocusStatus> = (|| {
+            if !self.backend.is_camera_connected() {
+                return Err(StorageError::camera_not_connected(
+                    "configured camera is not connected",
                 ));
             }
-            if current.step > 1 && (val - current.minimum) % current.step != 0 {
+            let current = self.backend.camera_focus()?.ok_or_else(|| {
+                StorageError::unsupported(
+                    "camera_focus_unsupported",
+                    "camera does not expose focus_absolute control",
+                )
+            })?;
+
+            if let Some(val) = req.value {
+                if val < current.minimum || val > current.maximum {
+                    return Err(StorageError::unprocessable(
+                        "invalid_camera_focus",
+                        format!(
+                            "focus value {val} outside allowed range {}..={}",
+                            current.minimum, current.maximum
+                        ),
+                    ));
+                }
+                if current.step > 1 && (val - current.minimum) % current.step != 0 {
+                    return Err(StorageError::unprocessable(
+                        "invalid_camera_focus",
+                        format!(
+                            "focus value {val} is not aligned with step {}",
+                            current.step
+                        ),
+                    ));
+                }
+            }
+            if req.auto_enabled.is_some() && !current.auto_supported {
                 return Err(StorageError::unprocessable(
                     "invalid_camera_focus",
-                    format!(
-                        "focus value {val} is not aligned with step {}",
-                        current.step
-                    ),
+                    "camera does not expose focus_auto control",
                 ));
             }
-        }
-        if req.auto_enabled.is_some() && !current.auto_supported {
-            return Err(StorageError::unprocessable(
-                "invalid_camera_focus",
-                "camera does not expose focus_auto control",
-            ));
-        }
 
-        let updated = self.backend.set_camera_focus(&req)?;
+            self.backend.set_camera_focus(&req)
+        })();
+
+        let updated = match exec_res {
+            Ok(u) => u,
+            Err(err) => {
+                if let Some(leader) = inflight_guard {
+                    leader.fail(&err);
+                }
+                return Err(err);
+            }
+        };
         if let Some(key) = idempotency_key {
-            if let Ok(json_val) = serde_json::to_value(&updated) {
-                self.receipts.store_idempotency(
-                    principal_id,
-                    "set_camera_focus",
-                    key,
-                    &req_hash,
-                    json_val,
-                    self.volume.is_mounted_and_writable(),
-                );
+            let json_val = serde_json::to_value(&updated).unwrap_or(Value::Null);
+            self.receipts.store_idempotency(
+                principal_id,
+                "set_camera_focus",
+                key,
+                &req_hash,
+                json_val.clone(),
+                self.volume.is_mounted_and_writable(),
+            );
+            if let Some(leader) = inflight_guard {
+                leader.succeed(json_val);
             }
         }
         Ok(IdempotentOutcome {
@@ -1757,6 +2508,29 @@ impl CaptureCoordinator {
             duration_seconds: req.duration_seconds,
         };
 
+        let _timer_io_guard = self
+            .timer_write_lock
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("timer_write_lock")))?;
+
+        if self.phase()?.is_busy() {
+            return Err(StorageError::conflict(
+                "capture_busy",
+                "cannot change capture timer settings while capture or finalization is active",
+            ));
+        }
+
+        // Perform atomic timer file write outside `self.state.lock()`.
+        if let Some(path) = &self.config.timer_settings_path {
+            let mut bytes = serde_json::to_vec_pretty(&new_settings).map_err(|err| {
+                StorageError::invalid_input("timer_encode_failed", err.to_string())
+            })?;
+            bytes.push(b'\n');
+            write_bytes_atomic(path, &bytes, 0o640, true).map_err(|err| {
+                StorageError::io("timer_save_failed", "persist capture timer settings", err)
+            })?;
+        }
+
         {
             let mut guard = self
                 .state
@@ -1767,15 +2541,6 @@ impl CaptureCoordinator {
                     "capture_busy",
                     "cannot change capture timer settings while capture or finalization is active",
                 ));
-            }
-            if let Some(path) = &self.config.timer_settings_path {
-                let mut bytes = serde_json::to_vec_pretty(&new_settings).map_err(|err| {
-                    StorageError::invalid_input("timer_encode_failed", err.to_string())
-                })?;
-                bytes.push(b'\n');
-                write_bytes_atomic(path, &bytes, 0o640, true).map_err(|err| {
-                    StorageError::io("timer_save_failed", "persist capture timer settings", err)
-                })?;
             }
             guard.timer_settings = new_settings;
         }
@@ -1890,6 +2655,7 @@ impl CaptureCoordinator {
         validate_start_request(&req)?;
         let volume_writable_hint = self.volume.is_mounted_and_writable();
         let req_hash = request_fingerprint(&req)?;
+        let mut inflight_guard = None;
         if let Some(key) = idempotency_key {
             validate_idempotency_key(key)?;
             if let Some(cached) = self.receipts.lookup_idempotency(
@@ -1908,15 +2674,79 @@ impl CaptureCoordinator {
                     replayed: true,
                 });
             }
+            match self
+                .inflight
+                .acquire(principal_id, "start_capture", key, &req_hash)?
+            {
+                InFlightRegistration::Replayed(cached) => {
+                    let snap: CaptureStatusSnapshot =
+                        serde_json::from_value(cached).map_err(|e| StorageError::Catalog {
+                            message: format!("corrupt replayed start receipt: {e}"),
+                        })?;
+                    return Ok(IdempotentOutcome {
+                        value: snap,
+                        replayed: true,
+                    });
+                }
+                InFlightRegistration::Leader(leader) => {
+                    if let Some(cached) = self.receipts.lookup_idempotency(
+                        principal_id,
+                        "start_capture",
+                        key,
+                        &req_hash,
+                        volume_writable_hint,
+                    )? {
+                        let snap: CaptureStatusSnapshot = serde_json::from_value(cached.clone())
+                            .map_err(|e| StorageError::Catalog {
+                                message: format!("corrupt cached start receipt: {e}"),
+                            })?;
+                        leader.succeed(cached);
+                        return Ok(IdempotentOutcome {
+                            value: snap,
+                            replayed: true,
+                        });
+                    }
+                    inflight_guard = Some(leader);
+                }
+            }
         }
 
+        let exec_res =
+            self.execute_start_capture_inner(&req, principal_id, idempotency_key, &req_hash);
+        match exec_res {
+            Ok(status_snapshot) => {
+                if let Some(leader) = inflight_guard {
+                    let json_val = serde_json::to_value(&status_snapshot).unwrap_or(Value::Null);
+                    leader.succeed(json_val);
+                }
+                Ok(IdempotentOutcome {
+                    value: status_snapshot,
+                    replayed: false,
+                })
+            }
+            Err(err) => {
+                if let Some(leader) = inflight_guard {
+                    leader.fail(&err);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn execute_start_capture_inner(
+        &self,
+        req: &CaptureStartRequest,
+        principal_id: &str,
+        idempotency_key: Option<&str>,
+        req_hash: &str,
+    ) -> StorageResult<CaptureStatusSnapshot> {
         // Fast preflight on coordinator state before hardware/filesystem probes.
         let prev_admission = {
             let guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.volume_released {
+            if guard.volume_released || self.volume.is_volume_released() {
                 return Err(StorageError::conflict(
                     "volume_released",
                     "recording volume was released for safe swap",
@@ -1959,7 +2789,8 @@ impl CaptureCoordinator {
             .volume
             .admit(prev_binding)
             .map_err(map_start_volume_error)?;
-        self.receipts.ensure_loaded_from_disk(admission.writable);
+        self.receipts
+            .bind_volume(Some(&admission.volume_id), admission.writable);
 
         if let Some(requested_vid) = &req.volume_id {
             if requested_vid != &admission.volume_id {
@@ -1980,14 +2811,11 @@ impl CaptureCoordinator {
             return Err(StorageError::unprocessable(reserve_code, reserve.message));
         }
 
-        // Acquire maintenance shared lock when run_dir is configured so idle fstrim / watchdog defer.
-        let maintenance_lock = match &self.config.run_dir {
-            Some(run_dir) => Some(
-                acquire_maintenance_lock(run_dir, LockMode::Shared, true)
-                    .map_err(StorageError::from)?,
-            ),
-            None => None,
-        };
+        // Acquire maintenance shared lock (retrying briefly on LockBusy) so idle fstrim / watchdog defer.
+        let maintenance_lock = self.acquire_shared_maintenance_lock()?;
+        // Keep a local clone across `Starting` so even if `close()` transitions `Starting -> Closing`
+        // while `begin_capture` is blocked, `maintenance.lock` stays held until cleanup finishes!
+        let local_starting_lock = maintenance_lock.clone();
 
         let session_id = new_uuid_v7();
         let started_at = now_rfc3339_utc();
@@ -2009,7 +2837,7 @@ impl CaptureCoordinator {
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.volume_released {
+            if guard.volume_released || self.volume.is_volume_released() {
                 return Err(StorageError::conflict(
                     "volume_released",
                     "recording volume was released for safe swap",
@@ -2069,6 +2897,7 @@ impl CaptureCoordinator {
                 handle: None,
                 _maintenance_lock: maintenance_lock,
             });
+            guard.active_volume_id = Some(admission.volume_id.clone());
             guard.admission = Some(admission.clone());
             guard.transition(CapturePhase::Starting)?;
             self.phase_cv.notify_all();
@@ -2083,7 +2912,7 @@ impl CaptureCoordinator {
 
         // Prepare staging directory `/data/.miro-ego/staging/<session_id>.partial`.
         if let Err(err) = fs::create_dir_all(staging_dir.join("video")) {
-            let _ = fs::remove_dir_all(&staging_dir);
+            cleanup_empty_staging_attempt(&staging_dir);
             let storage_err = StorageError::io(
                 "staging_create_failed",
                 "create staging partial directory",
@@ -2097,10 +2926,18 @@ impl CaptureCoordinator {
                 "staging_create_failed",
                 &storage_err.to_string(),
             );
+            drop(local_starting_lock);
             return Err(storage_err);
         }
 
-        // Write `capture.json` metadata marker so crash recovery can reconstruct full provenance.
+        // Write `capture.json` metadata marker (including encoding, camera, device, and audio mode)
+        // and propagate write errors before starting hardware capture!
+        let audio_req_mode = self
+            .audio_requested_mode
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_else(|| "device_default".to_owned());
         let capture_marker = json!({
             "session_id": session_id,
             "take_id": take_id,
@@ -2110,11 +2947,100 @@ impl CaptureCoordinator {
             "capture_mode": req.mode.as_str(),
             "display_name": display_name,
             "started_at": started_at,
+            "timezone": self.config.timezone,
             "segment_frames": self.config.segment_frames,
+            "audio_requested_mode": audio_req_mode,
+            "device": {
+                "device_id": self.config.device_id,
+                "device_label": self.config.device_label,
+                "hardware_fingerprint": self.config.hardware_fingerprint,
+                "platform": self.config.platform,
+                "software_version": self.config.software_version,
+                "commit": self.config.commit,
+            },
+            "camera": {
+                "width": self.config.camera_width,
+                "height": self.config.camera_height,
+                "sensor_fps": self.config.sensor_fps,
+                "frame_decimation": self.config.frame_decimation,
+            },
+            "encoding": self.config.encoding,
         });
-        if let Ok(mut bytes) = serde_json::to_vec_pretty(&capture_marker) {
+        let capture_marker_res: StorageResult<()> = (|| {
+            let mut bytes = serde_json::to_vec_pretty(&capture_marker).map_err(|err| {
+                StorageError::Catalog {
+                    message: format!("serialize capture.json failed: {err}"),
+                }
+            })?;
             bytes.push(b'\n');
-            let _ = write_bytes_atomic(&staging_dir.join("capture.json"), &bytes, 0o640, true);
+            write_bytes_atomic(&staging_dir.join("capture.json"), &bytes, 0o640, true).map_err(
+                |err| StorageError::io("capture_marker_write_failed", "write capture.json", err),
+            )
+        })();
+        if let Err(storage_err) = capture_marker_res {
+            cleanup_empty_staging_attempt(&staging_dir);
+            self.fail_start_attempt(
+                &session_id,
+                &take_id,
+                &display_name,
+                &admission,
+                storage_err.code(),
+                &storage_err.to_string(),
+            );
+            drop(local_starting_lock);
+            return Err(storage_err);
+        }
+
+        // Write initial `recording.json` outside `self.state.lock()` and propagate write errors!
+        let initial_rec_state = RecordingState {
+            schema: RECORDING_STATE_SCHEMA.to_owned(),
+            state: "recording".to_owned(),
+            authority_epoch: authority_epoch.clone(),
+            state_revision: 1,
+            updated_at: started_at.clone(),
+            session_id: session_id.clone(),
+            take_id: take_id.clone(),
+            display_name: display_name.clone(),
+            device: self.config.device_identity(),
+            storage: RecordingStateStorage {
+                volume_id: admission.volume_id.clone(),
+                status: "mounted".to_owned(),
+                writable: admission.writable,
+                remaining_bytes: Some(admission.available_bytes),
+            },
+            progress: RecordingStateProgress {
+                elapsed_seconds: 0.0,
+                captured_frames: 0,
+                bytes_written: 0,
+                verification: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let recording_marker_res: StorageResult<()> = (|| {
+            let mut bytes = serde_json::to_vec_pretty(&initial_rec_state).map_err(|err| {
+                StorageError::Catalog {
+                    message: format!("serialize recording.json failed: {err}"),
+                }
+            })?;
+            bytes.push(b'\n');
+            write_bytes_atomic(&staging_dir.join("recording.json"), &bytes, 0o640, true).map_err(
+                |err| {
+                    StorageError::io("recording_marker_write_failed", "write recording.json", err)
+                },
+            )
+        })();
+        if let Err(storage_err) = recording_marker_res {
+            cleanup_empty_staging_attempt(&staging_dir);
+            self.fail_start_attempt(
+                &session_id,
+                &take_id,
+                &display_name,
+                &admission,
+                storage_err.code(),
+                &storage_err.to_string(),
+            );
+            drop(local_starting_lock);
+            return Err(storage_err);
         }
 
         // Start backend capture.
@@ -2130,7 +3056,7 @@ impl CaptureCoordinator {
         let handle = match self.backend.begin_capture(&backend_req) {
             Ok(h) => h,
             Err(err) => {
-                let _ = fs::remove_dir_all(&staging_dir);
+                cleanup_empty_staging_attempt(&staging_dir);
                 if matches!(
                     err.code(),
                     "camera_not_connected" | "calibration_unavailable"
@@ -2158,6 +3084,7 @@ impl CaptureCoordinator {
                         &err.to_string(),
                     );
                 }
+                drop(local_starting_lock);
                 return Err(err);
             }
         };
@@ -2174,7 +3101,8 @@ impl CaptureCoordinator {
                 drop(guard);
                 handle.abort();
                 drop(released);
-                let _ = fs::remove_dir_all(&staging_dir);
+                cleanup_empty_staging_attempt(&staging_dir);
+                drop(local_starting_lock);
                 return Err(err);
             }
             // Starting a new take removes retained_unsuccessful from current status,
@@ -2185,19 +3113,49 @@ impl CaptureCoordinator {
             }
             self.phase_cv.notify_all();
             let snap = self.build_status_snapshot_locked(&guard, runtime_json);
-            if let Some(active_rec) = &snap.snapshot.active_recording {
-                if let Ok(mut bytes) = serde_json::to_vec_pretty(&active_rec.recording_state) {
-                    bytes.push(b'\n');
-                    let _ = write_bytes_atomic(
-                        &staging_dir.join("recording.json"),
-                        &bytes,
-                        0o640,
-                        true,
-                    );
-                }
-            }
             (snap, guard.source_revision)
         };
+        drop(local_starting_lock);
+
+        // Update `recording.json` with exact `state_revision` outside `self.state.lock()`.
+        if let Some(active_rec) = &status_snapshot.snapshot.active_recording {
+            if let Ok(mut bytes) = serde_json::to_vec_pretty(&active_rec.recording_state) {
+                bytes.push(b'\n');
+                if let Err(err) =
+                    write_bytes_atomic(&staging_dir.join("recording.json"), &bytes, 0o640, true)
+                {
+                    // Abort the just-started recording cleanly if `recording.json` fails to persist.
+                    let extracted = {
+                        let mut guard = match self.state.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let h = guard.active.as_mut().and_then(|c| c.handle.take());
+                        let _ = guard.transition(CapturePhase::Stopping);
+                        self.phase_cv.notify_all();
+                        h
+                    };
+                    if let Some(h) = extracted {
+                        h.abort();
+                    }
+                    cleanup_empty_staging_attempt(&staging_dir);
+                    let storage_err = StorageError::io(
+                        "recording_marker_write_failed",
+                        "persist recording.json after start",
+                        err,
+                    );
+                    self.fail_start_attempt(
+                        &session_id,
+                        &take_id,
+                        &display_name,
+                        &admission,
+                        storage_err.code(),
+                        &storage_err.to_string(),
+                    );
+                    return Err(storage_err);
+                }
+            }
+        }
 
         self.events.emit(
             &authority_epoch,
@@ -2225,17 +3183,14 @@ impl CaptureCoordinator {
                     principal_id,
                     "start_capture",
                     key,
-                    &req_hash,
+                    req_hash,
                     json_val,
                     admission.writable,
                 );
             }
         }
 
-        Ok(IdempotentOutcome {
-            value: status_snapshot,
-            replayed: false,
-        })
+        Ok(status_snapshot)
     }
 
     fn resolve_continuation_locked(
@@ -2302,6 +3257,7 @@ impl CaptureCoordinator {
 
         let volume_writable_hint = self.volume.is_mounted_and_writable();
         let req_hash = request_fingerprint(&req)?;
+        let mut inflight_guard = None;
         if let Some(key) = idempotency_key {
             validate_idempotency_key(key)?;
             if let Some(cached) = self.receipts.lookup_idempotency(
@@ -2320,8 +3276,74 @@ impl CaptureCoordinator {
                     replayed: true,
                 });
             }
+            match self
+                .inflight
+                .acquire(principal_id, "stop_capture", key, &req_hash)?
+            {
+                InFlightRegistration::Replayed(cached) => {
+                    let snap: Option<CaptureStatusSnapshot> = serde_json::from_value(cached)
+                        .map_err(|e| StorageError::Catalog {
+                            message: format!("corrupt replayed stop receipt: {e}"),
+                        })?;
+                    return Ok(IdempotentOutcome {
+                        value: snap,
+                        replayed: true,
+                    });
+                }
+                InFlightRegistration::Leader(leader) => {
+                    if let Some(cached) = self.receipts.lookup_idempotency(
+                        principal_id,
+                        "stop_capture",
+                        key,
+                        &req_hash,
+                        volume_writable_hint,
+                    )? {
+                        let snap: Option<CaptureStatusSnapshot> =
+                            serde_json::from_value(cached.clone()).map_err(|e| {
+                                StorageError::Catalog {
+                                    message: format!("corrupt cached stop receipt: {e}"),
+                                }
+                            })?;
+                        leader.succeed(cached);
+                        return Ok(IdempotentOutcome {
+                            value: snap,
+                            replayed: true,
+                        });
+                    }
+                    inflight_guard = Some(leader);
+                }
+            }
         }
 
+        let exec_res =
+            self.execute_stop_capture_inner(&req, principal_id, idempotency_key, &req_hash);
+        match exec_res {
+            Ok(wrapped) => {
+                if let Some(leader) = inflight_guard {
+                    let json_val = serde_json::to_value(&wrapped).unwrap_or(Value::Null);
+                    leader.succeed(json_val);
+                }
+                Ok(IdempotentOutcome {
+                    value: wrapped,
+                    replayed: false,
+                })
+            }
+            Err(err) => {
+                if let Some(leader) = inflight_guard {
+                    leader.fail(&err);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn execute_stop_capture_inner(
+        &self,
+        req: &CaptureStopRequest,
+        principal_id: &str,
+        idempotency_key: Option<&str>,
+        req_hash: &str,
+    ) -> StorageResult<Option<CaptureStatusSnapshot>> {
         let (meta, handle, final_progress, authority_epoch, stopping_rev) = {
             let mut guard = self
                 .state
@@ -2339,25 +3361,21 @@ impl CaptureCoordinator {
                 }
             }
 
-            if matches!(
-                guard.phase,
-                CapturePhase::Idle | CapturePhase::Deleting | CapturePhase::Failed
-            ) {
+            // `Deleting` is NOT idle: only `Idle` and `Failed` return `204` (`None`);
+            // `Deleting` falls through below and returns `409 capture_busy`.
+            if matches!(guard.phase, CapturePhase::Idle | CapturePhase::Failed) {
                 drop(guard);
                 if let Some(key) = idempotency_key {
                     self.receipts.store_idempotency(
                         principal_id,
                         "stop_capture",
                         key,
-                        &req_hash,
+                        req_hash,
                         Value::Null,
                         self.volume.is_mounted_and_writable(),
                     );
                 }
-                return Ok(IdempotentOutcome {
-                    value: None,
-                    replayed: false,
-                });
+                return Ok(None);
             }
 
             if guard.phase == CapturePhase::Stopping {
@@ -2371,11 +3389,20 @@ impl CaptureCoordinator {
                     ));
                 }
                 drop(guard);
-                let snap = self.capture_status()?;
-                return Ok(IdempotentOutcome {
-                    value: Some(snap),
-                    replayed: false,
-                });
+                let wrapped = Some(self.capture_status()?);
+                if let Some(key) = idempotency_key {
+                    if let Ok(json_val) = serde_json::to_value(&wrapped) {
+                        self.receipts.store_idempotency(
+                            principal_id,
+                            "stop_capture",
+                            key,
+                            req_hash,
+                            json_val,
+                            self.volume.is_mounted_and_writable(),
+                        );
+                    }
+                }
+                return Ok(wrapped);
             }
 
             if guard.phase != CapturePhase::Recording {
@@ -2446,26 +3473,30 @@ impl CaptureCoordinator {
                         principal_id,
                         "stop_capture",
                         key,
-                        &req_hash,
+                        req_hash,
                         json_val,
                         !media_lost && self.volume.is_mounted_and_writable(),
                     );
                 }
             }
-            return Ok(IdempotentOutcome {
-                value: wrapped,
-                replayed: false,
-            });
+            return Ok(wrapped);
         }
 
         let captured = match handle.finish(req.reason) {
             Ok(artifacts) => artifacts,
             Err(err) => {
                 let media_lost = !self.volume.is_mounted_and_writable();
+                let terminal_state =
+                    if !media_lost && is_transient_storage_error(&err) && meta.staging_dir.is_dir()
+                    {
+                        "recoverable"
+                    } else {
+                        "failed"
+                    };
                 let failed_snap = self.record_unsuccessful_stop(
                     &meta,
                     final_progress,
-                    "failed",
+                    terminal_state,
                     err.code(),
                     &err.to_string(),
                     media_lost,
@@ -2477,16 +3508,13 @@ impl CaptureCoordinator {
                             principal_id,
                             "stop_capture",
                             key,
-                            &req_hash,
+                            req_hash,
                             json_val,
                             !media_lost && self.volume.is_mounted_and_writable(),
                         );
                     }
                 }
-                return Ok(IdempotentOutcome {
-                    value: wrapped,
-                    replayed: false,
-                });
+                return Ok(wrapped);
             }
         };
 
@@ -2534,10 +3562,19 @@ impl CaptureCoordinator {
             Ok(s) => s,
             Err(err) => {
                 let media_lost = !self.volume.is_mounted_and_writable();
+                // Pre-publish transient storage error (`ENOSPC`) leaves `.partial` intact in
+                // `.miro-ego/staging/` as `"recoverable"` instead of quarantining or deleting!
+                let terminal_state =
+                    if !media_lost && is_transient_storage_error(&err) && meta.staging_dir.is_dir()
+                    {
+                        "recoverable"
+                    } else {
+                        "failed"
+                    };
                 let failed_snap = self.record_unsuccessful_stop(
                     &meta,
                     verify_progress,
-                    "failed",
+                    terminal_state,
                     err.code(),
                     &err.to_string(),
                     media_lost,
@@ -2549,22 +3586,19 @@ impl CaptureCoordinator {
                             principal_id,
                             "stop_capture",
                             key,
-                            &req_hash,
+                            req_hash,
                             json_val,
                             !media_lost && self.volume.is_mounted_and_writable(),
                         );
                     }
                 }
-                return Ok(IdempotentOutcome {
-                    value: wrapped,
-                    replayed: false,
-                });
+                return Ok(wrapped);
             }
         };
 
-        // Release ONLY `_maintenance_lock` BEFORE persisting/emitting a SafeSwapReceipt so
-        // `open_handle_count == 0` holds strictly while `guard.active` remains populated until
-        // the atomic `Stopping -> Idle` transition (preventing any `"blocked"` snapshot glitch!).
+        // Release `_maintenance_lock` FIRST, and on `SafeSwap` close `AuditLogger` + invoke
+        // release hooks, persist `stop_capture` idempotency + `safe_swap` TOGETHER in `ReceiptStore`,
+        // and THEN mark the volume released before emitting `SafeSwapReceipt`!
         let admission_writable = meta.admission.writable;
         let released_lock = {
             let mut guard = self
@@ -2578,25 +3612,9 @@ impl CaptureCoordinator {
         };
         drop(released_lock);
 
-        let safe_swap_receipt = if req.reason == StopReason::SafeSwap {
-            let receipt = SafeSwapReceipt {
-                schema: SAFE_SWAP_RECEIPT_SCHEMA.to_owned(),
-                session_id: session_id.clone(),
-                volume_id: volume_id.clone(),
-                generation_id: generation_id.clone(),
-                manifest_id: sealed.manifest_id.clone(),
-                manifest_sha256: sealed.manifest_sha256.clone(),
-                sealed_at: sealed.sealed_at.clone(),
-                released_at: now_rfc3339_utc(),
-                release_state: "device-released".to_owned(),
-                open_handle_count: 0,
-            };
-            self.receipts
-                .set_safe_swap(Some(receipt.clone()), admission_writable);
-            Some(receipt)
-        } else {
-            None
-        };
+        if req.reason == StopReason::SafeSwap {
+            self.close_all_volume_handles_for_safe_swap();
+        }
 
         let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
         let (final_snapshot, done_rev, released_ctx) = {
@@ -2607,6 +3625,12 @@ impl CaptureCoordinator {
             let released = guard.active.take();
             if req.reason == StopReason::SafeSwap {
                 guard.volume_released = true;
+                guard.released_mount_signature = Some((
+                    meta.admission.volume_id.clone(),
+                    meta.admission.device_id,
+                    meta.admission.mount_identity.clone(),
+                ));
+                guard.saw_unmount_since_release = false;
             }
             guard.transition(CapturePhase::Idle)?;
             self.phase_cv.notify_all();
@@ -2614,6 +3638,48 @@ impl CaptureCoordinator {
             (snap, guard.source_revision, released)
         };
         drop(released_ctx);
+
+        let wrapped = Some(final_snapshot);
+
+        let safe_swap_receipt = if req.reason == StopReason::SafeSwap {
+            self.close_all_volume_handles_for_safe_swap();
+            let open_handles = u32::try_from(self.open_handle_count()).unwrap_or(u32::MAX);
+            let receipt = SafeSwapReceipt {
+                schema: SAFE_SWAP_RECEIPT_SCHEMA.to_owned(),
+                session_id: session_id.clone(),
+                volume_id: volume_id.clone(),
+                generation_id: generation_id.clone(),
+                manifest_id: sealed.manifest_id.clone(),
+                manifest_sha256: sealed.manifest_sha256.clone(),
+                sealed_at: sealed.sealed_at.clone(),
+                released_at: now_rfc3339_utc(),
+                release_state: "device-released".to_owned(),
+                open_handle_count: open_handles,
+            };
+            let idem_json = serde_json::to_value(&wrapped).unwrap_or(Value::Null);
+            let idem_tuple = idempotency_key.map(|k| (principal_id, k, req_hash, idem_json));
+            // Persist BOTH `stop_capture` idempotency and `safe_swap` receipt BEFORE setting
+            // `volume.set_volume_released(true)` so zero writes occur on `/data` after release!
+            self.receipts
+                .commit_safe_swap_bundle(idem_tuple, receipt.clone(), admission_writable);
+            self.volume.set_volume_released(true);
+            self.close_all_volume_handles_for_safe_swap();
+            Some(receipt)
+        } else {
+            if let Some(key) = idempotency_key {
+                if let Ok(json_val) = serde_json::to_value(&wrapped) {
+                    self.receipts.store_idempotency(
+                        principal_id,
+                        "stop_capture",
+                        key,
+                        req_hash,
+                        json_val,
+                        admission_writable,
+                    );
+                }
+            }
+            None
+        };
 
         if let Some(receipt) = safe_swap_receipt {
             self.events.emit(
@@ -2624,32 +3690,17 @@ impl CaptureCoordinator {
                 serde_json::to_value(&receipt).unwrap_or(Value::Null),
             );
         }
-        self.events.emit(
-            &authority_epoch,
-            done_rev,
-            CaptureEventType::Snapshot,
-            None,
-            serde_json::to_value(&final_snapshot.snapshot).unwrap_or(Value::Null),
-        );
-
-        let wrapped = Some(final_snapshot);
-        if let Some(key) = idempotency_key {
-            if let Ok(json_val) = serde_json::to_value(&wrapped) {
-                self.receipts.store_idempotency(
-                    principal_id,
-                    "stop_capture",
-                    key,
-                    &req_hash,
-                    json_val,
-                    admission_writable,
-                );
-            }
+        if let Some(ref snap) = wrapped {
+            self.events.emit(
+                &authority_epoch,
+                done_rev,
+                CaptureEventType::Snapshot,
+                None,
+                serde_json::to_value(&snap.snapshot).unwrap_or(Value::Null),
+            );
         }
 
-        Ok(IdempotentOutcome {
-            value: wrapped,
-            replayed: false,
-        })
+        Ok(wrapped)
     }
 
     /// Batch-delete explicitly selected sealed recordings with idempotency, digest preflight,
@@ -2718,56 +3769,112 @@ impl CaptureCoordinator {
             });
         }
 
-        // Refuse deletion during active capture/finalization or when volume is released.
-        {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.volume_released {
-                return Err(StorageError::locked(
-                    "volume_released",
-                    "cannot delete sessions while recording volume is released",
-                ));
+        let inflight_leader = match self.inflight.acquire(
+            principal_id,
+            "delete_sessions",
+            idempotency_key,
+            &req_hash,
+        )? {
+            InFlightRegistration::Replayed(cached) => {
+                let result: DeleteSessionsResult =
+                    serde_json::from_value(cached).map_err(|e| StorageError::Catalog {
+                        message: format!("corrupt replayed delete receipt: {e}"),
+                    })?;
+                return Ok(IdempotentOutcome {
+                    value: result,
+                    replayed: true,
+                });
             }
-            if guard.phase != CapturePhase::Idle {
-                return Err(StorageError::conflict(
-                    "capture_busy",
-                    format!(
-                        "cannot delete sessions while coordinator is in phase {}",
-                        guard.phase.as_str()
-                    ),
-                ));
+            InFlightRegistration::Leader(leader) => {
+                if let Some(cached) = self.receipts.lookup_idempotency(
+                    principal_id,
+                    "delete_sessions",
+                    idempotency_key,
+                    &req_hash,
+                    volume_writable_hint,
+                )? {
+                    let result: DeleteSessionsResult = serde_json::from_value(cached.clone())
+                        .map_err(|e| StorageError::Catalog {
+                            message: format!("corrupt cached delete receipt: {e}"),
+                        })?;
+                    leader.succeed(cached);
+                    return Ok(IdempotentOutcome {
+                        value: result,
+                        replayed: true,
+                    });
+                }
+                leader
             }
-            guard.transition(CapturePhase::Deleting)?;
-            self.phase_cv.notify_all();
-        }
+        };
 
-        // Always restore `Idle` phase when deletion finishes or preflight fails.
-        let delete_outcome = self.execute_delete_preflight_and_remove(&req, &requested_ids);
+        let run_res: StorageResult<DeleteSessionsResult> =
+            (|| {
+                // Refuse deletion during active capture/finalization or when volume is released,
+                // and hold shared `maintenance.lock` throughout `Deleting`!
+                if self.volume.is_volume_released() {
+                    return Err(StorageError::locked(
+                        "volume_released",
+                        "cannot delete sessions while recording volume is released",
+                    ));
+                }
+                let maintenance_lock = self.acquire_shared_maintenance_lock()?;
+                {
+                    let mut guard = self.state.lock().map_err(|_| {
+                        StorageError::Core(CoreError::poisoned("coordinator_state"))
+                    })?;
+                    if guard.volume_released || self.volume.is_volume_released() {
+                        return Err(StorageError::locked(
+                            "volume_released",
+                            "cannot delete sessions while recording volume is released",
+                        ));
+                    }
+                    if guard.phase != CapturePhase::Idle {
+                        return Err(StorageError::conflict(
+                            "capture_busy",
+                            format!(
+                                "cannot delete sessions while coordinator is in phase {}",
+                                guard.phase.as_str()
+                            ),
+                        ));
+                    }
+                    guard.transition(CapturePhase::Deleting)?;
+                    self.phase_cv.notify_all();
+                }
 
-        {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase == CapturePhase::Deleting {
-                let _ = guard.transition(CapturePhase::Idle);
-                self.phase_cv.notify_all();
+                // Always restore `Idle` phase and drop `maintenance.lock` when deletion finishes.
+                let delete_outcome = self.execute_delete_preflight_and_remove(&req, &requested_ids);
+
+                {
+                    let mut guard = self.state.lock().map_err(|_| {
+                        StorageError::Core(CoreError::poisoned("coordinator_state"))
+                    })?;
+                    if guard.phase == CapturePhase::Deleting {
+                        let _ = guard.transition(CapturePhase::Idle);
+                        self.phase_cv.notify_all();
+                    }
+                }
+                drop(maintenance_lock);
+
+                delete_outcome
+            })();
+
+        let result = match run_res {
+            Ok(r) => r,
+            Err(err) => {
+                inflight_leader.fail(&err);
+                return Err(err);
             }
-        }
-
-        let result = delete_outcome?;
-        if let Ok(json_val) = serde_json::to_value(&result) {
-            self.receipts.store_idempotency(
-                principal_id,
-                "delete_sessions",
-                idempotency_key,
-                &req_hash,
-                json_val,
-                self.volume.is_mounted_and_writable(),
-            );
-        }
+        };
+        let json_val = serde_json::to_value(&result).unwrap_or(Value::Null);
+        self.receipts.store_idempotency(
+            principal_id,
+            "delete_sessions",
+            idempotency_key,
+            &req_hash,
+            json_val.clone(),
+            self.volume.is_mounted_and_writable(),
+        );
+        inflight_leader.succeed(json_val);
         Ok(IdempotentOutcome {
             value: result,
             replayed: false,
@@ -2783,6 +3890,13 @@ impl CaptureCoordinator {
         let mut resolved: HashMap<String, IndexedSession> =
             HashMap::with_capacity(req.sessions.len());
         let recordings_root = self.volume.paths().recordings_dir();
+        let root_fd =
+            open_directory_safe(&recordings_root).map_err(|err| StorageError::Unavailable {
+                message: format!("recordings directory unavailable: {err}"),
+            })?;
+        let root_dev = fstat(root_fd.as_raw_fd())
+            .map_err(|err| StorageError::io("recordings_stat", "fstat recordings root", err))?
+            .st_dev;
 
         for target in &req.sessions {
             let entry = self
@@ -2791,6 +3905,20 @@ impl CaptureCoordinator {
                 .ok_or_else(|| StorageError::NotFound {
                     session_id: target.session_id.clone(),
                 })?;
+
+            // Validate canonical catalog entry fields BEFORE constructing any deletion path!
+            if !is_valid_uuid_v7(&entry.session_id)
+                || !is_valid_sha256(&entry.manifest_sha256)
+                || !is_canonical_session_relative_dir(&entry.relative_dir)
+            {
+                return Err(StorageError::integrity(
+                    "unsafe_delete_target",
+                    format!(
+                        "catalog entry for session {} has non-canonical relative_dir or digest",
+                        target.session_id
+                    ),
+                ));
+            }
 
             // Check catalog digest AND exact on-disk manifest digest.
             if entry.manifest_sha256 != target.manifest_sha256 {
@@ -2842,14 +3970,57 @@ impl CaptureCoordinator {
         let mut failed_sessions = Vec::new();
 
         for entry in ordered {
+            if !is_valid_uuid_v7(&entry.session_id)
+                || !is_valid_sha256(&entry.manifest_sha256)
+                || !is_canonical_session_relative_dir(&entry.relative_dir)
+            {
+                failed_sessions.push(FailedDeleteSession {
+                    session_id: entry.session_id,
+                    error: "refusing to delete non-canonical session path".to_owned(),
+                });
+                break;
+            }
             let target_dir = recordings_root.join(&entry.relative_dir);
-            if let Err(err) = fs::remove_dir_all(&target_dir) {
-                if err.kind() != io::ErrorKind::NotFound {
+            if let Some(parent) = target_dir.parent() {
+                if let Ok(pmeta) = fs::symlink_metadata(parent) {
+                    if pmeta.file_type().is_symlink() || !pmeta.is_dir() || pmeta.dev() != root_dev
+                    {
+                        failed_sessions.push(FailedDeleteSession {
+                            session_id: entry.session_id,
+                            error: "parent date directory failed symlink or st_dev check"
+                                .to_owned(),
+                        });
+                        break;
+                    }
+                }
+            }
+            match fs::symlink_metadata(&target_dir) {
+                Ok(tmeta) => {
+                    if tmeta.file_type().is_symlink() || !tmeta.is_dir() || tmeta.dev() != root_dev
+                    {
+                        failed_sessions.push(FailedDeleteSession {
+                            session_id: entry.session_id,
+                            error: "session directory failed symlink or st_dev check".to_owned(),
+                        });
+                        break;
+                    }
+                    if let Err(err) = fs::remove_dir_all(&target_dir) {
+                        if err.kind() != io::ErrorKind::NotFound {
+                            failed_sessions.push(FailedDeleteSession {
+                                session_id: entry.session_id,
+                                error: format!("failed to remove session directory: {err}"),
+                            });
+                            // Stop further removal on storage failure and return partial result.
+                            break;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
                     failed_sessions.push(FailedDeleteSession {
                         session_id: entry.session_id,
-                        error: format!("failed to remove session directory: {err}"),
+                        error: format!("failed to stat session directory: {err}"),
                     });
-                    // Stop further removal on storage failure and return partial result.
                     break;
                 }
             }
@@ -2880,26 +4051,84 @@ impl CaptureCoordinator {
         })
     }
 
-    /// Enforce storage reserve thresholds during active capture; stops & seals when space
-    /// drops below `minimum_available_bytes` or marks media-lost if the volume disappears.
+    /// Enforce storage reserve thresholds during active capture (refreshing cached
+    /// `remaining_bytes` at 1 Hz) and auto-recover from `Failed` / `volume_released` when
+    /// an unmounted or replaced recording volume becomes mounted and writable again.
     pub fn enforce_storage_reserve(&self) -> StorageResult<ReserveEnforcementOutcome> {
         let _ = self.poll_active_failure()?;
 
-        let active_session_id = {
+        let (phase, volume_released, released_sig, saw_unmount, has_admission, active_session_id) = {
             let guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase != CapturePhase::Recording {
-                return Ok(ReserveEnforcementOutcome::Healthy);
-            }
-            guard.active.as_ref().map(|a| a.session_id.clone())
+            (
+                guard.phase,
+                guard.volume_released || self.volume.is_volume_released(),
+                guard.released_mount_signature.clone(),
+                guard.saw_unmount_since_release,
+                guard.admission.is_some(),
+                guard.active.as_ref().map(|a| a.session_id.clone()),
+            )
         };
+
+        if phase != CapturePhase::Recording {
+            if !phase.is_busy() && phase != CapturePhase::Closing {
+                if phase == CapturePhase::Failed || volume_released {
+                    match self.volume.probe_raw_volume() {
+                        Some(cap) if cap.mounted && cap.writable && !cap.read_only => {
+                            let disk_vid = read_bounded_json::<crate::volume::VolumeMetadata>(
+                                &self.volume.paths().volume_metadata_file(),
+                                8 * 1024,
+                                8,
+                            )
+                            .ok()
+                            .map(|m| m.volume_id);
+                            let mount_changed = match &released_sig {
+                                None => true,
+                                Some((old_vid, old_dev, old_mnt)) => {
+                                    cap.device_id != *old_dev
+                                        || cap.mount_identity != *old_mnt
+                                        || disk_vid.as_deref().is_some_and(|v| v != old_vid)
+                                }
+                            };
+                            if phase == CapturePhase::Failed || saw_unmount || mount_changed {
+                                let _ = self.reconcile_and_admit_volume(true);
+                            }
+                        }
+                        _ => {
+                            if let Ok(mut guard) = self.state.lock() {
+                                guard.saw_unmount_since_release = true;
+                            }
+                        }
+                    }
+                } else if phase == CapturePhase::Idle
+                    && !has_admission
+                    && self.volume.is_raw_mounted_and_writable()
+                {
+                    let _ = self.reconcile_and_admit_volume(true);
+                }
+            }
+            return Ok(ReserveEnforcementOutcome::Healthy);
+        }
+
         let Some(session_id) = active_session_id else {
             return Ok(ReserveEnforcementOutcome::Healthy);
         };
 
         let reserve = self.volume.check_reserve()?;
+        // Refresh cached `available_bytes` on active session at 1 Hz so `capture_status()`
+        // reports live `remaining_bytes` throughout long recordings!
+        if let Some(rec_budget) = &reserve.recording {
+            if let Ok(mut guard) = self.state.lock() {
+                if let Some(ctx) = guard.active.as_mut() {
+                    ctx.admission.available_bytes = rec_budget.available_bytes;
+                }
+                if let Some(adm) = guard.admission.as_mut() {
+                    adm.available_bytes = rec_budget.available_bytes;
+                }
+            }
+        }
         if reserve.ok {
             return Ok(ReserveEnforcementOutcome::Healthy);
         }
@@ -2984,7 +4213,8 @@ impl CaptureCoordinator {
     }
 
     /// Gracefully close the coordinator (`Closing` terminal phase), waiting for any in-flight
-    /// `Stopping` seal to finish before releasing `_maintenance_lock` and aborting any live handle.
+    /// `Starting`, `Stopping`, `Recovering`, or `Deleting` work before releasing `_maintenance_lock`
+    /// and NEVER mutating phase or dropping `_maintenance_lock` out from under an active sealer on timeout.
     pub fn close(&self) -> StorageResult<()> {
         let active_ctx = {
             let mut guard = self
@@ -2994,18 +4224,45 @@ impl CaptureCoordinator {
             if guard.phase == CapturePhase::Closing {
                 return Ok(());
             }
-            while matches!(
-                guard.phase,
-                CapturePhase::Stopping | CapturePhase::Recovering | CapturePhase::Deleting
-            ) {
+            // Wait briefly for `Starting` to finish handshake; if still blocked after 150ms,
+            // `Starting -> Closing` is permitted (`start_capture` holds its own `Arc<FlockGuard>`).
+            let starting_deadline = Instant::now() + Duration::from_millis(150);
+            while guard.phase == CapturePhase::Starting {
+                let now = Instant::now();
+                if now >= starting_deadline {
+                    break;
+                }
                 let (next_guard, wait_res) = self
                     .phase_cv
-                    .wait_timeout(guard, Duration::from_secs(30))
+                    .wait_timeout(guard, starting_deadline.saturating_duration_since(now))
                     .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
                 guard = next_guard;
                 if wait_res.timed_out() {
                     break;
                 }
+            }
+            // Wait up to 30s for `Stopping`, `Recovering`, or `Deleting`; NEVER pull phase or
+            // `_maintenance_lock` out from under an active sealer/recovery/delete on timeout!
+            let finish_deadline = Instant::now() + Duration::from_secs(30);
+            while matches!(
+                guard.phase,
+                CapturePhase::Stopping | CapturePhase::Recovering | CapturePhase::Deleting
+            ) {
+                let now = Instant::now();
+                if now >= finish_deadline {
+                    return Err(StorageError::conflict(
+                        "capture_busy",
+                        format!(
+                            "timed out waiting for {} operation to finish before close",
+                            guard.phase.as_str()
+                        ),
+                    ));
+                }
+                let (next_guard, _) = self
+                    .phase_cv
+                    .wait_timeout(guard, finish_deadline.saturating_duration_since(now))
+                    .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+                guard = next_guard;
             }
             if guard.phase == CapturePhase::Closing {
                 return Ok(());
@@ -3024,6 +4281,16 @@ impl CaptureCoordinator {
 
     // --- Internal zero-reread seal & state helpers ---
 
+    fn update_verification_completed(&self, completed: u64) {
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(ctx) = guard.active.as_mut() {
+                if let Some(ver) = ctx.verification_progress.as_mut() {
+                    ver.completed = completed.min(ver.total);
+                }
+            }
+        }
+    }
+
     fn seal_and_publish(
         &self,
         ctx: &SessionMetadata,
@@ -3037,6 +4304,9 @@ impl CaptureCoordinator {
         }
 
         let staging_root = &ctx.staging_dir;
+        let declared_log_paths: Vec<String> =
+            captured.logs.iter().map(|l| l.path.clone()).collect();
+        let mut verified_count = 0_u64;
         let mut expected_identities: Vec<ExpectedArtifactIdentity> = Vec::new();
         let mut segments_json = Vec::with_capacity(captured.segments.len());
 
@@ -3062,6 +4332,8 @@ impl CaptureCoordinator {
                 path: seg.right_path.clone(),
                 identity: right_digest.identity,
             });
+            verified_count = verified_count.saturating_add(2);
+            self.update_verification_completed(verified_count);
 
             segments_json.push(json!({
                 "index": seg.index,
@@ -3100,6 +4372,8 @@ impl CaptureCoordinator {
             path: captured.frames_artifact.path.clone(),
             identity: frames_digest.identity,
         });
+        verified_count = verified_count.saturating_add(1);
+        self.update_verification_completed(verified_count);
 
         let imu_digest = finalize_artifact_with_digest(
             &staging_root.join(&captured.imu_artifact.path),
@@ -3111,6 +4385,8 @@ impl CaptureCoordinator {
             path: captured.imu_artifact.path.clone(),
             identity: imu_digest.identity,
         });
+        verified_count = verified_count.saturating_add(1);
+        self.update_verification_completed(verified_count);
 
         let audio_json = match &captured.audio {
             CapturedAudioOutcome::Recorded {
@@ -3121,65 +4397,60 @@ impl CaptureCoordinator {
                 start_time_seconds,
                 end_time_seconds,
                 segments,
-            } => {
-                let mut audio_segs_json = Vec::with_capacity(segments.len());
-                for aseg in segments {
-                    let adig = finalize_artifact_with_digest(
-                        &staging_root.join(&aseg.artifact.path),
-                        Some(aseg.artifact.bytes),
-                        aseg.artifact.sha256.as_deref(),
-                    )
-                    .map_err(|e| StorageError::integrity("seal_artifact_invalid", e.message))?;
-                    expected_identities.push(ExpectedArtifactIdentity {
-                        path: aseg.artifact.path.clone(),
-                        identity: adig.identity,
-                    });
-                    audio_segs_json.push(json!({
-                        "index": aseg.index,
-                        "start_sample": aseg.start_sample,
-                        "end_sample": aseg.end_sample,
-                        "start_time_seconds": aseg.start_time_seconds,
-                        "end_time_seconds": aseg.end_time_seconds,
-                        "pcm_payload_bytes": aseg.pcm_payload_bytes,
-                        "wav_header_bytes": aseg.wav_header_bytes,
-                        "artifact": {
-                            "artifact_id": adig.sha256,
-                            "role": "audio.wav",
-                            "path": aseg.artifact.path,
-                            "media_type": aseg.artifact.media_type,
-                            "bytes": adig.identity.size,
-                            "sha256": adig.sha256,
-                        }
-                    }));
-                }
-                json!({
-                    "state": "recorded",
-                    "requested_mode": requested_mode,
-                    "resolved_mode": "enabled",
-                    "codec": "pcm_s16le",
-                    "container": "wav",
-                    "sample_format": "S16_LE",
-                    "sample_rate": sample_rate,
-                    "channels": channels,
-                    "sample_count": sample_count,
-                    "sync": {
-                        "time_base": "host_monotonic",
-                        "start_time_seconds": start_time_seconds,
-                        "end_time_seconds": end_time_seconds,
-                        "video_time_reference": "session_time_seconds",
-                    },
-                    "segments": audio_segs_json,
-                })
-            }
+            } => self.finalize_recorded_audio_json(
+                staging_root,
+                requested_mode,
+                *sample_rate,
+                *channels,
+                *sample_count,
+                *start_time_seconds,
+                *end_time_seconds,
+                segments,
+                None,
+                &mut expected_identities,
+                &mut verified_count,
+            )?,
+            CapturedAudioOutcome::RecordedWithClock {
+                requested_mode,
+                sample_rate,
+                channels,
+                sample_count,
+                start_time_seconds,
+                end_time_seconds,
+                segments,
+                capture_clock,
+            } => self.finalize_recorded_audio_json(
+                staging_root,
+                requested_mode,
+                *sample_rate,
+                *channels,
+                *sample_count,
+                *start_time_seconds,
+                *end_time_seconds,
+                segments,
+                capture_clock.as_ref(),
+                &mut expected_identities,
+                &mut verified_count,
+            )?,
             CapturedAudioOutcome::NotRecorded {
                 requested_mode,
                 reason,
-            } => json!({
-                "state": "not_recorded",
-                "requested_mode": requested_mode,
-                "resolved_mode": "disabled",
-                "reason": reason,
-            }),
+            } => {
+                // Clean/quarantine any leftover partial `audio/` files before publishing a
+                // `NotRecorded` session (preserving any path explicitly declared in `logs`).
+                clean_leftover_not_recorded_audio_files(
+                    self.volume.paths(),
+                    staging_root,
+                    &ctx.session_id,
+                    &declared_log_paths,
+                );
+                json!({
+                    "state": "not_recorded",
+                    "requested_mode": requested_mode,
+                    "resolved_mode": "disabled",
+                    "reason": reason,
+                })
+            }
         };
 
         let mut logs_json = Vec::with_capacity(captured.logs.len());
@@ -3194,6 +4465,8 @@ impl CaptureCoordinator {
                 path: log_art.path.clone(),
                 identity: ldig.identity,
             });
+            verified_count = verified_count.saturating_add(1);
+            self.update_verification_completed(verified_count);
             logs_json.push(json!({
                 "artifact_id": ldig.sha256,
                 "role": log_art.role,
@@ -3312,11 +4585,21 @@ impl CaptureCoordinator {
         let _ = fsync_directory(staging_root);
 
         let relative_dir =
-            publish_staging_directory(self.volume.paths(), staging_root, &ctx.started_at)?;
+            match publish_staging_directory(self.volume.paths(), staging_root, &ctx.started_at) {
+                Ok(rel) => rel,
+                Err(pub_err) => {
+                    // Leave `.partial` intact in `.miro-ego/staging/` (unlinking candidate `manifest.json`
+                    // so control markers remain authoritative for later crash recovery).
+                    let _ = fs::remove_file(&manifest_path);
+                    let _ = fsync_directory(staging_root);
+                    return Err(pub_err);
+                }
+            };
         let final_root = self.volume.paths().recordings_dir().join(&relative_dir);
 
-        let post_publish_res: StorageResult<()> = (|| {
-            remove_control_markers(&final_root)?;
+        // Step 1 post-publish: remove control markers and verify published artifacts on `final_root`.
+        let verify_published_res: StorageResult<IndexedSession> = (|| {
+            remove_control_markers_with_logs(&final_root, &declared_log_paths)?;
             let _ = fsync_directory(&final_root);
 
             // Post-publish exFAT-safe artifact identity verification (zero disk reread).
@@ -3352,17 +4635,41 @@ impl CaptureCoordinator {
                 verdict: "usable".to_owned(),
                 diagnostics: Vec::new(),
             });
-            self.catalog.admit_indexed_session(indexed)?;
-            Ok(())
+            Ok(indexed)
         })();
 
-        if let Err(post_err) = post_publish_res {
-            let q_base = format!("{}.postpublish", ctx.session_id);
-            if quarantine_session_directory(self.volume.paths(), &final_root, &q_base).is_err() {
-                let _ = fs::remove_dir_all(&final_root);
+        let indexed = match verify_published_res {
+            Ok(idx) => idx,
+            Err(post_err) => {
+                // NEVER call `fs::remove_dir_all(&final_root)`! Only quarantine if non-transient.
+                if !is_transient_storage_error(&post_err) {
+                    let q_base = format!("{}.postpublish", ctx.session_id);
+                    if quarantine_session_directory(self.volume.paths(), &final_root, &q_base)
+                        .is_ok()
+                    {
+                        cleanup_empty_date_parent(
+                            &self.volume.paths().recordings_dir(),
+                            &final_root,
+                        );
+                    }
+                }
+                return Err(post_err);
             }
-            cleanup_empty_date_parent(&self.volume.paths().recordings_dir(), &final_root);
-            return Err(post_err);
+        };
+
+        // Step 2 post-publish: `final_root` IS durably sealed & verified!
+        // If `catalog.admit_indexed_session` fails due to transient storage error (`ENOSPC`/`EIO`/`EROFS`),
+        // admit into the in-memory `BinarySessionCatalog` (`admit_in_memory`) and succeed!
+        if let Err(admit_err) = self.catalog.admit_indexed_session(indexed.clone()) {
+            if is_transient_storage_error(&admit_err) {
+                self.catalog.admit_in_memory(indexed)?;
+            } else {
+                let q_base = format!("{}.postpublish", ctx.session_id);
+                if quarantine_session_directory(self.volume.paths(), &final_root, &q_base).is_ok() {
+                    cleanup_empty_date_parent(&self.volume.paths().recordings_dir(), &final_root);
+                }
+                return Err(admit_err);
+            }
         }
 
         Ok(SealedPublishOutput {
@@ -3370,6 +4677,95 @@ impl CaptureCoordinator {
             manifest_sha256,
             sealed_at,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_recorded_audio_json(
+        &self,
+        staging_root: &Path,
+        requested_mode: &str,
+        sample_rate: u32,
+        channels: u16,
+        sample_count: u64,
+        start_time_seconds: f64,
+        end_time_seconds: f64,
+        segments: &[CapturedAudioSegment],
+        capture_clock: Option<&Value>,
+        expected_identities: &mut Vec<ExpectedArtifactIdentity>,
+        verified_count: &mut u64,
+    ) -> StorageResult<Value> {
+        let mut audio_segs_json = Vec::with_capacity(segments.len());
+        for aseg in segments {
+            let adig = finalize_artifact_with_digest(
+                &staging_root.join(&aseg.artifact.path),
+                Some(aseg.artifact.bytes),
+                aseg.artifact.sha256.as_deref(),
+            )
+            .map_err(|e| StorageError::integrity("seal_artifact_invalid", e.message))?;
+            expected_identities.push(ExpectedArtifactIdentity {
+                path: aseg.artifact.path.clone(),
+                identity: adig.identity,
+            });
+            *verified_count = verified_count.saturating_add(1);
+            self.update_verification_completed(*verified_count);
+            audio_segs_json.push(json!({
+                "index": aseg.index,
+                "start_sample": aseg.start_sample,
+                "end_sample": aseg.end_sample,
+                "start_time_seconds": aseg.start_time_seconds,
+                "end_time_seconds": aseg.end_time_seconds,
+                "pcm_payload_bytes": aseg.pcm_payload_bytes,
+                "wav_header_bytes": aseg.wav_header_bytes,
+                "artifact": {
+                    "artifact_id": adig.sha256,
+                    "role": "audio.wav",
+                    "path": aseg.artifact.path,
+                    "media_type": aseg.artifact.media_type,
+                    "bytes": adig.identity.size,
+                    "sha256": adig.sha256,
+                }
+            }));
+        }
+
+        // Also check `staging_root/audio/capture-clock.json` on disk if caller didn't pass `capture_clock`.
+        let disk_clock = if capture_clock.is_none() {
+            read_bounded_json::<Value>(
+                &staging_root.join("audio/capture-clock.json"),
+                64 * 1024,
+                16,
+            )
+            .ok()
+            .filter(|v| v.get("schema").and_then(Value::as_str) == Some("miro-ego.audio-clock.v1"))
+        } else {
+            None
+        };
+
+        let mut obj = json!({
+            "state": "recorded",
+            "requested_mode": requested_mode,
+            "resolved_mode": "enabled",
+            "codec": "pcm_s16le",
+            "container": "wav",
+            "sample_format": "S16_LE",
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "sample_count": sample_count,
+            "sync": {
+                "time_base": "host_monotonic",
+                "start_time_seconds": start_time_seconds,
+                "end_time_seconds": end_time_seconds,
+                "video_time_reference": "session_time_seconds",
+            },
+            "segments": audio_segs_json,
+        });
+        if let Some(clk) = capture_clock.or(disk_clock.as_ref()) {
+            if clk.get("schema").and_then(Value::as_str) == Some("miro-ego.audio-clock.v1") {
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("capture_clock".to_owned(), clk.clone());
+                }
+            }
+        }
+        Ok(obj)
     }
 
     fn fail_start_attempt(
@@ -3384,7 +4780,7 @@ impl CaptureCoordinator {
         let diag = RecordingDiagnostic {
             code: sanitize_diag_code(error_code),
             severity: "error".to_owned(),
-            message: error_message.chars().take(1024).collect(),
+            message: sanitize_diag_message(error_message),
             at: now_rfc3339_utc(),
             recoverable: false,
             details: None,
@@ -3461,22 +4857,20 @@ impl CaptureCoordinator {
         error_message: &str,
         media_lost: bool,
     ) -> CaptureStatusSnapshot {
-        // Isolate any remaining `.partial` directory into `quarantine/` when the volume is
-        // writable so crash recovery on next boot NEVER resurrects an immutable `failed` take!
+        // Isolate `.partial` into `quarantine/` ONLY for non-recoverable terminal failures (`failed`/`abandoned`)
+        // when the volume is writable; NEVER call `fs::remove_dir_all(&ctx.staging_dir)` and NEVER
+        // quarantine `"recoverable"` `.partial` directories left behind on `ENOSPC`!
         let volume_writable = !media_lost && self.volume.is_mounted_and_writable();
-        if volume_writable && ctx.staging_dir.exists() {
+        if volume_writable && terminal_state != "recoverable" && ctx.staging_dir.exists() {
             let base_name = ctx
                 .staging_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&ctx.session_id);
-            if quarantine_session_directory(self.volume.paths(), &ctx.staging_dir, base_name)
-                .is_err()
-            {
-                let _ = fs::remove_dir_all(&ctx.staging_dir);
-            }
+            let _ = quarantine_session_directory(self.volume.paths(), &ctx.staging_dir, base_name);
         }
 
+        let safe_msg = sanitize_diag_message(error_message);
         let diag = RecordingDiagnostic {
             code: if media_lost {
                 "media_lost".to_owned()
@@ -3484,7 +4878,7 @@ impl CaptureCoordinator {
                 sanitize_diag_code(error_code)
             },
             severity: "error".to_owned(),
-            message: error_message.chars().take(1024).collect(),
+            message: safe_msg.clone(),
             at: now_rfc3339_utc(),
             recoverable: terminal_state == "recoverable",
             details: None,
@@ -3498,7 +4892,8 @@ impl CaptureCoordinator {
             };
             let released = guard.active.take();
             let target_phase = if media_lost {
-                guard.last_failure_reason = Some(error_message.to_owned());
+                guard.last_failure_reason = Some(safe_msg);
+                guard.saw_unmount_since_release = true;
                 CapturePhase::Failed
             } else {
                 CapturePhase::Idle
@@ -3745,7 +5140,8 @@ struct SealedPublishOutput {
 
 fn count_captured_artifacts(captured: &CapturedSessionArtifacts) -> u64 {
     let audio_count = match &captured.audio {
-        CapturedAudioOutcome::Recorded { segments, .. } => segments.len() as u64,
+        CapturedAudioOutcome::Recorded { segments, .. }
+        | CapturedAudioOutcome::RecordedWithClock { segments, .. } => segments.len() as u64,
         CapturedAudioOutcome::NotRecorded { .. } => 0,
     };
     (captured.segments.len() as u64)
@@ -3765,15 +5161,108 @@ fn sum_captured_artifact_bytes(captured: &CapturedSessionArtifacts) -> u64 {
             .saturating_add(seg.left_bytes)
             .saturating_add(seg.right_bytes);
     }
-    if let CapturedAudioOutcome::Recorded { segments, .. } = &captured.audio {
-        for aseg in segments {
-            total = total.saturating_add(aseg.artifact.bytes);
+    match &captured.audio {
+        CapturedAudioOutcome::Recorded { segments, .. }
+        | CapturedAudioOutcome::RecordedWithClock { segments, .. } => {
+            for aseg in segments {
+                total = total.saturating_add(aseg.artifact.bytes);
+            }
         }
+        CapturedAudioOutcome::NotRecorded { .. } => {}
     }
     for log in &captured.logs {
         total = total.saturating_add(log.bytes);
     }
     total
+}
+
+/// Remove or quarantine any leftover partial files inside `staging_root/audio` when sealing
+/// `CapturedAudioOutcome::NotRecorded` (preserving any path explicitly declared in `manifest.logs`).
+fn clean_leftover_not_recorded_audio_files(
+    paths: &DataVolumePaths,
+    staging_root: &Path,
+    session_id: &str,
+    declared_log_paths: &[String],
+) {
+    let audio_dir = staging_root.join("audio");
+    if !audio_dir.is_dir() {
+        return;
+    }
+    let has_declared_audio_log = declared_log_paths
+        .iter()
+        .any(|p| p == "audio" || p.starts_with("audio/"));
+    if !has_declared_audio_log {
+        let q_name = format!("{session_id}.not-recorded-audio");
+        if quarantine_session_directory(paths, &audio_dir, &q_name).is_ok() {
+            let _ = fsync_directory(staging_root);
+            return;
+        }
+    }
+
+    let Ok(entries) = fs::read_dir(&audio_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let rel = format!("audio/{name}");
+        if declared_log_paths.iter().any(|p| p == &rel) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                let _ = quarantine_session_directory(
+                    paths,
+                    &path,
+                    &format!("{session_id}.audio-{name}"),
+                )
+                .or_else(|_| fs::remove_dir(&path).map(|()| String::new()));
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    let _ = fs::remove_dir(&audio_dir);
+    let _ = fsync_directory(staging_root);
+}
+
+/// Safely clean up an aborted pre-recording staging directory without invoking `fs::remove_dir_all`
+/// on populated recording directories: unlinks known start markers (`capture.json`, `recording.json`,
+/// `.tmp` files) and removes empty `video/`, `audio/`, and `<session_id>.partial` directories,
+/// falling back to moving into `quarantine/` if the backend already wrote files during `begin_capture`.
+fn cleanup_empty_staging_attempt(staging_dir: &Path) {
+    if !staging_dir.exists() {
+        return;
+    }
+    for marker in ["capture.json", "recording.json", "checkpoint.json"] {
+        let _ = fs::remove_file(staging_dir.join(marker));
+    }
+    let _ = sweep_stale_atomic_temps(staging_dir);
+    let _ = fs::remove_dir(staging_dir.join("video"));
+    let _ = fs::remove_dir(staging_dir.join("audio"));
+    if fs::remove_dir(staging_dir).is_err() {
+        // Backend wrote files into `staging_dir` before failing `begin_capture`: move to quarantine!
+        if let Some(meta_dir) = staging_dir.parent().and_then(Path::parent) {
+            let quarantine_root = meta_dir.join("quarantine");
+            if fs::create_dir_all(&quarantine_root).is_ok() {
+                if let Some(name) = staging_dir.file_name().and_then(|n| n.to_str()) {
+                    for ordinal in 1..=999_u32 {
+                        let candidate = if ordinal == 1 {
+                            format!("{name}.aborted")
+                        } else {
+                            format!("{name}.aborted_{ordinal:02}")
+                        };
+                        let dst = quarantine_root.join(candidate);
+                        if !dst.exists() && fs::rename(staging_dir, &dst).is_ok() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn validate_start_request(req: &CaptureStartRequest) -> StorageResult<()> {
@@ -3841,20 +5330,59 @@ fn request_fingerprint<T: Serialize>(value: &T) -> StorageResult<String> {
     Ok(sha256_hex(&bytes))
 }
 
-fn sanitize_diag_code(raw: &str) -> String {
-    let mut out = String::new();
-    for ch in raw.chars().take(96) {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-') {
-            out.push(ch);
+/// Sanitize a diagnostic code to strictly satisfy `^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$` (`<= 96` chars):
+/// collapses consecutive `[._-]` separators, strips leading/trailing separators, and falls back to `"capture_error"`.
+pub fn sanitize_diag_code(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(96));
+    let mut pending_sep: Option<char> = None;
+
+    for ch in raw.chars() {
+        if out.len() >= 96 {
+            break;
+        }
+        let mapped = if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            Some((ch, false))
         } else if ch.is_ascii_uppercase() {
-            out.push(ch.to_ascii_lowercase());
+            Some((ch.to_ascii_lowercase(), false))
+        } else if matches!(ch, '.' | '_' | '-') {
+            Some((ch, true))
         } else {
-            out.push('_');
+            Some(('_', true))
+        };
+
+        if let Some((c, is_sep)) = mapped {
+            if is_sep {
+                if !out.is_empty() && pending_sep.is_none() {
+                    pending_sep = Some(c);
+                }
+            } else {
+                if let Some(sep) = pending_sep.take() {
+                    if out.len() + 2 > 96 {
+                        break;
+                    }
+                    out.push(sep);
+                }
+                out.push(c);
+            }
         }
     }
+
+    while out.ends_with(['.', '_', '-']) {
+        out.pop();
+    }
+
     if out.is_empty() || !out.as_bytes()[0].is_ascii_lowercase() {
         "capture_error".to_owned()
     } else {
         out
+    }
+}
+
+fn sanitize_diag_message(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "capture failed".to_owned()
+    } else {
+        raw.chars().take(1024).collect()
     }
 }

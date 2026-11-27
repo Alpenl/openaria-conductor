@@ -464,3 +464,148 @@ fn audit_logger_repairs_partial_tail_line_on_reopen_and_skips_truncated_fallback
     assert!(lines[1].contains("req-clean-2"));
     assert!(lines[2].contains("req-offline-ok"));
 }
+
+#[test]
+fn safe_swap_volume_release_flag_handle_leases_and_audit_close_work_cleanly() {
+    let tmp = TempVolume::new("vol-release-leases");
+    let probe = MockProbe::for_dir(&tmp.root, 16 * 1024 * 1024 * 1024);
+    let mut policy = VolumePolicy::production(2 * 1024 * 1024 * 1024, 1024);
+    policy.system_state_root = Some(tmp.root.clone());
+    let mgr = ExfatVolumeManager::with_probe(tmp.paths(), policy, Arc::new(probe));
+    let _ = mgr.ensure_layout().unwrap();
+
+    assert!(!mgr.is_volume_released());
+    assert!(mgr.is_mounted_and_writable());
+    assert!(mgr.is_raw_mounted_and_writable());
+    assert_eq!(mgr.open_handle_count(), 0);
+
+    let lease1 = mgr.acquire_handle_lease();
+    let lease2 = lease1.clone();
+    assert_eq!(mgr.open_handle_count(), 2);
+    drop(lease1);
+    assert_eq!(mgr.open_handle_count(), 1);
+    drop(lease2);
+    assert_eq!(mgr.open_handle_count(), 0);
+
+    // Marking volume released hides writability from normal callers while raw probe still sees mount.
+    mgr.set_volume_released(true);
+    assert!(mgr.is_volume_released());
+    assert!(!mgr.is_mounted_and_writable());
+    assert!(mgr.is_raw_mounted_and_writable());
+
+    let logger = AuditLogger::new(tmp.paths(), AuditConfig::default(), Arc::new(|| true));
+    let ev = ApiAuditEvent::new("req-open-fd", None, "getCaptureStatus", None, "allowed");
+    assert_eq!(logger.record(&ev).unwrap(), AuditWriteTarget::Disk);
+    assert!(logger.has_open_file());
+    logger.close_active_file();
+    assert!(!logger.has_open_file());
+}
+
+#[test]
+fn audit_logger_validates_recorded_at_resets_fd_on_error_and_peeks_front_batch_on_enospc() {
+    use std::time::Duration;
+
+    let tmp = TempVolume::new("audit-enospc-peek");
+    let _ = tmp.paths().ensure_layout().unwrap();
+
+    // P2-13: ApiAuditEvent::validate rejects malformed `recorded_at`.
+    let mut bad_ev = ApiAuditEvent::new("req-ts", None, "listLogs", None, "allowed");
+    bad_ev.recorded_at = "not-a-valid-rfc3339-timestamp".to_owned();
+    assert_eq!(bad_ev.validate().unwrap_err().code(), "invalid_audit_event");
+    bad_ev.recorded_at = "2026-02-30T10:00:00Z".to_owned();
+    assert_eq!(bad_ev.validate().unwrap_err().code(), "invalid_audit_event");
+
+    // P1-11: Non-destructive peek-then-pop fallback flush + ENOSPC backoff + active_file reset on error.
+    let writable = Arc::new(AtomicBool::new(false));
+    let writable_flag = Arc::clone(&writable);
+    let logger = AuditLogger::new(
+        tmp.paths(),
+        AuditConfig {
+            max_file_bytes: 16 * 1024,
+            max_generations: 2,
+            fallback_ring_bytes: 16 * 1024,
+        },
+        Arc::new(move || writable_flag.load(Ordering::Acquire)),
+    )
+    .with_enospc_backoff(Duration::from_millis(40));
+
+    for idx in 0..3 {
+        let ev = ApiAuditEvent::new(format!("queued-{idx}"), None, "listLogs", None, "allowed");
+        assert_eq!(
+            logger.record(&ev).unwrap(),
+            AuditWriteTarget::MemoryFallback
+        );
+    }
+    assert_eq!(logger.fallback_stats().unwrap().entry_count, 3);
+
+    // Replace `audit/api-audit.ndjson` with a directory so opening for disk flush fails with EISDIR!
+    let active_path = logger.active_log_path();
+    fs::create_dir_all(&active_path).unwrap();
+    writable.store(true, Ordering::Release);
+
+    // Flush fails, resets `active_file = None`, and preserves exact FIFO order [queued-0, queued-1, queued-2] in ring!
+    assert!(logger.flush_fallback_to_disk().is_err());
+    assert!(!logger.has_open_file());
+    let snap = logger.fallback_snapshot().unwrap();
+    assert_eq!(snap.len(), 3);
+    assert_eq!(snap[0].payload["request_id"], "queued-0");
+    assert_eq!(snap[1].payload["request_id"], "queued-1");
+    assert_eq!(snap[2].payload["request_id"], "queued-2");
+
+    // Fix the obstruction -> flush now succeeds in exact original FIFO order!
+    fs::remove_dir(&active_path).unwrap();
+    assert_eq!(logger.flush_fallback_to_disk().unwrap(), 3);
+    assert_eq!(logger.fallback_stats().unwrap().entry_count, 0);
+    let disk_lines: Vec<String> = fs::read_to_string(&active_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(disk_lines.len(), 3);
+    assert!(disk_lines[0].contains("queued-0"));
+    assert!(disk_lines[1].contains("queued-1"));
+    assert!(disk_lines[2].contains("queued-2"));
+}
+
+#[test]
+fn volume_admit_rejects_subdir_symlinks_reads_env_policy_and_clamps_pre1970_timestamps() {
+    use miro_ego_storage::util::{
+        parse_rfc3339_utc_nanos, system_time_to_rfc3339_utc, unix_secs_to_rfc3339_utc,
+    };
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
+
+    // P3-03: Pre-1970 timestamps clamp consistently to `1970-01-01T00:00:00Z` (`0` nanos).
+    assert_eq!(unix_secs_to_rfc3339_utc(-86_400), "1970-01-01T00:00:00Z");
+    assert_eq!(
+        system_time_to_rfc3339_utc(UNIX_EPOCH - Duration::from_secs(500)),
+        "1970-01-01T00:00:00Z"
+    );
+    assert_eq!(parse_rfc3339_utc_nanos("1969-12-31T23:59:00Z"), Some(0));
+    assert_eq!(
+        parse_rfc3339_utc_nanos("1970-01-01T01:00:00+02:00"),
+        Some(0)
+    );
+
+    // P2-14: Environment overrides populate expected UUID / PARTUUID cleanly.
+    let mut pol = VolumePolicy::production(1024, 10);
+    pol.apply_volume_identity_overrides(Some("  DEAD-BEEF "), Some(" part-99 "));
+    assert_eq!(pol.expected_uuid.as_deref(), Some("DEAD-BEEF"));
+    assert_eq!(pol.expected_partuuid.as_deref(), Some("part-99"));
+
+    // P2-14: `ExfatVolumeManager::admit` rejects symlinks on canonical `.miro-ego/*` & `logs/` subdirs.
+    let tmp = TempVolume::new("subdir-symlink");
+    let probe = MockProbe::for_dir(&tmp.root, 16 * 1024 * 1024 * 1024);
+    let mut policy = VolumePolicy::production(1024 * 1024, 100);
+    policy.system_state_root = Some(tmp.root.clone());
+    let mgr = ExfatVolumeManager::with_probe(tmp.paths(), policy, Arc::new(probe));
+    let _ = mgr.ensure_layout().unwrap();
+    assert!(mgr.admit(None).is_ok());
+
+    let outside = std::env::temp_dir().join(format!("miro-outside-{}", std::process::id()));
+    fs::create_dir_all(&outside).unwrap();
+    fs::remove_dir_all(tmp.paths().logs_dir()).unwrap();
+    symlink(&outside, tmp.paths().logs_dir()).unwrap();
+    assert_eq!(mgr.admit(None).unwrap_err().code(), "volume_invalid");
+    let _ = fs::remove_dir_all(&outside);
+}

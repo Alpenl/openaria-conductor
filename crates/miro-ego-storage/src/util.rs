@@ -7,7 +7,37 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// RAII lease tracking an active open file descriptor on the recording volume (`/data`).
+///
+/// Increments the shared counter on acquisition and decrements it automatically on drop,
+/// allowing `SafeSwap` handoff receipts to report accurate `open_handle_count` values.
+#[derive(Debug)]
+pub struct VolumeHandleLease {
+    counter: Arc<AtomicUsize>,
+}
+
+impl VolumeHandleLease {
+    pub fn acquire(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Clone for VolumeHandleLease {
+    fn clone(&self) -> Self {
+        Self::acquire(Arc::clone(&self.counter))
+    }
+}
+
+impl Drop for VolumeHandleLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 const CRC32_TABLE: [u32; 256] = build_crc32_table();
 
@@ -61,18 +91,22 @@ pub fn now_rfc3339_utc() -> String {
 }
 
 /// Format a `SystemTime` as UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Pre-1970 wall-clock values (e.g. unsynchronized RTC before NTP/client sync) are clamped
+/// to `1970-01-01T00:00:00Z` so emitted timestamps remain consistent with [`parse_rfc3339_utc_nanos`].
 pub fn system_time_to_rfc3339_utc(time: SystemTime) -> String {
     let secs = match time.duration_since(UNIX_EPOCH) {
         Ok(dur) => i64::try_from(dur.as_secs()).unwrap_or(i64::MAX),
-        Err(err) => -i64::try_from(err.duration().as_secs()).unwrap_or(0),
+        Err(_) => 0,
     };
     unix_secs_to_rfc3339_utc(secs)
 }
 
-/// Format Unix epoch seconds as UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+/// Format Unix epoch seconds as UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`), clamping `< 0` to `0`.
 pub fn unix_secs_to_rfc3339_utc(unix_secs: i64) -> String {
-    let days = unix_secs.div_euclid(86_400);
-    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let clamped = unix_secs.max(0);
+    let days = clamped.div_euclid(86_400);
+    let secs_of_day = clamped.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
@@ -149,7 +183,7 @@ pub fn parse_rfc3339_utc_nanos(timestamp: &str) -> Option<i128> {
     let second: u32 = timestamp.get(17..19)?.parse().ok()?;
 
     let max_day = days_in_month(year, month);
-    if year < 1970
+    if year == 0
         || !(1..=12).contains(&month)
         || day == 0
         || day > max_day
@@ -201,7 +235,8 @@ pub fn parse_rfc3339_utc_nanos(timestamp: &str) -> Option<i128> {
     let local_secs =
         days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
     let utc_secs = local_secs - tz_offset_secs;
-    Some(i128::from(utc_secs) * 1_000_000_000 + i128::from(nanos))
+    let raw_nanos = i128::from(utc_secs) * 1_000_000_000 + i128::from(nanos);
+    Some(raw_nanos.max(0))
 }
 
 /// Extract `(YYYY-MM-DD, HH-MM-SS)` for readable session publication from an RFC 3339 timestamp.
@@ -391,3 +426,47 @@ pub fn is_unknown_time_dir_name(name: &str) -> bool {
 }
 
 pub const UNKNOWN_DATE_DIR_NAME: &str = "unknown-date";
+
+/// Validate a canonical 2-component session `relative_dir` under `/data/recordings/`:
+/// `YYYY-MM-DD/HH-MM-SS[_NN]` or `unknown-date/recording_NN`.
+pub fn is_canonical_session_relative_dir(relative_dir: &str) -> bool {
+    let Some((day, leaf)) = relative_dir.split_once('/') else {
+        return false;
+    };
+    if leaf.contains('/') || !is_safe_path_segment(day) || !is_safe_path_segment(leaf) {
+        return false;
+    }
+    if is_date_dir_name(day) {
+        let Some(year) = day.get(0..4).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(month) = day.get(5..7).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(dom) = day.get(8..10).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let max_dom = days_in_month(year, month);
+        if year == 0 || !(1..=12).contains(&month) || dom == 0 || dom > max_dom {
+            return false;
+        }
+        if !is_time_dir_name(leaf) {
+            return false;
+        }
+        let base = leaf.split_once('_').map_or(leaf, |(b, _)| b);
+        let Some(hh) = base.get(0..2).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(mm) = base.get(3..5).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(ss) = base.get(6..8).and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        hh <= 23 && mm <= 59 && ss <= 60
+    } else if day == UNKNOWN_DATE_DIR_NAME {
+        is_unknown_time_dir_name(leaf)
+    } else {
+        false
+    }
+}

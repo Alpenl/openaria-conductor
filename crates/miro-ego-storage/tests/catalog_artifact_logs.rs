@@ -741,3 +741,210 @@ fn artifact_missing_returns_409_integrity_and_log_truncation_detected() {
     assert_eq!(read_err.code(), "log_truncated");
     assert_eq!(read_err.http_status(), 409);
 }
+
+#[test]
+fn catalog_open_reconciles_ghosts_new_dirs_control_markers_verification_backfill_and_erofs() {
+    let tmp = TempVol::new("reconcile-backfill-erofs");
+    let rec_root = tmp.paths().recordings_dir();
+
+    let sid_keep = new_uuid_v7();
+    let sid_ghost = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/08-00-00",
+        &sid_keep,
+        &new_uuid_v7(),
+        "2026-11-26T08:00:00Z",
+        false,
+    );
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/08-05-00",
+        &sid_ghost,
+        &new_uuid_v7(),
+        "2026-11-26T08:05:00Z",
+        false,
+    );
+
+    // Initial open builds `catalog.bin` AND backfills `GatewayVerification` (`usable`)!
+    let cat1 = BinarySessionCatalog::open(tmp.paths()).unwrap();
+    let keep_idx = cat1.get_indexed_session(&sid_keep).unwrap().unwrap();
+    assert_eq!(
+        keep_idx.verification.as_ref().unwrap().verdict,
+        "usable",
+        "rebuild/open must backfill usable GatewayVerification"
+    );
+
+    // Mutate disk behind `catalog.bin`'s back while `catalog.bin` retains a valid CRC32:
+    // 1) Delete `sid_ghost` directory -> must be pruned on next `open()`!
+    fs::remove_dir_all(rec_root.join("2026-11-26/08-05-00")).unwrap();
+
+    // 2) Add a brand-new sealed session `sid_new` WITH leftover control markers (`capture.json`,
+    //    `recording.json`, `audio/checkpoint.json`, `audio/capture-clock.json`) -> must be indexed,
+    //    verified (`usable`), and swept clean on `open()`!
+    let sid_new = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/08-10-00",
+        &sid_new,
+        &new_uuid_v7(),
+        "2026-11-26T08:10:00Z",
+        false,
+    );
+    let new_dir = rec_root.join("2026-11-26/08-10-00");
+    fs::create_dir_all(new_dir.join("audio")).unwrap();
+    fs::write(new_dir.join("capture.json"), b"{}").unwrap();
+    fs::write(new_dir.join("recording.json"), b"{}").unwrap();
+    fs::write(new_dir.join("audio/checkpoint.json"), b"{}").unwrap();
+    fs::write(new_dir.join("audio/checkpoint.ndjson"), b"").unwrap();
+    fs::write(new_dir.join("audio/capture-clock.json"), b"{}").unwrap();
+
+    // 3) Add a session `sid_broken` with a missing MP4 artifact -> must get `verdict == "unusable"`!
+    let sid_broken = new_uuid_v7();
+    write_sealed_session(
+        &rec_root,
+        "2026-11-26/08-15-00",
+        &sid_broken,
+        &new_uuid_v7(),
+        "2026-11-26T08:15:00Z",
+        false,
+    );
+    fs::remove_file(rec_root.join("2026-11-26/08-15-00/video/right_00000.mp4")).unwrap();
+
+    // Reopen `BinarySessionCatalog` with valid `catalog.bin` still on disk -> reconciles everything!
+    let cat2 = BinarySessionCatalog::open(tmp.paths()).unwrap();
+    assert!(
+        cat2.get_indexed_session(&sid_ghost).unwrap().is_none(),
+        "ghost session must be pruned on open()"
+    );
+    let new_indexed = cat2.get_indexed_session(&sid_new).unwrap().unwrap();
+    assert_eq!(new_indexed.verification.as_ref().unwrap().verdict, "usable");
+    assert!(!new_dir.join("capture.json").exists());
+    assert!(!new_dir.join("recording.json").exists());
+    assert!(!new_dir.join("audio/checkpoint.json").exists());
+    assert!(!new_dir.join("audio/capture-clock.json").exists());
+    assert!(!new_dir.join("audio").exists());
+
+    let broken_indexed = cat2.get_indexed_session(&sid_broken).unwrap().unwrap();
+    let broken_ver = broken_indexed.verification.as_ref().unwrap();
+    assert_eq!(broken_ver.verdict, "unusable");
+    assert_eq!(broken_ver.diagnostics[0].code, "artifact_invalid");
+
+    // EROFS / unavailable persistence resilience: remove `.miro-ego` so `catalog.bin` cannot be
+    // persisted, and verify `open()` and `rebuild_index()` STILL succeed in memory!
+    fs::remove_dir_all(tmp.paths().hidden_meta_dir()).unwrap();
+    let cat_erofs = BinarySessionCatalog::open(tmp.paths()).unwrap();
+    assert_eq!(cat_erofs.list_sessions().unwrap().len(), 3);
+    assert_eq!(cat_erofs.rebuild_index().unwrap(), 3);
+}
+
+#[test]
+fn catalog_payload_validation_missing_logs_dir_scanned_bound_and_handle_leases() {
+    use miro_ego_storage::CATALOG_FORMAT_VERSION;
+    use miro_ego_storage::artifact_io::open_verified_artifact_with_lease;
+    use miro_ego_storage::catalog::CatalogIndex;
+    use miro_ego_storage::util::crc32_ieee;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn frame_megocat1(json_bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&CATALOG_BINARY_MAGIC);
+        out.extend_from_slice(&CATALOG_FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&crc32_ieee(json_bytes).to_le_bytes());
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(json_bytes);
+        out
+    }
+
+    let tmp = TempVol::new("payload-logs-leases");
+    let rec_root = tmp.paths().recordings_dir();
+    let sid = new_uuid_v7();
+    let (_, left_sha, _) = write_sealed_session(
+        &rec_root,
+        "2026-11-26/09-00-00",
+        &sid,
+        &new_uuid_v7(),
+        "2026-11-26T09:00:00Z",
+        false,
+    );
+
+    // P2-11: `CatalogIndex::from_payload` (via `decode_binary`) rejects non-canonical `relative_dir`, non-UUIDv7, and bad sha256.
+    let cat = BinarySessionCatalog::open(tmp.paths()).unwrap();
+    let valid_entry = cat.get_indexed_session(&sid).unwrap().unwrap();
+    let mut bad_rel = valid_entry.clone();
+    bad_rel.relative_dir = "../escape".to_owned();
+    let raw_bad_rel = serde_json::to_vec(&json!({
+        "revision_seq": 1,
+        "entries": [bad_rel],
+        "diagnostics": [],
+    }))
+    .unwrap();
+    assert!(CatalogIndex::decode_binary(&frame_megocat1(&raw_bad_rel)).is_err());
+
+    let mut bad_sid = valid_entry.clone();
+    bad_sid.session_id = new_uuid_v4(); // UUIDv4 instead of UUIDv7!
+    let raw_bad_sid = serde_json::to_vec(&json!({
+        "revision_seq": 1,
+        "entries": [bad_sid],
+        "diagnostics": [],
+    }))
+    .unwrap();
+    assert!(CatalogIndex::decode_binary(&frame_megocat1(&raw_bad_sid)).is_err());
+
+    let mut bad_sha = valid_entry.clone();
+    bad_sha.manifest_sha256 = "not-hex".to_owned();
+    let raw_bad_sha = serde_json::to_vec(&json!({
+        "revision_seq": 1,
+        "entries": [bad_sha],
+        "diagnostics": [],
+    }))
+    .unwrap();
+    assert!(CatalogIndex::decode_binary(&frame_megocat1(&raw_bad_sha)).is_err());
+
+    // P0-05: `open_verified_artifact_with_lease` and `LogStore::with_handle_counter` track open fds.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let art = open_verified_artifact_with_lease(
+        &rec_root,
+        "2026-11-26/09-00-00",
+        &left_sha,
+        Some(&sid),
+        false,
+        Some(&counter),
+    )
+    .unwrap();
+    assert_eq!(counter.load(Ordering::Acquire), 1);
+    drop(art);
+    assert_eq!(counter.load(Ordering::Acquire), 0);
+
+    // P2-14: Missing `/data/logs` on a mounted volume returns an empty `LogList` (and 404 on open_log).
+    fs::remove_dir_all(tmp.paths().logs_dir()).unwrap();
+    let log_store =
+        LogStore::new(tmp.paths(), Arc::new(|| true)).with_handle_counter(Arc::clone(&counter));
+    let empty_list = log_store.list_logs(None, None, None).unwrap();
+    assert!(empty_list.items.is_empty());
+    assert!(!empty_list.truncated);
+    assert_eq!(
+        log_store
+            .open_log("missing.log")
+            .err()
+            .unwrap()
+            .http_status(),
+        404
+    );
+
+    // Recreate `logs/`, plant > 4096 files outside the requested prefix, and verify `*scanned`
+    // increments BEFORE prefix filtering so `truncated == true` triggers deterministically!
+    let logs_dir = tmp.paths().logs_dir();
+    fs::create_dir_all(logs_dir.join("other")).unwrap();
+    for i in 0..4_100 {
+        fs::write(logs_dir.join(format!("other/f_{i:04}.log")), b"x").unwrap();
+    }
+    let filtered = log_store
+        .list_logs(Some("wanted/"), Some(50), None)
+        .unwrap();
+    assert!(filtered.items.is_empty());
+    assert!(
+        filtered.truncated,
+        "*scanned must count entries visited before prefix filtering"
+    );
+}

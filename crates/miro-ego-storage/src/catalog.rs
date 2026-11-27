@@ -13,12 +13,13 @@
 //! `/data/recordings/YYYY-MM-DD/HH-MM-SS/manifest.json` and writes a clean atomic snapshot.
 
 use crate::artifact_io::{
-    open_manifest_in_dir, open_pinned_directory, unique_downloadable_artifact_bytes,
+    extract_manifest_artifacts, open_manifest_in_dir, open_pinned_directory,
+    open_relative_regular_in_dir, unique_downloadable_artifact_bytes,
 };
 use crate::util::{
     UNKNOWN_DATE_DIR_NAME, base64url_decode, base64url_encode, crc32_ieee, domain_sha256,
-    is_date_dir_name, is_time_dir_name, is_unknown_time_dir_name, now_rfc3339_utc,
-    parse_rfc3339_utc_nanos, sweep_stale_atomic_temps,
+    is_canonical_session_relative_dir, is_date_dir_name, now_rfc3339_utc, parse_rfc3339_utc_nanos,
+    sha256_hex, sweep_stale_atomic_temps,
 };
 use crate::{
     CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION, CatalogEntry, SessionCatalog, SessionState,
@@ -310,6 +311,7 @@ impl CatalogIndex {
             diagnostics_by_path: BTreeMap::new(),
         };
         for entry in payload.entries {
+            validate_indexed_session_record(&entry)?;
             if idx.by_id.contains_key(&entry.session_id)
                 || idx.by_path.contains_key(&entry.relative_dir)
             {
@@ -323,12 +325,82 @@ impl CatalogIndex {
             idx.by_id.insert(entry.session_id.clone(), entry);
         }
         for rec in payload.diagnostics {
+            if !is_canonical_session_relative_dir(&rec.relative_dir)
+                || !is_valid_uuid_v4(&rec.diagnostic.quarantine_id)
+            {
+                return Err(StorageError::Catalog {
+                    message: "corrupt catalog snapshot contains invalid diagnostic path or id"
+                        .to_owned(),
+                });
+            }
             idx.diagnostics_by_path
                 .insert(rec.relative_dir, rec.diagnostic);
         }
         idx.recompute_revision();
         Ok(idx)
     }
+
+    /// Decode and strictly validate a framed `MEGOCAT1` binary catalog snapshot.
+    pub fn decode_binary(raw: &[u8]) -> StorageResult<Self> {
+        let payload = decode_catalog_binary(raw)?;
+        Self::from_payload(payload)
+    }
+}
+
+fn validate_indexed_session_record(entry: &IndexedSession) -> StorageResult<()> {
+    if !is_valid_uuid_v7(&entry.session_id) || !is_valid_uuid_v7(&entry.take_id) {
+        return Err(StorageError::Catalog {
+            message: "catalog entry session_id and take_id must be canonical UUIDv7".to_owned(),
+        });
+    }
+    if entry.take_sequence < 1 {
+        return Err(StorageError::Catalog {
+            message: "catalog entry take_sequence must be >= 1".to_owned(),
+        });
+    }
+    match &entry.continuation_of {
+        Some(cid) => {
+            if !is_valid_uuid_v7(cid) || entry.take_sequence < 2 {
+                return Err(StorageError::Catalog {
+                    message: "catalog entry continuation_of requires UUIDv7 and take_sequence >= 2"
+                        .to_owned(),
+                });
+            }
+        }
+        None => {
+            if entry.take_sequence != 1 {
+                return Err(StorageError::Catalog {
+                    message: "catalog entry without continuation_of must have take_sequence == 1"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    if !is_canonical_session_relative_dir(&entry.relative_dir) {
+        return Err(StorageError::Catalog {
+            message: format!(
+                "catalog entry has non-canonical relative_dir '{}'",
+                entry.relative_dir
+            ),
+        });
+    }
+    if !is_valid_sha256(&entry.manifest_sha256) {
+        return Err(StorageError::Catalog {
+            message: "catalog entry manifest_sha256 must be a 64-char lowercase hex digest"
+                .to_owned(),
+        });
+    }
+    if !is_valid_uuid_v4(&entry.device.device_id) {
+        return Err(StorageError::Catalog {
+            message: "catalog entry device_id must be a canonical UUIDv4".to_owned(),
+        });
+    }
+    if !entry.duration_seconds.is_finite() || entry.duration_seconds < 0.0 {
+        return Err(StorageError::Catalog {
+            message: "catalog entry duration_seconds must be finite and >= 0".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,8 +420,13 @@ pub struct BinarySessionCatalog {
 }
 
 impl BinarySessionCatalog {
-    /// Open the catalog: loads `catalog.bin` when valid, or automatically rebuilds from
-    /// `/data/recordings/` if `catalog.bin` is missing or corrupt.
+    /// Open the catalog: loads `catalog.bin` when valid and reconciles it against
+    /// `/data/recordings/` (pruning ghost entries, sweeping leftover control markers,
+    /// indexing newly discovered sessions, and backfilling missing verifications), or
+    /// automatically rebuilds if `catalog.bin` is missing or corrupt.
+    ///
+    /// If persisting `catalog.bin` fails due to `EROFS`, `ENOSPC`, or an unavailable
+    /// `.miro-ego/index` directory, commits the reconciled/rebuilt index in memory and succeeds.
     pub fn open(paths: DataVolumePaths) -> StorageResult<Self> {
         let _ = sweep_stale_atomic_temps(&paths.index_dir());
         let catalog = Self {
@@ -366,6 +443,7 @@ impl BinarySessionCatalog {
                         .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
                     *guard = loaded;
                 }
+                let _ = catalog.reconcile()?;
                 Ok(catalog)
             }
             Err(_) => {
@@ -486,13 +564,83 @@ impl BinarySessionCatalog {
         })
     }
 
+    /// Admit a rich [`IndexedSession`] into RAM without writing `catalog.bin`, used as a
+    /// fallback when a recording is already durably sealed in `/data/recordings/` and
+    /// persisting `catalog.bin` encounters a transient storage error (`ENOSPC`/`EROFS`/`EIO`).
+    pub fn admit_in_memory(&self, entry: IndexedSession) -> StorageResult<()> {
+        validate_indexed_session_record(&entry)?;
+        let _persist_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let mut staged = {
+            let guard = self
+                .index
+                .read()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+            guard.clone()
+        };
+        if let Some(existing) = staged.by_id.get(&entry.session_id) {
+            if existing.relative_dir != entry.relative_dir {
+                return Err(StorageError::conflict(
+                    "duplicate_session_id",
+                    format!(
+                        "session_id {} already indexed at another path",
+                        entry.session_id
+                    ),
+                ));
+            }
+        }
+        if let Some(existing_id) = staged.by_path.get(&entry.relative_dir) {
+            if existing_id != &entry.session_id {
+                return Err(StorageError::conflict(
+                    "duplicate_session_path",
+                    "directory path already belongs to another session_id",
+                ));
+            }
+        }
+        staged.diagnostics_by_path.remove(&entry.relative_dir);
+        staged
+            .by_path
+            .insert(entry.relative_dir.clone(), entry.session_id.clone());
+        staged.by_id.insert(entry.session_id.clone(), entry);
+        staged.bump_revision();
+
+        let mut guard = self
+            .index
+            .write()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+        *guard = staged;
+        Ok(())
+    }
+
+    /// Reconcile the in-memory catalog against `/data/recordings/`:
+    /// - prunes ghost entries whose directories no longer exist on disk,
+    /// - sweeps leftover control markers inside sealed directories,
+    /// - indexes newly discovered `recordings/<day>/<time>/manifest.json` directories, and
+    /// - preserves cached [`GatewayVerification`] for unchanged `(session_id, relative_dir, manifest_sha256)`
+    ///   while computing fresh verification verdicts for unverified or new sessions.
+    pub fn reconcile(&self) -> StorageResult<usize> {
+        self.scan_and_commit_from_disk(false)
+    }
+
     /// Parse and admit one sealed session directory under `/data/recordings/<relative_dir>`.
     pub fn admit_from_session_dir(&self, relative_dir: &str) -> StorageResult<IndexedSession> {
         let (dir_file, root_dev, exfat) =
             open_pinned_directory(&self.paths.recordings_dir(), relative_dir)?;
         let opened = open_manifest_in_dir(&dir_file, root_dev, exfat, None)?;
-        let indexed =
+        sweep_leftover_control_markers_best_effort(
+            &self.paths.recordings_dir().join(relative_dir),
+            &opened.parsed,
+        );
+        let mut indexed =
             parse_indexed_session_from_manifest(relative_dir, &opened.parsed, &opened.sha256)?;
+        indexed.verification = Some(verify_discovered_session_artifacts(
+            &dir_file,
+            root_dev,
+            &opened.parsed,
+            &opened.sha256,
+        ));
         self.admit_indexed_session(indexed.clone())?;
         Ok(indexed)
     }
@@ -691,6 +839,118 @@ impl BinarySessionCatalog {
             StorageError::io("catalog_write_failed", "write catalog.bin atomically", err)
         })
     }
+    fn scan_and_commit_from_disk(&self, force_bump: bool) -> StorageResult<usize> {
+        let _persist_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let current = {
+            let guard = self
+                .index
+                .read()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+            guard.clone()
+        };
+
+        let recordings_root = self.paths.recordings_dir();
+        let (scanned_sessions, scanned_diags) =
+            scan_recordings_tree(&recordings_root, Some(&current))?;
+
+        let mut by_id: HashMap<String, IndexedSession> = HashMap::new();
+        let mut by_path: HashMap<String, String> = HashMap::new();
+        let mut diagnostics_by_path: BTreeMap<String, SessionDiscoveryDiagnostic> = BTreeMap::new();
+        for (rel, mut diag) in scanned_diags {
+            if let Some(prev_diag) = current.diagnostics_by_path.get(&rel) {
+                if prev_diag.code == diag.code && prev_diag.message == diag.message {
+                    diag = prev_diag.clone();
+                }
+            }
+            diagnostics_by_path.insert(rel, diag);
+        }
+
+        let mut duplicate_ids: HashMap<String, Vec<String>> = HashMap::new();
+        for session in scanned_sessions {
+            if let Some(prev) = by_id.get(&session.session_id) {
+                duplicate_ids
+                    .entry(session.session_id.clone())
+                    .or_insert_with(|| vec![prev.relative_dir.clone()])
+                    .push(session.relative_dir.clone());
+            } else {
+                by_path.insert(session.relative_dir.clone(), session.session_id.clone());
+                by_id.insert(session.session_id.clone(), session);
+            }
+        }
+
+        // Duplicate session_id safety: remove ambiguous duplicates from `items` and
+        // surface deterministic discovery diagnostics instead of silently overwriting.
+        for (dup_id, rel_paths) in duplicate_ids {
+            by_id.remove(&dup_id);
+            for rel in rel_paths {
+                by_path.remove(&rel);
+                let dup_msg =
+                    "duplicate session identity detected across multiple recording directories"
+                        .to_owned();
+                let diag = match current.diagnostics_by_path.get(&rel) {
+                    Some(prev_diag)
+                        if prev_diag.code == DiscoveryDiagnosticCode::ManifestInvalid
+                            && prev_diag.message == dup_msg =>
+                    {
+                        prev_diag.clone()
+                    }
+                    _ => SessionDiscoveryDiagnostic {
+                        quarantine_id: new_uuid_v4(),
+                        code: DiscoveryDiagnosticCode::ManifestInvalid,
+                        observed_at: now_rfc3339_utc(),
+                        message: dup_msg,
+                    },
+                };
+                diagnostics_by_path.insert(rel, diag);
+            }
+        }
+
+        let count = by_id.len();
+        let unchanged = !force_bump
+            && by_id == current.by_id
+            && by_path == current.by_path
+            && diagnostics_by_path == current.diagnostics_by_path;
+        if unchanged {
+            return Ok(count);
+        }
+
+        let mut staged = CatalogIndex {
+            revision_seq: current.revision_seq.saturating_add(1),
+            catalog_revision: String::new(),
+            by_id,
+            by_path,
+            diagnostics_by_path,
+        };
+        staged.recompute_revision();
+
+        let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
+        if let Err(err) = self.write_snapshot_bytes(&snapshot_bytes) {
+            if !is_persist_ignorable_on_rebuild(&err) {
+                return Err(err);
+            }
+        }
+
+        let mut guard = self
+            .index
+            .write()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+        *guard = staged;
+        Ok(count)
+    }
+}
+
+fn is_persist_ignorable_on_rebuild(err: &StorageError) -> bool {
+    match err {
+        StorageError::Unavailable { .. } => true,
+        StorageError::Io { source, .. } => matches!(
+            source.raw_os_error(),
+            Some(libc::EROFS | libc::ENOSPC | libc::EIO | libc::EDQUOT | libc::EACCES)
+        ),
+        _ => false,
+    }
 }
 
 impl SessionCatalog for BinarySessionCatalog {
@@ -733,85 +993,7 @@ impl SessionCatalog for BinarySessionCatalog {
     }
 
     fn rebuild_index(&self) -> StorageResult<usize> {
-        let _persist_guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
-        let recordings_root = self.paths.recordings_dir();
-        let (scanned_sessions, scanned_diags) = scan_recordings_tree(&recordings_root)?;
-
-        let mut staged = {
-            let guard = self
-                .index
-                .read()
-                .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
-            guard.clone()
-        };
-
-        let next_rev_seq = staged.revision_seq.saturating_add(1);
-        let mut by_id: HashMap<String, IndexedSession> = HashMap::new();
-        let mut by_path: HashMap<String, String> = HashMap::new();
-        let mut diagnostics_by_path: BTreeMap<String, SessionDiscoveryDiagnostic> =
-            scanned_diags.into_iter().collect();
-        let mut duplicate_ids: HashMap<String, Vec<String>> = HashMap::new();
-
-        for session in scanned_sessions {
-            if let Some(prev) = by_id.get(&session.session_id) {
-                duplicate_ids
-                    .entry(session.session_id.clone())
-                    .or_insert_with(|| vec![prev.relative_dir.clone()])
-                    .push(session.relative_dir.clone());
-            } else {
-                by_path.insert(session.relative_dir.clone(), session.session_id.clone());
-                by_id.insert(session.session_id.clone(), session);
-            }
-        }
-
-        // Duplicate session_id safety: remove ambiguous duplicates from `items` and
-        // surface deterministic discovery diagnostics instead of silently overwriting.
-        for (dup_id, rel_paths) in duplicate_ids {
-            by_id.remove(&dup_id);
-            for rel in rel_paths {
-                by_path.remove(&rel);
-                diagnostics_by_path.insert(
-                    rel,
-                    SessionDiscoveryDiagnostic {
-                        quarantine_id: new_uuid_v4(),
-                        code: DiscoveryDiagnosticCode::ManifestInvalid,
-                        observed_at: now_rfc3339_utc(),
-                        message:
-                            "duplicate session identity detected across multiple recording directories"
-                                .to_owned(),
-                    },
-                );
-            }
-        }
-
-        // Preserve any previously verified gateway verdicts whose manifest_sha256 still matches.
-        for (sid, session) in &mut by_id {
-            if let Some(prev) = staged.by_id.get(sid) {
-                if prev.manifest_sha256 == session.manifest_sha256 {
-                    session.verification = prev.verification.clone();
-                }
-            }
-        }
-
-        let count = by_id.len();
-        staged.revision_seq = next_rev_seq;
-        staged.by_id = by_id;
-        staged.by_path = by_path;
-        staged.diagnostics_by_path = diagnostics_by_path;
-        staged.recompute_revision();
-
-        let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
-        self.write_snapshot_bytes(&snapshot_bytes)?;
-
-        let mut guard = self
-            .index
-            .write()
-            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
-        *guard = staged;
-        Ok(count)
+        self.scan_and_commit_from_disk(true)
     }
 }
 
@@ -897,7 +1079,10 @@ type ScannedRecordings = (
 );
 
 /// Scan `/data/recordings/` (`YYYY-MM-DD/HH-MM-SS[_NN]` and `unknown-date/recording_NN`).
-fn scan_recordings_tree(recordings_root: &Path) -> StorageResult<ScannedRecordings> {
+fn scan_recordings_tree(
+    recordings_root: &Path,
+    previous: Option<&CatalogIndex>,
+) -> StorageResult<ScannedRecordings> {
     let root_dir = match open_directory_safe(recordings_root) {
         Ok(dir) => dir,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -960,15 +1145,10 @@ fn scan_recordings_tree(recordings_root: &Path) -> StorageResult<ScannedRecordin
         child_names.sort();
 
         for child in child_names {
-            let valid_child = if is_dated {
-                is_time_dir_name(&child)
-            } else {
-                is_unknown_time_dir_name(&child)
-            };
-            if !valid_child {
+            let rel_dir = format!("{day_name}/{child}");
+            if !is_canonical_session_relative_dir(&rel_dir) {
                 continue;
             }
-            let rel_dir = format!("{day_name}/{child}");
             let Ok(child_c) = CString::new(child.as_str()) else {
                 continue;
             };
@@ -1010,7 +1190,31 @@ fn scan_recordings_tree(recordings_root: &Path) -> StorageResult<ScannedRecordin
             match open_manifest_in_dir(&session_dir, root_dev, exfat, None) {
                 Ok(opened) => {
                     match classify_and_parse_manifest(&rel_dir, &opened.parsed, &opened.sha256) {
-                        Ok(indexed) => sessions.push(indexed),
+                        Ok(mut indexed) => {
+                            sweep_leftover_control_markers_best_effort(
+                                &day_path.join(&child),
+                                &opened.parsed,
+                            );
+                            let cached_verification = previous
+                                .and_then(|prev| prev.by_id.get(&indexed.session_id))
+                                .filter(|prev_entry| {
+                                    prev_entry.relative_dir == indexed.relative_dir
+                                        && prev_entry.manifest_sha256 == indexed.manifest_sha256
+                                })
+                                .and_then(|prev_entry| prev_entry.verification.as_ref())
+                                .filter(|ver| ver.manifest_sha256 == indexed.manifest_sha256)
+                                .cloned();
+
+                            indexed.verification = Some(cached_verification.unwrap_or_else(|| {
+                                verify_discovered_session_artifacts(
+                                    &session_dir,
+                                    root_dev,
+                                    &opened.parsed,
+                                    &opened.sha256,
+                                )
+                            }));
+                            sessions.push(indexed);
+                        }
                         Err((code, message)) => {
                             diagnostics.push((
                                 rel_dir,
@@ -1040,6 +1244,161 @@ fn scan_recordings_tree(recordings_root: &Path) -> StorageResult<ScannedRecordin
     }
 
     Ok((sessions, diagnostics))
+}
+
+fn sweep_leftover_control_markers_best_effort(session_path: &Path, manifest: &Value) {
+    if manifest.get("sealed").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let declared_capture_clock =
+        manifest
+            .get("logs")
+            .and_then(Value::as_array)
+            .is_some_and(|logs| {
+                logs.iter().any(|item| {
+                    item.get("path").and_then(Value::as_str) == Some("audio/capture-clock.json")
+                })
+            });
+
+    for rel in [
+        "recording.json",
+        "capture.json",
+        "checkpoint.json",
+        "audio/checkpoint.json",
+        "audio/checkpoint.ndjson",
+    ] {
+        let p = session_path.join(rel);
+        if let Ok(st) = fs::symlink_metadata(&p) {
+            if st.file_type().is_file() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    let tmp_ckpt = session_path.join("audio/checkpoint.tmp");
+    if let Ok(st) = fs::symlink_metadata(&tmp_ckpt) {
+        if st.file_type().is_file() {
+            let _ = fs::remove_file(&tmp_ckpt);
+        } else if st.file_type().is_dir() {
+            let _ = fs::remove_dir(&tmp_ckpt);
+        }
+    }
+    if !declared_capture_clock {
+        let cc = session_path.join("audio/capture-clock.json");
+        if let Ok(st) = fs::symlink_metadata(&cc) {
+            if st.file_type().is_file() {
+                let _ = fs::remove_file(&cc);
+            }
+        }
+    }
+    let _ = sweep_stale_atomic_temps(session_path);
+    let audio_dir = session_path.join("audio");
+    if audio_dir.is_dir() {
+        let _ = sweep_stale_atomic_temps(&audio_dir);
+        let _ = fs::remove_dir(&audio_dir);
+    }
+}
+
+/// Perform a pinned-descriptor stat + size + regular-file integrity check over all declared
+/// manifest artifacts to populate [`GatewayVerification`] during catalog discovery/rebuild.
+pub(crate) fn verify_discovered_session_artifacts(
+    session_dir: &fs::File,
+    root_dev: u64,
+    manifest: &Value,
+    manifest_sha256: &str,
+) -> GatewayVerification {
+    let device_obj = manifest.get("device").and_then(Value::as_object);
+    let version = device_obj
+        .and_then(|d| d.get("software_version"))
+        .and_then(Value::as_str)
+        .filter(|s| (1..=64).contains(&s.chars().count()))
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_owned();
+    let commit = device_obj
+        .and_then(|d| d.get("commit"))
+        .and_then(Value::as_str)
+        .unwrap_or("0000000000000000000000000000000000000000");
+    let build_sha256 = sha256_hex(format!("miro-ego:{version}:{commit}").as_bytes());
+    let verified_at = now_rfc3339_utc();
+
+    let descriptors = match extract_manifest_artifacts(manifest) {
+        Ok(list) => list,
+        Err(_) => {
+            return GatewayVerification {
+                actor: "gateway".to_owned(),
+                validator: GatewayValidatorInfo {
+                    name: "miro-ego".to_owned(),
+                    version,
+                    build_sha256,
+                },
+                manifest_sha256: manifest_sha256.to_owned(),
+                verified_at,
+                verdict: "unusable".to_owned(),
+                diagnostics: vec![GatewayVerificationDiagnostic {
+                    code: "manifest_invalid".to_owned(),
+                    summary: "manifest artifact inventory failed structural validation".to_owned(),
+                }],
+            };
+        }
+    };
+
+    let mut diagnostics = Vec::new();
+    for desc in &descriptors {
+        let file = match open_relative_regular_in_dir(session_dir, root_dev, &desc.path) {
+            Ok(f) => f,
+            Err(_) => {
+                diagnostics.push(GatewayVerificationDiagnostic {
+                    code: "artifact_invalid".to_owned(),
+                    summary: format!(
+                        "declared artifact for role '{}' is missing or unsafe on disk",
+                        desc.role
+                    ),
+                });
+                continue;
+            }
+        };
+        let Ok(st) = fstat(file.as_raw_fd()) else {
+            diagnostics.push(GatewayVerificationDiagnostic {
+                code: "verification_failed".to_owned(),
+                summary: format!("unable to stat declared artifact for role '{}'", desc.role),
+            });
+            continue;
+        };
+        #[allow(clippy::useless_conversion)]
+        let nlink = u64::from(st.st_nlink);
+        let size_ok = u64::try_from(st.st_size).is_ok_and(|sz| sz == desc.bytes);
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || st.st_dev != root_dev
+            || nlink != 1
+            || !size_ok
+        {
+            diagnostics.push(GatewayVerificationDiagnostic {
+                code: "artifact_invalid".to_owned(),
+                summary: format!(
+                    "declared artifact for role '{}' failed size or regular-file identity check",
+                    desc.role
+                ),
+            });
+        }
+    }
+
+    let verdict = if diagnostics.is_empty() {
+        "usable".to_owned()
+    } else {
+        "unusable".to_owned()
+    };
+
+    GatewayVerification {
+        actor: "gateway".to_owned(),
+        validator: GatewayValidatorInfo {
+            name: "miro-ego".to_owned(),
+            version,
+            build_sha256,
+        },
+        manifest_sha256: manifest_sha256.to_owned(),
+        verified_at,
+        verdict,
+        diagnostics,
+    }
 }
 
 fn classify_and_parse_manifest(
