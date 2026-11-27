@@ -85,6 +85,25 @@ pub fn is_lower_hex_exact(value: &str, expected_len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+const MAX_ECHOED_FIELD_CHARS: usize = 64;
+
+/// Sanitize and truncate an untrusted field name or identifier before echoing it in an error message.
+pub fn truncate_untrusted_field(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_ECHOED_FIELD_CHARS + 3));
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx >= MAX_ECHOED_FIELD_CHARS {
+            out.push_str("...");
+            break;
+        }
+        if ch.is_control() {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Response headers metadata for streaming downloads (artifacts and diagnostic logs).
 pub struct DownloadResponseMeta<'a> {
     pub status: StatusCode,

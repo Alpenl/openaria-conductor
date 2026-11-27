@@ -1,8 +1,9 @@
 //! Decoupled `GatewayBackend` trait covering all 37 Miro-Ego v1 OpenAPI operations,
 //! plus a complete stateful in-memory `MockGatewayBackend` for integration testing and dev mode.
 
-use crate::downloads::{OpenRepresentation, open_safe_log_file};
+use crate::downloads::{LogEtagCache, OpenRepresentation, open_safe_log_file_with_cache};
 use crate::error::{ApiError, ApiResult};
+use crate::handlers::truncate_untrusted_field;
 use crate::preview::{H264PreviewHub, MjpegPreviewHub};
 use crate::range::{infer_log_media_type, is_valid_log_name};
 use crate::security::{AuditEvent, SecurityProfile, format_unix_secs_rfc3339, rfc3339_now_utc};
@@ -12,11 +13,11 @@ use bytes::Bytes;
 use miro_ego_core::ids::{hex_encode, new_uuid_v4, new_uuid_v7};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Idempotent command envelope passed from HTTP handlers to [`GatewayBackend`].
 #[derive(Debug, Clone)]
@@ -152,6 +153,12 @@ pub trait GatewayBackend: Send + Sync + 'static {
         artifact_id: &str,
     ) -> ApiResult<OpenRepresentation>;
     async fn delete_sessions(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome>;
+    async fn check_delete_sessions_idempotency(
+        &self,
+        _cmd: &IdempotentCommand,
+    ) -> ApiResult<Option<CommandOutcome>> {
+        Ok(None)
+    }
 
     // --- Diagnostic Logs ---
     async fn list_logs(&self, query: ListLogsQuery) -> ApiResult<Value>;
@@ -250,10 +257,30 @@ pub struct MockLogEntry {
     pub sha256: String,
 }
 
+const MOCK_MAX_CLOCK_CHALLENGES: usize = 256;
+const MOCK_CLOCK_CHALLENGE_TTL: Duration = Duration::from_millis(5000);
+const MOCK_MAX_NETWORK_CREDENTIALS: usize = 256;
+const MOCK_NETWORK_CREDENTIAL_TTL: Duration = Duration::from_secs(120);
+const MOCK_MAX_IDEMPOTENCY_RECORDS: usize = 512;
+const MAX_LOG_DIR_DEPTH: usize = 8;
+
 #[derive(Debug, Clone)]
 struct IdempotencyRecord {
     canonical_body: Vec<u8>,
     outcome: CommandOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct MockClockChallenge {
+    principal_id: String,
+    from_check: bool,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct MockNetworkCredential {
+    principal_id: String,
+    expires_at: Instant,
 }
 
 struct MockState {
@@ -281,13 +308,17 @@ struct MockState {
     clock_synced: bool,
     clock_unix_ms: u64,
     clock_synced_at_ms: Option<u64>,
-    clock_challenges: HashMap<String, (String, bool)>, // challenge -> (principal_id, is_check)
+    clock_challenges: HashMap<String, MockClockChallenge>,
+    clock_challenge_order: VecDeque<String>,
     network_mode: String,
     network_saved: bool,
     network_verified: bool,
     network_ssid: Option<String>,
     network_security: Option<String>,
-    network_credentials: HashMap<String, String>, // cred_ref -> principal_id
+    network_credentials: HashMap<String, MockNetworkCredential>,
+    network_credential_order: VecDeque<String>,
+    consumed_network_credentials: HashSet<String>,
+    consumed_credential_order: VecDeque<String>,
     network_transactions: HashMap<String, Value>,
     latest_network_tx: Option<Value>,
     firmware_current: (String, String),
@@ -301,6 +332,7 @@ struct MockState {
     in_memory_logs: HashMap<String, MockLogEntry>,
     web_assets: HashMap<String, StaticAsset>,
     idempotency: HashMap<(String, String, String), IdempotencyRecord>,
+    idempotency_order: VecDeque<(String, String, String)>,
     audit_events: Vec<AuditEvent>,
 }
 
@@ -311,6 +343,7 @@ pub struct MockGatewayBackend {
     h264_hub: Option<Arc<H264PreviewHub>>,
     capture_events: Arc<EventReplayBuffer>,
     network_events: Arc<NetworkEventReplayBuffer>,
+    log_etag_cache: Arc<LogEtagCache>,
     fail_audit: AtomicBool,
 }
 
@@ -501,12 +534,16 @@ impl MockGatewayBackend {
                 clock_unix_ms: 1_764_152_400_000,
                 clock_synced_at_ms: None,
                 clock_challenges: HashMap::new(),
+                clock_challenge_order: VecDeque::new(),
                 network_mode: "hotspot".to_owned(),
                 network_saved: false,
                 network_verified: false,
                 network_ssid: None,
                 network_security: None,
                 network_credentials: HashMap::new(),
+                network_credential_order: VecDeque::new(),
+                consumed_network_credentials: HashSet::new(),
+                consumed_credential_order: VecDeque::new(),
                 network_transactions,
                 latest_network_tx: Some(initial_tx),
                 firmware_current: ("0.3.0".to_owned(), fw_commit),
@@ -520,13 +557,37 @@ impl MockGatewayBackend {
                 in_memory_logs,
                 web_assets,
                 idempotency: HashMap::new(),
+                idempotency_order: VecDeque::new(),
                 audit_events: Vec::new(),
             }),
             mjpeg_hub,
             h264_hub,
             capture_events: Arc::new(EventReplayBuffer::default()),
             network_events: Arc::new(NetworkEventReplayBuffer::default()),
+            log_etag_cache: Arc::new(LogEtagCache::default()),
             fail_audit: AtomicBool::new(false),
+        }
+    }
+
+    pub fn log_etag_cache(&self) -> &Arc<LogEtagCache> {
+        &self.log_etag_cache
+    }
+
+    /// Force-expire a mock network credential reference (useful in deterministic TTL tests).
+    pub fn expire_network_credential(&self, cred_ref: &str) {
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(entry) = guard.network_credentials.get_mut(cred_ref)
+        {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
+    /// Force-expire a mock clock challenge token (useful in deterministic TTL tests).
+    pub fn expire_clock_challenge(&self, challenge: &str) {
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(entry) = guard.clock_challenges.get_mut(challenge)
+        {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
         }
     }
 
@@ -1048,6 +1109,24 @@ fn mock_capture_status_json(state: &MockState) -> Value {
     })
 }
 
+fn mock_network_disabled_reason(device_state: &str) -> Option<&'static str> {
+    match device_state {
+        "idle" => None,
+        "blocked" | "failed" | "recoverable" => Some("recovery_required"),
+        _ => Some("capture_active"),
+    }
+}
+
+fn ensure_mock_network_idle(state: &MockState) -> ApiResult<()> {
+    if let Some(reason) = mock_network_disabled_reason(&state.device_state) {
+        return Err(ApiError::network_mutation_unavailable(
+            reason,
+            "network mutation is only permitted when device is idle",
+        ));
+    }
+    Ok(())
+}
+
 fn mock_network_status_json(state: &MockState) -> Value {
     let desired_wifi = if state.network_mode == "wifi-client" {
         json!({
@@ -1058,6 +1137,7 @@ fn mock_network_status_json(state: &MockState) -> Value {
     } else {
         Value::Null
     };
+    let disabled_reason = mock_network_disabled_reason(&state.device_state);
     json!({
         "schema": "miro-ego.network-status.v1",
         "authority_epoch": state.authority_epoch,
@@ -1106,8 +1186,8 @@ fn mock_network_status_json(state: &MockState) -> Value {
             "latest": state.latest_network_tx
         },
         "mutation_capability": {
-            "enabled": true,
-            "disabled_reason": null,
+            "enabled": disabled_reason.is_none(),
+            "disabled_reason": disabled_reason,
             "operations": ["apply", "retry", "forget"],
             "idempotency_key_required": true,
             "secret_handling": "opaque_credential_reference_only",
@@ -1139,7 +1219,7 @@ fn check_idempotency(
             replayed.replayed = true;
             return Ok(Some(replayed));
         }
-        if matches!(scope, "network_apply" | "network_retry" | "network_forget") {
+        if scope == "network-mutation" {
             let orig_tx_id = existing
                 .outcome
                 .body
@@ -1169,6 +1249,16 @@ fn store_idempotency(
         cmd.principal_id.clone(),
         cmd.idempotency_key.clone(),
     );
+    if !state.idempotency.contains_key(&key) {
+        while state.idempotency.len() >= MOCK_MAX_IDEMPOTENCY_RECORDS {
+            if let Some(oldest) = state.idempotency_order.pop_front() {
+                state.idempotency.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        state.idempotency_order.push_back(key.clone());
+    }
     state.idempotency.insert(
         key,
         IdempotencyRecord {
@@ -1623,6 +1713,14 @@ impl GatewayBackend for MockGatewayBackend {
         }
     }
 
+    async fn check_delete_sessions_idempotency(
+        &self,
+        cmd: &IdempotentCommand,
+    ) -> ApiResult<Option<CommandOutcome>> {
+        let state = self.lock_state()?;
+        check_idempotency(&state, "sessions_delete", cmd)
+    }
+
     async fn delete_sessions(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
         let mut state = self.lock_state()?;
         if let Some(replayed) = check_idempotency(&state, "sessions_delete", &cmd)? {
@@ -1649,7 +1747,10 @@ impl GatewayBackend for MockGatewayBackend {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ApiError::bad_request("missing manifest_sha256"))?;
             let Some(sess) = state.sessions.get(sid) else {
-                return Err(ApiError::not_found(format!("session {sid} not found")));
+                return Err(ApiError::not_found(format!(
+                    "session {} not found",
+                    truncate_untrusted_field(sid)
+                )));
             };
             if sess.manifest.sha256 != digest {
                 return Err(ApiError::conflict(
@@ -1688,8 +1789,16 @@ impl GatewayBackend for MockGatewayBackend {
         if let Some(root) = logs_dir {
             let prefix = query.prefix.clone();
             entries = tokio::task::spawn_blocking(move || {
+                let root_meta = std::fs::symlink_metadata(&root).map_err(|err| {
+                    ApiError::storage_unavailable(format!("cannot stat logs directory: {err}"))
+                })?;
+                if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+                    return Err(ApiError::storage_unavailable(
+                        "diagnostic logs root must be a regular directory",
+                    ));
+                }
                 let mut disk_entries = Vec::new();
-                collect_disk_logs(&root, "", prefix.as_deref(), &mut disk_entries)?;
+                collect_disk_logs(&root, "", prefix.as_deref(), 0, &mut disk_entries)?;
                 Ok::<_, ApiError>(disk_entries)
             })
             .await
@@ -1753,14 +1862,17 @@ impl GatewayBackend for MockGatewayBackend {
         };
         if let Some(root) = logs_dir {
             let owned_name = name.to_owned();
-            return tokio::task::spawn_blocking(move || open_safe_log_file(&root, &owned_name))
-                .await
-                .map_err(|err| {
-                    ApiError::internal(
-                        "task_join_error",
-                        format!("open log file task failed: {err}"),
-                    )
-                })?;
+            let cache = Arc::clone(&self.log_etag_cache);
+            return tokio::task::spawn_blocking(move || {
+                open_safe_log_file_with_cache(&root, &owned_name, &cache)
+            })
+            .await
+            .map_err(|err| {
+                ApiError::internal(
+                    "task_join_error",
+                    format!("open log file task failed: {err}"),
+                )
+            })?;
         }
         let entry =
             mem_entry.ok_or_else(|| ApiError::not_found("diagnostic log file not found"))?;
@@ -1830,13 +1942,11 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn clock_status(&self, principal_id: &str) -> ApiResult<Value> {
         let mut state = self.lock_state()?;
+        prune_mock_clock_challenges(&mut state);
         let (challenge, expires_in_ms) = if state.clock_synced {
             (Value::Null, 0u64)
         } else {
-            let tok = new_challenge_hex();
-            state
-                .clock_challenges
-                .insert(tok.clone(), (principal_id.to_owned(), false));
+            let tok = issue_mock_clock_challenge(&mut state, principal_id, false);
             (Value::String(tok), 5000u64)
         };
         Ok(json!({
@@ -1854,10 +1964,8 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn clock_inspect(&self, principal_id: &str) -> ApiResult<Value> {
         let mut state = self.lock_state()?;
-        let tok = new_challenge_hex();
-        state
-            .clock_challenges
-            .insert(tok.clone(), (principal_id.to_owned(), true));
+        prune_mock_clock_challenges(&mut state);
+        let tok = issue_mock_clock_challenge(&mut state, principal_id, true);
         Ok(json!({
             "schema": "miro-ego.clock-status.v1",
             "source": if state.clock_synced { "client" } else { "unsynchronized" },
@@ -1892,23 +2000,37 @@ impl GatewayBackend for MockGatewayBackend {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let Some((owner, from_check)) = state.clock_challenges.remove(challenge) else {
+        let now = Instant::now();
+        let Some(record) = state.clock_challenges.remove(challenge) else {
+            prune_mock_clock_challenges(&mut state);
             return Err(ApiError::conflict(
                 "clock_challenge_invalid",
                 "clock challenge is expired, already used, or unknown",
-            ));
+            )
+            .with_error_code_header());
         };
-        if owner != principal_id {
+        state.clock_challenge_order.retain(|c| c != challenge);
+        prune_mock_clock_challenges(&mut state);
+        if record.expires_at <= now {
+            return Err(ApiError::conflict(
+                "clock_challenge_invalid",
+                "clock challenge has expired",
+            )
+            .with_error_code_header());
+        }
+        if record.principal_id != principal_id {
             return Err(ApiError::conflict(
                 "clock_challenge_invalid",
                 "clock challenge is bound to a different principal",
-            ));
+            )
+            .with_error_code_header());
         }
-        if replace && !from_check {
+        if replace && !record.from_check {
             return Err(ApiError::conflict(
                 "clock_challenge_invalid",
                 "replace=true requires a fresh /clock/check challenge",
-            ));
+            )
+            .with_error_code_header());
         }
         let applied = if !state.clock_synced || replace {
             state.clock_synced = true;
@@ -1963,6 +2085,14 @@ impl GatewayBackend for MockGatewayBackend {
 
     async fn network_scan(&self) -> ApiResult<Value> {
         let state = self.lock_state()?;
+        if state.device_state != "idle" {
+            return Err(ApiError::service_unavailable(
+                "capture_active",
+                "Wi-Fi scan is temporarily unavailable while capture is active",
+            )
+            .with_header("Retry-After", "1")
+            .with_error_code_header());
+        }
         Ok(json!({
             "schema": "miro-ego.network-scan.v1",
             "authority_epoch": state.authority_epoch,
@@ -1993,10 +2123,24 @@ impl GatewayBackend for MockGatewayBackend {
         _passphrase: &str,
     ) -> ApiResult<Value> {
         let mut state = self.lock_state()?;
+        ensure_mock_network_idle(&state)?;
+        prune_mock_network_credentials(&mut state);
+        while state.network_credentials.len() >= MOCK_MAX_NETWORK_CREDENTIALS {
+            if let Some(oldest) = state.network_credential_order.pop_front() {
+                state.network_credentials.remove(&oldest);
+            } else {
+                break;
+            }
+        }
         let cred_ref = format!("cred-{}", new_uuid_v4());
-        state
-            .network_credentials
-            .insert(cred_ref.clone(), principal_id.to_owned());
+        state.network_credential_order.push_back(cred_ref.clone());
+        state.network_credentials.insert(
+            cred_ref.clone(),
+            MockNetworkCredential {
+                principal_id: principal_id.to_owned(),
+                expires_at: Instant::now() + MOCK_NETWORK_CREDENTIAL_TTL,
+            },
+        );
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2017,9 +2161,10 @@ impl GatewayBackend for MockGatewayBackend {
     ) -> ApiResult<CommandOutcome> {
         let (outcome, updated_status) = {
             let mut state = self.lock_state()?;
-            if let Some(replayed) = check_idempotency(&state, "network_apply", &cmd)? {
+            if let Some(replayed) = check_idempotency(&state, "network-mutation", &cmd)? {
                 return Ok(replayed);
             }
+            ensure_mock_network_idle(&state)?;
             let desired = cmd
                 .body
                 .get("desired")
@@ -2058,17 +2203,7 @@ impl GatewayBackend for MockGatewayBackend {
                                 "reason": "missing_credential_ref"
                             }))
                         })?;
-                    if state.network_credentials.remove(cred_ref).is_none() {
-                        return Err(ApiError::unprocessable(
-                            "invalid_network_desired_state",
-                            "credential_ref expired or already used",
-                        )
-                        .with_error_code_header()
-                        .with_details(json!({
-                            "field": "desired.wifi_client.credential_ref",
-                            "reason": "credential_ref_already_used"
-                        })));
-                    }
+                    consume_mock_network_credential(&mut state, cred_ref, &cmd.principal_id)?;
                 }
                 state.network_mode = "wifi-client".to_owned();
                 state.network_saved = true;
@@ -2123,7 +2258,7 @@ impl GatewayBackend for MockGatewayBackend {
                 "transaction": tx
             });
             let outcome = CommandOutcome::accepted(receipt, false);
-            store_idempotency(&mut state, "network_apply", &cmd, &outcome);
+            store_idempotency(&mut state, "network-mutation", &cmd, &outcome);
             (outcome, mock_network_status_json(&state))
         };
         let _ = self.network_events.observe(updated_status);
@@ -2133,9 +2268,10 @@ impl GatewayBackend for MockGatewayBackend {
     async fn retry_network_transaction(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
         let (outcome, updated_status) = {
             let mut state = self.lock_state()?;
-            if let Some(replayed) = check_idempotency(&state, "network_retry", &cmd)? {
+            if let Some(replayed) = check_idempotency(&state, "network-mutation", &cmd)? {
                 return Ok(replayed);
             }
+            ensure_mock_network_idle(&state)?;
             let tx_id = cmd
                 .body
                 .get("transaction_id")
@@ -2175,7 +2311,7 @@ impl GatewayBackend for MockGatewayBackend {
                 "transaction": tx
             });
             let outcome = CommandOutcome::accepted(receipt, false);
-            store_idempotency(&mut state, "network_retry", &cmd, &outcome);
+            store_idempotency(&mut state, "network-mutation", &cmd, &outcome);
             (outcome, mock_network_status_json(&state))
         };
         let _ = self.network_events.observe(updated_status);
@@ -2188,9 +2324,10 @@ impl GatewayBackend for MockGatewayBackend {
     ) -> ApiResult<CommandOutcome> {
         let (outcome, updated_status) = {
             let mut state = self.lock_state()?;
-            if let Some(replayed) = check_idempotency(&state, "network_forget", &cmd)? {
+            if let Some(replayed) = check_idempotency(&state, "network-mutation", &cmd)? {
                 return Ok(replayed);
             }
+            ensure_mock_network_idle(&state)?;
             state.network_mode = "hotspot".to_owned();
             state.network_saved = false;
             state.network_verified = false;
@@ -2227,7 +2364,7 @@ impl GatewayBackend for MockGatewayBackend {
                 "transaction": tx
             });
             let outcome = CommandOutcome::accepted(receipt, false);
-            store_idempotency(&mut state, "network_forget", &cmd, &outcome);
+            store_idempotency(&mut state, "network-mutation", &cmd, &outcome);
             (outcome, mock_network_status_json(&state))
         };
         let _ = self.network_events.observe(updated_status);
@@ -2347,6 +2484,136 @@ fn mock_firmware_status(state: &MockState, checked_at: Option<u64>) -> Value {
     })
 }
 
+fn prune_mock_clock_challenges(state: &mut MockState) {
+    let now = Instant::now();
+    while let Some(front) = state.clock_challenge_order.front() {
+        let expired = state
+            .clock_challenges
+            .get(front)
+            .is_none_or(|c| c.expires_at <= now);
+        if expired {
+            if let Some(tok) = state.clock_challenge_order.pop_front() {
+                state.clock_challenges.remove(&tok);
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn issue_mock_clock_challenge(
+    state: &mut MockState,
+    principal_id: &str,
+    from_check: bool,
+) -> String {
+    while state.clock_challenges.len() >= MOCK_MAX_CLOCK_CHALLENGES {
+        if let Some(oldest) = state.clock_challenge_order.pop_front() {
+            state.clock_challenges.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+    let tok = new_challenge_hex();
+    state.clock_challenge_order.push_back(tok.clone());
+    state.clock_challenges.insert(
+        tok.clone(),
+        MockClockChallenge {
+            principal_id: principal_id.to_owned(),
+            from_check,
+            expires_at: Instant::now() + MOCK_CLOCK_CHALLENGE_TTL,
+        },
+    );
+    tok
+}
+
+fn prune_mock_network_credentials(state: &mut MockState) {
+    let now = Instant::now();
+    while let Some(front) = state.network_credential_order.front() {
+        let expired = state
+            .network_credentials
+            .get(front)
+            .is_none_or(|c| c.expires_at <= now);
+        if expired {
+            if let Some(cred) = state.network_credential_order.pop_front() {
+                state.network_credentials.remove(&cred);
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn consume_mock_network_credential(
+    state: &mut MockState,
+    cred_ref: &str,
+    principal_id: &str,
+) -> ApiResult<()> {
+    let now = Instant::now();
+    if let Some(entry) = state.network_credentials.get(cred_ref) {
+        if entry.expires_at <= now {
+            state.network_credentials.remove(cred_ref);
+            state.network_credential_order.retain(|c| c != cred_ref);
+            prune_mock_network_credentials(state);
+            return Err(ApiError::unprocessable(
+                "invalid_network_desired_state",
+                "credential_ref has expired",
+            )
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.credential_ref",
+                "reason": "credential_ref_expired"
+            })));
+        }
+        if entry.principal_id != principal_id {
+            return Err(ApiError::unprocessable(
+                "invalid_network_desired_state",
+                "credential_ref belongs to a different principal",
+            )
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.credential_ref",
+                "reason": "credential_ref_not_allowed"
+            })));
+        }
+    } else {
+        prune_mock_network_credentials(state);
+        let reason = if state.consumed_network_credentials.contains(cred_ref) {
+            "credential_ref_already_used"
+        } else {
+            "credential_ref_expired"
+        };
+        return Err(ApiError::unprocessable(
+            "invalid_network_desired_state",
+            "credential_ref expired or already used",
+        )
+        .with_error_code_header()
+        .with_details(json!({
+            "field": "desired.wifi_client.credential_ref",
+            "reason": reason
+        })));
+    }
+
+    state.network_credentials.remove(cred_ref);
+    state.network_credential_order.retain(|c| c != cred_ref);
+    while state.consumed_network_credentials.len() >= MOCK_MAX_NETWORK_CREDENTIALS {
+        if let Some(oldest) = state.consumed_credential_order.pop_front() {
+            state.consumed_network_credentials.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+    if state
+        .consumed_network_credentials
+        .insert(cred_ref.to_owned())
+    {
+        state
+            .consumed_credential_order
+            .push_back(cred_ref.to_owned());
+    }
+    prune_mock_network_credentials(state);
+    Ok(())
+}
+
 fn new_challenge_hex() -> String {
     let raw = new_uuid_v4().replace('-', "");
     raw.chars().take(32).collect()
@@ -2356,21 +2623,28 @@ fn collect_disk_logs(
     dir: &std::path::Path,
     rel_prefix: &str,
     filter_prefix: Option<&str>,
+    depth: usize,
     out: &mut Vec<(String, u64, String, String, Option<String>)>,
 ) -> ApiResult<()> {
+    if depth > MAX_LOG_DIR_DEPTH {
+        return Ok(());
+    }
     let read_dir = std::fs::read_dir(dir).map_err(|err| {
         ApiError::storage_unavailable(format!("cannot list logs directory: {err}"))
     })?;
     for entry_res in read_dir {
         let Ok(entry) = entry_res else { continue };
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_symlink() {
-            continue;
-        }
         let Some(name_str) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         if name_str.starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
             continue;
         }
         let rel = if rel_prefix.is_empty() {
@@ -2379,28 +2653,28 @@ fn collect_disk_logs(
             format!("{rel_prefix}/{name_str}")
         };
         if ft.is_dir() {
-            let _ = collect_disk_logs(&entry.path(), &rel, filter_prefix, out);
+            if depth < MAX_LOG_DIR_DEPTH {
+                let _ = collect_disk_logs(&entry.path(), &rel, filter_prefix, depth + 1, out);
+            }
         } else if ft.is_file() && is_valid_log_name(&rel) {
             if let Some(prefix) = filter_prefix
                 && !rel.starts_with(prefix)
             {
                 continue;
             }
-            if let Ok(meta) = entry.metadata() {
-                let modified_secs = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                out.push((
-                    rel.clone(),
-                    meta.len(),
-                    format_unix_secs_rfc3339(modified_secs),
-                    infer_log_media_type(&rel).to_owned(),
-                    None,
-                ));
-            }
+            let modified_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push((
+                rel.clone(),
+                meta.len(),
+                format_unix_secs_rfc3339(modified_secs),
+                infer_log_media_type(&rel).to_owned(),
+                None,
+            ));
         }
     }
     Ok(())

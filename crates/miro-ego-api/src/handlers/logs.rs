@@ -70,7 +70,7 @@ pub async fn get_log_file(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
 
     // Authenticate BEFORE inspecting path syntax or UTF-8 decoding so unauthenticated Customer callers fail closed with 401.
     let principal = match ctx.authenticate_for_operation(&state, &parts.headers, "getLogFile") {
@@ -79,26 +79,44 @@ pub async fn get_log_file(
     };
 
     let Ok(Path(decoded_name)) = path_res else {
+        ctx.audit(
+            &state,
+            "getLogFile",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::bad_request(
             "invalid diagnostic log path; traversal, percent-encoding, and hidden files are forbidden",
         ));
     };
 
-    // Inspect the raw URI path as well as decoded path to block `%2e`, `%2f`, `%5c`, `..`, etc.
+    // Allow `%2F`/`%2f` segment separators per OpenAPI path encoding while strictly blocking
+    // all other `%`-escapes (`%2e`, `%5c`, `%00`, `%25`, etc.), `..`, dotfiles, and empty segments.
     let raw_suffix = parts
         .uri
         .path()
         .strip_prefix("/api/v1/logs/")
         .or_else(|| parts.uri.path().strip_prefix("/logs/"));
-    let valid_raw = raw_suffix.is_some_and(|s| !s.contains('%') && is_valid_log_name(s));
-    if !valid_raw || !is_valid_log_name(&decoded_name) {
+    let normalized_raw = raw_suffix.and_then(decode_log_path_separators_only);
+    let decoded_normalized = decode_log_path_separators_only(&decoded_name);
+    let Some(canonical_name) = normalized_raw.filter(|norm| {
+        is_valid_log_name(norm) && decoded_normalized.as_deref() == Some(norm.as_str())
+    }) else {
+        ctx.audit(
+            &state,
+            "getLogFile",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::bad_request(
             "invalid diagnostic log path; traversal, percent-encoding, and hidden files are forbidden",
         ));
-    }
+    };
 
     if let Err(resp) =
-        ctx.authorize_resource_read(&state, &principal, "getLogFile", Some(&decoded_name))
+        ctx.authorize_resource_read(&state, &principal, "getLogFile", Some(&canonical_name))
     {
         return *resp;
     }
@@ -107,7 +125,7 @@ pub async fn get_log_file(
         return ctx.error_response(ApiError::download_capacity_exhausted());
     };
 
-    let representation = match state.backend.open_log_file(&decoded_name).await {
+    let representation = match state.backend.open_log_file(&canonical_name).await {
         Ok(repr) => repr,
         Err(err) => return ctx.error_response(err),
     };
@@ -160,4 +178,25 @@ pub async fn get_log_file(
         },
         body,
     )
+}
+
+/// Normalize `%2F` / `%2f` path segment separators to `/` in a single left-to-right pass while
+/// rejecting any other `%` byte (e.g. `%2e`, `%5c`, `%00`, `%25`, `%252f`).
+fn decode_log_path_separators_only(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'f' | b'F') {
+                out.push(b'/');
+                i += 3;
+                continue;
+            }
+            return None;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }

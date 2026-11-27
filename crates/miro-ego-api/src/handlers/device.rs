@@ -2,8 +2,8 @@
 
 use crate::backend::IdempotentCommand;
 use crate::error::ApiError;
-use crate::handlers::{is_lower_hex_exact, parse_strict_query};
-use crate::middleware::{GatewayState, RequestCtx, read_strict_json_object};
+use crate::handlers::{is_lower_hex_exact, parse_strict_query, truncate_untrusted_field};
+use crate::middleware::{GatewayState, RequestCtx, read_strict_json_object_with_timeout};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header;
@@ -91,11 +91,17 @@ pub async fn set_voice_volume(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     if let Err(resp) = ctx.authorize_write(&state, &parts.headers, "setVoiceVolume") {
         return *resp;
     }
-    let (json, _) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, _) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -172,12 +178,18 @@ pub async fn sync_device_clock(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let principal = match ctx.authorize_write(&state, &parts.headers, "syncDeviceClock") {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
-    let (json, _) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, _) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -206,7 +218,8 @@ fn validate_clock_sync_body(body: &Value) -> Result<(), ApiError> {
             "schema" | "challenge" | "unix_time_ms" | "replace"
         ) {
             return Err(ApiError::bad_request(format!(
-                "unknown field in clock sync request: {key}"
+                "unknown field in clock sync request: {}",
+                truncate_untrusted_field(key)
             )));
         }
     }
@@ -245,11 +258,10 @@ pub async fn firmware_status(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
-    let principal = match ctx.authorize_read(&state, &headers, "firmwareStatus", None) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
+    if let Err(resp) = ctx.authorize_read(&state, &headers, "firmwareStatus", None) {
+        return *resp;
+    }
     let Ok(_permit) = tokio::time::timeout(
         Duration::from_millis(100),
         state.firmware_semaphore.acquire(),
@@ -262,16 +274,7 @@ pub async fn firmware_status(
         );
     };
     match state.backend.firmware_status().await {
-        Ok(body) => {
-            let _ = ctx.audit(
-                &state,
-                "firmwareStatus",
-                None,
-                "completed",
-                Some(&principal),
-            );
-            ctx.json_response(StatusCode::OK, &body, &[])
-        }
+        Ok(body) => ctx.json_response(StatusCode::OK, &body, &[]),
         Err(err) => ctx.error_response(err),
     }
 }
@@ -282,11 +285,10 @@ pub async fn firmware_check(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
-    let principal = match ctx.authorize_read(&state, &parts.headers, "checkFirmware", None) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
+    if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "checkFirmware", None) {
+        return *resp;
+    }
     let query = match parse_strict_query(&parts.uri) {
         Ok(q) => q,
         Err(err) => return ctx.error_response(err),
@@ -320,10 +322,7 @@ pub async fn firmware_check(
         );
     };
     match state.backend.firmware_check(force).await {
-        Ok(body) => {
-            let _ = ctx.audit(&state, "checkFirmware", None, "completed", Some(&principal));
-            ctx.json_response(StatusCode::OK, &body, &[])
-        }
+        Ok(body) => ctx.json_response(StatusCode::OK, &body, &[]),
         Err(err) => ctx.error_response(err),
     }
 }
@@ -355,12 +354,18 @@ async fn firmware_mutation(
         "firmwareUpdate"
     };
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) = match ctx.authorize_command(&state, &parts.headers, op_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -391,7 +396,6 @@ async fn firmware_mutation(
     };
     match res {
         Ok(outcome) => {
-            let _ = ctx.audit(&state, op_id, None, "completed", Some(&principal));
             let headers = if outcome.replayed {
                 vec![("Idempotency-Replayed", "true")]
             } else {

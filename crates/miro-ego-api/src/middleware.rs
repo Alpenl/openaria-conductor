@@ -2,6 +2,7 @@
 //! strict JSON body parsing, audit recording, and Problem Details HTTP response rendering.
 
 use crate::backend::GatewayBackend;
+use crate::downloads::{ArtifactDeleteGate, LogEtagCache};
 use crate::error::{ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE};
 use crate::security::{
     AuditEvent, Principal, SecurityPolicy, SecurityProfile, is_allowed_gateway_host,
@@ -18,10 +19,11 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_JSON_DEPTH: usize = 32;
+pub const DEFAULT_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Exact `Access-Control-Expose-Headers` value mandated by Miro-Ego Device API v1.
 pub const CORS_EXPOSE_HEADERS: &str = "Accept-Ranges, Content-Range, ETag, Idempotency-Replayed, Retry-After, Miro-Ego-Audit-Status, Miro-Ego-Error-Code, Miro-Ego-Manifest-SHA256, Miro-Ego-Wait-State";
@@ -36,6 +38,7 @@ pub struct GatewayRuntimeConfig {
     pub max_firmware_slots: usize,
     pub sse_heartbeat_interval: Duration,
     pub download_chunk_bytes: usize,
+    pub request_body_timeout: Duration,
 }
 
 impl Default for GatewayRuntimeConfig {
@@ -48,6 +51,7 @@ impl Default for GatewayRuntimeConfig {
             max_firmware_slots: 4,
             sse_heartbeat_interval: Duration::from_secs(15),
             download_chunk_bytes: DEFAULT_IO_BUFFER_BYTES,
+            request_body_timeout: DEFAULT_REQUEST_BODY_TIMEOUT,
         }
     }
 }
@@ -59,10 +63,13 @@ pub struct GatewayState {
     pub config: GatewayRuntimeConfig,
     pub allowed_hosts: Arc<HashSet<String>>,
     pub download_semaphore: Arc<Semaphore>,
-    pub artifact_delete_gate: Arc<tokio::sync::RwLock<()>>,
+    pub artifact_delete_gate: Arc<ArtifactDeleteGate>,
+    pub log_etag_cache: Arc<LogEtagCache>,
     pub sse_semaphore: Arc<Semaphore>,
     pub preview_semaphore: Arc<Semaphore>,
     pub firmware_semaphore: Arc<Semaphore>,
+    shutdown_tx: watch::Sender<bool>,
+    pub shutdown_rx: watch::Receiver<bool>,
 }
 
 impl GatewayState {
@@ -76,17 +83,31 @@ impl GatewayState {
         let max_sse = config.max_sse_connections.max(1);
         let max_preview = config.max_preview_streams.max(1);
         let max_fw = config.max_firmware_slots.max(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Arc::new(Self {
             backend,
             security,
             config,
             allowed_hosts: Arc::new(allowed_hosts),
             download_semaphore: Arc::new(Semaphore::new(max_downloads)),
-            artifact_delete_gate: Arc::new(tokio::sync::RwLock::new(())),
+            artifact_delete_gate: Arc::new(ArtifactDeleteGate::new()),
+            log_etag_cache: Arc::new(LogEtagCache::default()),
             sse_semaphore: Arc::new(Semaphore::new(max_sse)),
             preview_semaphore: Arc::new(Semaphore::new(max_preview)),
             firmware_semaphore: Arc::new(Semaphore::new(max_fw)),
+            shutdown_tx,
+            shutdown_rx,
         })
+    }
+
+    /// Subscribe to the gateway-wide graceful shutdown signal.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    /// Broadcast immediate graceful shutdown to all open SSE, preview, and HTTP/1.1 tasks.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -112,6 +133,23 @@ impl RequestCtx {
             audit_failed: false,
             cors_origin,
         }
+    }
+
+    pub fn new_with_state(method: &Method, headers: &HeaderMap, state: &GatewayState) -> Self {
+        let mut ctx = Self::new(method, headers, &state.security);
+        if ctx.cors_origin.is_none()
+            && let HeaderExtract::Single(origin) = single_header(headers, header::ORIGIN)
+            && let HeaderExtract::Single(host) = single_header(headers, header::HOST)
+            && is_same_gateway_origin(
+                origin,
+                host,
+                &state.config.external_scheme,
+                &state.allowed_hosts,
+            )
+        {
+            ctx.cors_origin = Some(origin.to_owned());
+        }
+        ctx
     }
 
     pub fn audit(
@@ -171,7 +209,7 @@ impl RequestCtx {
         let permitted = if require_unscoped_permission {
             principal.permits(operation_id, None)
         } else {
-            principal.permissions().contains_key(operation_id)
+            principal.has_operation_permission(operation_id)
         };
         if !permitted {
             self.audit(state, operation_id, None, "forbidden", Some(&principal));
@@ -254,26 +292,40 @@ impl RequestCtx {
         Ok(principal)
     }
 
-    /// Authorize an idempotent command operation (all write checks + required `Idempotency-Key`).
+    /// Authorize an idempotent command operation (all write checks + required `Idempotency-Key`
+    /// verified BEFORE emitting the fail-closed `"allowed"` audit event).
     pub fn authorize_command(
         &mut self,
         state: &GatewayState,
         headers: &HeaderMap,
         operation_id: &str,
     ) -> Result<(Principal, String), Box<Response<Body>>> {
-        let principal = self.authorize_write(state, headers, operation_id)?;
-        match single_header_str(headers, "idempotency-key") {
-            HeaderExtract::Single(key) if is_valid_idempotency_key(key) => {
-                Ok((principal, key.to_owned()))
+        let principal = self.authorize_write_inner(state, headers, operation_id, true, false)?;
+        let key = match single_header_str(headers, "idempotency-key") {
+            HeaderExtract::Single(key) if is_valid_idempotency_key(key) => key.to_owned(),
+            _ => {
+                self.audit(
+                    state,
+                    operation_id,
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
+                return Err(Box::new(self.error_response(ApiError::bad_request(
+                    "Idempotency-Key header is missing or invalid",
+                ))));
             }
-            _ => Err(Box::new(self.error_response(ApiError::bad_request(
-                "Idempotency-Key header is missing or invalid",
-            )))),
+        };
+        if !self.audit(state, operation_id, None, "allowed", Some(&principal)) {
+            return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
         }
+        Ok((principal, key))
     }
 
-    /// Authenticate & CSRF-validate a resource-scoped idempotent command (`deleteSessions`)
-    /// before per-target resource IDs are inspected in the JSON body.
+    /// Authenticate, CSRF-validate, and check `Idempotency-Key` for a resource-scoped idempotent
+    /// command (`deleteSessions`) before per-target resource IDs are inspected in the JSON body.
+    /// Emits `"invalid_request"` if `Idempotency-Key` is missing/invalid; `"allowed"` is emitted
+    /// after body and resource-level authorization succeed.
     pub fn authorize_resource_command_headers(
         &mut self,
         state: &GatewayState,
@@ -281,17 +333,22 @@ impl RequestCtx {
         operation_id: &str,
     ) -> Result<(Principal, String), Box<Response<Body>>> {
         let principal = self.authorize_write_inner(state, headers, operation_id, false, false)?;
-        let unscoped = principal.permits(operation_id, None);
-        if unscoped && !self.audit(state, operation_id, None, "allowed", Some(&principal)) {
-            return Err(Box::new(self.error_response(ApiError::audit_unavailable())));
-        }
         match single_header_str(headers, "idempotency-key") {
             HeaderExtract::Single(key) if is_valid_idempotency_key(key) => {
                 Ok((principal, key.to_owned()))
             }
-            _ => Err(Box::new(self.error_response(ApiError::bad_request(
-                "Idempotency-Key header is missing or invalid",
-            )))),
+            _ => {
+                self.audit(
+                    state,
+                    operation_id,
+                    None,
+                    "invalid_request",
+                    Some(&principal),
+                );
+                Err(Box::new(self.error_response(ApiError::bad_request(
+                    "Idempotency-Key header is missing or invalid",
+                ))))
+            }
         }
     }
 
@@ -305,7 +362,7 @@ impl RequestCtx {
         operation_id: &str,
     ) -> Result<Principal, Box<Response<Body>>> {
         let (principal, _) = self.authenticate_caller(state, headers, operation_id, None)?;
-        if !principal.permissions().contains_key(operation_id) {
+        if !principal.has_operation_permission(operation_id) {
             self.audit(state, operation_id, None, "forbidden", Some(&principal));
             return Err(Box::new(self.error_response(ApiError::forbidden(
                 "forbidden",
@@ -483,8 +540,10 @@ impl RequestCtx {
     ) -> Response<Body> {
         let mut builder = Response::builder()
             .status(status)
-            .header(header::CONTENT_LENGTH, "0")
             .header(header::CACHE_CONTROL, "no-store");
+        if self.is_head || !(status == StatusCode::NO_CONTENT || status.is_informational()) {
+            builder = builder.header(header::CONTENT_LENGTH, "0");
+        }
         builder = self.apply_common_headers(builder, extra_headers);
         builder
             .body(Body::empty())
@@ -504,6 +563,15 @@ impl RequestCtx {
             .any(|(k, _)| k.eq_ignore_ascii_case(HEADER_ERROR_CODE));
         if !has_error_code_header {
             extra.push((HEADER_ERROR_CODE, error.code.as_str()));
+        }
+        if matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::REQUEST_TIMEOUT
+        ) && !extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        {
+            extra.push(("Connection", "close"));
         }
         if self.is_head {
             return self.empty_response(status, &extra);
@@ -577,10 +645,20 @@ pub fn single_header_str<'a>(headers: &'a HeaderMap, name: &str) -> HeaderExtrac
 }
 
 /// Strictly read and parse a bounded JSON object body (`<= 64 KiB`, `Content-Type: application/json`,
-/// rejecting duplicate JSON keys and nesting depth > 32).
+/// rejecting duplicate JSON keys and nesting depth > 32) using the default body read timeout.
 pub async fn read_strict_json_object(
     headers: &HeaderMap,
     body: Body,
+) -> ApiResult<(Value, Vec<u8>)> {
+    read_strict_json_object_with_timeout(headers, body, DEFAULT_REQUEST_BODY_TIMEOUT).await
+}
+
+/// Strictly read and parse a bounded JSON object body (`<= 64 KiB`) within `body_timeout`
+/// to defeat slowloris request-body trickle attacks.
+pub async fn read_strict_json_object_with_timeout(
+    headers: &HeaderMap,
+    body: Body,
+    body_timeout: Duration,
 ) -> ApiResult<(Value, Vec<u8>)> {
     match single_header(headers, header::CONTENT_TYPE) {
         HeaderExtract::Single(ct) => {
@@ -603,11 +681,16 @@ pub async fn read_strict_json_object(
         }
     }
 
-    let raw = axum::body::to_bytes(body, MAX_BODY_BYTES)
-        .await
-        .map_err(|_| {
-            ApiError::bad_request("request body exceeds 64 KiB limit or failed to read")
-        })?;
+    let effective_timeout = body_timeout.max(Duration::from_millis(20));
+    let raw_res = tokio::time::timeout(
+        effective_timeout,
+        axum::body::to_bytes(body, MAX_BODY_BYTES),
+    )
+    .await
+    .map_err(|_| ApiError::request_timeout("request body read timed out"))?;
+    let raw = raw_res.map_err(|_| {
+        ApiError::bad_request("request body exceeds 64 KiB limit or failed to read")
+    })?;
     if raw.is_empty() {
         return Err(ApiError::bad_request("request body must not be empty"));
     }
@@ -650,12 +733,12 @@ pub fn handle_options_preflight(
     allowed_methods: &[&str],
     allowed_headers_fn: fn(&str) -> &'static [&'static str],
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&Method::OPTIONS, headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&Method::OPTIONS, headers, state);
 
     // Host allowlist is enforced on OPTIONS as well as all HTTP methods.
-    match single_header(headers, header::HOST) {
-        HeaderExtract::Single(h) if is_allowed_gateway_host(h, &state.allowed_hosts) => {}
-        HeaderExtract::Missing => {}
+    let host_value = match single_header(headers, header::HOST) {
+        HeaderExtract::Single(h) if is_allowed_gateway_host(h, &state.allowed_hosts) => Some(h),
+        HeaderExtract::Missing => None,
         HeaderExtract::Single(_) | HeaderExtract::Multiple => {
             ctx.audit(state, "options", None, "origin_forbidden", None);
             return ctx.error_response(ApiError::forbidden(
@@ -663,7 +746,7 @@ pub fn handle_options_preflight(
                 "request Host header is not allowed",
             ));
         }
-    }
+    };
 
     let allow_header = allowed_methods.join(", ");
     let origin = match single_header(headers, header::ORIGIN) {
@@ -671,18 +754,28 @@ pub fn handle_options_preflight(
             return ctx.empty_response(StatusCode::NO_CONTENT, &[("Allow", &allow_header)]);
         }
         HeaderExtract::Multiple => {
+            ctx.audit(state, "options", None, "origin_forbidden", None);
             return ctx.error_response(ApiError::forbidden(
-                "forbidden",
-                "request Origin is not in allowed_origins",
+                "origin_forbidden",
+                "multiple Origin headers are not allowed",
             ));
         }
         HeaderExtract::Single(o) => o,
     };
 
-    if !state.security.allowed_origins().contains(origin) {
+    let same_origin = host_value.is_some_and(|h| {
+        is_same_gateway_origin(
+            origin,
+            h,
+            &state.config.external_scheme,
+            &state.allowed_hosts,
+        )
+    });
+    if !same_origin && !state.security.allowed_origins().contains(origin) {
+        ctx.audit(state, "options", None, "origin_forbidden", None);
         return ctx.error_response(ApiError::forbidden(
-            "forbidden",
-            "request Origin is not in allowed_origins",
+            "origin_forbidden",
+            "request Origin is not allowed",
         ));
     }
 

@@ -3,26 +3,32 @@
 
 use crate::backend::GatewayBackend;
 use crate::error::{ApiError, ApiResult};
-use crate::middleware::{GatewayRuntimeConfig, GatewayState};
+use crate::middleware::{DEFAULT_REQUEST_BODY_TIMEOUT, GatewayRuntimeConfig, GatewayState};
 use crate::router::build_router;
 use crate::security::{SecurityPolicy, normalize_allowed_hosts};
 use axum::Router;
+use futures_util::task::AtomicWaker;
+use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
+use hyper::service::Service as HyperService;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::convert::Infallible;
 use std::future::Future;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
+use tower::ServiceExt;
 
 /// TLS 1.2+ server configuration using `rustls` with the pure-Rust/C `ring` crypto provider.
 #[derive(Clone)]
@@ -90,6 +96,8 @@ pub struct GatewayServerConfig {
     pub tls: Option<TlsConfig>,
     pub tls_handshake_timeout: Duration,
     pub request_header_timeout: Duration,
+    pub request_body_timeout: Duration,
+    pub keep_alive_idle_timeout: Duration,
     pub max_connections: usize,
     pub runtime: GatewayRuntimeConfig,
     pub shutdown_drain_timeout: Duration,
@@ -103,6 +111,8 @@ impl GatewayServerConfig {
             tls: None,
             tls_handshake_timeout: Duration::from_secs(10),
             request_header_timeout: Duration::from_secs(30),
+            request_body_timeout: DEFAULT_REQUEST_BODY_TIMEOUT,
+            keep_alive_idle_timeout: Duration::from_secs(15),
             max_connections: 64,
             runtime: GatewayRuntimeConfig::default(),
             shutdown_drain_timeout: Duration::from_secs(5),
@@ -126,6 +136,7 @@ pub struct GatewayServer {
     tls_acceptor: Option<TlsAcceptor>,
     tls_handshake_timeout: Duration,
     request_header_timeout: Duration,
+    keep_alive_idle_timeout: Duration,
     max_connections: usize,
     shutdown_drain_timeout: Duration,
 }
@@ -150,6 +161,12 @@ impl GatewayServer {
         if config.tls.is_some() {
             runtime.external_scheme = "https".to_owned();
         }
+        if config.request_body_timeout != DEFAULT_REQUEST_BODY_TIMEOUT
+            || runtime.request_body_timeout == DEFAULT_REQUEST_BODY_TIMEOUT
+        {
+            runtime.request_body_timeout =
+                config.request_body_timeout.max(Duration::from_millis(20));
+        }
         let state = GatewayState::new(backend, security, allowed_hosts, runtime);
         let router = build_router(Arc::clone(&state));
         let tls_acceptor = config.tls.as_ref().map(TlsConfig::acceptor);
@@ -164,6 +181,9 @@ impl GatewayServer {
             request_header_timeout: config
                 .request_header_timeout
                 .max(Duration::from_millis(100)),
+            keep_alive_idle_timeout: config
+                .keep_alive_idle_timeout
+                .max(Duration::from_millis(50)),
             max_connections: config.max_connections.max(1),
             shutdown_drain_timeout: config
                 .shutdown_drain_timeout
@@ -189,7 +209,7 @@ impl GatewayServer {
         F: Future<Output = ()> + Send,
     {
         let conn_semaphore = Arc::new(Semaphore::new(self.max_connections));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_rx = self.state.subscribe_shutdown();
         let mut join_set = tokio::task::JoinSet::new();
         let mut shutdown = pin!(shutdown);
 
@@ -197,7 +217,7 @@ impl GatewayServer {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    let _ = shutdown_tx.send(true);
+                    self.state.signal_shutdown();
                     break;
                 }
                 accepted = self.listener.accept() => {
@@ -220,6 +240,7 @@ impl GatewayServer {
                     let tls_acceptor = self.tls_acceptor.clone();
                     let tls_timeout = self.tls_handshake_timeout;
                     let header_timeout = self.request_header_timeout;
+                    let idle_timeout = self.keep_alive_idle_timeout;
                     let drain_timeout = self.shutdown_drain_timeout;
                     let mut conn_shutdown_rx = shutdown_rx.clone();
 
@@ -238,6 +259,7 @@ impl GatewayServer {
                                 tls_stream,
                                 router,
                                 header_timeout,
+                                idle_timeout,
                                 drain_timeout,
                                 &mut conn_shutdown_rx,
                             )
@@ -247,6 +269,7 @@ impl GatewayServer {
                                 stream,
                                 router,
                                 header_timeout,
+                                idle_timeout,
                                 drain_timeout,
                                 &mut conn_shutdown_rx,
                             )
@@ -273,21 +296,209 @@ impl GatewayServer {
     }
 }
 
+struct ConnectionIdleTracker {
+    active_count: AtomicUsize,
+    idle_epoch: AtomicU64,
+    read_waker: AtomicWaker,
+}
+
+impl ConnectionIdleTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active_count: AtomicUsize::new(0),
+            idle_epoch: AtomicU64::new(0),
+            read_waker: AtomicWaker::new(),
+        })
+    }
+}
+
+struct ActiveRequestGuard {
+    tracker: Arc<ConnectionIdleTracker>,
+}
+
+impl ActiveRequestGuard {
+    fn acquire(tracker: Arc<ConnectionIdleTracker>) -> Self {
+        tracker.active_count.fetch_add(1, Ordering::AcqRel);
+        Self { tracker }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        let prev = self.tracker.active_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.tracker.idle_epoch.fetch_add(1, Ordering::AcqRel);
+            self.tracker.read_waker.wake();
+        }
+    }
+}
+
+struct GuardedResponseBody {
+    inner: axum::body::Body,
+    guard: Option<ActiveRequestGuard>,
+}
+
+impl HttpBody for GuardedResponseBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.guard.take();
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+#[derive(Clone)]
+struct TrackedRouterService {
+    router: Router,
+    tracker: Arc<ConnectionIdleTracker>,
+}
+
+impl HyperService<hyper::Request<Incoming>> for TrackedRouterService {
+    type Response = hyper::Response<GuardedResponseBody>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
+        let guard = ActiveRequestGuard::acquire(Arc::clone(&self.tracker));
+        let router = self.router.clone();
+        Box::pin(async move {
+            let Ok(resp) = router.oneshot(req).await;
+            Ok(resp.map(|body| GuardedResponseBody {
+                inner: body,
+                guard: Some(guard),
+            }))
+        })
+    }
+}
+
+struct IdleTimeoutIo<IO> {
+    io: IO,
+    idle_timeout: Duration,
+    tracker: Arc<ConnectionIdleTracker>,
+    observed_epoch: u64,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<IO> IdleTimeoutIo<IO> {
+    fn new(io: IO, idle_timeout: Duration, tracker: Arc<ConnectionIdleTracker>) -> Self {
+        Self {
+            io,
+            idle_timeout,
+            tracker,
+            observed_epoch: 0,
+            sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+        }
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for IdleTimeoutIo<IO> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        let before = buf.filled().len();
+        match Pin::new(&mut this.io).poll_read(cx, buf) {
+            Poll::Ready(res) => {
+                if res.is_ok() && buf.filled().len() > before {
+                    let ep = this.tracker.idle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                    this.observed_epoch = ep;
+                    this.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.idle_timeout);
+                }
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                if this.tracker.active_count.load(Ordering::Acquire) > 0 {
+                    this.tracker.read_waker.register(cx.waker());
+                    if this.tracker.active_count.load(Ordering::Acquire) > 0 {
+                        return Poll::Pending;
+                    }
+                }
+                let cur_epoch = this.tracker.idle_epoch.load(Ordering::Acquire);
+                if cur_epoch != this.observed_epoch {
+                    this.observed_epoch = cur_epoch;
+                    this.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.idle_timeout);
+                }
+                if this.sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP/1.1 keep-alive idle timeout",
+                    )));
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let poll = Pin::new(&mut this.io).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll
+            && n > 0
+        {
+            let ep = this.tracker.idle_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            this.observed_epoch = ep;
+            this.sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + this.idle_timeout);
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
 async fn serve_http1_stream<IO>(
     io: IO,
     router: Router,
     header_timeout: Duration,
+    idle_timeout: Duration,
     drain_timeout: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = TowerToHyperService::new(router);
+    let tracker = ConnectionIdleTracker::new();
+    let tracked_io = IdleTimeoutIo::new(io, idle_timeout, Arc::clone(&tracker));
+    let service = TrackedRouterService { router, tracker };
     let mut builder = http1::Builder::new();
     builder.timer(TokioTimer::new());
     builder.header_read_timeout(header_timeout);
     builder.keep_alive(true);
-    let conn = builder.serve_connection(TokioIo::new(io), service);
+    let conn = builder.serve_connection(TokioIo::new(tracked_io), service);
     let mut conn = pin!(conn);
 
     tokio::select! {

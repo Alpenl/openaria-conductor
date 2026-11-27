@@ -302,11 +302,20 @@ pub const ROUTE_TABLE: [RouteOperationSpec; 37] = [
 ];
 
 fn attach_options_and_405(
-    router: MethodRouter<Arc<GatewayState>>,
+    mut router: MethodRouter<Arc<GatewayState>>,
     allow_methods: &'static [&'static str],
     headers_for_method: fn(&str) -> &'static [&'static str],
 ) -> MethodRouter<Arc<GatewayState>> {
     let allow_str = allow_methods.join(", ");
+    if !allow_methods.contains(&"HEAD") {
+        let head_allow = allow_str.clone();
+        router = router.head(
+            move |State(state): State<Arc<GatewayState>>, headers: HeaderMap| async move {
+                let ctx = RequestCtx::new_with_state(&Method::HEAD, &headers, &state);
+                ctx.error_response(ApiError::method_not_allowed(&head_allow))
+            },
+        );
+    }
     router
         .options(
             move |State(state): State<Arc<GatewayState>>, headers: HeaderMap| async move {
@@ -317,7 +326,7 @@ fn attach_options_and_405(
             move |State(state): State<Arc<GatewayState>>,
                   method: Method,
                   headers: HeaderMap| async move {
-                let ctx = RequestCtx::new(&method, &headers, &state.security);
+                let ctx = RequestCtx::new_with_state(&method, &headers, &state);
                 ctx.error_response(ApiError::method_not_allowed(&allow_str))
             },
         )

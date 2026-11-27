@@ -3,8 +3,10 @@
 
 use crate::backend::IdempotentCommand;
 use crate::error::ApiError;
+use crate::handlers::truncate_untrusted_field;
 use crate::middleware::{
-    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object, single_header_str,
+    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object_with_timeout,
+    single_header_str,
 };
 use crate::sse::{EventCursor, network_sse_body, parse_last_event_id};
 use axum::body::Body;
@@ -106,6 +108,7 @@ pub async fn stream_network_events(
         initial_cursor,
         state.config.sse_heartbeat_interval,
         permit,
+        state.subscribe_shutdown(),
     );
 
     let mut builder = Response::builder()
@@ -128,13 +131,19 @@ pub async fn create_network_credential(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let principal =
         match ctx.authorize_write(&state, &parts.headers, "createNetworkCredentialReference") {
             Ok(p) => p,
             Err(resp) => return *resp,
         };
-    let (json, _) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, _) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -169,9 +178,9 @@ fn validate_credential_request_body(body: &Value) -> Result<&str, ApiError> {
     let Some(pass) = obj.get("passphrase").and_then(Value::as_str) else {
         return Err(ApiError::bad_request("missing passphrase string"));
     };
-    if !(8..=63).contains(&pass.len()) || pass.bytes().any(|b| b < 0x20) {
+    if pass.chars().count() < 8 || pass.len() > 63 || pass.bytes().any(|b| b < 0x20) {
         return Err(ApiError::bad_request(
-            "passphrase must be 8..=63 UTF-8 bytes without control characters",
+            "passphrase must be at least 8 characters and at most 63 UTF-8 bytes without control characters",
         ));
     }
     Ok(pass)
@@ -183,13 +192,19 @@ pub async fn apply_network_desired_state(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
         match ctx.authorize_command(&state, &parts.headers, "applyNetworkDesiredState") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -225,13 +240,19 @@ pub async fn retry_network_transaction(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
         match ctx.authorize_command(&state, &parts.headers, "retryNetworkTransaction") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -267,13 +288,19 @@ pub async fn forget_network_client_profile(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
         match ctx.authorize_command(&state, &parts.headers, "forgetNetworkClientProfile") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -319,10 +346,12 @@ fn validate_network_apply_body(body: &Value) -> Result<(), ApiError> {
     let Some(desired) = obj.get("desired").and_then(Value::as_object) else {
         return Err(ApiError::bad_request("desired must be a JSON object"));
     };
-    if desired.len() != 3 {
-        return Err(ApiError::bad_request(
-            "desired must contain only mode, wifi_client, and ethernet",
-        ));
+    for key in desired.keys() {
+        if !matches!(key.as_str(), "mode" | "wifi_client" | "ethernet") {
+            return Err(ApiError::bad_request(
+                "desired must contain only mode, wifi_client, and ethernet",
+            ));
+        }
     }
     let Some(mode) = desired.get("mode").and_then(Value::as_str) else {
         return Err(ApiError::bad_request("missing desired.mode"));
@@ -337,9 +366,7 @@ fn validate_network_apply_body(body: &Value) -> Result<(), ApiError> {
     let wifi = desired
         .get("wifi_client")
         .ok_or_else(|| ApiError::bad_request("desired must include wifi_client"))?;
-    let ethernet = desired
-        .get("ethernet")
-        .ok_or_else(|| ApiError::bad_request("desired must include ethernet"))?;
+    let ethernet = desired.get("ethernet").unwrap_or(&Value::Null);
 
     if mode == "wifi-client" {
         let Some(w) = wifi.as_object() else {
@@ -350,7 +377,8 @@ fn validate_network_apply_body(body: &Value) -> Result<(), ApiError> {
         for k in w.keys() {
             if !matches!(k.as_str(), "ssid" | "security" | "credential_ref") {
                 return Err(ApiError::bad_request(format!(
-                    "disallowed field in wifi_client: {k}"
+                    "disallowed field in wifi_client: {}",
+                    truncate_untrusted_field(k)
                 )));
             }
         }
@@ -393,12 +421,38 @@ fn validate_network_apply_body(body: &Value) -> Result<(), ApiError> {
         ));
     }
 
-    if !ethernet.is_null() {
-        validate_desired_ethernet(ethernet)?;
-    } else if mode == "ethernet-static" {
-        return Err(ApiError::bad_request(
-            "ethernet-static mode requires ethernet configuration",
-        ));
+    match mode {
+        "hotspot" | "wifi-client" => {
+            if !ethernet.is_null() {
+                return Err(ApiError::bad_request(
+                    "ethernet must be null when mode is hotspot or wifi-client",
+                ));
+            }
+        }
+        "ethernet-dhcp" => {
+            if !ethernet.is_null() {
+                validate_desired_ethernet(ethernet)?;
+                if ethernet.get("addressing").and_then(Value::as_str) != Some("dhcp") {
+                    return Err(ApiError::bad_request(
+                        "ethernet.addressing must be dhcp when mode is ethernet-dhcp",
+                    ));
+                }
+            }
+        }
+        "ethernet-static" => {
+            if ethernet.is_null() {
+                return Err(ApiError::bad_request(
+                    "ethernet-static mode requires ethernet configuration",
+                ));
+            }
+            validate_desired_ethernet(ethernet)?;
+            if ethernet.get("addressing").and_then(Value::as_str) != Some("static") {
+                return Err(ApiError::bad_request(
+                    "ethernet.addressing must be static when mode is ethernet-static",
+                ));
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

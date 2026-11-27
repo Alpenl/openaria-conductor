@@ -6,11 +6,30 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const API_ERROR_SCHEMA: &str = "miro-ego.api-error.v1";
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 
 pub const HEADER_AUDIT_STATUS: &str = "Miro-Ego-Audit-Status";
 pub const HEADER_ERROR_CODE: &str = "Miro-Ego-Error-Code";
 pub const HEADER_MANIFEST_SHA256: &str = "Miro-Ego-Manifest-SHA256";
 pub const HEADER_WAIT_STATE: &str = "Miro-Ego-Wait-State";
+
+/// Clamp an error message to `1..=1024` Unicode scalar characters per OpenAPI `ErrorResponse`.
+pub fn clamp_error_message(raw: &str) -> String {
+    let non_empty = if raw.is_empty() {
+        "request failed"
+    } else {
+        raw
+    };
+    if non_empty.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+        return non_empty.to_owned();
+    }
+    let mut truncated: String = non_empty
+        .chars()
+        .take(MAX_ERROR_MESSAGE_CHARS - 3)
+        .collect();
+    truncated.push_str("...");
+    truncated
+}
 
 /// Structured error carried between handlers, middleware, and [`crate::backend::GatewayBackend`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
@@ -30,12 +49,16 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status_code: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
+        let raw_msg = message.into();
         Self {
             schema: API_ERROR_SCHEMA.to_owned(),
             status_code,
             code: code.into(),
-            message: message.into(),
-            retryable: status_code >= 500 || status_code == 429 || status_code == 423,
+            message: clamp_error_message(&raw_msg),
+            retryable: status_code >= 500
+                || status_code == 429
+                || status_code == 423
+                || status_code == 408,
             details: None,
             headers: None,
         }
@@ -93,6 +116,12 @@ impl ApiError {
         )
         .with_retryable(false)
         .with_header("Allow", allow)
+    }
+
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::new(408, "request_timeout", message)
+            .with_retryable(true)
+            .with_header("Connection", "close")
     }
 
     pub fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -241,6 +270,13 @@ impl ApiError {
         }))
     }
 
+    pub fn network_mutation_unavailable(reason: &str, message: impl Into<String>) -> Self {
+        Self::new(503, "network_mutation_unavailable", message)
+            .with_retryable(true)
+            .with_header(HEADER_ERROR_CODE, "network_mutation_unavailable")
+            .with_details(json!({ "reason": reason }))
+    }
+
     pub fn audit_unavailable() -> Self {
         Self::new(
             500,
@@ -266,7 +302,10 @@ impl ApiError {
     pub fn to_problem_json(&self, request_id: &str) -> Value {
         let mut error_obj = serde_json::Map::new();
         error_obj.insert("code".to_owned(), Value::String(self.code.clone()));
-        error_obj.insert("message".to_owned(), Value::String(self.message.clone()));
+        error_obj.insert(
+            "message".to_owned(),
+            Value::String(clamp_error_message(&self.message)),
+        );
         error_obj.insert(
             "request_id".to_owned(),
             Value::String(request_id.to_owned()),

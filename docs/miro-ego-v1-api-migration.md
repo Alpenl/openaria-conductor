@@ -12,9 +12,9 @@ Consumers (Frontend build checks, SDK codegen, Bridge contract tests) should pin
 
 | Artifact | Path | Schema / Version | Bytes | SHA-256 |
 | --- | --- | --- | ---: | --- |
-| OpenAPI 3.1 Spec | `contracts/miro-ego-device-v1.openapi.yaml` | `1.0.0` (`/api/v1`) | `160114` | `83a7b0caac1982a08d3a27fec56027233b440d75964c03904b0a6f921a379b61` |
+| OpenAPI 3.1 Spec | `contracts/miro-ego-device-v1.openapi.yaml` | `1.0.0` (`/api/v1`) | `163286` | `14122800effbfe1d42eb1bebfa347c5b0f0cbe657b63850182fecde3c7ceefed` |
 | Contract Support Manifest | `contracts/miro-ego-api-support.json` | `miro-ego.device-api-consumer-support.v1` | — | See repo tree |
-| Device Session Schema | `contracts/schemas/miro-ego-device-session-v1.schema.json` | `miro-ego.device-session.v1` | `26811` | `892ec94bd9775c51175e80d40f7d702e287ca0084a34795ca0ae00aa44bc3035` |
+| Device Session Schema | `contracts/schemas/miro-ego-device-session-v1.schema.json` | `miro-ego.device-session.v1` | `26844` | `e4922f5042f427982853ddc1f2b69c9c0b90e0ec28b37ac25e6ee4fc78214ced` |
 | Recording State Schema | `contracts/schemas/miro-ego-recording-state-v1.schema.json` | `miro-ego.recording-state.v1` | `11843` | `f6ad048cc9f543da25730c5fe8fcea859726ed7c596d775acdf8d55525d4799b` |
 | API Audit Event Schema | `contracts/schemas/miro-ego-api-audit-event-v1.schema.json` | `miro-ego.api-audit-event.v1` | `1372` | `6e42174bf0d683c62ad93458bff820ece36b7203aad1b01a3722bb72e3ad0ece` |
 | Operational Event Schema | `contracts/schemas/miro-ego-operational-event-v1.schema.json` | `miro-ego.operational-event.v1` | `4287` | `3c9587acce891c342a3b5229864681ef83e38952f44d73f9ee34f26cb5d0d5bb` |

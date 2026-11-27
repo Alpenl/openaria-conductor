@@ -1,12 +1,15 @@
 //! Sealed session listing, exact raw manifest delivery, retained unsuccessful outcomes,
 //! verified artifact Range/HEAD streaming with page-cache eviction, and idempotent deletion.
 
-use crate::backend::{IdempotentCommand, ListSessionsQuery};
-use crate::downloads::{resolve_range_selection, stream_download_body_with_lease};
-use crate::error::{ApiError, HEADER_MANIFEST_SHA256};
+use crate::backend::{CommandOutcome, IdempotentCommand, ListSessionsQuery};
+use crate::downloads::{
+    DeleteBeginResult, DeleteReplayLookup, resolve_range_selection,
+    stream_download_body_with_session_lease,
+};
+use crate::error::{ApiError, ApiResult, HEADER_MANIFEST_SHA256};
 use crate::handlers::{DownloadResponseMeta, build_download_response, parse_strict_query};
 use crate::middleware::{
-    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object, single_header,
+    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object_with_timeout, single_header,
 };
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
@@ -94,15 +97,29 @@ pub async fn get_session_manifest(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let principal = match ctx.authenticate_for_operation(&state, &headers, "getSession") {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
     let Ok(Path(session_id)) = path_res else {
+        ctx.audit(
+            &state,
+            "getSession",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::not_found("session not found"));
     };
     if !is_valid_uuid_v7(&session_id) {
+        ctx.audit(
+            &state,
+            "getSession",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::not_found("session not found"));
     }
     if let Err(resp) =
@@ -144,7 +161,7 @@ pub async fn get_unsuccessful_outcome(
     method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let principal = match ctx.authenticate_for_operation(
         &state,
         &headers,
@@ -154,9 +171,23 @@ pub async fn get_unsuccessful_outcome(
         Err(resp) => return *resp,
     };
     let Ok(Path(session_id)) = path_res else {
+        ctx.audit(
+            &state,
+            "getRetainedUnsuccessfulSessionOutcome",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::not_found("session not found"));
     };
     if !is_valid_uuid_v7(&session_id) {
+        ctx.audit(
+            &state,
+            "getRetainedUnsuccessfulSessionOutcome",
+            None,
+            "invalid_request",
+            Some(&principal),
+        );
         return ctx.error_response(ApiError::not_found("session not found"));
     }
     if let Err(resp) = ctx.authorize_resource_read(
@@ -194,37 +225,46 @@ pub async fn session_artifact(
     } else {
         "getSessionArtifact"
     };
-    let mut ctx = RequestCtx::new(&method, &headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&method, &headers, &state);
     let principal = match ctx.authenticate_for_operation(&state, &headers, op_id) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
     let Ok(Path((session_id, artifact_id))) = path_res else {
+        ctx.audit(&state, op_id, None, "invalid_request", Some(&principal));
         return ctx.error_response(ApiError::not_found("artifact not found"));
     };
     if !is_valid_uuid_v7(&session_id) || !is_valid_sha256(&artifact_id) {
+        ctx.audit(&state, op_id, None, "invalid_request", Some(&principal));
         return ctx.error_response(ApiError::not_found("artifact not found"));
     }
     if let Err(resp) = ctx.authorize_resource_read(&state, &principal, op_id, Some(&session_id)) {
         return *resp;
     }
 
-    // Admission Gate 1 (evaluated BEFORE download slots, verification, or Range): capture busy -> 423.
+    // Per-session delete gate (checked BEFORE `artifact_io_busy_state` so an in-flight idle
+    // deletion of `session_id` returns `409 session_deleting`, NEVER fake `423 capture_busy ("finalizing")`).
+    let session_lease = match state.artifact_delete_gate.try_acquire_download(&session_id) {
+        Ok(lease) => lease,
+        Err(err) => return ctx.error_response(err),
+    };
+
+    // Admission Gate 1: capture busy -> 423.
     match state.backend.artifact_io_busy_state().await {
         Ok(Some(busy_state)) => {
+            drop(session_lease);
             return ctx.error_response(ApiError::capture_busy(&busy_state, 1));
         }
         Ok(None) => {}
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            drop(session_lease);
+            return ctx.error_response(err);
+        }
     }
-
-    // Shared artifact download lease preventing concurrent session deletion while streaming.
-    let Ok(delete_lease) = Arc::clone(&state.artifact_delete_gate).try_read_owned() else {
-        return ctx.error_response(ApiError::capture_busy("finalizing", 1));
-    };
 
     // Bounded concurrent download semaphore.
     let Ok(permit) = Arc::clone(&state.download_semaphore).try_acquire_owned() else {
+        drop(session_lease);
         return ctx.error_response(ApiError::download_capacity_exhausted());
     };
 
@@ -266,17 +306,17 @@ pub async fn session_artifact(
         .content_range
         .map(|r| r.content_range_header(representation.size));
     let body = if head {
-        drop(delete_lease);
+        drop(session_lease);
         drop(permit);
         Body::empty()
     } else {
-        stream_download_body_with_lease(
+        stream_download_body_with_session_lease(
             representation.source,
             resolved.offset,
             resolved.length,
             state.config.download_chunk_bytes,
             permit,
-            Some(delete_lease),
+            Some(session_lease),
         )
     };
 
@@ -300,19 +340,31 @@ pub async fn delete_sessions(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) =
         match ctx.authorize_resource_command_headers(&state, &parts.headers, "deleteSessions") {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "deleteSessions", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
     let target_sids = match validate_delete_sessions_body(&json) {
         Ok(ids) => ids,
-        Err(err) => return ctx.error_response(err),
+        Err(err) => {
+            ctx.audit(&state, "deleteSessions", None, &err.code, Some(&principal));
+            return ctx.error_response(err);
+        }
     };
 
     // Enforce per-session authorization when `deleteSessions` is resource-scoped on `Principal`.
@@ -332,49 +384,101 @@ pub async fn delete_sessions(
                 ));
             }
         }
-        if !ctx.audit(&state, "deleteSessions", None, "allowed", Some(&principal)) {
-            return ctx.error_response(ApiError::audit_unavailable());
-        }
+    }
+    if !ctx.audit(&state, "deleteSessions", None, "allowed", Some(&principal)) {
+        return ctx.error_response(ApiError::audit_unavailable());
     }
 
-    // Open downloads block session deletion per OpenAPI `deleteSessions` contract (`openapi.yaml:529-530`).
-    let Ok(_delete_guard) = Arc::clone(&state.artifact_delete_gate).try_write_owned() else {
-        return ctx.error_response(
-            ApiError::conflict(
-                "open_downloads",
-                "cannot delete sessions while artifact downloads are open",
-            )
-            .with_retryable(true),
-        );
-    };
+    // 1. Check gateway-level idempotency replay / in-flight duplicate coalescing BEFORE
+    // checking `open_downloads` so retries never falsely fail with `409 open_downloads`.
+    match state.artifact_delete_gate.lookup_replay_or_inflight(
+        principal.principal_id(),
+        &key,
+        &canonical,
+    ) {
+        Ok(DeleteReplayLookup::Replay(outcome)) => {
+            return render_delete_outcome(&ctx, outcome);
+        }
+        Ok(DeleteReplayLookup::Coalesce(rx)) => {
+            return render_coalesced_delete(&ctx, rx).await;
+        }
+        Ok(DeleteReplayLookup::Miss) => {}
+        Err(err) => return ctx.error_response(err),
+    }
 
     let cmd = IdempotentCommand {
         principal_id: principal.principal_id().to_owned(),
-        idempotency_key: key,
+        idempotency_key: key.clone(),
         body: json,
-        canonical_body: canonical,
+        canonical_body: canonical.clone(),
     };
-    match state.backend.delete_sessions(cmd).await {
-        Ok(outcome) => {
-            let _ = ctx.audit(
-                &state,
-                "deleteSessions",
-                None,
-                "completed",
-                Some(&principal),
-            );
-            let headers = if outcome.replayed {
-                vec![("Idempotency-Replayed", "true")]
-            } else {
-                Vec::new()
-            };
-            let status = StatusCode::from_u16(outcome.status_code).unwrap_or(StatusCode::OK);
-            match outcome.body {
-                Some(ref val) => ctx.json_response(status, val, &headers),
-                None => ctx.empty_response(status, &headers),
-            }
+
+    // 2. Also consult optional backend idempotency store (e.g. persisted across daemon restarts)
+    // before enforcing per-session `open_downloads`.
+    match state.backend.check_delete_sessions_idempotency(&cmd).await {
+        Ok(Some(outcome)) => return render_delete_outcome(&ctx, outcome),
+        Ok(None) => {}
+        Err(err) => return ctx.error_response(err),
+    }
+
+    // 3. Acquire per-session delete gate (only open downloads on `target_sids` block deletion!).
+    let exec_guard = match state.artifact_delete_gate.try_begin_delete(
+        principal.principal_id(),
+        &key,
+        canonical,
+        &target_sids,
+    ) {
+        Ok(DeleteBeginResult::Replay(outcome)) => {
+            return render_delete_outcome(&ctx, outcome);
         }
+        Ok(DeleteBeginResult::Coalesce(rx)) => {
+            return render_coalesced_delete(&ctx, rx).await;
+        }
+        Ok(DeleteBeginResult::Execute(guard)) => guard,
+        Err(err) => return ctx.error_response(err),
+    };
+
+    let res = state.backend.delete_sessions(cmd).await;
+    exec_guard.finish(&res);
+    match res {
+        Ok(outcome) => render_delete_outcome(&ctx, outcome),
         Err(err) => ctx.error_response(err),
+    }
+}
+
+async fn render_coalesced_delete(
+    ctx: &RequestCtx,
+    mut rx: tokio::sync::watch::Receiver<Option<ApiResult<CommandOutcome>>>,
+) -> Response<Body> {
+    loop {
+        if let Some(res) = rx.borrow_and_update().clone() {
+            return match res {
+                Ok(mut outcome) => {
+                    outcome.replayed = true;
+                    render_delete_outcome(ctx, outcome)
+                }
+                Err(err) => ctx.error_response(err),
+            };
+        }
+        if rx.changed().await.is_err() {
+            return ctx.error_response(ApiError::service_unavailable(
+                "delete_interrupted",
+                "in-flight session deletion was interrupted; retry",
+            ));
+        }
+    }
+}
+
+fn render_delete_outcome(ctx: &RequestCtx, outcome: CommandOutcome) -> Response<Body> {
+    let headers = if outcome.replayed {
+        vec![("Idempotency-Replayed", "true")]
+    } else {
+        Vec::new()
+    };
+    let status = StatusCode::from_u16(outcome.status_code).unwrap_or(StatusCode::OK);
+    match outcome.body {
+        Some(ref val) => ctx.json_response(status, val, &headers),
+        None => ctx.empty_response(status, &headers),
     }
 }
 

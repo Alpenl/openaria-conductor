@@ -87,12 +87,14 @@ pub fn encode_mjpeg_part(jpeg: &[u8]) -> Bytes {
 
 /// Build an async zero-copy MJPEG `multipart/x-mixed-replace` stream.
 ///
-/// Holds the preview concurrency `permit` until the viewer disconnects or the stream ends.
+/// Holds the preview concurrency `permit` until the viewer disconnects, `shutdown_rx` triggers,
+/// or the stream ends.
 pub fn mjpeg_stream_body(
     hub: Arc<MjpegPreviewHub>,
     requested_fps: Option<u32>,
     initial_frame: PreviewFrame,
     permit: OwnedSemaphorePermit,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> axum::body::Body {
     let effective_fps = requested_fps
         .map(|f| f.clamp(1, hub.max_fps()))
@@ -104,18 +106,22 @@ pub fn mjpeg_stream_body(
     tokio::spawn(async move {
         let _permit = permit;
         let mut last_seq = initial_frame.sequence;
-        if tx
-            .send(Ok(encode_mjpeg_part(&initial_frame.jpeg)))
-            .await
-            .is_err()
-        {
-            return;
+        let initial_part = encode_mjpeg_part(&initial_frame.jpeg);
+        tokio::select! {
+            biased;
+            _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
+            res = tx.send(Ok(initial_part)) => {
+                if res.is_err() {
+                    return;
+                }
+            }
         }
         let mut next_allowed = tokio::time::Instant::now() + min_period;
 
         loop {
             tokio::select! {
                 biased;
+                _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
                 _ = tx.closed() => return,
                 changed = rx.changed() => {
                     if changed.is_err() {
@@ -124,6 +130,8 @@ pub fn mjpeg_stream_body(
                     let now = tokio::time::Instant::now();
                     if now < next_allowed {
                         tokio::select! {
+                            biased;
+                            _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
                             _ = tx.closed() => return,
                             _ = tokio::time::sleep_until(next_allowed) => {}
                         }
@@ -137,8 +145,15 @@ pub fn mjpeg_stream_body(
                     }
                     last_seq = frame.sequence;
                     next_allowed = tokio::time::Instant::now() + min_period;
-                    if tx.send(Ok(encode_mjpeg_part(&frame.jpeg))).await.is_err() {
-                        return;
+                    let part = encode_mjpeg_part(&frame.jpeg);
+                    tokio::select! {
+                        biased;
+                        _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
+                        res = tx.send(Ok(part)) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -179,10 +194,19 @@ impl H264PreviewHub {
         &self.content_type
     }
 
-    /// Record optional caller-requested `(fps, bitrate_kbps)` upper-bound hints.
+    /// Record optional caller-requested `(fps, bitrate_kbps)` upper-bound hints without
+    /// clobbering active non-empty hints with `(None, None)`.
     pub fn record_stream_hints(&self, fps: Option<u32>, bitrate_kbps: Option<u32>) {
+        if fps.is_none() && bitrate_kbps.is_none() {
+            return;
+        }
         if let Ok(mut guard) = self.last_hints.lock() {
-            *guard = (fps, bitrate_kbps);
+            if let Some(f) = fps {
+                guard.0 = Some(f);
+            }
+            if let Some(b) = bitrate_kbps {
+                guard.1 = Some(b);
+            }
         }
     }
 
@@ -234,24 +258,40 @@ pub fn h264_stream_body(
     init_segment: Option<Arc<Bytes>>,
     mut rx: broadcast::Receiver<Arc<Bytes>>,
     permit: OwnedSemaphorePermit,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> axum::body::Body {
     let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let _permit = permit;
-        if let Some(init) = init_segment
-            && tx.send(Ok((*init).clone())).await.is_err()
-        {
-            return;
+        if let Some(init) = init_segment {
+            let chunk = (*init).clone();
+            tokio::select! {
+                biased;
+                _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
+                res = tx.send(Ok(chunk)) => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
         }
         loop {
             tokio::select! {
                 biased;
+                _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
                 _ = tx.closed() => return,
                 msg = rx.recv() => {
                     match msg {
                         Ok(fragment) => {
-                            if tx.send(Ok((*fragment).clone())).await.is_err() {
-                                return;
+                            let chunk = (*fragment).clone();
+                            tokio::select! {
+                                biased;
+                                _ = crate::sse::wait_for_shutdown(&mut shutdown_rx) => return,
+                                res = tx.send(Ok(chunk)) => {
+                                    if res.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
