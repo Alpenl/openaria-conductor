@@ -260,15 +260,21 @@ pub fn evaluate_clock_status(
     let persisted = load_boot_clock_state(run_dir, &boot_id);
 
     if ntp_synced {
+        let fallback_synced_at = (unix_time_ms >= CLOCK_MIN_MS).then_some(unix_time_ms);
+        let fallback_age = fallback_synced_at.map(|_| 0);
         return Ok(ClockStatusSnapshot {
             source: "ntp".to_owned(),
             unix_time_ms,
             applied: false,
             boot_id,
-            synchronized_at_ms: persisted.as_ref().map(|p| p.synchronized_at_ms),
+            synchronized_at_ms: persisted
+                .as_ref()
+                .map(|p| p.synchronized_at_ms)
+                .or(fallback_synced_at),
             age_seconds: persisted
                 .as_ref()
-                .map(|p| mono_now.saturating_sub(p.synchronized_mono_ns) / 1_000_000_000),
+                .map(|p| mono_now.saturating_sub(p.synchronized_mono_ns) / 1_000_000_000)
+                .or(fallback_age),
         });
     }
 
@@ -316,15 +322,21 @@ pub fn execute_clock_sync(
         let now_ms = backend.realtime_unix_ms()?;
         let mono_now = backend.monotonic_ns()?;
         let persisted = load_boot_clock_state(run_dir, &boot_id);
+        let fallback_synced_at = (now_ms >= CLOCK_MIN_MS).then_some(now_ms);
+        let fallback_age = fallback_synced_at.map(|_| 0);
         return Ok(ClockStatusSnapshot {
             source: "ntp".to_owned(),
             unix_time_ms: now_ms,
             applied: false,
             boot_id,
-            synchronized_at_ms: persisted.as_ref().map(|p| p.synchronized_at_ms),
+            synchronized_at_ms: persisted
+                .as_ref()
+                .map(|p| p.synchronized_at_ms)
+                .or(fallback_synced_at),
             age_seconds: persisted
                 .as_ref()
-                .map(|p| mono_now.saturating_sub(p.synchronized_mono_ns) / 1_000_000_000),
+                .map(|p| mono_now.saturating_sub(p.synchronized_mono_ns) / 1_000_000_000)
+                .or(fallback_age),
         });
     }
 
@@ -429,12 +441,25 @@ mod tests {
 
         // When NTP is synchronized, even replace=true does NOT call clock_settime and returns source="ntp", applied=false.
         mock.set_ntp_synchronized(true);
+        let ntp_before_valid_wall = evaluate_clock_status(&mock, &run_dir).unwrap();
+        assert_eq!(ntp_before_valid_wall.source, "ntp");
+        assert_eq!(ntp_before_valid_wall.synchronized_at_ms, None);
+        assert_eq!(ntp_before_valid_wall.age_seconds, None);
+        mock.advance_seconds(1_760_000_000);
+        let ntp_status = evaluate_clock_status(&mock, &run_dir).unwrap();
+        assert_eq!(ntp_status.source, "ntp");
+        assert_eq!(ntp_status.synchronized_at_ms, Some(1_760_000_005_000));
+        assert_eq!(ntp_status.age_seconds, Some(0));
         let ntp_skip = execute_clock_sync(&mock, &run_dir, 1_760_000_000_000, false).unwrap();
         assert_eq!(ntp_skip.source, "ntp");
         assert!(!ntp_skip.applied);
+        assert_eq!(ntp_skip.synchronized_at_ms, Some(1_760_000_005_000));
+        assert_eq!(ntp_skip.age_seconds, Some(0));
         let ntp_replace = execute_clock_sync(&mock, &run_dir, 1_760_000_000_000, true).unwrap();
         assert_eq!(ntp_replace.source, "ntp");
         assert!(!ntp_replace.applied);
+        assert_eq!(ntp_replace.synchronized_at_ms, Some(1_760_000_005_000));
+        assert_eq!(ntp_replace.age_seconds, Some(0));
         assert_eq!(mock.settime_calls(), 0);
 
         // Out-of-range timestamps must be rejected.

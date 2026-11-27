@@ -2415,16 +2415,21 @@ function validateClockStatus(doc) {
   if (!hasChallenge && !noChallenge) {
     throw new DeviceApiError("设备校时挑战令牌无效", 502, "invalid_clock_status");
   }
+  const hasValidCalibrationMeta =
+    Number.isSafeInteger(doc.synchronized_at_ms) &&
+    Number(doc.synchronized_at_ms) >= 1704067200000 &&
+    Number.isSafeInteger(doc.age_seconds) &&
+    Number(doc.age_seconds) >= 0;
+  const hasEmptyCalibrationMeta = doc.synchronized_at_ms === null && doc.age_seconds === null;
   if (doc.source === "unsynchronized") {
-    if (doc.synchronized_at_ms !== null || doc.age_seconds !== null) {
+    if (!hasEmptyCalibrationMeta) {
       throw new DeviceApiError("未校时状态包含非法校准元数据", 502, "invalid_clock_status");
     }
-  } else if (
-    !Number.isSafeInteger(doc.synchronized_at_ms) ||
-    Number(doc.synchronized_at_ms) < 1704067200000 ||
-    !Number.isSafeInteger(doc.age_seconds) ||
-    Number(doc.age_seconds) < 0
-  ) {
+  } else if (doc.source === "ntp") {
+    if (!hasValidCalibrationMeta && !hasEmptyCalibrationMeta) {
+      throw new DeviceApiError("已校时状态缺少有效校准元数据", 502, "invalid_clock_status");
+    }
+  } else if (!hasValidCalibrationMeta) {
     throw new DeviceApiError("已校时状态缺少有效校准元数据", 502, "invalid_clock_status");
   }
   return doc;

@@ -564,7 +564,7 @@ impl GatewayBackend for ProductionGatewayBackend {
             let storage_ready = writable
                 && coordinator
                     .capture_readiness()
-                    .map(|r| r.allowed)
+                    .map(|r| r.allowed || r.code == "clock_unsynchronized")
                     .unwrap_or(false);
 
             let deploy = release_manager.status().ok();
