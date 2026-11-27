@@ -7,8 +7,9 @@ use bytes::Bytes;
 use miro_ego_api::{
     ApiError, ApiResult, AuditEvent, CommandOutcome, EventReplayBuffer, GatewayBackend,
     GatewayServer, GatewayServerConfig, H264PreviewHub, IdempotentCommand, ListLogsQuery,
-    ListSessionsQuery, MjpegPreviewHub, NetworkEventReplayBuffer, OpenRepresentation, Principal,
-    RawManifest, SecurityPolicy, SecurityProfile, StaticAsset, TlsConfig,
+    ListSessionsQuery, LogEtagCache, MjpegPreviewHub, NetworkEventReplayBuffer, OpenRepresentation,
+    Principal, RawManifest, SecurityPolicy, SecurityProfile, StaticAsset, TlsConfig,
+    open_safe_log_file_with_cache,
 };
 use miro_ego_capture::audio::{self, Recorder as AudioRecorder};
 use miro_ego_capture::hardware::imu::{Collector as ImuCollector, ImuObservation};
@@ -21,7 +22,9 @@ use miro_ego_capture::session::recording::{
     ImuSampleRecord, RecordingSegmentPlanner, RecordingSink,
 };
 use miro_ego_capture::session::shm_ring::ShmRingConfig;
-use miro_ego_capture::session::stereo_encoder::{EncoderConfig, EncoderProcess, EncoderTransport};
+use miro_ego_capture::session::stereo_encoder::{
+    EncoderAbortHandle, EncoderConfig, EncoderProcess, EncoderTransport, min_shm_slot_capacity,
+};
 use miro_ego_core::CoreError;
 use miro_ego_core::config::{DeviceConfig, SecurityConfig};
 use miro_ego_core::ids::{hex_encode, is_valid_uuid_v7, new_uuid_v4};
@@ -54,7 +57,7 @@ use miro_ego_storage::{
     CapturedArtifact, CapturedAudioOutcome, CapturedAudioSegment, CapturedSessionArtifacts,
     CapturedVideoSegment, CoordinatorConfig, DeleteSessionsRequest, ExfatVolumeManager, LogStore,
     ReserveEnforcementOutcome, RuntimeObservation, StopReason, StorageError, StorageResult,
-    VolumeManager, VolumePolicy, open_manifest, open_verified_artifact,
+    VolumeManager, VolumePolicy, open_manifest, open_verified_artifact_with_lease,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -944,6 +947,7 @@ struct NativeActiveHandle {
     active_take: Arc<Mutex<ActiveTakeWriter>>,
     sink: Arc<Mutex<RecordingSink>>,
     encoder: Arc<Mutex<EncoderProcess>>,
+    encoder_abort: EncoderAbortHandle,
     segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     failure_log: Arc<CaptureFailureLog>,
     audio: Option<Arc<AudioRecorder>>,
@@ -975,6 +979,7 @@ impl NativeActiveHandle {
             return;
         }
         self.completed = true;
+        self.encoder_abort.abort();
         let _ = self.runtime.stop_recording(Duration::from_secs(2));
         if let Some(ref audio) = self.audio {
             let _ = audio.stop(Duration::from_secs(2));
@@ -1023,6 +1028,7 @@ impl ActiveCaptureHandle for NativeActiveHandle {
         let _ = self.runtime.stop_recording(Duration::from_secs(5));
 
         if let Some((code, msg)) = self.failure_log.take() {
+            self.encoder_abort.abort();
             if let Some(ref audio) = self.audio {
                 let _ = audio.stop(Duration::from_secs(2));
             }
@@ -1134,34 +1140,40 @@ impl ActiveCaptureHandle for NativeActiveHandle {
 
         let audio = match self.audio.take() {
             Some(recorder) => match recorder.stop(Duration::from_secs(5)) {
-                Ok(res) => CapturedAudioOutcome::Recorded {
-                    requested_mode: self.audio_requested_mode.clone(),
-                    sample_rate: res.sample_rate_hz,
-                    channels: res.channels,
-                    sample_count: res.sample_count,
-                    start_time_seconds: 0.0,
-                    end_time_seconds: duration_seconds,
-                    segments: res
-                        .segments
-                        .into_iter()
-                        .map(|seg| CapturedAudioSegment {
-                            index: seg.index,
-                            start_sample: seg.start_sample,
-                            end_sample: seg.end_sample,
-                            start_time_seconds: seg.start_time_seconds,
-                            end_time_seconds: seg.end_time_seconds,
-                            pcm_payload_bytes: seg.bytes.saturating_sub(audio::WAV_HEADER_BYTES),
-                            wav_header_bytes: audio::WAV_HEADER_BYTES,
-                            artifact: CapturedArtifact {
-                                role: "audio.wav".to_owned(),
-                                path: seg.relative_path,
-                                media_type: "audio/wav".to_owned(),
-                                bytes: seg.bytes,
-                                sha256: seg.sha256,
-                            },
-                        })
-                        .collect(),
-                },
+                Ok(res) => {
+                    let clock_json = serde_json::to_value(&res.capture_clock).ok();
+                    CapturedAudioOutcome::Recorded {
+                        requested_mode: self.audio_requested_mode.clone(),
+                        sample_rate: res.sample_rate_hz,
+                        channels: res.channels,
+                        sample_count: res.sample_count,
+                        start_time_seconds: 0.0,
+                        end_time_seconds: duration_seconds,
+                        segments: res
+                            .segments
+                            .into_iter()
+                            .map(|seg| CapturedAudioSegment {
+                                index: seg.index,
+                                start_sample: seg.start_sample,
+                                end_sample: seg.end_sample,
+                                start_time_seconds: seg.start_time_seconds,
+                                end_time_seconds: seg.end_time_seconds,
+                                pcm_payload_bytes: seg
+                                    .bytes
+                                    .saturating_sub(audio::WAV_HEADER_BYTES),
+                                wav_header_bytes: audio::WAV_HEADER_BYTES,
+                                artifact: CapturedArtifact {
+                                    role: "audio.wav".to_owned(),
+                                    path: seg.relative_path,
+                                    media_type: "audio/wav".to_owned(),
+                                    bytes: seg.bytes,
+                                    sha256: seg.sha256,
+                                },
+                            })
+                            .collect(),
+                    }
+                    .with_capture_clock(clock_json)
+                }
                 Err(_err) => CapturedAudioOutcome::NotRecorded {
                     requested_mode: self.audio_requested_mode.clone(),
                     reason: "recording_interrupted".to_owned(),
@@ -1454,6 +1466,7 @@ impl CaptureBackend for NativeCaptureBackend {
             (None, "device_default_disabled".to_owned())
         };
 
+        let encoder_abort = encoder.abort_handle();
         let active_take = Arc::new(Mutex::new(active_take));
         let sink = Arc::new(Mutex::new(sink));
         let encoder = Arc::new(Mutex::new(encoder));
@@ -1471,6 +1484,7 @@ impl CaptureBackend for NativeCaptureBackend {
             active_take: Arc::clone(&active_take),
             sink: Arc::clone(&sink),
             encoder: Arc::clone(&encoder),
+            encoder_abort,
             segment_planner: Arc::clone(&segment_planner),
             failure_log: Arc::clone(&failure_log),
             audio: audio.clone(),
@@ -1765,9 +1779,13 @@ impl CaptureBackend for ShmEncoderCaptureBackend {
             StorageError::io("staging_create_failed", "create staging video dir", err)
         })?;
 
+        let min_slot_cap = min_shm_slot_capacity(u64::from(self.width), u64::from(self.height))
+            .ok()
+            .and_then(|cap| u32::try_from(cap).ok())
+            .unwrap_or(256 * 1024);
         let shm_cfg = ShmRingConfig {
             slot_count: 8,
-            slot_capacity: 256 * 1024,
+            slot_capacity: (256 * 1024_u32).max(min_slot_cap),
         };
         let mut encoder = EncoderProcess::with_transport(
             EncoderConfig {
@@ -2453,6 +2471,7 @@ pub struct ProductionGatewayBackend {
     h264_hub: Option<Arc<H264PreviewHub>>,
     capture_events: Arc<EventReplayBuffer>,
     network_events: Arc<NetworkEventReplayBuffer>,
+    log_etag_cache: Arc<LogEtagCache>,
     clock: Mutex<ClockRuntimeState>,
     voice_fallback_volume: Mutex<u8>,
     firmware: Mutex<FirmwareRuntimeState>,
@@ -2535,6 +2554,7 @@ impl ProductionGatewayBackend {
             h264_hub,
             capture_events: Arc::new(EventReplayBuffer::default()),
             network_events: Arc::new(NetworkEventReplayBuffer::default()),
+            log_etag_cache: Arc::new(LogEtagCache::default()),
             clock: Mutex::new(ClockRuntimeState::new()),
             voice_fallback_volume: Mutex::new(80),
             firmware: Mutex::new(FirmwareRuntimeState::default()),
@@ -3105,10 +3125,11 @@ impl GatewayBackend for ProductionGatewayBackend {
         let phase = self.coordinator.phase().map_err(map_storage_error)?;
         let busy = match phase {
             CapturePhase::Starting | CapturePhase::Recording => Some("recording".to_owned()),
-            CapturePhase::Stopping | CapturePhase::Recovering | CapturePhase::Deleting => {
-                Some("finalizing".to_owned())
-            }
-            CapturePhase::Idle | CapturePhase::Failed | CapturePhase::Closing => None,
+            CapturePhase::Stopping | CapturePhase::Recovering => Some("finalizing".to_owned()),
+            CapturePhase::Idle
+            | CapturePhase::Deleting
+            | CapturePhase::Failed
+            | CapturePhase::Closing => None,
         };
         Ok(busy)
     }
@@ -3119,6 +3140,7 @@ impl GatewayBackend for ProductionGatewayBackend {
         artifact_id: &str,
     ) -> ApiResult<OpenRepresentation> {
         let catalog = Arc::clone(&self.catalog);
+        let coordinator = Arc::clone(&self.coordinator);
         let recordings_root = self.volume.paths().recordings_dir();
         let sid = session_id.to_owned();
         let aid = artifact_id.to_owned();
@@ -3147,12 +3169,14 @@ impl GatewayBackend for ProductionGatewayBackend {
             if opened_manifest.sha256 != verification.manifest_sha256 {
                 return Err(ApiError::session_not_verified("stale"));
             }
-            let verified = open_verified_artifact(
+            let counter = coordinator.open_handle_counter();
+            let verified = open_verified_artifact_with_lease(
                 &recordings_root,
                 &indexed.relative_dir,
                 &aid,
                 Some(&sid),
                 false,
+                Some(&counter),
             )
             .map_err(map_storage_error)?;
             let cloned_file = verified.file().try_clone().map_err(|err| {
@@ -3206,27 +3230,12 @@ impl GatewayBackend for ProductionGatewayBackend {
 
     async fn open_log_file(&self, name: &str) -> ApiResult<OpenRepresentation> {
         let logs = Arc::clone(&self.logs);
+        let logs_dir = self.volume.paths().logs_dir();
+        let etag_cache = Arc::clone(&self.log_etag_cache);
         let log_name = name.to_owned();
         run_blocking(move || {
-            let opened = logs.open_log(&log_name).map_err(map_storage_error)?;
-            let (_, etag) = opened
-                .compute_sha256_and_etag()
-                .map_err(map_storage_error)?;
-            let cloned = opened.file().try_clone().map_err(|err| {
-                ApiError::provider_failure(format!("clone diagnostic log descriptor: {err}"))
-            })?;
-            let leaf = log_name
-                .rsplit('/')
-                .next()
-                .unwrap_or(&log_name)
-                .replace('"', "");
-            Ok(OpenRepresentation::from_file(
-                opened.entry.media_type.clone(),
-                etag,
-                cloned,
-                opened.identity.size,
-            )
-            .with_content_disposition(format!("attachment; filename=\"{leaf}\"")))
+            let _opened = logs.open_log(&log_name).map_err(map_storage_error)?;
+            open_safe_log_file_with_cache(&logs_dir, &log_name, &etag_cache)
         })
         .await
     }
@@ -3322,6 +3331,34 @@ impl GatewayBackend for ProductionGatewayBackend {
     }
 
     async fn clock_status(&self, principal_id: &str) -> ApiResult<Value> {
+        if let Some(rpc) = self.network_probe_client.clone() {
+            let snap =
+                run_blocking(move || rpc.clock_status().map_err(map_clock_rpc_error)).await?;
+            let mut guard = self
+                .clock
+                .lock()
+                .map_err(|_| ApiError::internal("clock_poisoned", "clock state mutex poisoned"))?;
+            let (challenge, expires_in_ms) = if snap.source == "unsynchronized" {
+                (
+                    Value::String(guard.issue_challenge(principal_id, false)),
+                    5000u64,
+                )
+            } else {
+                (Value::Null, 0u64)
+            };
+            return Ok(json!({
+                "schema": "miro-ego.clock-status.v1",
+                "source": snap.source,
+                "unix_time_ms": snap.unix_time_ms,
+                "challenge": challenge,
+                "expires_in_ms": expires_in_ms,
+                "applied": snap.applied,
+                "boot_id": snap.boot_id,
+                "synchronized_at_ms": snap.synchronized_at_ms,
+                "age_seconds": snap.age_seconds,
+            }));
+        }
+
         let mut guard = self
             .clock
             .lock()
@@ -3348,6 +3385,27 @@ impl GatewayBackend for ProductionGatewayBackend {
     }
 
     async fn clock_inspect(&self, principal_id: &str) -> ApiResult<Value> {
+        if let Some(rpc) = self.network_probe_client.clone() {
+            let snap =
+                run_blocking(move || rpc.clock_status().map_err(map_clock_rpc_error)).await?;
+            let mut guard = self
+                .clock
+                .lock()
+                .map_err(|_| ApiError::internal("clock_poisoned", "clock state mutex poisoned"))?;
+            let tok = guard.issue_challenge(principal_id, true);
+            return Ok(json!({
+                "schema": "miro-ego.clock-status.v1",
+                "source": snap.source,
+                "unix_time_ms": snap.unix_time_ms,
+                "challenge": tok,
+                "expires_in_ms": 5000,
+                "applied": snap.applied,
+                "boot_id": snap.boot_id,
+                "synchronized_at_ms": snap.synchronized_at_ms,
+                "age_seconds": snap.age_seconds,
+            }));
+        }
+
         let mut guard = self
             .clock
             .lock()
@@ -3391,6 +3449,63 @@ impl GatewayBackend for ProductionGatewayBackend {
             .get("replace")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+
+        if let Some(rpc) = self.network_client.clone() {
+            {
+                let mut guard = self.clock.lock().map_err(|_| {
+                    ApiError::internal("clock_poisoned", "clock state mutex poisoned")
+                })?;
+                let Some(record) = guard.challenges.remove(challenge) else {
+                    return Err(ApiError::conflict(
+                        "clock_challenge_invalid",
+                        "clock challenge is expired, already used, or unknown",
+                    )
+                    .with_error_code_header());
+                };
+                if record.expires_at <= Instant::now() || record.principal_id != principal_id {
+                    return Err(ApiError::conflict(
+                        "clock_challenge_invalid",
+                        "clock challenge expired or bound to a different principal",
+                    )
+                    .with_error_code_header());
+                }
+                if replace && !record.from_check {
+                    return Err(ApiError::conflict(
+                        "clock_challenge_invalid",
+                        "replace=true requires a fresh /clock/check challenge",
+                    )
+                    .with_error_code_header());
+                }
+            }
+            if self
+                .coordinator
+                .phase()
+                .map_err(map_storage_error)?
+                .is_busy()
+            {
+                return Err(ApiError::conflict(
+                    "capture_active",
+                    "clock sync is prohibited while capture is active",
+                )
+                .with_error_code_header());
+            }
+            let snap = run_blocking(move || {
+                rpc.clock_sync(unix_time_ms, replace)
+                    .map_err(map_clock_rpc_error)
+            })
+            .await?;
+            return Ok(json!({
+                "schema": "miro-ego.clock-status.v1",
+                "source": snap.source,
+                "unix_time_ms": snap.unix_time_ms,
+                "challenge": Value::Null,
+                "expires_in_ms": 0,
+                "applied": snap.applied,
+                "boot_id": snap.boot_id,
+                "synchronized_at_ms": snap.synchronized_at_ms,
+                "age_seconds": snap.age_seconds,
+            }));
+        }
 
         let mut guard = self
             .clock
@@ -3631,10 +3746,14 @@ impl GatewayBackend for ProductionGatewayBackend {
             ApiError::bad_request(format!("invalid desired network state: {err}"))
         })?;
         let client = self.require_network_mutation_client()?;
+        let flush_client = self
+            .network_probe_client
+            .clone()
+            .unwrap_or_else(|| client.clone());
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
 
-        run_blocking(move || {
+        let outcome = run_blocking(move || {
             let res = client
                 .apply(&principal, &key, &desired)
                 .map_err(map_network_mutation_error)?;
@@ -3646,7 +3765,11 @@ impl GatewayBackend for ProductionGatewayBackend {
             })?;
             Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await
+        .await?;
+        if !outcome.replayed {
+            spawn_deferred_network_response_flush(flush_client);
+        }
+        Ok(outcome)
     }
 
     async fn retry_network_transaction(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
@@ -3669,10 +3792,14 @@ impl GatewayBackend for ProductionGatewayBackend {
             .ok_or_else(|| ApiError::bad_request("missing transaction_id"))?
             .to_owned();
         let client = self.require_network_mutation_client()?;
+        let flush_client = self
+            .network_probe_client
+            .clone()
+            .unwrap_or_else(|| client.clone());
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
 
-        run_blocking(move || {
+        let outcome = run_blocking(move || {
             let res = client.retry(&principal, &key, &tx_id).map_err(|err| {
                 if err.to_string().contains("transaction_not_found") {
                     ApiError::network_transaction_not_found(&tx_id)
@@ -3688,7 +3815,11 @@ impl GatewayBackend for ProductionGatewayBackend {
             })?;
             Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await
+        .await?;
+        if !outcome.replayed {
+            spawn_deferred_network_response_flush(flush_client);
+        }
+        Ok(outcome)
     }
 
     async fn forget_network_client_profile(
@@ -3708,10 +3839,14 @@ impl GatewayBackend for ProductionGatewayBackend {
             .with_error_code_header());
         }
         let client = self.require_network_mutation_client()?;
+        let flush_client = self
+            .network_probe_client
+            .clone()
+            .unwrap_or_else(|| client.clone());
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
 
-        run_blocking(move || {
+        let outcome = run_blocking(move || {
             let res = client
                 .forget(&principal, &key)
                 .map_err(map_network_mutation_error)?;
@@ -3723,7 +3858,11 @@ impl GatewayBackend for ProductionGatewayBackend {
             })?;
             Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await
+        .await?;
+        if !outcome.replayed {
+            spawn_deferred_network_response_flush(flush_client);
+        }
+        Ok(outcome)
     }
 
     async fn firmware_status(&self) -> ApiResult<Value> {
@@ -3893,7 +4032,10 @@ impl GatewayBackend for ProductionGatewayBackend {
 
         let staged_bundle = self.volume.paths().updates_dir().join(&commit);
         let commit_for_task = commit.clone();
-        let task = run_blocking(move || {
+        let principal_for_rpc = cmd.principal_id.clone();
+        let idem_for_rpc = cmd.idempotency_key.clone();
+        let req_hash = hex_encode(Sha256::digest(&cmd.canonical_body).as_slice());
+        let (task, rpc_replayed) = run_blocking(move || {
             let meta = match fs::symlink_metadata(&staged_bundle) {
                 Ok(m) => m,
                 Err(_) => {
@@ -3913,12 +4055,20 @@ impl GatewayBackend for ProductionGatewayBackend {
                 )
                 .with_error_code_header());
             }
-            let snap = rpc
-                .install(&staged_bundle, &commit_for_task, true)
+            let out = rpc
+                .install_idempotent(
+                    &staged_bundle,
+                    &commit_for_task,
+                    true,
+                    Some(&principal_for_rpc),
+                    Some(&idem_for_rpc),
+                    Some(&req_hash),
+                )
                 .map_err(map_deploy_error)?;
-            serde_json::to_value(snap).map_err(|err| {
+            let val = serde_json::to_value(out.task).map_err(|err| {
                 ApiError::internal("serialize_failed", format!("serialize firmware task: {err}"))
-            })
+            })?;
+            Ok((val, out.replayed))
         })
         .await?;
 
@@ -3935,7 +4085,7 @@ impl GatewayBackend for ProductionGatewayBackend {
         }
         guard.checked_instant = None;
         guard.task = Some(task.clone());
-        let outcome = CommandOutcome::accepted(task, false);
+        let outcome = CommandOutcome::accepted(task, rpc_replayed);
         guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
         Ok(outcome)
     }
@@ -3990,7 +4140,10 @@ impl GatewayBackend for ProductionGatewayBackend {
         };
 
         let commit_for_task = commit.clone();
-        let task = run_blocking(move || {
+        let principal_for_rpc = cmd.principal_id.clone();
+        let idem_for_rpc = cmd.idempotency_key.clone();
+        let req_hash = hex_encode(Sha256::digest(&cmd.canonical_body).as_slice());
+        let (task, rpc_replayed) = run_blocking(move || {
             let ctrl = rpc.status().map_err(map_deploy_error)?;
             if ctrl.deployment.previous.as_deref() != Some(commit_for_task.as_str()) {
                 return Err(ApiError::conflict(
@@ -3999,15 +4152,22 @@ impl GatewayBackend for ProductionGatewayBackend {
                 )
                 .with_error_code_header());
             }
-            let snap = rpc
-                .rollback(&commit_for_task, true)
+            let out = rpc
+                .rollback_idempotent(
+                    &commit_for_task,
+                    true,
+                    Some(&principal_for_rpc),
+                    Some(&idem_for_rpc),
+                    Some(&req_hash),
+                )
                 .map_err(map_deploy_error)?;
-            serde_json::to_value(snap).map_err(|err| {
+            let val = serde_json::to_value(out.task).map_err(|err| {
                 ApiError::internal(
                     "serialize_failed",
                     format!("serialize firmware task: {err}"),
                 )
-            })
+            })?;
+            Ok((val, out.replayed))
         })
         .await?;
 
@@ -4024,7 +4184,7 @@ impl GatewayBackend for ProductionGatewayBackend {
         }
         guard.checked_instant = None;
         guard.task = Some(task.clone());
-        let outcome = CommandOutcome::accepted(task, false);
+        let outcome = CommandOutcome::accepted(task, rpc_replayed);
         guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
         Ok(outcome)
     }
@@ -4061,6 +4221,35 @@ impl GatewayBackend for ProductionGatewayBackend {
 // ---------------------------------------------------------------------------
 // Unified Daemon Runtime Assembly & Graceful Lifecycle
 // ---------------------------------------------------------------------------
+
+fn map_clock_rpc_error(err: NetworkError) -> ApiError {
+    match err {
+        NetworkError::Invalid { message } => {
+            ApiError::bad_request(message).with_error_code_header()
+        }
+        NetworkError::Busy { message } if message.contains("capture_active") => {
+            ApiError::conflict("capture_active", message).with_error_code_header()
+        }
+        NetworkError::Busy { message } | NetworkError::Backend { message } => {
+            ApiError::service_unavailable("clock_unavailable", message)
+                .with_header("Retry-After", "1")
+                .with_error_code_header()
+        }
+        NetworkError::Core(core_err) => ApiError::from(core_err),
+    }
+}
+
+fn spawn_deferred_network_response_flush(client: NetworkRpcClient) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = client.notify_response_flushed();
+            })
+            .await;
+        });
+    }
+}
 
 /// Capture backend selection mode for [`DaemonServeOptions`].
 #[derive(Debug, Clone)]
@@ -4277,10 +4466,9 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
     let policy = if options.relaxed_volume {
         VolumePolicy::relaxed_for_tests(options.device_config.storage.minimum_available_bytes)
     } else {
-        let mut prod = VolumePolicy::production(
-            options.device_config.storage.minimum_available_bytes,
-            options.device_config.storage.minimum_available_inodes,
-        );
+        let mut prod = VolumePolicy::from_env_production();
+        prod.minimum_available_bytes = options.device_config.storage.minimum_available_bytes;
+        prod.minimum_available_inodes = options.device_config.storage.minimum_available_inodes;
         prod.system_state_root = Some(options.device_config.state_root.clone());
         prod
     };
@@ -4299,12 +4487,6 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
         volume_paths.clone(),
         AuditConfig::default(),
         Arc::new(move || vol_for_audit.is_mounted_and_writable()),
-    ));
-
-    let vol_for_logs = Arc::clone(&volume);
-    let logs = Arc::new(LogStore::new(
-        volume_paths,
-        Arc::new(move || vol_for_logs.is_mounted_and_writable()),
     ));
 
     let mjpeg_hub = Arc::new(MjpegPreviewHub::new(
@@ -4416,12 +4598,30 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
         timer_settings_path: Some(timer_settings_path),
     };
 
-    let coordinator = Arc::new(CaptureCoordinator::new(
-        coord_cfg,
-        Arc::clone(&volume),
-        Arc::clone(&catalog),
-        Arc::clone(&capture_backend),
-    ));
+    let audio_mode_str = if options.device_config.audio.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let coordinator = Arc::new(
+        CaptureCoordinator::new(
+            coord_cfg,
+            Arc::clone(&volume),
+            Arc::clone(&catalog),
+            Arc::clone(&capture_backend),
+        )
+        .with_audit_logger(Arc::clone(&audit))
+        .with_audio_requested_mode(audio_mode_str),
+    );
+
+    let vol_for_logs = Arc::clone(&volume);
+    let logs = Arc::new(
+        LogStore::new(
+            volume_paths,
+            Arc::new(move || vol_for_logs.is_mounted_and_writable()),
+        )
+        .with_handle_counter(coordinator.open_handle_counter()),
+    );
 
     // Step 1: Run crash staging recovery BEFORE opening HTTP intake.
     if volume.is_mounted_and_writable() {
@@ -4701,9 +4901,12 @@ where
         let _ = handle.join();
     }
 
-    // 3. Restore LED state on exit.
+    // 4. Restore LED state & close background voice queue on exit.
     if let Some(led) = backend.indicator() {
         let _ = led.restore();
+    }
+    if let Some(voice) = backend.voice_controller() {
+        voice.close();
     }
 
     serve_result.map_err(|err| format!("gateway server exited with error: {err}"))

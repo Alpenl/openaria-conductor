@@ -32,9 +32,9 @@ use miro_ego_core::paths::{
 };
 use miro_ego_core::sys::fs::{read_bounded_bytes, set_exfat_hidden, write_bytes_atomic};
 use miro_ego_deploy::{
-    DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcClient, DeployRpcServer, DeployRpcServerConfig,
-    FIRMWARE_STATUS_SCHEMA, HealthChecker, LocalHttpHealthChecker, RealSystemctlRunner,
-    ReleaseManager, ReleaseManagerPaths, SystemctlRunner,
+    DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcClient, DeployRpcServer,
+    DeployRpcServerConfig, FIRMWARE_STATUS_SCHEMA, HealthChecker, LocalHttpHealthChecker,
+    RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths, SystemctlRunner,
 };
 use miro_ego_hw::thermal::{
     DEFAULT_THERMAL_ROOT, is_rdk_x5_model, read_board_model, read_soc_temperature_c,
@@ -43,7 +43,7 @@ use miro_ego_hw::thermal::{
 use miro_ego_hw::{
     AplayAudioPlayer, ButtonConfig, ButtonMonitor, DEFAULT_BUTTON_CONFIG_PATH,
     DEFAULT_LEDS_SYSFS_ROOT, DEFAULT_VOICE_DEVICE, GpioButtonInput, IndicatorState,
-    LocalHttpCaptureClient, SysfsGpioPin, SysfsLedController, VoiceController,
+    LocalHttpCaptureClient, PlatformGpioPin, SysfsGpioPin, SysfsLedController, VoiceController,
 };
 use miro_ego_network::{
     AuthoritativeNetworkController, ControllerConfig, DEFAULT_AVAHI_SERVICES_DIR,
@@ -134,6 +134,7 @@ pub enum DeployAction {
     ServeRpc {
         socket: PathBuf,
         idle_timeout_secs: Option<u64>,
+        updates_root: Option<PathBuf>,
     },
 }
 
@@ -528,6 +529,8 @@ fn parse_deploy_args(args: &[String]) -> Result<Command, String> {
     let mut idle_timeout_secs: Option<u64> = env::var("MIRO_EGO_DEPLOY_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok());
+    let mut updates_root: Option<PathBuf> =
+        env::var_os("MIRO_EGO_ALLOWED_UPDATES_ROOT").map(PathBuf::from);
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -550,6 +553,13 @@ fn parse_deploy_args(args: &[String]) -> Result<Command, String> {
             }
             "--socket" => {
                 rpc_socket = Some(PathBuf::from(next_flag_value(args, &mut i, "--socket")?));
+            }
+            "--updates-root" => {
+                updates_root = Some(PathBuf::from(next_flag_value(
+                    args,
+                    &mut i,
+                    "--updates-root",
+                )?));
             }
             "--idle-timeout" => {
                 let raw = next_flag_value(args, &mut i, "--idle-timeout")?;
@@ -638,6 +648,7 @@ fn parse_deploy_args(args: &[String]) -> Result<Command, String> {
             DeployAction::ServeRpc {
                 socket,
                 idle_timeout_secs,
+                updates_root,
             }
         }
         other => {
@@ -1471,19 +1482,21 @@ fn run_button(args: ButtonArgs) -> Result<(), String> {
     )?;
 
     let pin = if let Some(val_path) = args.gpio_value {
-        SysfsGpioPin::from_value_path(val_path)
+        PlatformGpioPin::from_value_path(val_path)
     } else if let Some(soc_num) = args.gpio_num {
-        SysfsGpioPin::from_gpio_number(soc_num)
+        PlatformGpioPin::from_gpio_number(soc_num)
     } else if let Some(sysfs_root) = env::var_os("MIRO_EGO_GPIO_SYSFS_ROOT") {
-        SysfsGpioPin::open_rdk_x5_board_pin_in(Path::new(&sysfs_root), button_cfg.physical_pin)
-            .map_err(|err| {
-                format!(
-                    "failed to open RDK X5 GPIO board pin {}: {err}",
-                    button_cfg.physical_pin
-                )
-            })?
+        let sysfs_pin =
+            SysfsGpioPin::open_rdk_x5_board_pin_in(Path::new(&sysfs_root), button_cfg.physical_pin)
+                .map_err(|err| {
+                    format!(
+                        "failed to open RDK X5 GPIO board pin {}: {err}",
+                        button_cfg.physical_pin
+                    )
+                })?;
+        PlatformGpioPin::Sysfs(sysfs_pin)
     } else {
-        SysfsGpioPin::open_rdk_x5_board_pin(button_cfg.physical_pin).map_err(|err| {
+        PlatformGpioPin::open_rdk_x5_board_pin(button_cfg.physical_pin).map_err(|err| {
             format!(
                 "failed to open RDK X5 GPIO board pin {}: {err}",
                 button_cfg.physical_pin
@@ -1595,55 +1608,58 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
         DeployAction::ServeRpc {
             socket,
             idle_timeout_secs,
+            updates_root,
         } => {
+            let idle_secs = idle_timeout_secs.unwrap_or(30);
+            let idle_opt = (idle_secs > 0).then(|| Duration::from_secs(idle_secs));
+            let resolved_updates_root = updates_root
+                .or_else(|| {
+                    load_device_config(&manager.paths().config_root.join("device.json"))
+                        .ok()
+                        .map(|cfg| cfg.storage.mountpoint.join("updates"))
+                })
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_ALLOWED_UPDATES_ROOT));
+            let rpc_cfg = DeployRpcServerConfig::default()
+                .with_allowed_updates_root(resolved_updates_root)
+                .with_idle_timeout(idle_opt);
+
             let server = if let Some(listener) = take_systemd_socket_fd() {
-                DeployRpcServer::from_listener(
-                    listener,
-                    None,
-                    manager,
-                    DeployRpcServerConfig::default(),
-                )
-                .map_err(|err| format!("failed to attach systemd deploy socket listener: {err}"))?
+                DeployRpcServer::from_listener(listener, None, manager, rpc_cfg).map_err(|err| {
+                    format!("failed to attach systemd deploy socket listener: {err}")
+                })?
             } else {
-                DeployRpcServer::bind(&socket, manager, DeployRpcServerConfig::default()).map_err(
-                    |err| {
-                        format!(
-                            "failed to bind deploy-control socket {}: {err}",
-                            socket.display()
-                        )
-                    },
-                )?
+                DeployRpcServer::bind(&socket, manager, rpc_cfg).map_err(|err| {
+                    format!(
+                        "failed to bind deploy-control socket {}: {err}",
+                        socket.display()
+                    )
+                })?
             };
 
             notify_systemd("READY=1");
 
-            let idle_secs = idle_timeout_secs.unwrap_or(30);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|err| format!("failed to build deploy signal runtime: {err}"))?;
             rt.block_on(async {
-                if idle_secs == 0 {
-                    wait_for_termination_signal().await;
-                } else {
-                    let idle_limit = Duration::from_secs(idle_secs);
-                    let mut idle_since = std::time::Instant::now();
-                    let mut interval = tokio::time::interval(Duration::from_millis(250));
+                if let Some(idle_limit) = idle_opt {
+                    let mut interval = tokio::time::interval(Duration::from_millis(100));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tokio::select! {
                             () = wait_for_termination_signal() => break,
                             _ = interval.tick() => {
-                                if server.active_workers() > 0 {
-                                    idle_since = std::time::Instant::now();
-                                } else if idle_since.elapsed() >= idle_limit
-                                    && server.wait_for_idle(Duration::from_millis(1)).is_ok()
+                                if server.has_exited_idle()
+                                    || (server.is_idle() && server.idle_elapsed() >= idle_limit)
                                 {
                                     break;
                                 }
                             }
                         }
                     }
+                } else {
+                    wait_for_termination_signal().await;
                 }
             });
 
@@ -1660,7 +1676,9 @@ fn run_volume_init(mountpoint: PathBuf, relaxed_volume: bool) -> Result<(), Stri
     let policy = if relaxed_volume {
         VolumePolicy::relaxed_for_tests(0)
     } else {
-        let mut prod = VolumePolicy::production(0, 0);
+        let mut prod = VolumePolicy::from_env_production();
+        prod.minimum_available_bytes = 0;
+        prod.minimum_available_inodes = 0;
         prod.system_state_root = None;
         prod
     };

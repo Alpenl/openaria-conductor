@@ -26,10 +26,14 @@ use miro_ego_core::config::{
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
 use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL};
 use miro_ego_core::sys::fs::write_bytes_atomic;
-use miro_ego_deploy::ReleaseManagerPaths;
+use miro_ego_deploy::{
+    BUNDLE_SIGNATURE_FILENAME, ReleaseManagerPaths, default_release_signing_seed,
+    sign_bundle_manifest_with_seed,
+};
 use miro_ego_network::{
-    AuthoritativeNetworkController, CommandOutput, CommandRunner, ControllerConfig, NetworkResult,
-    NetworkRpcClient, NetworkRpcServer, NetworkStateStore, NmcliBackend, RpcServerConfig,
+    AuthoritativeNetworkController, CommandOutput, CommandRunner, ControllerConfig,
+    MockSystemClockBackend, NetworkResult, NetworkRpcClient, NetworkRpcServer, NetworkStateStore,
+    NmcliBackend, RpcServerConfig,
 };
 use miro_ego_storage::{
     BinarySessionCatalog, CATALOG_BINARY_MAGIC, CaptureCoordinator, CaptureStartRequest,
@@ -200,11 +204,16 @@ fn spawn_test_network_rpc(root: &Path, device_id: &str) -> (PathBuf, NetworkRpcS
 
     let state_store = NetworkStateStore::open_or_init(&state_path).expect("init net state");
     let nmcli = NmcliBackend::new(Arc::new(StubNmcliRunner), profiles_dir, "wlan0", "eth0");
+    let mock_clock = Arc::new(MockSystemClockBackend::new(
+        new_uuid_v4(),
+        1_764_150_000_000,
+        1_000_000_000,
+    ));
     let controller = Arc::new(
         AuthoritativeNetworkController::new(
             nmcli,
             state_store,
-            ControllerConfig::new(device_id.to_owned(), run_dir),
+            ControllerConfig::new(device_id.to_owned(), run_dir).with_clock_backend(mock_clock),
         )
         .expect("init network controller"),
     );
@@ -838,9 +847,13 @@ fn create_test_release_bundle(dir: &Path, commit: &str, version: &str) {
             }
         ]
     });
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    manifest_bytes.push(b'\n');
+    let sig_hex = sign_bundle_manifest_with_seed(&manifest_bytes, &default_release_signing_seed());
+    fs::write(dir.join("bundle.json"), &manifest_bytes).unwrap();
     fs::write(
-        dir.join("bundle.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
+        dir.join(BUNDLE_SIGNATURE_FILENAME),
+        format!("{sig_hex}\n").as_bytes(),
     )
     .unwrap();
 }

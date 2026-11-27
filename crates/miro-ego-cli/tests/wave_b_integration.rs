@@ -52,15 +52,17 @@ use miro_ego_core::paths::{DataVolumePaths, RECORDING_VOLUME_LABEL, SYSTEM_RUN_D
 use miro_ego_core::sys::clock::monotonic_ns;
 use miro_ego_core::sys::fs::write_bytes_atomic;
 use miro_ego_deploy::{
-    BUNDLE_SCHEMA, BundleFileEntry, BundleManifest, DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcServer,
-    DeployRpcServerConfig, ReleaseManager, ReleaseManagerPaths, TARGET_PLATFORM, verify_bundle_dir,
+    BUNDLE_SCHEMA, BUNDLE_SIGNATURE_FILENAME, BundleFileEntry, BundleManifest,
+    DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcServer, DeployRpcServerConfig, ReleaseManager,
+    ReleaseManagerPaths, TARGET_PLATFORM, default_release_signing_seed,
+    sign_bundle_manifest_with_seed, verify_bundle_dir,
 };
 use miro_ego_hw::{CaptureToggleAction, CaptureToggleClient};
 use miro_ego_network::{
     ApplyDesiredState, AuthoritativeNetworkController, CommandOutput, CommandRunner,
-    ControllerConfig, DEFAULT_AVAHI_SERVICES_DIR, DesiredMode, MdnsScheme, NetworkError,
-    NetworkResult, NetworkRpcClient, NetworkRpcServer, NetworkStateStore, NmcliBackend,
-    RpcServerConfig, derive_rescue_identity,
+    ControllerConfig, DEFAULT_AVAHI_SERVICES_DIR, DesiredMode, MdnsScheme, MockSystemClockBackend,
+    NetworkError, NetworkResult, NetworkRpcClient, NetworkRpcServer, NetworkStateStore,
+    NmcliBackend, RpcServerConfig, derive_rescue_identity,
 };
 use miro_ego_storage::catalog::{GatewayValidatorInfo, GatewayVerificationDiagnostic};
 use miro_ego_storage::coordinator::CAMERA_FOCUS_SCHEMA;
@@ -316,7 +318,13 @@ fn create_synthetic_release_bundle(bundle_dir: &Path, version: &str, commit: &st
     };
     let mut raw = serde_json::to_vec_pretty(&manifest).unwrap();
     raw.push(b'\n');
-    fs::write(bundle_dir.join("bundle.json"), raw).unwrap();
+    let sig_hex = sign_bundle_manifest_with_seed(&raw, &default_release_signing_seed());
+    fs::write(bundle_dir.join("bundle.json"), &raw).unwrap();
+    fs::write(
+        bundle_dir.join(BUNDLE_SIGNATURE_FILENAME),
+        format!("{sig_hex}\n").as_bytes(),
+    )
+    .unwrap();
     verify_bundle_dir(bundle_dir).expect("synthetic bundle must pass verify_bundle_dir");
 }
 
@@ -1502,6 +1510,8 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
             deploy_run.to_str().unwrap(),
             "--system-root",
             sysroot.to_str().unwrap(),
+            "--updates-root",
+            updates_dir.to_str().unwrap(),
         ])
         .env("NOTIFY_SOCKET", OsStr::new(&format!("@{abs_name}")))
         .env_remove("LISTEN_PID")
@@ -2582,11 +2592,19 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
         "wlan0",
         "eth0",
     );
+    let mock_clock = Arc::new(MockSystemClockBackend::new(
+        "11111111-2222-4333-8444-555555555555",
+        1_764_150_000_000,
+        5_000_000_000,
+    ));
     let controller = Arc::new(
         AuthoritativeNetworkController::new(
             nmcli,
             state_store,
-            ControllerConfig::new(cfg.device.device_id.clone(), run_dir.clone()),
+            ControllerConfig::new(cfg.device.device_id.clone(), run_dir.clone())
+                .with_clock_backend(
+                    Arc::clone(&mock_clock) as Arc<dyn miro_ego_network::SystemClockBackend>
+                ),
         )
         .unwrap(),
     );
@@ -2601,6 +2619,9 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
 
     let bound = bind_daemon(options).await.unwrap();
     let net_events = bound.backend.network_event_buffer();
+    let bound_audit = Arc::clone(bound.backend.audit());
+    let bound_coord = Arc::clone(bound.backend.coordinator());
+    let bound_vol = Arc::clone(bound.backend.volume());
     let addr = bound.server.local_addr();
     let origin = format!("http://{addr}");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2713,6 +2734,17 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
     assert_eq!(ok_sync_code, 200);
     let ok_sync_doc: Value = serde_json::from_slice(&ok_sync_body).unwrap();
     assert_eq!(ok_sync_doc["applied"], true);
+    assert_eq!(
+        ok_sync_doc["boot_id"],
+        "11111111-2222-4333-8444-555555555555"
+    );
+    assert_eq!(mock_clock.settime_calls(), 1);
+    assert!(
+        run_dir.join("clock-state.json").is_file(),
+        "clock.sync RPC must persist boot-bound clock-state.json in run_dir"
+    );
+
+    mock_clock.advance_seconds(7);
 
     // Challenge #2 with `replace: false` must return `applied: false` with numeric `age_seconds`:
     let (second_code, _, second_body) = http_request(
@@ -2734,7 +2766,8 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
     assert_eq!(second_code, 200);
     let second_doc: Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(second_doc["applied"], false);
-    assert!(second_doc["age_seconds"].is_u64());
+    assert_eq!(second_doc["age_seconds"], 7);
+    assert_eq!(mock_clock.settime_calls(), 1);
 
     // 5. Background network SSE poller automatically feeds async `/network/apply` settlement into `net_events`!
     let (_, _, init_net_body) = http_request(addr, Method::GET, "/api/v1/network", &[], None).await;
@@ -2821,7 +2854,7 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
         "maintenance_or_capture_busy"
     );
 
-    let _ = http_request(
+    let (swap_stop_code, _, _) = http_request(
         addr,
         Method::POST,
         "/api/v1/capture/stop",
@@ -2831,11 +2864,27 @@ async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voic
             ("Idempotency-Key", &new_uuid_v4()),
         ],
         Some(
-            serde_json::to_vec(&json!({ "schema": "miro-ego.capture-stop.v1", "reason": "user" }))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({ "schema": "miro-ego.capture-stop.v1", "reason": "safe_swap" }),
+            )
+            .unwrap(),
         ),
     )
     .await;
+    assert_eq!(swap_stop_code, 202);
+    assert!(
+        !bound_audit.has_open_file(),
+        "SafeSwap must close AuditLogger active fd before issuing SafeSwapReceipt"
+    );
+    assert_eq!(bound_coord.open_handle_count(), 0);
+    assert!(bound_vol.is_volume_released());
+
+    let (ss_code, _, ss_body) =
+        http_request(addr, Method::GET, "/api/v1/capture/safe-swap", &[], None).await;
+    assert_eq!(ss_code, 200);
+    let ss_doc: Value = serde_json::from_slice(&ss_body).unwrap();
+    assert_eq!(ss_doc["receipt"]["open_handle_count"], 0);
+    assert_eq!(ss_doc["receipt"]["release_state"], "device-released");
 
     let _ = shutdown_tx.send(());
     daemon_task.await.unwrap().unwrap();

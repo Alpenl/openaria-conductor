@@ -867,6 +867,7 @@ dependencies = [
  "libc",
  "miro-ego-core",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -895,6 +896,7 @@ dependencies = [
 name = "miro-ego-network"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "miro-ego-core",
  "serde",
  "serde_json",
