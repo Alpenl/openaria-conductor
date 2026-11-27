@@ -763,6 +763,7 @@ struct ExistingHotspotProfile {
     existing_psk: Option<String>,
     existing_ssid: Option<String>,
     autoconnect_false: bool,
+    wifi_powersave_disabled: bool,
     customized_outside_psk: bool,
 }
 
@@ -773,6 +774,7 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
     let mut key_mgmt: Option<String> = None;
     let mut ipv4_addr: Option<String> = None;
     let mut autoconnect_false = false;
+    let mut wifi_powersave_disabled = false;
     let mut has_timestamp_or_perms = false;
 
     for raw_line in content.lines() {
@@ -798,6 +800,7 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
                         existing_ssid = Some(parsed_ssid);
                     }
                 }
+                ("wifi", "powersave") => wifi_powersave_disabled = val_trimmed == "2",
                 ("wifi-security", "psk") => {
                     let parsed_psk = keyfile_unescape(v);
                     if !parsed_psk.is_empty() {
@@ -820,51 +823,76 @@ fn inspect_existing_hotspot_profile(content: &str, expected_ssid: &str) -> Exist
         existing_psk,
         existing_ssid,
         autoconnect_false,
+        wifi_powersave_disabled,
         customized_outside_psk,
     }
 }
 
-/// Rewrite only `autoconnect=<enabled>` inside `[connection]` while preserving PSK and all other settings.
-fn rewrite_autoconnect(content: &str, enabled: bool) -> String {
-    let target_val = if enabled { "true" } else { "false" };
-    let mut in_connection = false;
+fn push_key_before_section_gap(out: &mut String, key: &str, value: &str) {
+    let had_blank_gap = out.ends_with("\n\n");
+    if had_blank_gap {
+        out.pop();
+    } else if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("{key}={value}\n"));
+    if had_blank_gap {
+        out.push('\n');
+    }
+}
+
+/// Rewrite or insert `<key>=<value>` inside `<section_header>` while preserving all other fields.
+fn rewrite_section_key(content: &str, section_header: &str, key: &str, value: &str) -> String {
+    let mut in_section = false;
     let mut replaced = false;
-    let mut out = String::with_capacity(content.len() + 24);
+    let mut out = String::with_capacity(content.len() + key.len() + value.len() + 8);
 
     for line in content.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_connection && !replaced {
-                out.push_str(&format!("autoconnect={target_val}\n"));
+            if in_section && !replaced {
+                push_key_before_section_gap(&mut out, key, value);
                 replaced = true;
             }
-            in_connection = trimmed == "[connection]";
+            in_section = trimmed == section_header;
             out.push_str(line);
             continue;
         }
-        if in_connection && trimmed.starts_with("autoconnect=") {
+        if in_section
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == key)
+        {
             if line.ends_with('\n') {
-                out.push_str(&format!("autoconnect={target_val}\n"));
+                out.push_str(&format!("{key}={value}\n"));
             } else {
-                out.push_str(&format!("autoconnect={target_val}"));
+                out.push_str(&format!("{key}={value}"));
             }
             replaced = true;
         } else {
             out.push_str(line);
         }
     }
-    if in_connection && !replaced {
-        if !out.ends_with('\n') && !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("autoconnect={target_val}\n"));
+    if in_section && !replaced {
+        push_key_before_section_gap(&mut out, key, value);
     }
     out
+}
+
+/// Rewrite only `autoconnect=<enabled>` inside `[connection]` while preserving PSK and all other settings.
+fn rewrite_autoconnect(content: &str, enabled: bool) -> String {
+    let target_val = if enabled { "true" } else { "false" };
+    rewrite_section_key(content, "[connection]", "autoconnect", target_val)
 }
 
 /// Rewrite only `autoconnect=false` inside `[connection]` while preserving PSK and all other settings.
 fn rewrite_autoconnect_false(content: &str) -> String {
     rewrite_autoconnect(content, false)
+}
+
+/// Rewrite only `[wifi]` `powersave=2` while preserving PSK and all other settings.
+fn rewrite_wifi_powersave_disabled(content: &str) -> String {
+    rewrite_section_key(content, "[wifi]", "powersave", "2")
 }
 
 /// Split an `nmcli --terse --escape yes` line respecting `\` escapes.
@@ -1463,12 +1491,16 @@ impl NmcliBackend {
             let has_preserved_psk = preserve_existing_psk && inspected.existing_psk.is_some();
 
             if inspected.customized_outside_psk || has_preserved_psk {
-                // Preserve existing PSK and custom fields; only ensure autoconnect=false.
+                // Preserve existing PSK and custom fields; ensure autoconnect=false and powersave=2.
+                let mut updated = previous.clone();
                 if !inspected.autoconnect_false {
-                    let updated = rewrite_autoconnect_false(&previous);
-                    if updated != previous {
-                        self.atomic_update_with_rollback(&path, &previous, &updated)?;
-                    }
+                    updated = rewrite_autoconnect_false(&updated);
+                }
+                if !inspected.wifi_powersave_disabled {
+                    updated = rewrite_wifi_powersave_disabled(&updated);
+                }
+                if updated != previous {
+                    self.atomic_update_with_rollback(&path, &previous, &updated)?;
                 }
                 // Ensure strict 0600 permissions.
                 let mode = meta.permissions().mode() & 0o777;
@@ -2489,6 +2521,45 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("network_timeout"));
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_rescue_hotspot_backfills_powersave_disabled_while_preserving_psk() {
+        struct NoopRunner;
+        impl CommandRunner for NoopRunner {
+            fn run(
+                &self,
+                _program: &str,
+                _args: &[&str],
+                _timeout: Duration,
+            ) -> NetworkResult<CommandOutput> {
+                Ok(CommandOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let dir = temp_dir("rescue-powersave-backfill");
+        let backend = NmcliBackend::new(Arc::new(NoopRunner), &dir, "wlan0", "eth0");
+        let (ssid, profile_name) = derive_rescue_identity("board-legacy").unwrap();
+        let path = backend.profile_path(&profile_name);
+        let legacy_keyfile = format!(
+            "[connection]\nid={profile_name}\nuuid=11111111-1111-1111-1111-111111111111\ntype=wifi\ninterface-name=wlan0\nautoconnect=true\n\n[wifi]\nmode=ap\nssid={ssid}\n\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=operator-custom-psk\n\n[ipv4]\nmethod=shared\naddress1=10.42.0.1/24\n\n[ipv6]\nmethod=disabled\n"
+        );
+        fs::write(&path, legacy_keyfile).unwrap();
+
+        let info = backend.ensure_rescue_hotspot("board-legacy", true).unwrap();
+        assert!(info.preserved_existing_psk);
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("autoconnect=false\n"));
+        assert!(updated.contains("[wifi]\nmode=ap\nssid="));
+        assert!(updated.contains("powersave=2\n\n[wifi-security]"));
+        assert!(updated.contains("psk=operator-custom-psk\n"));
 
         fs::remove_dir_all(dir).unwrap();
     }
