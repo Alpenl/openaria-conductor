@@ -47,9 +47,27 @@ DATA_SUBDIRS = (
 )
 
 
-def run(*args: str, timeout: int = 120) -> str:
+def run(
+    *args: str,
+    timeout: int = 120,
+    env: dict[str, str] | None = None,
+) -> str:
     """Execute a system storage command and return stripped stdout text."""
-    return subprocess.check_output(args, timeout=timeout, text=True).strip()
+    merged_env = {**os.environ, **env} if env is not None else None
+    return subprocess.check_output(args, timeout=timeout, text=True, env=merged_env).strip()
+
+
+def install_deb_noninteractive(package: Path) -> None:
+    """Install a verified offline ``.deb`` package non-interactively."""
+    run(
+        "dpkg",
+        "-i",
+        "--force-confdef",
+        "--force-confold",
+        str(package),
+        timeout=180,
+        env={"DEBIAN_FRONTEND": "noninteractive"},
+    )
 
 
 def target(layout: dict[str, Any], *, allow_mounted: bool = False) -> tuple[Path, Path]:
@@ -162,7 +180,7 @@ def prepare(
         if previous and previous != {"phase": "formatting", "layout": layout}:
             raise RuntimeError("Unrelated storage transaction")
         root, data = target(layout)
-        run("dpkg", "-i", str(package))
+        install_deb_noninteractive(package)
         run("modprobe", "exfat")
         run("resize2fs", root.as_posix(), timeout=300)
         # Durable journal permits retry before ready is recorded; never formats after ready.
@@ -246,24 +264,49 @@ def _is_mounted(mountpoint: Path) -> bool:
     return result.returncode == 0
 
 
+def _resolve_mount_ids(user: str = "miro-ego", group: str = "miro-ego") -> tuple[int, int] | None:
+    if os.name != "posix":
+        return None
+    import grp
+    import pwd
+
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        gid = pw.pw_gid
+    return (pw.pw_uid, gid)
+
+
 def mount_and_initialize(
     data_device: Path,
     *,
     mountpoint: Path = DATA_MOUNT,
     helper: Path = DATA_VOLUME_HELPER,
     miro_ego_bin: Path = MIRO_EGO_BIN,
+    service_ids: tuple[int, int] | None = None,
 ) -> bool:
     """Mount ``/data`` as exFAT, ensure canonical layout, and apply ``ATTR_HIDDEN``."""
     if helper.is_file() and os.access(helper, os.X_OK):
         run(str(helper), "ensure")
     elif not _is_mounted(mountpoint):
         mountpoint.mkdir(parents=True, mode=0o755, exist_ok=True)
+        ids = service_ids if service_ids is not None else _resolve_mount_ids()
+        if ids is None:
+            raise RuntimeError("miro-ego service account is missing for fallback exFAT mount")
+        mount_opts = (
+            f"rw,nosuid,nodev,noexec,noatime,"
+            f"uid={ids[0]},gid={ids[1]},fmask=0137,dmask=0027,errors=remount-ro"
+        )
         run(
             "mount",
             "-t",
             "exfat",
             "-o",
-            "rw,nosuid,nodev,noexec,noatime,errors=remount-ro",
+            mount_opts,
             str(data_device),
             str(mountpoint),
         )
@@ -293,17 +336,34 @@ def _reread_partition_table(disk: Path) -> None:
     run("udevadm", "settle", "--timeout=30")
 
 
+def ensure_offline_packages(tools_dir: Path) -> None:
+    """Install offline ``exfatprogs`` and ``logrotate`` ``.deb``s when missing on target."""
+    if shutil.which("mkfs.exfat") is None or shutil.which("fsck.exfat") is None:
+        exfat_pkg = tools_dir / partition_layout.EXFATPROGS_PACKAGE
+        partition_layout.verify_deb(exfat_pkg, partition_layout.EXFATPROGS_SHA256)
+        install_deb_noninteractive(exfat_pkg)
+    if shutil.which("logrotate") is None:
+        logrotate_pkg = tools_dir / partition_layout.LOGROTATE_PACKAGE
+        partition_layout.verify_deb(logrotate_pkg, partition_layout.LOGROTATE_SHA256)
+        install_deb_noninteractive(logrotate_pkg)
+
+
 def ensure_ssh_data_volume(
     *,
     config_path: Path | None = None,
+    tools_dir: Path | None = None,
 ) -> dict[str, str]:
     """Discover or provision partition 3 (``MIRO-EGO`` exFAT) and write data-volume config.
 
     Used during SSH ``recover.py restore`` before ``ACTIVATE`` starts data-volume mount:
+    - Installs staged offline ``exfatprogs`` / ``logrotate`` ``.deb``s when missing on target.
     - Never reformats an existing exFAT recording partition.
     - Creates MBR partition 3 in unallocated trailing space after partition 2 if absent.
     - Formats partition 3 as ``MIRO-EGO`` exFAT only when partition 3 has no filesystem.
     """
+    if tools_dir is not None:
+        ensure_offline_packages(tools_dir)
+
     root_src = Path(run("findmnt", "-n", "-o", "SOURCE", "/")).resolve()
     root_posix = root_src.as_posix()
     if not re.fullmatch(r"/dev/mmcblk[0-9]+p2", root_posix):
@@ -336,8 +396,15 @@ def ensure_ssh_data_volume(
                 "use auto-flash to prepare a 20 GiB system + MIRO-EGO recording card"
             )
         updated_mbr = bytearray(mbr)
-        updated_mbr[478 + 4] = 0x07
-        struct.pack_into("<II", updated_mbr, 478 + 8, p3_start, p3_end - p3_start)
+        updated_mbr[478:494] = struct.pack(
+            "<B3sB3sII",
+            0,
+            b"\xfe\xff\xff",
+            0x07,
+            b"\xfe\xff\xff",
+            p3_start,
+            p3_end - p3_start,
+        )
         with disk.open("r+b") as dst:
             dst.write(updated_mbr)
             dst.flush()

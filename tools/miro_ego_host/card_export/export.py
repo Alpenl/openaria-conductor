@@ -20,7 +20,7 @@ import stat
 import struct
 import sys
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
@@ -88,6 +88,17 @@ def safe_name(name: str) -> str:
     return name
 
 
+_RESERVED_SESSION_FILES = frozenset(
+    {
+        "manifest.json",
+        "recording.json",
+        "capture.json",
+        "segments.json",
+        "checkpoint.json",
+    }
+)
+
+
 def safe_artifact_relpath(relpath: str) -> str:
     """Validate an artifact relative POSIX path from ``miro-ego.device-session.v1``."""
     if (
@@ -102,8 +113,8 @@ def safe_artifact_relpath(relpath: str) -> str:
     parts = relpath.split("/")
     if any(not part or part in {".", ".."} for part in parts):
         raise RuntimeError(f"Unsafe manifest artifact path: {relpath!r}")
-    if parts[0] in {"manifest.json", "recording.json"}:
-        raise RuntimeError(f"Manifest cannot declare {parts[0]!r} as an artifact")
+    if parts[0].casefold() in _RESERVED_SESSION_FILES or parts[-1].casefold() == "checkpoint.json":
+        raise RuntimeError(f"Manifest cannot declare {relpath!r} as an artifact")
     for part in parts:
         safe_name(part)
         if ".tmp" in part and re.search(r"\.tmp(?:[._-].*)?$", part):
@@ -894,6 +905,15 @@ def export_selected(
             folded_rel = rel_posix.casefold()
             present_folded.add(folded_rel)
             matched = expected_by_folded.get(folded_rel) if record["sealed"] else None
+            if (
+                record["sealed"]
+                and not allow_unsealed
+                and folded_rel != "manifest.json"
+                and matched is None
+            ):
+                raise RuntimeError(
+                    f"Recording {record['id']} contains undeclared file: {rel_posix}"
+                )
             canonical_rel = matched[0] if matched is not None else None
             effective_rel = Path(canonical_rel) if canonical_rel is not None else rel_path
             out_path = record["prefix"] / effective_rel
@@ -958,44 +978,49 @@ def export_selected(
             target = output / out_path
             _ensure_export_dir(target.parent, output, sudo_ids)
             temporary = target.with_name(target.name + ".export-partial")
-            src_digest = hashlib.sha256()
-            remaining = node.size
-            with node.open() as src, temporary.open("xb") as dst:
-                while remaining:
-                    chunk = src.read(min(BLOCK, remaining))
-                    if not chunk:
-                        raise RuntimeError("Short source read: " + str(out_path))
-                    dst.write(chunk)
-                    src_digest.update(chunk)
-                    remaining -= len(chunk)
-                dst.flush()
-                os.fsync(dst.fileno())
-            readback_sha = disks.sha256_file(temporary)
-            source_sha = src_digest.hexdigest()
-            if readback_sha != source_sha:
-                raise RuntimeError("Destination verification failed: " + str(out_path))
+            try:
+                src_digest = hashlib.sha256()
+                remaining = node.size
+                with node.open() as src, temporary.open("xb") as dst:
+                    while remaining:
+                        chunk = src.read(min(BLOCK, remaining))
+                        if not chunk:
+                            raise RuntimeError("Short source read: " + str(out_path))
+                        dst.write(chunk)
+                        src_digest.update(chunk)
+                        remaining -= len(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                readback_sha = disks.sha256_file(temporary)
+                source_sha = src_digest.hexdigest()
+                if readback_sha != source_sha:
+                    raise RuntimeError("Destination verification failed: " + str(out_path))
 
-            manifest_verified = False
-            if (
-                record is not None
-                and record["sealed"]
-                and rel_posix in record["expected_artifacts"]
-            ):
-                expected_bytes, expected_sha = record["expected_artifacts"][rel_posix]
-                if node.size != expected_bytes:
-                    raise RuntimeError(
-                        f"Manifest byte count mismatch for {record['id']}/{rel_posix}: "
-                        f"expected {expected_bytes}, got {node.size}"
-                    )
-                if readback_sha != expected_sha:
-                    raise RuntimeError(
-                        f"Manifest SHA-256 mismatch for {record['id']}/{rel_posix}: "
-                        f"expected {expected_sha}, got {readback_sha}"
-                    )
-                manifest_verified = True
-                verified_count += 1
+                manifest_verified = False
+                if (
+                    record is not None
+                    and record["sealed"]
+                    and rel_posix in record["expected_artifacts"]
+                ):
+                    expected_bytes, expected_sha = record["expected_artifacts"][rel_posix]
+                    if node.size != expected_bytes:
+                        raise RuntimeError(
+                            f"Manifest byte count mismatch for {record['id']}/{rel_posix}: "
+                            f"expected {expected_bytes}, got {node.size}"
+                        )
+                    if readback_sha != expected_sha:
+                        raise RuntimeError(
+                            f"Manifest SHA-256 mismatch for {record['id']}/{rel_posix}: "
+                            f"expected {expected_sha}, got {readback_sha}"
+                        )
+                    manifest_verified = True
+                    verified_count += 1
 
-            os.replace(temporary, target)
+                os.replace(temporary, target)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+                raise
             _apply_export_permissions(target, sudo_ids, is_dir=False)
             report["files"].append(
                 {
@@ -1018,12 +1043,13 @@ def export_selected(
         raise
     finally:
         report_path = output / "export-report.json"
-        with report_path.open("x", encoding="utf-8") as dst:
-            json.dump(report, dst, ensure_ascii=True, indent=2)
-            dst.write("\n")
-            dst.flush()
-            os.fsync(dst.fileno())
-        _apply_export_permissions(report_path, sudo_ids, is_dir=False)
+        with suppress(OSError):
+            with report_path.open("x", encoding="utf-8") as dst:
+                json.dump(report, dst, ensure_ascii=True, indent=2)
+                dst.write("\n")
+                dst.flush()
+                os.fsync(dst.fileno())
+            _apply_export_permissions(report_path, sudo_ids, is_dir=False)
         print("Export directory: " + str(output), flush=True)
     return output
 

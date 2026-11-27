@@ -1,6 +1,6 @@
 [Unit]
 Description=Miro-Ego RDK X5 Wi-Fi health and recovery check
-After=systemd-tmpfiles-setup.service NetworkManager.service network.target miro-ego-network.socket miro-ego-network.service miro-ego-data-volume.service
+After=data.mount systemd-tmpfiles-setup.service NetworkManager.service network.target miro-ego-network.socket miro-ego-network.service miro-ego-data-volume.service
 Wants=NetworkManager.service miro-ego-network.socket
 
 [Service]
@@ -25,8 +25,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=-/run/miro-ego/network-operation.lock
-ReadWritePaths=-/run/miro-ego/maintenance.lock
+ReadWritePaths=/run/miro-ego
 ReadWritePaths=-/data/logs
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

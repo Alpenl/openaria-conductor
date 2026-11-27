@@ -61,61 +61,78 @@ if ! flock -n 9; then
     exit 0
 fi
 
-if [ -L "$NETWORK_OPERATION_LOCK" ]; then
-    log "network operation lock is an unsafe symlink; deferring Wi-Fi recovery"
-    exit 0
-elif [ ! -f "$NETWORK_OPERATION_LOCK" ]; then
-    log "network operation lock is missing; deferring Wi-Fi recovery"
-    exit 0
-else
+MAINTENANCE_LOCK_ACTIVE=0
+
+ensure_wifi_client_mode()
+{
+    desired_mode=$("$MIRO_EGO_COMMAND" network-control watchdog-mode 2>/dev/null || printf 'unknown')
+    case "$desired_mode" in
+        wifi-client)
+            return 0
+            ;;
+        hotspot)
+            rm -f "$FAILURE_FILE"
+            log "desired hotspot mode does not require an upstream default route"
+            return 1
+            ;;
+        ethernet-dhcp|ethernet-static)
+            rm -f "$FAILURE_FILE"
+            log "desired ethernet mode does not permit Wi-Fi recovery"
+            return 1
+            ;;
+        defer)
+            rm -f "$FAILURE_FILE"
+            log "network transaction or rescue outcome requires watchdog to defer"
+            return 1
+            ;;
+        *)
+            rm -f "$FAILURE_FILE"
+            log "desired network mode is unavailable; deferring Wi-Fi recovery"
+            return 1
+            ;;
+    esac
+}
+
+acquire_recovery_locks()
+{
+    if [ -L "$NETWORK_OPERATION_LOCK" ]; then
+        log "network operation lock is an unsafe symlink; deferring Wi-Fi recovery"
+        return 1
+    elif [ ! -f "$NETWORK_OPERATION_LOCK" ]; then
+        log "network operation lock is missing; deferring Wi-Fi recovery"
+        return 1
+    fi
     exec 8<"$NETWORK_OPERATION_LOCK"
     if ! flock -x -n 8; then
         log "network controller operation is active; deferring driver recovery"
-        exit 0
+        return 1
     fi
-fi
 
-MAINTENANCE_LOCK_ACTIVE=0
-if [ -L "$MAINTENANCE_LOCK" ]; then
-    log "maintenance lock is an unsafe symlink; deferring Wi-Fi recovery"
-    exit 0
-elif [ ! -f "$MAINTENANCE_LOCK" ]; then
-    log "maintenance lock is missing; deferring Wi-Fi recovery"
-    exit 0
-else
+    if [ -L "$MAINTENANCE_LOCK" ]; then
+        flock -u 8 || true
+        log "maintenance lock is an unsafe symlink; deferring Wi-Fi recovery"
+        return 1
+    elif [ ! -f "$MAINTENANCE_LOCK" ]; then
+        flock -u 8 || true
+        log "maintenance lock is missing; deferring Wi-Fi recovery"
+        return 1
+    fi
     exec 7<"$MAINTENANCE_LOCK"
     if ! flock -x -n 7; then
+        flock -u 8 || true
         log "maintenance operation is active; deferring Wi-Fi recovery"
-        exit 0
+        return 1
     fi
     MAINTENANCE_LOCK_ACTIVE=1
-fi
 
-desired_mode=$("$MIRO_EGO_COMMAND" network-control watchdog-mode 2>/dev/null || printf 'unknown')
-case "$desired_mode" in
-    wifi-client)
-        ;;
-    hotspot)
-        rm -f "$FAILURE_FILE"
-        log "desired hotspot mode does not require an upstream default route"
-        exit 0
-        ;;
-    ethernet-dhcp|ethernet-static)
-        rm -f "$FAILURE_FILE"
-        log "desired ethernet mode does not permit Wi-Fi recovery"
-        exit 0
-        ;;
-    defer)
-        rm -f "$FAILURE_FILE"
-        log "network transaction or rescue outcome requires watchdog to defer"
-        exit 0
-        ;;
-    *)
-        rm -f "$FAILURE_FILE"
-        log "desired network mode is unavailable; deferring Wi-Fi recovery"
-        exit 0
-        ;;
-esac
+    if ! ensure_wifi_client_mode; then
+        flock -u 7 || true
+        flock -u 8 || true
+        MAINTENANCE_LOCK_ACTIVE=0
+        return 1
+    fi
+    return 0
+}
 
 read_failure_count()
 {
@@ -322,7 +339,7 @@ maybe_reboot_after_recovery_failure()
         log "automatic reboot is in cooldown"
         return 0
     fi
-    if ! flock -n 8; then
+    if ! flock -x -n 8; then
         log "network controller operation is active; deferring automatic reboot"
         return 0
     fi
@@ -338,6 +355,9 @@ maybe_reboot_after_recovery_failure()
         log "maintenance or capture operation is active; deferring automatic reboot"
         return 0
     fi
+    if ! ensure_wifi_client_mode; then
+        return 0
+    fi
     date +%s >"$LAST_REBOOT_FILE"
     chmod 0600 "$LAST_REBOOT_FILE"
     log "$INTERFACE is still unhealthy after driver recovery; rebooting the device"
@@ -347,6 +367,12 @@ maybe_reboot_after_recovery_failure()
 
 force_recovery()
 {
+    if ! ensure_wifi_client_mode; then
+        exit 0
+    fi
+    if ! acquire_recovery_locks; then
+        exit 0
+    fi
     record_diagnostics
     mark_recovery
     if ! reload_driver; then
@@ -366,6 +392,9 @@ force_recovery()
 
 check_health()
 {
+    if ! ensure_wifi_client_mode; then
+        exit 0
+    fi
     if is_healthy; then
         if [ "$(read_failure_count)" -ne 0 ]; then
             log "$INTERFACE connectivity recovered"
@@ -382,6 +411,9 @@ check_health()
     fi
     if recovery_is_in_cooldown; then
         log "recovery is in cooldown"
+        exit 0
+    fi
+    if ! acquire_recovery_locks; then
         exit 0
     fi
 

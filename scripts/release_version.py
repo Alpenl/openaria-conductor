@@ -12,6 +12,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = re.compile(r"0\.3\.[0-9]+\Z")
 EXPECTED_SUPPORT_SCHEMA = "miro-ego.device-api-consumer-support.v1"
+_TAG_SIGNATURE_RE = re.compile(
+    r"(?:\r?\n)*-----BEGIN (?:PGP|SSH) SIGNATURE-----[\s\S]*?"
+    r"-----END (?:PGP|SSH) SIGNATURE-----\s*\Z"
+)
+
+
+def strip_tag_signature(text: str) -> str:
+    """Strip trailing PGP or SSH signature armor from annotated Git tag notes."""
+    return _TAG_SIGNATURE_RE.sub("", text).strip()
 
 
 def project_version(root: Path = ROOT) -> str:
@@ -83,7 +92,10 @@ def release_tag(tag: str, root: Path = ROOT) -> tuple[str, str]:
         raise ValueError("Release tag does not point to HEAD")
     if git("status", "--porcelain", "--untracked-files=no"):
         raise ValueError("Working tree has uncommitted changes; refusing release tag verification")
-    notes = git("for-each-ref", "--format=%(contents)", f"refs/tags/{tag}")
+    subject = git("for-each-ref", "--format=%(contents:subject)", f"refs/tags/{tag}")
+    body = git("for-each-ref", "--format=%(contents:body)", f"refs/tags/{tag}")
+    combined = f"{subject}\n\n{body}" if body else subject
+    notes = strip_tag_signature(combined)
     if not notes or len(notes) > 16000:
         raise ValueError("Annotated release tag must contain non-empty notes (<= 16000 chars)")
     return version, notes

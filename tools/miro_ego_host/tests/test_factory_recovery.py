@@ -314,7 +314,7 @@ class FactoryRecoveryTests(unittest.TestCase):
             out_dir = tmp / "bundle"
             archive = tmp / "bundle.tar"
 
-            build_bundle(
+            summary = build_bundle(
                 miro_ego_bin=miro_bin,
                 encoder_bin=enc_bin,
                 output=out_dir,
@@ -322,9 +322,18 @@ class FactoryRecoveryTests(unittest.TestCase):
                 version="0.3.0",
                 commit="2" * 40,
             )
+            self.assertEqual(summary["public_key_hex"], provision.default_release_public_key_hex())
+            self.assertTrue((out_dir / "bundle.json.sig").is_file())
+            sig_text = (out_dir / "bundle.json.sig").read_text(encoding="ascii")
+            self.assertTrue(sig_text.endswith("\n"))
+            self.assertEqual(len(sig_text.strip()), 128)
+            self.assertNotIn(
+                "bundle.json.sig", (out_dir / "SHA256SUMS").read_text(encoding="utf-8")
+            )
             provision.require_native_bundle(archive)
             manifest = json.loads((out_dir / "bundle.json").read_text(encoding="utf-8"))
             asset_paths = {item["path"] for item in manifest["assets"]}
+            self.assertNotIn("bundle.json.sig", asset_paths)
             for cue in REQUIRED_VOICE_ASSETS:
                 self.assertIn(f"share/voice/{cue}", asset_paths)
                 self.assertTrue((out_dir / "share/voice" / cue).is_file())
@@ -334,6 +343,47 @@ class FactoryRecoveryTests(unittest.TestCase):
                 "deploy/miro-ego/miro-ego-deploy.service",
             ):
                 self.assertIn(expected_deploy, asset_paths)
+
+            # Custom signing seed produces distinct public key verified by require_native_bundle.
+            custom_seed_hex = "ab" * 32
+            custom_dir = tmp / "custom-bundle"
+            custom_archive = tmp / "custom-bundle.tar"
+            custom_summary = build_bundle(
+                miro_ego_bin=miro_bin,
+                encoder_bin=enc_bin,
+                output=custom_dir,
+                archive=custom_archive,
+                version="0.3.0",
+                commit="3" * 40,
+                signing_seed_hex=custom_seed_hex,
+            )
+            self.assertNotEqual(
+                custom_summary["public_key_hex"], provision.default_release_public_key_hex()
+            )
+            with self.assertRaisesRegex(RuntimeError, "signature"):
+                provision.require_native_bundle(custom_archive)
+            provision.require_native_bundle(
+                custom_archive, trusted_public_key_hex=custom_summary["public_key_hex"]
+            )
+            with patch.dict(
+                os.environ,
+                {"MIRO_EGO_RELEASE_PUBLIC_KEY_HEX": custom_summary["public_key_hex"]},
+            ):
+                provision.require_native_bundle(custom_archive)
+
+            # Reject invalid voice cue stem in build_bundle.
+            bad_voice_dir = tmp / "bad-voice"
+            shutil.copytree(repo_root / "share" / "voice", bad_voice_dir)
+            shutil.copy2(bad_voice_dir / "device_ready.wav", bad_voice_dir / "bad cue.wav")
+            with self.assertRaisesRegex(ValueError, "stem"):
+                build_bundle(
+                    miro_ego_bin=miro_bin,
+                    encoder_bin=enc_bin,
+                    output=tmp / "bad-voice-bundle",
+                    voice_dir=bad_voice_dir,
+                    version="0.3.0",
+                    commit="4" * 40,
+                )
 
     def test_native_bundle_validation_checks_aarch64_elf_and_exfat_support(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -429,6 +479,46 @@ class FactoryRecoveryTests(unittest.TestCase):
                 tar.addfile(member)
             with self.assertRaisesRegex(RuntimeError, "Unsafe"):
                 provision.require_native_bundle(symlink_tar)
+
+            # Reject unsigned bundle (missing bundle.json.sig).
+            unsigned = make_native_bundle(root / "unsigned.tar", include_sig=False)
+            with self.assertRaisesRegex(RuntimeError, "bundle.json.sig"):
+                provision.require_native_bundle(unsigned)
+
+            # Reject malformed signature text.
+            malformed_sig = make_native_bundle(root / "malformed-sig.tar", sig_bytes=b"not-hex\n")
+            with self.assertRaisesRegex(RuntimeError, "bundle.json.sig"):
+                provision.require_native_bundle(malformed_sig)
+
+            # Reject bundle signed with untrusted Ed25519 seed (even with valid SHA256SUMS).
+            untrusted = make_native_bundle(root / "untrusted.tar", signing_seed=b"\x99" * 32)
+            with self.assertRaisesRegex(RuntimeError, "signature"):
+                provision.require_native_bundle(untrusted)
+
+            # Reject tampered member bytes even when byte size matches bundle.json!
+            corrupted_bin = aarch64_elf_stub(payload=b"miro-ego-biX")
+            tampered_payload = make_native_bundle(
+                root / "tampered-bin.tar",
+                tamper_after_signing={"bin/miro-ego": corrupted_bin},
+            )
+            with self.assertRaisesRegex(RuntimeError, "Digest or byte-length mismatch"):
+                provision.require_native_bundle(tampered_payload)
+
+            # Reject undeclared extra file in tar archive.
+            undeclared_tar = make_native_bundle(
+                root / "undeclared.tar",
+                extra_files={"deploy/miro-ego/rogue-script": b"#!/bin/sh\nid\n"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "undeclared"):
+                provision.require_native_bundle(undeclared_tar)
+
+            # Reject invalid voice cue stem in bundle.json.
+            bad_voice = make_native_bundle(
+                root / "bad-voice.tar",
+                voice_files={"bad cue.wav": b"RIFF$\x00\x00\x00WAVE"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "Invalid voice asset"):
+                provision.require_native_bundle(bad_voice)
 
     def test_real_fat32_composition_embeds_miro_ego_payload_and_three_partition_mbr(self) -> None:
         from pyfatfs.PyFat import PyFat
@@ -624,6 +714,340 @@ class FactoryRecoveryTests(unittest.TestCase):
                 prepare_image.prepare(root)
             manifest = json.loads((root / "image.json").read_bytes())
             self.assertEqual(manifest["sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_customer_profile_backup_restore_permissions_and_https_live_probe(self) -> None:
+        cust_profile = factory_profile(board="c" * 64, security_profile="customer", voice_volume=80)
+        decoded = device.validate(cust_profile)
+        self.assertIn("etc/miro-ego/tls.crt", decoded)
+        self.assertIn("etc/miro-ego/tls.key", decoded)
+        self.assertIn("etc/miro-ego/bearer.token", decoded)
+
+        # Missing TLS key in customer profile must fail validation.
+        missing_key = json.loads(json.dumps(cust_profile))
+        del missing_key["files"]["etc/miro-ego/tls.key"]
+        with self.assertRaisesRegex(RuntimeError, "missing required file"):
+            device.validate(missing_key)
+
+        # Restore customer profile and verify 0640 root:miro-ego on cert, key, and token.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            chowned: dict[str, tuple[int, int]] = {}
+
+            def rooted(*parts: str) -> Path:
+                return root / Path(*parts).relative_to("/")
+
+            def fake_chown(path: Path, uid: int, gid: int, **_kwargs: object) -> None:
+                rel = Path(path).relative_to(root).as_posix()
+                chowned[rel] = (uid, gid)
+
+            with (
+                patch.object(device, "Path", side_effect=rooted),
+                patch.object(device.os, "chown", side_effect=fake_chown, create=True),
+            ):
+                device.write_files(decoded, service_ids=(997, 998))
+
+                self.assertEqual(chowned["etc/miro-ego/tls.crt"], (0, 998))
+                self.assertEqual(chowned["etc/miro-ego/tls.key"], (0, 998))
+                self.assertEqual(chowned["etc/miro-ego/bearer.token"], (0, 998))
+                if os.name == "posix":
+                    self.assertEqual((root / "etc/miro-ego/tls.crt").stat().st_mode & 0o777, 0o640)
+                    self.assertEqual((root / "etc/miro-ego/tls.key").stat().st_mode & 0o777, 0o640)
+
+                # Verify customer backup_locked + HTTPS Bearer live idle probe.
+                seen_req: list[tuple[str, str | None, object]] = []
+
+                class FakeResp:
+                    status = 200
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_a: object) -> None:
+                        return None
+
+                    def read(self, _n: int = -1) -> bytes:
+                        return b'{"snapshot":{"device_state":"idle"}}'
+
+                def fake_urlopen(req: object, timeout: float = 1.0, context: object = None):
+                    url = getattr(req, "full_url", "")
+                    auth = req.get_header("Authorization")  # type: ignore[attr-defined]
+                    seen_req.append((url, auth, context))
+                    return FakeResp()
+
+                with (
+                    patch.object(device, "hardware", return_value="c" * 64),
+                    patch.object(device.urllib.request, "urlopen", side_effect=fake_urlopen),
+                ):
+                    backed_up = device.backup_locked()
+
+                self.assertEqual(len(seen_req), 1)
+                self.assertTrue(seen_req[0][0].startswith("https://127.0.0.1:8080/api/v1/"))
+                self.assertEqual(seen_req[0][1], "Bearer customer-secret-token")
+                self.assertIsNotNone(seen_req[0][2])
+                self.assertIn("etc/miro-ego/tls.crt", backed_up["files"])
+                self.assertIn("etc/miro-ego/tls.key", backed_up["files"])
+
+    def test_ssh_restore_uploads_offline_debs_and_cleans_up_factory_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            bundle = make_native_bundle(tmp / "bundle.tar")
+            bundle_sha = disks.sha256_file(bundle)
+            prof_path = tmp / "device.mer"
+            raw_prof = json.dumps(factory_profile()).encode("utf-8")
+            prof_path.write_bytes(recover.encrypt(raw_prof, "strong-backup-password"))
+
+            exfat_deb = tmp / partition_layout.EXFATPROGS_PACKAGE
+            logrotate_deb = tmp / partition_layout.LOGROTATE_PACKAGE
+            exfat_deb.write_bytes(b"exfat-deb")
+            logrotate_deb.write_bytes(b"logrotate-deb")
+
+            remote_root = tmp / "var_lib_miro_ego_factory" / "miro-ego-factory-1234"
+            remote_root.mkdir(parents=True)
+            (remote_root / "bundle.tar").write_bytes(b"staged-tar")
+            (remote_root / "bundle").mkdir()
+            (remote_root / "bundle" / "bin").write_bytes(b"staged-bin")
+            shutil.copy2(Path(device.__file__).resolve(), remote_root / "device.py")
+            voice_target = tmp / "voice.json"
+
+            uploaded: list[str] = []
+            remote_scripts: list[str] = []
+
+            class FakeSftp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_a: object) -> None:
+                    return None
+
+                def mkdir(self, _p: str, mode: int = 0o700) -> None:
+                    return None
+
+                def put(self, local: str, remote_dest: str) -> None:
+                    uploaded.append(Path(remote_dest).name)
+
+            class FakeClient:
+                def open_sftp(self) -> FakeSftp:
+                    return FakeSftp()
+
+                def close(self) -> None:
+                    return None
+
+            def fake_remote(
+                _client: object,
+                _pw: str,
+                _user: str,
+                script: str,
+                r_args: tuple[str, ...] = (),
+                _payload: bytes = b"",
+            ) -> bytes:
+                remote_scripts.append(script)
+                if "bundle.tar" in script and "tarfile.open" in script:
+                    return json.dumps({"root": str(remote_root)}).encode("utf-8")
+                if "ensure_ssh_data_volume" in script:
+                    self.assertIn("tools_dir=root", script)
+                    return b'{"uuid":"ABCD-1234"}'
+                if "systemd-run" in script:
+                    return json.dumps(
+                        {"unit": "miro-ego-factory-1234", "log": str(remote_root / "install.log")}
+                    ).encode("utf-8")
+                if "ActiveState,Result" in script:
+                    return b"inactive\nsuccess\n"
+                if "print('installed')" in script:
+                    patched_script = script.replace(
+                        "pathlib.Path('/var/lib/miro-ego/voice.json')",
+                        f"pathlib.Path({str(voice_target)!r})",
+                    ).replace(
+                        "pathlib.Path('/usr/local/sbin/miro-ego-device-login')",
+                        f"pathlib.Path({str(tmp / 'nonexistent-login')!r})",
+                    )
+                    with (
+                        patch.object(subprocess, "run"),
+                        patch.object(device, "apply_service_permissions"),
+                    ):
+                        ns = {"__name__": "__finalize__"}
+                        with patch.object(sys, "argv", ["finalize", str(remote_root)]):
+                            exec(patched_script, ns)
+                    return b"installed\n"
+                return b'{"restored":true}'
+
+            args = recover.parser().parse_args(
+                [
+                    "restore",
+                    "--host",
+                    "192.0.2.10",
+                    "--profile",
+                    str(prof_path),
+                    "--bundle",
+                    str(bundle),
+                    "--bundle-sha256",
+                    bundle_sha,
+                    "--tools-directory",
+                    str(tmp),
+                ]
+            )
+            with (
+                patch.object(
+                    partition_layout, "prepare_tools", side_effect=[exfat_deb, logrotate_deb]
+                ) as prep_tools_mock,
+                patch.object(recover.getpass, "getpass", return_value="strong-backup-password"),
+                patch.object(recover, "connection", return_value=(FakeClient(), "pw")),
+                patch.object(recover, "remote", side_effect=fake_remote),
+                patch("builtins.input", return_value="NO"),
+            ):
+                recover.restore(args)
+
+            self.assertEqual(prep_tools_mock.call_count, 2)
+            self.assertIn(partition_layout.EXFATPROGS_PACKAGE, uploaded)
+            self.assertIn(partition_layout.LOGROTATE_PACKAGE, uploaded)
+            self.assertFalse((remote_root / "bundle.tar").exists())
+            self.assertFalse((remote_root / "bundle").exists())
+            self.assertFalse(remote_root.exists())
+            self.assertTrue(voice_target.is_file())
+
+    def test_release_version_strips_pgp_and_ssh_tag_signatures_and_deploy_units_hardened(
+        self,
+    ) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from scripts.release_version import strip_tag_signature
+
+        pgp_tagged = (
+            "Miro-Ego 0.3.0 release\n\nAll hardware checks passed.\n"
+            "-----BEGIN PGP SIGNATURE-----\nVersion: GnuPG v2\nabc123==\n"
+            "-----END PGP SIGNATURE-----\n"
+        )
+        ssh_tagged = (
+            "Miro-Ego 0.3.0 release\n\nSigned with SSH key.\n"
+            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n"
+        )
+        self.assertEqual(
+            strip_tag_signature(pgp_tagged),
+            "Miro-Ego 0.3.0 release\n\nAll hardware checks passed.",
+        )
+        self.assertEqual(
+            strip_tag_signature(ssh_tagged),
+            "Miro-Ego 0.3.0 release\n\nSigned with SSH key.",
+        )
+
+        deploy_dir = repo_root / "deploy" / "miro-ego"
+        deploy_svc = (deploy_dir / "miro-ego-deploy.service").read_text(encoding="utf-8")
+        self.assertIn("Requires=miro-ego-deploy.socket", deploy_svc)
+        self.assertIn("Wants=miro-ego-recover.service", deploy_svc)
+        self.assertNotIn("Requires=miro-ego-recover.service", deploy_svc)
+
+        main_svc = (deploy_dir / "miro-ego.service").read_text(encoding="utf-8")
+        self.assertIn("TimeoutStopSec=60s", main_svc)
+        self.assertIn("ReadWritePaths=/run/miro-ego", main_svc)
+        self.assertIn("After=data.mount ", main_svc)
+        self.assertNotIn("Requires=data.mount", main_svc)
+
+        btn_svc = (deploy_dir / "miro-ego-button.service").read_text(encoding="utf-8")
+        self.assertIn("TimeoutStopSec=30s", btn_svc)
+        self.assertIn("CapabilityBoundingSet=CAP_DAC_READ_SEARCH", btn_svc)
+
+        tmpfiles = (deploy_dir / "miro-ego.tmpfiles").read_text(encoding="utf-8")
+        self.assertIn("d /run/miro-ego 0750 root miro-ego -", tmpfiles)
+
+        recover_svc = (deploy_dir / "miro-ego-recover.service").read_text(encoding="utf-8")
+        self.assertNotIn("ProtectSystem=strict", recover_svc)
+        self.assertNotIn("ProtectHome=yes", recover_svc)
+        self.assertNotIn("NoNewPrivileges=yes", recover_svc)
+        self.assertNotIn("CapabilityBoundingSet=", recover_svc)
+        self.assertIn("AF_NETLINK", recover_svc)
+
+        net_svc = (deploy_dir / "miro-ego-network.service").read_text(encoding="utf-8")
+        self.assertIn("ReadWritePaths=/run/miro-ego", net_svc)
+
+        wd_svc = (deploy_dir / "miro-ego-wifi-watchdog.service").read_text(encoding="utf-8")
+        self.assertIn("After=data.mount ", wd_svc)
+
+        fstrim_conf = (deploy_dir / "miro-ego-idle-fstrim.conf").read_text(encoding="utf-8")
+        self.assertIn("RuntimeMaxSec=10min", fstrim_conf)
+
+    @unittest.skipUnless(
+        os.name == "posix" and shutil.which("flock") is not None,
+        "POSIX sh + flock required for live watchdog lock behavior test",
+    )
+    def test_wifi_watchdog_passive_check_does_not_contend_on_operation_or_maintenance_locks(
+        self,
+    ) -> None:
+        import fcntl
+
+        repo_root = Path(__file__).resolve().parents[3]
+        watchdog_script = repo_root / "deploy" / "miro-ego" / "miro-ego-wifi-watchdog"
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            net_sys = tmp / "sys_net" / "wlan0"
+            net_sys.mkdir(parents=True)
+            net_lock = tmp / "network-operation.lock"
+            maint_lock = tmp / "maintenance.lock"
+            net_lock.write_bytes(b"")
+            maint_lock.write_bytes(b"")
+
+            mode_file = tmp / "mode.txt"
+            mode_file.write_text("wifi-client\n", encoding="utf-8")
+            ping_rc_file = tmp / "ping_rc.txt"
+            ping_rc_file.write_text("0\n", encoding="utf-8")
+
+            fake_miro = bin_dir / "miro-ego"
+            fake_miro.write_text(
+                f"#!/bin/sh\ncat {str(mode_file)!r}\n",
+                encoding="utf-8",
+            )
+            fake_miro.chmod(0o755)
+
+            for helper_name, body in (
+                ("logger", "#!/bin/sh\nexit 0\n"),
+                ("ping", f"#!/bin/sh\nexit $(cat {str(ping_rc_file)!r})\n"),
+            ):
+                p = bin_dir / helper_name
+                p.write_text(body, encoding="utf-8")
+                p.chmod(0o755)
+
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "WIFI_INTERFACE": "wlan0",
+                "WIFI_GATEWAY": "192.0.2.1",
+                "WIFI_FAILURE_THRESHOLD": "2",
+                "STATE_DIRECTORY": str(tmp / "state"),
+                "RUNTIME_DIRECTORY": str(tmp / "run"),
+                "WIFI_SYS_CLASS_NET": str(tmp / "sys_net"),
+                "MIRO_EGO_COMMAND": str(fake_miro),
+                "MIRO_EGO_NETWORK_OPERATION_LOCK_PATH": str(net_lock),
+                "MIRO_EGO_MAINTENANCE_LOCK": str(maint_lock),
+            }
+
+            # Hold BOTH network-operation.lock and maintenance.lock exclusively while running
+            # passive check: passive probe must STILL run and record failure=1 without deferring!
+            with net_lock.open("rb") as nl, maint_lock.open("rb") as ml:
+                fcntl.flock(nl.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(ml.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                ping_rc_file.write_text("1\n", encoding="utf-8")
+                proc1 = subprocess.run(
+                    ["/bin/sh", str(watchdog_script), "check"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("gateway probe failed (1/2)", proc1.stdout)
+                self.assertEqual(
+                    (tmp / "run" / "failures").read_text(encoding="utf-8").strip(), "1"
+                )
+
+                # Reaching threshold (2/2) while locks are busy defers disruptive driver reload!
+                proc2 = subprocess.run(
+                    ["/bin/sh", str(watchdog_script), "check"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("deferring driver recovery", proc2.stdout)
 
 
 if __name__ == "__main__":

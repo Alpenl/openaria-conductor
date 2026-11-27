@@ -27,6 +27,8 @@ if str(ROOT) not in sys.path:
 from scripts.release_version import project_version  # noqa: E402
 
 BUNDLE_SCHEMA = "miro-ego.rdk-x5-bundle.v1"
+BUNDLE_SIG_DOMAIN = b"miro-ego.rdk-x5-bundle-sig.v1\n"
+DEFAULT_SIGNING_SEED_MATERIAL = b"miro-ego-0.3.0-default-release-signing-seed"
 TARGET_PLATFORM = "linux_aarch64_rdk_x5_v1"
 REQUIRED_BINARIES = ("bin/miro-ego", "bin/miro-ego-encoder")
 REQUIRED_DEPLOY_ASSETS = ("miro-ego-data-volume", "miro-ego-data-volume.service")
@@ -49,6 +51,38 @@ ET_EXEC = 2
 ET_DYN = 3
 EM_AARCH64 = 183
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}\Z")
+HEX_32B_RE = re.compile(r"^[0-9a-fA-F]{64}\Z")
+VOICE_STEM_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+
+
+def resolve_signing_seed(signing_seed_hex: str | None = None) -> bytes:
+    """Resolve 32-byte Ed25519 private signing seed from CLI arg, env var, or default."""
+    candidate = signing_seed_hex
+    if candidate is None:
+        env_seed = os.environ.get("MIRO_EGO_RELEASE_SIGNING_SEED_HEX", "").strip()
+        if env_seed:
+            candidate = env_seed
+    if candidate is not None:
+        cleaned = candidate.strip()
+        if not HEX_32B_RE.fullmatch(cleaned):
+            raise ValueError("Ed25519 signing seed must be a 64-character hex string (32 bytes)")
+        return bytes.fromhex(cleaned)
+    return hashlib.sha256(DEFAULT_SIGNING_SEED_MATERIAL).digest()
+
+
+def sign_manifest_bytes(manifest_bytes: bytes, seed: bytes) -> tuple[str, str]:
+    """Sign ``BUNDLE_SIG_DOMAIN + manifest_bytes`` and return ``(sig_hex, public_key_hex)``."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+    public_key_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+    signature_hex = private_key.sign(BUNDLE_SIG_DOMAIN + manifest_bytes).hex()
+    return signature_hex, public_key_hex
 
 
 def sha256_file(path: Path) -> tuple[int, str, bytes]:
@@ -225,10 +259,12 @@ def build_bundle(
     deploy_dir: Path = ROOT / "deploy" / "miro-ego",
     voice_dir: Path = ROOT / "share" / "voice",
     archive: Path | None = None,
+    signing_seed_hex: str | None = None,
 ) -> dict[str, Any]:
     """Assemble a verified pure-native Miro-Ego RDK X5 bundle directory (and optional tar)."""
     _validate_version(version)
     commit = _resolve_commit(commit)
+    signing_seed = resolve_signing_seed(signing_seed_hex)
 
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -315,8 +351,8 @@ def build_bundle(
     for src in voice_files:
         if src.is_symlink() or not src.is_file():
             raise ValueError(f"Voice asset must be a regular non-symlink file: {src}")
-        if src.suffix != ".wav":
-            raise ValueError(f"Voice asset must be a .wav file: {src}")
+        if src.suffix != ".wav" or not VOICE_STEM_RE.fullmatch(src.stem):
+            raise ValueError(f"Voice asset must be a .wav file with [A-Za-z0-9_-] stem: {src}")
         rel = f"share/voice/{src.name}"
         validate_relative_path(rel)
         size, digest, _ = sha256_file(src)
@@ -364,6 +400,11 @@ def build_bundle(
     manifest_path.chmod(0o644)
     sums_entries.append(("bundle.json", hashlib.sha256(manifest_bytes).hexdigest()))
 
+    signature_hex, public_key_hex = sign_manifest_bytes(manifest_bytes, signing_seed)
+    sig_path = output / "bundle.json.sig"
+    sig_path.write_text(f"{signature_hex}\n", encoding="ascii")
+    sig_path.chmod(0o644)
+
     sums_lines = [f"{digest}  {rel}\n" for rel, digest in sorted(sums_entries, key=lambda x: x[0])]
     sums_path = output / "SHA256SUMS"
     sums_path.write_text("".join(sums_lines), encoding="utf-8")
@@ -377,6 +418,7 @@ def build_bundle(
         "platform": TARGET_PLATFORM,
         "version": version,
         "commit": commit,
+        "public_key_hex": public_key_hex,
         "binaries": [entry["path"] for entry in binaries],
         "asset_count": len(assets),
         "total_bytes": total_bytes,
@@ -432,6 +474,13 @@ def main(argv: list[str] | None = None) -> int:
         "--commit",
         help="40-char lowercase Git commit SHA (defaults to git rev-parse HEAD)",
     )
+    parser.add_argument(
+        "--signing-seed-hex",
+        help=(
+            "Optional 64-char hex Ed25519 private signing seed "
+            "(defaults to MIRO_EGO_RELEASE_SIGNING_SEED_HEX or built-in release seed)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     version = args.version if args.version is not None else project_version()
@@ -445,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         deploy_dir=args.deploy_dir,
         voice_dir=args.voice_dir,
         archive=args.archive,
+        signing_seed_hex=args.signing_seed_hex,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0

@@ -59,6 +59,7 @@ jobs:
           {
             echo "MIRO_EGO_VERSION=${version}"
             echo "MIRO_EGO_COMMIT=${commit}"
+            echo "MIRO_EGO_GIT_COMMIT=${commit}"
           } >> "$GITHUB_ENV"
           echo "Resolved Miro-Ego ${version} (${commit})"
 
@@ -92,7 +93,29 @@ jobs:
           /tmp/miro-ego-cross/bin/cargo-zigbuild --version
 
       - name: Cross-compile pure-Rust miro-ego for aarch64-unknown-linux-gnu
+        env:
+          MIRO_EGO_RELEASE_PUBLIC_KEY_HEX: ${{ secrets.MIRO_EGO_RELEASE_PUBLIC_KEY_HEX || vars.MIRO_EGO_RELEASE_PUBLIC_KEY_HEX || '' }}
+          MIRO_EGO_RELEASE_SIGNING_SEED_HEX: ${{ secrets.MIRO_EGO_RELEASE_SIGNING_SEED_HEX || '' }}
         run: |
+          if [[ -z "${MIRO_EGO_RELEASE_PUBLIC_KEY_HEX}" && -n "${MIRO_EGO_RELEASE_SIGNING_SEED_HEX}" ]]; then
+            MIRO_EGO_RELEASE_PUBLIC_KEY_HEX="$(
+              uv run --extra dev python - <<'PY'
+          import os
+          from scripts.build_rdk_x5_bundle import resolve_signing_seed, sign_manifest_bytes
+          seed = resolve_signing_seed(os.environ["MIRO_EGO_RELEASE_SIGNING_SEED_HEX"])
+          _, pub_hex = sign_manifest_bytes(b"", seed)
+          print(pub_hex)
+          PY
+            )"
+          fi
+          if [[ -n "${MIRO_EGO_RELEASE_PUBLIC_KEY_HEX}" ]]; then
+            export MIRO_EGO_RELEASE_PUBLIC_KEY_HEX
+            echo "MIRO_EGO_RELEASE_PUBLIC_KEY_HEX=${MIRO_EGO_RELEASE_PUBLIC_KEY_HEX}" >> "$GITHUB_ENV"
+          else
+            unset MIRO_EGO_RELEASE_PUBLIC_KEY_HEX
+          fi
+          unset MIRO_EGO_RELEASE_SIGNING_SEED_HEX
+          export MIRO_EGO_GIT_COMMIT="${MIRO_EGO_COMMIT}"
           cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.28 -p miro-ego-cli
 
       - name: Cross-compile C miro-ego-encoder for aarch64-unknown-linux-gnu
@@ -111,7 +134,8 @@ jobs:
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
               -I"$HOBOT_SDK_INCLUDE" -Icsrc/miro-ego-encoder \
               "${SRCS[@]}" \
-              -L"$HOBOT_SDK_LIB" -lmultimedia -lpthread \
+              -L"$HOBOT_SDK_LIB" -Wl,-rpath,/usr/hobot/lib -Wl,-rpath-link,"$HOBOT_SDK_LIB" \
+              -lmultimedia -lpthread \
               -o dist-aarch64/miro-ego-encoder
             {
               echo "MIRO_EGO_MOCK_SDK=0"
@@ -156,15 +180,24 @@ jobs:
           PY
 
       - name: Assemble pure-native RDK X5 bundle and archive
+        env:
+          MIRO_EGO_RELEASE_SIGNING_SEED_HEX: ${{ secrets.MIRO_EGO_RELEASE_SIGNING_SEED_HEX || '' }}
         run: |
           mkdir -p dist-rdk-x5
+          signing_args=()
+          if [[ -n "${MIRO_EGO_RELEASE_SIGNING_SEED_HEX}" ]]; then
+            signing_args+=(--signing-seed-hex "${MIRO_EGO_RELEASE_SIGNING_SEED_HEX}")
+          else
+            unset MIRO_EGO_RELEASE_SIGNING_SEED_HEX
+          fi
           uv run --extra dev python scripts/build_rdk_x5_bundle.py \
             --miro-ego-bin target/aarch64-unknown-linux-gnu/release/miro-ego \
             --encoder-bin dist-aarch64/miro-ego-encoder \
             --output dist-rdk-x5/bundle \
             --archive "dist-rdk-x5/${MIRO_EGO_ARCHIVE_NAME}" \
             --version "$MIRO_EGO_VERSION" \
-            --commit "$MIRO_EGO_COMMIT"
+            --commit "$MIRO_EGO_COMMIT" \
+            "${signing_args[@]}"
           if [[ "${MIRO_EGO_MOCK_SDK}" == "1" ]]; then
             cat > dist-rdk-x5/MOCK_SDK_WARNING.txt <<'EOF'
           CI SMOKE ARTIFACT ONLY (-mock-sdk)

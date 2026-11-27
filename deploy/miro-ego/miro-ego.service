@@ -2,7 +2,7 @@
 Description=Miro-Ego RDK X5 stereo capture service
 Requires=miro-ego-recover.service miro-ego-network.socket
 Wants=miro-ego-data-volume.service miro-ego-network.service miro-ego-deploy.socket network-online.target
-After=miro-ego-data-volume.service miro-ego-recover.service miro-ego-network.socket miro-ego-network.service miro-ego-deploy.socket network-online.target NetworkManager.service systemd-tmpfiles-setup.service
+After=data.mount miro-ego-data-volume.service miro-ego-recover.service miro-ego-network.socket miro-ego-network.service miro-ego-deploy.socket network-online.target NetworkManager.service systemd-tmpfiles-setup.service
 
 [Service]
 Type=simple
@@ -22,7 +22,7 @@ StandardError=journal
 SyslogIdentifier=miro-ego
 Restart=on-failure
 RestartSec=2s
-TimeoutStopSec=30s
+TimeoutStopSec=60s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
@@ -38,8 +38,7 @@ CapabilityBoundingSet=
 ReadWritePaths=/var/lib/miro-ego
 ReadWritePaths=-/data
 ReadWritePaths=-/sys/class/leds
-ReadWritePaths=-/run/miro-ego/network-operation.lock
-ReadWritePaths=-/run/miro-ego/maintenance.lock
+ReadWritePaths=/run/miro-ego
 RestrictSUIDSGID=yes
 LockPersonality=yes
 

@@ -1,6 +1,7 @@
 [Unit]
 Description=Miro-Ego privileged firmware deployment control worker
-Requires=miro-ego-recover.service miro-ego-deploy.socket
+Requires=miro-ego-deploy.socket
+Wants=miro-ego-recover.service
 After=local-fs.target systemd-tmpfiles-setup.service miro-ego-recover.service miro-ego-deploy.socket
 
 [Service]

@@ -1,3 +1,3 @@
 # Grant the unprivileged miro-ego service group write access to status LED sysfs controls
 # (including dynamically created ledtrig-timer delay_on/delay_off attributes).
-SUBSYSTEM=="leds", ACTION=="add|change", RUN+="/bin/sh -c 'for attr in trigger brightness delay_on delay_off; do if [ -e \"$1/$attr\" ]; then /bin/chgrp miro-ego \"$1/$attr\" 2>/dev/null || true; /bin/chmod 0660 \"$1/$attr\" 2>/dev/null || true; fi; done' -- %S%p"
+SUBSYSTEM=="leds", ACTION=="add|change", RUN+="/bin/sh -c 'led=$1; set --; for attr in trigger brightness delay_on delay_off; do [ -e \"$led/$attr\" ] && set -- \"$@\" \"$led/$attr\"; done; [ \"$#\" -gt 0 ] && { /bin/chgrp miro-ego \"$@\" 2>/dev/null || true; /bin/chmod 0660 \"$@\" 2>/dev/null || true; } || true' -- %S%p"

@@ -45,6 +45,8 @@ jobs:
 
       - name: Build release miro-ego binary and verify version
         run: |
+          MIRO_EGO_GIT_COMMIT="$(git rev-parse HEAD)"
+          export MIRO_EGO_GIT_COMMIT
           cargo build --release -p miro-ego-cli
           build_info="$(./target/release/miro-ego --version)"
           echo "$build_info"

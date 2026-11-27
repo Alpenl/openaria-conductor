@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import io
+import json
 import os
 import plistlib
 import tempfile
@@ -72,6 +73,7 @@ class HostDisksTests(unittest.TestCase):
             {"size": None},
             {"children": [{"type": "part", "mountpoints": ["/"]}]},
             {"children": [{"type": "part", "mountpoints": ["/boot/efi"]}]},
+            {"children": [{"type": "part", "mountpoints": ["/home"]}]},
             {"children": [{"type": "part", "mountpoints": ["[SWAP]"]}]},
             {"children": [{"type": "crypt", "mountpoints": [None]}]},
             {"children": [{"type": "lvm", "mountpoints": [None]}]},
@@ -253,6 +255,71 @@ class HostDisksTests(unittest.TestCase):
         for cmd in seen_cmds:
             self.assertIn("Get-Partition -DiskNumber 3 -ErrorAction SilentlyContinue", cmd)
             self.assertIn("Get-Volume -ErrorAction SilentlyContinue", cmd)
+
+    def test_windows_path_check_and_transient_disk_offline(self) -> None:
+        # Multi-disk / mount-point JSON array blocks matching disk, allows mapped/unrelated disks.
+        fake_win_path = type(
+            "FakeWinPath",
+            (),
+            {
+                "exists": lambda self: True,
+                "parent": None,
+                "drive": "C:",
+                "__str__": lambda self: r"C:\Mounts\SDCard\image.img",
+            },
+        )()
+        with (
+            patch.object(disks.platform, "system", return_value="Windows"),
+            patch.object(disks, "powershell", return_value=b"[0, 3]\r\n"),
+            self.assertRaisesRegex(RuntimeError, "target disk"),
+        ):
+            disks.check_path_not_on_disk(
+                r"\\.\PhysicalDrive3",
+                fake_win_path,  # type: ignore[arg-type]
+                message="Image is stored on target disk",
+            )
+
+        # Mapped drive returning empty JSON array must not crash or falsely reject.
+        with (
+            patch.object(disks.platform, "system", return_value="Windows"),
+            patch.object(disks, "powershell", return_value=b"[]\r\n"),
+        ):
+            disks.check_path_not_on_disk(
+                r"\\.\PhysicalDrive3",
+                fake_win_path,  # type: ignore[arg-type]
+                message="Image is stored on target disk",
+            )
+
+        # Verify windows_volume_locks offlines an online disk and brings it back online on exit.
+        ioctls: list[int] = []
+
+        class CallableWinDLL:
+            def __init__(self, *_a: object, **_kw: object) -> None:
+                def create_file(*_args: object) -> int:
+                    return 42
+
+                def close_handle(_h: int) -> int:
+                    return 1
+
+                def device_ioctl(_h: int, code: int, *_rest: object) -> int:
+                    ioctls.append(code)
+                    return 1
+
+                self.CreateFileW = create_file
+                self.CloseHandle = close_handle
+                self.DeviceIoControl = device_ioctl
+
+        d = disks.Disk(r"\\.\PhysicalDrive3", 64 * 1024**3, "SER", "SD Reader")
+        vol_json = (json.dumps([r"\\?\Volume{abc}" + "\\"]) + "\r\n").encode("utf-8")
+        with (
+            patch.object(disks, "powershell", return_value=vol_json),
+            patch("ctypes.WinDLL", CallableWinDLL, create=True),
+            disks.windows_volume_locks(d),
+        ):
+            self.assertIn(0x00090018, ioctls)  # FSCTL_LOCK_VOLUME
+            self.assertIn(0x00090020, ioctls)  # FSCTL_DISMOUNT_VOLUME
+            self.assertIn(0x0007C0F4, ioctls)  # IOCTL_DISK_SET_DISK_ATTRIBUTES (offline)
+        self.assertIn(0x00070140, ioctls)  # IOCTL_DISK_UPDATE_PROPERTIES on restore
 
 
 if __name__ == "__main__":

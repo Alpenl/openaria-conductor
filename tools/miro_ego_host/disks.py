@@ -13,9 +13,10 @@ import os
 import platform
 import plistlib
 import re
+import struct
 import subprocess
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -30,6 +31,7 @@ _LINUX_PROTECTED_MOUNTS = frozenset(
         "/boot",
         "/boot/efi",
         "/boot/firmware",
+        "/home",
         "/usr",
         "/var",
         "[SWAP]",
@@ -346,9 +348,88 @@ def unmount(disk: Disk) -> None:
         raise RuntimeError("Disk identity changed after unmount")
 
 
+_FSCTL_LOCK_VOLUME = 0x00090018
+_FSCTL_DISMOUNT_VOLUME = 0x00090020
+_IOCTL_DISK_GET_DISK_ATTRIBUTES = 0x000700F0
+_IOCTL_DISK_SET_DISK_ATTRIBUTES = 0x0007C0F4
+_IOCTL_DISK_UPDATE_PROPERTIES = 0x00070140
+_DISK_ATTRIBUTE_OFFLINE = 0x0000000000000001
+_WINERROR_UNSUPPORTED_OFFLINE = frozenset({1, 50, 87})
+
+
+def _set_windows_disk_offline(
+    kernel: Any,
+    disk_path: str,
+    *,
+    offline: bool,
+    refresh_properties: bool = False,
+) -> bool:
+    """Toggle transient ``DISK_ATTRIBUTE_OFFLINE`` (``Persist=0``) on a Windows physical drive."""
+    import ctypes
+    from ctypes import wintypes
+
+    if not callable(getattr(kernel, "CreateFileW", None)):
+        return False
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = kernel.CreateFileW(disk_path, 0xC0000000, 3, None, 3, 0, None)
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        returned = wintypes.DWORD()
+        if offline:
+            get_buf = ctypes.create_string_buffer(struct.pack("<IIQ", 16, 0, 0), 16)
+            if kernel.DeviceIoControl(
+                handle,
+                _IOCTL_DISK_GET_DISK_ATTRIBUTES,
+                None,
+                0,
+                get_buf,
+                16,
+                ctypes.byref(returned),
+                None,
+            ):
+                _ver, _res, current_attrs = struct.unpack("<IIQ", get_buf.raw)
+                if current_attrs & _DISK_ATTRIBUTE_OFFLINE:
+                    return False
+
+        target_attr = _DISK_ATTRIBUTE_OFFLINE if offline else 0
+        set_payload = struct.pack("<IBB2xQQ16x", 40, 0, 0, target_attr, _DISK_ATTRIBUTE_OFFLINE)
+        set_buf = ctypes.create_string_buffer(set_payload, 40)
+        changed = bool(
+            kernel.DeviceIoControl(
+                handle,
+                _IOCTL_DISK_SET_DISK_ATTRIBUTES,
+                set_buf,
+                40,
+                None,
+                0,
+                ctypes.byref(returned),
+                None,
+            )
+        )
+        if not changed:
+            err_code = ctypes.get_last_error()
+            if err_code not in _WINERROR_UNSUPPORTED_OFFLINE:
+                raise ctypes.WinError(err_code)
+        if refresh_properties:
+            kernel.DeviceIoControl(
+                handle,
+                _IOCTL_DISK_UPDATE_PROPERTIES,
+                None,
+                0,
+                None,
+                0,
+                ctypes.byref(returned),
+                None,
+            )
+        return changed
+    finally:
+        kernel.CloseHandle(handle)
+
+
 @contextmanager
 def windows_volume_locks(disk: Disk):
-    """Lock and dismount all Windows volumes on *disk* for raw sector writes."""
+    """Lock/dismount all Windows volumes and transiently offline *disk* for raw sector writes."""
     import ctypes
     from ctypes import wintypes
 
@@ -391,6 +472,7 @@ def windows_volume_locks(disk: Disk):
         wintypes.LPVOID,
     ]
     handles = []
+    offlined = False
     try:
         for volume_path in paths:
             if not volume_path.startswith("\\\\?\\Volume{"):
@@ -400,15 +482,39 @@ def windows_volume_locks(disk: Disk):
                 raise ctypes.WinError(ctypes.get_last_error())
             handles.append(handle)
             count = wintypes.DWORD()
-            for code in (0x00090018, 0x00090020):  # FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME
+            for code in (_FSCTL_LOCK_VOLUME, _FSCTL_DISMOUNT_VOLUME):
                 if not kernel.DeviceIoControl(
                     handle, code, None, 0, None, 0, ctypes.byref(count), None
                 ):
                     raise ctypes.WinError(ctypes.get_last_error())
+        offlined = _set_windows_disk_offline(kernel, disk.path, offline=True)
         yield
     finally:
         for handle in reversed(handles):
             kernel.CloseHandle(handle)
+        if offlined:
+            with suppress(OSError):
+                _set_windows_disk_offline(
+                    kernel,
+                    disk.path,
+                    offline=False,
+                    refresh_properties=True,
+                )
+
+
+def _parse_windows_disk_numbers(raw: bytes) -> list[int]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = [int(tok) for tok in text.split() if tok.lstrip("-").isdigit()]
+    if isinstance(parsed, int) and not isinstance(parsed, bool):
+        return [parsed]
+    if isinstance(parsed, list):
+        return [int(item) for item in parsed if item is not None and not isinstance(item, bool)]
+    return []
 
 
 def check_path_not_on_disk(disk_path: str, target_path: Path, *, message: str) -> None:
@@ -424,11 +530,41 @@ def check_path_not_on_disk(disk_path: str, target_path: Path, *, message: str) -
         if info.get("ParentWholeDisk") == disk_path.removeprefix("/dev/"):
             raise RuntimeError(message)
     elif system == "Windows":
-        drive = target_path.drive
+        probe = target_path
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        drive = probe.drive.removeprefix("\\\\?\\")
         if not re.fullmatch(r"[A-Za-z]:", drive):
             raise RuntimeError("Choose a local fixed drive")
-        raw = powershell("(Get-Partition -DriveLetter " + drive[0] + ").DiskNumber")
-        if int(raw.strip()) == int(disk_path.removeprefix(r"\\.\PhysicalDrive")):
+        escaped = str(probe).replace("'", "''")
+        ps_script = (
+            f"$p = '{escaped}'; "
+            "$item = Get-Item -LiteralPath $p -Force; "
+            "$full = $item.FullName.TrimEnd('\\') + '\\'; "
+            "$matches_ap = @(Get-Partition -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.AccessPaths } "
+            "| ForEach-Object { "
+            "$part = $_; "
+            "foreach ($ap in $part.AccessPaths) { "
+            "if ($ap -and $ap -notlike '\\\\?\\Volume*') { "
+            "$norm = $ap.TrimEnd('\\') + '\\'; "
+            "if ($full.StartsWith($norm, [System.StringComparison]::OrdinalIgnoreCase)) { "
+            "[PSCustomObject]@{ Len = $norm.Length; DiskNumber = $part.DiskNumber } "
+            "} } } }); "
+            "$nums = @(); "
+            "if ($matches_ap.Count -gt 0) { "
+            "$maxLen = ($matches_ap | Measure-Object -Property Len -Maximum).Maximum; "
+            "$nums = @($matches_ap | Where-Object { $_.Len -eq $maxLen } "
+            "| Select-Object -ExpandProperty DiskNumber); "
+            "} else { "
+            f"$nums = @(Get-Partition -DriveLetter '{drive[0]}' -ErrorAction SilentlyContinue "
+            "| Select-Object -ExpandProperty DiskNumber); "
+            "} "
+            "ConvertTo-Json -Compress -InputObject "
+            "@($nums | Where-Object { $null -ne $_ } | Select-Object -Unique)"
+        )
+        disk_numbers = _parse_windows_disk_numbers(powershell(ps_script))
+        if int(disk_path.removeprefix(r"\\.\PhysicalDrive")) in disk_numbers:
             raise RuntimeError(message)
 
 
@@ -562,6 +698,8 @@ def operate(
     if input("Type ERASE " + disk.path + " to continue: ") != "ERASE " + disk.path:
         raise RuntimeError("Cancelled")
     unmount(disk)
+    if select(disk.path) != disk:
+        raise RuntimeError("Disk identity changed before write")
     raw_path = (
         disk.path.replace("/dev/disk", "/dev/rdisk") if platform.system() == "Darwin" else disk.path
     )
@@ -571,6 +709,4 @@ def operate(
     )
     guard = windows_volume_locks(disk) if platform.system() == "Windows" else nullcontext()
     with guard:
-        if select(disk.path) != disk:
-            raise RuntimeError("Disk identity changed before write")
         write_card(raw_path, flags, disk, resolved_image, expected, quick=quick)

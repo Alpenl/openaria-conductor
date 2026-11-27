@@ -6,7 +6,7 @@ This document defines the canonical 3-partition TF/SD card layout, the `/data` (
 
 ## 1. Three-Partition MBR Layout
 
-Miro-Ego 0.3.0 targets freshly provisioned RDK X5 TF/SD cards (24 GiB–512 GiB actual capacity; minimum 4 GiB reserved for recordings) using an MBR partition table that preserves the official RDK OS 3.5.0 boot code, 32-bit disk signature, and Partition 1/2 start offsets:
+Miro-Ego 0.3.0 targets freshly provisioned RDK X5 TF/SD cards (~24.26 GiB–512 GiB actual capacity; 260 MiB boot/CONFIG + 20 GiB rootfs + minimum 4 GiB reserved for recordings, i.e. `MIN_CARD_BYTES = 26,042,433,536` bytes) using an MBR partition table that preserves the official RDK OS 3.5.0 boot code, 32-bit disk signature, and Partition 1/2 start offsets:
 
 | Partition | Device Node | MBR Type | Filesystem | Label | Start Sector | Size | Mountpoint | Role |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -35,9 +35,9 @@ The 20 GiB ext4 root filesystem is treated as an **immutable-capacity appliance 
   - `/etc/default/miro-ego-data-volume` — 3-line exFAT mount identity (`MIRO_EGO_DATA_VOLUME_MODE=exfat`, `MIRO_EGO_DATA_VOLUME_PARTUUID`, `MIRO_EGO_DATA_VOLUME_UUID`).
   - `/etc/default/miro-ego-wifi-watchdog` — bounded watchdog tuning defaults.
   - `/var/lib/miro-ego/` — small bounded appliance state (`0750 miro-ego:miro-ego`), no unbounded journals or recordings.
-  - `/var/lib/miro-ego-network/` — bounded authoritative NetworkManager transaction state (`0700 root:root`).
+  - `/var/lib/miro-ego-network/` — bounded authoritative NetworkManager transaction state (`0750 root:root`).
   - `/var/lib/miro-ego-wifi-watchdog/` — strictly two fixed-size epoch timestamp files (`last-recovery-epoch`, `last-automatic-reboot-epoch`, `< 64 bytes` combined).
-  - `/run/miro-ego/` and `/run/miro-ego-wifi-watchdog/` — volatile `tmpfs` (RAM-backed) locks, sockets, and bounded fallback watchdog diagnostics.
+  - `/run/miro-ego/` (`0750 root:miro-ego`) and `/run/miro-ego-wifi-watchdog/` (`0700 root:root`) — volatile `tmpfs` (RAM-backed) locks, sockets, clock sync state, and bounded fallback watchdog diagnostics.
 
 ### System-Disk Growth Budget
 
@@ -53,7 +53,7 @@ Every background subsystem capable of unbounded disk growth on Linux is capped b
 | **APT binary caches** | `miro-ego-apt-cache.conf` + `miro-ego.tmpfiles` | `/etc/apt/apt.conf.d/99miro-ego-cache` | `Dir::Cache::pkgcache ""`, `Dir::Cache::srcpkgcache ""`, plus tmpfiles `r` removal | `0 B` |
 | **Wi-Fi watchdog logs** | `miro-ego-wifi-watchdog` + `miro-ego-wifi-watchdog.service` | `/usr/local/sbin/miro-ego-wifi-watchdog` | Writes rotated logs (`<= 10` files) to mounted `rw` `/data/logs/wifi-watchdog/`; falls back to tmpfs `/run/miro-ego-wifi-watchdog/diagnostics/` (`<= 3` files); `ProtectSystem=strict` blocks writes to unmounted `/data` | `<= 64 B` on ext4 (2 epoch timestamps only) |
 | **Telemetry / audit fallback** | Native Rust daemon (`miro-ego-core`) | In-process RAM ring | When `/data` is unmounted, audit/telemetry buffer stays in RAM (`<= 4 MiB`), never spills to ext4 | `0 B` on ext4 |
-| **Idle TRIM** | `miro-ego-idle-fstrim` + `miro-ego-idle-fstrim.conf` | `/usr/local/sbin/miro-ego-idle-fstrim` & `/etc/systemd/system/fstrim.service.d/50-miro-ego-idle.conf` | `Type=exec`, exclusive non-blocking `flock` on `/run/miro-ego/maintenance.lock` (defers with exit `75`, retries after `15min`), trims `/data` and mounted filesystems when idle | Reclaims flash blocks without stalling capture |
+| **Idle TRIM** | `miro-ego-idle-fstrim` + `miro-ego-idle-fstrim.conf` | `/usr/local/sbin/miro-ego-idle-fstrim` & `/etc/systemd/system/fstrim.service.d/50-miro-ego-idle.conf` | `Type=exec` (`RuntimeMaxSec=10min`), exclusive non-blocking `flock` on `/run/miro-ego/maintenance.lock` (defers with exit `75`, retries after `15min`), trims `/data` and mounted filesystems when idle | Reclaims flash blocks without stalling capture |
 | **Base RDK OS + 2 native release slots** | Vendor OS + `/opt/miro-ego/releases/*` | `/` | RDK OS 3.5.0 base (~9–10 GiB) + 2 native binary releases (`< 200 MiB`) + bounded caps (`< 128 MiB`) | `~10.5 GiB` total (`~9.5 GiB` free headroom in 20 GiB) |
 
 ---
@@ -66,8 +66,8 @@ Every background subsystem capable of unbounded disk growth on Linux is capped b
 
 1. Requires `miro-ego` system user (`getent passwd miro-ego`).
 2. Requires `MIRO_EGO_DATA_VOLUME_MODE=exfat`; rejects any other mode.
-3. Validates `MIRO_EGO_DATA_VOLUME_PARTUUID` (`^[[:xdigit:]]{8}-03$`) and `MIRO_EGO_DATA_VOLUME_UUID` (`^[[:xdigit:]]{4}-[[:xdigit:]]{4}$`).
-4. Waits up to 5 seconds for `/dev/disk/by-uuid/<UUID>` and verifies via `blkid` that `PARTUUID`, `UUID`, and `TYPE=exfat` all match.
+3. Validates and case-normalizes `MIRO_EGO_DATA_VOLUME_PARTUUID` (`^[[:xdigit:]]{8}-03$`, normalized lowercase) and `MIRO_EGO_DATA_VOLUME_UUID` (`^[[:xdigit:]]{4}-[[:xdigit:]]{4}$`, normalized uppercase).
+4. Waits up to 5 seconds for `/dev/disk/by-uuid/<UUID>` (tolerating case) and verifies via `blkid` that `PARTUUID`, `UUID`, and `TYPE=exfat` all match.
 5. If `/data` is not mounted:
    - Runs bounded safe repair: `timeout --kill-after=5s 90s fsck.exfat -p "$device"` (accepts exit code `0` clean or `1` repaired; never reformats).
    - Mounts with hardened exFAT options:
@@ -109,13 +109,13 @@ Unix dot-prefixes hide `.miro-ego` on macOS and Linux, but Windows Explorer igno
 
 ## 4. Concurrency Locks & Identity Summary
 
-- **Service account**: `miro-ego:miro-ego` (`SupplementaryGroups=video vpu jpu vps misc` on `miro-ego.service`).
-- **SSH admin account**: `MiroEgo` (provisioned by `/usr/local/sbin/miro-ego-device-login`; existing user passwords are preserved across upgrades).
+- **Service account**: `miro-ego:miro-ego` (`SupplementaryGroups=audio video vpu jpu vps misc` on `miro-ego.service`).
+- **SSH admin account**: `MiroEgo` (provisioned atomically by `/usr/local/sbin/miro-ego-device-login`; existing user passwords are preserved across upgrades).
 - **Rescue hotspot SSID**: `MiroEgo-XXXXXXXX`.
 - **mDNS discovery**: `_miro-ego._tcp` (`Miro-Ego on %h`, TXT `api=/api/v1/device`, port `8080`).
-- **Runtime locks** (created by `miro-ego.tmpfiles` in `/run/miro-ego`, `0660 root:miro-ego`, never unlinked):
-  - `/run/miro-ego/maintenance.lock`: Shared lock during capture; exclusive non-blocking lock required by `miro-ego-idle-fstrim` (defers with exit `75` if busy) and `miro-ego-wifi-watchdog` (defers driver reload and automatic reboot fail-closed if missing, symlinked, or busy).
-  - `/run/miro-ego/network-operation.lock`: Serializes authoritative network transactions in `miro-ego-network.service` against `miro-ego-wifi-watchdog` health checks and driver reloads.
+- **Runtime locks** (created by `miro-ego.tmpfiles` in `/run/miro-ego` (`0750 root:miro-ego`), lock files `0660 root:miro-ego`, never unlinked):
+  - `/run/miro-ego/maintenance.lock`: Shared lock during capture, recovery, and session deletion; exclusive non-blocking lock required by `miro-ego-idle-fstrim` (defers with exit `75` if busy), `miro-ego-deploy`, and `miro-ego-wifi-watchdog` (acquired right before disruptive driver reload or automatic reboot, never during passive probes).
+  - `/run/miro-ego/network-operation.lock`: Serializes authoritative network transactions in `miro-ego-network.service` against `miro-ego-wifi-watchdog` disruptive driver reloads and reboots.
 
 ---
 
@@ -128,8 +128,11 @@ Unix dot-prefixes hide `.miro-ego` on macOS and Linux, but Windows Explorer igno
 | `miro-ego-data-volume.service` | `/usr/lib/systemd/system/miro-ego-data-volume.service` | `0644` | Early oneshot unit mounting `/data` before `miro-ego.service` |
 | `miro-ego-network.service` | `/usr/lib/systemd/system/miro-ego-network.service` | `0644` | Hardened socket-activated privileged network & clock worker |
 | `miro-ego-network.socket` | `/usr/lib/systemd/system/miro-ego-network.socket` | `0644` | Root/miro-ego fail-closed Unix control socket (`0600`) |
+| `miro-ego-deploy.service` | `/usr/lib/systemd/system/miro-ego-deploy.service` | `0644` | Privileged transactional A/B firmware deployment & rollback RPC worker |
+| `miro-ego-deploy.socket` | `/usr/lib/systemd/system/miro-ego-deploy.socket` | `0644` | Socket-activated Unix control socket (`/run/miro-ego/deploy-control.sock`, `0660`) |
 | `miro-ego-button.service` | `/usr/lib/systemd/system/miro-ego-button.service` | `0644` | 40-pin physical recording button & `ACT` LED daemon |
 | `miro-ego-button.json` | `/etc/miro-ego/button.json` | `0644` | Physical pin 37 button & LED default config (preserved on upgrade) |
+| `90-miro-ego-leds.rules` | `/etc/udev/rules.d/90-miro-ego-leds.rules` | `0644` | Grants `miro-ego` group write access (`0660`) to LED sysfs attributes |
 | `miro-ego-recover.service` | `/usr/lib/systemd/system/miro-ego-recover.service` | `0644` | Boot-time transactional release recovery |
 | `miro-ego-wifi-watchdog` | `/usr/local/sbin/miro-ego-wifi-watchdog` | `0755` | POSIX sh Wi-Fi health check, driver reload, & bounded diagnostics |
 | `miro-ego-wifi-watchdog.default` | `/etc/default/miro-ego-wifi-watchdog` | `0644` | Watchdog tuning defaults (preserved on upgrade) |
