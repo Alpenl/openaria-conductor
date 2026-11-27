@@ -23,8 +23,10 @@ pub use backend::{
     StaticAsset,
 };
 pub use downloads::{
-    DownloadSource, OpenRepresentation, ResolvedRange, open_safe_log_file, stream_download_body,
-    stream_download_body_with_lease,
+    ArtifactDeleteGate, DEFAULT_LOG_ETAG_CACHE_CAPACITY, DownloadSource, LogEtagCache,
+    OpenRepresentation, ResolvedRange, SessionDownloadLease, compute_page_aligned_dontneed,
+    open_safe_log_file, open_safe_log_file_with_cache, stream_download_body,
+    stream_download_body_with_lease, stream_download_body_with_session_lease,
 };
 pub use error::{
     API_ERROR_SCHEMA, ApiError, ApiResult, HEADER_AUDIT_STATUS, HEADER_ERROR_CODE,

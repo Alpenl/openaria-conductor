@@ -442,6 +442,9 @@ paths:
       responses:
         "202":
           description: Firmware update accepted or replayed
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
           content:
             application/json:
               schema:
@@ -490,6 +493,9 @@ paths:
       responses:
         "202":
           description: Firmware rollback accepted or replayed
+          headers:
+            Idempotency-Replayed:
+              $ref: "#/components/headers/IdempotencyReplayed"
           content:
             application/json:
               schema:

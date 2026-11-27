@@ -1546,13 +1546,27 @@ async fn diagnostic_logs_disk_listing_range_read_and_traversal_symlink_rejection
     );
     assert_eq!(&body[..], b"abcdefghij");
 
-    // 4. Path traversal, percent-encoding, hidden dotfiles, and symlinks all fail closed!
+    // 3b. OpenAPI path-parameter `%2F` / `%2f` segment separator encoding succeeds!
+    for encoded_ok in [
+        "/api/v1/logs/wifi-watchdog%2Fevents.ndjson",
+        "/api/v1/logs/wifi-watchdog%2fevents.ndjson",
+    ] {
+        let (st_enc, _, body_enc) =
+            http_request(srv.addr, Method::GET, encoded_ok, &[], None).await;
+        assert_eq!(st_enc, StatusCode::OK, "expected 200 for {encoded_ok}");
+        assert_eq!(&body_enc[..], b"{\"ok\":true}\n");
+    }
+
+    // 4. Path traversal, disallowed percent-encoding, hidden dotfiles, and symlinks all fail closed!
     for bad_path in [
         "/api/v1/logs/../outside.txt",
         "/api/v1/logs/%2e%2e/outside.txt",
         "/api/v1/logs/wifi-watchdog/../../outside.txt",
         "/api/v1/logs/.hidden.log",
-        "/api/v1/logs/wifi-watchdog%2fevents.ndjson",
+        "/api/v1/logs/wifi-watchdog%5cevents.ndjson",
+        "/api/v1/logs/wifi-watchdog%00events.ndjson",
+        "/api/v1/logs/wifi-watchdog%252fevents.ndjson",
+        "/api/v1/logs/wifi-watchdog%2f%2fevents.ndjson",
     ] {
         let (st, _, _) = http_request(srv.addr, Method::GET, bad_path, &[], None).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "expected 400 for {bad_path}");
@@ -1661,7 +1675,8 @@ async fn sse_live_lag_resync_fetches_fresh_backend_state() {
     );
     drop(tcp);
 
-    // 2. Network SSE: connect in hotspot mode, mutate backend desired state + overflow 128-slot ring.
+    // 2. Network SSE: return to idle, connect in hotspot mode, mutate backend desired state + overflow 128-slot ring.
+    backend.set_device_state("idle");
     let mut tcp_net = TcpStream::connect(srv.addr).await.unwrap();
     let req_net = format!(
         "GET /api/v1/network/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
@@ -2807,4 +2822,1733 @@ async fn contract_parity_network_errors_cursor_binding_preview_guards_and_mock_s
     );
     let _ = tx2.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), h2).await;
+}
+
+#[tokio::test]
+async fn p1_12_graceful_shutdown_cancels_sse_and_preview_streams_in_milliseconds() {
+    let (tls_cfg, connector) = generate_test_tls();
+    let backend = Arc::new(MockGatewayBackend::with_options(true));
+    let mut cfg = GatewayServerConfig::https("127.0.0.1:0".parse().unwrap(), tls_cfg);
+    cfg.shutdown_drain_timeout = Duration::from_secs(5);
+    cfg.runtime.sse_heartbeat_interval = Duration::from_secs(60);
+    cfg.runtime.max_sse_connections = 4;
+    cfg.runtime.max_preview_streams = 4;
+
+    let server = GatewayServer::bind(cfg, backend, Arc::new(SecurityPolicy::lab_default()))
+        .await
+        .unwrap();
+    let addr = server.local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        server
+            .serve_with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    async fn open_tls_stream(
+        addr: SocketAddr,
+        connector: &TlsConnector,
+        raw_req: &str,
+        marker: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let sni = ServerName::try_from("localhost".to_owned()).unwrap();
+        let mut tls = connector.connect(sni, tcp).await.unwrap();
+        tls.write_all(raw_req.as_bytes()).await.unwrap();
+        let mut acc = Vec::new();
+        let mut buf = [0_u8; 4096];
+        while !String::from_utf8_lossy(&acc).contains(marker) {
+            let n = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n > 0, "unexpected early EOF waiting for {marker}");
+            acc.extend_from_slice(&buf[..n]);
+        }
+        tls
+    }
+
+    let port = addr.port();
+    let mut cap_sse = open_tls_stream(
+        addr,
+        &connector,
+        &format!("GET /api/v1/capture/events HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        "event: snapshot",
+    )
+    .await;
+    let mut net_sse = open_tls_stream(
+        addr,
+        &connector,
+        &format!("GET /api/v1/network/events HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        "event: snapshot",
+    )
+    .await;
+    let mut mjpeg_tls = open_tls_stream(
+        addr,
+        &connector,
+        &format!(
+            "GET /api/v1/preview?fps=5 HTTP/1.1\r\nHost: localhost:{port}\r\nAccept: multipart/x-mixed-replace\r\n\r\n"
+        ),
+        "MOCK-JPEG",
+    )
+    .await;
+    let mut h264_tls = open_tls_stream(
+        addr,
+        &connector,
+        &format!("GET /api/v1/preview/h264 HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        "ftypisommoov",
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    let _ = shutdown_tx.send(());
+
+    // Drain each TLS stream to clean EOF (`0\r\n\r\n` + TLS `close_notify` -> `Ok(0)`).
+    for tls in [&mut cap_sse, &mut net_sse, &mut mjpeg_tls, &mut h264_tls] {
+        let mut tail = Vec::new();
+        let mut scratch = [0_u8; 1024];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(1), tls.read(&mut scratch))
+                .await
+                .expect("stream must close rapidly on shutdown")
+                .expect("TLS stream must send clean close_notify without UnexpectedEof");
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&scratch[..n]);
+        }
+        assert!(
+            tail.windows(5).any(|w| w == b"0\r\n\r\n"),
+            "chunked stream must terminate with HTTP chunked EOF 0\\r\\n\\r\\n"
+        );
+    }
+
+    let srv_res = tokio::time::timeout(Duration::from_secs(1), srv_handle)
+        .await
+        .expect("server must finish shutdown well under 5s drain timeout")
+        .unwrap();
+    assert!(srv_res.is_ok());
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "shutdown took {:?} instead of milliseconds",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn p1_13_slowloris_body_timeout_401_403_conn_close_and_keepalive_idle_hardening() {
+    let backend = Arc::new(MockGatewayBackend::new());
+    let admin = Principal::all_v1_operations("admin").unwrap();
+    let mut tokens = HashMap::new();
+    tokens.insert("admin-secret-token-9999".to_owned(), admin);
+    let security = Arc::new(
+        SecurityPolicy::customer(tokens, HashSet::new(), Some("csrf-secret-123".to_owned()))
+            .unwrap(),
+    );
+
+    let mut cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
+    cfg.max_connections = 2;
+    cfg.request_body_timeout = Duration::from_millis(120);
+    cfg.keep_alive_idle_timeout = Duration::from_millis(160);
+    cfg.runtime.sse_heartbeat_interval = Duration::from_secs(30);
+
+    let server = GatewayServer::bind(
+        cfg,
+        Arc::clone(&backend) as Arc<dyn GatewayBackend>,
+        security,
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        let _ = server
+            .serve_with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    // 1. 401 and 403 responses carry `Connection: close` and immediately drop TCP keep-alive.
+    let mut unauth_tcp = TcpStream::connect(addr).await.unwrap();
+    let req_401 = format!(
+        "GET /api/v1/device HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\n\r\n",
+        addr.port()
+    );
+    unauth_tcp.write_all(req_401.as_bytes()).await.unwrap();
+    let mut resp_401 = Vec::new();
+    unauth_tcp.read_to_end(&mut resp_401).await.unwrap();
+    let text_401 = String::from_utf8_lossy(&resp_401).to_ascii_lowercase();
+    assert!(text_401.starts_with("http/1.1 401"), "got:\n{text_401}");
+    assert!(
+        text_401.contains("connection: close"),
+        "401 must carry Connection: close:\n{text_401}"
+    );
+
+    let mut forbid_tcp = TcpStream::connect(addr).await.unwrap();
+    let req_403 = format!(
+        "POST /api/v1/voice HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer admin-secret-token-9999\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{{}}",
+        addr.port(),
+        addr.port()
+    );
+    forbid_tcp.write_all(req_403.as_bytes()).await.unwrap();
+    let mut resp_403 = Vec::new();
+    forbid_tcp.read_to_end(&mut resp_403).await.unwrap();
+    let text_403 = String::from_utf8_lossy(&resp_403).to_ascii_lowercase();
+    assert!(text_403.starts_with("http/1.1 403"), "got:\n{text_403}");
+    assert!(
+        text_403.contains("connection: close"),
+        "403 must carry Connection: close:\n{text_403}"
+    );
+
+    // 2. Slowloris POST body timeout -> 408 Request Timeout Problem Details + Connection: close.
+    let mut slow_tcp = TcpStream::connect(addr).await.unwrap();
+    let req_slow = format!(
+        "POST /api/v1/voice HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer admin-secret-token-9999\r\nOrigin: http://127.0.0.1:{}\r\nX-CSRF-Token: csrf-secret-123\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{\"schema\":",
+        addr.port(),
+        addr.port()
+    );
+    slow_tcp.write_all(req_slow.as_bytes()).await.unwrap();
+    let mut resp_slow = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), slow_tcp.read_to_end(&mut resp_slow))
+        .await
+        .expect("slowloris POST body must time out promptly")
+        .unwrap();
+    let text_slow = String::from_utf8_lossy(&resp_slow);
+    assert!(
+        text_slow.starts_with("HTTP/1.1 408"),
+        "expected 408 on body timeout:\n{text_slow}"
+    );
+    assert!(
+        text_slow.to_ascii_lowercase().contains("connection: close"),
+        "got:\n{text_slow}"
+    );
+    assert!(
+        text_slow.contains("\"request_timeout\""),
+        "got:\n{text_slow}"
+    );
+
+    // 3. Idle HTTP/1.1 keep-alive connections time out and free `max_connections = 2` permits.
+    let mut idle_a = TcpStream::connect(addr).await.unwrap();
+    let mut idle_b = TcpStream::connect(addr).await.unwrap();
+    let valid_get = format!(
+        "GET /api/v1/device HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer admin-secret-token-9999\r\nConnection: keep-alive\r\n\r\n",
+        addr.port()
+    );
+    for sock in [&mut idle_a, &mut idle_b] {
+        sock.write_all(valid_get.as_bytes()).await.unwrap();
+        let mut buf = [0_u8; 4096];
+        let mut acc = Vec::new();
+        while !String::from_utf8_lossy(&acc).contains("\"miro-ego.device.v1\"") {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            acc.extend_from_slice(&buf[..n]);
+        }
+    }
+    // Wait past keep_alive_idle_timeout (160ms): server must evict both idle keep-alive sockets!
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let (st_after, _, _) = http_request(
+        addr,
+        Method::GET,
+        "/api/v1/device",
+        &[("Authorization", "Bearer admin-secret-token-9999")],
+        None,
+    )
+    .await;
+    assert_eq!(st_after, StatusCode::OK);
+    drop(idle_a);
+    drop(idle_b);
+
+    // 4. Active SSE stream is NOT killed by keep_alive_idle_timeout even when quiet > 2x idle timeout!
+    let mut sse_sock = TcpStream::connect(addr).await.unwrap();
+    let sse_req = format!(
+        "GET /api/v1/capture/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer admin-secret-token-9999\r\n\r\n",
+        addr.port()
+    );
+    sse_sock.write_all(sse_req.as_bytes()).await.unwrap();
+    let mut sse_buf = [0_u8; 4096];
+    let mut sse_acc = Vec::new();
+    while !String::from_utf8_lossy(&sse_acc).contains("event: snapshot") {
+        let n = sse_sock.read(&mut sse_buf).await.unwrap();
+        assert!(n > 0);
+        sse_acc.extend_from_slice(&sse_buf[..n]);
+    }
+    // Sleep 350ms (> 2x 160ms keep_alive_idle_timeout with 30s heartbeat -> zero traffic)
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let epoch = backend.capture_status().await.unwrap()["authority_epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    backend
+        .capture_event_buffer()
+        .publish(json!({
+            "authority_epoch": epoch,
+            "source_revision": 2,
+            "type": "state",
+            "occurred_at": "2026-11-26T12:00:00Z",
+            "session_id": new_uuid_v7(),
+            "data": {"schema": "miro-ego.capture-state-event.v1", "state": "recording"}
+        }))
+        .unwrap();
+    sse_acc.clear();
+    while !String::from_utf8_lossy(&sse_acc).contains("event: state") {
+        let n = tokio::time::timeout(Duration::from_secs(1), sse_sock.read(&mut sse_buf))
+            .await
+            .expect("active SSE stream must stay alive past keep-alive idle timeout")
+            .unwrap();
+        assert!(
+            n > 0,
+            "active SSE stream must not be closed by idle timeout"
+        );
+        sse_acc.extend_from_slice(&sse_buf[..n]);
+    }
+    drop(sse_sock);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), srv_handle).await;
+}
+
+#[tokio::test]
+async fn p1_14_and_p1_15_network_replay_broadcast_log_etag_cache_and_ipv6_host() {
+    use miro_ego_api::{
+        EventCursor, NetworkEventReplayBuffer, is_allowed_gateway_host, normalize_allowed_hosts,
+    };
+
+    // 1. P1-14: NetworkEventReplayBuffer broadcasts published delivery_ids on resync AND replay!
+    let net_buf = NetworkEventReplayBuffer::new(16);
+    let epoch = new_uuid_v4();
+    let mk_net_status = |rev: u64, mode: &str| {
+        json!({
+            "schema": "miro-ego.network-status.v1",
+            "authority_epoch": epoch,
+            "source_revision": rev,
+            "observed_at": "2026-11-26T10:00:00Z",
+            "saved": false,
+            "verified": false,
+            "desired": { "mode": mode, "wifi_client": null, "ethernet": null },
+            "observed": { "ap": {}, "wifi_client": {}, "wired": {}, "default_route": "none", "mdns": {}, "devices": [] },
+            "transaction": { "current": null, "latest": null },
+            "mutation_capability": { "enabled": true, "disabled_reason": null },
+            "concurrency_capability": {}
+        })
+    };
+
+    let init = net_buf
+        .replay_or_snapshot(None, mk_net_status(1, "hotspot"))
+        .unwrap();
+    let anchor_id = init[0].delivery_id;
+    let mut live_sub = net_buf.subscribe();
+
+    // Client B connects without cursor while status advanced to rev 2 (resync path):
+    let _ = net_buf
+        .replay_or_snapshot(None, mk_net_status(2, "ethernet-dhcp"))
+        .unwrap();
+    let recv_resync_id = live_sub
+        .try_recv()
+        .expect("live subscriber must receive broadcast when resync observes new status");
+    let missed_batch = net_buf.try_events_after(anchor_id).unwrap().unwrap();
+    assert_eq!(missed_batch.len(), 1);
+    assert_eq!(missed_batch[0].delivery_id, recv_resync_id);
+
+    // Client C reconnects with valid cursor `recv_resync_id` while status advanced to rev 3 (replay path):
+    let replayed = net_buf
+        .replay_or_snapshot(
+            Some(EventCursor::Exact(recv_resync_id)),
+            mk_net_status(3, "hotspot"),
+        )
+        .unwrap();
+    assert_eq!(replayed.len(), 1);
+    let recv_replay_id = live_sub
+        .try_recv()
+        .expect("live subscriber must receive broadcast when replay observes new status");
+    assert_eq!(replayed[0].delivery_id, recv_replay_id);
+
+    // 2. P1-15: Unbracketed IPv6 listen_host fallback in normalize_allowed_hosts
+    let v6_hosts = normalize_allowed_hosts("2001:db8::abcd", Vec::<String>::new());
+    assert!(is_allowed_gateway_host("[2001:db8::abcd]:8443", &v6_hosts));
+    assert!(is_allowed_gateway_host("[2001:db8::ABCD]", &v6_hosts));
+    assert!(!is_allowed_gateway_host("[2001:db8::9999]:8443", &v6_hosts));
+    assert!(!is_allowed_gateway_host("[::]:8443", &v6_hosts));
+
+    // 3. P1-15: Bounded LogEtagCache validates fstat in O(1) across Range chunks without re-hashing!
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_root = std::env::temp_dir().join(format!(
+        "miro-ego-etag-cache-{}-{unique}",
+        std::process::id()
+    ));
+    let sub_dir = tmp_root.join("wifi-watchdog");
+    fs::create_dir_all(&sub_dir).unwrap();
+    let log_file = sub_dir.join("events.ndjson");
+    fs::write(&log_file, b"line-1\nline-2\nline-3\n").unwrap();
+
+    let backend = Arc::new(MockGatewayBackend::new());
+    backend.set_logs_dir(tmp_root.clone());
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        Arc::new(SecurityPolicy::lab_default()),
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+
+    let mut first_etag = String::new();
+    for range_spec in ["bytes=0-6", "bytes=7-13", "bytes=14-20"] {
+        let (st, hdrs, _) = http_request(
+            srv.addr,
+            Method::GET,
+            "/api/v1/logs/wifi-watchdog%2Fevents.ndjson",
+            &[("Range", range_spec)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        let etag = hdrs.get("etag").unwrap().to_str().unwrap().to_owned();
+        if first_etag.is_empty() {
+            first_etag = etag;
+        } else {
+            assert_eq!(etag, first_etag);
+        }
+    }
+    assert_eq!(backend.log_etag_cache().misses(), 1);
+    assert_eq!(backend.log_etag_cache().hits(), 2);
+
+    // Mutate file size -> cache invalidates via fstat and computes fresh ETag!
+    fs::write(&log_file, b"line-1\nline-2\nline-3\nline-4-extra\n").unwrap();
+    let (st_mod, hdrs_mod, _) = http_request(
+        srv.addr,
+        Method::GET,
+        "/api/v1/logs/wifi-watchdog%2Fevents.ndjson",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_mod, StatusCode::OK);
+    let second_etag = hdrs_mod.get("etag").unwrap().to_str().unwrap();
+    assert_ne!(second_etag, first_etag);
+    assert_eq!(backend.log_etag_cache().misses(), 2);
+
+    srv.shutdown().await;
+    let _ = fs::remove_dir_all(tmp_root);
+}
+
+#[tokio::test]
+async fn p2_15_per_session_delete_gate_coalescing_and_customer_firmware_aliases() {
+    // 1. Per-session delete gate: downloading Session A does NOT block deleting Session B,
+    //    concurrent artifact download of being-deleted Session B returns 409 session_deleting
+    //    (NEVER 423 capture_busy), and concurrent / post-completion retries coalesce & replay!
+    struct BarrierDeleteBackend {
+        inner: MockGatewayBackend,
+        entered_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release_rx: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GatewayBackend for BarrierDeleteBackend {
+        async fn device_info(
+            &self,
+            sp: miro_ego_api::SecurityProfile,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.device_info(sp).await
+        }
+        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_status().await
+        }
+        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_snapshot_event().await
+        }
+        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_readiness().await
+        }
+        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.capture_safe_swap().await
+        }
+        async fn start_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.start_capture(c).await
+        }
+        async fn stop_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.stop_capture(c).await
+        }
+        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_timer().await
+        }
+        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_capture_timer(e, d).await
+        }
+        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.camera_focus().await
+        }
+        async fn set_camera_focus(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.set_camera_focus(c).await
+        }
+        async fn list_sessions(
+            &self,
+            q: miro_ego_api::ListSessionsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_sessions(q).await
+        }
+        async fn open_session_manifest(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> {
+            self.inner.open_session_manifest(s).await
+        }
+        async fn retained_unsuccessful_outcome(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.retained_unsuccessful_outcome(s).await
+        }
+        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> {
+            self.inner.artifact_io_busy_state().await
+        }
+        async fn open_session_artifact(
+            &self,
+            s: &str,
+            a: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_session_artifact(s, a).await
+        }
+        async fn check_delete_sessions_idempotency(
+            &self,
+            c: &miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<Option<miro_ego_api::CommandOutcome>> {
+            self.inner.check_delete_sessions_idempotency(c).await
+        }
+        async fn delete_sessions(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            let maybe_tx = self.entered_tx.lock().unwrap().take();
+            if let Some(tx) = maybe_tx {
+                let _ = tx.send(());
+            }
+            let maybe_rx = self.release_rx.lock().await.take();
+            if let Some(rx) = maybe_rx {
+                let _ = rx.await;
+            }
+            self.inner.delete_sessions(c).await
+        }
+        async fn list_logs(
+            &self,
+            q: miro_ego_api::ListLogsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_logs(q).await
+        }
+        async fn open_log_file(
+            &self,
+            n: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_log_file(n).await
+        }
+        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> {
+            self.inner.preview_mjpeg_hub()
+        }
+        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> {
+            self.inner.preview_h264_hub()
+        }
+        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> {
+            self.inner.capture_event_buffer()
+        }
+        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> {
+            self.inner.network_event_buffer()
+        }
+        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_status(p).await
+        }
+        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_inspect(p).await
+        }
+        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_sync(p, b).await
+        }
+        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.voice_status().await
+        }
+        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_voice_volume(v).await
+        }
+        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_status().await
+        }
+        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_scan().await
+        }
+        async fn create_network_credential(
+            &self,
+            p: &str,
+            pw: &str,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.create_network_credential(p, pw).await
+        }
+        async fn apply_network_desired_state(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.apply_network_desired_state(c).await
+        }
+        async fn retry_network_transaction(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.retry_network_transaction(c).await
+        }
+        async fn forget_network_client_profile(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.forget_network_client_profile(c).await
+        }
+        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_status().await
+        }
+        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_check(f).await
+        }
+        async fn firmware_update(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_update(c).await
+        }
+        async fn firmware_rollback(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_rollback(c).await
+        }
+        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> {
+            self.inner.record_audit(e)
+        }
+        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> {
+            self.inner.get_web_asset(n)
+        }
+    }
+
+    let inner = MockGatewayBackend::new();
+    let (sid_a, aid_a, sha_a) = inner.sample_session_and_artifact().unwrap();
+    let (sid_b, aid_b, sha_b) = inner.insert_sample_session(None).unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let barrier_backend: Arc<dyn GatewayBackend> = Arc::new(BarrierDeleteBackend {
+        inner,
+        entered_tx: std::sync::Mutex::new(Some(entered_tx)),
+        release_rx: tokio::sync::Mutex::new(Some(release_rx)),
+    });
+
+    let cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
+    let server = GatewayServer::bind(
+        cfg,
+        barrier_backend,
+        Arc::new(SecurityPolicy::lab_default()),
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr();
+    let state = server.state();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let srv_h = tokio::spawn(async move {
+        let _ = server
+            .serve_with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+
+    // Hold a per-session download lease on Session A directly via GatewayState!
+    let lease_a = state
+        .artifact_delete_gate
+        .try_acquire_download(&sid_a)
+        .unwrap();
+
+    // Deleting Session A while Session A is downloading -> 409 open_downloads.
+    let del_a_body = Bytes::from(
+        json!({
+            "schema": "miro-ego.session-delete-request.v1",
+            "sessions": [{"session_id": sid_a, "manifest_sha256": sha_a}]
+        })
+        .to_string(),
+    );
+    let (st_del_a, _, body_del_a) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "del-a-blocked"),
+        ],
+        Some(del_a_body.clone()),
+    )
+    .await;
+    assert_eq!(st_del_a, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_del_a).unwrap()["error"]["code"],
+        "open_downloads"
+    );
+
+    // Deleting Session B while Session A is downloading -> allowed and enters execution!
+    let del_b_body = Bytes::from(
+        json!({
+            "schema": "miro-ego.session-delete-request.v1",
+            "sessions": [{"session_id": sid_b, "manifest_sha256": sha_b}]
+        })
+        .to_string(),
+    );
+    let del_b_clone = del_b_body.clone();
+    let primary_del_task = tokio::spawn(async move {
+        http_request(
+            addr,
+            Method::POST,
+            "/api/v1/sessions/delete",
+            &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "del-b-coalesce"),
+            ],
+            Some(del_b_clone),
+        )
+        .await
+    });
+
+    entered_rx.await.unwrap();
+
+    // While Session B deletion is in flight:
+    // (1) Artifact download on Session B returns 409 session_deleting (NEVER 423 capture_busy!)
+    let (st_dl_b, hdrs_dl_b, body_dl_b) = http_request(
+        addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_b}/artifacts/{aid_b}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_dl_b, StatusCode::CONFLICT);
+    assert_eq!(
+        hdrs_dl_b
+            .get(HEADER_ERROR_CODE)
+            .and_then(|v| v.to_str().ok()),
+        Some("session_deleting")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_dl_b).unwrap()["error"]["code"],
+        "session_deleting"
+    );
+
+    // (2) Artifact download on Session A STILL SUCCEEDS concurrently!
+    let (st_dl_a, _, _) = http_request(
+        addr,
+        Method::GET,
+        &format!("/api/v1/sessions/{sid_a}/artifacts/{aid_a}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_dl_a, StatusCode::OK);
+
+    // (3) Duplicate retry of deleteSessions with SAME key & body coalesces onto in-flight delete!
+    let del_b_dup = del_b_body.clone();
+    let dup_del_task = tokio::spawn(async move {
+        http_request(
+            addr,
+            Method::POST,
+            "/api/v1/sessions/delete",
+            &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "del-b-coalesce"),
+            ],
+            Some(del_b_dup),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Release barrier -> both primary and coalesced retry finish 200 OK!
+    let _ = release_tx.send(());
+    let (st_prim, hdrs_prim, _) = primary_del_task.await.unwrap();
+    let (st_dup, hdrs_dup, _) = dup_del_task.await.unwrap();
+    assert_eq!(st_prim, StatusCode::OK);
+    assert!(hdrs_prim.get("idempotency-replayed").is_none());
+    assert_eq!(st_dup, StatusCode::OK);
+    assert_eq!(
+        hdrs_dup
+            .get("idempotency-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+
+    // Even if we hold a fake download lease on sid_b now, replaying completed key `del-b-coalesce`
+    // returns 200 Idempotency-Replayed: true instead of false 409 open_downloads!
+    let fake_lease_b = state
+        .artifact_delete_gate
+        .try_acquire_download(&sid_b)
+        .unwrap();
+    let (st_rep, hdrs_rep, _) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "del-b-coalesce"),
+        ],
+        Some(del_b_body),
+    )
+    .await;
+    assert_eq!(st_rep, StatusCode::OK);
+    assert_eq!(
+        hdrs_rep
+            .get("idempotency-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    drop(fake_lease_b);
+    drop(lease_a);
+
+    let _ = stop_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), srv_h).await;
+
+    // 2. Customer firmware permission aliases (`firmwareStatus` -> `checkFirmware`,
+    //    `firmwareUpdate` -> `rollbackFirmware`) while Lab `allowed_operation_ids` stays exact!
+    let mut cust_perms = HashMap::new();
+    cust_perms.insert("firmwareStatus".to_owned(), None);
+    cust_perms.insert("firmwareUpdate".to_owned(), None);
+    let cust_p = Principal::new("fw-operator", cust_perms).unwrap();
+    let mut cust_tokens = HashMap::new();
+    cust_tokens.insert("fw-operator-token-1234".to_owned(), cust_p);
+    let cust_sec = Arc::new(SecurityPolicy::customer(cust_tokens, HashSet::new(), None).unwrap());
+    let cust_srv = RunningServer::start_http(
+        Arc::new(MockGatewayBackend::new()),
+        cust_sec,
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+    let cust_origin = format!("http://127.0.0.1:{}", cust_srv.addr.port());
+
+    let (st_chk, _, _) = http_request(
+        cust_srv.addr,
+        Method::GET,
+        "/api/v1/firmware/check",
+        &[("Authorization", "Bearer fw-operator-token-1234")],
+        None,
+    )
+    .await;
+    assert_eq!(st_chk, StatusCode::OK);
+
+    let (st_rb, _, _) = http_request(
+        cust_srv.addr,
+        Method::POST,
+        "/api/v1/firmware/rollback",
+        &[
+            ("Authorization", "Bearer fw-operator-token-1234"),
+            ("Origin", &cust_origin),
+            ("X-CSRF-Token", "fw-operator-token-1234"),
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "cust-fw-rb-1"),
+        ],
+        Some(Bytes::from(json!({"commit": "2".repeat(40)}).to_string())),
+    )
+    .await;
+    assert_eq!(st_rb, StatusCode::ACCEPTED);
+    cust_srv.shutdown().await;
+
+    // Lab profile with exact `allowed_operation_ids = ["firmwareStatus", "firmwareUpdate"]`
+    // MUST reject `checkFirmware` and `rollbackFirmware` with 403!
+    let lab_sec = Arc::new(
+        SecurityPolicy::lab(
+            HashSet::from(["firmwareStatus".to_owned(), "firmwareUpdate".to_owned()]),
+            HashSet::new(),
+            None,
+        )
+        .unwrap(),
+    );
+    let lab_srv = RunningServer::start_http(
+        Arc::new(MockGatewayBackend::new()),
+        lab_sec,
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+    let (st_lab_chk, _, _) = http_request(
+        lab_srv.addr,
+        Method::GET,
+        "/api/v1/firmware/check",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_lab_chk, StatusCode::FORBIDDEN);
+    let (st_lab_rb, _, _) = http_request(
+        lab_srv.addr,
+        Method::POST,
+        "/api/v1/firmware/rollback",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "lab-fw-rb-1"),
+        ],
+        Some(Bytes::from(json!({"commit": "2".repeat(40)}).to_string())),
+    )
+    .await;
+    assert_eq!(st_lab_rb, StatusCode::FORBIDDEN);
+    lab_srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn p2_16_network_validation_and_mock_backend_parity() {
+    let backend = Arc::new(MockGatewayBackend::new());
+    let op_a = Principal::all_v1_operations("net-op-a").unwrap();
+    let op_b = Principal::all_v1_operations("net-op-b").unwrap();
+    let mut tokens = HashMap::new();
+    tokens.insert("net-token-alpha-1111".to_owned(), op_a);
+    tokens.insert("net-token-bravo-2222".to_owned(), op_b);
+    let security = Arc::new(SecurityPolicy::customer(tokens, HashSet::new(), None).unwrap());
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        security,
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+    let origin = format!("http://127.0.0.1:{}", srv.addr.port());
+    let headers_for = |tok: &'static str, idem: &'static str| -> Vec<(&str, String)> {
+        vec![
+            ("Authorization", format!("Bearer {tok}")),
+            ("Origin", origin.clone()),
+            ("X-CSRF-Token", tok.to_owned()),
+            ("Content-Type", "application/json".to_owned()),
+            ("Idempotency-Key", idem.to_owned()),
+        ]
+    };
+
+    // 1. validate_network_apply_body: mode vs ethernet mismatch rejected with 400
+    let bad_desired_cases = [
+        // hotspot with non-null ethernet
+        json!({
+            "mode": "hotspot",
+            "wifi_client": null,
+            "ethernet": { "addressing": "dhcp", "static_ipv4": null }
+        }),
+        // wifi-client with non-null ethernet
+        json!({
+            "mode": "wifi-client",
+            "wifi_client": { "ssid": "open-net", "security": "open" },
+            "ethernet": { "addressing": "dhcp", "static_ipv4": null }
+        }),
+        // ethernet-static with addressing=dhcp
+        json!({
+            "mode": "ethernet-static",
+            "wifi_client": null,
+            "ethernet": { "addressing": "dhcp", "static_ipv4": null }
+        }),
+        // ethernet-dhcp with addressing=static
+        json!({
+            "mode": "ethernet-dhcp",
+            "wifi_client": null,
+            "ethernet": {
+                "addressing": "static",
+                "static_ipv4": { "address": "10.0.0.2", "prefix_length": 24, "gateway": null, "dns": [] }
+            }
+        }),
+    ];
+    for (idx, bad_desired) in bad_desired_cases.iter().enumerate() {
+        let h_owned = headers_for(
+            "net-token-alpha-1111",
+            Box::leak(format!("bad-eth-{idx}").into_boxed_str()),
+        );
+        let h_refs: Vec<(&str, &str)> = h_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (st, _, _) = http_request(
+            srv.addr,
+            Method::POST,
+            "/api/v1/network/apply",
+            &h_refs,
+            Some(Bytes::from(
+                json!({
+                    "schema": "miro-ego.network-apply-request.v1",
+                    "desired": bad_desired
+                })
+                .to_string(),
+            )),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "case {idx} must be 400");
+    }
+
+    // 2. Passphrase char count >= 8 alongside byte length <= 63 ("密码1" = 3 chars, 9 bytes -> 400!)
+    let cred_hdrs = [
+        ("Authorization", "Bearer net-token-alpha-1111"),
+        ("Origin", origin.as_str()),
+        ("X-CSRF-Token", "net-token-alpha-1111"),
+        ("Content-Type", "application/json"),
+    ];
+    let (st_short_chars, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/credentials",
+        &cred_hdrs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-credential-request.v1",
+                "passphrase": "密码1"
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_short_chars, StatusCode::BAD_REQUEST);
+
+    // 8 CJK chars (24 UTF-8 bytes <= 63) -> 201 Created!
+    let (st_cjk_ok, _, cred_body) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/credentials",
+        &cred_hdrs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-credential-request.v1",
+                "passphrase": "密码密码密码密码"
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_cjk_ok, StatusCode::CREATED);
+    let cred_a = serde_json::from_slice::<Value>(&cred_body).unwrap()["credential_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 3. Cross-principal credential_ref rejected with 422 credential_ref_not_allowed (without consuming it!)
+    let h_bravo = headers_for("net-token-bravo-2222", "bravo-steal-cred");
+    let h_bravo_refs: Vec<(&str, &str)> = h_bravo.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (st_steal, _, b_steal) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &h_bravo_refs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "wifi-client",
+                    "wifi_client": { "ssid": "studio-wifi", "security": "wpa2-personal", "credential_ref": cred_a },
+                    "ethernet": null
+                }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_steal, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_steal).unwrap()["error"]["details"]["reason"],
+        "credential_ref_not_allowed"
+    );
+
+    // Expire cred_a -> 422 credential_ref_expired
+    backend.expire_network_credential(&cred_a);
+    let h_alpha_exp = headers_for("net-token-alpha-1111", "alpha-expired-cred");
+    let h_alpha_exp_refs: Vec<(&str, &str)> =
+        h_alpha_exp.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (st_exp, _, b_exp) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &h_alpha_exp_refs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "wifi-client",
+                    "wifi_client": { "ssid": "studio-wifi", "security": "wpa2-personal", "credential_ref": cred_a },
+                    "ethernet": null
+                }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_exp, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_exp).unwrap()["error"]["details"]["reason"],
+        "credential_ref_expired"
+    );
+
+    // 4. Unified "network-mutation" idempotency scope across apply & forget!
+    let h_shared = headers_for("net-token-alpha-1111", "shared-net-key-1");
+    let h_shared_refs: Vec<(&str, &str)> = h_shared.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (st_net_ap, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &h_shared_refs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": { "mode": "hotspot", "wifi_client": null, "ethernet": null }
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_net_ap, StatusCode::ACCEPTED);
+
+    let (st_net_fg, _, b_net_fg) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/forget",
+        &h_shared_refs,
+        Some(Bytes::from(
+            json!({ "schema": "miro-ego.network-forget-request.v1" }).to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_net_fg, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_net_fg).unwrap()["error"]["details"]["idempotency_scope"],
+        "network-mutation"
+    );
+
+    // 5. Clock challenge 5000ms TTL enforcement
+    let (_, _, chk_bytes) = http_request(
+        srv.addr,
+        Method::GET,
+        "/api/v1/clock/check",
+        &[("Authorization", "Bearer net-token-alpha-1111")],
+        None,
+    )
+    .await;
+    let challenge = serde_json::from_slice::<Value>(&chk_bytes).unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    backend.expire_clock_challenge(&challenge);
+    let (st_clk_exp, _, b_clk_exp) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/clock/sync",
+        &cred_hdrs,
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.clock-sync-request.v1",
+                "challenge": challenge,
+                "unix_time_ms": 1_764_152_700_000_u64,
+                "replace": true
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_clk_exp, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_clk_exp).unwrap()["error"]["code"],
+        "clock_challenge_invalid"
+    );
+
+    // 6. idle_only enforcement when capture is active -> 503 network_mutation_unavailable
+    backend.set_device_state("recording");
+    let (_, _, st_net_busy) = http_request(
+        srv.addr,
+        Method::GET,
+        "/api/v1/network",
+        &[("Authorization", "Bearer net-token-alpha-1111")],
+        None,
+    )
+    .await;
+    let net_doc: Value = serde_json::from_slice(&st_net_busy).unwrap();
+    assert_eq!(net_doc["mutation_capability"]["enabled"], false);
+    assert_eq!(
+        net_doc["mutation_capability"]["disabled_reason"],
+        "capture_active"
+    );
+
+    let h_busy = headers_for("net-token-alpha-1111", "net-while-busy-1");
+    let h_busy_refs: Vec<(&str, &str)> = h_busy.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (st_fg_busy, _, b_fg_busy) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/network/forget",
+        &h_busy_refs,
+        Some(Bytes::from(
+            json!({ "schema": "miro-ego.network-forget-request.v1" }).to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_fg_busy, StatusCode::SERVICE_UNAVAILABLE);
+    let fg_busy_json: Value = serde_json::from_slice(&b_fg_busy).unwrap();
+    assert_eq!(
+        fg_busy_json["error"]["code"],
+        "network_mutation_unavailable"
+    );
+    assert_eq!(fg_busy_json["error"]["details"]["reason"], "capture_active");
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn p2_17_and_p3_04_audit_hygiene_rfc9110_204_tokens_head_405_preview_and_fadvise() {
+    use miro_ego_api::{
+        ApiError, H264PreviewHub, compute_page_aligned_dontneed, security::constant_time_eq_bytes,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Error message clamping (1..=1024 chars) & constant-time digest compare & bearer min length 8
+    let empty_err = ApiError::bad_request("");
+    let empty_json = empty_err.to_problem_json(&new_uuid_v4());
+    assert!(!empty_json["error"]["message"].as_str().unwrap().is_empty());
+
+    let huge_err = ApiError::bad_request("x".repeat(5000));
+    let huge_json = huge_err.to_problem_json(&new_uuid_v4());
+    assert_eq!(
+        huge_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        1024
+    );
+
+    let mut short_tokens = HashMap::new();
+    short_tokens.insert(
+        "short77".to_owned(),
+        Principal::all_v1_operations("op").unwrap(),
+    );
+    assert!(
+        SecurityPolicy::customer(short_tokens, HashSet::new(), None).is_err(),
+        "bearer token shorter than 8 chars must be rejected"
+    );
+    assert!(constant_time_eq_bytes(
+        b"secret-12345678",
+        b"secret-12345678"
+    ));
+    assert!(!constant_time_eq_bytes(b"secret-12345678", b"short"));
+    assert!(!constant_time_eq_bytes(
+        &vec![b'a'; 5000],
+        &vec![b'a'; 5000]
+    ));
+
+    // 2. Page-aligned fadvise_dontneed across unaligned Range chunks never skips straddling pages!
+    let mut evicted_until = 1000_u64.div_ceil(4096) * 4096;
+    assert_eq!(evicted_until, 4096);
+    let (off1, len1, next1) = compute_page_aligned_dontneed(evicted_until, 263_144, false).unwrap();
+    assert_eq!((off1, len1, next1), (4096, 258_048, 262_144));
+    evicted_until = next1;
+    let (off2, len2, next2) = compute_page_aligned_dontneed(evicted_until, 525_288, false).unwrap();
+    // Straddling page [262_144, 266_240) MUST be included starting at 262_144!
+    assert_eq!((off2, len2, next2), (262_144, 262_144, 524_288));
+
+    // 3. H264PreviewHub::record_stream_hints does not clobber active hints with (None, None)
+    let hub = H264PreviewHub::new_fmp4(16);
+    hub.record_stream_hints(Some(20), Some(3000));
+    hub.record_stream_hints(None, None);
+    assert_eq!(hub.last_stream_hints(), (Some(20), Some(3000)));
+    hub.record_stream_hints(Some(15), None);
+    assert_eq!(hub.last_stream_hints(), (Some(15), Some(3000)));
+
+    // 4. Audit hygiene, RFC 9110 204 Content-Length omission, HEAD 405, and truncated field names
+    let backend = Arc::new(MockGatewayBackend::new());
+    let (sid, aid, sha) = backend.sample_session_and_artifact().unwrap();
+    let srv = RunningServer::start_http(
+        Arc::clone(&backend),
+        Arc::new(SecurityPolicy::lab_default()),
+        GatewayRuntimeConfig::default(),
+    )
+    .await;
+
+    // Missing Idempotency-Key on startCapture & deleteSessions must record "invalid_request", NEVER "allowed"!
+    let (st_no_idem, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[("Content-Type", "application/json")],
+        Some(Bytes::from(
+            json!({"schema": "miro-ego.capture-start.v1", "mode": "production", "take": {"kind": "new"}})
+                .to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_no_idem, StatusCode::BAD_REQUEST);
+
+    let (st_del_bad_body, _, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "bad-del-body-1"),
+        ],
+        Some(Bytes::from(r#"{"schema":"wrong"}"#)),
+    )
+    .await;
+    assert_eq!(st_del_bad_body, StatusCode::BAD_REQUEST);
+
+    let _ = http_request(srv.addr, Method::GET, "/api/v1/logs/..%2fsecret", &[], None).await;
+    let _ = http_request(
+        srv.addr,
+        Method::GET,
+        "/api/v1/sessions/bad-uuid",
+        &[],
+        None,
+    )
+    .await;
+
+    // Disallowed Origin on OPTIONS -> 403 origin_forbidden + "origin_forbidden" audit!
+    let (st_opt_bad, _, b_opt_bad) = http_request(
+        srv.addr,
+        Method::OPTIONS,
+        "/api/v1/device",
+        &[
+            ("Origin", "https://evil.example"),
+            ("Access-Control-Request-Method", "GET"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_opt_bad, StatusCode::FORBIDDEN);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b_opt_bad).unwrap()["error"]["code"],
+        "origin_forbidden"
+    );
+
+    // Same-origin OPTIONS -> 204 No Content WITHOUT Content-Length header!
+    let same_origin = format!("http://127.0.0.1:{}", srv.addr.port());
+    let (st_opt_same, hdrs_opt_same, _) = http_request(
+        srv.addr,
+        Method::OPTIONS,
+        "/api/v1/device",
+        &[
+            ("Origin", &same_origin),
+            ("Access-Control-Request-Method", "GET"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_opt_same, StatusCode::NO_CONTENT);
+    assert!(
+        hdrs_opt_same.get("content-length").is_none(),
+        "RFC 9110 forbids Content-Length on 204 No Content"
+    );
+
+    // Idle stopCapture -> 204 No Content WITHOUT Content-Length header!
+    let (st_stop_204, hdrs_stop_204, _) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "idle-stop-204"),
+        ],
+        Some(Bytes::from(
+            json!({"schema": "miro-ego.capture-stop.v1", "reason": "user"}).to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(st_stop_204, StatusCode::NO_CONTENT);
+    assert!(hdrs_stop_204.get("content-length").is_none());
+
+    // Execute all 5 routes that previously emitted duplicate "completed" audits:
+    let _ = http_request(srv.addr, Method::GET, "/api/v1/firmware", &[], None).await;
+    let _ = http_request(srv.addr, Method::GET, "/api/v1/firmware/check", &[], None).await;
+    let _ = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/firmware/update",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "aud-fw-u1"),
+        ],
+        Some(Bytes::from(json!({"commit": "3".repeat(40)}).to_string())),
+    )
+    .await;
+    let _ = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/firmware/rollback",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "aud-fw-r1"),
+        ],
+        Some(Bytes::from(json!({"commit": "2".repeat(40)}).to_string())),
+    )
+    .await;
+
+    // Before deleting `sid`, verify HEAD on artifact & web root still return 200 OK,
+    // while HEAD on GET-only /api/v1/* routes returns 405 Method Not Allowed!
+    let (st_head_art, _, _) = http_request(
+        srv.addr,
+        Method::HEAD,
+        &format!("/api/v1/sessions/{sid}/artifacts/{aid}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st_head_art, StatusCode::OK);
+    let (st_head_web, _, _) = http_request(srv.addr, Method::HEAD, "/app.js", &[], None).await;
+    assert_eq!(st_head_web, StatusCode::OK);
+
+    for (get_only_path, expected_allow) in [
+        ("/api/v1/device", "GET, OPTIONS"),
+        ("/api/v1/voice", "GET, POST, OPTIONS"),
+        ("/api/v1/capture/events", "GET, OPTIONS"),
+        ("/api/v1/preview", "GET, OPTIONS"),
+        ("/api/v1/logs", "GET, OPTIONS"),
+        ("/api/v1/logs/device.log", "GET, OPTIONS"),
+    ] {
+        let (st_h, hdrs_h, body_h) =
+            http_request(srv.addr, Method::HEAD, get_only_path, &[], None).await;
+        assert_eq!(
+            st_h,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "HEAD {get_only_path} must return 405"
+        );
+        assert_eq!(
+            hdrs_h.get("allow").and_then(|v| v.to_str().ok()),
+            Some(expected_allow),
+            "Allow mismatch on HEAD {get_only_path}"
+        );
+        assert!(body_h.is_empty());
+    }
+
+    let _ = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/sessions/delete",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "aud-del-1"),
+        ],
+        Some(Bytes::from(
+            json!({
+                "schema": "miro-ego.session-delete-request.v1",
+                "sessions": [{"session_id": sid, "manifest_sha256": sha}]
+            })
+            .to_string(),
+        )),
+    )
+    .await;
+
+    // Echoed unknown field name is truncated cleanly
+    let huge_field = "z".repeat(300);
+    let mut bad_obj = serde_json::Map::new();
+    bad_obj.insert("schema".to_owned(), json!("miro-ego.camera-focus-set.v1"));
+    bad_obj.insert(huge_field.clone(), json!(1));
+    let (st_uf, _, b_uf) = http_request(
+        srv.addr,
+        Method::POST,
+        "/api/v1/camera/focus",
+        &[
+            ("Content-Type", "application/json"),
+            ("Idempotency-Key", "uf-1"),
+        ],
+        Some(Bytes::from(Value::Object(bad_obj).to_string())),
+    )
+    .await;
+    assert_eq!(st_uf, StatusCode::BAD_REQUEST);
+    let uf_msg = serde_json::from_slice::<Value>(&b_uf).unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!uf_msg.contains(&huge_field));
+    assert!(uf_msg.ends_with("..."));
+
+    // Verify audit events invariants!
+    let audits = backend.audit_events();
+    assert!(
+        audits.iter().all(|e| e.outcome != "completed"),
+        "duplicate 'completed' audit events must not be emitted"
+    );
+    assert!(
+        !audits
+            .iter()
+            .any(|e| e.operation_id == "startCapture" && e.outcome == "allowed"),
+        "missing Idempotency-Key on startCapture must not emit 'allowed'"
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|e| e.operation_id == "startCapture" && e.outcome == "invalid_request")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|e| e.operation_id == "deleteSessions" && e.outcome == "invalid_request")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|e| e.operation_id == "getLogFile" && e.outcome == "invalid_request")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|e| e.operation_id == "getSession" && e.outcome == "invalid_request")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|e| e.operation_id == "options" && e.outcome == "origin_forbidden")
+    );
+    for op in [
+        "firmwareStatus",
+        "checkFirmware",
+        "firmwareUpdate",
+        "rollbackFirmware",
+        "deleteSessions",
+    ] {
+        let allowed_cnt = audits
+            .iter()
+            .filter(|e| e.operation_id == op && e.outcome == "allowed")
+            .count();
+        assert_eq!(allowed_cnt, 1, "expected exactly 1 allowed audit for {op}");
+    }
+
+    srv.shutdown().await;
+
+    // 5. Verify preview_semaphore is acquired BEFORE calling open_preview_mjpeg / open_preview_h264!
+    struct CountingPreviewBackend {
+        inner: MockGatewayBackend,
+        open_calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl GatewayBackend for CountingPreviewBackend {
+        async fn device_info(
+            &self,
+            sp: miro_ego_api::SecurityProfile,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.device_info(sp).await
+        }
+        async fn capture_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_status().await
+        }
+        async fn capture_snapshot_event(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_snapshot_event().await
+        }
+        async fn capture_readiness(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_readiness().await
+        }
+        async fn capture_safe_swap(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.capture_safe_swap().await
+        }
+        async fn start_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.start_capture(c).await
+        }
+        async fn stop_capture(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.stop_capture(c).await
+        }
+        async fn capture_timer(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.capture_timer().await
+        }
+        async fn set_capture_timer(&self, e: bool, d: u64) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_capture_timer(e, d).await
+        }
+        async fn camera_focus(&self) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.camera_focus().await
+        }
+        async fn set_camera_focus(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.set_camera_focus(c).await
+        }
+        async fn list_sessions(
+            &self,
+            q: miro_ego_api::ListSessionsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_sessions(q).await
+        }
+        async fn open_session_manifest(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::RawManifest> {
+            self.inner.open_session_manifest(s).await
+        }
+        async fn retained_unsuccessful_outcome(
+            &self,
+            s: &str,
+        ) -> miro_ego_api::ApiResult<Option<Value>> {
+            self.inner.retained_unsuccessful_outcome(s).await
+        }
+        async fn artifact_io_busy_state(&self) -> miro_ego_api::ApiResult<Option<String>> {
+            self.inner.artifact_io_busy_state().await
+        }
+        async fn open_session_artifact(
+            &self,
+            s: &str,
+            a: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_session_artifact(s, a).await
+        }
+        async fn delete_sessions(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.delete_sessions(c).await
+        }
+        async fn list_logs(
+            &self,
+            q: miro_ego_api::ListLogsQuery,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.list_logs(q).await
+        }
+        async fn open_log_file(
+            &self,
+            n: &str,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::OpenRepresentation> {
+            self.inner.open_log_file(n).await
+        }
+        fn preview_mjpeg_hub(&self) -> Option<Arc<miro_ego_api::MjpegPreviewHub>> {
+            self.inner.preview_mjpeg_hub()
+        }
+        fn preview_h264_hub(&self) -> Option<Arc<miro_ego_api::H264PreviewHub>> {
+            self.inner.preview_h264_hub()
+        }
+        async fn open_preview_mjpeg(
+            &self,
+            fps: Option<u32>,
+        ) -> miro_ego_api::ApiResult<Arc<miro_ego_api::MjpegPreviewHub>> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.open_preview_mjpeg(fps).await
+        }
+        async fn open_preview_h264(
+            &self,
+            fps: Option<u32>,
+            br: Option<u32>,
+        ) -> miro_ego_api::ApiResult<Arc<miro_ego_api::H264PreviewHub>> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.open_preview_h264(fps, br).await
+        }
+        fn capture_event_buffer(&self) -> Arc<miro_ego_api::EventReplayBuffer> {
+            self.inner.capture_event_buffer()
+        }
+        fn network_event_buffer(&self) -> Arc<miro_ego_api::NetworkEventReplayBuffer> {
+            self.inner.network_event_buffer()
+        }
+        async fn clock_status(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_status(p).await
+        }
+        async fn clock_inspect(&self, p: &str) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_inspect(p).await
+        }
+        async fn clock_sync(&self, p: &str, b: Value) -> miro_ego_api::ApiResult<Value> {
+            self.inner.clock_sync(p, b).await
+        }
+        async fn voice_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.voice_status().await
+        }
+        async fn set_voice_volume(&self, v: u8) -> miro_ego_api::ApiResult<Value> {
+            self.inner.set_voice_volume(v).await
+        }
+        async fn network_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_status().await
+        }
+        async fn network_scan(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.network_scan().await
+        }
+        async fn create_network_credential(
+            &self,
+            p: &str,
+            pw: &str,
+        ) -> miro_ego_api::ApiResult<Value> {
+            self.inner.create_network_credential(p, pw).await
+        }
+        async fn apply_network_desired_state(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.apply_network_desired_state(c).await
+        }
+        async fn retry_network_transaction(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.retry_network_transaction(c).await
+        }
+        async fn forget_network_client_profile(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.forget_network_client_profile(c).await
+        }
+        async fn firmware_status(&self) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_status().await
+        }
+        async fn firmware_check(&self, f: bool) -> miro_ego_api::ApiResult<Value> {
+            self.inner.firmware_check(f).await
+        }
+        async fn firmware_update(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_update(c).await
+        }
+        async fn firmware_rollback(
+            &self,
+            c: miro_ego_api::IdempotentCommand,
+        ) -> miro_ego_api::ApiResult<miro_ego_api::CommandOutcome> {
+            self.inner.firmware_rollback(c).await
+        }
+        fn record_audit(&self, e: miro_ego_api::AuditEvent) -> miro_ego_api::ApiResult<()> {
+            self.inner.record_audit(e)
+        }
+        fn get_web_asset(&self, n: &str) -> Option<miro_ego_api::StaticAsset> {
+            self.inner.get_web_asset(n)
+        }
+    }
+
+    let open_calls = Arc::new(AtomicUsize::new(0));
+    let cnt_backend: Arc<dyn GatewayBackend> = Arc::new(CountingPreviewBackend {
+        inner: MockGatewayBackend::with_options(true),
+        open_calls: Arc::clone(&open_calls),
+    });
+    let mut cnt_cfg = GatewayServerConfig::http("127.0.0.1:0".parse().unwrap());
+    cnt_cfg.runtime.max_preview_streams = 1;
+    let cnt_srv = GatewayServer::bind(
+        cnt_cfg,
+        cnt_backend,
+        Arc::new(SecurityPolicy::lab_default()),
+    )
+    .await
+    .unwrap();
+    let cnt_addr = cnt_srv.local_addr();
+    let cnt_state = cnt_srv.state();
+    let (cnt_tx, cnt_rx) = oneshot::channel::<()>();
+    let cnt_h = tokio::spawn(async move {
+        let _ = cnt_srv
+            .serve_with_graceful_shutdown(async {
+                let _ = cnt_rx.await;
+            })
+            .await;
+    });
+
+    let held_prev = Arc::clone(&cnt_state.preview_semaphore)
+        .try_acquire_owned()
+        .unwrap();
+    for p in ["/api/v1/preview", "/api/v1/preview/h264"] {
+        let (st_cap, _, b_cap) = http_request(cnt_addr, Method::GET, p, &[], None).await;
+        assert_eq!(st_cap, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b_cap).unwrap()["error"]["code"],
+            "preview_capacity_exhausted"
+        );
+    }
+    assert_eq!(
+        open_calls.load(Ordering::SeqCst),
+        0,
+        "preview_semaphore must block before calling open_preview_*"
+    );
+    drop(held_prev);
+    let _ = cnt_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), cnt_h).await;
 }

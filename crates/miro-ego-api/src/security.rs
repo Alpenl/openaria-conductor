@@ -2,8 +2,9 @@
 //! per-operation authorization, Host anti-DNS-rebinding validation, and audit events.
 
 use crate::error::{ApiError, ApiResult};
-use miro_ego_core::ids::CUSTOMER_BEARER_TOKEN_MAX_LENGTH;
+use miro_ego_core::ids::{CUSTOMER_BEARER_TOKEN_MAX_LENGTH, is_valid_bearer_token};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,6 +107,7 @@ impl SecurityProfile {
 pub struct Principal {
     principal_id: String,
     permissions: HashMap<String, Option<HashSet<String>>>,
+    exact_operation_ids_only: bool,
 }
 
 impl Principal {
@@ -122,6 +124,7 @@ impl Principal {
         Ok(Self {
             principal_id,
             permissions,
+            exact_operation_ids_only: false,
         })
     }
 
@@ -141,7 +144,34 @@ impl Principal {
         &self.permissions
     }
 
+    /// Check whether this principal holds operation-level permission (including OpenAPI
+    /// Customer firmware permission aliases: `firmwareStatus` -> `checkFirmware` and
+    /// `firmwareUpdate` -> `rollbackFirmware`, while keeping `Lab` `allowed_operation_ids` exact).
+    pub fn has_operation_permission(&self, operation_id: &str) -> bool {
+        if self.permissions.contains_key(operation_id) {
+            return true;
+        }
+        if !self.exact_operation_ids_only
+            && let Some(alias) = customer_permission_alias(operation_id)
+        {
+            return self.permissions.contains_key(alias);
+        }
+        false
+    }
+
     pub fn permits(&self, operation_id: &str, resource_id: Option<&str>) -> bool {
+        if self.permits_exact(operation_id, resource_id) {
+            return true;
+        }
+        if !self.exact_operation_ids_only
+            && let Some(alias) = customer_permission_alias(operation_id)
+        {
+            return self.permits_exact(alias, resource_id);
+        }
+        false
+    }
+
+    fn permits_exact(&self, operation_id: &str, resource_id: Option<&str>) -> bool {
         let Some(allowed_resources) = self.permissions.get(operation_id) else {
             return false;
         };
@@ -149,6 +179,14 @@ impl Principal {
             None => true,
             Some(resources) => resource_id.is_some_and(|id| resources.contains(id)),
         }
+    }
+}
+
+fn customer_permission_alias(operation_id: &str) -> Option<&'static str> {
+    match operation_id {
+        "checkFirmware" => Some("firmwareStatus"),
+        "rollbackFirmware" => Some("firmwareUpdate"),
+        _ => None,
     }
 }
 
@@ -188,9 +226,10 @@ impl AuditEvent {
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     profile: SecurityProfile,
-    tokens: Vec<(String, Principal)>,
+    tokens: Vec<(String, [u8; 32], Principal)>,
     allowed_origins: HashSet<String>,
     csrf_token: Option<String>,
+    csrf_token_digest: Option<[u8; 32]>,
     lab_principal: Option<Principal>,
 }
 
@@ -206,9 +245,9 @@ impl SecurityPolicy {
             ));
         }
         for token in tokens.keys() {
-            if !valid_token_characters(token) {
+            if !is_valid_bearer_token(token) {
                 return Err(ApiError::bad_request(
-                    "invalid customer bearer token format",
+                    "invalid customer bearer token format (must be 8..=512 visible ASCII chars)",
                 ));
             }
         }
@@ -218,11 +257,22 @@ impl SecurityPolicy {
             return Err(ApiError::bad_request("invalid csrf_token format"));
         }
         validate_origins(&allowed_origins)?;
+        let csrf_token_digest = csrf_token
+            .as_deref()
+            .map(|c| sha256_digest_bytes(c.as_bytes()));
+        let token_entries = tokens
+            .into_iter()
+            .map(|(tok, principal)| {
+                let digest = sha256_digest_bytes(tok.as_bytes());
+                (tok, digest, principal)
+            })
+            .collect();
         Ok(Self {
             profile: SecurityProfile::Customer,
-            tokens: tokens.into_iter().collect(),
+            tokens: token_entries,
             allowed_origins,
             csrf_token,
+            csrf_token_digest,
             lab_principal: None,
         })
     }
@@ -242,12 +292,17 @@ impl SecurityPolicy {
             .into_iter()
             .map(|op| (op, None))
             .collect();
-        let principal = Principal::new("isolated-lab-device", permissions)?;
+        let mut principal = Principal::new("isolated-lab-device", permissions)?;
+        principal.exact_operation_ids_only = true;
+        let csrf_token_digest = csrf_token
+            .as_deref()
+            .map(|c| sha256_digest_bytes(c.as_bytes()));
         Ok(Self {
             profile: SecurityProfile::Lab,
             tokens: Vec::new(),
             allowed_origins,
             csrf_token,
+            csrf_token_digest,
             lab_principal: Some(principal),
         })
     }
@@ -263,9 +318,11 @@ impl SecurityPolicy {
             tokens: Vec::new(),
             allowed_origins: HashSet::new(),
             csrf_token: None,
+            csrf_token_digest: None,
             lab_principal: Some(Principal {
                 principal_id: "isolated-lab-device".to_owned(),
                 permissions,
+                exact_operation_ids_only: true,
             }),
         }
     }
@@ -282,7 +339,7 @@ impl SecurityPolicy {
         self.csrf_token.as_deref()
     }
 
-    /// Authenticate a request using constant-time UTF-8 byte comparison for Customer bearer tokens.
+    /// Authenticate a request using length-hiding constant-time SHA-256 digest comparison.
     pub fn authenticate(&self, authorization: Option<&str>) -> Option<&Principal> {
         self.authenticate_with_token(authorization).map(|(p, _)| p)
     }
@@ -297,13 +354,13 @@ impl SecurityPolicy {
         }
         let header = authorization?;
         let candidate = header.strip_prefix("Bearer ")?;
-        if candidate.is_empty() {
+        if candidate.is_empty() || candidate.len() > CUSTOMER_BEARER_TOKEN_MAX_LENGTH {
             return None;
         }
-        let candidate_bytes = candidate.as_bytes();
+        let candidate_digest = sha256_digest_bytes(candidate.as_bytes());
         let mut matched: Option<(&Principal, &str)> = None;
-        for (token, principal) in &self.tokens {
-            if constant_time_eq_bytes(candidate_bytes, token.as_bytes()) {
+        for (token, expected_digest, principal) in &self.tokens {
+            if bool::from(candidate_digest.ct_eq(expected_digest)) {
                 matched = Some((principal, token.as_str()));
             }
         }
@@ -311,8 +368,13 @@ impl SecurityPolicy {
     }
 
     pub fn verify_csrf(&self, candidate: Option<&str>) -> bool {
-        match (self.csrf_token.as_deref(), candidate) {
-            (Some(expected), Some(actual)) => constant_time_eq(actual, expected),
+        match (&self.csrf_token_digest, candidate) {
+            (Some(expected_digest), Some(actual))
+                if !actual.is_empty() && actual.len() <= CUSTOMER_BEARER_TOKEN_MAX_LENGTH =>
+            {
+                let actual_digest = sha256_digest_bytes(actual.as_bytes());
+                bool::from(actual_digest.ct_eq(expected_digest))
+            }
             _ => false,
         }
     }
@@ -328,22 +390,41 @@ impl SecurityPolicy {
         let Some(actual) = candidate else {
             return false;
         };
+        if actual.is_empty() || actual.len() > CUSTOMER_BEARER_TOKEN_MAX_LENGTH {
+            return false;
+        }
+        let actual_digest = sha256_digest_bytes(actual.as_bytes());
         let matches_configured = self
-            .csrf_token
-            .as_deref()
-            .is_some_and(|expected| constant_time_eq(actual, expected));
-        let matches_bearer =
-            authenticated_bearer.is_some_and(|bearer| constant_time_eq(actual, bearer));
+            .csrf_token_digest
+            .as_ref()
+            .is_some_and(|expected_digest| bool::from(actual_digest.ct_eq(expected_digest)));
+        let matches_bearer = authenticated_bearer.is_some_and(|bearer| {
+            let bearer_digest = sha256_digest_bytes(bearer.as_bytes());
+            bool::from(actual_digest.ct_eq(&bearer_digest))
+        });
         matches_configured | matches_bearer
     }
+}
+
+const MAX_CONSTANT_TIME_COMPARE_BYTES: usize = 4096;
+
+fn sha256_digest_bytes(input: &[u8]) -> [u8; 32] {
+    Sha256::digest(input).into()
 }
 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     constant_time_eq_bytes(a.as_bytes(), b.as_bytes())
 }
 
+/// Compare two byte slices without leaking secret length via timing: bounds incoming lengths
+/// first, then compares fixed 32-byte `Sha256::digest` outputs via `subtle::ConstantTimeEq`.
 pub fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    bool::from(a.ct_eq(b))
+    if a.len() > MAX_CONSTANT_TIME_COMPARE_BYTES || b.len() > MAX_CONSTANT_TIME_COMPARE_BYTES {
+        return false;
+    }
+    let digest_a = sha256_digest_bytes(a);
+    let digest_b = sha256_digest_bytes(b);
+    bool::from(digest_a.ct_eq(&digest_b))
 }
 
 pub fn valid_token_characters(value: &str) -> bool {
@@ -422,11 +503,16 @@ where
         .map(|h| (*h).to_owned())
         .collect();
     let trimmed_listen = listen_host.trim();
-    if !WILDCARD_LISTEN_HOSTS.contains(&trimmed_listen)
-        && let Some(norm) = extract_host_hostname(trimmed_listen)
-        && !is_unspecified_ip(&norm)
-    {
-        hosts.insert(norm);
+    if !WILDCARD_LISTEN_HOSTS.contains(&trimmed_listen) {
+        if let Some(norm) = extract_host_hostname(trimmed_listen) {
+            if !is_unspecified_ip(&norm) {
+                hosts.insert(norm);
+            }
+        } else if let Ok(v6) = trimmed_listen.parse::<Ipv6Addr>()
+            && !v6.is_unspecified()
+        {
+            hosts.insert(v6.to_string().to_ascii_lowercase());
+        }
     }
     for entry in configured {
         let text = entry.as_ref().trim();

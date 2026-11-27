@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, broadcast, watch};
 
 pub const DEFAULT_REPLAY_CAPACITY: usize = 128;
 pub const CAPTURE_EVENT_SCHEMA: &str = "miro-ego.capture-event.v1";
@@ -603,29 +603,45 @@ impl NetworkEventReplayBuffer {
     /// Replay buffered network events after `cursor`, or emit a resync snapshot.
     ///
     /// Untrusted `Last-Event-ID` values (including huge numbers) NEVER jump `next_delivery_id`.
+    /// Any state transition newly observed in `status` is also broadcast to live SSE subscribers.
     pub fn replay_or_snapshot(
         &self,
         cursor: Option<EventCursor>,
         status: Value,
     ) -> ApiResult<Vec<SseEvent>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| ApiError::internal("state_poisoned", "network replay buffer poisoned"))?;
-        let Some(EventCursor::Exact(cursor_id)) = cursor else {
-            let snap = issue_network_resync_locked(&mut guard, status, None)?;
-            return Ok(vec![snap]);
+        let (events, published) = {
+            let mut guard = self.inner.lock().map_err(|_| {
+                ApiError::internal("state_poisoned", "network replay buffer poisoned")
+            })?;
+            match cursor {
+                None | Some(EventCursor::OutOfRange) => {
+                    let (snap, pub_id) = issue_network_resync_locked(&mut guard, status, None)?;
+                    (vec![snap], pub_id)
+                }
+                Some(EventCursor::Exact(cursor_id)) => {
+                    if network_replay_after_locked(&guard.replay, cursor_id).is_none() {
+                        let (snap, pub_id) =
+                            issue_network_resync_locked(&mut guard, status, Some(cursor_id))?;
+                        (vec![snap], pub_id)
+                    } else {
+                        let published_obs = observe_network_locked(&mut guard, status.clone())?;
+                        if let Some(replayed) =
+                            network_replay_after_locked(&guard.replay, cursor_id)
+                        {
+                            (replayed, published_obs)
+                        } else {
+                            let (snap, pub_resync) =
+                                issue_network_resync_locked(&mut guard, status, Some(cursor_id))?;
+                            (vec![snap], pub_resync.or(published_obs))
+                        }
+                    }
+                }
+            }
         };
-        if network_replay_after_locked(&guard.replay, cursor_id).is_none() {
-            let snap = issue_network_resync_locked(&mut guard, status, Some(cursor_id))?;
-            return Ok(vec![snap]);
+        if let Some(id) = published {
+            let _ = self.tx.send(id);
         }
-        let _ = observe_network_locked(&mut guard, status.clone())?;
-        if let Some(events) = network_replay_after_locked(&guard.replay, cursor_id) {
-            return Ok(events);
-        }
-        let snap = issue_network_resync_locked(&mut guard, status, Some(cursor_id))?;
-        Ok(vec![snap])
+        Ok(events)
     }
 
     pub fn try_events_after(&self, cursor_id: u64) -> ApiResult<Option<Vec<SseEvent>>> {
@@ -641,11 +657,16 @@ impl NetworkEventReplayBuffer {
         status: Value,
         after_cursor: Option<u64>,
     ) -> ApiResult<SseEvent> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| ApiError::internal("state_poisoned", "network replay buffer poisoned"))?;
-        issue_network_resync_locked(&mut guard, status, after_cursor)
+        let (snap, published) = {
+            let mut guard = self.inner.lock().map_err(|_| {
+                ApiError::internal("state_poisoned", "network replay buffer poisoned")
+            })?;
+            issue_network_resync_locked(&mut guard, status, after_cursor)?
+        };
+        if let Some(id) = published {
+            let _ = self.tx.send(id);
+        }
+        Ok(snap)
     }
 }
 
@@ -895,10 +916,12 @@ fn issue_network_resync_locked(
     guard: &mut NetworkReplayInner,
     status: Value,
     after_cursor: Option<u64>,
-) -> ApiResult<SseEvent> {
-    if guard.last_status.is_some() {
-        let _ = observe_network_locked(guard, status.clone())?;
-    }
+) -> ApiResult<(SseEvent, Option<u64>)> {
+    let published = if guard.last_status.is_some() {
+        observe_network_locked(guard, status.clone())?
+    } else {
+        None
+    };
     let selected = match &guard.last_status {
         Some(existing) => existing.clone(),
         None => {
@@ -931,24 +954,42 @@ fn issue_network_resync_locked(
     map.insert("data".to_owned(), selected);
 
     let publish_index = guard.replay.publish_count;
-    Ok(allocate_resync_anchor_locked(
+    let event = allocate_resync_anchor_locked(
         &mut guard.replay,
         Value::Object(map),
         publish_index,
         after_cursor,
         NETWORK_EVENT_SCHEMA,
-    ))
+    );
+    Ok((event, published))
 }
 
 // ---------------------------------------------------------------------------
 // Async SSE response body stream (holds SSE concurrency semaphore permit)
 // ---------------------------------------------------------------------------
 
+/// Await a `true` shutdown signal on `rx`. If all senders drop without signaling `true`,
+/// park forever so standalone unit-test streams without an active server do not abort early.
+pub(crate) async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+    if !*rx.borrow() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Build an async `axum::body::Body` for capture SSE streaming.
 ///
 /// `sub` MUST be subscribed BEFORE calling `replay_or_snapshot` so events published between
 /// replay and live streaming never miss a broadcast wakeup. Lagged resyncs always fetch a
 /// fresh authoritative snapshot from `backend`.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_sse_body(
     buffer: Arc<EventReplayBuffer>,
     mut sub: broadcast::Receiver<u64>,
@@ -957,6 +998,7 @@ pub fn capture_sse_body(
     initial_cursor: u64,
     heartbeat_interval: Duration,
     permit: OwnedSemaphorePermit,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> axum::body::Body {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
@@ -967,8 +1009,14 @@ pub fn capture_sse_body(
             match event.encode() {
                 Ok(chunk) => {
                     cursor = event.delivery_id;
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        res = tx.send(Ok(chunk)) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
                 Err(_) => return,
@@ -982,6 +1030,7 @@ pub fn capture_sse_body(
         loop {
             tokio::select! {
                 biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => return,
                 _ = tx.closed() => return,
                 recv = sub.recv() => {
                     match recv {
@@ -990,18 +1039,21 @@ pub fn capture_sse_body(
                                 Ok(Some(events)) => events,
                                 Ok(None) => {
                                     let backend_ref = Arc::clone(&backend);
-                                    match buffer
+                                    let resync_fut = buffer
                                         .issue_resync_snapshot_with_cursor_async(
                                             Some(cursor),
                                             || {
                                                 let b = Arc::clone(&backend_ref);
                                                 async move { b.capture_snapshot_event().await }
                                             },
-                                        )
-                                        .await
-                                    {
-                                        Ok(snap) => vec![snap],
-                                        Err(_) => return,
+                                        );
+                                    tokio::select! {
+                                        biased;
+                                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                                        res = resync_fut => match res {
+                                            Ok(snap) => vec![snap],
+                                            Err(_) => return,
+                                        },
                                     }
                                 }
                                 Err(_) => return,
@@ -1010,8 +1062,14 @@ pub fn capture_sse_body(
                                 match event.encode() {
                                     Ok(chunk) => {
                                         cursor = event.delivery_id;
-                                        if tx.send(Ok(chunk)).await.is_err() {
-                                            return;
+                                        tokio::select! {
+                                            biased;
+                                            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                                            res = tx.send(Ok(chunk)) => {
+                                                if res.is_err() {
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
                                     Err(_) => return,
@@ -1022,8 +1080,14 @@ pub fn capture_sse_body(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if tx.send(Ok(Bytes::from_static(HEARTBEAT_BYTES))).await.is_err() {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        res = tx.send(Ok(Bytes::from_static(HEARTBEAT_BYTES))) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1036,6 +1100,7 @@ pub fn capture_sse_body(
 ///
 /// `sub` MUST be subscribed BEFORE calling `replay_or_snapshot`. Lagged resyncs always fetch
 /// fresh authoritative network status from `backend`.
+#[allow(clippy::too_many_arguments)]
 pub fn network_sse_body(
     buffer: Arc<NetworkEventReplayBuffer>,
     mut sub: broadcast::Receiver<u64>,
@@ -1044,6 +1109,7 @@ pub fn network_sse_body(
     initial_cursor: u64,
     heartbeat_interval: Duration,
     permit: OwnedSemaphorePermit,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> axum::body::Body {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
@@ -1054,8 +1120,14 @@ pub fn network_sse_body(
             match event.encode() {
                 Ok(chunk) => {
                     cursor = event.delivery_id;
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        res = tx.send(Ok(chunk)) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
                 Err(_) => return,
@@ -1069,24 +1141,39 @@ pub fn network_sse_body(
         loop {
             tokio::select! {
                 biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => return,
                 _ = tx.closed() => return,
                 recv = sub.recv() => {
                     match recv {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                             let batch = match buffer.try_events_after(cursor) {
                                 Ok(Some(events)) => events,
-                                Ok(None) => match backend.network_status().await.and_then(|s| buffer.issue_resync_snapshot(s, Some(cursor))) {
-                                    Ok(snap) => vec![snap],
-                                    Err(_) => return,
-                                },
+                                Ok(None) => {
+                                    let status_fut = backend.network_status();
+                                    let status_res = tokio::select! {
+                                        biased;
+                                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                                        res = status_fut => res,
+                                    };
+                                    match status_res.and_then(|s| buffer.issue_resync_snapshot(s, Some(cursor))) {
+                                        Ok(snap) => vec![snap],
+                                        Err(_) => return,
+                                    }
+                                }
                                 Err(_) => return,
                             };
                             for event in batch {
                                 match event.encode() {
                                     Ok(chunk) => {
                                         cursor = event.delivery_id;
-                                        if tx.send(Ok(chunk)).await.is_err() {
-                                            return;
+                                        tokio::select! {
+                                            biased;
+                                            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                                            res = tx.send(Ok(chunk)) => {
+                                                if res.is_err() {
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
                                     Err(_) => return,
@@ -1097,8 +1184,14 @@ pub fn network_sse_body(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if tx.send(Ok(Bytes::from_static(HEARTBEAT_BYTES))).await.is_err() {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                        res = tx.send(Ok(Bytes::from_static(HEARTBEAT_BYTES))) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }

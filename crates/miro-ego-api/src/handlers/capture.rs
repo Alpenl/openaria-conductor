@@ -3,9 +3,10 @@
 
 use crate::backend::IdempotentCommand;
 use crate::error::ApiError;
-use crate::handlers::parse_strict_query;
+use crate::handlers::{parse_strict_query, truncate_untrusted_field};
 use crate::middleware::{
-    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object, single_header_str,
+    GatewayState, HeaderExtract, RequestCtx, read_strict_json_object_with_timeout,
+    single_header_str,
 };
 use crate::preview::{MJPEG_CONTENT_TYPE, h264_stream_body, mjpeg_stream_body};
 use crate::sse::{EventCursor, capture_sse_body, parse_last_event_id};
@@ -90,11 +91,17 @@ pub async fn set_capture_timer(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     if let Err(resp) = ctx.authorize_write(&state, &parts.headers, "setCaptureTimer") {
         return *resp;
     }
-    let (json, _) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, _) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -145,12 +152,18 @@ pub async fn start_capture(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "startCapture") {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -192,7 +205,8 @@ fn validate_capture_start_body(body: &Value) -> Result<(), ApiError> {
             "schema" | "mode" | "volume_id" | "display_name" | "take"
         ) {
             return Err(ApiError::bad_request(format!(
-                "unknown field in capture start request: {key}"
+                "unknown field in capture start request: {}",
+                truncate_untrusted_field(key)
             )));
         }
     }
@@ -249,12 +263,18 @@ pub async fn stop_capture(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "stopCapture") {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -327,12 +347,18 @@ pub async fn set_camera_focus(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     let (principal, key) = match ctx.authorize_command(&state, &parts.headers, "setCameraFocus") {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let (json, canonical) = match read_strict_json_object(&parts.headers, body).await {
+    let (json, canonical) = match read_strict_json_object_with_timeout(
+        &parts.headers,
+        body,
+        state.config.request_body_timeout,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(err) => return ctx.error_response(err),
     };
@@ -371,7 +397,8 @@ fn validate_camera_focus_body(body: &Value) -> Result<(), ApiError> {
     for key in obj.keys() {
         if !matches!(key.as_str(), "schema" | "value" | "auto_enabled") {
             return Err(ApiError::bad_request(format!(
-                "unknown field in camera focus request: {key}"
+                "unknown field in camera focus request: {}",
+                truncate_untrusted_field(key)
             )));
         }
     }
@@ -460,6 +487,7 @@ pub async fn stream_capture_events(
         initial_cursor,
         state.config.sse_heartbeat_interval,
         permit,
+        state.subscribe_shutdown(),
     );
 
     let mut builder = Response::builder()
@@ -482,7 +510,7 @@ pub async fn get_preview(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "getPreview", None) {
         return *resp;
     }
@@ -504,6 +532,12 @@ pub async fn get_preview(
         fps = Some(valid_fps);
     }
 
+    // Acquire preview semaphore BEFORE calling `open_preview_mjpeg` so capacity-exhausted
+    // requests never invoke backend preview initialization.
+    let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
+        return ctx.error_response(ApiError::preview_capacity_exhausted());
+    };
+
     let hub = match state.backend.open_preview_mjpeg(fps).await {
         Ok(h) => h,
         Err(err) => return ctx.error_response(err),
@@ -522,6 +556,7 @@ pub async fn get_preview(
         .any(|s| s.to_ascii_lowercase().contains("multipart/x-mixed-replace"));
 
     if !wants_multipart {
+        drop(permit);
         let frame_bytes = (*latest.jpeg).clone();
         let len = frame_bytes.len();
         let mut builder = Response::builder()
@@ -538,10 +573,7 @@ pub async fn get_preview(
         });
     }
 
-    let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
-        return ctx.error_response(ApiError::preview_capacity_exhausted());
-    };
-    let body = mjpeg_stream_body(hub, fps, latest, permit);
+    let body = mjpeg_stream_body(hub, fps, latest, permit, state.subscribe_shutdown());
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, MJPEG_CONTENT_TYPE)
@@ -562,7 +594,7 @@ pub async fn get_preview_h264(
     req: Request<Body>,
 ) -> Response<Body> {
     let (parts, _) = req.into_parts();
-    let mut ctx = RequestCtx::new(&parts.method, &parts.headers, &state.security);
+    let mut ctx = RequestCtx::new_with_state(&parts.method, &parts.headers, &state);
     if let Err(resp) = ctx.authorize_read(&state, &parts.headers, "getPreviewH264", None) {
         return *resp;
     }
@@ -598,12 +630,14 @@ pub async fn get_preview_h264(
         }
     }
 
+    // Acquire preview semaphore BEFORE calling `open_preview_h264`.
+    let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
+        return ctx.error_response(ApiError::preview_capacity_exhausted());
+    };
+
     let hub = match state.backend.open_preview_h264(fps, bitrate_kbps).await {
         Ok(h) => h,
         Err(err) => return ctx.error_response(err),
-    };
-    let Ok(permit) = Arc::clone(&state.preview_semaphore).try_acquire_owned() else {
-        return ctx.error_response(ApiError::preview_capacity_exhausted());
     };
 
     let rx = hub.subscribe();
@@ -614,7 +648,7 @@ pub async fn get_preview_h264(
     };
     hub.record_stream_hints(fps, bitrate_kbps);
     let content_type = hub.content_type().to_owned();
-    let body = h264_stream_body(Some(init), rx, permit);
+    let body = h264_stream_body(Some(init), rx, permit, state.subscribe_shutdown());
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
